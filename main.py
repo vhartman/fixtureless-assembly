@@ -37,10 +37,106 @@ def parse_args():
       "--no-disp-final", dest="disp_final", action="store_false",
       help="Do not show the final desired result.",
   )
+  parser.add_argument(
+      "--show-successors", action="store_true",
+      help="Visualize a few successor states of the initial search state, then exit.",
+  )
+  parser.add_argument(
+      "--parts", type=int, default=7,
+      help="Number of parts in the assembly (clamped per type). Default: 7.",
+  )
+  parser.add_argument(
+      "--assembly", choices=["cross", "cube", "arch", "arch-seq"], default="cross",
+      help="Assembly to build: cross (cube cross, 7), cube (2x2x2 grid, 8), "
+           "arch (two pillars + lintel, 7 -- known-flawed star model), "
+           "arch-seq (arch shape built as a sequential chain, 7). Default: cross.",
+  )
+  parser.add_argument(
+      "--solve", action="store_true",
+      help="Run the A* assembly search and print the plan.",
+  )
+  parser.add_argument(
+      "--canonical", action="store_true",
+      help="Break robot symmetry in the search (lowest-index free robot). TEST-ONLY: "
+           "unsound once robots have fixed bases -- emits a warning.",
+  )
+  parser.add_argument(
+      "--weight", type=float, default=1.0,
+      help="Weighted-A* factor f=g+w*h: 1=optimal, >1 faster & bounded-suboptimal, "
+           "inf=greedy best-first. Use a large value (e.g. 5 or inf) for fast solutions.",
+  )
+  parser.add_argument(
+      "--test-pick-ik", nargs="?", const="a1:obj_1:0", default=None,
+      metavar="ROBOT:PART:GRASP",
+      help="Pop up the real-robot pick IK for a (robot, part, grasp) and exit, e.g. "
+           "--test-pick-ik a1:obj_1:0 (default a1:obj_1:0).",
+  )
+  parser.add_argument(
+      "--test-assemble-ik", nargs="?", const="a1:obj_1:0", default=None,
+      metavar="ROBOT:PART:GRASP",
+      help="Pop up the real-robot assemble IK: robot holds PART at GRASP and mates it "
+           "onto its manual parent, then exit, e.g. --test-assemble-ik a1:obj_1:0.",
+  )
+  parser.add_argument(
+      "--test-assemble-held-ik", nargs="?", const="a1:obj_1:0:a2:1", default=None,
+      metavar="ROBOT:PART:GRASP:TARGET_ROBOT:ONTO_GRASP",
+      help="Like --test-assemble-ik but the target (manual parent) is HELD by TARGET_ROBOT "
+           "at ONTO_GRASP, so both cubes are in the air and both arms co-optimize. "
+           "E.g. --test-assemble-held-ik a1:obj_1:0:a2:1.",
+  )
+  parser.add_argument(
+      "--test-place-ik", nargs="?", const="a1:obj_1:0:1:5", default=None,
+      metavar="ROBOT:PART:GRASP:N_ASSEMBLED[:FACE]",
+      help="Pop up the real-robot place IK: with N_ASSEMBLED parts already mated, ROBOT "
+           "picks the subassembly by PART at GRASP and sets it on the table resting on "
+           "placement FACE (0-5, 5=upright default), then exit. "
+           "E.g. --test-place-ik a1:obj_1:0:1:0.",
+  )
+  parser.add_argument(
+      "--real-ik", action="store_true",
+      help="Run the search with real-robot IK in the feasibility loop (RobotIK), and "
+           "replay the plan with the actual arm poses instead of floating-EE stand-ins.",
+  )
+  parser.add_argument(
+      "--seed", type=int, default=0,
+      help="RNG seed for numpy + rai (KOMO IK), for reproducible runs. Default: 0.",
+  )
   return parser.parse_args()
 
 def main():
   args = parse_args()
+  set_seed(args.seed)                           # reproducible numpy + rai (KOMO) RNG
+  # grasp rolls are a property of the gripper: the vacuum is symmetric about its suction
+  # axis (1 grasp per face); the two-finger has two in-plane orientations (90 deg apart).
+  set_rolls_per_face(1 if args.vacuum else 2)
+
+  if args.test_pick_ik is not None:
+    robot, part, grasp = args.test_pick_ik.split(":")
+    visualize_pick_ik(part=part, grasp_id=int(grasp), robot=robot, n_parts=args.parts,
+                      num_robots=args.num_robots, vacuum=args.vacuum)
+    return
+
+  if args.test_assemble_ik is not None:
+    robot, part, grasp = args.test_assemble_ik.split(":")
+    visualize_assemble_ik(part=part, grasp_id=int(grasp), robot=robot, n_parts=args.parts,
+                          num_robots=args.num_robots, vacuum=args.vacuum)
+    return
+
+  if args.test_place_ik is not None:
+    fields = args.test_place_ik.split(":")
+    robot, part, grasp, n_asm = fields[:4]
+    face = int(fields[4]) if len(fields) > 4 else 5
+    visualize_place_ik(part=part, grasp_id=int(grasp), robot=robot,
+                       n_assembled=int(n_asm), n_parts=args.parts,
+                       num_robots=args.num_robots, vacuum=args.vacuum, face=face)
+    return
+
+  if args.test_assemble_held_ik is not None:
+    robot, part, grasp, target_robot, onto_grasp = args.test_assemble_held_ik.split(":")
+    visualize_assemble_ik(part=part, grasp_id=int(grasp), robot=robot,
+                          target_robot=target_robot, onto_grasp=int(onto_grasp),
+                          n_parts=args.parts, num_robots=args.num_robots, vacuum=args.vacuum)
+    return
 
   C = make_four_robot_env(
       num_robots=args.num_robots,
@@ -49,17 +145,36 @@ def main():
       robot_types=args.robot_types,
   )
 
-  C = add_disassembled_obj(C, perturb_start_pose=args.perturb_start_pose)
+  assembly = make_assembly(args.assembly, args.parts)
 
-  if args.view:
-    C.view(True)
+  C = add_disassembled_obj(C, assembly, perturb_start_pose=args.perturb_start_pose)
 
-  assembly = CubeCrossAssembly()
 
   if args.disp_final:
     display_final_assembly(C, assembly, [0, 0, 0.5])
+    
+  if args.show_successors:
+    visualize_successor_states(C, assembly)
+    return
 
-  solve_assembly_problem(C, assembly)
+  if args.solve:
+    robots = get_robots(C)
+    robot_ik = RobotIK(C, robots) if args.real_ik else None
+    plan = solve_assembly_problem(C, assembly, robots=robots, canonical=args.canonical,
+                                  weight=args.weight, robot_ik=robot_ik)
+    if plan is not None:
+      print(f"plan ({len(plan)} actions):")
+      for step in plan:
+        print("  ", step)
+      if args.view:
+        if args.real_ik:
+          visualize_plan_ik(C, assembly, plan, robots=robots, robot_ik=robot_ik)
+        else:
+          visualize_plan(C, assembly, plan)
+    return
+
+  if args.view:
+    C.view(True)
 
 if __name__ == "__main__":
   main()

@@ -48,12 +48,53 @@ LAYOUT_6 = {
 }
 
 
+# distinctive per-robot gripper colors (a1, a2, ...) so robots are easy to follow in the
+# viewer: red, green, blue, yellow, magenta, cyan.
+GRIPPER_COLORS = [
+    [0.90, 0.15, 0.15, 0.3],
+    [0.15, 0.70, 0.20, 0.3],
+    [0.20, 0.40, 0.90, 0.3],
+    [0.95, 0.80, 0.10, 0.3],
+    [0.80, 0.20, 0.80, 0.3],
+    [0.10, 0.80, 0.80, 0.3],
+]
+
+# frame-name fragments that identify gripper bodies (two-finger palm/fingers, vacuum pen).
+_GRIPPER_BODY_KEYS = ("vacuum", "finger", "palm", "gripper_fill", "gripper_center")
+
+
+def color_gripper(C, prefix, color):
+    """Tint the gripper bodies of the robot with frame prefix `prefix` (e.g. 'a1_')."""
+    for name in C.getFrameNames():
+        if name.startswith(prefix) and any(k in name for k in _GRIPPER_BODY_KEYS):
+            try:
+                C.getFrame(name).setColor(color)
+            except Exception:
+                pass                      # shapeless frames (markers) may not take a color
+
+
 def _robot_path(robot_type, floating_ee, vacuum):
     if robot_type == "ur10":
         return os.path.join(HERE, UR10_PATHS[(floating_ee, vacuum)])
     if robot_type == "ur5":
         return os.path.join(HERE, "./src/rai/ur5_vamp/ur5_vamp.g")
     return os.path.join(HERE, "./src/rai/kuka_drake/kuka_two_finger.g")
+
+
+def make_world():
+    # the static environment shared by every scene: floor + table. Single source of
+    # truth, so the real-robot env and the floating-EE collision scene agree exactly.
+    C = ry.Config()
+
+    C.addFrame("floor").setPosition([0, 0, 0.0]).setShape(
+        ry.ST.box, size=[20, 20, 0.02, 0.005]
+    ).setColor([0.9, 0.9, 0.9]).setContact(0)
+
+    C.addFrame("table").setPosition([0, 0, 0.2 - 0.06 / 2]).setShape(
+        ry.ST.box, size=[3, 3, 0.06, 0.005]
+    ).setColor([0.6, 0.6, 0.6]).setContact(1)
+
+    return C
 
 
 def make_four_robot_env(
@@ -65,15 +106,7 @@ def make_four_robot_env(
         robot_types = [robot_types] * num_robots
     assert num_robots <= len(robot_types)
 
-    C = ry.Config()
-
-    C.addFrame("floor").setPosition([0, 0, 0.0]).setShape(
-        ry.ST.box, size=[20, 20, 0.02, 0.005]
-    ).setColor([0.9, 0.9, 0.9]).setContact(0)
-
-    C.addFrame("table").setPosition([0, 0, 0.2 - 0.06 / 2]).setShape(
-        ry.ST.box, size=[3, 3, 0.06, 0.005]
-    ).setColor([0.6, 0.6, 0.6]).setContact(1)
+    C = make_world()
 
     layout = LAYOUT_6 if num_robots > 4 else LAYOUT_4
 
@@ -87,6 +120,9 @@ def make_four_robot_env(
         ).setParent(C.getFrame("table")).setRelativePosition(
             place["pos"][i]
         ).setRelativeQuaternion(place["rot"][i]).setJoint(ry.JT.rigid)
+
+        # unique gripper colour per robot, so they are easy to tell apart in the viewer
+        color_gripper(C, prefix, GRIPPER_COLORS[i % len(GRIPPER_COLORS)])
 
     return C
 
