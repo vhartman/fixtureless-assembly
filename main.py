@@ -98,6 +98,35 @@ def parse_args():
            "replay the plan with the actual arm poses instead of floating-EE stand-ins.",
   )
   parser.add_argument(
+      "--optimistic", action="store_true",
+      help="Use the optimistic (Dogar-style) per-part search -- add one part at a time via "
+           "its own small complete sub-search (reorient/hold/pick/mate/set-down), with exact "
+           "fallback -- instead of the exact search. Much faster on the cases that blow up.",
+  )
+  parser.add_argument(
+      "--declutter", action="store_true",
+      help="With --optimistic: allow each per-part step to RELOCATE blocking loose parts "
+           "(stow them aside on demand) instead of only touching that part and the assembly. "
+           "Removes the 'nothing else is in the way' assumption.",
+  )
+  parser.add_argument(
+      "--wrench", action="store_true",
+      help="Turn on the static-equilibrium (stability) model: support-gate assemble/release "
+           "with the insertion reaction, so sideways mates on a resting assembly need a hold "
+           "(mating becomes perpendicular unless braced). Default off (topological baseline).",
+  )
+  parser.add_argument(
+      "--no-handovers", dest="handovers", action="store_false",
+      help="Disable the add_grasp/handover primitives (regrasp-in-air). On by default; "
+           "turning it off gives a leaner reference search (no second-grasp branching).",
+  )
+  parser.add_argument(
+      "--no-place", dest="allow_place", action="store_false",
+      help="Forbid setting a held assembly back on the table: the search must hold it and "
+           "regrasp in the air (handovers become mandatory -- the Dogar hold-and-work "
+           "regime). Meaningful for the exact search; the optimistic search needs to set down.",
+  )
+  parser.add_argument(
       "--seed", type=int, default=0,
       help="RNG seed for numpy + rai (KOMO IK), for reproducible runs. Default: 0.",
   )
@@ -160,8 +189,19 @@ def main():
   if args.solve:
     robots = get_robots(C)
     robot_ik = RobotIK(C, robots) if args.real_ik else None
-    plan = solve_assembly_problem(C, assembly, robots=robots, canonical=args.canonical,
-                                  weight=args.weight, robot_ik=robot_ik)
+    if args.optimistic and args.declutter:
+      plan = solve_assembly_problem_optimistic_declutter(
+          C, assembly, robots=robots, robot_ik=robot_ik, weight=args.weight,
+          wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place)
+    elif args.optimistic:
+      plan = solve_assembly_problem_optimistic(C, assembly, robots=robots,
+                                               robot_ik=robot_ik, weight=args.weight,
+                                               wrench=args.wrench, handovers=args.handovers,
+                                               allow_place=args.allow_place)
+    else:
+      plan = solve_assembly_problem(C, assembly, robots=robots, canonical=args.canonical,
+                                    weight=args.weight, robot_ik=robot_ik, wrench=args.wrench,
+                                    handovers=args.handovers, allow_place=args.allow_place)
     if plan is not None:
       print(f"plan ({len(plan)} actions):")
       for step in plan:

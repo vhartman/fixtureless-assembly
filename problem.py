@@ -7,6 +7,7 @@ import robotic as ry
 import numpy as np
 
 from env import *
+import wrench
 
 
 def set_seed(seed=0):
@@ -30,15 +31,39 @@ class Assembly:
 
   The base class only stores this structure and derives things from it (e.g.
   `position_in_base`); it has no geometry/planner assumptions.
+
+  Physics (for the wrench/stability model, see wrench.py):
+    masses:      {part: kg}          per-part mass (NOT rai's frame mass), default
+                                     DEFAULT_MASS. Used by the equilibrium check.
+    mate_types:  {part: type_str}    the contact TYPE of the mate that joins `part` to its
+                                     parent (a key into wrench.py's capability builders).
+                                     Default "rigid_weld" for every mate.
+  Subclasses may override either in define(); anything left unset gets the default.
   """
+
+  DEFAULT_MASS = 0.1                                        # kg, a single cube
+  DEFAULT_MATE_TYPE = "rigid_weld"
 
   def __init__(self):
     self.objects = []
     self.base = None
     self.assembly_dependencies = {}
     self.assembly_relative_poses = {}
+    self.masses = {}
+    self.mate_types = {}
     self.define()
+    for p in self.objects:                                 # fill physics defaults
+      self.masses.setdefault(p, self.DEFAULT_MASS)
+    for p in self.assembly_relative_poses:                 # every mate has a type
+      self.mate_types.setdefault(p, self.DEFAULT_MATE_TYPE)
     self.validate()
+
+  def mass(self, part):
+    return self.masses.get(part, self.DEFAULT_MASS)
+
+  def mate_type(self, part):
+    # contact type of the mate joining `part` to its parent (None for the base / free part).
+    return self.mate_types.get(part)
 
   def define(self):
     # subclasses populate objects / base / dependencies / relative poses here
@@ -677,10 +702,17 @@ class State:
     # grounding contacts (grasp / table) over all members of a subassembly
     return frozenset(c for p in group for c in self.supports.get(p, ()) if is_grounding(c))
 
-  def is_supported(self, group):
-    # topological support (some member is grounded) gated by the wrench stub
+  def is_supported(self, group, assembly=None, gripper_kind=None):
+    # a group is supported iff it has grounding contacts AND they can hold it. With
+    # gripper_kind None this is the TOPOLOGICAL baseline (grounded + wrench stub); with a
+    # gripper kind it is the real static-equilibrium check (gravity only -- callers add
+    # insertion loads separately).
     grounding = self.grounding_contacts(group)
-    return len(grounding) > 0 and wrench_sufficient(grounding)
+    if len(grounding) == 0:
+      return False
+    if gripper_kind is None:
+      return wrench_sufficient(grounding)
+    return _group_stable(self, assembly, group, gripper_kind)
 
   def robots_holding(self):
     return {c[1] for cs in self.supports.values() for c in cs if c[0] == "grasp"}
@@ -874,7 +906,7 @@ def places(state, assembly, robots):
       yield ("place", r, root, face), ns
 
 
-def assembles(state, assembly, robots):
+def assembles(state, assembly, robots, gripper_kind=None):
   # a robot mates its held single part onto a supported target assembly per the manual.
   # The robot KEEPS holding (its grasp becomes a brace); freeing it is a separate,
   # support-gated `release`. So assemble only adds the mate -- it does not let go.
@@ -899,8 +931,16 @@ def assembles(state, assembly, robots):
       # dependency-closed order ideal, so it is never enumerated in get_subassemblies /
       # the grasp table (KeyError) and is not a sensible sequential build anyway.
       continue                                            # precedence: target stays an ideal
-    if not state.is_supported(target):
+    if not state.is_supported(target, assembly, gripper_kind):
       continue                                            # target must be supported
+    if gripper_kind is not None and not _group_stable(
+        state, assembly, target, gripper_kind,
+        applied=[_insertion_load(state, assembly, p, onto)]):
+      # WRENCH: the target must also withstand the INSERTION reaction while p is seated. On
+      # a table-only target a sideways seating has no frictional resistance and topples it
+      # -> the mate is infeasible here; the search must reorient (so seating is top-down) or
+      # hold the target. This is what makes mating usually perpendicular.
+      continue
     if _group_is_on_table(state, target) and not _on_table_mateable_cached(
         assembly, p, _placement_face(state, target)):
       # the mate would jam p into the table at the group's CURRENT rest pose -- for its
@@ -930,33 +970,149 @@ def _on_table_mateable_cached(assembly, part, face=_IDENTITY_FACE):
   return cache[key]
 
 
-def releases(state, assembly, robots):
+def add_grasps(state, assembly, robots, grasp_table=None):
+  # a free robot adds a SECOND grasp (a brace) to an already-HELD subassembly -- the unfused
+  # primitive behind HANDOVERS (add_grasp; release) and bracing. The new grasp is a SUPPORT
+  # contact only; the kinematic `parent` is unchanged (the group stays rooted at its current
+  # holder -- this is the whole point of parent(single)/supports(set)). A later release of the
+  # original holder then re-roots the tree onto this grasp (see `releases`).
+  free = state.free_robots(robots)
+  if not free:
+    return
+  for group in state.subassemblies():
+    if not _group_holders(state, group):
+      continue                                            # only brace an already-held group
+    key = _subasm_key(group)
+    labeled = grasp_table[key] if grasp_table is not None else \
+        compute_cube_grasps(assembly, key, return_labeled=True)
+    taken = {(c[2], c[3]) for p in group for c in state.supports[p] if c[0] == "grasp"}
+    for r in free:
+      for gpart, grasp_id, _pose in labeled:              # grasp ANY free face of the group
+        if (gpart, grasp_id) in taken:
+          continue                                        # that grasp is already occupied
+        ns = _copy_edit_support(state)
+        ns.supports[gpart] = ns.supports[gpart] | {("grasp", r, gpart, grasp_id)}
+        yield ("add_grasp", r, gpart, grasp_id), ns
+
+
+def fused_handovers(state, assembly, robots, grasp_table=None):
+  # FUSED handover: a free robot B takes a singly-held group from its holder A in ONE step
+  # (B grasps a free face, A releases, the tree re-roots to B). Net holder count is UNCHANGED,
+  # so unlike the unfused add_grasp;release it introduces no higher-h two-holder intermediate
+  # -- it is the heuristically neutral, air analogue of the place;pick regrasp. (Unfused
+  # add_grasp stays for genuine bracing, where you keep both holders.)
+  free = state.free_robots(robots)
+  if not free:
+    return
+  for group in state.subassemblies():
+    if len(_group_holders(state, group)) != 1:
+      continue                                              # clean 1->1 take-over only
+    root = _group_root(state, group)
+    if state.parent.get(root, (None,))[0] != "gripper":
+      continue                                              # must be gripper-held (in the air)
+    rA = state.parent[root][1]
+    key = _subasm_key(group)
+    labeled = grasp_table[key] if grasp_table is not None else \
+        compute_cube_grasps(assembly, key, return_labeled=True)
+    taken = {(c[2], c[3]) for p in group for c in state.supports[p] if c[0] == "grasp"}
+    for rB in free:
+      for gpart, grasp_id, _pose in labeled:                # B grabs any free face...
+        if (gpart, grasp_id) in taken:
+          continue
+        ns = _copy_edit_support(state)
+        ns.supports[root] = frozenset(                      # ...A lets go...
+            c for c in ns.supports[root] if not (c[0] == "grasp" and c[1] == rA))
+        ns.grasp.pop(root, None)
+        ns.supports[gpart] = ns.supports[gpart] | {("grasp", rB, gpart, grasp_id)}
+        ns.parent = _rerooted(ns.parent, gpart)             # ...tree re-roots to B
+        ns.parent[gpart] = ("gripper", rB)
+        ns.grasp[gpart] = grasp_id
+        yield ("handover", rB, gpart, grasp_id), ns
+
+
+def releases(state, assembly, robots, gripper_kind=None):
   # a robot opens its gripper without setting the part down. Support-gated: legal only if
   # the subassembly is still supported once this grasp is gone. This is the whole "you
-  # can't always let go" rule -- with wrench ignored it just means "something else still
-  # grounds it" (a mate to a grounded neighbour, the table, or another gripper).
+  # can't always let go" rule -- topologically it just means "something else still grounds
+  # it"; with wrench it means the REMAINING contacts can still balance gravity (so a
+  # cantilever cannot be let go until the loop/ground carries it).
   for group in state.subassemblies():
     for p in group:
       for c in [c for c in state.supports[p] if c[0] == "grasp"]:
         r = c[1]
         ns = _copy_edit_support(state)
         ns.supports[p] = frozenset(x for x in ns.supports[p] if x != c)
-        if not ns.is_supported(group):
+        if not ns.is_supported(group, assembly, gripper_kind):
           continue                    # letting go would drop it -> not allowed
         if ns.parent.get(p) == ("gripper", r):
-          # the released grasp was the kinematic parent yet the part stays supported by
-          # another contact -> needs reparenting to that supporter; only arises with
-          # add_grasp (handover/brace), which is deferred. Skip for now.
-          continue
+          # HANDOVER completion: the released grasp was the kinematic root, but another grasp
+          # still holds the group -> re-root the tree onto that remaining holder (canonical
+          # choice: the lowest-index still-grasped part). This is the case add_grasp enables.
+          remaining = [(cc[2], cc[1], cc[3]) for pp in group
+                       for cc in ns.supports[pp] if cc[0] == "grasp"]
+          if not remaining:
+            continue                  # no other holder to take it (should not happen if supported)
+          q, r2, gid2 = min(remaining, key=lambda t: _part_index(t[0]))
+          ns.parent = _rerooted(ns.parent, q)
+          ns.parent[q] = ("gripper", r2)
+          ns.grasp.pop(p, None)
+          ns.grasp[q] = gid2
         yield ("release", r, p), ns
 
 
-def successors(state, assembly, robots, grasp_table=None, canonical=False):
+def successors(state, assembly, robots, grasp_table=None, canonical=False,
+               gripper_kind=None, handovers=True, allow_place=True, bracing=False):
+  # handovers=True (default) enables regrasp-in-air via the FUSED `handover`: a free robot
+  # takes a held group from its holder in ONE heuristically-neutral edge (no higher-h
+  # two-holder intermediate). That covers regrasp; the unfused `add_grasp` (a 2nd grasp you
+  # KEEP -- genuine bracing/multi-hold) is a separate, rarely-needed capability behind
+  # `bracing=` (off by default: it just adds branching everywhere). `release` reparents onto a
+  # remaining holder either way. allow_place=False FORBIDS setting a held group back on the
+  # table -> the search holds + regrasps in the air (no forced regime; just fewer options).
   yield from picks(state, assembly, robots, grasp_table=grasp_table, canonical=canonical)
-  yield from assembles(state, assembly, robots)
-  yield from releases(state, assembly, robots)
-  yield from places(state, assembly, robots)
-  # deferred (unfused): add_grasps, set_downs
+  yield from assembles(state, assembly, robots, gripper_kind=gripper_kind)
+  if handovers:
+    yield from fused_handovers(state, assembly, robots, grasp_table=grasp_table)
+  if bracing:
+    yield from add_grasps(state, assembly, robots, grasp_table=grasp_table)
+  yield from releases(state, assembly, robots, gripper_kind=gripper_kind)
+  if allow_place:
+    yield from places(state, assembly, robots)
+  # deferred (unfused): set_downs
+
+
+def assembly_order(assembly):
+  # parts in a dependency-respecting order, base first: a part comes after everything in its
+  # transitive closure. (For the chain DAGs here this is index order; the key keeps it
+  # correct for any DAG.) The order the parts get mated in.
+  return sorted(assembly.objects, key=lambda p: (len(_mate_closure(assembly, p)), _part_index(p)))
+
+
+def context_scatter_state(assembly, context, face, poses):
+  """The isolated scene for one optimistic assemble step: the parts in `context` assembled
+  onto the base and resting on the table on `face`, and EVERY other part still a loose
+  singleton on the table at its scanned pose. No braces, no held part yet -- phase 1 then
+  picks the target part off this scene and mates it, so the per-part check exercises exactly
+  the pick->mate progression the realizer will run, in isolation (which is what makes the
+  per-part (grasp, face) choices decouple). `poses` is the world-pose payload."""
+  parent, place, supports = {}, {}, {}
+  base = assembly.base
+  ctx = set(context)
+  for q in assembly.objects:
+    if q in ctx:
+      if q == base:
+        parent[q] = ("table",)
+        supports[q] = frozenset({("table",)})
+        place[q] = ("slot", _part_index(q), face)
+      else:
+        onto = assembly.relative_pose(q)[0]
+        parent[q] = ("part", onto)
+        supports[q] = frozenset({("mate", onto)})
+    else:                                                 # still a loose part on the table
+      parent[q] = ("table",)
+      supports[q] = frozenset({("table",)})
+      place[q] = ("slot", _part_index(q), _IDENTITY_FACE)
+  return State(parent=parent, place=place, supports=supports, poses=dict(poses))
 
 
 
@@ -1018,6 +1174,150 @@ def _state_part_poses(state, assembly, lift=0.35):
       rel = assembly.position_in_base(p) - base_in_asm     # translation, identity rot
       poses[p] = _pose_compose(base_pose, np.concatenate([rel, [1.0, 0.0, 0.0, 0.0]]))
   return poses
+
+
+# ===========================================================================
+# Wrench / stability evaluation (bridges the discrete state to wrench.py's LP)
+# ===========================================================================
+#
+# Mates are RIGID WELDS, so a subassembly is one rigid body: its stability depends only on
+# the GROUNDING contacts (table / grasp) versus the external load (gravity + any insertion
+# reaction). We read the contact GEOMETRY from the state's world poses and hand capability
+# sets to wrench.equilibrium_feasible. Enabled per call via `gripper_kind` (None => the
+# topological baseline is used instead; nothing here runs).
+
+def _cube_corners_world(pose, cube_size):
+  h = cube_size / 2.0
+  c = np.asarray(pose[:3], dtype=float)
+  R = _quat_to_R(np.asarray(pose[3:], dtype=float))
+  return [c + R @ (np.array([sx, sy, sz]) * h)
+          for sx in (-1.0, 1.0) for sy in (-1.0, 1.0) for sz in (-1.0, 1.0)]
+
+
+def _table_footprint(poses, group, cube_size, tol=1e-3):
+  # the support polygon of a table-resting group: the world corners of whichever parts sit
+  # at the group's lowest z (the ones actually touching the table).
+  by_part = {p: _cube_corners_world(poses[p], cube_size) for p in group}
+  zmin = min(x[2] for cs in by_part.values() for x in cs)
+  return [x for cs in by_part.values() for x in cs if x[2] <= zmin + tol]
+
+
+def _grasp_frame(part_pose, grasp_id, cube_size):
+  # world frame of a grasp on a part: its APPROACH axis (grasp local z, points into the cube)
+  # and the two LATERAL axes (local x/y), plus a contact point ~at the grasped face centre.
+  # Feeds the directional friction-grasp capability (axial vs shear vs torque).
+  gpose = _pose_compose(np.asarray(part_pose, dtype=float),
+                        cube_grasp_pose(grasp_id, cube_size))
+  R = _quat_to_R(np.asarray(gpose[3:], dtype=float))
+  n = R[:, 2]
+  point = np.asarray(part_pose[:3], dtype=float) - (cube_size / 2.0) * n
+  return point, n, R[:, 0], R[:, 1]
+
+
+# memoized equilibrium verdicts. The LP dominates the wrench-on search cost, but the result
+# is invariant to a global translation of all contacts+loads and to absolute x/y position,
+# so we canonicalise every query to the group centroid and round -- states that share the
+# same discrete structure (parts, placement face, grounding contacts, applied load) then hit
+# the same entry. Cleared per solve via reset_wrench_cache().
+_WRENCH_CACHE = {}
+
+
+def reset_wrench_cache():
+  _WRENCH_CACHE.clear()
+
+
+def _group_stable(state, assembly, group, gripper_kind, applied=()):
+  # static-equilibrium feasibility for a subassembly: can its grounding contacts balance
+  # gravity plus any `applied` [(force_vec_world, point_world), ...] (e.g. insertion)?
+  poses = _state_part_poses(state, assembly, lift=0.0)
+  members = sorted(group, key=_part_index)                 # stable order -> stable cache key
+  pos = {p: np.asarray(poses[p][:3], dtype=float) for p in members}
+  centroid = np.mean([pos[p] for p in members], axis=0)    # canonicalise position away
+
+  w_ext = wrench.gravity_wrench([(assembly.mass(p), pos[p] - centroid) for p in members])
+  for f, pt in applied:
+    w_ext = w_ext + wrench.point_force_wrench(f, np.asarray(pt, dtype=float) - centroid)
+
+  caps = []
+  if any(("table",) in state.supports.get(p, ()) for p in members):
+    fp = _table_footprint(poses, members, assembly.cube_size)
+    caps.append(wrench.cap_table_unilateral([np.asarray(x, dtype=float) - centroid for x in fp]))
+  cs = assembly.cube_size
+  for p in members:
+    for c in sorted(state.supports.get(p, ())):
+      if c[0] == "grasp":
+        gp, n, t1, t2 = _grasp_frame(poses[c[2]], c[3], cs)   # c=(grasp, r, gpart, grasp_id)
+        caps.append(wrench.cap_friction_grasp(gp - centroid, n, t1, t2,
+                                              **wrench.PARAMS["grasp"][gripper_kind]))
+
+  key = (tuple(np.round(arr, 4).tobytes() for G_i, A_i, b_i in caps
+               for arr in (G_i, A_i, b_i)), np.round(w_ext, 4).tobytes())
+  if key in _WRENCH_CACHE:
+    return _WRENCH_CACHE[key]
+  res = wrench.equilibrium_feasible(caps, w_ext)
+  _WRENCH_CACHE[key] = res
+  return res
+
+
+def _insertion_load(state, assembly, part, onto):
+  # the insertion reaction the mate of `part` exerts on the target during seating: a force
+  # of magnitude wrench.insert_force(part) along the SEATING direction (from part toward
+  # onto, i.e. -mate-axis) in world, applied at the mate interface. On a table-supported
+  # target a top-down seating pushes into the table (fine); a sideways one has no frictional
+  # resistance and topples/slides it -- so it needs a hold. Returns (force_world, point_world).
+  poses = _state_part_poses(state, assembly, lift=0.0)
+  R = _quat_to_R(np.asarray(poses[onto][3:], dtype=float))  # target's world orientation
+  rel = np.asarray(assembly.relative_pose(part)[1], dtype=float)
+  axis = rel / (np.linalg.norm(rel) + 1e-12)                # mate axis in the base frame
+  f_world = wrench.insert_force(part) * (-(R @ axis))       # force ON target, seating dir
+  point = np.asarray(poses[onto][:3], dtype=float) + R @ rel  # ~ part's seated position
+  return f_world, point
+
+
+# reference anchor poses for the wrench precompute: absolute position is irrelevant (the
+# stability LP is canonicalised to the group centroid), so a single fixed table-height
+# anchor per part suffices -- the layout / face rotation / rest lift are recomputed from it.
+def _flat_poses(assembly):
+  return {p: np.array([0.0, 0.0, 0.2, 1.0, 0.0, 0.0, 0.0]) for p in assembly.objects}
+
+
+def precompute_stable_faces(assembly, gripper_kind):
+  """For every assembly STEP (mate part p onto subassembly S), the set of table PLACEMENT
+  FACES on which the step is both geometrically reachable AND wrench-stable to seat top-down
+  (S itself stable resting on the table on that face, and stable under the insertion
+  reaction). A bounded table keyed by (subassembly_key, part), computed once like the grasp
+  table. Its uses:
+    - an EMPTY set => the step cannot be done on the table at all -> it REQUIRES holding the
+      assembly in the air (a cantilever); a NON-empty set => it needs the assembly reoriented
+      onto one of those faces. This is exactly the wrench-forced structure a stability-aware
+      heuristic needs, and it prunes on-table mate generation to the stable faces.
+  Returns {} when gripper_kind is None (wrench disabled)."""
+  if gripper_kind is None:
+    return {}
+  poses = _flat_poses(assembly)
+  table = {}
+  for group in get_subassemblies(assembly):
+    S = frozenset(group)
+    for p in assembly.objects:
+      rel = assembly.relative_pose(p)
+      if p in S or rel is None or rel[0] not in S:
+        continue                                            # p must mate onto a part of S
+      if not _mate_closure(assembly, p).issubset(S):
+        continue                                            # S must be an order ideal for p
+      onto = rel[0]
+      faces = set()
+      for f in range(len(_FACE_DOWN_QUATS)):
+        if not _on_table_mateable_cached(assembly, p, f):
+          continue                                          # mate site not reachable at f
+        st = context_scatter_state(assembly, S, f, poses)
+        if not _group_stable(st, assembly, S, gripper_kind):
+          continue                                          # S topples resting on face f
+        if not _group_stable(st, assembly, S, gripper_kind,
+                             applied=[_insertion_load(st, assembly, p, onto)]):
+          continue                                          # topples under the insertion
+        faces.add(f)
+      table[(_subasm_key(S), p)] = frozenset(faces)
+  return table
 
 
 # penetration the CHEAP checker tolerates before rejecting. The real IK's collision

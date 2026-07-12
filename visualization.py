@@ -161,9 +161,11 @@ def visualize_plan(C, assembly, plan, robots=None, gripper_path=None):
   print(f"[0/{len(plan)}] initial: {s}")
   visualize_state(C, s, assembly, gripper_path)
 
+  allobj = set(assembly.objects)                           # for resolving stow edges (declutter)
   for i, action in enumerate(plan, 1):
     # re-derive the successor for this action (reuses the transition logic)
-    nxt = next((ns for a, ns in successors(s, assembly, robots) if a == action), None)
+    nxt = next((ns for a, ns in _declutter_edges(s, assembly, robots, None, allobj)
+                if a == action), None)
     if nxt is None:
       print(f"[{i}/{len(plan)}] !! could not apply {action} in {s}")
       return
@@ -182,7 +184,7 @@ def _active_robots(action, s, rik):
   kind = action[0]
   if kind == "pick":
     return [action[1]]                                    # picks move no held group
-  if kind == "place":
+  if kind in ("place", "stow"):                            # stow = a place aside (declutter)
     r, root = action[1], action[2]
     group = next((g for g in s.subassemblies() if root in g), frozenset())
     return list(dict.fromkeys([r] + rik._holders_of_group(s, group)))
@@ -190,6 +192,10 @@ def _active_robots(action, s, rik):
     _, r, _part, onto = action
     target = next((g for g in s.subassemblies() if onto in g), frozenset())
     return list(dict.fromkeys([r] + rik._holders_of_group(s, target)))
+  if kind in ("add_grasp", "handover"):                   # new arm reaches; holders present it
+    r, gpart = action[1], action[2]
+    group = next((g for g in s.subassemblies() if gpart in g), frozenset())
+    return list(dict.fromkeys([r] + rik._holders_of_group(s, group)))
   return []                                               # release: nobody moves
 
 
@@ -255,7 +261,9 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True):
     # via the group's kinematic root.
     root = _group_root(state, group)
     ref = min(group, key=_part_index)
-    anchor = np.asarray(robot_ik.C.getFrame(ref).getPose())     # ref's initial table pose
+    anchor = state.poses.get(ref)                               # ref's recorded table pose
+    anchor = np.asarray(anchor) if anchor is not None \
+        else np.asarray(robot_ik.C.getFrame(ref).getPose())    # (its initial pose by default)
     ref_pose = _group_rest_pose(assembly, group, ref,
                                 anchor, _placement_face(state, group))
     rel = assembly.position_in_base(root) - assembly.position_in_base(ref)
@@ -282,12 +290,16 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True):
     f.setPosition(new[:3])
     f.setQuaternion(new[3:])
 
+  allobj = set(assembly.objects)                           # for resolving stow edges (declutter)
   for i, action in enumerate(plan, 1):
-    nxt = next((ns for a, ns in successors(s, assembly, robots) if a == action), None)
+    nxt = next((ns for a, ns in _declutter_edges(s, assembly, robots, None, allobj)
+                if a == action), None)
     if nxt is None:
       print(f"[{i}/{len(plan)}] !! could not apply {action} in {s}")
       return
-    _ok, witness = robot_ik.bind(action, s, nxt, assembly)
+    # a stow is a place aside: run the place IK (which now targets the recorded stow pose).
+    bind_action = ("place",) + tuple(action[1:]) if action[0] == "stow" else action
+    _ok, witness = robot_ik.bind(bind_action, s, nxt, assembly)
     # 1) active arms -> the solved config; every other arm -> home, EXCEPT arms that must
     #    stay with their grasp. A KINEMATIC holder of a SOLO-held group may ride home (the
     #    group travels with it, out of the way). But if the group has OTHER holders
@@ -311,16 +323,11 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True):
       solo = len(robot_ik._holders_of_group(nxt, g)) == 1
       return kinematic and solo                           # ride home only if unbraced
 
-    for r in robots:
-      if r in active:
-        _write_robot_dofs(Cv, r, witness)
-      elif _may_home(r):
-        _write_robot_dofs(Cv, r, robot_ik.home)
-    # 2) mirror the kinematic re-parenting on the SAME config. attach preserves each part's
-    #    current world pose. Re-rooting a held subassembly REVERSES part->part edges, so a
-    #    part must be re-attached only AFTER its NEW parent has been re-attached -- otherwise
-    #    we'd link obj_0->obj_1 while obj_1 is still a child of obj_0, making a kinematic loop
-    #    (rai warns, then segfaults). Process new-parent-first (topological over changes).
+    # mirror the kinematic re-parenting on the SAME config. attach preserves each part's
+    # current world pose. Re-rooting a held subassembly REVERSES part->part edges, so a part
+    # must be re-attached only AFTER its NEW parent has been re-attached -- otherwise we'd link
+    # obj_0->obj_1 while obj_1 is still a child of obj_0, making a kinematic loop (rai warns,
+    # then segfaults). Process new-parent-first (topological over changes).
     changed = {p: c for p, c in nxt.parent.items() if s.parent.get(p) != c}
     relinked = set()
 
@@ -333,8 +340,26 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True):
         _relink(carrier[1])                    # settle (re-parent) the new parent first
       Cv.attach(_carrier_frame_name(carrier, robot_ik), p)
 
-    for p in changed:
-      _relink(p)
+    def _apply_relink():
+      for p in changed:
+        _relink(p)
+
+    # ORDER: on a HANDOVER frame (a release that re-roots the group onto a remaining holder;
+    # witness is None) re-attach BEFORE homing -- so the new carrier is bound to the group at
+    # its actual holding pose and then rides home CARRYING it. If we homed first, the arms
+    # (and the group, still attached to the RELEASING arm) would move, and the re-attach would
+    # capture that stale pose -> the assembly floats off the new carrier's gripper. For the
+    # witnessed skills (pick/place/assemble) keep home/witness-then-relink (+ the snap below),
+    # which is the order those were tuned for.
+    if witness is None:
+      _apply_relink()
+    for r in robots:
+      if r in active:
+        _write_robot_dofs(Cv, r, witness)
+      elif _may_home(r):
+        _write_robot_dofs(Cv, r, robot_ik.home)
+    if witness is not None:
+      _apply_relink()
     # 3) per-action consistency snap:
     if action[0] == "pick":
       # pin the freshly grasped group exactly onto the gripper (covers IK residual and a
@@ -342,8 +367,9 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True):
       # trails the arm forever).
       group = next(g for g in nxt.subassemblies() if action[2] in g)
       _align_group_to_holder(nxt, group, action[1], action[2], action[3])
-    elif action[0] == "place":
-      # the group left the gripper: seat it exactly at its canonical table pose.
+    elif action[0] in ("place", "stow"):
+      # the group left the gripper: seat it exactly at its table pose (the stow cell for a
+      # stow -- _seat_rest reads the recorded pose).
       _seat_rest(nxt, next(g for g in nxt.subassemblies() if action[2] in g))
     elif action[0] == "assemble":
       # exact mate: the added part sits exactly at its offset under `onto` ...
