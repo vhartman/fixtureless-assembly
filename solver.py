@@ -75,6 +75,30 @@ class CollisionChecker:
     for i, prefix in enumerate(self.slots):
       template.getFrame(prefix + "ur_base").setPosition(_park_pos(i))
     self.template = template
+    self._verdicts = {}                                    # discrete scene signature -> bool
+
+  def _sig(self, state, extra_grasps):
+    # DISCRETE signature of everything `_check` looks at, for verdict memoization. Per
+    # subassembly: on-table groups contribute members + placement (face/slot/stow) + the
+    # ref part's anchor pose (rounded; catches stowed/perturbed anchors) + their grasps;
+    # held-in-air groups are PARKED far away in the check, so only their pose-invariant
+    # internals matter (members + grasps). Robot identities are irrelevant to geometry
+    # (the EE pose comes from the grasp), so they are omitted -- states differing only in
+    # WHO holds what share one verdict. The same state is pushed/checked from many parents,
+    # so hit rates are high.
+    parts = []
+    for group in state.subassemblies():
+      members = tuple(sorted(group))
+      grasps = tuple(sorted((c[2], c[3]) for p in group
+                            for c in state.supports.get(p, ()) if c[0] == "grasp"))
+      on_table = any(("table",) in state.supports.get(p, ()) for p in group)
+      if on_table:
+        ref = reference_part(group)
+        anchor = tuple(np.round(np.asarray(state.poses[ref], dtype=float), 4))
+        parts.append(("T", members, state.place.get(ref), anchor, grasps))
+      else:
+        parts.append(("H", members, grasps))
+    return (tuple(sorted(parts)), tuple(sorted(extra_grasps)))
 
   def _scene_for(self, state, assembly, extra_grasps=()):
     # build the floating-EE collision config for a state: parts posed per the state's scene
@@ -120,8 +144,16 @@ class CollisionChecker:
   def _check(self, state, assembly, extra_grasps=()):
     # tolerate grazing contacts (see _CHEAP_PENETRATION_TOL) instead of binary-exact
     # getCollisionFree -- the cheap layer must not be stricter than the (soft) IK.
+    # VERDICT-MEMOIZED on the discrete scene signature (see _sig): building the rai scene
+    # + collision query costs ~2ms and dominated whole-search profiles (~90%).
+    key = self._sig(state, tuple(map(tuple, extra_grasps)))
+    hit = self._verdicts.get(key)
+    if hit is not None:
+      return hit
     C_col = self._scene_for(state, assembly, extra_grasps)
-    return all(d >= -_CHEAP_PENETRATION_TOL for _a, _b, d in C_col.getCollisions())
+    ok = all(d >= -_CHEAP_PENETRATION_TOL for _a, _b, d in C_col.getCollisions())
+    self._verdicts[key] = ok
+    return ok
 
   def penetrating_pairs(self, state, assembly, extra_grasps=()):
     # the collision pairs that make `_check` reject: (frame_a, frame_b, depth) with
@@ -918,14 +950,18 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
     return successors(s, assembly, robots, grasp_table=grasp_table, canonical=canonical,
                       gripper_kind=gk, handovers=handovers, allow_place=allow_place)
 
-  def cheap_fn(prev, act, ns):
-    return cheap_feasible(act, prev, ns, assembly, checker)
-
+  # FULLY LAZY feasibility: the cheap geometric check moved from PUSH to POP (edge check),
+  # like the IK before it -- profiling showed ~20 pushed edges per expansion, each paying a
+  # ~2ms rai collision query, while most pushed edges are never popped. Claim-at-first-
+  # feasible-pop keeps this sound (an edge failing at pop is dropped; the state stays
+  # reachable via its other queued edges).
   def edge_check_fn(prev, act, ns):
-    if act[0] not in _IK_ACTIONS:
-      return True
-    ok, _witness = robot_ik.bind(act, prev, ns, assembly)
-    return ok
+    if not cheap_feasible(act, prev, ns, assembly, checker):
+      return False
+    if robot_ik is not None and act[0] in _IK_ACTIONS:
+      ok, _witness = robot_ik.bind(act, prev, ns, assembly)
+      return ok
+    return True
 
   # LATE BINDING (anonymous=True): search with a robot-anonymous state key -- states that
   # differ only in WHICH robot holds what merge, so robot-permutation redundancy vanishes and
@@ -942,8 +978,8 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
   try:
     return _astar(get_initial_state(C, assembly),
                   goal_fn=lambda s: s.is_goal(assembly),
-                  succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn, cheap_fn=cheap_fn,
-                  edge_check_fn=edge_check_fn if robot_ik is not None else None,
+                  succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn, cheap_fn=None,
+                  edge_check_fn=edge_check_fn,
                   weight=weight, max_nodes=max_nodes, verbose=verbose, tag=tag, t0=t0,
                   cost_bound=cost_bound, deadline=deadline)
   finally:
@@ -1053,18 +1089,17 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
       if a[2] in relevant:                                # a[2] is the part every action acts on
         yield a, ns
 
-  def cheap_fn(prev, act, ns):
-    return cheap_feasible(act, prev, ns, assembly, checker)
-
   def edge_check_fn(prev, act, ns):
-    if act[0] not in _IK_ACTIONS:
-      return True
-    ok, _w = robot_ik.bind(act, prev, ns, assembly)
-    return ok
+    # fully lazy (cheap geometry + IK at POP; see solve_assembly_problem)
+    if not cheap_feasible(act, prev, ns, assembly, checker):
+      return False
+    if robot_ik is not None and act[0] in _IK_ACTIONS:
+      ok, _w = robot_ik.bind(act, prev, ns, assembly)
+      return ok
+    return True
 
   subplan = _astar(start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
-                   cheap_fn=cheap_fn,
-                   edge_check_fn=edge_check_fn if robot_ik is not None else None,
+                   cheap_fn=None, edge_check_fn=edge_check_fn,
                    weight=weight, max_nodes=max_nodes, verbose=False,
                    tag=f"add {p}")
   if subplan is None:
@@ -1269,30 +1304,31 @@ def _add_one_part_declutter(start, p, ideal, assembly, robots, checker, grasp_ta
         if a[0] == "stow" or a[2] in relevant:            # touch p, the assembly, or a blocker
           yield a, ns
 
-    def cheap_fn(prev, act, ns):
+    def edge_check_fn(prev, act, ns):
+      # fully lazy (cheap geometry + IK at POP; see solve_assembly_problem). Blocker
+      # ATTRIBUTION stays here: a goal-relevant action failing the cheap check names the
+      # loose parts in the way (same information as at push, just evaluated later).
       if act[0] == "stow":
         ok = checker.collision_free(ns, assembly)         # stow lands aside -> check the result
       else:
         ok = cheap_feasible(act, prev, ns, assembly, checker)
-      if not ok and (act[2] == p or act[2] in ideal):     # a GOAL-RELEVANT action was blocked
-        if act[0] == "pick":
-          pairs = checker.penetrating_pairs(prev, assembly,
-                                            extra_grasps=[(act[2], act[3])])
-        else:
-          pairs = checker.penetrating_pairs(ns, assembly)
-        hit.update(_declutter_blockers(pairs, relevant, objects, checker.slots))
-      return ok
-
-    def edge_check_fn(prev, act, ns):
-      if act[0] not in _IK_ACTIONS and act[0] != "stow":
-        return True
-      a = ("place",) + tuple(act[1:]) if act[0] == "stow" else act   # stow is a place aside
-      ok, _w = robot_ik.bind(a, prev, ns, assembly)
-      return ok
+      if not ok:
+        if act[2] == p or act[2] in ideal:                # a GOAL-RELEVANT action was blocked
+          if act[0] == "pick":
+            pairs = checker.penetrating_pairs(prev, assembly,
+                                              extra_grasps=[(act[2], act[3])])
+          else:
+            pairs = checker.penetrating_pairs(ns, assembly)
+          hit.update(_declutter_blockers(pairs, relevant, objects, checker.slots))
+        return False
+      if robot_ik is not None and (act[0] in _IK_ACTIONS or act[0] == "stow"):
+        a = ("place",) + tuple(act[1:]) if act[0] == "stow" else act   # stow is a place aside
+        ok, _w = robot_ik.bind(a, prev, ns, assembly)
+        return ok
+      return True
 
     subplan = _astar(start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost,
-                     h_fn=make_h(movable), cheap_fn=cheap_fn,
-                     edge_check_fn=edge_check_fn if robot_ik is not None else None,
+                     h_fn=make_h(movable), cheap_fn=None, edge_check_fn=edge_check_fn,
                      weight=weight, max_nodes=max_nodes, verbose=False,
                      tag=f"add {p}")
     if subplan is not None:

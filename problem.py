@@ -554,17 +554,30 @@ def set_rolls_per_face(n):
   _N_CUBE_GRASPS = len(_CUBE_FACE_NORMALS) * _ROLLS_PER_FACE
 
 
+_GRASP_POSE_CACHE = {}
+
+
 def cube_grasp_pose(grasp_id, cube_size, offset=0.01):
   # grasp pose [x,y,z, qw,qx,qy,qz] in the grasped cube's OWN frame. grasp_id encodes
   # (face, roll): the face sets the approach (-normal); the roll spins the gripper about
   # that approach axis (in-plane finger orientation). cube_size comes from the assembly.
+  # MEMOIZED (pure function of a handful of inputs; the cheap collision checker calls it
+  # hundreds of thousands of times -- 13% of a whole search before caching). _ROLLS_PER_FACE
+  # is part of the key: it changes what a grasp_id means.
+  key = (grasp_id, cube_size, offset, _ROLLS_PER_FACE)
+  hit = _GRASP_POSE_CACHE.get(key)
+  if hit is not None:
+    return hit
   face, roll = divmod(grasp_id, _ROLLS_PER_FACE)
   normal = _CUBE_FACE_NORMALS[face]
   standoff = cube_size / 2.0 + offset
   angle = roll * (np.pi / _ROLLS_PER_FACE)                 # 0, 90 deg for two-finger
   roll_q = np.array([np.cos(angle / 2.0), 0.0, 0.0, np.sin(angle / 2.0)])  # about approach (local z)
   q = _quat_mul(_grasp_quat_for_normal(normal), roll_q)
-  return np.concatenate([standoff * normal, q])
+  pose = np.concatenate([standoff * normal, q])
+  pose.setflags(write=False)                               # shared across callers: freeze
+  _GRASP_POSE_CACHE[key] = pose
+  return pose
 
 
 def _subasm_key(group):
@@ -1240,6 +1253,19 @@ def _state_part_poses(state, assembly, lift=0.35):
   # synthesize a world pose per part from the scene graph: each subassembly is laid out
   # around its base part's anchor pose; held subassemblies are raised by `lift` so it is
   # visually obvious they are off the table.
+  #
+  # MEMOIZED PER STATE (keyed by lift): the cheap checker and the wrench LP call this for
+  # every feasibility query -- recomputing the layout dominated profiles. Callers may
+  # REPLACE entries of the returned dict (the checker parks held groups) but must not
+  # mutate the pose arrays in place, so a shallow copy per call is enough. Safe because a
+  # State is never structurally edited after it is first queried (successors finish their
+  # edits before yielding).
+  cache = getattr(state, "_ppc", None)
+  if cache is None:
+    cache = state._ppc = {}
+  hit = cache.get(lift)
+  if hit is not None:
+    return dict(hit)
   poses = {}
   for group in state.subassemblies():
     base = reference_part(group)                            # layout reference (obj_0)
@@ -1259,7 +1285,8 @@ def _state_part_poses(state, assembly, lift=0.35):
     for p in group:
       rel = assembly.position_in_base(p) - base_in_asm     # translation, identity rot
       poses[p] = _pose_compose(base_pose, np.concatenate([rel, [1.0, 0.0, 0.0, 0.0]]))
-  return poses
+  cache[lift] = poses
+  return dict(poses)
 
 
 # ===========================================================================
