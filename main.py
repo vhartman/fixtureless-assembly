@@ -116,6 +116,15 @@ def parse_args():
            "(mating becomes perpendicular unless braced). Default off (topological baseline).",
   )
   parser.add_argument(
+      "--grasp-model", choices=["isotropic", "directional", "asymmetric"],
+      default="isotropic",
+      help="Grasp wrench-capability model (with --wrench): isotropic = the original "
+           "direction-agnostic box (default); directional = weak-shear vacuum / weak-torque "
+           "two-finger in the grasp frame; asymmetric = directional + push/pull asymmetry "
+           "along the approach axis (pressing into the palm/cup is structural, pull-off is "
+           "the weak suction/friction path).",
+  )
+  parser.add_argument(
       "--no-handovers", dest="handovers", action="store_false",
       help="Disable the add_grasp/handover primitives (regrasp-in-air). On by default; "
            "turning it off gives a leaner reference search (no second-grasp branching).",
@@ -125,6 +134,40 @@ def parse_args():
       help="Forbid setting a held assembly back on the table: the search must hold it and "
            "regrasp in the air (handovers become mandatory -- the Dogar hold-and-work "
            "regime). Meaningful for the exact search; the optimistic search needs to set down.",
+  )
+  parser.add_argument(
+      "--anytime", type=float, nargs="?", const=60.0, default=None, metavar="SECONDS",
+      help="Anytime mode (exact search): restarting weighted A* -- a fast suboptimal plan "
+           "first, then keep improving it (and possibly prove optimality) until the time "
+           "budget runs out. Optional value = budget in seconds (default 60).",
+  )
+  parser.add_argument(
+      "--anon-robots", action="store_true",
+      help="LATE BINDING: search with a robot-anonymous state key -- robot-permutation "
+           "states merge, so adding (idle) robots does not blow up the search. Sound for "
+           "interchangeable floating grippers; with --real-ik treat the plan as a candidate.",
+  )
+  parser.add_argument(
+      "--insert-force", type=float, default=10.0, metavar="N",
+      help="Insertion (mating) reaction magnitude in newtons (with --wrench). Default 10. "
+           "Sets what binds: e.g. two-finger caps are shear 15 / pull 25 / push 100, so at "
+           "10 N held side-mates are free, at 30 N only press-aligned grasps survive.",
+  )
+  parser.add_argument(
+      "--no-inserter-check", dest="inserter_check", action="store_false",
+      help="With --wrench: skip the inserter-side check (whether the pressing arm's own "
+           "grasp can transmit the seating reaction) -- equivalent to giving that grasp "
+           "unbounded capability. The target-side stability check stays on.",
+  )
+  parser.add_argument(
+      "--viser", action="store_true",
+      help="Display via a viser web viewer (http://localhost:<port>) instead of the rai "
+           "window: the whole replay is recorded and served with a step slider / playback "
+           "controls (no per-step blocking windows).",
+  )
+  parser.add_argument(
+      "--viser-port", type=int, default=8080,
+      help="Port for the viser server (with --viser). Default: 8080.",
   )
   parser.add_argument(
       "--seed", type=int, default=0,
@@ -138,6 +181,10 @@ def main():
   # grasp rolls are a property of the gripper: the vacuum is symmetric about its suction
   # axis (1 grasp per face); the two-finger has two in-plane orientations (90 deg apart).
   set_rolls_per_face(1 if args.vacuum else 2)
+  import wrench
+  wrench.PARAMS["grasp_model"] = args.grasp_model  # capability model (used when --wrench)
+  wrench.PARAMS["check_inserter"] = args.inserter_check
+  wrench.PARAMS["insert_force"]["_default"] = args.insert_force
 
   if args.test_pick_ik is not None:
     robot, part, grasp = args.test_pick_ik.split(":")
@@ -198,22 +245,40 @@ def main():
                                                robot_ik=robot_ik, weight=args.weight,
                                                wrench=args.wrench, handovers=args.handovers,
                                                allow_place=args.allow_place)
+    elif args.anytime is not None:
+      plan, _cost, _opt = solve_assembly_problem_anytime(
+          C, assembly, robots=robots, time_budget=args.anytime, robot_ik=robot_ik,
+          wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
+          anonymous=args.anon_robots)
     else:
       plan = solve_assembly_problem(C, assembly, robots=robots, canonical=args.canonical,
                                     weight=args.weight, robot_ik=robot_ik, wrench=args.wrench,
-                                    handovers=args.handovers, allow_place=args.allow_place)
+                                    handovers=args.handovers, allow_place=args.allow_place,
+                                    anonymous=args.anon_robots)
     if plan is not None:
       print(f"plan ({len(plan)} actions):")
       for step in plan:
         print("  ", step)
-      if args.view:
+      if args.view or args.viser:
+        recorder = None
+        if args.viser:
+          from viser_view import ViserRecorder
+          recorder = ViserRecorder()
         if args.real_ik:
-          visualize_plan_ik(C, assembly, plan, robots=robots, robot_ik=robot_ik)
+          visualize_plan_ik(C, assembly, plan, robots=robots, robot_ik=robot_ik,
+                            recorder=recorder)
         else:
-          visualize_plan(C, assembly, plan)
+          visualize_plan(C, assembly, plan, recorder=recorder)
+        if recorder is not None:
+          recorder.serve(port=args.viser_port)
     return
 
-  if args.view:
+  if args.viser:
+    from viser_view import ViserRecorder
+    recorder = ViserRecorder()
+    recorder.record(C, "scene")
+    recorder.serve(port=args.viser_port)
+  elif args.view:
     C.view(True)
 
 if __name__ == "__main__":

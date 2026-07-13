@@ -38,7 +38,14 @@ class Assembly:
     mate_types:  {part: type_str}    the contact TYPE of the mate that joins `part` to its
                                      parent (a key into wrench.py's capability builders).
                                      Default "rigid_weld" for every mate.
-  Subclasses may override either in define(); anything left unset gets the default.
+    mate_axes:   {part: unit 3-vec}  the ASSEMBLY (press/seating) DIRECTION of the mate, in
+                                     the base frame: the direction the part is pressed along
+                                     while seating. Default: -offset for axis-aligned mates
+                                     (press onto the parent face); for DIAGONAL offsets an
+                                     axis-aligned direction with a FREE approach cell,
+                                     preferring top-down -- a diagonal offset is a
+                                     bookkeeping artifact, real insertions are not diagonal.
+  Subclasses may override any of these in define(); anything left unset gets the default.
   """
 
   DEFAULT_MASS = 0.1                                        # kg, a single cube
@@ -51,11 +58,13 @@ class Assembly:
     self.assembly_relative_poses = {}
     self.masses = {}
     self.mate_types = {}
+    self.mate_axes = {}
     self.define()
     for p in self.objects:                                 # fill physics defaults
       self.masses.setdefault(p, self.DEFAULT_MASS)
-    for p in self.assembly_relative_poses:                 # every mate has a type
+    for p in self.assembly_relative_poses:                 # every mate has a type + an axis
       self.mate_types.setdefault(p, self.DEFAULT_MATE_TYPE)
+      self.mate_axes.setdefault(p, self._default_mate_axis(p))
     self.validate()
 
   def mass(self, part):
@@ -64,6 +73,39 @@ class Assembly:
   def mate_type(self, part):
     # contact type of the mate joining `part` to its parent (None for the base / free part).
     return self.mate_types.get(part)
+
+  def mate_axis(self, part):
+    # THE press/seating direction of `part`'s mate, base frame (None for the base / a free
+    # part). A SINGLE direction -- like a real assembly manual, the mate specifies how the
+    # part goes in; the planner does not get to choose. Subclasses may override in define().
+    a = self.mate_axes.get(part)
+    return None if a is None else np.asarray(a, dtype=float)
+
+  def _default_mate_axis(self, part):
+    # sensible default assembly direction: PRESS AGAINST AN ALREADY-BUILT FLANKING NEIGHBOR
+    # (a mate must seat against a face). Axis-aligned offset: the only such face is the
+    # parent's -> -offset (unchanged face-glue semantics). Diagonal offset (a grid pocket;
+    # single-parent bookkeeping makes it look diagonal): press along an offset component
+    # whose neighbor cell is in the MATE CLOSURE (already built when `part` is inserted),
+    # preferring in-plane x then y then z -- the row press ('hold the row, push from the
+    # open end'), which a gripper can transmit as compression with the fingers clear;
+    # a top-down press into a two-sided pocket traps the fingers against the flanks.
+    off = np.asarray(self.assembly_relative_poses[part][1], dtype=float)
+    nz = np.abs(off) > 1e-9
+    if nz.sum() <= 1:
+      return -off / (np.linalg.norm(off) + 1e-12)          # axis-aligned: unchanged semantics
+    step = min(abs(c) for c in off[nz])                    # lattice pitch
+    seat = self.position_in_base(part)
+    built = [self.position_in_base(q) for q in _mate_closure(self, part)]
+    axes = [np.array([1.0, 0, 0]), np.array([0, 1.0, 0]), np.array([0, 0, 1.0])]
+    for i in (0, 1, 2):                                    # prefer the in-plane row press
+      if not nz[i]:
+        continue
+      d = -np.sign(off[i]) * axes[i]
+      neighbor = seat + d * step                           # the face the press seats against
+      if any(np.linalg.norm(b - neighbor) < 0.5 * step for b in built):
+        return d
+    return -off / (np.linalg.norm(off) + 1e-12)            # nothing flanking: old behavior
 
   def define(self):
     # subclasses populate objects / base / dependencies / relative poses here
@@ -639,6 +681,37 @@ def is_grounding(contact):
   return contact[0] in GROUNDING_CONTACTS
 
 
+# LATE BINDING (robot-anonymous search). When on, State.key() relabels robots to canonical
+# ids so states that differ ONLY in which robot holds what collapse to one -- killing the
+# robot-assignment redundancy that makes the search blow up as robots are added, and making
+# it GRACEFUL (extra idle robots add no states). Sound for interchangeable (floating) grippers;
+# with fixed-base arms it plans robot-free and the concrete robots are bound/verified afterward.
+_ANON_ROBOTS = False
+
+
+def set_anonymous_robots(on=True):
+  global _ANON_ROBOTS
+  _ANON_ROBOTS = bool(on)
+
+
+def _relabel_robots(parent, supports):
+  # canonical robot ids: order the holders by the (grasped_part, grasp_id) they hold (unique
+  # per robot), then relabel every ("gripper", r) / ("grasp", r, ...) to that rank. Robot
+  # permutations map to the same relabelled parent/supports.
+  held = {}
+  for p, cs in supports.items():
+    for c in cs:
+      if c[0] == "grasp":
+        held[c[1]] = (c[2], c[3])
+  canon = {r: i for i, r in enumerate(sorted(held, key=held.get))}
+  new_parent = {p: (("gripper", canon[c[1]]) if c[0] == "gripper" else c)
+                for p, c in parent.items()}
+  new_supports = {p: frozenset(((c[0], canon[c[1]]) + tuple(c[2:])) if c[0] == "grasp" else c
+                               for c in cs)
+                  for p, cs in supports.items()}
+  return new_parent, new_supports
+
+
 def wrench_sufficient(contacts, external=None):
   # STUB (design doc §5.2): stability / wrench balance is ignored for now. Any
   # non-empty contact set is treated as able to resist the load. Replace this body
@@ -734,11 +807,14 @@ class State:
 
   # --- identity ---
   def key(self):
+    parent, supports = self.parent, self.supports
+    if _ANON_ROBOTS:                                       # LATE-BINDING: robot-anonymous key
+      parent, supports = _relabel_robots(parent, supports)  # merge robot permutations
     return (
-        tuple(sorted(self.parent.items())),
+        tuple(sorted(parent.items())),
         tuple(sorted(self.grasp.items())),
         tuple(sorted(self.place.items())),
-        tuple(sorted((p, tuple(sorted(cs))) for p, cs in self.supports.items())),
+        tuple(sorted((p, tuple(sorted(cs))) for p, cs in supports.items())),
     )
 
   def __eq__(self, other):
@@ -933,14 +1009,24 @@ def assembles(state, assembly, robots, gripper_kind=None):
       continue                                            # precedence: target stays an ideal
     if not state.is_supported(target, assembly, gripper_kind):
       continue                                            # target must be supported
-    if gripper_kind is not None and not _group_stable(
-        state, assembly, target, gripper_kind,
-        applied=[_insertion_load(state, assembly, p, onto)]):
-      # WRENCH: the target must also withstand the INSERTION reaction while p is seated. On
-      # a table-only target a sideways seating has no frictional resistance and topples it
-      # -> the mate is infeasible here; the search must reorient (so seating is top-down) or
-      # hold the target. This is what makes mating usually perpendicular.
-      continue
+    if gripper_kind is not None:
+      # WRENCH: THE mate's press direction (assembly.mate_axis -- a single direction, like
+      # a real assembly manual; per-mate overridable) must satisfy BOTH
+      #   (a) the target withstands the insertion reaction while p is seated (a table-only
+      #       target has no friction for a sideways press -> topples; a held one loads its
+      #       carrier grasp incl. the lever torque), and
+      #   (b) [PARAMS['check_inserter']] the actor's OWN grasp transmits the press (e.g. a
+      #       vacuum side-grasp cannot push 10 N of shear across a 3.75 N cap; the grasp
+      #       aligned with the press takes it as compression) -- so both grasp-the-part-
+      #       to-press and hold-the-assembly-in-line emerge.
+      d = assembly.mate_axis(p)
+      if not _group_stable(state, assembly, target, gripper_kind,
+                           applied=[_insertion_load(state, assembly, p, onto, d)]):
+        continue
+      if wrench.PARAMS.get("check_inserter", True) and not _group_stable(
+          state, assembly, group, gripper_kind,
+          applied=[_inserter_load(state, assembly, p, onto, d)]):
+        continue
     if _group_is_on_table(state, target) and not _on_table_mateable_cached(
         assembly, p, _placement_face(state, target)):
       # the mate would jam p into the table at the group's CURRENT rest pose -- for its
@@ -1203,15 +1289,14 @@ def _table_footprint(poses, group, cube_size, tol=1e-3):
 
 
 def _grasp_frame(part_pose, grasp_id, cube_size):
-  # world frame of a grasp on a part: its APPROACH axis (grasp local z, points into the cube)
-  # and the two LATERAL axes (local x/y), plus a contact point ~at the grasped face centre.
-  # Feeds the directional friction-grasp capability (axial vs shear vs torque).
+  # world frame of a grasp on a part: contact point (the grasped part's centre, matching the
+  # original isotropic model) plus the APPROACH axis (grasp local z) and the two LATERAL axes
+  # (local x/y) -- the axes feed the DIRECTIONAL grasp model (axial vs shear vs torque); the
+  # isotropic model ignores them.
   gpose = _pose_compose(np.asarray(part_pose, dtype=float),
                         cube_grasp_pose(grasp_id, cube_size))
   R = _quat_to_R(np.asarray(gpose[3:], dtype=float))
-  n = R[:, 2]
-  point = np.asarray(part_pose[:3], dtype=float) - (cube_size / 2.0) * n
-  return point, n, R[:, 0], R[:, 1]
+  return np.asarray(part_pose[:3], dtype=float), R[:, 2], R[:, 0], R[:, 1]
 
 
 # memoized equilibrium verdicts. The LP dominates the wrench-on search cost, but the result
@@ -1241,17 +1326,17 @@ def _group_stable(state, assembly, group, gripper_kind, applied=()):
   caps = []
   if any(("table",) in state.supports.get(p, ()) for p in members):
     fp = _table_footprint(poses, members, assembly.cube_size)
-    caps.append(wrench.cap_table_unilateral([np.asarray(x, dtype=float) - centroid for x in fp]))
+    caps.append(wrench.table_capability([np.asarray(x, dtype=float) - centroid for x in fp]))
   cs = assembly.cube_size
   for p in members:
     for c in sorted(state.supports.get(p, ())):
       if c[0] == "grasp":
         gp, n, t1, t2 = _grasp_frame(poses[c[2]], c[3], cs)   # c=(grasp, r, gpart, grasp_id)
-        caps.append(wrench.cap_friction_grasp(gp - centroid, n, t1, t2,
-                                              **wrench.PARAMS["grasp"][gripper_kind]))
+        caps.append(wrench.grasp_capability(gp - centroid, n, t1, t2, gripper_kind))
 
-  key = (tuple(np.round(arr, 4).tobytes() for G_i, A_i, b_i in caps
-               for arr in (G_i, A_i, b_i)), np.round(w_ext, 4).tobytes())
+  G = np.hstack([c[0] for c in caps]) if caps else np.zeros((6, 0))
+  ub = np.concatenate([c[1] for c in caps]) if caps else np.zeros(0)
+  key = (np.round(G, 4).tobytes(), np.round(ub, 4).tobytes(), np.round(w_ext, 4).tobytes())
   if key in _WRENCH_CACHE:
     return _WRENCH_CACHE[key]
   res = wrench.equilibrium_feasible(caps, w_ext)
@@ -1259,18 +1344,39 @@ def _group_stable(state, assembly, group, gripper_kind, applied=()):
   return res
 
 
-def _insertion_load(state, assembly, part, onto):
+def _insertion_load(state, assembly, part, onto, d=None):
   # the insertion reaction the mate of `part` exerts on the target during seating: a force
-  # of magnitude wrench.insert_force(part) along the SEATING direction (from part toward
-  # onto, i.e. -mate-axis) in world, applied at the mate interface. On a table-supported
-  # target a top-down seating pushes into the table (fine); a sideways one has no frictional
+  # of magnitude wrench.insert_force(part) along THE mate's press direction (d, defaulting
+  # to assembly.mate_axis(part) -- a single per-mate direction, like a real manual),
+  # applied at the mate interface. On a table-supported target a
+  # top-down seating pushes into the table (fine); a sideways one has no frictional
   # resistance and topples/slides it -- so it needs a hold. Returns (force_world, point_world).
   poses = _state_part_poses(state, assembly, lift=0.0)
   R = _quat_to_R(np.asarray(poses[onto][3:], dtype=float))  # target's world orientation
   rel = np.asarray(assembly.relative_pose(part)[1], dtype=float)
-  axis = rel / (np.linalg.norm(rel) + 1e-12)                # mate axis in the base frame
-  f_world = wrench.insert_force(part) * (-(R @ axis))       # force ON target, seating dir
+  if d is None:
+    d = assembly.mate_axis(part)
+  f_world = wrench.insert_force(part) * (R @ d)             # force ON target, seating dir
   point = np.asarray(poses[onto][:3], dtype=float) + R @ rel  # ~ part's seated position
+  return f_world, point
+
+
+def _inserter_load(state, assembly, part, onto, d=None):
+  # the seating reaction ON THE INSERTED PART itself: the actor presses `part` in along the
+  # mate's ASSEMBLY DIRECTION (assembly.mate_axis), so the mate pushes back with
+  # insert_force opposite that press, applied at `part`'s pressing face. Expressed through
+  # PART's current pose in the check state -- the press direction is fixed in the part's
+  # own frame (parts mate axis-aligned), so the load-vs-GRASP-axis relation (compression vs
+  # pull-off vs shear: the thing the grasp capability distinguishes) is exact wherever the
+  # held part happens to be posed. (Gravity-vs-load angle is approximate, same class of
+  # approximation as _insertion_load.)
+  poses = _state_part_poses(state, assembly, lift=0.0)
+  R = _quat_to_R(np.asarray(poses[part][3:], dtype=float))  # part's world orientation
+  if d is None:
+    d = assembly.mate_axis(part)
+  f_world = wrench.insert_force(part) * (R @ (-d))          # reaction ON part: opposite press
+  point = np.asarray(poses[part][:3], dtype=float) \
+      + R @ (d * assembly.cube_size / 2.0)                  # at the pressing face (real lever)
   return f_world, point
 
 

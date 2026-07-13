@@ -747,7 +747,7 @@ class AbstractionHeuristic:
 
 def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
            edge_check_fn=None, weight=1.0, max_nodes=200000, verbose=True,
-           tag="A*", t0=None):
+           tag="A*", t0=None, cost_bound=None, deadline=None):
   """Generic LAZY weighted-A* engine, shared by every search variant (exact + optimistic).
 
   The domain enters only through callbacks -- this function knows nothing about assemblies:
@@ -760,8 +760,12 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
 
   Priority f = h (greedy, weight=inf) or g + weight*h. A state is CLAIMED by the first
   popped edge that passes edge_check_fn; duplicates are left in the heap so a state pruned
-  via one (infeasible) edge stays reachable via its others. Returns the action list, or
-  None (max_nodes / exhausted)."""
+  via one (infeasible) edge stays reachable via its others.
+
+  cost_bound: prune every node with g + h >= cost_bound (h admissible => sound: no plan
+  cheaper than the bound is lost). The anytime driver passes the incumbent's cost so each
+  restart only looks for strictly better plans. deadline: perf_counter time to give up at.
+  Returns the action list, or None (max_nodes / deadline / bound-exhausted)."""
   import heapq
   import itertools
   import math
@@ -787,6 +791,12 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
     _f, _h, g, _, s, prev, action = heapq.heappop(pq)
     if s in claimed:
       continue                                            # already claimed via a cheaper/earlier edge
+    if cost_bound is not None and g + _h >= cost_bound:
+      continue                                            # cannot beat the incumbent (h admissible)
+    if deadline is not None and time.perf_counter() > deadline:
+      if verbose:
+        print(f"[{tag}] deadline reached after {expanded} expansions")
+      return None
     if action is not None and edge_check_fn is not None:
       edge_checks += 1
       if not edge_check_fn(prev, action, s):
@@ -819,6 +829,8 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
         continue                                          # eager cheap filter (prunes heap growth)
       ng = g + cost_fn(act)
       hns = h_fn(ns)
+      if cost_bound is not None and ng + hns >= cost_bound:
+        continue                                          # sound prune vs the incumbent
       heapq.heappush(pq, (f_value(ng, hns), hns, ng, next(tie), ns, s, act))
 
   if verbose:
@@ -849,7 +861,8 @@ def gripper_kind(C):
 def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=True,
                            use_heuristic=True, canonical=False, weight=1.0, robot_ik=None,
                            wrench=False, wrench_aware_h=True, handovers=True,
-                           allow_place=True):
+                           allow_place=True, cost_bound=None, deadline=None,
+                           anonymous=False):
   """EXACT (weighted) A* over scene-graph states from the initial scene to a completed
   assembly -- the reference baseline. Priority is f = g + weight * h.
     - weight = 1.0 : ordinary A*, returns a minimum-cost plan.
@@ -914,13 +927,70 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
     ok, _witness = robot_ik.bind(act, prev, ns, assembly)
     return ok
 
+  # LATE BINDING (anonymous=True): search with a robot-anonymous state key -- states that
+  # differ only in WHICH robot holds what merge, so robot-permutation redundancy vanishes and
+  # extra idle robots add no states. The returned plan still names concrete robots (the merged
+  # class's representative assignment). Sound for interchangeable (floating) grippers, like
+  # `canonical`; with fixed-base arms + robot_ik a merged assignment may hide a reachability
+  # difference -- use for the fast first answer, then verify/repair with concrete IK.
+  if anonymous and robot_ik is not None and verbose:
+    warnings.warn("anonymous=True with robot_ik: merged robot assignments may hide "
+                  "per-robot reachability differences; treat the plan as a candidate.")
   tag = ("UCS" if not use_heuristic else "greedy" if math.isinf(weight)
          else "A*" if weight == 1.0 else f"wA*(w={weight:g})")
-  return _astar(get_initial_state(C, assembly),
-                goal_fn=lambda s: s.is_goal(assembly),
-                succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn, cheap_fn=cheap_fn,
-                edge_check_fn=edge_check_fn if robot_ik is not None else None,
-                weight=weight, max_nodes=max_nodes, verbose=verbose, tag=tag, t0=t0)
+  set_anonymous_robots(anonymous)
+  try:
+    return _astar(get_initial_state(C, assembly),
+                  goal_fn=lambda s: s.is_goal(assembly),
+                  succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn, cheap_fn=cheap_fn,
+                  edge_check_fn=edge_check_fn if robot_ik is not None else None,
+                  weight=weight, max_nodes=max_nodes, verbose=verbose, tag=tag, t0=t0,
+                  cost_bound=cost_bound, deadline=deadline)
+  finally:
+    set_anonymous_robots(False)
+
+
+def solve_assembly_problem_anytime(C, assembly, robots=None, time_budget=60.0,
+                                   weights=(float("inf"), 5.0, 2.0, 1.5, 1.0),
+                                   verbose=True, **kw):
+  """ANYTIME planner: restarting weighted A* (RWA*). Runs the exact search with a DECREASING
+  weight schedule -- the first (greedy / high-weight) pass returns a suboptimal plan FAST;
+  every later pass searches only for STRICTLY BETTER plans (the incumbent's cost is a sound
+  prune bound, h admissible) and either improves the incumbent or proves a tighter bound,
+  until the weight-1 pass ends (incumbent = optimal) or the time budget runs out. Returns
+  (best_plan, cost, optimal_proved). Accepts every solve_assembly_problem kwarg."""
+  import math
+  import time
+
+  t0 = time.perf_counter()
+  deadline = t0 + time_budget
+  if robots is None:
+    robots = get_robots(C)
+  best, best_cost = None, float("inf")
+  proved = False
+  for w in weights:
+    if time.perf_counter() > deadline:
+      break
+    plan = solve_assembly_problem(
+        C, assembly, robots=robots, weight=w, verbose=verbose,
+        cost_bound=best_cost if best is not None else None, deadline=deadline, **kw)
+    if plan is not None:
+      cost = sum(action_cost(a) for a in plan)
+      if cost < best_cost:
+        best, best_cost = plan, cost
+        if verbose:
+          print(f"[anytime] incumbent improved: cost {cost:g} (w={w:g}, "
+                f"{time.perf_counter() - t0:.1f}s)")
+    elif best is not None and w == 1.0 and time.perf_counter() <= deadline:
+      # the w=1 restart exhausted under the incumbent bound WITHOUT timing out: nothing
+      # strictly better exists -> the incumbent is optimal.
+      proved = True
+      if verbose:
+        print(f"[anytime] incumbent proved optimal (cost {best_cost:g})")
+  if verbose:
+    print(f"[anytime] done: cost {best_cost:g}, optimal={proved}, "
+          f"{time.perf_counter() - t0:.1f}s total")
+  return best, best_cost, proved
 
 
 # ===========================================================================

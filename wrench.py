@@ -32,21 +32,41 @@ GRAVITY = 9.81                      # m/s^2, along -z
 # capabilities and the insertion force are read from here; nothing hard-codes them.
 # ---------------------------------------------------------------------------------------
 PARAMS = {
-    # friction-pyramid grasp (cap_friction_grasp) per gripper type, in the grasp's own frame
-    # (approach axis = local z). Fields: F_axial [N] max push/pull along the axis; mu the
-    # friction coefficient -> lateral (shear) force <= mu*axial; T_axis / T_lat [Nm] the
-    # couple it can resist about the approach axis / the two lateral axes.
+    # which capability MODEL each contact uses -- swap here (the LP is model-agnostic, so a
+    # new model is just a new cap_* builder + an entry below). The no-wrench path is
+    # unaffected either way (topological support; these are only read when wrench is on).
+    "grasp_model": "isotropic",     # "isotropic" (original box) | "directional" | "asymmetric"
+    "table_model": "unilateral",    # wrench table model (no-wrench table stays topological)
+
     "grasp": {
-        # two-finger: strong grip, decent shear, but WEAK TORQUE (the part pivots in the jaws)
-        "two_finger": {"F_axial": 40.0, "mu": 0.6, "T_axis": 0.4, "T_lat": 0.4},
-        # vacuum: decent axial suction, but WEAK LATERAL/SHEAR (small mu -> holds from the top,
-        # slips from the side); the cup's area gives it a bit more couple than a bare point
-        "vacuum":     {"F_axial": 25.0, "mu": 0.15, "T_axis": 0.8, "T_lat": 0.8},
+        # ISOTROPIC (original): a bounded axis-aligned wrench box -- push/pull up to F_max on
+        # any (world) axis, couple up to T_max. Direction-agnostic.
+        "isotropic": {"two_finger": {"F_max": 40.0, "T_max": 4.0},
+                      "vacuum":     {"F_max": 15.0, "T_max": 1.0}},
+        # DIRECTIONAL: a box in the GRASP's own frame -- |axial|<=F_axial, |lateral|<=mu*F_axial,
+        # couple <=T_axis about the approach axis / <=T_lat about the lateral axes. two_finger =
+        # strong grip but WEAK TORQUE; vacuum = decent suction but WEAK LATERAL/SHEAR (small mu).
+        "directional": {"two_finger": {"F_axial": 40.0, "mu": 0.6, "T_axis": 0.4, "T_lat": 0.4},
+                        "vacuum":     {"F_axial": 25.0, "mu": 0.15, "T_axis": 0.8, "T_lat": 0.8}},
+        # ASYMMETRIC: directional + PUSH/PULL asymmetry along the approach axis. Pressing the
+        # part INTO the gripper is a STRUCTURAL path (palm stop / cup housing) -- F_push is
+        # large (really arm-limited); pulling it OFF is the suction / finger-friction path --
+        # F_pull is the weak number. Lateral <= mu * F_pull (friction at the grip preload).
+        # => an insertion reaction is "free" when it COMPRESSES the grasp: emergent grasp-side
+        # selection (e.g. brace the assembly from BELOW when a part is pressed on from above).
+        "asymmetric": {"two_finger": {"F_push": 100.0, "F_pull": 25.0, "mu": 0.6,
+                                      "T_axis": 0.4, "T_lat": 0.4},
+                       "vacuum":     {"F_push": 100.0, "F_pull": 25.0, "mu": 0.15,
+                                      "T_axis": 0.8, "T_lat": 0.8}},
     },
     # insertion (mating) reaction: ONE magnitude for now, but read per-mate from a dict so
     # individual mates can override it later without touching call sites. `_default` applies
     # to any mate not listed.
     "insert_force": {"_default": 10.0},                 # newtons, along the mate axis
+    # check that the INSERTING arm's own grasp can transmit the press (the seating reaction
+    # also acts on the held part). False = skip the check, equivalent to giving the inserter
+    # grasp unbounded capability ("a very high value") -- the target-side check stays on.
+    "check_inserter": True,
 }
 
 
@@ -57,11 +77,10 @@ def insert_force(part):
 
 
 # ---------------------------------------------------------------------------------------
-# Contact capabilities. Each returns (G, A_ub, b_ub): G is 6xk generator wrenches, and the
-# suppliable set is { G @ lambda : lambda >= 0, A_ub @ lambda <= b_ub }. The extra linear
-# inequalities let a FRICTION PYRAMID bound its normal force (a plain per-generator cap
-# cannot -- the normal is a SUM of the pyramid rays). Unbounded contacts (table, rigid weld)
-# have no inequalities (empty A_ub) -> their rays are limited only by lambda >= 0.
+# Contact capabilities: each returns (G [6xk] generators, ub [k] per-generator upper bounds).
+# A suppliable wrench is { G @ lambda : 0 <= lambda <= ub }. ub = inf means unbounded. Every
+# model here is a bounded polytope of this form; models are selected via PARAMS + the
+# grasp_capability / table_capability dispatchers (the LP itself is model-agnostic).
 # ---------------------------------------------------------------------------------------
 def _force_gen(direction, point):
   # generator wrench of a unit force along `direction` applied at world `point`.
@@ -78,17 +97,12 @@ def _couple_gen(axis):
 _AXES = [np.array([1.0, 0, 0]), np.array([0, 1.0, 0]), np.array([0, 0, 1.0])]
 
 
-def _no_bounds(k):
-  return np.zeros((0, k)), np.zeros(0)                  # unbounded: no inequality rows
-
-
 def cap_rigid_weld(point):
   # RIGID WELD -- the whole 6-D wrench space: any force at the interface + any couple. The
   # special case the others specialise. Point is the mate interface centre.
   G = [_force_gen(s * a, point) for a in _AXES for s in (+1.0, -1.0)]
   G += [_couple_gen(s * a) for a in _AXES for s in (+1.0, -1.0)]
-  G = np.array(G).T
-  return (G,) + _no_bounds(G.shape[1])
+  return np.array(G).T, np.full(len(G), np.inf)
 
 
 def cap_table_unilateral(points):
@@ -96,21 +110,31 @@ def cap_table_unilateral(points):
   # (+z), never pull, and no tangential (frictionless) component. The set of such points is
   # the support polygon. Unbounded magnitude (the table takes any downward load).
   n = np.array([0.0, 0.0, 1.0])
-  G = np.array([_force_gen(n, p) for p in points]).T
-  return (G,) + _no_bounds(G.shape[1])
+  G = [_force_gen(n, p) for p in points]
+  return np.array(G).T, np.full(len(G), np.inf)
+
+
+def cap_grasp_box(point, F_max, T_max):
+  # ISOTROPIC grasp (the ORIGINAL model): push/pull up to F_max along any (world) axis and a
+  # couple up to T_max, at the grasp point -- an axis-aligned wrench box. Direction-agnostic.
+  G, ub = [], []
+  for a in _AXES:
+    for s in (+1.0, -1.0):
+      G.append(_force_gen(s * a, point)); ub.append(F_max)
+  for a in _AXES:
+    for s in (+1.0, -1.0):
+      G.append(_couple_gen(s * a)); ub.append(T_max)
+  return np.array(G).T, np.array(ub, float)
 
 
 def cap_friction_grasp(point, n, t1, t2, F_axial, mu, T_axis, T_lat):
-  # DIRECTIONAL grasp capability at `point`, approach axis `n` (unit), lateral axes `t1`,`t2`
-  # -- a wrench BOX in the grasp frame:
-  #   FORCE : |axial| <= F_axial ; |lateral| <= mu * F_axial. The lateral bound is the
-  #           friction at the grip/suction PRELOAD, so it holds even at zero external axial
-  #           (a preloaded contact, unlike the table's unilateral cone whose friction would
-  #           scale with the instantaneous normal). A SMALL mu => weak shear (suction cup:
-  #           holds from the top, slips from the side).
-  #   MOMENT: |couple about n| <= T_axis ; |couple about t1,t2| <= T_lat. A SMALL T_lat =>
-  #           weak torque (a two-finger grip lets the held part pivot in the jaws).
-  # Per-generator upper bounds (A_ub = I) -- no coupling sum needed for a box.
+  # DIRECTIONAL grasp: a wrench box in the GRASP's own frame (approach axis n, laterals t1,t2).
+  #   FORCE : |axial| <= F_axial ; |lateral| <= mu*F_axial. The lateral bound is the friction
+  #           at the grip/suction PRELOAD (holds even at zero external axial, unlike the
+  #           table's unilateral cone). Small mu => weak shear (suction: holds from the top,
+  #           slips from the side).
+  #   MOMENT: |couple about n| <= T_axis ; |couple about t1,t2| <= T_lat. Small T_lat => weak
+  #           torque (a two-finger grip lets the held part pivot in the jaws).
   n = np.asarray(n, float); t1 = np.asarray(t1, float); t2 = np.asarray(t2, float)
   G, ub = [], []
   for vec, bound in ((n, F_axial), (t1, mu * F_axial), (t2, mu * F_axial)):
@@ -119,8 +143,51 @@ def cap_friction_grasp(point, n, t1, t2, F_axial, mu, T_axis, T_lat):
   for axis, T in ((n, T_axis), (t1, T_lat), (t2, T_lat)):
     for s in (+1.0, -1.0):
       G.append(_couple_gen(s * axis)); ub.append(T)
-  G = np.array(G).T
-  return G, np.eye(G.shape[1]), np.array(ub, float)
+  return np.array(G).T, np.array(ub, float)
+
+
+def cap_asymmetric_grasp(point, n, t1, t2, F_push, F_pull, mu, T_axis, T_lat):
+  # DIRECTIONAL + PUSH/PULL asymmetry. Grasp local z (`n`) points from the gripper INTO the
+  # part, so a contact force ON the part
+  #   along +n  = the palm / cup housing PUSHING the part -- a structural stop, not a
+  #               friction path -> F_push (large; really arm-limited),
+  #   along -n  = holding the part against pull-OFF -- the suction / finger-friction path
+  #               -> F_pull (the weak number).
+  # Lateral <= mu * F_pull (friction at the grip/suction preload); couples as directional.
+  # Consequence: a load is cheap when it COMPRESSES the grasp -- e.g. a carrier holding the
+  # assembly from BELOW takes an insertion press from above through the strong +n path,
+  # while a top grasp must carry it on suction/friction.
+  n = np.asarray(n, float); t1 = np.asarray(t1, float); t2 = np.asarray(t2, float)
+  G, ub = [], []
+  G.append(_force_gen(n, point)); ub.append(F_push)      # push (compression) -- strong
+  G.append(_force_gen(-n, point)); ub.append(F_pull)     # pull-off -- weak
+  for vec in (t1, t2):
+    for s in (+1.0, -1.0):
+      G.append(_force_gen(s * vec, point)); ub.append(mu * F_pull)
+  for axis, T in ((n, T_axis), (t1, T_lat), (t2, T_lat)):
+    for s in (+1.0, -1.0):
+      G.append(_couple_gen(s * axis)); ub.append(T)
+  return np.array(G).T, np.array(ub, float)
+
+
+# --- model selection: dispatch a contact to its configured capability builder --------------
+def grasp_capability(point, n, t1, t2, gripper_kind):
+  # build the grasp cap per PARAMS['grasp_model']. `point` is the grasp/contact point; n,t1,t2
+  # the grasp frame (used only by the directional/asymmetric models; isotropic ignores them).
+  model = PARAMS["grasp_model"]
+  p = PARAMS["grasp"][model][gripper_kind]
+  if model == "isotropic":
+    return cap_grasp_box(point, **p)
+  if model == "asymmetric":
+    return cap_asymmetric_grasp(point, n, t1, t2, **p)
+  return cap_friction_grasp(point, n, t1, t2, **p)
+
+
+_TABLE_BUILDERS = {"unilateral": cap_table_unilateral}
+
+
+def table_capability(points):
+  return _TABLE_BUILDERS[PARAMS["table_model"]](points)
 
 
 # ---------------------------------------------------------------------------------------
@@ -142,25 +209,17 @@ def point_force_wrench(force_vec, point):
 
 
 def equilibrium_feasible(caps, w_external, tol=1e-6):
-  """Can the contacts (list of (G, A_ub, b_ub)) supply wrenches summing to -w_external?
+  """Can the contacts (list of (G, ub)) supply wrenches summing to -w_external?
 
-  Solves the LP feasibility  { G_all @ lambda = -w_external, lambda >= 0,
-  A_ub @ lambda <= b_ub } where each contact's inequalities act on ITS OWN lambda block.
-  Returns True iff a feasible multiplier vector exists. An empty contact set is stable only
-  under (near-)zero external load."""
+  Solves the LP feasibility  { G_all @ lambda = -w_external, 0 <= lambda <= ub }.
+  Returns True iff a feasible multiplier vector exists. An empty contact set is stable
+  only under (near-)zero external load."""
   if not caps:
     return bool(np.linalg.norm(w_external) <= tol)
   G = np.hstack([c[0] for c in caps])                   # 6 x K
+  ub = np.concatenate([c[1] for c in caps])             # K
   K = G.shape[1]
-  A_blocks, b_parts, col = [], [], 0                    # place each cap's A_ub at its columns
-  for Gi, Ai, bi in caps:
-    ki = Gi.shape[1]
-    if Ai.shape[0] > 0:
-      full = np.zeros((Ai.shape[0], K)); full[:, col:col + ki] = Ai
-      A_blocks.append(full); b_parts.append(bi)
-    col += ki
-  A_ub = np.vstack(A_blocks) if A_blocks else None
-  b_ub = np.concatenate(b_parts) if b_parts else None
+  bounds = [(0.0, None if not np.isfinite(u) else float(u)) for u in ub]
   res = linprog(c=np.zeros(K), A_eq=G, b_eq=-np.asarray(w_external, float),
-                A_ub=A_ub, b_ub=b_ub, bounds=(0.0, None), method="highs")
+                bounds=bounds, method="highs")
   return bool(res.success)

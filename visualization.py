@@ -150,16 +150,23 @@ def visualize_successor_states(C, assembly, robots=None, per_depth=3):
       break
 
 
-def visualize_plan(C, assembly, plan, robots=None, gripper_path=None):
+def visualize_plan(C, assembly, plan, robots=None, gripper_path=None, recorder=None):
   """Replay a plan (list of actions from solve_assembly_problem) step by step, opening
   the viewer on the initial state and on the state after each action. Each view() is
-  blocking -- close the window to advance to the next step."""
+  blocking -- close the window to advance to the next step. With `recorder` (a
+  viser_view.ViserRecorder) the steps are RECORDED instead of viewed; call
+  recorder.serve() afterwards for the scrubbable web view."""
   if robots is None:
     robots = get_robots(C)
 
+  def show(state, label):
+    C_viz = visualize_state(C, state, assembly, gripper_path, view=recorder is None)
+    if recorder is not None:
+      recorder.record(C_viz, label)
+
   s = get_initial_state(C, assembly)
   print(f"[0/{len(plan)}] initial: {s}")
-  visualize_state(C, s, assembly, gripper_path)
+  show(s, "0: initial")
 
   allobj = set(assembly.objects)                           # for resolving stow edges (declutter)
   for i, action in enumerate(plan, 1):
@@ -171,7 +178,7 @@ def visualize_plan(C, assembly, plan, robots=None, gripper_path=None):
       return
     s = nxt
     print(f"[{i}/{len(plan)}] {action} -> {s}")
-    visualize_state(C, s, assembly, gripper_path)
+    show(s, f"{i}: {action[0]} {' '.join(map(str, action[1:]))}")
 
 
 def _active_robots(action, s, rik):
@@ -219,7 +226,8 @@ def _write_robot_dofs(C, robot, q_full):
   C.setJointState(q)
 
 
-def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True):
+def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
+                      recorder=None):
   """Replay a plan on a SINGLE persistent config: for each action we solve the skill IK,
   write the active arms' DOFs into the live config (so the arms keep their poses between
   steps), and mirror the scene-graph re-parenting with C.attach (so grabbed parts stay
@@ -227,7 +235,9 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True):
 
   Because non-active arms are left where they are (not reset to home), this reads as a
   continuous choreography. It is still not a collision-checked trajectory -- only the
-  per-action key configs are IK-solved. Each view() is blocking -- close to advance."""
+  per-action key configs are IK-solved. Each view() is blocking -- close to advance.
+  With `recorder` (a viser_view.ViserRecorder) the steps are RECORDED instead of viewed;
+  call recorder.serve() afterwards for the scrubbable web view."""
   if robots is None:
     robots = get_robots(C)
   if robot_ik is None:
@@ -240,7 +250,9 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True):
 
   s = get_initial_state(C, assembly)
   print(f"[0/{len(plan)}] initial: {s}")
-  if view:
+  if recorder is not None:
+    recorder.record(Cv, "0: initial")
+  elif view:
     Cv.view(True, "0: initial")
 
   # CONSISTENCY MODEL of the replay: every frame shows either
@@ -397,7 +409,9 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True):
       if table and not held:
         _seat_rest(nxt, g)
     print(f"[{i}/{len(plan)}] {action} (feasible={_ok}) -> {nxt}")
-    if view:
+    if recorder is not None:
+      recorder.record(Cv, f"{i}: {action[0]} {' '.join(map(str, action[1:]))}")
+    elif view:
       Cv.view(True, f"{i}: {action[0]} {' '.join(map(str, action[1:]))}")
     s = nxt
   return Cv
