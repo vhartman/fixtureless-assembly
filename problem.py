@@ -137,13 +137,17 @@ class Assembly:
     parent, rel_pos = rel
     return self.position_in_base(parent) + np.asarray(rel_pos, dtype=float)
 
-def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, max_tries=200):
+def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, max_tries=200,
+                         spacing=1.0 / 7.0):
   # scatter the assembly's parts on the table as loose cubes (test scene). Geometry
-  # (cube_size / cube_radius) comes from the assembly, not a global.
+  # (cube_size / cube_radius) comes from the assembly, not a global. `spacing` = the x-pitch
+  # of the scatter line (default = historical 1/7 m ~ 0.143); a knob for analysing how much
+  # search/IK pain comes from the cramped test scene (arms diving between close neighbours)
+  # rather than the planner.
   cs, cr = assembly.cube_size, assembly.cube_radius
 
   for i, name in enumerate(assembly.objects):
-      pos = np.array([-0.5 + i * 1 / 7, 0, 0.07])
+      pos = np.array([-0.5 + i * spacing, 0, 0.07])
 
       obj = (
           C.addFrame(name).setParent(C.getFrame("table")).setShape(
@@ -152,6 +156,12 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
               np.random.rand(3)
           ).setContact(1).setJoint(ry.JT.rigid)
       )
+
+      # ORIENTATION MARKER: a rai axis-triad marker per cube, so rotations of the
+      # uniformly-colored cubes are visible. A child frame -> follows the part wherever
+      # the state graph moves it; no contact shape, so the planner never sees it. The
+      # ViserRecorder renders marker frames as viser axis frames (they have no mesh).
+      C.addFrame(f"{name}_marker", name).setShape(ry.ST.marker, [cs * 1.5])
 
       if perturb_start_pose:
           # rejection-sample a perturbation that keeps the config collision free
@@ -323,11 +333,70 @@ class ArchSequentialAssembly(Assembly):
     }
 
 
+class CubeTwoPlateAssembly(Assembly):
+  """A 2x2x2 cube conceived as TWO 2x2 PLATES (bottom obj_0..3, top obj_4..7) that stack.
+
+  Unlike CubeGridAssembly (a star: every cell welds to obj_0), this uses a FAITHFUL
+  adjacency mate graph -- each cell mates onto a physically touching neighbour -- and DAG
+  dependencies with real DIAMONDS: the 4th cell of a plate needs BOTH of its in-plane
+  neighbours, and the top plate's root joins only once the whole bottom plate is built. It
+  exists to stress-test assumptions the chain-based test assemblies never exercise:
+  multi-predecessor (diamond) dependencies, and a stacked mate-onto-non-base JOIN.
+
+  NB the CURRENT planner still builds this as ONE growing component (single-part `assembles`
+  only): the top plate is NOT pre-built as a detached unit and then joined -- obj_4 joins
+  onto the bottom plate first, then obj_5..7 are added one at a time onto the joined stack.
+  A genuine build-two-plates-then-connect needs the deferred connect-two-subassemblies
+  capability (see ArchAssembly doc); this assembly is the motivating case for it."""
+
+  def __init__(self, n_parts=8, spacing=0.055, cube_size=0.05, cube_radius=0.005):
+    assert 1 <= n_parts <= 8, "a 2x2x2 cube has 8 cells"
+    self.n_parts = n_parts
+    self.spacing = spacing
+    self.cube_size = cube_size
+    self.cube_radius = cube_radius
+    super().__init__()
+
+  def define(self):
+    self.objects = [f"obj_{i}" for i in range(self.n_parts)]
+    self.base = "obj_0"
+    o = self.spacing
+    # faithful mate tree: [parent, offset-from-parent]. Rooted at obj_0; each part welds to
+    # an ADJACENT part already in its dependency closure. obj_4->obj_0 is the vertical JOIN.
+    mates = {
+        "obj_1": ["obj_0", [o, 0, 0]],
+        "obj_2": ["obj_0", [0, o, 0]],
+        "obj_3": ["obj_1", [0, o, 0]],          # bottom-plate diamond corner
+        "obj_4": ["obj_0", [0, 0, o]],          # THE JOIN (top plate stacks on bottom)
+        "obj_5": ["obj_4", [o, 0, 0]],
+        "obj_6": ["obj_4", [0, o, 0]],
+        "obj_7": ["obj_5", [0, o, 0]],          # top-plate diamond corner
+    }
+    # DAG precedence (diamonds): a plate's 4th cell needs both in-plane neighbours; the join
+    # (obj_4) needs the bottom plate complete (via obj_3's closure). _mate_closure unions
+    # these with the mate parents, so deps need only add the non-mate-parent predecessors.
+    deps = {
+        "obj_1": ["obj_0"], "obj_2": ["obj_0"], "obj_3": ["obj_1", "obj_2"],
+        "obj_4": ["obj_3"],                     # => transitively the whole bottom plate
+        "obj_5": ["obj_4"], "obj_6": ["obj_4"], "obj_7": ["obj_5", "obj_6"],
+    }
+    self.assembly_relative_poses = {
+        p: [par, np.array(off, dtype=float)] for p, (par, off) in mates.items()
+        if int(p.split("_")[1]) < self.n_parts
+    }
+    self.assembly_dependencies = {
+        p: [d for d in ds if int(d.split("_")[1]) < self.n_parts]
+        for p, ds in deps.items() if int(p.split("_")[1]) < self.n_parts
+    }
+
+
 def make_assembly(kind, n_parts):
   """Assembly factory for the CLI: cross (cube cross), cube (2x2x2 grid), arch (bridge --
-  known-flawed star, see class doc), arch-seq (arch shape built as a sequential chain)."""
+  known-flawed star, see class doc), arch-seq (arch shape built as a sequential chain),
+  cube-plates (2x2x2 cube as two stacked 2x2 plates, faithful DAG mate graph)."""
   kinds = {"cross": (CubeCrossAssembly, 7), "cube": (CubeGridAssembly, 8),
-           "arch": (ArchAssembly, 7), "arch-seq": (ArchSequentialAssembly, 7)}
+           "arch": (ArchAssembly, 7), "arch-seq": (ArchSequentialAssembly, 7),
+           "cube-plates": (CubeTwoPlateAssembly, 8)}
   cls, max_n = kinds[kind]
   return cls(n_parts=min(n_parts, max_n))
 

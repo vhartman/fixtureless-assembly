@@ -30,6 +30,11 @@ def parse_args():
       help="Randomly perturb the object start poses (kept collision free).",
   )
   parser.add_argument(
+      "--scatter-spacing", type=float, default=1.0 / 7.0, metavar="M",
+      help="x-pitch of the scatter line in metres (default 1/7 ~ 0.143, the historical "
+           "layout). For analysing how much search/IK cost is scene density.",
+  )
+  parser.add_argument(
       "--no-view", dest="view", action="store_false",
       help="Do not open the interactive viewer.",
   )
@@ -46,10 +51,13 @@ def parse_args():
       help="Number of parts in the assembly (clamped per type). Default: 7.",
   )
   parser.add_argument(
-      "--assembly", choices=["cross", "cube", "arch", "arch-seq"], default="cross",
+      "--assembly", choices=["cross", "cube", "arch", "arch-seq", "cube-plates"],
+      default="cross",
       help="Assembly to build: cross (cube cross, 7), cube (2x2x2 grid, 8), "
            "arch (two pillars + lintel, 7 -- known-flawed star model), "
-           "arch-seq (arch shape built as a sequential chain, 7). Default: cross.",
+           "arch-seq (arch shape built as a sequential chain, 7), "
+           "cube-plates (2x2x2 cube as two stacked 2x2 plates, faithful DAG). "
+           "Default: cross.",
   )
   parser.add_argument(
       "--solve", action="store_true",
@@ -142,6 +150,17 @@ def parse_args():
            "budget runs out. Optional value = budget in seconds (default 60).",
   )
   parser.add_argument(
+      "--no-wrench-aware-h", dest="wrench_aware_h", action="store_false",
+      help="With --wrench: build the heuristic (h_abs or --labeled-h) WITHOUT the wrench "
+           "facts, for comparison. Default: wrench-aware whenever --wrench is on.",
+  )
+  parser.add_argument(
+      "--labeled-h", action="store_true",
+      help="EXACT search only: use the grasp+face-LABELED disassembly abstraction as the "
+           "heuristic (strictly tighter than the default abstraction; one-time build of "
+           "seconds). Finite weights only (like the default abstraction).",
+  )
+  parser.add_argument(
       "--anon-robots", action="store_true",
       help="LATE BINDING: search with a robot-anonymous state key -- robot-permutation "
            "states merge, so adding (idle) robots does not blow up the search. Sound for "
@@ -158,6 +177,22 @@ def parse_args():
       help="With --wrench: skip the inserter-side check (whether the pressing arm's own "
            "grasp can transmit the seating reaction) -- equivalent to giving that grasp "
            "unbounded capability. The target-side stability check stays on.",
+  )
+  parser.add_argument(
+      "--log-ik-failures", type=float, nargs="?", const=60.0, default=None,
+      metavar="SECONDS",
+      help="With --real-ik: record FAILED IK binds of the search (the skill's scene posed "
+           "at the best failed attempt, labelled with action + solver residuals) and serve "
+           "them in a viser browser after the solve (before the plan replay). Collection "
+           "stops after SECONDS (default 60, measured from the first failure) or 300 "
+           "entries, whichever first.",
+  )
+  parser.add_argument(
+      "--view-cheap-checks", action="store_true",
+      help="Step through every (uncached) cheap collision check in a blocking C.view(True) "
+           "window -- verdict, triggering action, and penetrating pairs in the overlay. "
+           "Both FREE and COLLIDING results are shown; each distinct scene appears once. "
+           "Use with small instances: the search blocks on every window.",
   )
   parser.add_argument(
       "--viser", action="store_true",
@@ -223,7 +258,8 @@ def main():
 
   assembly = make_assembly(args.assembly, args.parts)
 
-  C = add_disassembled_obj(C, assembly, perturb_start_pose=args.perturb_start_pose)
+  C = add_disassembled_obj(C, assembly, perturb_start_pose=args.perturb_start_pose,
+                           spacing=args.scatter_spacing)
 
 
   if args.disp_final:
@@ -236,25 +272,45 @@ def main():
   if args.solve:
     robots = get_robots(C)
     robot_ik = RobotIK(C, robots) if args.real_ik else None
-    if args.optimistic and args.declutter:
-      plan = solve_assembly_problem_optimistic_declutter(
-          C, assembly, robots=robots, robot_ik=robot_ik, weight=args.weight,
-          wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place)
-    elif args.optimistic:
-      plan = solve_assembly_problem_optimistic(C, assembly, robots=robots,
-                                               robot_ik=robot_ik, weight=args.weight,
-                                               wrench=args.wrench, handovers=args.handovers,
-                                               allow_place=args.allow_place)
-    elif args.anytime is not None:
-      plan, _cost, _opt = solve_assembly_problem_anytime(
-          C, assembly, robots=robots, time_budget=args.anytime, robot_ik=robot_ik,
-          wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
-          anonymous=args.anon_robots)
-    else:
-      plan = solve_assembly_problem(C, assembly, robots=robots, canonical=args.canonical,
-                                    weight=args.weight, robot_ik=robot_ik, wrench=args.wrench,
-                                    handovers=args.handovers, allow_place=args.allow_place,
-                                    anonymous=args.anon_robots)
+    if args.view_cheap_checks:
+      set_cheap_check_debug(True)
+    fail_rec = None
+    if args.log_ik_failures is not None and robot_ik is not None:
+      from viser_view import ViserRecorder
+      fail_rec = ViserRecorder()
+      robot_ik.fail_recorder = fail_rec
+      robot_ik.fail_log_seconds = args.log_ik_failures
+      robot_ik.fail_log_stop = True                # abort the search when the window closes
+    try:
+      if args.optimistic and args.declutter:
+        plan = solve_assembly_problem_optimistic_declutter(
+            C, assembly, robots=robots, robot_ik=robot_ik, weight=args.weight,
+            wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place)
+      elif args.optimistic:
+        plan = solve_assembly_problem_optimistic(C, assembly, robots=robots,
+                                                 robot_ik=robot_ik, weight=args.weight,
+                                                 wrench=args.wrench, handovers=args.handovers,
+                                                 allow_place=args.allow_place)
+      elif args.anytime is not None:
+        plan, _cost, _opt = solve_assembly_problem_anytime(
+            C, assembly, robots=robots, time_budget=args.anytime, robot_ik=robot_ik,
+            wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
+            anonymous=args.anon_robots, labeled_h=args.labeled_h,
+            wrench_aware_h=args.wrench_aware_h)
+      else:
+        plan = solve_assembly_problem(C, assembly, robots=robots, canonical=args.canonical,
+                                      weight=args.weight, robot_ik=robot_ik, wrench=args.wrench,
+                                      handovers=args.handovers, allow_place=args.allow_place,
+                                      anonymous=args.anon_robots, labeled_h=args.labeled_h,
+                                      wrench_aware_h=args.wrench_aware_h)
+    except IKFailureLogDone:
+      print(f"[ik-failures] window/cap reached -- search stopped for debugging "
+            f"({len(fail_rec.steps)} failures collected).")
+      plan = None
+    if fail_rec is not None and fail_rec.steps:
+      print(f"[ik-failures] {len(fail_rec.steps)} failed binds recorded -- serving in "
+            f"viser (Stop in the GUI to continue to the plan replay).")
+      fail_rec.serve(port=args.viser_port)
     if plan is not None:
       print(f"plan ({len(plan)} actions):")
       for step in plan:

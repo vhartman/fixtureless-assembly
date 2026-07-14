@@ -11,6 +11,18 @@ UR10_PATHS = {
     (True, True): "./src/rai/ur10/ur10_vacuum_floating.g",
 }
 
+# Cheap-collision EE stand-in PAIRED with the actual robot model, keyed like UR10_PATHS
+# by (floating_ee, vacuum) of the env. Real arms -> the *_wrist variant (the wrist-3 link
+# exists on the real robot, so the cheap model carries its calibrated capsule, radius .035
+# = an under-approximation that never rejects a true IK success); floating-EE envs -> the
+# plain floating EE (no wrist exists in that model, so the cheap check must not invent one).
+CHEAP_EE_PATHS = {
+    (False, False): "./src/rai/ur10/ur10_two_finger_floating_wrist.g",
+    (False, True): "./src/rai/ur10/ur10_vacuum_floating_wrist.g",
+    (True, False): "./src/rai/ur10/ur10_two_finger_floating.g",
+    (True, True): "./src/rai/ur10/ur10_vacuum_floating.g",
+}
+
 # Prefix used by each robot type's .g file.
 ROBOT_PREFIXES = {"ur5": "ur_", "ur10": "ur_", "kuka": "kuka_"}
 

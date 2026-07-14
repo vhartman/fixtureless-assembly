@@ -26,33 +26,41 @@ import robotic as ry
 class ViserRecorder:
   def __init__(self):
     self.geometry = {}                    # name -> (verts, tris, color_rgb, opacity)
+    self.markers = {}                     # name -> axes_length (rai ST.marker frames)
     self.steps = []                       # [{name: (pos3, wxyz4)}]
     self.labels = []                      # one per step
 
   def record(self, C, label=""):
     """Snapshot every mesh-bearing frame of `C` as one step. Geometry is captured the
-    first time a frame name is seen (assumed rigid thereafter)."""
+    first time a frame name is seen (assumed rigid thereafter). rai ST.marker frames
+    have no mesh; they are tracked separately and served as viser axis frames."""
     snap = {}
     for frame in C.getFrames():
       name = frame.name
-      if name not in self.geometry:
+      if name not in self.geometry and name not in self.markers:
         verts = np.asarray(frame.getMeshPoints(), dtype=np.float32)
         tris = np.asarray(frame.getMeshTriangles(), dtype=np.uint32)
         if verts.ndim < 2 or tris.ndim < 2 or len(verts) == 0 or len(tris) == 0:
-          continue                        # no renderable geometry
-        # per-vertex colors when present; frame-info color as fallback
-        mesh_colors = np.asarray(frame.getMeshColors())
-        if mesh_colors.ndim == 2 and len(mesh_colors) > 0:
-          c = mesh_colors[0]              # [R,G,B,A] 0-255
-          color_rgb = (int(c[0]), int(c[1]), int(c[2]))
-          alpha = int(c[3]) if len(c) > 3 else 255
-          opacity = alpha / 255.0 if alpha < 255 else None
+          info = frame.info()
+          if info.get("shape") == "marker":
+            size = info.get("size", [0.1])
+            self.markers[name] = float(size[0] if hasattr(size, "__len__") else size)
+          else:
+            continue                      # no renderable geometry
         else:
-          raw = frame.info().get("color", [0.7, 0.7, 0.7])
-          color_rgb = tuple(int(x * 255) for x in raw[:3])
-          opacity = float(raw[3]) if len(raw) > 3 and raw[3] < 1.0 else None
-        self.geometry[name] = (verts, tris, color_rgb, opacity)
-      if name in self.geometry:
+          # per-vertex colors when present; frame-info color as fallback
+          mesh_colors = np.asarray(frame.getMeshColors())
+          if mesh_colors.ndim == 2 and len(mesh_colors) > 0:
+            c = mesh_colors[0]            # [R,G,B,A] 0-255
+            color_rgb = (int(c[0]), int(c[1]), int(c[2]))
+            alpha = int(c[3]) if len(c) > 3 else 255
+            opacity = alpha / 255.0 if alpha < 255 else None
+          else:
+            raw = frame.info().get("color", [0.7, 0.7, 0.7])
+            color_rgb = tuple(int(x * 255) for x in raw[:3])
+            opacity = float(raw[3]) if len(raw) > 3 and raw[3] < 1.0 else None
+          self.geometry[name] = (verts, tris, color_rgb, opacity)
+      if name in self.geometry or name in self.markers:
         snap[name] = (np.array(frame.getPosition(), dtype=np.float32),
                       np.array(frame.getQuaternion(), dtype=np.float32))  # ry = [w,x,y,z]
     self.steps.append(snap)
@@ -75,6 +83,9 @@ class ViserRecorder:
       handles[name] = server.scene.add_mesh_simple(
           name=f"frames/{name}", vertices=verts, faces=tris,
           color=color_rgb, flat_shading=False, opacity=opacity)
+    for name, size in self.markers.items():
+      handles[name] = server.scene.add_frame(
+          name=f"frames/{name}", axes_length=0.5 * size, axes_radius=0.04 * size)
 
     step_slider = server.gui.add_slider("Step", min=0, max=len(self.steps) - 1,
                                         step=1, initial_value=0)

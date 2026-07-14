@@ -141,7 +141,7 @@ class CollisionChecker:
     # any remaining slots stay parked (from the template) -> out of the way.
     return C_col
 
-  def _check(self, state, assembly, extra_grasps=()):
+  def _check(self, state, assembly, extra_grasps=(), note=""):
     # tolerate grazing contacts (see _CHEAP_PENETRATION_TOL) instead of binary-exact
     # getCollisionFree -- the cheap layer must not be stricter than the (soft) IK.
     # VERDICT-MEMOIZED on the discrete scene signature (see _sig): building the rai scene
@@ -151,7 +151,14 @@ class CollisionChecker:
     if hit is not None:
       return hit
     C_col = self._scene_for(state, assembly, extra_grasps)
-    ok = all(d >= -_CHEAP_PENETRATION_TOL for _a, _b, d in C_col.getCollisions())
+    ok = all(d >= -_CHEAP_PENETRATION_TOL or _wrist_table_pair(a, b)
+             for a, b, d in C_col.getCollisions())
+    if _CHEAP_DEBUG_VIEW:
+      pairs = [(a, b, d) for a, b, d in C_col.getCollisions()
+               if d < -_CHEAP_PENETRATION_TOL and not _wrist_table_pair(a, b)]
+      msg = (f"cheap check: {'FREE' if ok else 'COLLIDING'}\n{note}\n"
+             + "\n".join(f"  {a} x {b}  depth {d:.4f}" for a, b, d in pairs))
+      C_col.view(True, msg)
     self._verdicts[key] = ok
     return ok
 
@@ -162,19 +169,48 @@ class CollisionChecker:
     # way -- so it can be relocated rather than the whole step abandoned.
     C_col = self._scene_for(state, assembly, extra_grasps)
     return [(a, b, d) for a, b, d in C_col.getCollisions()
-            if d < -_CHEAP_PENETRATION_TOL]
+            if d < -_CHEAP_PENETRATION_TOL and not _wrist_table_pair(a, b)]
 
-  def collision_free(self, state, assembly):
-    return self._check(state, assembly)
+  def collision_free(self, state, assembly, note=""):
+    return self._check(state, assembly, note=note)
 
-  def pick_collision_free(self, s0, gpart, grasp_id, assembly):
+  def pick_collision_free(self, s0, gpart, grasp_id, assembly, note=""):
     # cheap gate for PICK edges: place a floating EE at the candidate grasp with the part
     # at its CURRENT (pre-pick, on-table) pose, in the actual environment. This is what
     # the precomputed grasp table does NOT see -- it checks a grasp only against its own
     # subassembly (no table, no neighbours), so e.g. a two-finger side grasp whose lower
     # finger dips below the cube (into the table) passes precompute yet can never be
     # picked. Rejecting it here costs ~2ms instead of a full (restarted) IK solve.
-    return self._check(s0, assembly, extra_grasps=[(gpart, grasp_id)])
+    return self._check(s0, assembly, extra_grasps=[(gpart, grasp_id)], note=note)
+
+
+def _wrist_table_pair(a, b):
+  # wrist-capsule-vs-TABLE grazes are the soft-IK-margin class the wrist radius was shaved
+  # for -- yet two-finger SIDE grasps still put the wrist within ~10mm of the table, and
+  # the real (soft) arm IK ACCEPTS those (measured: 8/24 edges of a verified plan were
+  # wrongly rejected on exactly this pair). The wrist stand-in exists to catch wrist-vs-
+  # CLUTTER; table-margin reachability is not soundly checkable at the EE level, so this
+  # pair never rejects.
+  return ("table" in (a, b)) and (a.endswith("ur_wrist_coll") or b.endswith("ur_wrist_coll"))
+
+
+_CHEAP_DEBUG_VIEW = False
+
+
+def set_cheap_check_debug(on=True):
+  # step-through debugging of the cheap layer: every UNCACHED CollisionChecker query pops
+  # C.view(True, ...) with verdict + triggering action + penetrating pairs. First-run cache
+  # semantics mean each distinct scene appears exactly once. Use with tiny instances --
+  # every check blocks on the viewer window.
+  global _CHEAP_DEBUG_VIEW
+  _CHEAP_DEBUG_VIEW = bool(on)
+
+
+class IKFailureLogDone(Exception):
+  # raised by RobotIK._log_failure (only when fail_log_stop is set) once the failure-log
+  # window or cap is reached: in debug mode the run's PURPOSE is the failure browser, so
+  # the search aborts instead of grinding on with logging silenced.
+  pass
 
 
 class RobotIK:
@@ -215,6 +251,12 @@ class RobotIK:
       # so we constrain only position + approach axis (5-DOF). the two-finger's fingers
       # break that symmetry -> full pose (6-DOF).
       self.symmetric[r] = "vacuum" in tool_center
+    self._ik_cache = {}                                   # (action, scene sig) -> (ok, witness)
+    self.fail_recorder = None                             # viser recorder for failed binds
+    self.fail_log_cap = 300
+    self.fail_log_seconds = 60.0                          # window from the FIRST failure
+    self.fail_log_stop = False                            # abort the search when done?
+    self._fail_log_t0 = None
 
   def holders(self, state):
     # {robot: (grasped_part, grasp_id)} -- who holds what, at which grasp, in this state.
@@ -329,17 +371,47 @@ class RobotIK:
   # ------------------------------------------------------------------------------------
   def bind(self, action, s0, s1, assembly, seed=None):
     kind = action[0]
+    if kind == "release":
+      return True, None                                   # no new reach
+    # VERDICT + WITNESS CACHE on a discrete scene signature: the search re-probes the SAME
+    # (action, scene) from many parent states, and a FAILED solve costs ~135ms (initial +
+    # 12 restarts) vs ~5ms for a success -- measured 81 re-probed pick failures per 40
+    # expansions on cross7-R3. Unlike the cheap checker's signature this one KEEPS robot
+    # identities (fixed bases: who reaches matters) and the grasp contacts' robots. Caching
+    # also makes the stochastic restarts deterministic within a solve (same query -> same
+    # verdict), which the search prefers anyway.
+    key = (action, self._scene_sig(s0))
+    hit = self._ik_cache.get(key)
+    if hit is not None:
+      return hit
     if kind == "pick":
-      return self._ik_pick(action, s0, s1, assembly, seed)
-    if kind == "place":
-      return self._ik_place(action, s0, s1, assembly, seed)
-    if kind == "assemble":
-      return self._ik_assemble(action, s0, s1, assembly, seed)
-    if kind in ("add_grasp", "handover"):
-      # both are a 2nd arm reaching a grasp while the current holder presents the group; the
-      # handover's release adds no reach. Action layout (kind, robot, gpart, grasp) matches.
-      return self._ik_add_grasp(action, s0, s1, assembly, seed)
-    return True, None                                     # release: no new reach
+      res = self._ik_pick(action, s0, s1, assembly, seed)
+    elif kind == "place":
+      res = self._ik_place(action, s0, s1, assembly, seed)
+    elif kind == "assemble":
+      res = self._ik_assemble(action, s0, s1, assembly, seed)
+    else:                                                 # add_grasp / handover: 2nd arm
+      res = self._ik_add_grasp(action, s0, s1, assembly, seed)
+    self._ik_cache[key] = res
+    return res
+
+  def _scene_sig(self, state):
+    # discrete signature of everything the per-skill IK scenes depend on: per subassembly
+    # its members, table placement + rounded anchor (or held-flag), and grasp contacts WITH
+    # robot identities. Mirrors CollisionChecker._sig but keeps robots (fixed bases).
+    parts = []
+    for group in state.subassemblies():
+      members = tuple(sorted(group))
+      grasps = tuple(sorted((c[1], c[2], c[3]) for p in group
+                            for c in state.supports.get(p, ()) if c[0] == "grasp"))
+      on_table = any(("table",) in state.supports.get(p, ()) for p in group)
+      if on_table:
+        ref = reference_part(group)
+        anchor = tuple(np.round(np.asarray(state.poses[ref], dtype=float), 4))
+        parts.append(("T", members, state.place.get(ref), anchor, grasps))
+      else:
+        parts.append(("H", members, grasps))
+    return tuple(sorted(parts))
 
   def _holders_of_group(self, state, group):
     # robots grasping any part of `group`
@@ -350,16 +422,50 @@ class RobotIK:
     # its guess with a little noise, so a borderline-reachable target flips feasible/
     # infeasible run-to-run; restarts make bind reliable -- a genuinely feasible action
     # returns a witness (instead of sometimes None, which would corrupt search + replay).
-    # Returns (feasible, witness joint config or None).
+    # Returns (feasible, witness joint config or None). The last attempt's solver report is
+    # kept on self._last_res for the failure log.
     r = ry.NLP_Solver(komo.nlp(), verbose=0).solve().dict()
     if r["feasible"]:
+      self._last_res = r
       return True, komo.getPath()[-1]
     for _ in range(restarts):
       komo.initRandom()
       r = ry.NLP_Solver(komo.nlp(), verbose=0).solve().dict()
       if r["feasible"]:
+        self._last_res = r
         return True, komo.getPath()[-1]
+    self._last_res = r
     return False, None
+
+  def _log_failure(self, action, C, komo):
+    # IK-FAILURE INSTRUMENTATION (opt-in via self.fail_recorder = a viser_view.ViserRecorder;
+    # None = zero cost): pose the skill's OWN scene at the LAST (failed) attempt and record
+    # it as one browsable viser step, labelled with the action and the solver residuals --
+    # so failed binds of the forward search can be inspected by eye. Bounded BOTH by entry
+    # count (fail_log_cap) and a TIME WINDOW (fail_log_seconds, measured from the FIRST
+    # failure so the heuristic build does not eat it) -- long runs would otherwise collect
+    # useless thousands.
+    import time as _time
+    if self.fail_recorder is None:
+      return
+    done = len(self.fail_recorder.steps) >= self.fail_log_cap
+    if not done and self._fail_log_t0 is not None:
+      done = _time.perf_counter() - self._fail_log_t0 > self.fail_log_seconds
+    if done:
+      if self.fail_log_stop:
+        raise IKFailureLogDone()
+      return
+    if self._fail_log_t0 is None:
+      self._fail_log_t0 = _time.perf_counter()
+    try:
+      C.setJointState(komo.getPath()[-1])                  # best (infeasible) attempt
+    except Exception:
+      pass
+    res = getattr(self, "_last_res", {}) or {}
+    label = (f"FAIL {action}  \n"
+             f"eq={res.get('eq', float('nan')):.3f} ineq={res.get('ineq', float('nan')):.3f} "
+             f"sos={res.get('sos', float('nan')):.3f}")
+    self.fail_recorder.record(C, label)
 
   def _ik_pick(self, action, s0, s1, assembly, seed):
     # simple IK: ONE robot (the picker) reaches a fixed grasp pose on an on-table part.
@@ -404,6 +510,8 @@ class RobotIK:
     self._add_grasp_maintenance(komo, s0, assembly)       # brace arms posed at their grasps
 
     feasible, witness = self._solve_ik(komo)
+    if not feasible:
+      self._log_failure(action, C, komo)
 
     if self.debug_view:
         print("pick feasible:", feasible)
@@ -434,6 +542,8 @@ class RobotIK:
     self._add_grasp_maintenance(komo, s0, assembly)       # existing braces stay at their grasps
 
     feasible, witness = self._solve_ik(komo)
+    if not feasible:
+      self._log_failure(action, C, komo)
 
     if self.debug_view:
         print("add_grasp feasible:", feasible)
@@ -475,6 +585,8 @@ class RobotIK:
     self._add_grasp_maintenance(komo, s0, assembly)       # braces ride along / stay pinned
 
     feasible, witness = self._solve_ik(komo)
+    if not feasible:
+      self._log_failure(action, C, komo)
 
     if self.debug_view:
         print("place feasible:", feasible)
@@ -549,6 +661,8 @@ class RobotIK:
       komo = self._assemble_komo(C, part_name, onto, rel_pos, rel_quat, None)
       self._add_grasp_maintenance(komo, s0, assembly)
       feasible, witness = self._solve_ik(komo, restarts=6)
+    if not feasible:
+      self._log_failure(action, C, komo)
 
     if self.debug_view:
         print("assemble feasible:", feasible)
@@ -559,7 +673,25 @@ class RobotIK:
 
 # actions that move a part into a possibly-colliding pose (so they need the CHEAP geometry
 # check on the RESULT). release does not move any part, so its geometry is unchanged.
-_GEOMETRIC_ACTIONS = {"assemble", "place", "set_down"}
+_GEOMETRIC_ACTIONS = {"assemble", "place", "set_down", "stow"}
+
+# geometric actions that OPEN the moving robot's grasp on arrival: the result state has no
+# EE on the moved group anymore, so checking s1 alone misses the gripper at the moment of
+# set-down. These get the opening grasp re-added as an extra EE (part at its PLACED pose --
+# exactly the configuration the place IK solves). assemble is NOT here: it keeps the grasp
+# (brace), so its EE is already in s1.
+_OPENING_ACTIONS = {"place", "set_down", "stow"}
+
+
+def _opening_grasp(action, s0):
+  # the (gpart, grasp_id) that action's robot is about to open, read from s0.
+  r, root = action[1], action[2]
+  group = next((g for g in s0.subassemblies() if root in g), (root,))
+  for p in group:
+    for c in s0.supports.get(p, ()):
+      if c[0] == "grasp" and c[1] == r:
+        return (c[2], c[3])
+  return None
 
 # actions that place a NEW gripper at a grasp (checked cheaply like a pick: the EE at the
 # candidate grasp alongside the state's existing EEs -- catches gripper/gripper for a 2nd
@@ -580,10 +712,15 @@ def cheap_feasible(action, s0, s1, assembly, checker):
   #     that grasp WITH the state's existing EEs present (so a 2nd grasp is tested against the
   #     holder's gripper, and a pick against its neighbours). The precomputed grasp table only
   #     sees the subassembly itself, so this is where env/holder collisions are caught.
-  if action[0] in _GEOMETRIC_ACTIONS and not checker.collision_free(s1, assembly):
-    return False
+  if action[0] in _GEOMETRIC_ACTIONS:
+    extra = ()
+    if action[0] in _OPENING_ACTIONS:
+      g = _opening_grasp(action, s0)                       # EE at the about-to-open grasp,
+      extra = (g,) if g is not None else ()                # part at its PLACED pose
+    if not checker._check(s1, assembly, extra_grasps=extra, note=f"result of {action}"):
+      return False
   if action[0] in _GRASP_ACTIONS and not checker.pick_collision_free(
-      s0, action[2], action[3], assembly):
+      s0, action[2], action[3], assembly, note=f"grasp candidate of {action}"):
     return False
   return True
 
@@ -777,6 +914,342 @@ class AbstractionHeuristic:
     return self.dist.get(self.abstract(state), 0.0)
 
 
+class LabeledDisassemblyHeuristic:
+  """GRASP-LABELED backward-disassembly abstraction (the tractability spike).
+
+  Same idea as AbstractionHeuristic -- forget, solve the abstract problem exactly backward
+  from the goal, look distances up at search time -- but the abstract state KEEPS the labels
+  cheap geometry depends on:
+
+      (ideal, G, face|H, L)
+        ideal : frozenset of assembled parts
+        G     : grasps ON the assembly, {(part, gid)}   (holders + braces; robots anonymous)
+        face|H: the assembly's placement face, or 'H' = held in the air
+        L     : held LOOSE parts with their grasps, {(part, gid)}
+
+  Geometry enters through three fact families, all cheap-layer and cached:
+    * grasp validity per ideal -- straight from the precomputed grasp table. MONOTONE:
+      valid on a larger assembly => valid on any sub-ideal (removing parts removes
+      obstacles), which keeps every inverse action closed under the invariants for free.
+    * pick facts (LAZY): grasp (p,g) additionally collision-free vs the TABLE with the
+      subassembly resting on face f (the finger-into-table cases the grasp table misses).
+    * mate facts: the existing per-(part, face) _on_table_mateable table.
+
+  The abstract actions mirror the real primitives one-for-one (pick/lift/assemble/release/
+  place/fused-handover at the real costs; every gate is a RELAXATION of the real one), so
+  distances are ADMISSIBLE. Solved by BACKWARD Dijkstra (handover costs 2) from all goal
+  states via INVERSE actions -- only CO-REACHABLE states are enumerated, which is exactly
+  the tractability question. A projection missing from the table falls back to the caller's
+  counting heuristic (self.misses counts how often)."""
+
+  H = "H"                                                  # face value for held-in-air
+
+  def __init__(self, assembly, n_robots, grasp_table, gripper_path=None, verbose=False,
+               max_states=2_000_000, clearance=0.02, gripper_kind=None):
+    import heapq
+    import time as _time
+
+    t0 = _time.perf_counter()
+    self.assembly = assembly
+    self.R = n_robots
+    self.misses = 0
+    self._clearance = clearance                            # see _table_aware_pick_fact
+    self._gk = gripper_kind                                # non-None => WRENCH facts active
+    objs = list(assembly.objects)
+    base = assembly.base
+    # STATES ARE SORTED TUPLES (ideal, G, face, L) -- tuples hash ~2x faster than
+    # frozensets, and the Dijkstra loop is hash-bound (py-spy: ~36% of the build).
+    all_parts = _subasm_key(objs)
+    self._closure = {p: frozenset(_mate_closure(assembly, p)) for p in objs}
+
+    def tadd(t, x):
+      return tuple(sorted(t + (x,)))
+
+    def tsub(t, x):
+      i = t.index(x)
+      return t[:i] + t[i + 1:]
+
+    # grasp validity per buildable ideal (+ singletons), from the precomputed table
+    ideal_keys = [_subasm_key(s) for s in get_subassemblies(assembly) if base in s]
+    self.valid = {S: tuple(sorted((p, g) for p, g, _ in grasp_table[S]))
+                  for S in ideal_keys}
+    self.single = {q: tuple(sorted(g for _p, g, _ in grasp_table[(q,)])) for q in objs}
+
+    # lazy, cached table-aware pick fact -- keyed PER PART deliberately (no identical-parts
+    # aliasing: per-part shapes/meshes and forces are coming; the template reuse makes the
+    # extra per-part queries cheap anyway).
+    self._ee_path = gripper_path
+    self._pick_cache = {}
+
+    def pick_ok(S_key, face, pg):
+      key = (S_key, face, pg)
+      hit = self._pick_cache.get(key)
+      if hit is None:
+        hit = self._pick_cache[key] = _table_aware_pick_fact(
+            assembly, S_key, face, pg[0], pg[1], self._ee_path,
+            clearance=self._clearance)
+      return hit
+
+    FACES = list(range(len(_FACE_DOWN_QUATS)))
+    Hf = self.H
+
+    # ---- WRENCH facts (gripper_kind set): gate the abstract mates/releases with the SAME
+    # `_group_stable` LP the real gates run, on CRAFTED states -- since the labeled state
+    # knows the grasps, these facts are EXACT for their (ideal, G, face) tuple, not a
+    # relaxation. Without them the heuristic walks into wrench-deleted edges and the search
+    # degenerates back to a plateau exactly on wrench-heavy configs (measured).
+    flatposes = _flat_poses(assembly)
+    self._wfacts = {}
+
+    def crafted(ideal_key, G, face):
+      # a minimal real State for the LP: ideal parts mate-parented under the base; base on
+      # the table at `face` (or held when face==Hf); grasps G as support contacts. The
+      # kinematic root choice is irrelevant to _group_stable (it reads supports + layout).
+      parent, place, supports = {}, {}, {}
+      ideal_set = set(ideal_key)
+      for q in assembly.objects:
+        if q in ideal_set:
+          if q == assembly.base:
+            parent[q] = ("gripper", "zz0") if face is Hf else ("table",)
+            supports[q] = frozenset() if face is Hf else frozenset({("table",)})
+            if face is not Hf:
+              place[q] = ("slot", 0, face)
+          else:
+            onto = assembly.relative_pose(q)[0]
+            parent[q] = ("part", onto)
+            supports[q] = frozenset({("mate", onto)})
+        else:
+          parent[q] = ("table",)
+          supports[q] = frozenset({("table",)})
+          place[q] = ("slot", _part_index(q), _IDENTITY_FACE)
+      for i, (p, g) in enumerate(G):
+        supports[p] = supports[p] | {("grasp", f"zz{i}", p, g)}
+      return State(parent=parent, place=place, supports=supports, poses=dict(flatposes))
+
+    def held_single(q, gq):
+      st = crafted((), (), _IDENTITY_FACE)                 # everything loose on the table
+      st.parent[q] = ("gripper", "zzq")
+      st.place.pop(q, None)
+      st.supports[q] = frozenset({("grasp", "zzq", q, gq)})
+      return st
+
+    def w_hold_ok(ideal_key, G, face):
+      # can supports G (+ table if resting) hold the assembly under gravity? (real release
+      # gate / assemble's target-supported gate)
+      if self._gk is None:
+        return True
+      key = ("H", ideal_key, G, face)
+      hit = self._wfacts.get(key)
+      if hit is None:
+        st = crafted(ideal_key, G, face)
+        hit = self._wfacts[key] = _group_stable(st, assembly, set(ideal_key), self._gk)
+      return hit
+
+    def w_assemble_ok(ideal_s_key, G2, face, q, gq):
+      # the real assemble wrench gates: target (with braces G2, at `face` or held) must be
+      # stable under gravity AND under the insertion reaction of q; the inserter's grasp gq
+      # must transmit the press (mirrors PARAMS['check_inserter']).
+      if self._gk is None:
+        return True
+      key = ("A", ideal_s_key, G2, face, q, gq)
+      hit = self._wfacts.get(key)
+      if hit is None:
+        onto = assembly.relative_pose(q)[0]
+        ok = w_hold_ok(ideal_s_key, G2, face)
+        if ok and wrench.PARAMS.get("check_inserter", True):
+          st_q = held_single(q, gq)
+          ok = _group_stable(st_q, assembly, frozenset({q}), self._gk,
+                             applied=[_inserter_load(st_q, assembly, q, onto)])
+        if ok:
+          st_t = crafted(ideal_s_key, G2, face)
+          ok = _group_stable(st_t, assembly, set(ideal_s_key), self._gk,
+                             applied=[_insertion_load(st_t, assembly, q, onto)])
+        hit = self._wfacts[key] = ok
+      return hit
+
+    def preds(t):
+      ideal, G, face, L = t
+      cap_used = len(G) + len(L)
+      # inverse ASSEMBLE: some (q,gq) in G was the inserter's brace; q maximal in ideal
+      for q, gq in G:
+        if q == base:
+          continue
+        if any(q in self._closure[r] for r in ideal if r != q):
+          continue                                        # not maximal -> not last-added
+        if face is not Hf and not _on_table_mateable_cached(self.assembly, q, face):
+          continue
+        G2 = tsub(G, (q, gq))
+        if any(p == q for p, _ in G2):
+          continue                                        # q was loose then: single-held only
+        if face is Hf and len(G2) < 1:
+          continue                                        # target had to be supported
+        if not w_assemble_ok(tsub(ideal, q), G2, face, q, gq):
+          continue                                        # wrench: press not transmittable
+        yield (tsub(ideal, q), G2, face, tadd(L, (q, gq))), 1.0
+      # inverse PICK-LOOSE: some (q,gq) in L was just picked off the table. The abstraction
+      # does not track loose parts' resting faces (they can be reoriented via place+pick),
+      # so the gate is EXISTS-a-face -- optimistic about the reorientation cost, admissible.
+      for q, gq in L:
+        if any(pick_ok((q,), f, (q, gq)) for f in FACES):
+          yield (ideal, G, face, tsub(L, (q, gq))), 1.0
+      # inverse LIFT: held solo -> was resting on some face and got picked
+      if face is Hf and len(G) == 1:
+        pg = G[0]
+        for f in FACES:
+          if pick_ok(ideal, f, pg):
+            yield (ideal, (), f, L), 1.0
+      # inverse PLACE-ASSEMBLY: on table now -> was held by one more grasp in the air
+      if face is not Hf and cap_used < self.R:
+        for pg in self.valid[ideal]:
+          if pg not in G:
+            yield (ideal, tadd(G, pg), Hf, L), 1.0
+      # inverse RELEASE: some grasp was just opened (it existed in the pre-state). The real
+      # release is wrench-gated on the POST-state (t) staying supported.
+      if cap_used < self.R and w_hold_ok(ideal, G, face):
+        for pg in self.valid[ideal]:
+          if pg not in G:
+            yield (ideal, tadd(G, pg), face, L), 1.0
+      # inverse fused HANDOVER (cost 2): solo-held; the grasp was swapped
+      if face is Hf and len(G) == 1 and len(L) <= self.R - 2:
+        pg_new = G[0]
+        for pg_old in self.valid[ideal]:
+          if pg_old != pg_new:
+            yield (ideal, (pg_old,), Hf, L), 2.0
+      # inverse PLACE-LOOSE: a loose part now on the table was held just before
+      if cap_used < self.R:
+        for q in objs:
+          if q in ideal or any(q == p for p, _ in L):
+            continue
+          for qg in self.single[q]:
+            yield (ideal, G, face, tadd(L, (q, qg))), 1.0
+
+    # goal states: everything assembled, any supported holder configuration, nothing loose
+    self.dist = {}
+    pq = []
+    from itertools import combinations
+    vg_full = self.valid[all_parts]
+    for k in range(self.R + 1):
+      for combo in combinations(vg_full, k):
+        for face in [Hf] + FACES:
+          if face is Hf and len(combo) < 1:
+            continue
+          st = (all_parts, combo, face, ())
+          self.dist[st] = 0.0
+          heapq.heappush(pq, (0.0, id(st), st))
+
+    popped = 0
+    while pq:
+      d, _, t = heapq.heappop(pq)
+      if d > self.dist.get(t, float("inf")):
+        continue
+      popped += 1
+      if len(self.dist) > max_states:
+        raise RuntimeError(f"labeled abstraction exceeded {max_states} states")
+      for s, c in preds(t):
+        nd = d + c
+        if nd < self.dist.get(s, float("inf")):
+          self.dist[s] = nd
+          heapq.heappush(pq, (nd, id(s), s))
+
+    self.n_states = len(self.dist)
+    self.n_pick_facts = len(self._pick_cache)
+    self.build_time = _time.perf_counter() - t0
+    if verbose:
+      print(f"[labeled-h] {self.n_states} coreachable states, {self.n_pick_facts} pick "
+            f"facts, built in {self.build_time:.2f}s")
+
+  def abstract(self, state):
+    main = next(g for g in state.subassemblies() if self.assembly.base in g)
+    ideal = _subasm_key(main)
+    G = tuple(sorted((c[2], c[3]) for p in main
+                     for c in state.supports.get(p, ()) if c[0] == "grasp"))
+    on_table = any(("table",) in state.supports.get(p, ()) for p in main)
+    face = _placement_face(state, main) if on_table else self.H
+    L = tuple(sorted((c[2], c[3]) for p in state.parent if p not in main
+                     for c in state.supports.get(p, ()) if c[0] == "grasp"))
+    return (ideal, G, face, L)
+
+  def value(self, state):
+    # A projection with no backward distance PROVABLY cannot reach the goal: the abstract
+    # actions cover every real action (relaxation), so no abstract path => no real path.
+    # inf lets the search prune dead branches -- and detect infeasible INSTANCES at s0
+    # (e.g. insert-force above every grasp cap: no assemble is ever wrench-feasible).
+    v = self.dist.get(self.abstract(state))
+    if v is None:
+      self.misses += 1
+      return float("inf")
+    return v
+
+
+_TABLE_PICK_FACT_CACHE = {}
+_FACT_TEMPLATES = {}                                       # (ee_path, cs, cr, n) -> template
+
+
+def _fact_template(gripper_path, cs, cr, n_parts):
+  # ONE reusable config per (gripper, cube geometry, max parts): world + n generic cubes
+  # parked far away + the EE pre-parsed. Per fact we COPY it (rai ~0.4ms) and reposition --
+  # profiling showed place_floating_ee's addFile (re-parsing the gripper .g per fact) was
+  # a third of the whole heuristic build.
+  key = (gripper_path, cs, cr, n_parts)
+  hit = _FACT_TEMPLATES.get(key)
+  if hit is not None:
+    return hit
+  C = make_world()
+  for i in range(n_parts):
+    C.addFrame(f"factcube{i}").setShape(ry.ST.ssBox, [cs, cs, cs, cr]) \
+        .setPosition([0.0, -500.0 - 2.0 * i, 1.0]).setContact(1)
+  place_floating_ee(C, np.array([0.0, -900.0, 1.0, 1.0, 0.0, 0.0, 0.0]),
+                    gripper_path, prefix="eeFACT_")
+  tool, base_rel_tool, q_corr = _gripper_rest_transforms(C, "eeFACT_")
+  table = C.getFrame("table")
+  top = table.getPosition()[2] + table.getSize()[2] / 2.0
+  hit = _FACT_TEMPLATES[key] = (C, base_rel_tool, q_corr, top)
+  return hit
+
+
+def _table_aware_pick_fact(assembly, S_key, face, gpart, gid, gripper_path,
+                           clearance=0.0):
+  # can the floating EE sit at grasp (gpart,gid) while subassembly S_key rests on `face`,
+  # without hitting the TABLE (or S itself)? The grasp table checks the grasp only against
+  # S; the table is what kills e.g. two-finger side grasps whose lower finger dips under
+  # the cube. One template-copied rai config per fact, cached globally (pure geometry).
+  #
+  # `clearance` raises the group above exact rest: the REAL scatter poses float ~15mm above
+  # the table, so the real pick gate is more tolerant than an exactly-resting scene -- an
+  # abstraction fact must be AT LEAST as permissive as any real context (over-permissive
+  # only weakens the heuristic; over-strict breaks admissibility).
+  key = (id(assembly), S_key, face, gpart, gid, gripper_path, round(clearance, 4))
+  hit = _TABLE_PICK_FACT_CACHE.get(key)
+  if hit is not None:
+    return hit
+  cs, cr = assembly.cube_size, assembly.cube_radius
+  tmpl, base_rel_tool, q_corr, top = _fact_template(
+      gripper_path, cs, cr, len(assembly.objects))
+  C = ry.Config()
+  C.addConfigurationCopy(tmpl)
+  q = _FACE_DOWN_QUATS[face]
+  R = _quat_to_R(q)
+  ref = S_key[0]
+  lift = _group_rest_lift(assembly, set(S_key), ref, face)
+  ref_off = assembly.position_in_base(ref)
+  base_pos = np.array([0.0, 0.0, top + cs / 2.0 + lift + clearance])
+  poses = {}
+  for i, p in enumerate(S_key):
+    pos = base_pos + R @ (assembly.position_in_base(p) - ref_off)
+    f = C.getFrame(f"factcube{i}")
+    f.setPosition(pos)
+    f.setQuaternion(q)
+    poses[p] = np.concatenate([pos, q])
+  grasp_world = _pose_compose(poses[gpart], cube_grasp_pose(gid, cs))
+  base_world = _ee_root_pose(grasp_world, base_rel_tool, q_corr)
+  root = C.getFrame("eeFACT_ur_base")
+  root.setPosition(base_world[:3])
+  root.setQuaternion(base_world[3:])
+  ok = all(d >= -_CHEAP_PENETRATION_TOL for _a, _b, d in C.getCollisions())
+  _TABLE_PICK_FACT_CACHE[key] = ok
+  return ok
+
+
 def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
            edge_check_fn=None, weight=1.0, max_nodes=200000, verbose=True,
            tag="A*", t0=None, cost_bound=None, deadline=None):
@@ -861,6 +1334,8 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
         continue                                          # eager cheap filter (prunes heap growth)
       ng = g + cost_fn(act)
       hns = h_fn(ns)
+      if hns == float("inf"):
+        continue                                          # provable dead end (admissible h)
       if cost_bound is not None and ng + hns >= cost_bound:
         continue                                          # sound prune vs the incumbent
       heapq.heappush(pq, (f_value(ng, hns), hns, ng, next(tie), ns, s, act))
@@ -877,9 +1352,17 @@ def _search_context(C, assembly, robots):
   # the cheap checker's floating EE must MATCH the real gripper: a vacuum stand-in is much
   # slimmer than the two-finger, so it would let grasps through that the real palm/fingers
   # rule out (neighbouring cubes, finger-under-the-cube-into-the-table).
-  vacuum = any(n.endswith("_ur_vacuum") for n in C.getFrameNames())
-  ee_path = os.path.join(os.path.dirname(__file__), UR10_PATHS[(True, vacuum)])
+  names = C.getFrameNames()
+  vacuum = any(n.endswith("_ur_vacuum") for n in names)
+  # ...and mirror the ROBOT model: real arms get the wrist-extended cheap EE, a floating-EE
+  # env gets the plain one (no wrist exists in that model). See CHEAP_EE_PATHS in env.py.
+  floating = not any(n.endswith("_ur_wrist_3_joint") for n in names)
+  ee_path = os.path.join(os.path.dirname(__file__), CHEAP_EE_PATHS[(floating, vacuum)])
   checker = CollisionChecker(assembly, robots, gripper_path=ee_path)
+  # plain-EE variant for the labeled-h pick facts (clutter-free scenes; see the h_lab
+  # construction in solve_assembly_problem for why the wrist is excluded there).
+  checker.fact_gripper_path = os.path.join(os.path.dirname(__file__),
+                                           UR10_PATHS[(True, vacuum)])
   grasp_table = precompute_grasps(assembly, gripper_path=ee_path)
   return checker, grasp_table
 
@@ -894,7 +1377,7 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
                            use_heuristic=True, canonical=False, weight=1.0, robot_ik=None,
                            wrench=False, wrench_aware_h=True, handovers=True,
                            allow_place=True, cost_bound=None, deadline=None,
-                           anonymous=False):
+                           anonymous=False, labeled_h=False):
   """EXACT (weighted) A* over scene-graph states from the initial scene to a completed
   assembly -- the reference baseline. Priority is f = g + weight * h.
     - weight = 1.0 : ordinary A*, returns a minimum-cost plan.
@@ -936,15 +1419,42 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
                                gripper_kind=gk if wrench_aware_h else None) \
       if use_heuristic and not math.isinf(weight) else None
 
+  checker, grasp_table = _search_context(C, assembly, robots)
+  if gk is not None:
+    reset_wrench_cache()
+
+  # labeled_h=True swaps h_abs for the GRASP+FACE-LABELED disassembly abstraction (see
+  # LabeledDisassemblyHeuristic) -- strictly tighter where labels matter, at a build cost
+  # of seconds. Same finite-weight gating as h_abs.
+  h_lab = None
+  if labeled_h and use_heuristic:
+    if math.isinf(weight):
+      warnings.warn("labeled_h requested but weight=inf (greedy): abstraction heuristics "
+                    "are gated to finite weights -- running WITHOUT it. Use e.g. weight=5.",
+                    stacklevel=2)
+    else:
+      if gk is not None:
+        reset_wrench_cache()                              # facts below use the wrench LP
+      # wrench facts follow the search's wrench model (gk) by default; wrench_aware_h=False
+      # builds the labeled abstraction wrench-BLIND for comparison (same toggle as h_abs).
+      # pick facts use the PLAIN floating EE even when the checker runs the wrist variant:
+      # fact scenes hold ONE part at a free table spot (no clutter), so the wrist capsule
+      # adds nothing there except unsound wrist-vs-table rejections (see _wrist_table_pair).
+      h_lab = LabeledDisassemblyHeuristic(assembly, len(robots), grasp_table,
+                                          gripper_path=getattr(
+                                              checker, "fact_gripper_path",
+                                              checker.gripper_path),
+                                          verbose=verbose,
+                                          gripper_kind=gk if wrench_aware_h else None)
+      h_abs = None
+
   def h_fn(state):
     if not use_heuristic:
       return 0.0
     hv = heuristic(state, assembly)
+    if h_lab is not None:
+      return max(hv, h_lab.value(state))
     return max(hv, h_abs.value(state)) if h_abs is not None else hv
-
-  checker, grasp_table = _search_context(C, assembly, robots)
-  if gk is not None:
-    reset_wrench_cache()
 
   def succ_fn(s):
     return successors(s, assembly, robots, grasp_table=grasp_table, canonical=canonical,
@@ -972,11 +1482,19 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
   if anonymous and robot_ik is not None and verbose:
     warnings.warn("anonymous=True with robot_ik: merged robot assignments may hide "
                   "per-robot reachability differences; treat the plan as a candidate.")
+  start = get_initial_state(C, assembly)
+  if h_lab is not None and h_lab.value(start) == float("inf"):
+    if verbose:
+      print("[labeled-h] the INITIAL state provably cannot reach the goal under the "
+            "abstraction's cheap-geometry + wrench facts -> instance INFEASIBLE as "
+            "configured (e.g. insert-force above every grasp capability).")
+    return None
+
   tag = ("UCS" if not use_heuristic else "greedy" if math.isinf(weight)
          else "A*" if weight == 1.0 else f"wA*(w={weight:g})")
   set_anonymous_robots(anonymous)
   try:
-    return _astar(get_initial_state(C, assembly),
+    return _astar(start,
                   goal_fn=lambda s: s.is_goal(assembly),
                   succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn, cheap_fn=None,
                   edge_check_fn=edge_check_fn,
@@ -1308,10 +1826,7 @@ def _add_one_part_declutter(start, p, ideal, assembly, robots, checker, grasp_ta
       # fully lazy (cheap geometry + IK at POP; see solve_assembly_problem). Blocker
       # ATTRIBUTION stays here: a goal-relevant action failing the cheap check names the
       # loose parts in the way (same information as at push, just evaluated later).
-      if act[0] == "stow":
-        ok = checker.collision_free(ns, assembly)         # stow lands aside -> check the result
-      else:
-        ok = cheap_feasible(act, prev, ns, assembly, checker)
+      ok = cheap_feasible(act, prev, ns, assembly, checker)  # stow is a _GEOMETRIC_ACTION now
       if not ok:
         if act[2] == p or act[2] in ideal:                # a GOAL-RELEVANT action was blocked
           if act[0] == "pick":
