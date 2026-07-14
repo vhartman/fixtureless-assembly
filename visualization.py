@@ -13,6 +13,110 @@ globals().update({k: v for k, v in vars(_problem).items() if not k.startswith("_
 globals().update({k: v for k, v in vars(_solver).items() if not k.startswith("__")})
 
 
+def visualize_dependency_graph(assembly, path=None, view=False):
+  """Render the assembly's PRECEDENCE / mate structure as a layered DAG (graphviz `dot`),
+  so the build order the model actually enforces is visible at a glance. Edge kinds:
+    * solid black  : mate-parent (the geometric weld a part seats onto -- also a precedence),
+    * dashed grey  : an EXTRA dependency (a precedence that is not this part's mate parent,
+                     e.g. a plate's diamond corner needing its second in-plane neighbour),
+    * bold red     : a CONNECT mate (a module join; label shows connect_requires).
+  Arrows point prerequisite -> dependent (build flows along the arrows); the base is pinned
+  to the bottom rank. Returns the output PNG path. Needs pydot + the graphviz `dot` binary.
+
+  Also prints the adjacency as text (works with no display / no graphviz)."""
+  import os
+  base = assembly.base
+  connect = getattr(assembly, "connect_parts", set())
+  requires = getattr(assembly, "connect_requires", {})
+
+  # --- text form: parts and their precedences (always available) ---
+  print(f"dependency graph: {type(assembly).__name__} ({len(assembly.objects)} parts, "
+        f"base={base})")
+  for p in assembly.objects:
+    rel = assembly.relative_pose(p)
+    mate = rel[0] if rel else None
+    deps = [d for d in assembly.dependencies_of(p) if d != mate]
+    tag = "  [CONNECT" + (f" needs {sorted(requires.get(p, set()), key=_part_index)}]"
+                          if requires.get(p) else "]") if p in connect else ""
+    parts = []
+    if mate is not None:
+      parts.append(f"mate<-{mate}" + (" (connect)" if p in connect else ""))
+    if deps:
+      parts.append(f"dep<-{deps}")
+    print(f"  {p}: {', '.join(parts) if parts else '(base / free)'}{tag}")
+
+  # --- graphviz render ---
+  try:
+    import pydot
+  except ImportError:
+    print("[dep-graph] pydot not available -- text form only")
+    return None
+  # MODULES = connected components once the connect (join) edges are removed. Each is a
+  # self-contained order ideal -- a sub-assembly buildable on its own. Drawing them as
+  # clusters makes "how many independent pieces, joined how" obvious.
+  comp = {p: p for p in assembly.objects}
+
+  def find(x):
+    while comp[x] != x:
+      comp[x] = comp[comp[x]]
+      x = comp[x]
+    return x
+
+  def union(a, b):
+    comp[find(a)] = find(b)
+  for p in assembly.objects:
+    rel = assembly.relative_pose(p)
+    if rel is not None and p not in connect:
+      union(p, rel[0])
+    for d in assembly.dependencies_of(p):
+      union(p, d)
+  modules = {}
+  for p in assembly.objects:
+    modules.setdefault(find(p), []).append(p)
+
+  g = pydot.Dot(graph_type="digraph", rankdir="BT", splines="true", nodesep="0.4",
+                compound="true")
+  for i, (root, members) in enumerate(sorted(modules.items(),
+                                             key=lambda kv: min(_part_index(m) for m in kv[1]))):
+    sub = pydot.Cluster(f"m{i}", label=(f"module {i}" if len(modules) > 1 else ""),
+                        color="#8899bb", style="rounded")
+    for p in sorted(members, key=_part_index):
+      fill = "#cde6ff" if p == base else ("#ffe0cc" if p in connect else "#eeeeee")
+      sub.add_node(pydot.Node(p, style="filled", fillcolor=fill, shape="box",
+                              fontname="Helvetica"))
+    g.add_subgraph(sub)
+  # pin the base to the bottom rank
+  for p in assembly.objects:
+    rel = assembly.relative_pose(p)
+    mate = rel[0] if rel else None
+    if mate is not None:
+      if p in connect:
+        req = sorted(requires.get(p, set()), key=_part_index)
+        g.add_edge(pydot.Edge(mate, p, color="red", penwidth="2.2",
+                              label="connect" + (f"\\nneeds {req}" if req else ""),
+                              fontcolor="red", fontsize="9"))
+      else:
+        g.add_edge(pydot.Edge(mate, p, color="black"))
+    for d in assembly.dependencies_of(p):
+      if d != mate:
+        g.add_edge(pydot.Edge(d, p, color="grey40", style="dashed"))
+
+  if path is None:
+    path = os.path.join(os.path.dirname(__file__),
+                        f"depgraph_{type(assembly).__name__}.png")
+  g.write_png(path)
+  print(f"[dep-graph] wrote {path}")
+  if view:
+    try:
+      import matplotlib.pyplot as plt
+      import matplotlib.image as mpimg
+      plt.figure(figsize=(6, 8)); plt.imshow(mpimg.imread(path)); plt.axis("off")
+      plt.tight_layout(); plt.show()
+    except Exception as e:
+      print(f"[dep-graph] view failed ({e}); open {path} manually")
+  return path
+
+
 def display_final_assembly(C, assembly, base_pose):
   C_final = ry.Config()
   C_final.addConfigurationCopy(C)

@@ -59,6 +59,16 @@ class Assembly:
     self.masses = {}
     self.mate_types = {}
     self.mate_axes = {}
+    # CONNECT (module-join) mates: parts whose mate onto their parent joins two independently
+    # built MODULES rather than adding a part within one. Their mate edge is NOT traversed by
+    # `_mate_closure` (so each module's internal build precedence excludes the join), which is
+    # what lets a module (e.g. a plate) be an order ideal on its own -- buildable detached and
+    # connected as a UNIT. `connect_requires[p]` = the parts of the OTHER module that must be
+    # complete before p may connect (the join precedence, enforced by the connect action, not
+    # by module enumeration). Default empty -> the classic single-tree assemblies are
+    # unchanged. See CubeTwoPlateAssembly.
+    self.connect_parts = set()
+    self.connect_requires = {}
     self.define()
     for p in self.objects:                                 # fill physics defaults
       self.masses.setdefault(p, self.DEFAULT_MASS)
@@ -334,20 +344,20 @@ class ArchSequentialAssembly(Assembly):
 
 
 class CubeTwoPlateAssembly(Assembly):
-  """A 2x2x2 cube conceived as TWO 2x2 PLATES (bottom obj_0..3, top obj_4..7) that stack.
+  """A 2x2x2 cube built as TWO 2x2 PLATES (bottom obj_0..3, top obj_4..7) that stack.
 
-  Unlike CubeGridAssembly (a star: every cell welds to obj_0), this uses a FAITHFUL
-  adjacency mate graph -- each cell mates onto a physically touching neighbour -- and DAG
-  dependencies with real DIAMONDS: the 4th cell of a plate needs BOTH of its in-plane
-  neighbours, and the top plate's root joins only once the whole bottom plate is built. It
-  exists to stress-test assumptions the chain-based test assemblies never exercise:
-  multi-predecessor (diamond) dependencies, and a stacked mate-onto-non-base JOIN.
+  Each plate is a linear CHAIN of face-adjacent cubes (a snake around the square), so the
+  precedence is a simple sequence -- no diamonds. The bottom chain is rooted at the global
+  base obj_0; the top chain is rooted at obj_4, whose mate onto obj_0 is the module JOIN
+  (a `connect` mate: not traversed by `_mate_closure`, so the top plate is a self-contained
+  order ideal, buildable DETACHED).
 
-  NB the CURRENT planner still builds this as ONE growing component (single-part `assembles`
-  only): the top plate is NOT pre-built as a detached unit and then joined -- obj_4 joins
-  onto the bottom plate first, then obj_5..7 are added one at a time onto the joined stack.
-  A genuine build-two-plates-then-connect needs the deferred connect-two-subassemblies
-  capability (see ArchAssembly doc); this assembly is the motivating case for it."""
+  The join is FORCED by structure, not by a special rule: `connect_requires[obj_4]` is just
+  the LAST cube of each chain (bottom obj_2, top obj_6). Because each chain is linear,
+  needing its last cube transitively needs the whole plate -- so obj_4 can only join once
+  BOTH plates are complete, and (since obj_4's own module must be complete to hold the last
+  top cube) the top plate is necessarily pre-built as a unit. `assemble` handles the join
+  (a module is just a subassembly-valued insert); there is no separate action."""
 
   def __init__(self, n_parts=8, spacing=0.055, cube_size=0.05, cube_radius=0.005):
     assert 1 <= n_parts <= 8, "a 2x2x2 cube has 8 cells"
@@ -361,33 +371,38 @@ class CubeTwoPlateAssembly(Assembly):
     self.objects = [f"obj_{i}" for i in range(self.n_parts)]
     self.base = "obj_0"
     o = self.spacing
-    # faithful mate tree: [parent, offset-from-parent]. Rooted at obj_0; each part welds to
-    # an ADJACENT part already in its dependency closure. obj_4->obj_0 is the vertical JOIN.
+    # each plate is a CHAIN (face-adjacent snake), [parent, offset]. Bottom: 0->1->3->2.
+    # Top: 4->5->7->6, rooted at obj_4 whose mate onto obj_0 is the JOIN (connect).
     mates = {
         "obj_1": ["obj_0", [o, 0, 0]],
-        "obj_2": ["obj_0", [0, o, 0]],
-        "obj_3": ["obj_1", [0, o, 0]],          # bottom-plate diamond corner
-        "obj_4": ["obj_0", [0, 0, o]],          # THE JOIN (top plate stacks on bottom)
+        "obj_3": ["obj_1", [0, o, 0]],
+        "obj_2": ["obj_3", [-o, 0, 0]],         # bottom chain ends here (obj_2)
+        "obj_4": ["obj_0", [0, 0, o]],          # THE JOIN: top plate root onto the base
         "obj_5": ["obj_4", [o, 0, 0]],
-        "obj_6": ["obj_4", [0, o, 0]],
-        "obj_7": ["obj_5", [0, o, 0]],          # top-plate diamond corner
-    }
-    # DAG precedence (diamonds): a plate's 4th cell needs both in-plane neighbours; the join
-    # (obj_4) needs the bottom plate complete (via obj_3's closure). _mate_closure unions
-    # these with the mate parents, so deps need only add the non-mate-parent predecessors.
-    deps = {
-        "obj_1": ["obj_0"], "obj_2": ["obj_0"], "obj_3": ["obj_1", "obj_2"],
-        "obj_4": ["obj_3"],                     # => transitively the whole bottom plate
-        "obj_5": ["obj_4"], "obj_6": ["obj_4"], "obj_7": ["obj_5", "obj_6"],
+        "obj_7": ["obj_5", [0, o, 0]],
+        "obj_6": ["obj_7", [-o, 0, 0]],         # top chain ends here (obj_6)
     }
     self.assembly_relative_poses = {
         p: [par, np.array(off, dtype=float)] for p, (par, off) in mates.items()
         if int(p.split("_")[1]) < self.n_parts
     }
+    # dependencies MIRROR the mate chains (each cube needs its one predecessor), EXCEPT the
+    # connect root obj_4 has no dependency -- that keeps the top chain {obj_4..7} a
+    # self-contained order ideal in get_subassemblies (enumerable + buildable detached).
+    deps = {
+        "obj_1": ["obj_0"], "obj_3": ["obj_1"], "obj_2": ["obj_3"],   # bottom chain
+        "obj_5": ["obj_4"], "obj_7": ["obj_5"], "obj_6": ["obj_7"],   # top chain
+    }
     self.assembly_dependencies = {
         p: [d for d in ds if int(d.split("_")[1]) < self.n_parts]
         for p, ds in deps.items() if int(p.split("_")[1]) < self.n_parts
     }
+    # the JOIN (obj_4->obj_0) needs the LAST cube of each chain present: bottom obj_2 (=>
+    # bottom plate complete, in the target) and top obj_6 (=> top plate complete, in obj_4's
+    # own held module). Only when both plates exist (n_parts == 8).
+    if self.n_parts == 8:
+      self.connect_parts = {"obj_4"}
+      self.connect_requires = {"obj_4": {"obj_2", "obj_6"}}
 
 
 def make_assembly(kind, n_parts):
@@ -1065,42 +1080,52 @@ def places(state, assembly, robots):
 
 
 def assembles(state, assembly, robots, gripper_kind=None):
-  # a robot mates its held single part onto a supported target assembly per the manual.
-  # The robot KEEPS holding (its grasp becomes a brace); freeing it is a separate,
-  # support-gated `release`. So assemble only adds the mate -- it does not let go.
+  # Mate a HELD subassembly onto a supported target per the manual: the group's SEAM part (the
+  # one whose mate parent lies in the target) welds on. A single held part is the size-1 case;
+  # a whole MODULE (a finished plate) is the general case -- ONE action either way (`assemble`),
+  # so real-IK covers both. The holder KEEPS gripping (its grasp becomes a brace); a separate
+  # support-gated `release` frees it. So assemble only adds the mate -- it does not let go.
+  connect_parts = getattr(assembly, "connect_parts", set())
   for group in state.subassemblies():
-    if len(group) != 1:
-      continue                                            # simplest: add single parts only
-    (p,) = tuple(group)
-    if state.parent.get(p, (None,))[0] != "gripper":
-      continue                                            # the added part must be held
-    holder = state.parent[p][1]
-    rel = assembly.assembly_relative_poses.get(p)
-    if rel is None:
-      continue                                            # base part has no mate parent
-    onto = rel[0]
+    gset = set(group)
+    roots = [q for q in group if state.parent.get(q, (None,))[0] == "gripper"]
+    if len(roots) != 1:
+      continue                                            # the group must be HELD (one gripper)
+    if any(("table",) in state.supports.get(q, ()) for q in group):
+      continue                                            # ... in the air (not resting)
+    holder = state.parent[roots[0]][1]
+    # the SEAM: the single part of the held group whose mate parent lies OUTSIDE the group.
+    # (0 -> a held base, nothing to mate; >1 -> ambiguous, not a clean insert.)
+    external = [q for q in group if assembly.relative_pose(q) is not None
+                and assembly.relative_pose(q)[0] not in gset]
+    if len(external) != 1:
+      continue
+    p = external[0]
+    onto = assembly.relative_pose(p)[0]
     target = next((g for g in state.subassemblies() if onto in g), None)
     if target is None:
       continue
-    if not _mate_closure(assembly, p).issubset(target):
-      # the target must contain ALL of p's transitive dependencies (deps + mate parents),
-      # not just the direct one -- otherwise a chain that mates onto its PREDECESSOR (not
-      # the base, e.g. arch-seq) could build a FLOATING mid-chain group that is not a
-      # dependency-closed order ideal, so it is never enumerated in get_subassemblies /
-      # the grasp table (KeyError) and is not a sensible sequential build anyway.
-      continue                                            # precedence: target stays an ideal
+    if not _mate_closure(assembly, p).issubset(gset | set(target)):
+      # precedence: p's transitive predecessors must be built -- inside the held group (the
+      # module's own chain) or in the target. Keeps the target an order ideal and forbids
+      # mating a chain onto a floating mid-chain piece.
+      continue
+    if p in connect_parts and not assembly.connect_requires.get(p, set()).issubset(
+        gset | set(target)):
+      # a module JOIN: the seam's required last-cubes (the end of each plate's chain) must be
+      # present -- in the held module (=> this plate complete) and the target (=> that plate
+      # complete). Being a chain, needing the last cube needs the whole plate, so a partial
+      # module has no complete seam to join with: the two-plates-then-join order is FORCED.
+      continue
     if not state.is_supported(target, assembly, gripper_kind):
       continue                                            # target must be supported
     if gripper_kind is not None:
-      # WRENCH: THE mate's press direction (assembly.mate_axis -- a single direction, like
-      # a real assembly manual; per-mate overridable) must satisfy BOTH
-      #   (a) the target withstands the insertion reaction while p is seated (a table-only
-      #       target has no friction for a sideways press -> topples; a held one loads its
-      #       carrier grasp incl. the lever torque), and
-      #   (b) [PARAMS['check_inserter']] the actor's OWN grasp transmits the press (e.g. a
-      #       vacuum side-grasp cannot push 10 N of shear across a 3.75 N cap; the grasp
-      #       aligned with the press takes it as compression) -- so both grasp-the-part-
-      #       to-press and hold-the-assembly-in-line emerge.
+      # WRENCH (single part or whole module alike): the mate's press direction (mate_axis, a
+      # single per-mate direction like a real manual) must satisfy BOTH
+      #   (a) the target withstands the insertion reaction while the seam seats, and
+      #   (b) [check_inserter] the HELD group -- its own weight/lever plus the seating reaction
+      #       -- is transmittable through its grasp(s). Passing `group` to _group_stable prices
+      #       in a heavy module's gravity automatically; for a single part it is the old check.
       d = assembly.mate_axis(p)
       if not _group_stable(state, assembly, target, gripper_kind,
                            applied=[_insertion_load(state, assembly, p, onto, d)]):
@@ -1111,18 +1136,16 @@ def assembles(state, assembly, robots, gripper_kind=None):
         continue
     if _group_is_on_table(state, target) and not _on_table_mateable_cached(
         assembly, p, _placement_face(state, target)):
-      # the mate would jam p into the table at the group's CURRENT rest pose -- for its
-      # CURRENT placement face (e.g. the -z cube under an upright base; a different face
-      # may well admit it: that is what reorientation placements are for). The table
-      # contact must genuinely be removed first -- pick, mate in the air, place back (or
-      # re-place on a suitable face). Without this gate the state would carry a FALSE
-      # persistent table support through a braced lift, wrongly legalizing releases.
+      # the mate would jam the seam into the table at the target's CURRENT rest pose/face
+      # (a different face may admit it -- that is what reorientation placements are for).
       continue
     ns = _copy_edit_support(state)
-    ns.parent[p] = ("part", onto)     # pose now defined by the mate, not the gripper
-    ns.grasp.pop(p, None)             # ... so it is no longer the kinematic gripper child
-    ns.place.pop(p, None)
-    ns.supports[p] = ns.supports[p] | {("mate", onto)}    # grasp contact stays as a brace
+    ns.parent = _rerooted(ns.parent, p)          # re-root the held group at its seam (no-op for
+    ns.parent[p] = ("part", onto)                # a single part)... and weld the seam onto target
+    for x in group:                              # no held part is a gripper child now; the grasp
+      ns.grasp.pop(x, None)                      # CONTACTS stay in supports as braces until a
+      ns.place.pop(x, None)                      # later `release`
+    ns.supports[p] = ns.supports[p] | {("mate", onto)}
     yield ("assemble", holder, p, onto), ns
 
 
@@ -1238,7 +1261,7 @@ def successors(state, assembly, robots, grasp_table=None, canonical=False,
   # remaining holder either way. allow_place=False FORBIDS setting a held group back on the
   # table -> the search holds + regrasps in the air (no forced regime; just fewer options).
   yield from picks(state, assembly, robots, grasp_table=grasp_table, canonical=canonical)
-  yield from assembles(state, assembly, robots, gripper_kind=gripper_kind)
+  yield from assembles(state, assembly, robots, gripper_kind=gripper_kind)  # incl. module joins
   if handovers:
     yield from fused_handovers(state, assembly, robots, grasp_table=grasp_table)
   if bracing:
@@ -1532,14 +1555,22 @@ _CHEAP_PENETRATION_TOL = 0.005
 
 
 def _mate_closure(assembly, part):
-  # every part that must already be assembled before `part` can be mated: transitive
-  # dependencies plus the chain of mate parents (both are required by `assembles`).
+  # every part that must already be assembled before `part` can be mated WITHIN ITS MODULE:
+  # transitive dependencies plus the chain of mate parents (both required by `assembles`).
+  # A CONNECT part's mate edge is a module JOIN, not an intra-module build step, so it is NOT
+  # traversed here -- that is exactly what keeps a module (e.g. a plate) a self-contained
+  # order ideal, buildable before it is joined. The join precedence lives in connect_requires
+  # (enforced by the connect action), not in this closure.
+  connect = getattr(assembly, "connect_parts", set())
   need = set()
   frontier = [part]
   while frontier:
     p = frontier.pop()
-    for q in list(assembly.dependencies_of(p)) + (
-        [assembly.relative_pose(p)[0]] if assembly.relative_pose(p) else []):
+    deps = list(assembly.dependencies_of(p))
+    rel = assembly.relative_pose(p)
+    if rel is not None and p not in connect:
+      deps.append(rel[0])                                  # intra-module mate parent
+    for q in deps:
       if q not in need:
         need.add(q)
         frontier.append(q)

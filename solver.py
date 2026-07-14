@@ -624,10 +624,12 @@ class RobotIK:
     return komo
 
   def _ik_assemble(self, action, s0, s1, assembly, seed, bias_axes=None):
-    # solve for the added CUBE's pose: the added part must reach its mate pose relative to
-    # the target subassembly. Active = the adder + whoever holds the target (if held) -- so
-    # the assembly pose is co-optimized. If the target is on the table it is a fixed target
-    # and only the adder is active (all others held near home by the control cost).
+    # solve for the added part's mate pose: the SEAM (`part`) must reach its mate pose
+    # relative to the target subassembly. `part` may be a single cube OR the seam of a whole
+    # held MODULE (a plate) -- in the latter case the module is rigid in the scene, so the
+    # one seam->onto constraint positions the entire module (obj_5..7 ride along). Active =
+    # the adder + whoever holds the target (if held). If the target is on the table it is a
+    # fixed target and only the adder is active (others held near home by the control cost).
     #
     # STRUCTURED RESTARTS: instead of random inits, sweep the canonical assembly
     # orientations (`_ASSEMBLE_BIAS_ORIENTATIONS`) -- each biases the held assembly toward a
@@ -643,10 +645,14 @@ class RobotIK:
     rel_pos = np.asarray(assembly.relative_pose(part)[1], dtype=float)
     rel_quat = np.array([1.0, 0.0, 0.0, 0.0])
 
-    # the mate seats `part` flush against `onto`, so their contact is intended -- exclude the
-    # moving part from collision (otherwise the mate itself reads as a penetration). The
-    # cheap floating-EE check already covers this part-vs-scene geometry.
-    C.getFrame(part_name).setContact(0)
+    # the mate seats the moving group flush against the target, so those contacts are intended
+    # -- exclude the WHOLE moving group from collision (a single cube, or every cube of a
+    # module: a stacked plate touches the target plate on all its cubes). Otherwise the
+    # intended flush seating reads as penetration and IK fails. Arm-vs-rest collision stays on;
+    # the cheap floating-EE check already covered the moved geometry vs the scene.
+    moving = next((g for g in s0.subassemblies() if part in g), (part,))
+    for mp in moving:
+      C.getFrame(mp).setContact(0)
 
     biases = [bias_axes] if bias_axes is not None else _ASSEMBLE_BIAS_ORIENTATIONS
     komo = None
