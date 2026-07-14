@@ -63,7 +63,7 @@ class CollisionChecker:
     template = make_world()                                # floor + table, same as the real env
     cs, cr = assembly.cube_size, assembly.cube_radius
     for obj in assembly.objects:                           # the parts, as cubes (posed per query)
-      template.addFrame(obj).setShape(ry.ST.ssBox, [cs, cs, cs, cr]).setContact(1)
+      template.addFrame(obj).setShape(ry.ST.box, [cs, cs, cs]).setContact(1)
 
     # one free-floating gripper slot per robot (at most one active grasp per robot),
     # pre-loaded and parked far away so unused slots touch nothing.
@@ -1202,7 +1202,7 @@ def _fact_template(gripper_path, cs, cr, n_parts):
     return hit
   C = make_world()
   for i in range(n_parts):
-    C.addFrame(f"factcube{i}").setShape(ry.ST.ssBox, [cs, cs, cs, cr]) \
+    C.addFrame(f"factcube{i}").setShape(ry.ST.box, [cs, cs, cs]) \
         .setPosition([0.0, -500.0 - 2.0 * i, 1.0]).setContact(1)
   place_floating_ee(C, np.array([0.0, -900.0, 1.0, 1.0, 0.0, 0.0, 0.0]),
                     gripper_path, prefix="eeFACT_")

@@ -161,7 +161,7 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
 
       obj = (
           C.addFrame(name).setParent(C.getFrame("table")).setShape(
-              ry.ST.ssBox, [cs, cs, cs, cr]
+              ry.ST.box, [cs, cs, cs]
           ).setRelativePosition([pos[0], pos[1], pos[2]]).setMass(0.1).setColor(
               np.random.rand(3)
           ).setContact(1).setJoint(ry.JT.rigid)
@@ -519,7 +519,7 @@ def make_subassembly_scene(assembly, subassembly, contact=1):
   for obj in subassembly:
     obj_in_ref = assembly.position_in_base(obj) - ref_pos
     (C.addFrame(obj)
-        .setShape(ry.ST.ssBox, [cs, cs, cs, cr])
+        .setShape(ry.ST.box, [cs, cs, cs])
         .setPosition(obj_in_ref)
         .setContact(contact))
   return C
@@ -1600,6 +1600,6 @@ def _on_table_mateable(assembly, part, tol=None, face=_IDENTITY_FACE):
   lift = _group_rest_lift(assembly, context, assembly.base, face) if context else 0.0
   base_pos = np.array([0.0, 0.0, top + cs / 2.0 + lift])
   for p in sorted(context | {part}, key=_part_index):
-    C.addFrame(p).setShape(ry.ST.ssBox, [cs, cs, cs, cr]).setPosition(
+    C.addFrame(p).setShape(ry.ST.box, [cs, cs, cs]).setPosition(
         base_pos + R @ assembly.position_in_base(p)).setQuaternion(q).setContact(1)
   return all(d >= -tol for _a, _b, d in C.getCollisions())
