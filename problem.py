@@ -148,16 +148,19 @@ class Assembly:
     return self.position_in_base(parent) + np.asarray(rel_pos, dtype=float)
 
 def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, max_tries=200,
-                         spacing=1.0 / 7.0):
+                         spacing=1.0 / 7.0, per_row=8):
   # scatter the assembly's parts on the table as loose cubes (test scene). Geometry
   # (cube_size / cube_radius) comes from the assembly, not a global. `spacing` = the x-pitch
   # of the scatter line (default = historical 1/7 m ~ 0.143); a knob for analysing how much
   # search/IK pain comes from the cramped test scene (arms diving between close neighbours)
-  # rather than the planner.
+  # rather than the planner. Parts beyond `per_row` WRAP into further rows (y += spacing per
+  # row) -- a single line of >8 parts walks off the reachable table. Row 0 is byte-identical
+  # to the historical line, so existing <=8-part scenes are unchanged.
   cs, cr = assembly.cube_size, assembly.cube_radius
 
   for i, name in enumerate(assembly.objects):
-      pos = np.array([-0.5 + i * spacing, 0, 0.07])
+      row, col = divmod(i, per_row)
+      pos = np.array([-0.5 + col * spacing, row * spacing, 0.07])
 
       obj = (
           C.addFrame(name).setParent(C.getFrame("table")).setShape(
@@ -343,75 +346,84 @@ class ArchSequentialAssembly(Assembly):
     }
 
 
-class CubeTwoPlateAssembly(Assembly):
-  """A 2x2x2 cube built as TWO 2x2 PLATES (bottom obj_0..3, top obj_4..7) that stack.
+class CubePlatesAssembly(Assembly):
+  """A width x depth x height cube LATTICE built as `height` stacked width-x-depth PLATES.
 
-  Each plate is a linear CHAIN of face-adjacent cubes (a snake around the square), so the
-  precedence is a simple sequence -- no diamonds. The bottom chain is rooted at the global
-  base obj_0; the top chain is rooted at obj_4, whose mate onto obj_0 is the module JOIN
-  (a `connect` mate: not traversed by `_mate_closure`, so the top plate is a self-contained
-  order ideal, buildable DETACHED).
+  Each plate is a linear CHAIN of face-adjacent cubes (a boustrophedon/serpentine walk over
+  the w x d grid), so the intra-plate precedence is a simple sequence -- no diamonds. Cubes
+  are NAMED IN CHAIN ORDER: plate k occupies obj_{k*w*d} .. obj_{(k+1)*w*d - 1}, rooted at
+  obj_{k*w*d}. The bottom root is the global base; every higher plate's root mates onto the
+  root directly BENEATH it, and that mate is the module JOIN (a `connect` mate: not
+  traversed by `_mate_closure`, so each plate is a self-contained order ideal, buildable
+  DETACHED).
 
-  The join is FORCED by structure, not by a special rule: `connect_requires[obj_4]` is just
-  the LAST cube of each chain (bottom obj_2, top obj_6). Because each chain is linear,
-  needing its last cube transitively needs the whole plate -- so obj_4 can only join once
-  BOTH plates are complete, and (since obj_4's own module must be complete to hold the last
-  top cube) the top plate is necessarily pre-built as a unit. `assemble` handles the join
-  (a module is just a subassembly-valued insert); there is no separate action."""
+  The join order is FORCED by structure, not by a special rule: `connect_requires[root_k]`
+  is the LAST cube of plate k's chain (own plate complete, in the held module) and the LAST
+  cube of plate k-1's chain (the plate below complete, in the target -- lower plates are
+  then complete transitively, since plate k-1 could itself only have joined complete).
+  Because each chain is linear, needing its last cube needs the whole plate. `assemble`
+  handles the join (a module is just a subassembly-valued insert); no separate action.
 
-  def __init__(self, n_parts=8, spacing=0.055, cube_size=0.05, cube_radius=0.005):
-    assert 1 <= n_parts <= 8, "a 2x2x2 cube has 8 cells"
-    self.n_parts = n_parts
+  Truncation (n_parts < w*d*h) keeps the first n_parts cubes: a PARTIAL top plate keeps its
+  root as a REGULAR mate (buildable cube-by-cube on the stack); the root becomes a connect
+  only when its whole plate exists. This preserves the old 2x2x2 partial-instance behavior
+  (used by the test suite at 4/6 parts)."""
+
+  def __init__(self, width=2, depth=2, height=2, n_parts=None,
+               spacing=0.055, cube_size=0.05, cube_radius=0.005):
+    total = width * depth * height
+    self.width, self.depth, self.height = width, depth, height
+    self.n_parts = total if n_parts is None else min(n_parts, total)
+    assert self.n_parts >= 1
     self.spacing = spacing
     self.cube_size = cube_size
     self.cube_radius = cube_radius
     super().__init__()
 
   def define(self):
+    w, per = self.width, self.width * self.depth
+    o = self.spacing
     self.objects = [f"obj_{i}" for i in range(self.n_parts)]
     self.base = "obj_0"
-    o = self.spacing
-    # each plate is a CHAIN (face-adjacent snake), [parent, offset]. Bottom: 0->1->3->2.
-    # Top: 4->5->7->6, rooted at obj_4 whose mate onto obj_0 is the JOIN (connect).
-    mates = {
-        "obj_1": ["obj_0", [o, 0, 0]],
-        "obj_3": ["obj_1", [0, o, 0]],
-        "obj_2": ["obj_3", [-o, 0, 0]],         # bottom chain ends here (obj_2)
-        "obj_4": ["obj_0", [0, 0, o]],          # THE JOIN: top plate root onto the base
-        "obj_5": ["obj_4", [o, 0, 0]],
-        "obj_7": ["obj_5", [0, o, 0]],
-        "obj_6": ["obj_7", [-o, 0, 0]],         # top chain ends here (obj_6)
-    }
+
+    def cell(j):
+      # grid cell of chain index j within a plate: serpentine rows (even row left->right,
+      # odd row right->left), so consecutive chain indices are always face-adjacent.
+      row, col = divmod(j, w)
+      return (col if row % 2 == 0 else w - 1 - col, row)
+
+    mates, deps = {}, {}
+    for i in range(1, self.n_parts):
+      k, j = divmod(i, per)
+      if j == 0:                                # plate ROOT: stacks onto the root below (JOIN)
+        mates[f"obj_{i}"] = [f"obj_{(k - 1) * per}", [0.0, 0.0, o]]
+        # no dependency entry: the plate stays a self-contained ideal (buildable detached)
+      else:                                     # serpentine step within the plate
+        (x0, y0), (x1, y1) = cell(j - 1), cell(j)
+        mates[f"obj_{i}"] = [f"obj_{i - 1}", [(x1 - x0) * o, (y1 - y0) * o, 0.0]]
+        deps[f"obj_{i}"] = [f"obj_{i - 1}"]
     self.assembly_relative_poses = {
         p: [par, np.array(off, dtype=float)] for p, (par, off) in mates.items()
-        if int(p.split("_")[1]) < self.n_parts
     }
-    # dependencies MIRROR the mate chains (each cube needs its one predecessor), EXCEPT the
-    # connect root obj_4 has no dependency -- that keeps the top chain {obj_4..7} a
-    # self-contained order ideal in get_subassemblies (enumerable + buildable detached).
-    deps = {
-        "obj_1": ["obj_0"], "obj_3": ["obj_1"], "obj_2": ["obj_3"],   # bottom chain
-        "obj_5": ["obj_4"], "obj_7": ["obj_5"], "obj_6": ["obj_7"],   # top chain
-    }
-    self.assembly_dependencies = {
-        p: [d for d in ds if int(d.split("_")[1]) < self.n_parts]
-        for p, ds in deps.items() if int(p.split("_")[1]) < self.n_parts
-    }
-    # the JOIN (obj_4->obj_0) needs the LAST cube of each chain present: bottom obj_2 (=>
-    # bottom plate complete, in the target) and top obj_6 (=> top plate complete, in obj_4's
-    # own held module). Only when both plates exist (n_parts == 8).
-    if self.n_parts == 8:
-      self.connect_parts = {"obj_4"}
-      self.connect_requires = {"obj_4": {"obj_2", "obj_6"}}
+    self.assembly_dependencies = deps
+    # a plate root is a CONNECT iff its plate is FULLY present; the join requires the last
+    # chain cube of its own plate and of the plate below (see class doc).
+    for k in range(1, self.height):
+      root, last_own, last_below = k * per, (k + 1) * per - 1, k * per - 1
+      if last_own < self.n_parts:
+        self.connect_parts.add(f"obj_{root}")
+        self.connect_requires[f"obj_{root}"] = {f"obj_{last_own}", f"obj_{last_below}"}
 
 
 def make_assembly(kind, n_parts):
   """Assembly factory for the CLI: cross (cube cross), cube (2x2x2 grid), arch (bridge --
   known-flawed star, see class doc), arch-seq (arch shape built as a sequential chain),
-  cube-plates (2x2x2 cube as two stacked 2x2 plates, faithful DAG mate graph)."""
+  cube-plates (2x2x2 as two stacked 2x2 plates), cube-plates-2x2x3 (three stacked 2x2
+  plates, 12 cubes). The plates family generalizes to any WxDxH via CubePlatesAssembly."""
   kinds = {"cross": (CubeCrossAssembly, 7), "cube": (CubeGridAssembly, 8),
            "arch": (ArchAssembly, 7), "arch-seq": (ArchSequentialAssembly, 7),
-           "cube-plates": (CubeTwoPlateAssembly, 8)}
+           "cube-plates": (CubePlatesAssembly, 8),
+           "cube-plates-2x2x3": (lambda n_parts: CubePlatesAssembly(2, 2, 3, n_parts=n_parts), 12)}
   cls, max_n = kinds[kind]
   return cls(n_parts=min(n_parts, max_n))
 

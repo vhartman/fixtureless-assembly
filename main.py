@@ -51,12 +51,14 @@ def parse_args():
       help="Number of parts in the assembly (clamped per type). Default: 7.",
   )
   parser.add_argument(
-      "--assembly", choices=["cross", "cube", "arch", "arch-seq", "cube-plates"],
+      "--assembly",
+      choices=["cross", "cube", "arch", "arch-seq", "cube-plates", "cube-plates-2x2x3"],
       default="cross",
       help="Assembly to build: cross (cube cross, 7), cube (2x2x2 grid, 8), "
            "arch (two pillars + lintel, 7 -- known-flawed star model), "
            "arch-seq (arch shape built as a sequential chain, 7), "
-           "cube-plates (2x2x2 cube as two stacked 2x2 plates, faithful DAG). "
+           "cube-plates (2x2x2 cube as two stacked 2x2 plates, faithful DAG), "
+           "cube-plates-2x2x3 (three stacked 2x2 plates, 12 cubes -- use --parts 12). "
            "Default: cross.",
   )
   parser.add_argument(
