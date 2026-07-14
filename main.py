@@ -106,6 +106,12 @@ def parse_args():
            "replay the plan with the actual arm poses instead of floating-EE stand-ins.",
   )
   parser.add_argument(
+      "--full-ik", action="store_true",
+      help="DEBUG: disable the single-active-arm pick-IK optimisations (restrict-to-arm + "
+           "strip inactive-robot collision). Uses the full multi-arm KOMO instead. Slower; "
+           "for checking the optimisations against the reference.",
+  )
+  parser.add_argument(
       "--optimistic", action="store_true",
       help="Use the optimistic (Dogar-style) per-part search -- add one part at a time via "
            "its own small complete sub-search (reorient/hold/pick/mate/set-down), with exact "
@@ -186,6 +192,13 @@ def parse_args():
            "them in a viser browser after the solve (before the plan replay). Collection "
            "stops after SECONDS (default 60, measured from the first failure) or 300 "
            "entries, whichever first.",
+  )
+  parser.add_argument(
+      "--collapsed-h", action="store_true",
+      help="Use the IDENTITY-COLLAPSED labeled disassembly heuristic (loose held parts "
+           "tracked WITHOUT grasp ids). Same admissibility/completeness guarantees as "
+           "--labeled-h, weaker guidance, but the build scales in #robots (the fine "
+           "version explodes at 4). Mutually exclusive with --labeled-h.",
   )
   parser.add_argument(
       "--view-cheap-checks", action="store_true",
@@ -272,6 +285,10 @@ def main():
   if args.solve:
     robots = get_robots(C)
     robot_ik = RobotIK(C, robots) if args.real_ik else None
+    if robot_ik is not None and args.full_ik:
+      robot_ik.single_arm_ik = False
+      robot_ik.strip_inactive_collision = False
+      robot_ik.reach_precheck = False
     if args.view_cheap_checks:
       set_cheap_check_debug(True)
     fail_rec = None
@@ -296,12 +313,13 @@ def main():
             C, assembly, robots=robots, time_budget=args.anytime, robot_ik=robot_ik,
             wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
             anonymous=args.anon_robots, labeled_h=args.labeled_h,
-            wrench_aware_h=args.wrench_aware_h)
+            collapsed_h=args.collapsed_h, wrench_aware_h=args.wrench_aware_h)
       else:
         plan = solve_assembly_problem(C, assembly, robots=robots, canonical=args.canonical,
                                       weight=args.weight, robot_ik=robot_ik, wrench=args.wrench,
                                       handovers=args.handovers, allow_place=args.allow_place,
                                       anonymous=args.anon_robots, labeled_h=args.labeled_h,
+                                      collapsed_h=args.collapsed_h,
                                       wrench_aware_h=args.wrench_aware_h)
     except IKFailureLogDone:
       print(f"[ik-failures] window/cap reached -- search stopped for debugging "

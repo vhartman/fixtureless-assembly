@@ -63,7 +63,7 @@ class CollisionChecker:
     template = make_world()                                # floor + table, same as the real env
     cs, cr = assembly.cube_size, assembly.cube_radius
     for obj in assembly.objects:                           # the parts, as cubes (posed per query)
-      template.addFrame(obj).setShape(ry.ST.box, [cs, cs, cs]).setContact(1)
+      template.addFrame(obj).setShape(ry.ST.ssBox, [cs, cs, cs, cr]).setContact(1)
 
     # one free-floating gripper slot per robot (at most one active grasp per robot),
     # pre-loaded and parked far away so unused slots touch nothing.
@@ -243,6 +243,7 @@ class RobotIK:
     self.gripper_frame = {}
     self.q_correction = {}
     self.symmetric = {}                                # roll-free about the approach axis?
+    self.robot_base = {}                               # subtree root, for single-arm IK
     for r in self.robots:
       tool_center, _base_rel, q_corr = _gripper_rest_transforms(self.C, r + "_")
       self.gripper_frame[r] = tool_center
@@ -251,6 +252,25 @@ class RobotIK:
       # so we constrain only position + approach axis (5-DOF). the two-finger's fingers
       # break that symmetry -> full pose (6-DOF).
       self.symmetric[r] = "vacuum" in tool_center
+      self.robot_base[r] = r + "_ur_base"              # UR base frame; parented to the table
+    # SINGLE-ACTIVE-ARM IK optimisations (pick/place move only one arm). Both default ON;
+    # flip either OFF for debugging (they change the IK scene, not the plan semantics):
+    #   single_arm_ik           : restrict the KOMO to the active arm's joints (others frozen)
+    #   strip_inactive_collision: drop the other arms' collision geometry (fewer contact pairs)
+    self.single_arm_ik = True
+    self.strip_inactive_collision = True
+    # REACH PRECHECK: before the full (collision-aware) solve, solve the SAME problem WITHOUT
+    # the collision objective. Collisions only SHRINK the feasible set, so a TRULY infeasible
+    # relaxation implies infeasibility -- but the relaxed solver is stochastic-incomplete, so
+    # "relaxed solve failed" is only evidence, not proof (measured: 4/97 binds where 13
+    # relaxed attempts missed a solution the FULL solve found -- the collision gradient can
+    # guide the solver out of a bad basin). Hence the RESIDUAL GATE: reject instantly only
+    # when the relaxed solve failed AND missed by a lot (eq > precheck_eq_min: a clear
+    # can't-reach, measured false-rejects sat at eq 0.8-2.5 vs true catches median 5.6);
+    # borderline relaxed failures fall through to the full solve. No warm-starting.
+    self.reach_precheck = True
+    self.precheck_eq_min = 3.0                            # residual gate (see above)
+    self.precheck_rejects = 0                             # rejects caught by the precheck
     self._ik_cache = {}                                   # (action, scene sig) -> (ok, witness)
     self.fail_recorder = None                             # viser recorder for failed binds
     self.fail_log_cap = 300
@@ -286,6 +306,44 @@ class RobotIK:
                         ry.OT.eq, [1e1], tgt[:3])
       komo.addObjective([1, 1], ry.FS.quaternionRel, [self.gripper_frame[r], pt],
                         ry.OT.eq, [1e1], tgt[3:])
+
+  def _disable_inactive_collision(self, C, active_robot):
+    # drop the collision geometry of every robot EXCEPT `active_robot` (setContact(0) on their
+    # arm frames). Collision evaluation over all pairs is the pick-IK bottleneck (not DOF
+    # count), so removing the inactive arms' links is the real speed lever -- sound where they
+    # cannot block the active arm (verified 0 verdict change on cross). Held PARTS keep their
+    # collision (only the arm links are dropped).
+    for r in self.robots:
+      if r == active_robot:
+        continue
+      pre = r + "_"
+      for nm in C.getFrameNames():
+        if nm.startswith(pre):
+          C.getFrame(nm).setContact(0)
+
+  def _restrict_to_arm(self, C, robot):
+    # SINGLE-ARM IK: restrict the config's active joints to just `robot`'s subtree, so the
+    # KOMO only optimizes that one arm and every other robot is a FROZEN obstacle (at home).
+    # Cuts the IK from R*6 DOFs to 6 -> much faster; valid where exactly one arm moves (pick).
+    # Returns the FULL joint-name list so the restricted solution can be re-expanded to the
+    # full witness vector the replay expects (see _expand_witness). NOTE: brace grasp-
+    # maintenance must be SKIPPED under this restriction (a frozen brace arm cannot satisfy
+    # its eq objective -> spurious infeasibility).
+    full_names = C.getJointNames()
+    C.selectJointsBySubtree(C.getFrame(self.robot_base[robot]))
+    return full_names
+
+  def _expand_witness(self, C_restricted, w, full_names):
+    # map a single-arm solution `w` (ordered like the restricted config's joints) back to the
+    # full joint vector the replay/_write_robot_dofs expect. Non-active joints keep home
+    # (harmless: replay only reads the moved arm's DOFs out of the witness).
+    if w is None:
+      return None
+    idx = {nm: i for i, nm in enumerate(full_names)}
+    full = np.array(self.home, dtype=float).copy()
+    for j, nm in enumerate(C_restricted.getJointNames()):
+      full[idx[nm]] = w[j]
+    return full
 
   # ------------------------------------------------------------------------------------
   # scene prep -- build a real-robot config whose kinematics reflect a state:
@@ -437,6 +495,20 @@ class RobotIK:
     self._last_res = r
     return False, None
 
+  def _reach_precheck_reject(self, action, C, komo_nc):
+    # run the RELAXED (collision-free) solve; True => clear reach failure, reject the bind
+    # without running the full solve. Residual-gated (see the reach_precheck comment in
+    # __init__): a failed relaxed solve rejects only when it missed by a lot (eq >
+    # precheck_eq_min); borderline failures fall through to the full solve, which decides.
+    ok0, _ = self._solve_ik(komo_nc)
+    if ok0:
+      return False
+    if (getattr(self, "_last_res", {}) or {}).get("eq", 0.0) <= self.precheck_eq_min:
+      return False                                        # borderline: let the full solve decide
+    self.precheck_rejects += 1
+    self._log_failure(action, C, komo_nc)
+    return True
+
   def _log_failure(self, action, C, komo):
     # IK-FAILURE INSTRUMENTATION (opt-in via self.fail_recorder = a viser_view.ViserRecorder;
     # None = zero cost): pose the skill's OWN scene at the LAST (failed) attempt and record
@@ -470,6 +542,15 @@ class RobotIK:
   def _ik_pick(self, action, s0, s1, assembly, seed):
     # simple IK: ONE robot (the picker) reaches a fixed grasp pose on an on-table part.
     # Every other robot -- free or holding something else -- stays at home (an obstacle).
+    #
+    # SINGLE ACTIVE ARM: a pick moves ONLY the picker, so we restrict the IK to the picker's
+    # subtree (selectJointsBySubtree) -- the other arms become frozen obstacles instead of
+    # co-optimized DOFs, cutting the problem from R*6 to 6 DOFs. (This also means brace grasp-
+    # maintenance is skipped: a frozen brace arm can't satisfy it.)
+    #
+    # TODO(future): this per-node KOMO is overkill for a fixed grasp on a fixed on-table part
+    # -- it is a plain 6-DOF reach with a known target, so an ANALYTICAL IK (e.g. ssik) would
+    # give the joint solution directly (and far faster) instead of a nonlinear solve+restarts.
     _, robot, part, grasp_id = action
     C = self.scene_for(s0, assembly)                      # part sits on the table (fixed target)
     grasp = cube_grasp_pose(grasp_id, assembly.cube_size)  # gripper pose relative to `part`
@@ -485,31 +566,43 @@ class RobotIK:
     # objective forbids the grasp itself.
     C.getFrame(part_name).setContact(0)
 
-    komo = ry.KOMO(
-        C, phases=1, slicesPerPhase=1, kOrder=1, enableCollisions=True
-    )
-    # no scene-penetration: without this the arm reaches the grasp by driving its links
-    # THROUGH the table and the other cubes -- the tool center looks right but the pose is
-    # physically bogus, and grasps that are actually unreachable wrongly pass. (the target
-    # part is excluded above, since the gripper is supposed to touch it.)
-    komo.addObjective(
-        [], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [1e1], [-0.0]
-    )
+    if self.strip_inactive_collision:
+      self._disable_inactive_collision(C, robot)          # drop other arms' contact pairs
+    full_names = self._restrict_to_arm(C, robot) if self.single_arm_ik else None
 
-    komo.addControlObjective([], 0, 1e-1)
-    komo.addControlObjective([], 1, 1e-1)
+    def build(collisions):
+      komo = ry.KOMO(
+          C, phases=1, slicesPerPhase=1, kOrder=1, enableCollisions=collisions
+      )
+      if collisions:
+        # no scene-penetration: without this the arm reaches the grasp by driving its links
+        # THROUGH the table and the other cubes -- the tool center looks right but the pose
+        # is physically bogus, and grasps that are actually unreachable wrongly pass. (the
+        # target part is excluded above, since the gripper is supposed to touch it.)
+        komo.addObjective(
+            [], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [1e1], [-0.0]
+        )
+      komo.addControlObjective([], 0, 1e-1)
+      komo.addControlObjective([], 1, 1e-1)
+      # 6-DOF: gripper tool-center must sit at the (approach-corrected) grasp on the part:
+      #   pose(ee) relative to pose(part) == ee_target.
+      komo.addObjective(
+          [1, 1], ry.FS.positionRel, [robot_ee_name, part_name], ry.OT.eq, [1e1], ee_target[:3]
+      )
+      komo.addObjective(
+          [1, 1], ry.FS.quaternionRel, [robot_ee_name, part_name], ry.OT.eq, [1e1], ee_target[3:]
+      )
+      if not self.single_arm_ik:
+        self._add_grasp_maintenance(komo, s0, assembly)   # braces are DOFs only in full mode
+      return komo
 
-    # 6-DOF: gripper tool-center must sit at the (approach-corrected) grasp on the part:
-    #   pose(ee) relative to pose(part) == ee_target.
-    komo.addObjective(
-        [1, 1], ry.FS.positionRel, [robot_ee_name, part_name], ry.OT.eq, [1e1], ee_target[:3]
-    )
-    komo.addObjective(
-        [1, 1], ry.FS.quaternionRel, [robot_ee_name, part_name], ry.OT.eq, [1e1], ee_target[3:]
-    )
-    self._add_grasp_maintenance(komo, s0, assembly)       # brace arms posed at their grasps
+    if self.reach_precheck and self._reach_precheck_reject(action, C, build(False)):
+      return False, None                                  # clear reach failure (relaxed solve)
 
+    komo = build(True)
     feasible, witness = self._solve_ik(komo)
+    if self.single_arm_ik:
+      witness = self._expand_witness(C, witness, full_names)  # restricted -> full joint vector
     if not feasible:
       self._log_failure(action, C, komo)
 
@@ -531,16 +624,23 @@ class RobotIK:
     ee_target = np.concatenate([grasp[:3], _quat_mul(grasp[3:], self.q_correction[robot])])
     C.getFrame(gpart).setContact(0)                       # the new gripper is meant to touch gpart
 
-    komo = ry.KOMO(C, phases=1, slicesPerPhase=1, kOrder=1, enableCollisions=True)
-    komo.addObjective([], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [1e1], [-0.0])
-    komo.addControlObjective([], 0, 1e-1)
-    komo.addControlObjective([], 1, 1e-1)
-    komo.addObjective([1, 1], ry.FS.positionRel, [self.gripper_frame[robot], gpart],
-                      ry.OT.eq, [1e1], ee_target[:3])
-    komo.addObjective([1, 1], ry.FS.quaternionRel, [self.gripper_frame[robot], gpart],
-                      ry.OT.eq, [1e1], ee_target[3:])
-    self._add_grasp_maintenance(komo, s0, assembly)       # existing braces stay at their grasps
+    def build(collisions):
+      komo = ry.KOMO(C, phases=1, slicesPerPhase=1, kOrder=1, enableCollisions=collisions)
+      if collisions:
+        komo.addObjective([], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [1e1], [-0.0])
+      komo.addControlObjective([], 0, 1e-1)
+      komo.addControlObjective([], 1, 1e-1)
+      komo.addObjective([1, 1], ry.FS.positionRel, [self.gripper_frame[robot], gpart],
+                        ry.OT.eq, [1e1], ee_target[:3])
+      komo.addObjective([1, 1], ry.FS.quaternionRel, [self.gripper_frame[robot], gpart],
+                        ry.OT.eq, [1e1], ee_target[3:])
+      self._add_grasp_maintenance(komo, s0, assembly)     # existing braces stay at their grasps
+      return komo
 
+    if self.reach_precheck and self._reach_precheck_reject(action, C, build(False)):
+      return False, None                                  # clear reach failure (relaxed solve)
+
+    komo = build(True)
     feasible, witness = self._solve_ik(komo)
     if not feasible:
       self._log_failure(action, C, komo)
@@ -567,24 +667,45 @@ class RobotIK:
     anchor = np.asarray(anchor) if anchor is not None else np.asarray(self.C.getFrame(ref).getPose())
     target = _group_rest_pose(assembly, group, ref, anchor, face)
 
-    komo = ry.KOMO(
-        C, phases=1, slicesPerPhase=1, kOrder=1, enableCollisions=True
-    )
-    # resting on the table is intended contact (0 penetration satisfies the ineq); real
-    # penetrations (through the table / into neighbours) still reject.
-    komo.addObjective(
-        [], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [1e1], [-0.0]
-    )
-    komo.addControlObjective([], 0, 1e-1)
-    komo.addControlObjective([], 1, 1e-1)
+    # SINGLE ACTIVE ARM: like pick, a place moves only the placer -- BUT only when the placer
+    # is the group's SOLE holder. If another robot BRACES the group, that arm must co-move as
+    # the group lands, so the optimisations don't apply and we fall back to the full KOMO.
+    # (For a solo place _add_grasp_maintenance is already a no-op, so nothing is lost.)
+    gparts = set(group)
+    solo = not any(rr != robot and pt in gparts
+                   for rr, (pt, _g) in self.holders(s0).items())
+    if self.strip_inactive_collision and solo:
+      self._disable_inactive_collision(C, robot)          # drop other arms' contact pairs
+    single = self.single_arm_ik and solo
+    full_names = self._restrict_to_arm(C, robot) if single else None
 
-    # object-pose constraint (like assemble, not an EE pose): the group's reference part
-    # must reach its canonical table pose, axis-aligned.
-    komo.addObjective([1, 1], ry.FS.position, [ref], ry.OT.eq, [1e1], target[:3])
-    komo.addObjective([1, 1], ry.FS.quaternion, [ref], ry.OT.eq, [1e1], target[3:])
-    self._add_grasp_maintenance(komo, s0, assembly)       # braces ride along / stay pinned
+    def build(collisions):
+      komo = ry.KOMO(
+          C, phases=1, slicesPerPhase=1, kOrder=1, enableCollisions=collisions
+      )
+      if collisions:
+        # resting on the table is intended contact (0 penetration satisfies the ineq); real
+        # penetrations (through the table / into neighbours) still reject.
+        komo.addObjective(
+            [], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [1e1], [-0.0]
+        )
+      komo.addControlObjective([], 0, 1e-1)
+      komo.addControlObjective([], 1, 1e-1)
+      # object-pose constraint (like assemble, not an EE pose): the group's reference part
+      # must reach its canonical table pose, axis-aligned.
+      komo.addObjective([1, 1], ry.FS.position, [ref], ry.OT.eq, [1e1], target[:3])
+      komo.addObjective([1, 1], ry.FS.quaternion, [ref], ry.OT.eq, [1e1], target[3:])
+      if not single:
+        self._add_grasp_maintenance(komo, s0, assembly)   # braces ride along / stay pinned
+      return komo
 
+    if self.reach_precheck and self._reach_precheck_reject(action, C, build(False)):
+      return False, None                                  # clear reach failure (relaxed solve)
+
+    komo = build(True)
     feasible, witness = self._solve_ik(komo)
+    if single:
+      witness = self._expand_witness(C, witness, full_names)  # restricted -> full joint vector
     if not feasible:
       self._log_failure(action, C, komo)
 
@@ -594,12 +715,15 @@ class RobotIK:
 
     return feasible, witness
 
-  def _assemble_komo(self, C, part_name, onto, rel_pos, rel_quat, bias_axes):
+  def _assemble_komo(self, C, part_name, onto, rel_pos, rel_quat, bias_axes,
+                     collisions=True):
     # build the assemble KOMO for one orientation bias. Shared by every step of the
-    # orientation sweep (only the soft bias objective changes).
-    komo = ry.KOMO(C, phases=1, slicesPerPhase=1, kOrder=1, enableCollisions=True)
-    # no scene-penetration: keep the arm(s) from driving links through the table / cubes.
-    komo.addObjective([], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [1e1], [-0.0])
+    # orientation sweep (only the soft bias objective changes). collisions=False builds the
+    # RELAXED problem for the reach precheck.
+    komo = ry.KOMO(C, phases=1, slicesPerPhase=1, kOrder=1, enableCollisions=collisions)
+    if collisions:
+      # no scene-penetration: keep the arm(s) from driving links through the table / cubes.
+      komo.addObjective([], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [1e1], [-0.0])
     komo.addControlObjective([], 0, 1e-1)
     komo.addControlObjective([], 1, 1e-1)
     # cube-pose constraint (NOT an EE pose): pose(part) relative to pose(onto) == the mate.
@@ -653,6 +777,16 @@ class RobotIK:
     moving = next((g for g in s0.subassemblies() if part in g), (part,))
     for mp in moving:
       C.getFrame(mp).setContact(0)
+
+    if self.reach_precheck:
+      # relaxed (collision-free) reach: can the mate pose be reached AT ALL? A clear relaxed
+      # failure rejects instantly -- skipping the whole bias sweep + restart fallback (the
+      # most expensive failure path there is). Residual-gated like the other skills.
+      komo_nc = self._assemble_komo(C, part_name, onto, rel_pos, rel_quat, None,
+                                    collisions=False)
+      self._add_grasp_maintenance(komo_nc, s0, assembly)
+      if self._reach_precheck_reject(action, C, komo_nc):
+        return False, None
 
     biases = [bias_axes] if bias_axes is not None else _ASSEMBLE_BIAS_ORIENTATIONS
     komo = None
@@ -1187,6 +1321,265 @@ class LabeledDisassemblyHeuristic:
     return v
 
 
+class CollapsedLabeledHeuristic:
+  """IDENTITY-COLLAPSED variant of LabeledDisassemblyHeuristic, for per-robot SCALING.
+
+  Same backward-Dijkstra construction and the same fact machinery, but the abstract state
+  drops the grasp identity of LOOSE held parts:
+
+      (ideal, G, face, L)   with   L = sorted tuple of PART NAMES (no grasp ids).
+
+  `G` (grasps ON the assembly) stays labeled, so every wrench fact (w_hold_ok /
+  w_assemble_ok, incl. the inserter-press check that powers instance-infeasibility
+  detection like isotropic@30N) is computed EXACTLY as in the fine class. What changes:
+
+    * inverse PICK-LOOSE gates on EXISTS-a-grasp (and exists-a-face, as before): a loose
+      part is backward-removable iff SOME grasp picks it off the table. Cached PER PART.
+    * inverse PLACE-LOOSE emits ONE edge per part (not one per grasp).
+    * inverse ASSEMBLE moves the inserted part to L as a bare name; its brace grasp gq
+      (from the still-labeled G) is checked by w_assemble_ok exactly, then forgotten.
+
+  This is a COARSENING of the fine abstraction: every gate is equal or more permissive, so
+  the values are still ADMISSIBLE lower bounds (coarse_h <= fine_h pointwise) and an inf
+  verdict is still a proof -- optimality/completeness guarantees are unchanged; only
+  guidance tightness is traded for a state count that no longer multiplies grasp choices
+  into L (C(parts,k) instead of C(all-grasps,k) per capacity slot).
+
+  DELIBERATELY NOT DONE: gating inverse-assemble on "gq is pickable" (the pick/press
+  linkage the fine class gets implicitly). With handovers enabled a press-capable but
+  unpickable grasp is REAL-reachable (pick any grasp, hand over in the air), so that
+  conjunction gate would be INADMISSIBLE. The collapse simply prices the swap optimistically.
+
+  Kept fully separate from the fine class (own flag `collapsed_h`) so the well-tested one
+  stays untouched; the duplication is the price of that isolation."""
+
+  H = "H"                                                  # face value for held-in-air
+
+  def __init__(self, assembly, n_robots, grasp_table, gripper_path=None, verbose=False,
+               max_states=2_000_000, clearance=0.02, gripper_kind=None):
+    import heapq
+    import time as _time
+
+    t0 = _time.perf_counter()
+    self.assembly = assembly
+    self.R = n_robots
+    self.misses = 0
+    self._clearance = clearance
+    self._gk = gripper_kind
+    objs = list(assembly.objects)
+    base = assembly.base
+    all_parts = _subasm_key(objs)
+    self._closure = {p: frozenset(_mate_closure(assembly, p)) for p in objs}
+
+    def tadd(t, x):
+      return tuple(sorted(t + (x,)))
+
+    def tsub(t, x):
+      i = t.index(x)
+      return t[:i] + t[i + 1:]
+
+    ideal_keys = [_subasm_key(s) for s in get_subassemblies(assembly) if base in s]
+    self.valid = {S: tuple(sorted((p, g) for p, g, _ in grasp_table[S]))
+                  for S in ideal_keys}
+    self.single = {q: tuple(sorted(g for _p, g, _ in grasp_table[(q,)])) for q in objs}
+
+    self._ee_path = gripper_path
+    self._pick_cache = {}
+
+    def pick_ok(S_key, face, pg):
+      key = (S_key, face, pg)
+      hit = self._pick_cache.get(key)
+      if hit is None:
+        hit = self._pick_cache[key] = _table_aware_pick_fact(
+            assembly, S_key, face, pg[0], pg[1], self._ee_path,
+            clearance=self._clearance)
+      return hit
+
+    FACES = list(range(len(_FACE_DOWN_QUATS)))
+    Hf = self.H
+
+    # per-PART loose-pickability: exists-a-face AND exists-a-grasp (the collapse of the fine
+    # class's per-(part,grasp) gate). Lazy: most parts are decided by their first grasp.
+    self._loose_pickable = {}
+
+    def loose_pickable(q):
+      hit = self._loose_pickable.get(q)
+      if hit is None:
+        hit = self._loose_pickable[q] = any(
+            pick_ok((q,), f, (q, g)) for g in self.single[q] for f in FACES)
+      return hit
+
+    # ---- WRENCH facts: identical to the fine class (G stays labeled, so these are exact).
+    flatposes = _flat_poses(assembly)
+    self._wfacts = {}
+
+    def crafted(ideal_key, G, face):
+      parent, place, supports = {}, {}, {}
+      ideal_set = set(ideal_key)
+      for q in assembly.objects:
+        if q in ideal_set:
+          if q == assembly.base:
+            parent[q] = ("gripper", "zz0") if face is Hf else ("table",)
+            supports[q] = frozenset() if face is Hf else frozenset({("table",)})
+            if face is not Hf:
+              place[q] = ("slot", 0, face)
+          else:
+            onto = assembly.relative_pose(q)[0]
+            parent[q] = ("part", onto)
+            supports[q] = frozenset({("mate", onto)})
+        else:
+          parent[q] = ("table",)
+          supports[q] = frozenset({("table",)})
+          place[q] = ("slot", _part_index(q), _IDENTITY_FACE)
+      for i, (p, g) in enumerate(G):
+        supports[p] = supports[p] | {("grasp", f"zz{i}", p, g)}
+      return State(parent=parent, place=place, supports=supports, poses=dict(flatposes))
+
+    def held_single(q, gq):
+      st = crafted((), (), _IDENTITY_FACE)
+      st.parent[q] = ("gripper", "zzq")
+      st.place.pop(q, None)
+      st.supports[q] = frozenset({("grasp", "zzq", q, gq)})
+      return st
+
+    def w_hold_ok(ideal_key, G, face):
+      if self._gk is None:
+        return True
+      key = ("H", ideal_key, G, face)
+      hit = self._wfacts.get(key)
+      if hit is None:
+        st = crafted(ideal_key, G, face)
+        hit = self._wfacts[key] = _group_stable(st, assembly, set(ideal_key), self._gk)
+      return hit
+
+    def w_assemble_ok(ideal_s_key, G2, face, q, gq):
+      if self._gk is None:
+        return True
+      key = ("A", ideal_s_key, G2, face, q, gq)
+      hit = self._wfacts.get(key)
+      if hit is None:
+        onto = assembly.relative_pose(q)[0]
+        ok = w_hold_ok(ideal_s_key, G2, face)
+        if ok and wrench.PARAMS.get("check_inserter", True):
+          st_q = held_single(q, gq)
+          ok = _group_stable(st_q, assembly, frozenset({q}), self._gk,
+                             applied=[_inserter_load(st_q, assembly, q, onto)])
+        if ok:
+          st_t = crafted(ideal_s_key, G2, face)
+          ok = _group_stable(st_t, assembly, set(ideal_s_key), self._gk,
+                             applied=[_insertion_load(st_t, assembly, q, onto)])
+        hit = self._wfacts[key] = ok
+      return hit
+
+    def preds(t):
+      ideal, G, face, L = t                               # L: bare part names
+      cap_used = len(G) + len(L)
+      # inverse ASSEMBLE: some (q,gq) in G was the inserter's brace; q maximal in ideal.
+      # The predecessor holds q LOOSE -- as a bare name (its grasp identity is forgotten).
+      for q, gq in G:
+        if q == base:
+          continue
+        if any(q in self._closure[r] for r in ideal if r != q):
+          continue                                        # not maximal -> not last-added
+        if face is not Hf and not _on_table_mateable_cached(self.assembly, q, face):
+          continue
+        G2 = tsub(G, (q, gq))
+        if any(p == q for p, _ in G2):
+          continue                                        # q was loose then: single-held only
+        if face is Hf and len(G2) < 1:
+          continue                                        # target had to be supported
+        if not w_assemble_ok(tsub(ideal, q), G2, face, q, gq):
+          continue                                        # wrench: press not transmittable
+        yield (tsub(ideal, q), G2, face, tadd(L, q)), 1.0
+      # inverse PICK-LOOSE: exists-a-face AND exists-a-grasp (the collapse)
+      for q in L:
+        if loose_pickable(q):
+          yield (ideal, G, face, tsub(L, q)), 1.0
+      # inverse LIFT: held solo -> was resting on some face and got picked (G-labeled, exact)
+      if face is Hf and len(G) == 1:
+        pg = G[0]
+        for f in FACES:
+          if pick_ok(ideal, f, pg):
+            yield (ideal, (), f, L), 1.0
+      # inverse PLACE-ASSEMBLY: on table now -> was held by one more grasp in the air
+      if face is not Hf and cap_used < self.R:
+        for pg in self.valid[ideal]:
+          if pg not in G:
+            yield (ideal, tadd(G, pg), Hf, L), 1.0
+      # inverse RELEASE: some grasp was just opened (wrench-gated on t staying supported)
+      if cap_used < self.R and w_hold_ok(ideal, G, face):
+        for pg in self.valid[ideal]:
+          if pg not in G:
+            yield (ideal, tadd(G, pg), face, L), 1.0
+      # inverse fused HANDOVER (cost 2): solo-held; the grasp was swapped
+      if face is Hf and len(G) == 1 and len(L) <= self.R - 2:
+        pg_new = G[0]
+        for pg_old in self.valid[ideal]:
+          if pg_old != pg_new:
+            yield (ideal, (pg_old,), Hf, L), 2.0
+      # inverse PLACE-LOOSE: ONE edge per part (any valid grasp; existence suffices)
+      if cap_used < self.R:
+        for q in objs:
+          if q in ideal or q in L:
+            continue
+          if self.single[q]:
+            yield (ideal, G, face, tadd(L, q)), 1.0
+
+    # goal states: identical seeding to the fine class (L=() either way)
+    self.dist = {}
+    pq = []
+    from itertools import combinations
+    vg_full = self.valid[all_parts]
+    for k in range(self.R + 1):
+      for combo in combinations(vg_full, k):
+        for face in [Hf] + FACES:
+          if face is Hf and len(combo) < 1:
+            continue
+          st = (all_parts, combo, face, ())
+          self.dist[st] = 0.0
+          heapq.heappush(pq, (0.0, id(st), st))
+
+    popped = 0
+    while pq:
+      d, _, t = heapq.heappop(pq)
+      if d > self.dist.get(t, float("inf")):
+        continue
+      popped += 1
+      if len(self.dist) > max_states:
+        raise RuntimeError(f"collapsed labeled abstraction exceeded {max_states} states")
+      for s, c in preds(t):
+        nd = d + c
+        if nd < self.dist.get(s, float("inf")):
+          self.dist[s] = nd
+          heapq.heappush(pq, (nd, id(s), s))
+
+    self.n_states = len(self.dist)
+    self.n_pick_facts = len(self._pick_cache)
+    self.build_time = _time.perf_counter() - t0
+    if verbose:
+      print(f"[collapsed-h] {self.n_states} coreachable states, {self.n_pick_facts} pick "
+            f"facts, built in {self.build_time:.2f}s")
+
+  def abstract(self, state):
+    main = next(g for g in state.subassemblies() if self.assembly.base in g)
+    ideal = _subasm_key(main)
+    G = tuple(sorted((c[2], c[3]) for p in main
+                     for c in state.supports.get(p, ()) if c[0] == "grasp"))
+    on_table = any(("table",) in state.supports.get(p, ()) for p in main)
+    face = _placement_face(state, main) if on_table else self.H
+    L = tuple(sorted({c[2] for p in state.parent if p not in main
+                      for c in state.supports.get(p, ()) if c[0] == "grasp"}))
+    return (ideal, G, face, L)
+
+  def value(self, state):
+    # inf is still a PROOF (the collapse only coarsens the relaxation) -- see class doc.
+    v = self.dist.get(self.abstract(state))
+    if v is None:
+      self.misses += 1
+      return float("inf")
+    return v
+
+
 _TABLE_PICK_FACT_CACHE = {}
 _FACT_TEMPLATES = {}                                       # (ee_path, cs, cr, n) -> template
 
@@ -1202,7 +1595,7 @@ def _fact_template(gripper_path, cs, cr, n_parts):
     return hit
   C = make_world()
   for i in range(n_parts):
-    C.addFrame(f"factcube{i}").setShape(ry.ST.box, [cs, cs, cs]) \
+    C.addFrame(f"factcube{i}").setShape(ry.ST.ssBox, [cs, cs, cs, cr]) \
         .setPosition([0.0, -500.0 - 2.0 * i, 1.0]).setContact(1)
   place_floating_ee(C, np.array([0.0, -900.0, 1.0, 1.0, 0.0, 0.0, 0.0]),
                     gripper_path, prefix="eeFACT_")
@@ -1383,7 +1776,7 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
                            use_heuristic=True, canonical=False, weight=1.0, robot_ik=None,
                            wrench=False, wrench_aware_h=True, handovers=True,
                            allow_place=True, cost_bound=None, deadline=None,
-                           anonymous=False, labeled_h=False):
+                           anonymous=False, labeled_h=False, collapsed_h=False):
   """EXACT (weighted) A* over scene-graph states from the initial scene to a completed
   assembly -- the reference baseline. Priority is f = g + weight * h.
     - weight = 1.0 : ordinary A*, returns a minimum-cost plan.
@@ -1431,9 +1824,11 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
 
   # labeled_h=True swaps h_abs for the GRASP+FACE-LABELED disassembly abstraction (see
   # LabeledDisassemblyHeuristic) -- strictly tighter where labels matter, at a build cost
-  # of seconds. Same finite-weight gating as h_abs.
+  # of seconds. collapsed_h=True uses the IDENTITY-COLLAPSED variant instead (same
+  # guarantees, weaker guidance, per-robot-scalable build; see CollapsedLabeledHeuristic).
+  # Same finite-weight gating as h_abs.
   h_lab = None
-  if labeled_h and use_heuristic:
+  if (labeled_h or collapsed_h) and use_heuristic:
     if math.isinf(weight):
       warnings.warn("labeled_h requested but weight=inf (greedy): abstraction heuristics "
                     "are gated to finite weights -- running WITHOUT it. Use e.g. weight=5.",
@@ -1446,12 +1841,11 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
       # pick facts use the PLAIN floating EE even when the checker runs the wrist variant:
       # fact scenes hold ONE part at a free table spot (no clutter), so the wrist capsule
       # adds nothing there except unsound wrist-vs-table rejections (see _wrist_table_pair).
-      h_lab = LabeledDisassemblyHeuristic(assembly, len(robots), grasp_table,
-                                          gripper_path=getattr(
-                                              checker, "fact_gripper_path",
-                                              checker.gripper_path),
-                                          verbose=verbose,
-                                          gripper_kind=gk if wrench_aware_h else None)
+      cls = CollapsedLabeledHeuristic if collapsed_h else LabeledDisassemblyHeuristic
+      h_lab = cls(assembly, len(robots), grasp_table,
+                  gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
+                  verbose=verbose,
+                  gripper_kind=gk if wrench_aware_h else None)
       h_abs = None
 
   def h_fn(state):
