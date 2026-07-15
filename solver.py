@@ -242,6 +242,10 @@ class RobotIK:
     self.q_correction = {}
     self.symmetric = {}                                # roll-free about the approach axis?
     self.robot_base = {}                               # subtree root, for single-arm IK
+    self.robot_arm = {}                                # 'ur5' | 'ur10' -- picks the analytic solver
+    self.base_link = {}                                # URDF base frame (ssik's reference)
+    self.ik_seeding = False                            # warm-start KOMO with analytic (ssik) IK
+    names = set(self.C.getFrameNames())
     for r in self.robots:
       tool_center, _base_rel, q_corr = _gripper_rest_transforms(self.C, r + "_")
       self.gripper_frame[r] = tool_center
@@ -251,6 +255,8 @@ class RobotIK:
       # break that symmetry -> full pose (6-DOF).
       self.symmetric[r] = "vacuum" in tool_center
       self.robot_base[r] = r + "_ur_base"              # UR base frame; parented to the table
+      self.robot_arm[r] = "ur5" if (r + "_ur_arm_ur5") in names else "ur10"
+      self.base_link[r] = r + "_ur_base_link"          # ssik solves in base_link's frame
     # SINGLE-ACTIVE-ARM IK optimisations (pick/place move only one arm). Both default ON;
     # flip either OFF for debugging (they change the IK scene, not the plan semantics):
     #   single_arm_ik           : restrict the KOMO to the active arm's joints (others frozen)
@@ -473,13 +479,21 @@ class RobotIK:
     # robots grasping any part of `group`
     return [r for r, (pt, _gid) in self.holders(state).items() if pt in group]
 
-  def _solve_ik(self, komo, restarts=12):
-    # solve a skill KOMO, retrying from fresh random inits until one converges. KOMO seeds
-    # its guess with a little noise, so a borderline-reachable target flips feasible/
-    # infeasible run-to-run; restarts make bind reliable -- a genuinely feasible action
-    # returns a witness (instead of sometimes None, which would corrupt search + replay).
-    # Returns (feasible, witness joint config or None). The last attempt's solver report is
-    # kept on self._last_res for the failure log.
+  def _solve_ik(self, komo, restarts=12, seeds=None):
+    # solve a skill KOMO, retrying from fresh inits until one converges. KOMO seeds its guess
+    # with a little noise, so a borderline-reachable target flips feasible/infeasible run-to-
+    # run; restarts make bind reliable -- a genuinely feasible action returns a witness (instead
+    # of sometimes None, which would corrupt search + replay). Returns (feasible, witness joint
+    # config or None). `seeds` (analytic ssik solutions, exact for the pose) are tried FIRST as
+    # warm starts -- helps CONVERGENCE-limited reaches; note it does NOT help collision-limited
+    # ones (an exact analytic pose may collide, whereas the KOMO's tolerant pose eq can settle on
+    # a nearby collision-free pose the discrete IK solutions don't cover), hence the fallback.
+    for seed in (seeds or []):
+      komo.initWithConstant(np.asarray(seed, dtype=float))
+      r = ry.NLP_Solver(komo.nlp(), verbose=0).solve().dict()
+      if r["feasible"]:
+        self._last_res = r
+        return True, komo.getPath()[-1]
     r = ry.NLP_Solver(komo.nlp(), verbose=0).solve().dict()
     if r["feasible"]:
       self._last_res = r
@@ -493,6 +507,44 @@ class RobotIK:
     self._last_res = r
     return False, None
 
+  def _analytic_reject_ok(self, robot):
+    # may we use analytic IK for an EXACT reachability REJECT on a FIXED-target reach? Only when
+    # seeding is on, ssik has this arm calibrated, and the grasp is a full 6-DOF pose (two-finger):
+    # then an empty solution set means KINEMATICALLY UNREACHABLE -> reject with no KOMO. Excluded:
+    # the vacuum (5-DOF, free roll -> one roll's empty set is NOT "unreachable"), and uncalibrated
+    # arms / absent ssik. (Only the fixed on-table pick uses this; a held add_grasp target can move.)
+    if not self.ik_seeding or self.symmetric[robot]:
+      return False
+    import analytic_ik
+    return analytic_ik.available(self.robot_arm[robot])
+
+  def _analytic_seeds(self, C, robot, ee_target, target_frame):
+    # analytic (ssik) joint solutions for the active arm to place its tool center at `ee_target`
+    # (a 7-pose relative to `target_frame`), in RAI joint order, filtered to rai's arm limits.
+    # Empty unless ik_seeding is on AND this arm is calibrated (ur5). Call AFTER _restrict_to_arm
+    # so C.getJointLimits() returns the 6 arm limits.
+    import analytic_ik
+    if not self.ik_seeding or not analytic_ik.available(self.robot_arm[robot]):
+      return []
+    tpose = np.asarray(C.getFrame(target_frame).getPose(), dtype=float)
+    ee_world = _pose_compose(tpose, np.asarray(ee_target, dtype=float))   # tool target in world
+    bl = np.asarray(C.getFrame(self.base_link[robot]).getPose(), dtype=float)
+    rel = _pose_compose(_pose_invert(bl), ee_world)                       # tool target in base_link
+    T = np.eye(4)
+    T[:3, 3] = rel[:3]
+    T[:3, :3] = _quat_to_R(rel[3:])
+    try:
+      lo, hi = C.getJointLimits()
+      lo, hi = np.asarray(lo, float), np.asarray(hi, float)
+    except Exception:
+      lo = hi = None
+    out = []
+    for q in analytic_ik.seed_configs(self.robot_arm[robot], T):
+      if lo is not None and len(q) == len(lo) and (np.any(q < lo) or np.any(q > hi)):
+        continue                                            # outside rai's joint limits
+      out.append(q)
+    return out
+
   def _reach_precheck_reject(self, action, C, komo_nc):
     # run the RELAXED (collision-free) solve; True => clear reach failure, reject the bind
     # without running the full solve. Residual-gated (see the reach_precheck comment in
@@ -504,7 +556,9 @@ class RobotIK:
     if (getattr(self, "_last_res", {}) or {}).get("eq", 0.0) <= self.precheck_eq_min:
       return False                                        # borderline: let the full solve decide
     self.precheck_rejects += 1
-    self._log_failure(action, C, komo_nc)
+    # NOT logged to the failure recorder: a precheck reject is a CLEAR reach failure (arm can't
+    # get near the pose) -- the failure log is for inspecting the IK-ITSELF failures (reachable
+    # pose, but the full collision solve found no config), which is what is diagnostically useful.
     return True
 
   def _log_failure(self, action, C, komo):
@@ -594,11 +648,20 @@ class RobotIK:
         self._add_grasp_maintenance(komo, s0, assembly)   # braces are DOFs only in full mode
       return komo
 
-    if self.reach_precheck and self._reach_precheck_reject(action, C, build(False)):
+    # analytic (ssik) IK for the fixed grasp pose: EXACT and instant. When calibrated (two-finger),
+    # an empty solution set means the pose is kinematically unreachable -> reject with no KOMO
+    # (fail fast, replacing the slower + convergence-fallible relaxed reach precheck); a non-empty
+    # set proves reachability -> skip the precheck and warm-start the collision solve below. Vacuum
+    # / uncalibrated / no-ssik fall back to the relaxed precheck.
+    seeds = self._analytic_seeds(C, robot, ee_target, part_name)
+    if self._analytic_reject_ok(robot):
+      if not seeds:
+        return False, None                                # analytic: kinematically unreachable
+    elif self.reach_precheck and self._reach_precheck_reject(action, C, build(False)):
       return False, None                                  # clear reach failure (relaxed solve)
 
     komo = build(True)
-    feasible, witness = self._solve_ik(komo)
+    feasible, witness = self._solve_ik(komo, seeds=seeds)
     if self.single_arm_ik:
       witness = self._expand_witness(C, witness, full_names)  # restricted -> full joint vector
     if not feasible:
@@ -1794,9 +1857,12 @@ def _search_context(C, assembly, robots):
   names = C.getFrameNames()
   vacuum = any(n.endswith("_ur_vacuum") for n in names)
   # ...and mirror the ROBOT model: real arms get the wrist-extended cheap EE, a floating-EE
-  # env gets the plain one (no wrist exists in that model). See CHEAP_EE_PATHS in env.py.
+  # env gets the plain one (no wrist exists in that model). The wrist-3 capsule is arm-SPECIFIC,
+  # so a real UR5 arm (detected via its ur_arm_ur5 marker) gets the ur5-calibrated cheap wrist,
+  # not the ur10 one. See cheap_ee_path / UR5_CHEAP_EE_PATHS in env.py.
   floating = not any(n.endswith("_ur_wrist_3_joint") for n in names)
-  ee_path = os.path.join(os.path.dirname(__file__), CHEAP_EE_PATHS[(floating, vacuum)])
+  is_ur5 = any(n.endswith("_ur_arm_ur5") for n in names)
+  ee_path = cheap_ee_path(is_ur5, floating, vacuum)
   checker = CollisionChecker(assembly, robots, gripper_path=ee_path)
   # plain-EE variant for the labeled-h pick facts (clutter-free scenes; see the h_lab
   # construction in solve_assembly_problem for why the wrist is excluded there).

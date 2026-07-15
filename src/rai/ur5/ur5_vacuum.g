@@ -3,6 +3,7 @@
 ## root on `ur_ee_link` and derives the approach axis from (ur_vacuum - ur_ee_link).
 
 ur_base: {multibody: true}
+ur_arm_ur5 (ur_base): {}          # marker so the search picks the ur5-calibrated cheap wrist model
 
 Prefix: "ur_"
 Include: <ur5e_clean.g>

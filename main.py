@@ -46,8 +46,8 @@ def parse_args():
       help="Do not open the interactive viewer.",
   )
   parser.add_argument(
-      "--no-disp-final", dest="disp_final", action="store_false",
-      help="Do not show the final desired result.",
+      "--disp-final", dest="disp_final", action="store_true",
+      help="Show the final desired result.",
   )
   parser.add_argument(
       "--show-successors", action="store_true",
@@ -117,6 +117,13 @@ def parse_args():
       "--real-ik", action="store_true",
       help="Run the search with real-robot IK in the feasibility loop (RobotIK), and "
            "replay the plan with the actual arm poses instead of floating-EE stand-ins.",
+  )
+  parser.add_argument(
+      "--ik-seeding", action="store_true",
+      help="With --real-ik: WARM-START each single-arm reach KOMO (pick/add_grasp) with analytic "
+           "closed-form IK (ssik), calibrated to the arm. Solves poses the KOMO otherwise can't "
+           "converge to (measured: ur5 real-arm picks 2/12 -> far more) and skips the redundant "
+           "reach precheck when a solution provably exists. ur5 only for now (ur10 uncalibrated).",
   )
   parser.add_argument(
       "--full-ik", action="store_true",
@@ -356,6 +363,8 @@ def main():
       robot_ik.single_arm_ik = False
       robot_ik.strip_inactive_collision = False
       robot_ik.reach_precheck = False
+    if robot_ik is not None and args.ik_seeding:
+      robot_ik.ik_seeding = True
     if args.view_cheap_checks:
       set_cheap_check_debug(True)
     fail_rec = None

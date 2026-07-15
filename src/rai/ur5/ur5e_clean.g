@@ -25,7 +25,7 @@ shoulder_pan_joint_origin (base_link) 	{  Q:[0, 0, 0.0991, 0.707107, 0.707107, 0
 shoulder_pan_joint (shoulder_pan_joint_origin) 	{ , joint:hingeY, limits:[-3.2832, 3.2832, 3.14, -1, 150], ctrl_limits:[3.14, -1, 150] }
 shoulder_link_0 (shoulder_pan_joint) 	{  Q:[0, -0.0991, 0, -1, 0, 0, 0], shape:mesh, color:[0.7, 0.7, 0.7, 1], mesh:'meshes/eSeries_UR5e_link1.obj', visual }
 shoulder_lift_joint_origin (shoulder_pan_joint) 	{  Q:[0, 0.0634, 0.0744, -1, 0, 0, 0] }
-shoulder_lift_joint (shoulder_lift_joint_origin) 	{ , joint:hingeZ, limits:[-2, 0.75, 3.14, -1, 150], ctrl_limits:[3.14, -1, 150] }
+shoulder_lift_joint (shoulder_lift_joint_origin) 	{ , joint:hingeZ, limits:[-1.5, 2, 3.14, -1, 150], ctrl_limits:[3.14, -1, 150] }
 upper_arm_link_0 (shoulder_lift_joint) 	{  Q:[0, -0.1625, -0.0744, -1, 0, 0, 0], shape:mesh, color:[0.7, 0.7, 0.7, 1], mesh:'meshes/eSeries_UR5e_link2.obj', visual }
 elbow_joint_origin (shoulder_lift_joint) 	{  Q:[0, 0.425, 0, -1, 0, 0, 0] }
 elbow_joint (elbow_joint_origin) 	{ , joint:hingeZ, limits:[-3.1416, 3.1416, 3.14, -1, 150], ctrl_limits:[3.14, -1, 150] }

@@ -23,6 +23,23 @@ CHEAP_EE_PATHS = {
     (True, True): "./src/rai/ur10/ur10_vacuum_floating.g",
 }
 
+# UR5 cheap EE: the REAL-arm variants carry the ur5-CALIBRATED wrist-3 capsule (the ur10 wrist
+# is placed for the ur10 arm and is wrong here). The FLOATING variants have no wrist to model,
+# so they reuse the ur10 plain floating gripper (arm-independent). Only the wrist differs by arm.
+UR5_CHEAP_EE_PATHS = {
+    (False, False): "./src/rai/ur5/ur5_two_finger_floating_wrist.g",
+    (False, True): "./src/rai/ur5/ur5_vacuum_floating_wrist.g",
+    (True, False): "./src/rai/ur10/ur10_two_finger_floating.g",
+    (True, True): "./src/rai/ur10/ur10_vacuum_floating.g",
+}
+
+
+def cheap_ee_path(is_ur5, floating, vacuum):
+    """Cheap-collision EE model matching the arm: ur5 gets the ur5-calibrated wrist for the
+    REAL arm, everything else the ur10 table (the floating cases coincide -- no arm/wrist)."""
+    table = UR5_CHEAP_EE_PATHS if is_ur5 else CHEAP_EE_PATHS
+    return os.path.join(HERE, table[(floating, vacuum)])
+
 # UR5 EE variants, keyed by (floating_ee, vacuum). The REAL-ARM variants are the normal
 # src/rai/ur5 model (ur5.g = arm + robotiq two-finger; ur5_vacuum.g = arm + vacuum pen). The
 # FLOATING variants are arm-INDEPENDENT (a 6-DOF floating gripper, no arm), so they reuse the

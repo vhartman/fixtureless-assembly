@@ -1922,13 +1922,36 @@ def _grasp_surface(spec, grasp_id):
   return surfaces[grasp_id]
 
 
+_WORST_CORNER = {}                                          # geometry sig -> last-infeasible corner idx
+
+
 def _group_stable_loaded(state, assembly, group, gripper_kind, load_variants):
   # ROBUST stability under an UNCERTAIN applied load: the group must balance EVERY worst-case
   # realization in `load_variants` (a list of (force_world, point) corners from
   # _insertion_uncertainty_variants). With insertion_uncertainty off that list is the single
   # nominal load, so this is exactly the old one-shot _group_stable check.
-  return all(_group_stable(state, assembly, group, gripper_kind, applied=[lv])
-             for lv in load_variants)
+  #
+  # Each corner is an independent equilibrium LP (contact forces are free to differ per
+  # realization), so there is nothing to fold into a single joint solve. But the `all` below
+  # SHORT-CIRCUITS on the first infeasible corner, so an unstable group need not price all 2^k
+  # corners -- IF we test a failing one first. The same grounding GEOMETRY tends to fail in the
+  # same direction throughout the search, so we remember the last-infeasible corner index per
+  # geometry and try it first. Exact (still requires every corner); only the order changes.
+  n = len(load_variants)
+  if n <= 1:
+    return _group_stable(state, assembly, group, gripper_kind,
+                         applied=list(load_variants))
+  _, _, _, _, _, gbytes = _grounding_caps(state, assembly, group, gripper_kind)
+  gkey = (gbytes[0], gbytes[1])                             # load-independent geometry signature
+  order = range(n)
+  hint = _WORST_CORNER.get(gkey)
+  if hint is not None and hint < n:
+    order = [hint] + [i for i in range(n) if i != hint]    # worst-known corner first
+  for idx in order:
+    if not _group_stable(state, assembly, group, gripper_kind, applied=[load_variants[idx]]):
+      _WORST_CORNER[gkey] = idx
+      return False
+  return True
 
 
 def _cross3(a, b):
