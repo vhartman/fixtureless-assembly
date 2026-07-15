@@ -37,7 +37,8 @@ def build_scene(cfg):
   set_rolls_per_face(1 if cfg["vacuum"] else 2)
   apply_wrench_params(cfg)
   C = make_four_robot_env(num_robots=cfg["num_robots"], floating_ee=cfg["floating_ee"],
-                          vacuum=cfg["vacuum"], robot_types=cfg["robot_types"])
+                          vacuum=cfg["vacuum"],
+                          robot_types=cfg.get("robot_types") or cfg.get("robot", "ur10"))
   assembly = make_assembly(cfg["assembly"], cfg["parts"])
   C = add_disassembled_obj(C, assembly, perturb_start_pose=cfg["perturb_start_pose"],
                            spacing=cfg["scatter_spacing"])

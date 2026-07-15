@@ -4,7 +4,7 @@ Prefix: "ur_"
 Include: <ur5e_clean.g>
 Prefix: false
 
-Edit ur_base_link(ur_base): {}
+Edit ur_base_link(ur_base): { Q:"d(180 0 0 1)" }   # face the workspace (ur5 base convention is 180deg off ur10)
 
 coll1(ur_shoulder_pan_joint_origin)  { shape:capsule color:[1.,1.,1.,.5] size:[.18 .08] Q:"t(0 0 0) d(90 90 1 0)", contact:-2 }
 coll1_1(ur_shoulder_lift_joint)      { shape:capsule color:[1.,1.,1.,.5] size:[.16 .065] Q:"t(0 .0 0.01) d(0 0 1 0)", contact:-2 }
@@ -17,9 +17,14 @@ coll7(ur_wrist_3_joint)              { shape:capsule color:[1.,1.,1.,.5] size:[.
 
 ur_ee_marker (ur_wrist_3_joint) { shape:marker, size:[.05], Q:"t(0 0 .24)"}
 
+# gripper-mount flange: the tool root the assembly code keys on (ur_ee_link, like ur10.g).
+# Sits where the gripper bolts on (= the robotiq_base attach transform), i.e. BEHIND the tool
+# centre along the approach axis, so _gripper_rest_transforms derives the approach correctly.
+ur_ee_link (ur_wrist_3_joint) { Q:"d(90 0 0 1) t(-.0 -.0 .09)" }
+
 Prefix: "ur_"
 Include: <../robotiq/robotiq.g>
-Edit ur_robotiq_base (ur_wrist_3_joint) { Q:"d(90 0 0 1) t(-.0 -.0 .09)" }
+Edit ur_robotiq_base (ur_ee_link) {}
 
 Edit ur_shoulder_pan_joint: { q: 0.0 }
 Edit ur_shoulder_lift_joint: { q: -0.5 }

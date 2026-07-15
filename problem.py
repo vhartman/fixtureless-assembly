@@ -81,6 +81,12 @@ class Assembly:
     # unchanged. See CubeTwoPlateAssembly.
     self.connect_parts = set()
     self.connect_requires = {}
+    # NO-HOLD parts: a grasp on one of these may only manipulate the LONE part (pick it, press
+    # it in as the inserter) -- it can never HOLD/BRACE a multi-part subassembly. Models parts
+    # that are not a stable grip for the rest (e.g. a wheel that would rotate): you can put it
+    # on the car, but you can't then hang the car off it for later steps. NOT a physics change
+    # (mates stay rigid welds); just a discrete restriction on which grasps count as support.
+    self.no_hold = set()
     self.define()
     for p in self.objects:                                 # fill physics defaults
       self.masses.setdefault(p, self.DEFAULT_MASS)
@@ -98,6 +104,10 @@ class Assembly:
 
   def mass(self, part):
     return self.masses.get(part, self.DEFAULT_MASS)
+
+  def can_hold(self, part):
+    # may a grasp on `part` HOLD/BRACE a subassembly? False for no_hold parts (see __init__).
+    return part not in self.no_hold
 
   def mate_type(self, part):
     # contact type of the mate joining `part` to its parent (None for the base / free part).
@@ -532,6 +542,7 @@ class CarAssembly(Assembly):
       self.scatter_orientations[f"obj_{i}"] = q_flat
       self.assembly_relative_poses[f"obj_{i}"] = ["obj_0", np.array([x, y, -0.3 * w])]
       self.mate_axes[f"obj_{i}"] = np.array([0.0, -np.sign(y), 0.0])  # axial, onto the axle
+      self.no_hold.add(f"obj_{i}")                          # a wheel would rotate -> can't brace
     self.assembly_dependencies = {}
 
 
@@ -1078,6 +1089,13 @@ def is_grounding(contact):
   return contact[0] in GROUNDING_CONTACTS
 
 
+def _grasp_holds(assembly, group, gpart):
+  # does a grasp on `gpart` count as HOLDING `group`? A no_hold part (e.g. a wheel) may hold
+  # only a LONE part -- itself, being picked / pressed in as the inserter -- never a multi-part
+  # subassembly. So you can put a wheel on the car, but you can't then hold the car by it.
+  return assembly.can_hold(gpart) or len(group) == 1
+
+
 # LATE BINDING (robot-anonymous search). When on, State.key() relabels robots to canonical
 # ids so states that differ ONLY in which robot holds what collapse to one -- killing the
 # robot-assignment redundancy that makes the search blow up as robots are added, and making
@@ -1176,8 +1194,12 @@ class State:
     # a group is supported iff it has grounding contacts AND they can hold it. With
     # gripper_kind None this is the TOPOLOGICAL baseline (grounded + wrench stub); with a
     # gripper kind it is the real static-equilibrium check (gravity only -- callers add
-    # insertion loads separately).
+    # insertion loads separately). NO-HOLD parts (assembly.no_hold) don't count as holding a
+    # multi-part group, so a car braced only by a wheel is UNSUPPORTED (see _grasp_holds).
     grounding = self.grounding_contacts(group)
+    if assembly is not None and assembly.no_hold:
+      grounding = frozenset(c for c in grounding
+                            if c[0] != "grasp" or _grasp_holds(assembly, group, c[2]))
     if len(grounding) == 0:
       return False
     if gripper_kind is None:
@@ -1856,6 +1878,8 @@ def _grounding_caps(state, assembly, group, gripper_kind):
   for p in members:
     for c in sorted(state.supports.get(p, ())):
       if c[0] == "grasp":
+        if not _grasp_holds(assembly, members, c[2]):
+          continue                                          # no_hold part can't brace a group
         gp, n, t1, t2 = _grasp_frame(assembly, c[2], poses[c[2]], c[3])  # c=(grasp,r,gpart,gid)
         surf = _grasp_surface(assembly.part_shape(c[2]), c[3]) if derate else "flat"
         caps.append(wrench.grasp_capability(gp - centroid, n, t1, t2, gripper_kind, surface=surf))

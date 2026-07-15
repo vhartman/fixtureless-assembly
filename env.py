@@ -23,6 +23,17 @@ CHEAP_EE_PATHS = {
     (True, True): "./src/rai/ur10/ur10_vacuum_floating.g",
 }
 
+# UR5 EE variants, keyed by (floating_ee, vacuum). The REAL-ARM variants are the normal
+# src/rai/ur5 model (ur5.g = arm + robotiq two-finger; ur5_vacuum.g = arm + vacuum pen). The
+# FLOATING variants are arm-INDEPENDENT (a 6-DOF floating gripper, no arm), so they reuse the
+# UR10 floating files -- a floating EE is the same whichever arm it stands in for.
+UR5_PATHS = {
+    (False, False): "./src/rai/ur5/ur5.g",
+    (False, True): "./src/rai/ur5/ur5_vacuum.g",
+    (True, False): "./src/rai/ur10/ur10_two_finger_floating.g",
+    (True, True): "./src/rai/ur10/ur10_vacuum_floating.g",
+}
+
 # Prefix used by each robot type's .g file.
 ROBOT_PREFIXES = {"ur5": "ur_", "ur10": "ur_", "kuka": "kuka_"}
 
@@ -89,7 +100,7 @@ def _robot_path(robot_type, floating_ee, vacuum):
     if robot_type == "ur10":
         return os.path.join(HERE, UR10_PATHS[(floating_ee, vacuum)])
     if robot_type == "ur5":
-        return os.path.join(HERE, "./src/rai/ur5_vamp/ur5_vamp.g")
+        return os.path.join(HERE, UR5_PATHS[(floating_ee, vacuum)])
     return os.path.join(HERE, "./src/rai/kuka_drake/kuka_two_finger.g")
 
 

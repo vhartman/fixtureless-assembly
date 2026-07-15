@@ -144,6 +144,9 @@ def test_wrench_uncertainty_flags():
   'don't hold by the wheel' without forbidding any action by hand."""
   A.set_seed(0); A.set_rolls_per_face(2)
   car = A.make_assembly("car", 5)
+  car.no_hold = set()      # this test isolates the curved/noise WRENCH mechanism -- it holds the
+                           # car by a wheel on purpose, which the no_hold POLICY (tested separately
+                           # in test_no_hold_parts) would otherwise forbid.
   sw = A.part_grasp_surfaces(car.part_shape("obj_1"))
   sb = A.part_grasp_surfaces(car.part_shape("obj_0"))
   g_wheel = next(i for i, s in enumerate(sw) if s == "curved")
@@ -190,6 +193,42 @@ def test_wrench_uncertainty_flags():
   finally:
     W.PARAMS["grasp_model"], W.PARAMS["curved_grasp_torque_scale"], \
         W.PARAMS["insertion_uncertainty"] = saved
+
+
+def test_no_hold_parts():
+  """assembly.no_hold: a grasp on a no_hold part (a car WHEEL) may hold only the LONE part (the
+  inserter) -- never a multi-part subassembly. So you can put a wheel on the car, but can't then
+  hold the car BY it. (Fast: crafted states, no search.)"""
+  A.set_seed(0); A.set_rolls_per_face(2)
+  saved = W.PARAMS.get("grasp_model")
+  try:
+    W.PARAMS["grasp_model"] = "asymmetric"; W.PARAMS["insertion_uncertainty"] = None
+    asm = A.make_assembly("car-mini", 3)
+    assert asm.no_hold == {"obj_1", "obj_2"} and not asm.can_hold("obj_1") and asm.can_hold("obj_0")
+    C = make_four_robot_env(num_robots=3, floating_ee=True, vacuum=False)
+    A.add_disassembled_obj(C, asm, spacing=0.2)
+    gk = A.gripper_kind(C); poses = A._flat_poses(asm)
+
+    def held(holder):                                       # {obj_0,obj_1} welded, held by holder
+      parent = {"obj_0": ("gripper", "a1"), "obj_1": ("part", "obj_0"), "obj_2": ("table",)}
+      supports = {"obj_0": frozenset(), "obj_1": frozenset({("mate", "obj_0")}),
+                  "obj_2": frozenset({("table",)})}
+      supports[holder] = supports[holder] | {("grasp", "a1", holder, 0)}
+      return A.State(parent=parent, place={"obj_2": ("slot", 2, 5)}, supports=supports,
+                     poses=dict(poses))
+
+    assert not held("obj_1").is_supported({"obj_0", "obj_1"}, asm, gk), "wheel must not hold the car"
+    assert held("obj_0").is_supported({"obj_0", "obj_1"}, asm, gk), "body may hold the car"
+    # the lone wheel (inserter) is still holdable
+    lone = A.State(parent={"obj_1": ("gripper", "a1"), "obj_0": ("table",), "obj_2": ("table",)},
+                   place={}, poses=dict(poses),
+                   supports={"obj_1": frozenset({("grasp", "a1", "obj_1", 0)}),
+                             "obj_0": frozenset({("table",)}), "obj_2": frozenset({("table",)})})
+    assert lone.is_supported({"obj_1"}, asm, gk), "a lone wheel (the inserter) stays holdable"
+    # all-cube assemblies are unaffected (empty no_hold)
+    assert A.make_assembly("cube", 4).no_hold == set()
+  finally:
+    W.PARAMS["grasp_model"] = saved
 
 
 def test_cograsp_bracing():

@@ -22,8 +22,15 @@ def parse_args():
       help="Use the vacuum end-effector instead of the two-finger gripper.",
   )
   parser.add_argument(
-      "--robot-types", default="ur10",
-      help="Robot type for all robots (e.g. ur10, ur5). Default: ur10",
+      "--robot", choices=["ur10", "ur5"], default="ur10",
+      help="Robot arm for all robots: ur10 (default) or ur5. With --floating-ee the arm is "
+           "irrelevant (a generic floating gripper); it matters for the real arm (no --floating-ee "
+           "/ --real-ik) -- note the ur5 has a much shorter reach (~0.85 m vs ~1.3 m).",
+  )
+  parser.add_argument(
+      "--robot-types", default=None,
+      help="Advanced: comma-free per-slot override of the robot type (defaults to --robot for "
+           "every slot). Rarely needed.",
   )
   parser.add_argument(
       "--perturb-start-pose", action="store_true",
@@ -266,7 +273,7 @@ def parse_args():
 
 # fields persisted by --save so replay.py can reconstruct the EXACT scene (see plan_io.py).
 _SAVE_CONFIG_FIELDS = (
-    "assembly", "parts", "num_robots", "vacuum", "floating_ee", "robot_types",
+    "assembly", "parts", "num_robots", "vacuum", "floating_ee", "robot", "robot_types",
     "scatter_spacing", "perturb_start_pose", "seed", "wrench", "grasp_model", "insert_force",
     "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
     "bracing",
@@ -326,7 +333,7 @@ def main():
       num_robots=args.num_robots,
       floating_ee=args.floating_ee,
       vacuum=args.vacuum,
-      robot_types=args.robot_types,
+      robot_types=args.robot_types or args.robot,   # --robot for all; --robot-types overrides
   )
 
   assembly = make_assembly(args.assembly, args.parts)
