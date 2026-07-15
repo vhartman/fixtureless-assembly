@@ -129,10 +129,11 @@ def display_final_assembly(C, assembly, base_pose):
 
     C_final.getFrame(obj).setRelativePosition(parent[1])
 
-    # keep the object's color, just lower its opacity
-    mesh_colors = np.asarray(C_final.getFrame(obj).getMeshColors(), dtype=float)
+    # keep the object's color, just lower its opacity (shape may live on a __shape child)
+    sf = C_final.getFrame(part_shape_frame(C_final, obj))
+    mesh_colors = np.asarray(sf.getMeshColors(), dtype=float)
     rgb = (mesh_colors.reshape(-1, mesh_colors.shape[-1])[0][:3]) / 255.0
-    C_final.getFrame(obj).setColor([rgb[0], rgb[1], rgb[2], 0.3])
+    sf.setColor([rgb[0], rgb[1], rgb[2], 0.3])
 
   C_final.getFrame(assembly.base).setPosition(base_pose)
 
@@ -155,10 +156,11 @@ def show_subassemblies(C, assembly, subassemblies, base_pose):
 
         C_final.getFrame(obj).setRelativePosition(parent[1])
 
-      # keep the object's color, just lower its opacity
-      mesh_colors = np.asarray(C_final.getFrame(obj).getMeshColors(), dtype=float)
+      # keep the object's color, just lower its opacity (shape may live on a __shape child)
+      sf = C_final.getFrame(part_shape_frame(C_final, obj))
+      mesh_colors = np.asarray(sf.getMeshColors(), dtype=float)
       rgb = (mesh_colors.reshape(-1, mesh_colors.shape[-1])[0][:3]) / 255.0
-      C_final.getFrame(obj).setColor([rgb[0], rgb[1], rgb[2], 0.3])
+      sf.setColor([rgb[0], rgb[1], rgb[2], 0.3])
 
     C_final.getFrame(assembly.base).setPosition(base_pose)
 
@@ -212,7 +214,7 @@ def visualize_state(C, state, assembly, gripper_path=None, view=True):
         continue
       robot, gpart, grasp_id = c[1], c[2], c[3]
       grasp_world = _pose_compose(np.asarray(part_poses[gpart], dtype=float),
-                                  cube_grasp_pose(grasp_id, assembly.cube_size))
+                                  grasp_pose(assembly, gpart, grasp_id))
       place_floating_ee(C_viz, grasp_world, gripper_path, prefix=f"ee_{robot}_{gpart}_")
 
   if view:
@@ -273,9 +275,13 @@ def visualize_plan(C, assembly, plan, robots=None, gripper_path=None, recorder=N
   show(s, "0: initial")
 
   allobj = set(assembly.objects)                           # for resolving stow edges (declutter)
+  # the REAL grasp table (auto-detected gripper): the on-the-fly fallback would default to
+  # the VACUUM EE and its flat-surface grasp filter -- with a two-finger env that silently
+  # drops the radial grasps the search used, and the replay dies with "could not apply".
+  _, grasp_table = _search_context(C, assembly, robots)
   for i, action in enumerate(plan, 1):
     # re-derive the successor for this action (reuses the transition logic)
-    nxt = next((ns for a, ns in _declutter_edges(s, assembly, robots, None, allobj)
+    nxt = next((ns for a, ns in _declutter_edges(s, assembly, robots, grasp_table, allobj)
                 if a == action), None)
     if nxt is None:
       print(f"[{i}/{len(plan)}] !! could not apply {action} in {s}")
@@ -392,7 +398,7 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
     # rigidly move the whole group so `gpart` sits at `robot`'s gripper exactly at its
     # grasp transform -- the configuration the IK solved in (scene_for attaches held
     # groups to their holder, even table-braced ones; the replay must match it).
-    grasp = cube_grasp_pose(grasp_id, assembly.cube_size)
+    grasp = grasp_pose(assembly, gpart, grasp_id)
     ee_t = np.concatenate([grasp[:3],
                            _quat_mul(grasp[3:], robot_ik.q_correction[robot])])
     grip = np.asarray(Cv.getFrame(robot_ik.gripper_frame[robot]).getPose())
@@ -407,8 +413,9 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
     f.setQuaternion(new[3:])
 
   allobj = set(assembly.objects)                           # for resolving stow edges (declutter)
+  _, grasp_table = _search_context(C, assembly, robots)    # REAL gripper's table (see above)
   for i, action in enumerate(plan, 1):
-    nxt = next((ns for a, ns in _declutter_edges(s, assembly, robots, None, allobj)
+    nxt = next((ns for a, ns in _declutter_edges(s, assembly, robots, grasp_table, allobj)
                 if a == action), None)
     if nxt is None:
       print(f"[{i}/{len(plan)}] !! could not apply {action} in {s}")

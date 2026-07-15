@@ -52,13 +52,17 @@ def parse_args():
   )
   parser.add_argument(
       "--assembly",
-      choices=["cross", "cube", "arch", "arch-seq", "cube-plates", "cube-plates-2x2x3"],
+      choices=["cross", "cube", "arch", "arch-seq", "cube-plates", "cube-plates-2x2x3",
+               "cuboid-tower", "car", "car-mini"],
       default="cross",
       help="Assembly to build: cross (cube cross, 7), cube (2x2x2 grid, 8), "
            "arch (two pillars + lintel, 7 -- known-flawed star model), "
            "arch-seq (arch shape built as a sequential chain, 7), "
            "cube-plates (2x2x2 cube as two stacked 2x2 plates, faithful DAG), "
-           "cube-plates-2x2x3 (three stacked 2x2 plates, 12 cubes -- use --parts 12). "
+           "cube-plates-2x2x3 (three stacked 2x2 plates, 12 cubes -- use --parts 12), "
+           "cuboid-tower (jenga-style: 2 laid cuboids per level, levels rotated 90deg, up to 8), "
+           "car (cuboid body + 4 sideways cylinder wheels, 5), "
+           "car-mini (car scaled to w=0.03: wheels fit ACROSS the two-finger gap). "
            "Default: cross.",
   )
   parser.add_argument(

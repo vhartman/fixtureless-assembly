@@ -58,12 +58,10 @@ class CollisionChecker:
 
   def __init__(self, assembly, robots, gripper_path=None):
     self.gripper_path = gripper_path or os.path.join(os.path.dirname(__file__), DEFAULT_FLOATING_EE)
-    self.cube_size = assembly.cube_size
 
     template = make_world()                                # floor + table, same as the real env
-    cs, cr = assembly.cube_size, assembly.cube_radius
-    for obj in assembly.objects:                           # the parts, as cubes (posed per query)
-      template.addFrame(obj).setShape(ry.ST.ssBox, [cs, cs, cs, cr]).setContact(1)
+    for obj in assembly.objects:                           # the parts (posed per query)
+      add_part_frame(template, obj, assembly.part_shape(obj))
 
     # one free-floating gripper slot per robot (at most one active grasp per robot),
     # pre-loaded and parked far away so unused slots touch nothing.
@@ -133,7 +131,7 @@ class CollisionChecker:
     grasps += list(extra_grasps)
     for prefix, (gpart, grasp_id) in zip(self.slots, grasps):   # move a slot onto each grasp
       grasp_world = _pose_compose(np.asarray(part_poses[gpart], dtype=float),
-                                  cube_grasp_pose(grasp_id, self.cube_size))
+                                  grasp_pose(assembly, gpart, grasp_id))
       base_world = _ee_root_pose(grasp_world, self.base_rel_tool, self.q_correction)
       root = C_col.getFrame(prefix + "ur_base")
       root.setPosition(base_world[:3])
@@ -283,10 +281,10 @@ class RobotIK:
     return {c[1]: (c[2], c[3]) for p in state.bodies()
             for c in state.supports.get(p, ()) if c[0] == "grasp"}
 
-  def ee_target(self, robot, grasp_id, assembly):
-    # the gripper's target pose relative to its grasped part: the generated grasp,
+  def ee_target(self, robot, part, grasp_id, assembly):
+    # the gripper's target pose relative to its grasped part: the part's generated grasp,
     # approach-corrected for THIS robot's EE.
-    grasp = cube_grasp_pose(grasp_id, assembly.cube_size)
+    grasp = grasp_pose(assembly, part, grasp_id)
     return np.concatenate([grasp[:3], _quat_mul(grasp[3:], self.q_correction[robot])])
 
   def _add_grasp_maintenance(self, komo, state, assembly):
@@ -301,7 +299,7 @@ class RobotIK:
       root = _group_root(state, g)
       if pt == root and state.parent.get(root) == ("gripper", r):
         continue                            # kinematic holder: enforced by the attach
-      tgt = self.ee_target(r, gid, assembly)
+      tgt = self.ee_target(r, pt, gid, assembly)
       komo.addObjective([1, 1], ry.FS.positionRel, [self.gripper_frame[r], pt],
                         ry.OT.eq, [1e1], tgt[:3])
       komo.addObjective([1, 1], ry.FS.quaternionRel, [self.gripper_frame[r], pt],
@@ -403,7 +401,7 @@ class RobotIK:
     # identity for the two-finger but a 90 deg rotation for the vacuum, so using the raw
     # grasp here would seat the cube rotated 90 deg off the gripper.)
     gripper = self.gripper_frame[robot]
-    grasp = cube_grasp_pose(grasp_id, assembly.cube_size)
+    grasp = grasp_pose(assembly, gpart, grasp_id)
     ee_target = np.concatenate([grasp[:3], _quat_mul(grasp[3:], self.q_correction[robot])])
     gp_world = _pose_compose(np.asarray(C.getFrame(gripper).getPose()), _pose_invert(ee_target))
     C.getFrame(gpart).setPosition(gp_world[:3])
@@ -553,7 +551,7 @@ class RobotIK:
     # give the joint solution directly (and far faster) instead of a nonlinear solve+restarts.
     _, robot, part, grasp_id = action
     C = self.scene_for(s0, assembly)                      # part sits on the table (fixed target)
-    grasp = cube_grasp_pose(grasp_id, assembly.cube_size)  # gripper pose relative to `part`
+    grasp = grasp_pose(assembly, part, grasp_id)          # gripper pose relative to `part`
     # align the grasp's +z approach with THIS EE's real approach axis (identity for the
     # two-finger, a rotation for the vacuum) -- so the tool-center is oriented correctly.
     ee_target = np.concatenate([grasp[:3], _quat_mul(grasp[3:], self.q_correction[robot])])
@@ -564,7 +562,7 @@ class RobotIK:
     # the gripper is SUPPOSED to touch the part it grasps (two-finger palm/fingers close
     # around it), so exclude the target part from collision -- otherwise the collision
     # objective forbids the grasp itself.
-    C.getFrame(part_name).setContact(0)
+    set_part_contact(C, part_name, 0)
 
     if self.strip_inactive_collision:
       self._disable_inactive_collision(C, robot)          # drop other arms' contact pairs
@@ -620,9 +618,9 @@ class RobotIK:
     # the grasp. Existing braces stay pinned via grasp maintenance.
     _, robot, gpart, grasp_id = action
     C = self.scene_for(s0, assembly)                      # group held at its current holder(s)
-    grasp = cube_grasp_pose(grasp_id, assembly.cube_size)
+    grasp = grasp_pose(assembly, gpart, grasp_id)
     ee_target = np.concatenate([grasp[:3], _quat_mul(grasp[3:], self.q_correction[robot])])
-    C.getFrame(gpart).setContact(0)                       # the new gripper is meant to touch gpart
+    set_part_contact(C, gpart, 0)                        # the new gripper is meant to touch gpart
 
     def build(collisions):
       komo = ry.KOMO(C, phases=1, slicesPerPhase=1, kOrder=1, enableCollisions=collisions)
@@ -776,7 +774,7 @@ class RobotIK:
     # the cheap floating-EE check already covered the moved geometry vs the scene.
     moving = next((g for g in s0.subassemblies() if part in g), (part,))
     for mp in moving:
-      C.getFrame(mp).setContact(0)
+      set_part_contact(C, mp, 0)
 
     if self.reach_precheck:
       # relaxed (collision-free) reach: can the mate pose be reached AT ALL? A clear relaxed
@@ -1581,22 +1579,22 @@ class CollapsedLabeledHeuristic:
 
 
 _TABLE_PICK_FACT_CACHE = {}
-_FACT_TEMPLATES = {}                                       # (ee_path, cs, cr, n) -> template
+_FACT_TEMPLATES = {}                                       # (ee_path, id(assembly)) -> template
 
 
-def _fact_template(gripper_path, cs, cr, n_parts):
-  # ONE reusable config per (gripper, cube geometry, max parts): world + n generic cubes
-  # parked far away + the EE pre-parsed. Per fact we COPY it (rai ~0.4ms) and reposition --
-  # profiling showed place_floating_ee's addFile (re-parsing the gripper .g per fact) was
-  # a third of the whole heuristic build.
-  key = (gripper_path, cs, cr, n_parts)
+def _fact_template(gripper_path, assembly):
+  # ONE reusable config per (gripper, assembly): world + every part's shape parked far away
+  # + the EE pre-parsed. Per fact we COPY it (rai ~0.4ms) and reposition -- profiling showed
+  # place_floating_ee's addFile (re-parsing the gripper .g per fact) was a third of the
+  # whole heuristic build. Frames are named by PART (shape-correct per part).
+  key = (gripper_path, id(assembly))
   hit = _FACT_TEMPLATES.get(key)
   if hit is not None:
     return hit
   C = make_world()
-  for i in range(n_parts):
-    C.addFrame(f"factcube{i}").setShape(ry.ST.ssBox, [cs, cs, cs, cr]) \
-        .setPosition([0.0, -500.0 - 2.0 * i, 1.0]).setContact(1)
+  for i, p in enumerate(assembly.objects):
+    add_part_frame(C, p, assembly.part_shape(p)) \
+        .setPosition([0.0, -500.0 - 2.0 * i, 1.0])
   place_floating_ee(C, np.array([0.0, -900.0, 1.0, 1.0, 0.0, 0.0, 0.0]),
                     gripper_path, prefix="eeFACT_")
   tool, base_rel_tool, q_corr = _gripper_rest_transforms(C, "eeFACT_")
@@ -1621,25 +1619,23 @@ def _table_aware_pick_fact(assembly, S_key, face, gpart, gid, gripper_path,
   hit = _TABLE_PICK_FACT_CACHE.get(key)
   if hit is not None:
     return hit
-  cs, cr = assembly.cube_size, assembly.cube_radius
-  tmpl, base_rel_tool, q_corr, top = _fact_template(
-      gripper_path, cs, cr, len(assembly.objects))
+  tmpl, base_rel_tool, q_corr, top = _fact_template(gripper_path, assembly)
   C = ry.Config()
   C.addConfigurationCopy(tmpl)
   q = _FACE_DOWN_QUATS[face]
   R = _quat_to_R(q)
   ref = S_key[0]
-  lift = _group_rest_lift(assembly, set(S_key), ref, face)
+  rest = _group_rest_height(assembly, set(S_key), ref, face)
   ref_off = assembly.position_in_base(ref)
-  base_pos = np.array([0.0, 0.0, top + cs / 2.0 + lift + clearance])
+  base_pos = np.array([0.0, 0.0, top + rest + clearance])
   poses = {}
-  for i, p in enumerate(S_key):
+  for p in S_key:
     pos = base_pos + R @ (assembly.position_in_base(p) - ref_off)
-    f = C.getFrame(f"factcube{i}")
+    f = C.getFrame(p)
     f.setPosition(pos)
     f.setQuaternion(q)
     poses[p] = np.concatenate([pos, q])
-  grasp_world = _pose_compose(poses[gpart], cube_grasp_pose(gid, cs))
+  grasp_world = _pose_compose(poses[gpart], grasp_pose(assembly, gpart, gid))
   base_world = _ee_root_pose(grasp_world, base_rel_tool, q_corr)
   root = C.getFrame("eeFACT_ur_base")
   root.setPosition(base_world[:3])

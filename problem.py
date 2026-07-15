@@ -59,6 +59,18 @@ class Assembly:
     self.masses = {}
     self.mate_types = {}
     self.mate_axes = {}
+    # PER-PART SHAPES: {part: (kind, params)} -- ("box", [sx, sy, sz, corner_r]),
+    # ("cylinder", [length, radius]) (axis = local z), ("sphere", [radius]). Anything unset
+    # defaults to the assembly's cube (cube_size/cube_radius) after define(), so classic
+    # all-cube assemblies are untouched. Every scene builder, grasp generator, rest-pose and
+    # wrench-contact computation reads shapes through part_shape() -- ONE source of truth,
+    # so the cheap scenes, IK scenes and real env always agree.
+    self.part_shapes = {}
+    # SCATTER ORIENTATIONS: {part: quat} -- how a part initially LIES on the table (default
+    # identity). E.g. the car's wheels rest FLAT (cap down) in the scatter although their
+    # assembled orientation is axle-sideways; the anchor pose carries the rotation, and the
+    # whole placement-face system composes on the anchor, so nothing else changes.
+    self.scatter_orientations = {}
     # CONNECT (module-join) mates: parts whose mate onto their parent joins two independently
     # built MODULES rather than adding a part within one. Their mate edge is NOT traversed by
     # `_mate_closure` (so each module's internal build precedence excludes the join), which is
@@ -72,10 +84,17 @@ class Assembly:
     self.define()
     for p in self.objects:                                 # fill physics defaults
       self.masses.setdefault(p, self.DEFAULT_MASS)
+      cs = getattr(self, "cube_size", 0.05)
+      cr = getattr(self, "cube_radius", 0.005)
+      self.part_shapes.setdefault(p, ("box", [cs, cs, cs, cr]))
     for p in self.assembly_relative_poses:                 # every mate has a type + an axis
       self.mate_types.setdefault(p, self.DEFAULT_MATE_TYPE)
       self.mate_axes.setdefault(p, self._default_mate_axis(p))
     self.validate()
+
+  def part_shape(self, part):
+    # (kind, params) collision/appearance shape of `part` -- see part_shapes in __init__.
+    return self.part_shapes[part]
 
   def mass(self, part):
     return self.masses.get(part, self.DEFAULT_MASS)
@@ -156,19 +175,35 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
   # rather than the planner. Parts beyond `per_row` WRAP into further rows (y += spacing per
   # row) -- a single line of >8 parts walks off the reachable table. Row 0 is byte-identical
   # to the historical line, so existing <=8-part scenes are unchanged.
-  cs, cr = assembly.cube_size, assembly.cube_radius
+  cs = assembly.cube_size
+
+  table_half = C.getFrame("table").getSize()[2] / 2.0
 
   for i, name in enumerate(assembly.objects):
       row, col = divmod(i, per_row)
-      pos = np.array([-0.5 + col * spacing, row * spacing, 0.07])
+      # scatter orientation (how the part initially LIES, e.g. wheels flat) and a
+      # SHAPE-AWARE height: table top + half extent at that orientation + the historical
+      # 15mm float (for the classic cube this is exactly the old fixed z of 0.07).
+      scatter_q = assembly.scatter_orientations.get(name)
+      spec = assembly.part_shape(name)
+      Rs = _quat_to_R(scatter_q) if scatter_q is not None else np.eye(3)
+      z = table_half + _shape_half_z(spec, Rs) + 0.015
+      pos = np.array([-0.5 + col * spacing, row * spacing, z])
 
-      obj = (
-          C.addFrame(name).setParent(C.getFrame("table")).setShape(
-              ry.ST.ssBox, [cs, cs, cs, cr]
-          ).setRelativePosition([pos[0], pos[1], pos[2]]).setMass(0.1).setColor(
-              np.random.rand(3)
-          ).setContact(1).setJoint(ry.JT.rigid)
-      )
+      sq = _shape_quat(spec)
+      obj = C.addFrame(name).setParent(C.getFrame("table"))
+      if sq is None:                                       # shape on the part frame itself
+        _set_raw_shape(obj, spec).setContact(1)
+        shape_f = obj
+      else:                                                # rotated shape -> rigid child
+        shape_f = _set_raw_shape(C.addFrame(f"{name}__shape", name), spec)
+        shape_f.setRelativeQuaternion(list(sq))
+        shape_f.setContact(1)
+      obj.setRelativePosition([pos[0], pos[1], pos[2]]).setJoint(ry.JT.rigid)
+      if scatter_q is not None:
+        obj.setRelativeQuaternion(list(scatter_q))
+      shape_f.setMass(0.1)                                 # rai wants the mass on the shape
+      shape_f.setColor(np.random.rand(3))
 
       # ORIENTATION MARKER: a rai axis-triad marker per cube, so rotations of the
       # uniformly-colored cubes are visible. A child frame -> follows the part wherever
@@ -177,20 +212,21 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
       C.addFrame(f"{name}_marker", name).setShape(ry.ST.marker, [cs * 1.5])
 
       if perturb_start_pose:
-          # rejection-sample a perturbation that keeps the config collision free
+          # rejection-sample a perturbation that keeps the config collision free (the yaw
+          # composes ONTO the scatter orientation, so e.g. flat wheels stay flat)
+          base_q = scatter_q if scatter_q is not None else np.array([1.0, 0.0, 0.0, 0.0])
           for _ in range(max_tries):
               dxy = np.random.uniform(-pos_noise, pos_noise, size=2)
               yaw = np.random.uniform(-np.pi, np.pi)
               obj.setRelativePosition([pos[0] + dxy[0], pos[1] + dxy[1], pos[2]])
-              obj.setRelativeQuaternion(
-                  [np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)]
-              )
+              obj.setRelativeQuaternion(list(_quat_mul(
+                  np.array([np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)]), base_q)))
               if C.getCollisionFree():
                   break
           else:
               # could not place without collision: fall back to the nominal pose
               obj.setRelativePosition([pos[0], pos[1], pos[2]])
-              obj.setRelativeQuaternion([1, 0, 0, 0])
+              obj.setRelativeQuaternion(list(base_q))
 
   return C
 
@@ -415,15 +451,107 @@ class CubePlatesAssembly(Assembly):
         self.connect_requires[f"obj_{root}"] = {f"obj_{last_own}", f"obj_{last_below}"}
 
 
+class CuboidTowerAssembly(Assembly):
+  """A JENGA-STYLE tower of laid-down 2:1:1 cuboids: TWO per level, side by side, each
+  level rotated 90 degrees against the one below.
+
+  Every level is a 2w x 2w slab. Even levels use x-long parts ("box",[2w,w,w]); odd levels
+  use the ROTATED variant expressed as its own shape ("box",[w,2w,w]) -- parts stay
+  axis-aligned, the 90-degree turn lives in the per-part shape. Parts form a plain mate
+  chain (each onto its predecessor; level roots sit diagonally on the slab below), and
+  every mate seats TOP-DOWN (mate_axes = -z: blocks are lowered into place, like real
+  block stacking)."""
+
+  def __init__(self, n_parts=4, width=0.05, cube_radius=0.005):
+    self.n_parts = n_parts
+    self.width = width
+    self.cube_size = width                # scalar fallback (marker sizing, defaults)
+    self.cube_radius = cube_radius
+    super().__init__()
+
+  def define(self):
+    w, r = self.width, self.cube_radius
+    self.objects = [f"obj_{i}" for i in range(self.n_parts)]
+    self.base = "obj_0"
+
+    def cell(i):
+      # center of part i relative to obj_0, and its shape (levels alternate orientation;
+      # both cover the same 2w x 2w slab footprint, centered above each other).
+      k, a = divmod(i, 2)                                  # level, position-in-level
+      if k % 2 == 0:                                       # x-long pair, side by side in y
+        return np.array([0.0, a * w, k * w]), ("box", [2.0 * w, w, w, r])
+      return np.array([-w / 2.0 + a * w, w / 2.0, k * w]), ("box", [w, 2.0 * w, w, r])
+
+    self.assembly_relative_poses = {}
+    for i in range(self.n_parts):
+      pos, spec = cell(i)
+      self.part_shapes[f"obj_{i}"] = spec
+      if i > 0:
+        prev, _ = cell(i - 1)
+        self.assembly_relative_poses[f"obj_{i}"] = [f"obj_{i - 1}", pos - prev]
+        self.mate_axes[f"obj_{i}"] = np.array([0.0, 0.0, -1.0])   # lowered into place
+    self.assembly_dependencies = {}       # the mate chain IS the precedence
+
+
+class CarAssembly(Assembly):
+  """A toy car: a cuboid BODY and four CYLINDER WHEELS, two per side, axes sideways.
+
+  The wheels are the first ROTATED shapes: ("cylinder", [l, rad], q) with q turning the
+  cylinder's local z onto the part's y axis -- the part frame stays axis-aligned (mates are
+  translation-only as everywhere), the rotation lives inside the shape spec (realized as a
+  `__shape` child frame in every scene). Each wheel mates AXIALLY onto the body's side
+  (mate_axes = -+y: pressed onto its axle); the assembled car rests on its wheels (the
+  rest-height machinery reads the wheel rims as the lowest contacts)."""
+
+  def __init__(self, n_parts=5, width=0.05, cube_radius=0.005):
+    self.n_parts = min(n_parts, 5)
+    self.width = width
+    self.cube_size = width
+    self.cube_radius = cube_radius
+    super().__init__()
+
+  def define(self):
+    w, r = self.width, self.cube_radius
+    self.objects = [f"obj_{i}" for i in range(self.n_parts)]
+    self.base = "obj_0"                                    # the body
+    body = ("box", [4.0 * w, 2.0 * w, w, r])
+    q_axis_y = np.array([np.cos(np.pi / 4.0), np.sin(np.pi / 4.0), 0.0, 0.0])  # z -> y
+    wheel = ("cylinder", [0.4 * w, 0.8 * w], q_axis_y)     # thin disc, radius 0.8w
+    self.part_shapes["obj_0"] = body
+    # wheels at the four side positions: x = +-1.2w (front/back), y = +-1.2w so the inner
+    # cap just touches the body side (body half-depth w + half wheel length 0.2w), the
+    # axle slightly below the body's midline.
+    slots = [(1.2 * w, 1.2 * w), (1.2 * w, -1.2 * w),
+             (-1.2 * w, 1.2 * w), (-1.2 * w, -1.2 * w)]
+    # wheels start FLAT on the table (cap down): rotate the part -90 deg about x so the
+    # axle (part y) points up. The assembled orientation stays identity (axle sideways).
+    q_flat = np.array([np.cos(np.pi / 4.0), -np.sin(np.pi / 4.0), 0.0, 0.0])
+    for i in range(1, self.n_parts):
+      x, y = slots[i - 1]
+      self.part_shapes[f"obj_{i}"] = wheel
+      self.scatter_orientations[f"obj_{i}"] = q_flat
+      self.assembly_relative_poses[f"obj_{i}"] = ["obj_0", np.array([x, y, -0.3 * w])]
+      self.mate_axes[f"obj_{i}"] = np.array([0.0, -np.sign(y), 0.0])  # axial, onto the axle
+    self.assembly_dependencies = {}
+
+
 def make_assembly(kind, n_parts):
   """Assembly factory for the CLI: cross (cube cross), cube (2x2x2 grid), arch (bridge --
   known-flawed star, see class doc), arch-seq (arch shape built as a sequential chain),
   cube-plates (2x2x2 as two stacked 2x2 plates), cube-plates-2x2x3 (three stacked 2x2
-  plates, 12 cubes). The plates family generalizes to any WxDxH via CubePlatesAssembly."""
+  plates, 12 cubes), cuboid-tower (laid-down 2:1:1 cuboids stacked along z -- the first
+  non-cube assembly). The plates family generalizes to any WxDxH via CubePlatesAssembly."""
   kinds = {"cross": (CubeCrossAssembly, 7), "cube": (CubeGridAssembly, 8),
            "arch": (ArchAssembly, 7), "arch-seq": (ArchSequentialAssembly, 7),
            "cube-plates": (CubePlatesAssembly, 8),
-           "cube-plates-2x2x3": (lambda n_parts: CubePlatesAssembly(2, 2, 3, n_parts=n_parts), 12)}
+           "cube-plates-2x2x3": (lambda n_parts: CubePlatesAssembly(2, 2, 3, n_parts=n_parts), 12),
+           "cuboid-tower": (CuboidTowerAssembly, 8),
+           "car": (CarAssembly, 5),
+           # mini car: whole car scaled to width=0.03 -> wheels are discs of diameter
+           # 0.8w*2 = 0.048, comfortably inside the two-finger's ~0.078 inner gap, so the
+           # fingers can take a wheel ACROSS THE DIAMETER (radial side grasp) -- the
+           # grasp-DB's curved-surface entries, which the two-finger keeps (vacuum drops).
+           "car-mini": (lambda n_parts: CarAssembly(n_parts=n_parts, width=0.03), 5)}
   cls, max_n = kinds[kind]
   return cls(n_parts=min(n_parts, max_n))
 
@@ -524,16 +652,13 @@ def _align_quat(u, v):
 def make_subassembly_scene(assembly, subassembly, contact=1):
   # fresh Config holding the subassembly's parts at their assembled relative poses,
   # expressed in the first obj's frame (ref part at the origin). Frames are named by
-  # their obj id. Placeholder geometry: every part is a cube (size from the assembly).
-  cs, cr = assembly.cube_size, assembly.cube_radius
+  # their obj id; geometry comes from each part's shape spec.
   C = ry.Config()
   ref_pos = assembly.position_in_base(subassembly[0])
   for obj in subassembly:
     obj_in_ref = assembly.position_in_base(obj) - ref_pos
-    (C.addFrame(obj)
-        .setShape(ry.ST.ssBox, [cs, cs, cs, cr])
-        .setPosition(obj_in_ref)
-        .setContact(contact))
+    (add_part_frame(C, obj, assembly.part_shape(obj), contact=contact)
+        .setPosition(obj_in_ref))
   return C
 
 
@@ -653,6 +778,155 @@ def set_rolls_per_face(n):
 _GRASP_POSE_CACHE = {}
 
 
+# ---------------------------------------------------------------------------
+# Per-part shape helpers: ONE place that knows how to realize a shape spec as a rai frame,
+# and how to measure its extents. Shape spec: ("box",[sx,sy,sz,r]) | ("cylinder",[l,rad])
+# (axis = local z) | ("sphere",[rad]) -- optionally with a THIRD element, a quaternion
+# [w,x,y,z] posing the shape INSIDE the part frame (e.g. a wheel: a cylinder whose axis
+# lies along the part's y). Rotated shapes are realized the rai way: the part frame stays
+# shapeless and a rigid CHILD frame `<part>__shape` carries the rotated geometry (contact
+# lives on the child; use set_part_contact / part_shape_frame to address it).
+# ---------------------------------------------------------------------------
+
+def _shape_quat(spec):
+  return np.asarray(spec[2], dtype=float) if len(spec) > 2 else None
+
+
+def _set_raw_shape(f, spec):
+  kind, p = spec[0], spec[1]
+  if kind == "box":
+    f.setShape(ry.ST.ssBox, list(p))                       # [sx, sy, sz, corner_r]
+  elif kind == "cylinder":
+    f.setShape(ry.ST.cylinder, list(p))                    # [length, radius]
+  elif kind == "sphere":
+    f.setShape(ry.ST.sphere, list(p))                      # [radius]
+  else:
+    raise ValueError(f"unknown shape kind {kind!r}")
+  return f
+
+
+def _set_frame_shape(f, spec):
+  # only valid for unrotated specs (shape aligned with the part frame).
+  assert _shape_quat(spec) is None, "rotated shape needs add_part_frame (child frame)"
+  return _set_raw_shape(f, spec)
+
+
+def add_part_frame(C, name, spec, contact=1):
+  q = _shape_quat(spec)
+  f = C.addFrame(name)
+  if q is None:
+    return _set_raw_shape(f, spec).setContact(contact)
+  shp = C.addFrame(f"{name}__shape", name)                 # rigid child carries the shape
+  _set_raw_shape(shp, spec).setContact(contact)
+  shp.setRelativeQuaternion(list(q))
+  return f
+
+
+def part_shape_frame(C, name):
+  # the frame that CARRIES a part's collision shape: the `__shape` child for rotated
+  # specs, the part frame itself otherwise.
+  child = f"{name}__shape"
+  return child if child in C.getFrameNames() else name
+
+
+def set_part_contact(C, name, v):
+  # contact toggle that works for both plain parts and rotated-shape parts.
+  C.getFrame(part_shape_frame(C, name)).setContact(v)
+
+
+def _shape_half_extents(spec):
+  # SHAPE-frame half extents [hx, hy, hz] of the shape's bounding box (before any shape
+  # rotation inside the part frame).
+  kind, p = spec[0], spec[1]
+  if kind == "box":
+    return np.array([p[0], p[1], p[2]], dtype=float) / 2.0
+  if kind == "cylinder":
+    return np.array([p[1], p[1], p[0] / 2.0], dtype=float)
+  if kind == "sphere":
+    return np.array([p[0], p[0], p[0]], dtype=float)
+  raise ValueError(f"unknown shape kind {kind!r}")
+
+
+def _shape_half_extent_along(spec, d_part):
+  # half extent of the shape along direction `d_part` given in the PART frame (accounts
+  # for the spec's shape rotation). Exact for axis-aligned directions.
+  q = _shape_quat(spec)
+  d = d_part if q is None else _quat_to_R(q).T @ np.asarray(d_part, dtype=float)
+  return float(np.abs(d) @ _shape_half_extents(spec))
+
+
+def _shape_half_z(spec, R):
+  # half extent along WORLD z when the PART frame is rotated by R (the shape's own
+  # rotation inside the part frame is composed in). Exact for our axis-aligned placement
+  # rotations; a safe over-approximation for general R.
+  if spec[0] == "sphere":
+    return _shape_half_extents(spec)[2]
+  q = _shape_quat(spec)
+  R_total = R if q is None else R @ _quat_to_R(q)
+  return float(np.abs(R_total[2, :]) @ _shape_half_extents(spec))
+
+
+def part_grasp_poses(spec, rolls=None, offset=0.01):
+  """All candidate grasp poses of a part shape, in the part's OWN frame -- the per-part
+  grasp DB the labeled tables index into (grasp_id = position in this list). V1 generator:
+  the six axis-direction grasps at the FACE CENTER (approach along -direction, standoff =
+  the shape's half-extent along that direction + offset) x `rolls` spins about the approach
+  axis. For a cube this reproduces cube_grasp_pose exactly (same ids, same poses); for a
+  cuboid the standoff per face follows its half-extents; for a cylinder the +-z grasps sit
+  on the caps and the side grasps on the curved surface (vacuum allowed there, same force
+  -- per current model decision); spheres get the same six directions at radius standoff.
+  Rotated/off-center grasp variants are a later, purely additive extension."""
+  if rolls is None:
+    rolls = _ROLLS_PER_FACE
+  sq = _shape_quat(spec)
+  key = ("DB", spec[0], tuple(spec[1]),
+         tuple(sq) if sq is not None else None, rolls, offset)
+  hit = _GRASP_POSE_CACHE.get(key)
+  if hit is not None:
+    return hit
+  h = _shape_half_extents(spec)
+  poses = []
+  for normal in _CUBE_FACE_NORMALS:                        # six axis directions (SHAPE frame)
+    standoff = float(np.abs(normal) @ h) + offset
+    for roll in range(rolls):
+      angle = roll * (np.pi / rolls)
+      roll_q = np.array([np.cos(angle / 2.0), 0.0, 0.0, np.sin(angle / 2.0)])
+      q = _quat_mul(_grasp_quat_for_normal(normal), roll_q)
+      pose = np.concatenate([standoff * normal, q])
+      if sq is not None:                                   # rotate the grasp into the PART frame
+        pose = np.concatenate([_quat_to_R(sq) @ pose[:3], _quat_mul(sq, pose[3:])])
+      pose.setflags(write=False)
+      poses.append(pose)
+  hit = _GRASP_POSE_CACHE[key] = tuple(poses)
+  return hit
+
+
+def grasp_pose(assembly, part, grasp_id, offset=0.01):
+  # grasp `grasp_id` of `part`, in the part's own frame (the shape-aware replacement for
+  # raw cube_grasp_pose(gid, cube_size) -- identical values for cube parts).
+  return part_grasp_poses(assembly.part_shape(part), offset=offset)[grasp_id]
+
+
+def part_grasp_surfaces(spec, rolls=None):
+  # surface TYPE contacted by each grasp in part_grasp_poses (parallel list): "flat" or
+  # "curved". Box faces are flat; a cylinder's +-z caps are flat, its side is curved; a
+  # sphere is curved everywhere. Used to restrict the VACUUM to flat surfaces (a suction
+  # cup cannot seal on strong curvature) -- the two-finger keeps curved grasps.
+  if rolls is None:
+    rolls = _ROLLS_PER_FACE
+  kind = spec[0]
+  out = []
+  for normal in _CUBE_FACE_NORMALS:
+    if kind == "box":
+      surf = "flat"
+    elif kind == "cylinder":
+      surf = "flat" if abs(normal[2]) > 0.5 else "curved"  # caps flat, side curved
+    else:                                                  # sphere
+      surf = "curved"
+    out.extend([surf] * rolls)
+  return out
+
+
 def cube_grasp_pose(grasp_id, cube_size, offset=0.01):
   # grasp pose [x,y,z, qw,qx,qy,qz] in the grasped cube's OWN frame. grasp_id encodes
   # (face, roll): the face sets the approach (-normal); the roll spins the gripper about
@@ -718,25 +992,39 @@ def compute_cube_grasps(assembly, subassembly, offset=0.01,
 
   def grasp_is_collision_free(grasp_pose, grasped_obj):
     # move the pre-loaded EE so its tool center hits the grasp, then check the EE against
-    # every part except the one being grasped (touching it is allowed).
+    # every part except the one being grasped (touching it is allowed). ONLY EE-involving
+    # pairs may reject: the subassembly's INTERNAL part-part contacts are the mates
+    # themselves (flush-seated parts touch at d=-0.0) and are irrelevant to whether the
+    # gripper fits -- a binary getCollisionFree() here wrongly killed EVERY grasp on any
+    # flush-mated subassembly (found via the car: wheel caps seat flush on the body).
     C_col = ry.Config()
     C_col.addConfigurationCopy(base_scene)
     base_world = _ee_root_pose(grasp_pose, base_rel_tool, q_correction)
     root = C_col.getFrame("ee_ur_base")
     root.setPosition(base_world[:3])
     root.setQuaternion(base_world[3:])
-    C_col.getFrame(grasped_obj).setContact(0)
-    return C_col.getCollisionFree()
+    set_part_contact(C_col, grasped_obj, 0)
+    return not any((a.startswith("ee_") or b.startswith("ee_")) and d < -1e-9
+                   for a, b, d in C_col.getCollisions())
+
+  # a VACUUM cannot seal on curved surfaces -> restrict it to flat-surface grasps (grasp
+  # ids stay positions in the FULL per-shape DB, so id-based lookups are unaffected -- the
+  # table simply never contains curved candidates for the vacuum). The two-finger grasps
+  # curved surfaces fine and keeps everything.
+  vacuum = "vacuum" in os.path.basename(gripper_path)
 
   labeled = []
   for obj in subassembly:
     # obj origin expressed in the reference (first obj) frame
     obj_in_ref = assembly.position_in_base(obj) - ref_pos
-    # _N_CUBE_GRASPS candidate grasps per part (faces x rolls); grasp_id indexes the
-    # part's grasp set. cube_grasp_pose gives the grasp in the part frame; shift it into
-    # the subassembly ref frame (parts are axis-aligned, so translation only).
-    for grasp_id in range(_N_CUBE_GRASPS):
-      local = cube_grasp_pose(grasp_id, cube_size, offset)
+    # candidate grasps come from the part's own grasp DB (shape-aware; grasp_id indexes
+    # the part's set). The DB pose is in the part frame; shift it into the subassembly
+    # ref frame (parts are axis-aligned, so translation only).
+    surfaces = part_grasp_surfaces(assembly.part_shape(obj))
+    for grasp_id, local in enumerate(part_grasp_poses(assembly.part_shape(obj),
+                                                      offset=offset)):
+      if vacuum and surfaces[grasp_id] == "curved":
+        continue
       grasp = np.concatenate([obj_in_ref + local[:3], local[3:]])
 
       if grasp_is_collision_free(grasp, obj):
@@ -1323,16 +1611,31 @@ def context_scatter_state(assembly, context, face, poses):
 # State visualization (debugging)
 # ===========================================================================
 
-def _group_rest_lift(assembly, group, ref, face=_IDENTITY_FACE):
-  # how far the group's reference part must sit ABOVE the single-cube rest height so the
-  # group's LOWEST part rests on the table (0 for a bare cube or top-heavy groups), for
-  # the given PLACEMENT face (the group is rotated so cube face `face` points down).
-  # This is the table-placement rule: keep ref's x/y, rotate per the placement, lift to
-  # clear parts hanging below (e.g. the -z cube of the cross when placed upright).
+def _group_rest_height(assembly, group, ref, face=_IDENTITY_FACE, anchor_q=None):
+  # height of the reference part's CENTER above the table when the group rests on it,
+  # rotated so `face` points down COMPOSED ONTO the anchor's own orientation (the group's
+  # world rotation is face_quat o anchor_quat, see _group_rest_pose): the max over parts of
+  # (part-bottom-to-ref-center), shape-aware via each part's half extent along world z at
+  # that total orientation. For an all-cube identity-anchor group this is cs/2 - min_rel
+  # (the classic rule). anchor_q=None means identity (all classic callers).
   R = _quat_to_R(_FACE_DOWN_QUATS[face])
+  if anchor_q is not None:
+    R = R @ _quat_to_R(np.asarray(anchor_q, dtype=float))
   ref_off = assembly.position_in_base(ref)
-  min_rel = min((R @ (assembly.position_in_base(p) - ref_off))[2] for p in group)
-  return -min_rel                                          # >= 0 (ref itself gives 0)
+  return max(-(R @ (assembly.position_in_base(p) - ref_off))[2]
+             + _shape_half_z(assembly.part_shape(p), R) for p in group)
+
+
+def _group_rest_lift(assembly, group, ref, face=_IDENTITY_FACE, anchor_q=None):
+  # how far the group's reference part must sit ABOVE its anchor height so the group's
+  # LOWEST part rests on the table, for the given PLACEMENT face (group rotated so `face`
+  # points down, composed onto the anchor's orientation). The anchor height carries ref's
+  # half extent at the ANCHOR's orientation (plus any float), so the lift is rest_height
+  # (total orientation) minus that half extent -- for uniform cubes the halves cancel and
+  # this is the classic -min_rel; for shaped parts a reorientation changes rest height too.
+  half_anchor = _shape_half_z(assembly.part_shape(ref),
+                              _quat_to_R(anchor_q) if anchor_q is not None else np.eye(3))
+  return _group_rest_height(assembly, group, ref, face, anchor_q=anchor_q) - half_anchor
 
 
 def _placement_face(state, group):
@@ -1349,7 +1652,7 @@ def _group_rest_pose(assembly, group, ref, anchor_pose, face):
   anchor_pose = np.asarray(anchor_pose, dtype=float)
   q = _quat_mul(_FACE_DOWN_QUATS[face], anchor_pose[3:])
   pos = anchor_pose[:3].copy()
-  pos[2] += _group_rest_lift(assembly, group, ref, face)
+  pos[2] += _group_rest_lift(assembly, group, ref, face, anchor_q=anchor_pose[3:])
   return np.concatenate([pos, q])
 
 
@@ -1403,29 +1706,45 @@ def _state_part_poses(state, assembly, lift=0.35):
 # sets to wrench.equilibrium_feasible. Enabled per call via `gripper_kind` (None => the
 # topological baseline is used instead; nothing here runs).
 
-def _cube_corners_world(pose, cube_size):
-  h = cube_size / 2.0
+def _part_support_points_world(pose, spec):
+  # candidate contact points of a part for the table support polygon, world frame. Box:
+  # its 8 corners (per-axis half extents). Cylinder: 8 points on each cap rim. Sphere: the
+  # bottom/top poles (a resting sphere touches at a point). The spec's shape rotation
+  # (inside the part frame) is composed into R.
   c = np.asarray(pose[:3], dtype=float)
   R = _quat_to_R(np.asarray(pose[3:], dtype=float))
-  return [c + R @ (np.array([sx, sy, sz]) * h)
-          for sx in (-1.0, 1.0) for sy in (-1.0, 1.0) for sz in (-1.0, 1.0)]
+  sq = _shape_quat(spec)
+  if sq is not None:
+    R = R @ _quat_to_R(sq)
+  kind, p = spec[0], spec[1]
+  if kind == "box":
+    h = _shape_half_extents(spec)
+    return [c + R @ (np.array([sx, sy, sz]) * h)
+            for sx in (-1.0, 1.0) for sy in (-1.0, 1.0) for sz in (-1.0, 1.0)]
+  if kind == "cylinder":
+    l, r = p[0], p[1]
+    return [c + R @ np.array([r * np.cos(a), r * np.sin(a), sz * l / 2.0])
+            for sz in (-1.0, 1.0) for a in np.arange(8) * (np.pi / 4.0)]
+  if kind == "sphere":
+    return [c + np.array([0.0, 0.0, sz * p[0]]) for sz in (-1.0, 1.0)]
+  raise ValueError(f"unknown shape kind {kind!r}")
 
 
-def _table_footprint(poses, group, cube_size, tol=1e-3):
-  # the support polygon of a table-resting group: the world corners of whichever parts sit
-  # at the group's lowest z (the ones actually touching the table).
-  by_part = {p: _cube_corners_world(poses[p], cube_size) for p in group}
+def _table_footprint(assembly, poses, group, tol=1e-3):
+  # the support polygon of a table-resting group: the world contact points of whichever
+  # parts sit at the group's lowest z (the ones actually touching the table).
+  by_part = {p: _part_support_points_world(poses[p], assembly.part_shape(p)) for p in group}
   zmin = min(x[2] for cs in by_part.values() for x in cs)
   return [x for cs in by_part.values() for x in cs if x[2] <= zmin + tol]
 
 
-def _grasp_frame(part_pose, grasp_id, cube_size):
+def _grasp_frame(assembly, part, part_pose, grasp_id):
   # world frame of a grasp on a part: contact point (the grasped part's centre, matching the
   # original isotropic model) plus the APPROACH axis (grasp local z) and the two LATERAL axes
   # (local x/y) -- the axes feed the DIRECTIONAL grasp model (axial vs shear vs torque); the
   # isotropic model ignores them.
   gpose = _pose_compose(np.asarray(part_pose, dtype=float),
-                        cube_grasp_pose(grasp_id, cube_size))
+                        grasp_pose(assembly, part, grasp_id))
   R = _quat_to_R(np.asarray(gpose[3:], dtype=float))
   return np.asarray(part_pose[:3], dtype=float), R[:, 2], R[:, 0], R[:, 1]
 
@@ -1456,13 +1775,12 @@ def _group_stable(state, assembly, group, gripper_kind, applied=()):
 
   caps = []
   if any(("table",) in state.supports.get(p, ()) for p in members):
-    fp = _table_footprint(poses, members, assembly.cube_size)
+    fp = _table_footprint(assembly, poses, members)
     caps.append(wrench.table_capability([np.asarray(x, dtype=float) - centroid for x in fp]))
-  cs = assembly.cube_size
   for p in members:
     for c in sorted(state.supports.get(p, ())):
       if c[0] == "grasp":
-        gp, n, t1, t2 = _grasp_frame(poses[c[2]], c[3], cs)   # c=(grasp, r, gpart, grasp_id)
+        gp, n, t1, t2 = _grasp_frame(assembly, c[2], poses[c[2]], c[3])  # c=(grasp,r,gpart,gid)
         caps.append(wrench.grasp_capability(gp - centroid, n, t1, t2, gripper_kind))
 
   G = np.hstack([c[0] for c in caps]) if caps else np.zeros((6, 0))
@@ -1506,8 +1824,9 @@ def _inserter_load(state, assembly, part, onto, d=None):
   if d is None:
     d = assembly.mate_axis(part)
   f_world = wrench.insert_force(part) * (R @ (-d))          # reaction ON part: opposite press
+  half_d = _shape_half_extent_along(assembly.part_shape(part), d)
   point = np.asarray(poses[part][:3], dtype=float) \
-      + R @ (d * assembly.cube_size / 2.0)                  # at the pressing face (real lever)
+      + R @ (np.asarray(d, dtype=float) * half_d)           # at the pressing face (real lever)
   return f_world, point
 
 
@@ -1599,7 +1918,6 @@ def _on_table_mateable(assembly, part, tol=None, face=_IDENTITY_FACE):
   # real scene only has MORE obstacles. This is what forces base-lifts / reorientations.
   if tol is None:
     tol = _CHEAP_PENETRATION_TOL
-  cs, cr = assembly.cube_size, assembly.cube_radius
   C = make_world()
   table = C.getFrame("table")
   top = table.getPosition()[2] + table.getSize()[2] / 2.0
@@ -1609,9 +1927,9 @@ def _on_table_mateable(assembly, part, tol=None, face=_IDENTITY_FACE):
   context = _mate_closure(assembly, part)
   q = _FACE_DOWN_QUATS[face]
   R = _quat_to_R(q)
-  lift = _group_rest_lift(assembly, context, assembly.base, face) if context else 0.0
-  base_pos = np.array([0.0, 0.0, top + cs / 2.0 + lift])
+  rest = _group_rest_height(assembly, context or {assembly.base}, assembly.base, face)
+  base_pos = np.array([0.0, 0.0, top + rest])
   for p in sorted(context | {part}, key=_part_index):
-    C.addFrame(p).setShape(ry.ST.ssBox, [cs, cs, cs, cr]).setPosition(
-        base_pos + R @ assembly.position_in_base(p)).setQuaternion(q).setContact(1)
+    add_part_frame(C, p, assembly.part_shape(p)).setPosition(
+        base_pos + R @ assembly.position_in_base(p)).setQuaternion(q)
   return all(d >= -tol for _a, _b, d in C.getCollisions())
