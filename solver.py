@@ -520,14 +520,18 @@ class RobotIK:
 
   def _analytic_seeds(self, C, robot, ee_target, target_frame):
     # analytic (ssik) joint solutions for the active arm to place its tool center at `ee_target`
-    # (a 7-pose relative to `target_frame`), in RAI joint order, filtered to rai's arm limits.
-    # Empty unless ik_seeding is on AND this arm is calibrated (ur5). Call AFTER _restrict_to_arm
-    # so C.getJointLimits() returns the 6 arm limits.
+    # (a 7-pose relative to `target_frame`; target_frame=None => ee_target is already a WORLD
+    # pose, e.g. a place's computed gripper pose at the group's landing spot), in RAI joint
+    # order, filtered to rai's arm limits. Empty unless ik_seeding is on AND this arm is
+    # calibrated. Call AFTER _restrict_to_arm so C.getJointLimits() returns the 6 arm limits.
     import analytic_ik
     if not self.ik_seeding or not analytic_ik.available(self.robot_arm[robot]):
       return []
-    tpose = np.asarray(C.getFrame(target_frame).getPose(), dtype=float)
-    ee_world = _pose_compose(tpose, np.asarray(ee_target, dtype=float))   # tool target in world
+    if target_frame is None:
+      ee_world = np.asarray(ee_target, dtype=float)
+    else:
+      tpose = np.asarray(C.getFrame(target_frame).getPose(), dtype=float)
+      ee_world = _pose_compose(tpose, np.asarray(ee_target, dtype=float))  # tool target in world
     bl = np.asarray(C.getFrame(self.base_link[robot]).getPose(), dtype=float)
     rel = _pose_compose(_pose_invert(bl), ee_world)                       # tool target in base_link
     T = np.eye(4)
@@ -760,11 +764,28 @@ class RobotIK:
         self._add_grasp_maintenance(komo, s0, assembly)   # braces ride along / stay pinned
       return komo
 
-    if self.reach_precheck and self._reach_precheck_reject(action, C, build(False)):
+    # analytic (ssik) IK: the place target is FULLY DETERMINED for the placer's tool too --
+    # the group lands at `target` and is RIGIDLY attached to the gripper, so the tool's world
+    # pose is target(ref) o (ref -> gripper), both known. Same contract as pick: an empty
+    # analytic solution set on a calibrated two-finger arm proves the pose kinematically
+    # unreachable -> reject with NO KOMO (replacing the relaxed reach precheck, the dominant
+    # cost of place binds); non-empty proves reachability -> skip the precheck and warm-start
+    # the collision solve. Braced (non-solo) places keep the old path: the KOMO then spans
+    # several arms, so a single-arm seed doesn't fit its joint vector.
+    seeds = []
+    if single:
+      gpose = np.asarray(C.getFrame(self.gripper_frame[robot]).getPose(), dtype=float)
+      rpose = np.asarray(C.getFrame(ref).getPose(), dtype=float)
+      ee_world = _pose_compose(target, _pose_compose(_pose_invert(rpose), gpose))
+      seeds = self._analytic_seeds(C, robot, ee_world, None)
+    if single and self._analytic_reject_ok(robot):
+      if not seeds:
+        return False, None                                # analytic: kinematically unreachable
+    elif self.reach_precheck and self._reach_precheck_reject(action, C, build(False)):
       return False, None                                  # clear reach failure (relaxed solve)
 
     komo = build(True)
-    feasible, witness = self._solve_ik(komo)
+    feasible, witness = self._solve_ik(komo, seeds=seeds)
     if single:
       witness = self._expand_witness(C, witness, full_names)  # restricted -> full joint vector
     if not feasible:

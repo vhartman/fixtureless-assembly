@@ -22,7 +22,16 @@ force f applied at world point p is the wrench [f, p x f]. Quasi-static, gravity
 """
 
 import numpy as np
+from collections import OrderedDict
 from scipy.optimize import linprog
+
+try:
+  import highspy                                            # optional: warm-startable LP backend
+  _HS_OK = True
+  _HS_INF = highspy.kHighsInf
+  _HS_OPTIMAL = highspy.HighsModelStatus.kOptimal
+except Exception:
+  _HS_OK = False
 
 GRAVITY = 9.81                      # m/s^2, along -z
 
@@ -75,6 +84,14 @@ PARAMS = {
     # => a 4-corner box; a,r>0 => 16 corners. Adds an unavoidable shear+torque no favourable
     # lever can cancel, so a weak grasp holding far from the mate fails -- emergently.
     "insertion_uncertainty": None,
+    # how the insertion-uncertainty box is discharged into a stability check:
+    #   "corners" (default, EXACT): every box corner must be balanceable, contacts free to
+    #             rechoose their force split per realization (fully-adjustable robustness);
+    #   "affine"  (CONSERVATIVE): one fixed AFFINE force-response policy must cover the whole box
+    #             -- an open-loop / fixed-compliance grasp that cannot sense the seating error and
+    #             re-optimize. A single LP (vs 2^k corner solves); sound but stricter. See
+    #             equilibrium_robust_affine. Ignored when insertion_uncertainty is None.
+    "robust_mode": "corners",
     # insertion (mating) reaction: ONE magnitude for now, but read per-mate from a dict so
     # individual mates can override it later without touching call sites. `_default` applies
     # to any mate not listed.
@@ -257,15 +274,174 @@ def equilibrium_feasible(caps, w_external, tol=1e-6):
   return equilibrium_feasible_matrices(G, ub, w_external, tol)
 
 
-def equilibrium_feasible_matrices(G, ub, w_external, tol=1e-6, bounds=None):
+_BASIS_CACHE = {}                                           # geo_key -> pool of warm bases (see below)
+_BASIS_POOL = 8                                             # max distinct bases kept per geometry
+_HS_MODELS = OrderedDict()                                  # geo_key -> [Highs, K]  (LRU warm models)
+_HS_CAP = 1024                                              # max persistent models kept alive
+_WARM_ON = True                                             # master switch (diagnostics/ablation)
+_WARM = [0, 0, 0]                                           # [warm/hs solves, scipy lp, extractions]
+
+
+def _hs_model(geo_key, G, ub):
+  # a persistent HiGHS model per geometry: 0 objective, K vars in [0,ub], 6 equality rows Glam=b
+  # whose RHS we overwrite per load. Keeping the model alive lets HiGHS DUAL-SIMPLEX WARM-START
+  # from the previous load's basis -- an RHS-only change re-solves in ~0.04ms vs ~0.85ms cold.
+  m = _HS_MODELS.get(geo_key)
+  if m is not None:
+    _HS_MODELS.move_to_end(geo_key)
+    return m
+  h = highspy.Highs()
+  h.setOptionValue("output_flag", False)
+  K = G.shape[1]
+  upper = np.where(np.isfinite(ub), ub, _HS_INF).astype(float)
+  empty_i = np.array([], dtype=np.int32)
+  h.addCols(K, np.zeros(K), np.zeros(K), upper, 0, empty_i, empty_i, np.array([]))
+  idx = np.arange(K, dtype=np.int32)
+  for i in range(6):
+    h.addRow(0.0, 0.0, K, idx, np.ascontiguousarray(G[i, :], dtype=float))
+  _HS_MODELS[geo_key] = m = [h, K]
+  if len(_HS_MODELS) > _HS_CAP:
+    _HS_MODELS.popitem(last=False)                          # evict least-recently-used geometry
+  return m
+
+
+def _hs_feasible(geo_key, G, ub, beq):
+  h, _ = _hs_model(geo_key, G, ub)
+  for i in range(6):
+    h.changeRowBounds(i, float(beq[i]), float(beq[i]))
+  h.run()
+  return h.getModelStatus() == _HS_OPTIMAL                  # 0-objective LP: optimal <=> feasible
+
+
+def _extract_basis(G, ub, x, tol=1e-7):
+  # Turn a HiGHS basic-feasible vertex `x` into a reusable warm basis. A feasibility BFS of a
+  # 6-row system has (generically) exactly 6 variables strictly between their bounds -- the
+  # BASIC columns, an invertible 6x6 -- with the rest pinned at 0 or ub (NONBASIC). We store the
+  # basic columns' inverse and the constant wrench the pinned nonbasics contribute, so a later
+  # load w' on the SAME geometry is tested by one 6x6 back-substitution instead of a fresh LP.
+  ubv = np.where(np.isfinite(ub), ub, np.inf)
+  basic = np.where((x > tol) & (x < ubv - tol))[0]
+  if basic.size != 6:
+    return None                                             # degenerate/non-vertex -> don't warm
+  B = G[:, basic]
+  try:
+    Binv = np.linalg.inv(B)
+  except np.linalg.LinAlgError:
+    return None
+  if not np.all(np.isfinite(Binv)) or np.linalg.cond(B) > 1e10:
+    return None
+  mask = np.ones(G.shape[1], dtype=bool); mask[basic] = False
+  nb = np.where(mask)[0]
+  nb_vals = np.where(x[nb] > tol, ub[nb], 0.0)              # snap each nonbasic to its bound
+  const = G[:, nb] @ nb_vals                                # constant wrench from pinned nonbasics
+  return (basic, Binv, ub[basic], const)
+
+
+def equilibrium_feasible_matrices(G, ub, w_external, tol=1e-6, bounds=None, geo_key=None):
   """The LP feasibility test on the already-assembled generator matrix (G [6xK], ub [K]).
   The contact-INDEPENDENT parts (G, ub, and the derived `bounds` list) can be built ONCE and
   reused across many external loads -- e.g. the corners of an insertion-uncertainty box --
-  so the caller (`_group_stable`/`_grounding_caps`) hoists them out of the per-load loop."""
+  so the caller (`_group_stable`/`_grounding_caps`) hoists them out of the per-load loop.
+
+  `geo_key` (a hashable geometry signature) turns on same-geometry WARM-START, since ~6 distinct
+  loads share each geometry and only the RHS changes between them:
+    * with `highspy` installed we keep a persistent HiGHS model per geometry and only overwrite
+      its RHS, so HiGHS dual-simplex warm-starts from the previous basis (~0.04ms vs ~0.85ms);
+    * without it we fall back to scipy + a per-geometry numpy warm-basis POOL -- cache each
+      feasible vertex's basis and first try it as a cheap ACCEPT test (a 6x6 back-substitution
+      yielding an explicit in-box multiplier -> a SOUND feasibility witness, no LP); the scipy LP
+      runs only on a miss or a genuinely infeasible load.
+  Both stay exact (the LP is always the authority on a warm miss)."""
   if G.shape[1] == 0:
     return bool(np.linalg.norm(w_external) <= tol)
+  beq = -np.asarray(w_external, float)
+  if geo_key is not None and _WARM_ON and _HS_OK:
+    _WARM[0] += 1
+    return _hs_feasible(geo_key, G, ub, beq)
+  if geo_key is not None and _WARM_ON:
+    pool = _BASIS_CACHE.get(geo_key)
+    if pool:
+      # a geometry accumulates loads from several mates, each with its own optimal basis, so we
+      # keep a small POOL and try each (still microseconds vs a 1.1ms LP). Move a hit to the
+      # front so the working set stays hot.
+      for i, (basic, Binv, ubB, const) in enumerate(pool):
+        lamB = Binv @ (beq - const)                         # basics that make Glam = beq exactly
+        if np.all(lamB >= -tol) and np.all(lamB <= ubB + tol):
+          if i:
+            pool.insert(0, pool.pop(i))
+          _WARM[0] += 1
+          return True                                       # explicit feasible point -> accept
   if bounds is None:
     bounds = [(0.0, None if not np.isfinite(u) else float(u)) for u in ub]
-  res = linprog(c=np.zeros(G.shape[1]), A_eq=G, b_eq=-np.asarray(w_external, float),
-                bounds=bounds, method="highs")
+  res = linprog(c=np.zeros(G.shape[1]), A_eq=G, b_eq=beq, bounds=bounds, method="highs")
+  _WARM[1] += 1
+  if res.success and geo_key is not None and _WARM_ON:
+    nb = _extract_basis(G, np.asarray(ub, float), np.asarray(res.x, float))
+    if nb is not None:
+      pool = _BASIS_CACHE.setdefault(geo_key, [])
+      bset = frozenset(nb[0].tolist())
+      if all(bset != frozenset(b[0].tolist()) for b in pool):  # only keep DISTINCT bases
+        pool.insert(0, nb)
+        del pool[_BASIS_POOL:]                              # cap (LRU)
+        _WARM[2] += 1
+  return bool(res.success)
+
+
+def equilibrium_robust_affine(G, ub, w0, deltas, bounds=None, tol=1e-6):
+  """CONSERVATIVE robust equilibrium via an AFFINE decision rule (adjustable-robust counterpart).
+
+  The exact corner test asks 'for every disturbance realization, does SOME in-box contact-force
+  vector balance it?' -- the contacts may pick a different force distribution per realization.
+  This asks the stricter question: is there ONE affine force-response policy
+
+      lam(s) = lam0 + sum_j s_j * lam_j ,   s in [-1,1]^m
+
+  that stays in [0,ub] AND balances w0 + sum_j s_j*delta_j for EVERY s in the box? Because an
+  affine policy is one admissible way to respond, its feasibility IMPLIES every corner is stable
+  (sound, conservative). It rejects cases that would require the contacts to switch strategy
+  between realizations. One LP replaces the 2^m corner solves.
+
+  Physical reading: lam0 is the nominal grasp/support load; lam_j is a fixed linear reaction gain
+  to disturbance axis j -- an open-loop / fixed-compliance grasp that cannot sense the exact
+  seating error and re-optimize, only respond linearly. delta_j are the generator wrenches
+  (transverse force / off-centre couple) of the uncertainty box, about the same origin as w0."""
+  K = G.shape[1]
+  ub = np.asarray(ub, float)
+  m = len(deltas)
+  if K == 0:                                                # no contacts: only zero wrench holds
+    return np.linalg.norm(w0) <= tol and all(np.linalg.norm(d) <= tol for d in deltas)
+  n = K + 2 * K * m                                         # [lam0 | lam_1..lam_m | t_1..t_m]
+  I = np.eye(K)
+
+  def col(block):                                           # column slice of a K-block
+    return slice(block * K, block * K + K)
+
+  A_eq = np.zeros((6 * (1 + m), n)); b_eq = np.zeros(6 * (1 + m))
+  A_eq[0:6, col(0)] = G; b_eq[0:6] = -np.asarray(w0, float)          # G lam0 = -w0
+  for j in range(m):
+    A_eq[6 * (j + 1):6 * (j + 2), col(1 + j)] = G                    # G lam_j = -delta_j
+    b_eq[6 * (j + 1):6 * (j + 2)] = -np.asarray(deltas[j], float)
+
+  rows = []; bub = []
+  for j in range(m):                                        # t_j >= |lam_j|
+    r = np.zeros((K, n)); r[:, col(1 + j)] = I;  r[:, col(1 + m + j)] = -I; rows.append(r); bub.append(np.zeros(K))
+    r = np.zeros((K, n)); r[:, col(1 + j)] = -I; r[:, col(1 + m + j)] = -I; rows.append(r); bub.append(np.zeros(K))
+  r = np.zeros((K, n)); r[:, col(0)] = -I                   # lam0 - sum_j t_j >= 0  (worst-case >= 0)
+  for j in range(m):
+    r[:, col(1 + m + j)] += I
+  rows.append(r); bub.append(np.zeros(K))
+  fin = np.isfinite(ub)                                     # lam0 + sum_j t_j <= ub  (worst-case <= ub)
+  if fin.any():
+    idx = np.where(fin)[0]; r = np.zeros((idx.size, n))
+    for rr, k in enumerate(idx):
+      r[rr, col(0).start + k] = 1.0
+      for j in range(m):
+        r[rr, col(1 + m + j).start + k] = 1.0
+    rows.append(r); bub.append(ub[fin])
+
+  vb = [(0.0, None if not fin[k] else float(ub[k])) for k in range(K)]   # lam0 in [0,ub]
+  vb += [(None, None)] * (K * m)                                         # lam_j free
+  vb += [(0.0, None)] * (K * m)                                          # t_j >= 0
+  res = linprog(np.zeros(n), A_ub=np.vstack(rows), b_ub=np.concatenate(bub),
+                A_eq=A_eq, b_eq=b_eq, bounds=vb, method="highs")
   return bool(res.success)

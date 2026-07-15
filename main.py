@@ -227,6 +227,14 @@ def parse_args():
            "0 (default) => a 4-corner lateral-only box; >0 => a 16-corner box.",
   )
   parser.add_argument(
+      "--robust-mode", choices=("corners", "affine"), default="corners",
+      help="How the insertion-uncertainty box is checked. 'corners' (default): EXACT -- every box "
+           "corner must be balanceable, contacts free to rechoose their force split per "
+           "realization. 'affine': CONSERVATIVE -- one fixed affine force-response policy (an "
+           "open-loop / fixed-compliance grasp that cannot sense the seating error and "
+           "re-optimize) must cover the whole box; a single LP, stricter, still sound.",
+  )
+  parser.add_argument(
       "--no-inserter-check", dest="inserter_check", action="store_false",
       help="With --wrench: skip the inserter-side check (whether the pressing arm's own "
            "grasp can transmit the seating reaction) -- equivalent to giving that grasp "
@@ -283,7 +291,7 @@ _SAVE_CONFIG_FIELDS = (
     "assembly", "parts", "num_robots", "vacuum", "floating_ee", "robot", "robot_types",
     "scatter_spacing", "perturb_start_pose", "seed", "wrench", "grasp_model", "insert_force",
     "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
-    "bracing",
+    "bracing", "robust_mode",
 )
 
 
@@ -307,6 +315,7 @@ def main():
   wrench.PARAMS["insertion_uncertainty"] = (
       None if args.insertion_noise is None
       else {"lateral": args.insertion_noise, "offset": args.insertion_offset})
+  wrench.PARAMS["robust_mode"] = args.robust_mode
 
   if args.test_pick_ik is not None:
     robot, part, grasp = args.test_pick_ik.split(":")

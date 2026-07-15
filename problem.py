@@ -1462,12 +1462,10 @@ def assembles(state, assembly, robots, gripper_kind=None):
       #       -- is transmittable through its grasp(s). Passing `group` to _group_stable prices
       #       in a heavy module's gravity automatically; for a single part it is the old check.
       d = assembly.mate_axis(p)
-      if not _group_stable_loaded(state, assembly, target, gripper_kind,
-                                  _insertion_load_variants(state, assembly, p, onto, d)):
+      if not _insertion_stable(state, assembly, target, gripper_kind, p, onto, d):
         continue
-      if wrench.PARAMS.get("check_inserter", True) and not _group_stable_loaded(
-          state, assembly, group, gripper_kind,
-          _inserter_load_variants(state, assembly, p, onto, d)):
+      if wrench.PARAMS.get("check_inserter", True) and not _inserter_stable(
+          state, assembly, group, gripper_kind, p, onto, d):
         continue
     if _group_is_on_table(state, target) and not _on_table_mateable_cached(
         assembly, p, _placement_face(state, target)):
@@ -1900,11 +1898,12 @@ def _group_stable(state, assembly, group, gripper_kind, applied=()):
   w_ext = w_grav
   for f, pt in applied:
     w_ext = w_ext + wrench.point_force_wrench(f, np.asarray(pt, dtype=float) - centroid)
-  key = (gbytes[0], gbytes[1], np.round(w_ext, 4).tobytes())
+  geo_key = (gbytes[0], gbytes[1])
+  key = (geo_key[0], geo_key[1], np.round(w_ext, 4).tobytes())
   hit = _WRENCH_CACHE.get(key)
   if hit is not None:
     return hit
-  res = wrench.equilibrium_feasible_matrices(G, ub, w_ext, bounds=bounds)
+  res = wrench.equilibrium_feasible_matrices(G, ub, w_ext, bounds=bounds, geo_key=geo_key)
   _WRENCH_CACHE[key] = res
   return res
 
@@ -1922,36 +1921,46 @@ def _grasp_surface(spec, grasp_id):
   return surfaces[grasp_id]
 
 
-_WORST_CORNER = {}                                          # geometry sig -> last-infeasible corner idx
-
-
 def _group_stable_loaded(state, assembly, group, gripper_kind, load_variants):
   # ROBUST stability under an UNCERTAIN applied load: the group must balance EVERY worst-case
   # realization in `load_variants` (a list of (force_world, point) corners from
   # _insertion_uncertainty_variants). With insertion_uncertainty off that list is the single
   # nominal load, so this is exactly the old one-shot _group_stable check.
-  #
-  # Each corner is an independent equilibrium LP (contact forces are free to differ per
-  # realization), so there is nothing to fold into a single joint solve. But the `all` below
-  # SHORT-CIRCUITS on the first infeasible corner, so an unstable group need not price all 2^k
-  # corners -- IF we test a failing one first. The same grounding GEOMETRY tends to fail in the
-  # same direction throughout the search, so we remember the last-infeasible corner index per
-  # geometry and try it first. Exact (still requires every corner); only the order changes.
-  n = len(load_variants)
-  if n <= 1:
-    return _group_stable(state, assembly, group, gripper_kind,
-                         applied=list(load_variants))
-  _, _, _, _, _, gbytes = _grounding_caps(state, assembly, group, gripper_kind)
-  gkey = (gbytes[0], gbytes[1])                             # load-independent geometry signature
-  order = range(n)
-  hint = _WORST_CORNER.get(gkey)
-  if hint is not None and hint < n:
-    order = [hint] + [i for i in range(n) if i != hint]    # worst-known corner first
-  for idx in order:
-    if not _group_stable(state, assembly, group, gripper_kind, applied=[load_variants[idx]]):
-      _WORST_CORNER[gkey] = idx
-      return False
-  return True
+  return all(_group_stable(state, assembly, group, gripper_kind, applied=[lv])
+             for lv in load_variants)
+
+
+def _group_stable_affine(state, assembly, group, gripper_kind, f0, point, gens):
+  # CONSERVATIVE robust check: one AFFINE contact-force policy must hold across the whole
+  # uncertainty box (wrench.equilibrium_robust_affine), vs _group_stable_loaded's EXACT per-corner
+  # test. Builds the nominal wrench w0 and the box's generator wrenches delta_j about the group
+  # centroid, then a single LP. Feasibility here implies every corner is stable (sound); it is
+  # stricter (rejects loads that would need the contacts to switch strategy per realization).
+  centroid, w_grav, G, ub, bounds, _ = _grounding_caps(state, assembly, group, gripper_kind)
+  f0 = np.asarray(f0, dtype=float); point = np.asarray(point, dtype=float)
+  w0 = w_grav + wrench.point_force_wrench(f0, point - centroid)
+  deltas = []
+  for kind, axis, amt in gens:
+    axis = np.asarray(axis, dtype=float)
+    if kind == "f":                                         # transverse force amt*axis at `point`
+      deltas.append(wrench.point_force_wrench(amt * axis, point - centroid))
+    else:                                                   # point shift amt*axis -> pure couple
+      deltas.append(np.concatenate([np.zeros(3), _cross3(amt * axis, f0)]))
+  return wrench.equilibrium_robust_affine(G, ub, w0, deltas, bounds=bounds)
+
+
+def _robust_stable(state, assembly, group, gripper_kind, f_world, point, mag):
+  # dispatch the robust insertion-stability check by wrench.PARAMS['robust_mode']:
+  #   'corners' (default, EXACT): every uncertainty-box corner must be balanceable, the contacts
+  #             free to rechoose their force split per realization (fully-adjustable robustness).
+  #   'affine'  (CONSERVATIVE): one fixed affine force-response policy must cover the whole box
+  #             (an open-loop / fixed-compliance grasp) -- a single LP, stricter, still sound.
+  # Identical to the plain nominal check when insertion_uncertainty is off (no generators).
+  if wrench.PARAMS.get("robust_mode", "corners") == "affine" and wrench.PARAMS.get("insertion_uncertainty"):
+    f0, pt, gens = _insertion_uncertainty_gens(f_world, point, mag)
+    return _group_stable_affine(state, assembly, group, gripper_kind, f0, pt, gens)
+  return _group_stable_loaded(state, assembly, group, gripper_kind,
+                              _insertion_uncertainty_variants(f_world, point, mag))
 
 
 def _cross3(a, b):
@@ -1971,21 +1980,17 @@ def _transverse_basis(dvec):
   return t1, _cross3(d, t1)
 
 
-def _insertion_uncertainty_variants(f_world, point, mag):
-  # the seating force as an UNCERTAINTY POLYTOPE, returned as its CORNERS. Real seating is
-  # misaligned in two independent ways: the press direction TILTS (angular) -> a transverse
-  # shear up to lateral*mag, and the contact point SHIFTS (positional) -> the axial force
-  # lands up to offset metres off-centre (a transverse couple). Each is one axis of a box in
-  # the plane transverse to the mate axis; the box has 2 (lateral only) or 4 (lateral+offset)
-  # dimensions, so 4 or 16 corners. Because the set of balanceable external wrenches is CONVEX,
-  # requiring every CORNER stable (_group_stable_loaded) is EXACT for the box -- no sampling,
-  # no tunable count. (The box is a conservative OUTER polytope of the true circular cone/disk,
-  # so it rejects marginally more, in the safe direction.) Off => [(nominal)], byte-identical.
+def _insertion_uncertainty_gens(f_world, point, mag):
+  # the seating force as an UNCERTAINTY BOX, returned as (nominal_force, nominal_point, gens)
+  # where each gen is (apply-to, axis, half-width). Real seating is misaligned in two independent
+  # ways: the press direction TILTS (angular) -> a transverse shear up to lateral*mag ("f"), and
+  # the contact point SHIFTS (positional) -> the axial force lands up to offset m off-centre, a
+  # couple ("p"). Each is one box axis in the plane transverse to the mate axis (2 or 4 axes).
   unc = wrench.PARAMS.get("insertion_uncertainty")
   f_world = np.asarray(f_world, dtype=float)
   point = np.asarray(point, dtype=float)
   if not unc:
-    return [(f_world, point)]
+    return f_world, point, []
   t1, t2 = _transverse_basis(f_world)
   lat = float(unc.get("lateral", 0.0)) * mag              # transverse-force half-widths (N)
   off = float(unc.get("offset", 0.0))                     # application-offset half-widths (m)
@@ -1994,6 +1999,15 @@ def _insertion_uncertainty_variants(f_world, point, mag):
     gens += [("f", t1, lat), ("f", t2, lat)]              # angular tilt -> transverse force
   if off > 0.0:
     gens += [("p", t1, off), ("p", t2, off)]              # positional shift -> off-centre couple
+  return f_world, point, gens
+
+
+def _insertion_uncertainty_variants(f_world, point, mag):
+  # the uncertainty box as its CORNERS (list of (force, point)). Because the set of balanceable
+  # external wrenches is CONVEX, requiring every CORNER stable (_group_stable_loaded) is EXACT for
+  # the box -- no sampling, no tunable count. (The box is a conservative OUTER polytope of the true
+  # circular cone/disk, so it rejects marginally more, in the safe direction.) Off => [(nominal)].
+  f_world, point, gens = _insertion_uncertainty_gens(f_world, point, mag)
   if not gens:
     return [(f_world, point)]
   out = []
@@ -2059,6 +2073,18 @@ def _inserter_load_variants(state, assembly, part, onto, d=None):
   return _insertion_uncertainty_variants(f_world, point, wrench.insert_force(part))
 
 
+def _insertion_stable(state, assembly, group, gripper_kind, part, onto, d=None):
+  # `group` (the TARGET) withstands the robust insertion reaction of `part` seating onto it.
+  f_world, point = _insertion_load(state, assembly, part, onto, d)
+  return _robust_stable(state, assembly, group, gripper_kind, f_world, point, wrench.insert_force(part))
+
+
+def _inserter_stable(state, assembly, group, gripper_kind, part, onto, d=None):
+  # the HELD `group` transmits its own weight plus the robust seating reaction through its grasp(s).
+  f_world, point = _inserter_load(state, assembly, part, onto, d)
+  return _robust_stable(state, assembly, group, gripper_kind, f_world, point, wrench.insert_force(part))
+
+
 # reference anchor poses for the wrench precompute: absolute position is irrelevant (the
 # stability LP is canonicalised to the group centroid), so a single fixed table-height
 # anchor per part suffices -- the layout / face rotation / rest lift are recomputed from it.
@@ -2097,8 +2123,7 @@ def precompute_stable_faces(assembly, gripper_kind):
         st = context_scatter_state(assembly, S, f, poses)
         if not _group_stable(st, assembly, S, gripper_kind):
           continue                                          # S topples resting on face f
-        if not _group_stable_loaded(st, assembly, S, gripper_kind,
-                                    _insertion_load_variants(st, assembly, p, onto)):
+        if not _insertion_stable(st, assembly, S, gripper_kind, p, onto):
           continue                                          # topples under the insertion
         faces.add(f)
       table[(_subasm_key(S), p)] = frozenset(faces)

@@ -195,6 +195,43 @@ def test_wrench_uncertainty_flags():
         W.PARAMS["insertion_uncertainty"] = saved
 
 
+def test_equilibrium_backend_agrees():
+  """The warm-startable LP backend (highspy persistent model / numpy warm-basis pool) must give
+  the SAME feasibility verdict as a cold scipy solve on the same (G, ub, wrench) -- across many
+  loads sharing a geometry, which is exactly when the warm path is exercised."""
+  import numpy as np
+  from scipy.optimize import linprog
+  rng = np.random.default_rng(7)
+  for _ in range(300):
+    K = int(rng.integers(6, 30))
+    G = rng.standard_normal((6, K)); ub = np.abs(rng.standard_normal(K)) * 3 + 0.5
+    gk = (G.tobytes(), ub.tobytes())
+    for _ in range(5):                                       # several loads on the SAME geometry
+      w = rng.standard_normal(6) * rng.uniform(0.1, 5)
+      got = W.equilibrium_feasible_matrices(G, ub, w, geo_key=gk)
+      truth = bool(linprog(np.zeros(K), A_eq=G, b_eq=-w,
+                           bounds=[(0.0, float(u)) for u in ub], method="highs").success)
+      assert got == truth
+
+
+def test_robust_affine_sound():
+  """equilibrium_robust_affine (the CONSERVATIVE robust mode) must be SOUND: whenever it reports
+  feasible, every corner of the uncertainty box is genuinely balanceable. It may reject some
+  corner-feasible loads (that is the conservatism), but it must never accept an infeasible one."""
+  import numpy as np
+  rng = np.random.default_rng(8)
+  unsound = 0
+  for _ in range(800):
+    K = int(rng.integers(6, 24)); G = rng.standard_normal((6, K)); ub = np.abs(rng.standard_normal(K)) * 3 + 0.5
+    w0 = rng.standard_normal(6) * rng.uniform(0.1, 4)
+    D = [rng.standard_normal(6) * rng.uniform(0.05, 1.0) for _ in range(2)]
+    if W.equilibrium_robust_affine(G, ub, w0, D):
+      corners = [w0 + s1 * D[0] + s2 * D[1] for s1 in (-1, 1) for s2 in (-1, 1)]
+      if not all(W.equilibrium_feasible_matrices(G, ub, w) for w in corners):
+        unsound += 1
+  assert unsound == 0
+
+
 def test_no_hold_parts():
   """assembly.no_hold: a grasp on a no_hold part (a car WHEEL) may hold only the LONE part (the
   inserter) -- never a multi-part subassembly. So you can put a wheel on the car, but can't then

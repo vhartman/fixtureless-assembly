@@ -29,6 +29,7 @@ def apply_wrench_params(cfg):
   wrench.PARAMS["insertion_uncertainty"] = (
       None if cfg["insertion_noise"] is None
       else {"lateral": cfg["insertion_noise"], "offset": cfg["insertion_offset"]})
+  wrench.PARAMS["robust_mode"] = cfg.get("robust_mode", "corners")
 
 
 def build_scene(cfg):
