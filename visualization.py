@@ -256,7 +256,8 @@ def visualize_successor_states(C, assembly, robots=None, per_depth=3):
       break
 
 
-def visualize_plan(C, assembly, plan, robots=None, gripper_path=None, recorder=None):
+def visualize_plan(C, assembly, plan, robots=None, gripper_path=None, recorder=None,
+                   bracing=False):
   """Replay a plan (list of actions from solve_assembly_problem) step by step, opening
   the viewer on the initial state and on the state after each action. Each view() is
   blocking -- close the window to advance to the next step. With `recorder` (a
@@ -270,22 +271,27 @@ def visualize_plan(C, assembly, plan, robots=None, gripper_path=None, recorder=N
     if recorder is not None:
       recorder.record(C_viz, label)
 
-  s = get_initial_state(C, assembly)
+  # PREFER the state trajectory the search RECORDED (plan.states): walking it can't disagree
+  # with the search about which actions exist. Only when it is absent (e.g. a plan loaded from
+  # disk) do we RE-DERIVE via _declutter_edges -- which must then match the search's successor
+  # flags exactly (grasp table, bracing), the historical source of "could not apply" bugs.
+  recorded = getattr(plan, "states", None)
+  s = recorded[0] if recorded else get_initial_state(C, assembly)
   print(f"[0/{len(plan)}] initial: {s}")
   show(s, "0: initial")
 
   allobj = set(assembly.objects)                           # for resolving stow edges (declutter)
-  # the REAL grasp table (auto-detected gripper): the on-the-fly fallback would default to
-  # the VACUUM EE and its flat-surface grasp filter -- with a two-finger env that silently
-  # drops the radial grasps the search used, and the replay dies with "could not apply".
-  _, grasp_table = _search_context(C, assembly, robots)
+  grasp_table = None if recorded else _search_context(C, assembly, robots)[1]
   for i, action in enumerate(plan, 1):
-    # re-derive the successor for this action (reuses the transition logic)
-    nxt = next((ns for a, ns in _declutter_edges(s, assembly, robots, grasp_table, allobj)
-                if a == action), None)
-    if nxt is None:
-      print(f"[{i}/{len(plan)}] !! could not apply {action} in {s}")
-      return
+    if recorded is not None:
+      nxt = recorded[i]
+    else:                                                  # re-derive (must match search flags)
+      nxt = next((ns for a, ns in _declutter_edges(s, assembly, robots, grasp_table, allobj,
+                                                   bracing=bracing)
+                  if a == action), None)
+      if nxt is None:
+        print(f"[{i}/{len(plan)}] !! could not apply {action} in {s}")
+        return
     s = nxt
     print(f"[{i}/{len(plan)}] {action} -> {s}")
     show(s, f"{i}: {action[0]} {' '.join(map(str, action[1:]))}")
@@ -337,7 +343,7 @@ def _write_robot_dofs(C, robot, q_full):
 
 
 def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
-                      recorder=None):
+                      recorder=None, bracing=False):
   """Replay a plan on a SINGLE persistent config: for each action we solve the skill IK,
   write the active arms' DOFs into the live config (so the arms keep their poses between
   steps), and mirror the scene-graph re-parenting with C.attach (so grabbed parts stay
@@ -358,7 +364,10 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
   Cv = ry.Config()
   Cv.addConfigurationCopy(robot_ik.C)
 
-  s = get_initial_state(C, assembly)
+  # prefer the search's RECORDED state trajectory (plan.states); re-derive only as a fallback
+  # (loaded-from-disk plans), where the successor flags must match the search -- see visualize_plan.
+  recorded = getattr(plan, "states", None)
+  s = recorded[0] if recorded else get_initial_state(C, assembly)
   print(f"[0/{len(plan)}] initial: {s}")
   if recorder is not None:
     recorder.record(Cv, "0: initial")
@@ -413,13 +422,17 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
     f.setQuaternion(new[3:])
 
   allobj = set(assembly.objects)                           # for resolving stow edges (declutter)
-  _, grasp_table = _search_context(C, assembly, robots)    # REAL gripper's table (see above)
+  grasp_table = None if recorded else _search_context(C, assembly, robots)[1]
   for i, action in enumerate(plan, 1):
-    nxt = next((ns for a, ns in _declutter_edges(s, assembly, robots, grasp_table, allobj)
-                if a == action), None)
-    if nxt is None:
-      print(f"[{i}/{len(plan)}] !! could not apply {action} in {s}")
-      return
+    if recorded is not None:
+      nxt = recorded[i]
+    else:                                                  # re-derive (must match search flags)
+      nxt = next((ns for a, ns in _declutter_edges(s, assembly, robots, grasp_table, allobj,
+                                                   bracing=bracing)
+                  if a == action), None)
+      if nxt is None:
+        print(f"[{i}/{len(plan)}] !! could not apply {action} in {s}")
+        return
     # a stow is a place aside: run the place IK (which now targets the recorded stow pose).
     bind_action = ("place",) + tuple(action[1:]) if action[0] == "stow" else action
     _ok, witness = robot_ik.bind(bind_action, s, nxt, assembly)

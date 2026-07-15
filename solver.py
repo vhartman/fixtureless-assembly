@@ -878,15 +878,29 @@ def feasible(action, s0, s1, assembly, checker, robot_ik=None):
   return True
 
 
+class Plan(list):
+  """The action list PLUS `.states` = the exact state trajectory [s0, s1, ..., sN] the search
+  visited (len == len(plan)+1). Behaves as a plain list everywhere (iteration, len, indexing,
+  JSON via list()), but lets an in-session replay WALK the recorded states instead of RE-DERIVING
+  each successor -- re-derivation must otherwise reproduce the search's exact successor flags
+  (grasp table, bracing, ...) and has repeatedly drifted (the vacuum-table and add_grasp replay
+  bugs). `.states` is None when a plan is built some other way (e.g. loaded from disk)."""
+  states = None
+
+
 def _reconstruct_plan(came_from, goal):
-  # walk parent links back to the start; return the list of actions start -> goal
-  actions = []
+  # walk parent links back to the start; return the actions start -> goal, plus the state
+  # trajectory (attached to the returned Plan as `.states`).
+  actions, states = [], [goal]
   s = goal
   while came_from[s][0] is not None:
     prev, action = came_from[s]
     actions.append(action)
+    states.append(prev)
     s = prev
-  return list(reversed(actions))
+  plan = Plan(reversed(actions))
+  plan.states = list(reversed(states))
+  return plan
 
 
 # Event-based action costs (design doc §1): grabs/releases and transports cost; a
@@ -2178,14 +2192,15 @@ def _stow_moves(state, movable):
 
 
 def _declutter_edges(state, assembly, robots, grasp_table, movable, gripper_kind=None,
-                     handovers=True, allow_place=True):
+                     handovers=True, allow_place=True, bracing=False):
   # the full edge set of the declutter sub-search: the ordinary successors plus the
   # stow-a-blocker moves. Shared by the sub-search and the plan-realisation walk so both
   # agree on what a "stow" edge produces. (Stowing a loose blocker aside is always allowed --
-  # allow_place=False only forbids setting the ASSEMBLY down.)
+  # allow_place=False only forbids setting the ASSEMBLY down.) `bracing` must match the search
+  # that PRODUCED the plan, else a plan using add_grasp can't be re-derived on replay.
   yield from successors(state, assembly, robots, grasp_table=grasp_table,
                         gripper_kind=gripper_kind, handovers=handovers,
-                        allow_place=allow_place)
+                        allow_place=allow_place, bracing=bracing)
   yield from _stow_moves(state, movable)
 
 

@@ -403,9 +403,9 @@ def main():
           recorder = ViserRecorder()
         if args.real_ik:
           visualize_plan_ik(C, assembly, plan, robots=robots, robot_ik=robot_ik,
-                            recorder=recorder)
+                            recorder=recorder, bracing=args.bracing)
         else:
-          visualize_plan(C, assembly, plan, recorder=recorder)
+          visualize_plan(C, assembly, plan, recorder=recorder, bracing=args.bracing)
         if recorder is not None:
           recorder.serve(port=args.viser_port)
     return

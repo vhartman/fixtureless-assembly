@@ -60,11 +60,12 @@ def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=T
   if viser or not view:
     from viser_view import ViserRecorder
     recorder = ViserRecorder()
+  brace = bool(cfg.get("bracing"))                           # match the search that made the plan
   if use_ik:
     visualize_plan_ik(C, assembly, plan, robots=robots, robot_ik=RobotIK(C, robots),
-                      recorder=recorder)
+                      recorder=recorder, bracing=brace)
   else:
-    visualize_plan(C, assembly, plan, robots=robots, recorder=recorder)
+    visualize_plan(C, assembly, plan, robots=robots, recorder=recorder, bracing=brace)
   if viser and serve:
     recorder.serve(port=viser_port)
   return recorder
