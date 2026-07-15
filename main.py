@@ -167,6 +167,14 @@ def parse_args():
            "facts, for comparison. Default: wrench-aware whenever --wrench is on.",
   )
   parser.add_argument(
+      "--bracing", action="store_true",
+      help="Enable the add_grasp (co-grasp) primitive: a free robot adds a SECOND gripper to "
+           "an already-held assembly and KEEPS it (unlike handover, which swaps). Needed for "
+           "offset HORIZONTAL mates (e.g. car wheels), where one grasp cannot supply the "
+           "yaw-cancelling couple so two braces are required. Off by default (adds branching). "
+           "Exact search only (solve/anytime); the labeled-h abstraction models it when on.",
+  )
+  parser.add_argument(
       "--labeled-h", action="store_true",
       help="EXACT search only: use the grasp+face-LABELED disassembly abstraction as the "
            "heuristic (strictly tighter than the default abstraction; one-time build of "
@@ -183,6 +191,26 @@ def parse_args():
       help="Insertion (mating) reaction magnitude in newtons (with --wrench). Default 10. "
            "Sets what binds: e.g. two-finger caps are shear 15 / pull 25 / push 100, so at "
            "10 N held side-mates are free, at 30 N only press-aligned grasps survive.",
+  )
+  parser.add_argument(
+      "--curved-torque-scale", type=float, default=None, metavar="S",
+      help="With --wrench: derate the TORQUE (couple) a CURVED grasp (cylinder side / sphere) "
+           "can resist to S x that of a flat hold (force caps unchanged). E.g. 0.25. Models "
+           "'a wheel grip pivots in the jaws'; off by default (flat and curved treated alike).",
+  )
+  parser.add_argument(
+      "--insertion-noise", type=float, nargs="?", const=0.2, default=None, metavar="LATERAL",
+      help="With --wrench: model MISALIGNED seating as a worst-case uncertainty BOX -- an "
+           "angular tilt gives a shear up to LATERAL x insert_force transverse to the mate "
+           "axis (default 0.2 when given bare), and the state must be stable at EVERY corner "
+           "of the box (exact, by convexity -- no sampling). Adds an unavoidable shear/torque "
+           "so a weak grasp holding far from the mate fails. Off by default.",
+  )
+  parser.add_argument(
+      "--insertion-offset", type=float, default=0.0, metavar="M",
+      help="With --insertion-noise: add the second (positional) box axis -- the axial press "
+           "also lands off-CENTRE by up to M metres (a transverse couple = insert_force x M). "
+           "0 (default) => a 4-corner lateral-only box; >0 => a 16-corner box.",
   )
   parser.add_argument(
       "--no-inserter-check", dest="inserter_check", action="store_false",
@@ -227,7 +255,29 @@ def parse_args():
       "--seed", type=int, default=0,
       help="RNG seed for numpy + rai (KOMO IK), for reproducible runs. Default: 0.",
   )
+  parser.add_argument(
+      "--save", metavar="PATH", default=None,
+      help="After --solve, write the plan + the scene config (assembly, parts, robots, seed, "
+           "wrench settings, ...) to PATH as JSON, so it can be replayed later without "
+           "re-searching via the standalone `python replay.py PATH` script.",
+  )
   return parser.parse_args()
+
+
+# fields persisted by --save so replay.py can reconstruct the EXACT scene (see plan_io.py).
+_SAVE_CONFIG_FIELDS = (
+    "assembly", "parts", "num_robots", "vacuum", "floating_ee", "robot_types",
+    "scatter_spacing", "perturb_start_pose", "seed", "wrench", "grasp_model", "insert_force",
+    "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
+    "bracing",
+)
+
+
+def save_plan(path, args, plan):
+  from plan_io import write_plan
+  config = {k: getattr(args, k) for k in _SAVE_CONFIG_FIELDS}
+  write_plan(path, config, plan)
+  print(f"[save] wrote {len(plan)}-action plan + scene config to {path}")
 
 def main():
   args = parse_args()
@@ -239,6 +289,10 @@ def main():
   wrench.PARAMS["grasp_model"] = args.grasp_model  # capability model (used when --wrench)
   wrench.PARAMS["check_inserter"] = args.inserter_check
   wrench.PARAMS["insert_force"]["_default"] = args.insert_force
+  wrench.PARAMS["curved_grasp_torque_scale"] = args.curved_torque_scale
+  wrench.PARAMS["insertion_uncertainty"] = (
+      None if args.insertion_noise is None
+      else {"lateral": args.insertion_noise, "offset": args.insertion_offset})
 
   if args.test_pick_ik is not None:
     robot, part, grasp = args.test_pick_ik.split(":")
@@ -319,14 +373,15 @@ def main():
             C, assembly, robots=robots, time_budget=args.anytime, robot_ik=robot_ik,
             wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
             anonymous=args.anon_robots, labeled_h=args.labeled_h,
-            collapsed_h=args.collapsed_h, wrench_aware_h=args.wrench_aware_h)
+            collapsed_h=args.collapsed_h, wrench_aware_h=args.wrench_aware_h,
+            bracing=args.bracing)
       else:
         plan = solve_assembly_problem(C, assembly, robots=robots, canonical=args.canonical,
                                       weight=args.weight, robot_ik=robot_ik, wrench=args.wrench,
                                       handovers=args.handovers, allow_place=args.allow_place,
                                       anonymous=args.anon_robots, labeled_h=args.labeled_h,
                                       collapsed_h=args.collapsed_h,
-                                      wrench_aware_h=args.wrench_aware_h)
+                                      wrench_aware_h=args.wrench_aware_h, bracing=args.bracing)
     except IKFailureLogDone:
       print(f"[ik-failures] window/cap reached -- search stopped for debugging "
             f"({len(fail_rec.steps)} failures collected).")
@@ -339,6 +394,8 @@ def main():
       print(f"plan ({len(plan)} actions):")
       for step in plan:
         print("  ", step)
+      if args.save is not None:
+        save_plan(args.save, args, plan)
       if args.view or args.viser:
         recorder = None
         if args.viser:

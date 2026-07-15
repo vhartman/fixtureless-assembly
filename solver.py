@@ -1083,7 +1083,7 @@ class LabeledDisassemblyHeuristic:
   H = "H"                                                  # face value for held-in-air
 
   def __init__(self, assembly, n_robots, grasp_table, gripper_path=None, verbose=False,
-               max_states=2_000_000, clearance=0.02, gripper_kind=None):
+               max_states=2_000_000, clearance=0.02, gripper_kind=None, bracing=False):
     import heapq
     import time as _time
 
@@ -1091,6 +1091,7 @@ class LabeledDisassemblyHeuristic:
     self.assembly = assembly
     self.R = n_robots
     self.misses = 0
+    self._bracing = bracing                                # model the add_grasp (co-grasp) edge
     self._clearance = clearance                            # see _table_aware_pick_fact
     self._gk = gripper_kind                                # non-None => WRENCH facts active
     objs = list(assembly.objects)
@@ -1200,12 +1201,12 @@ class LabeledDisassemblyHeuristic:
         ok = w_hold_ok(ideal_s_key, G2, face)
         if ok and wrench.PARAMS.get("check_inserter", True):
           st_q = held_single(q, gq)
-          ok = _group_stable(st_q, assembly, frozenset({q}), self._gk,
-                             applied=[_inserter_load(st_q, assembly, q, onto)])
+          ok = _group_stable_loaded(st_q, assembly, frozenset({q}), self._gk,
+                                    _inserter_load_variants(st_q, assembly, q, onto))
         if ok:
           st_t = crafted(ideal_s_key, G2, face)
-          ok = _group_stable(st_t, assembly, set(ideal_s_key), self._gk,
-                             applied=[_insertion_load(st_t, assembly, q, onto)])
+          ok = _group_stable_loaded(st_t, assembly, set(ideal_s_key), self._gk,
+                                    _insertion_load_variants(st_t, assembly, q, onto))
         hit = self._wfacts[key] = ok
       return hit
 
@@ -1251,6 +1252,18 @@ class LabeledDisassemblyHeuristic:
         for pg in self.valid[ideal]:
           if pg not in G:
             yield (ideal, tadd(G, pg), face, L), 1.0
+      # inverse ADD_GRASP (bracing only): a brace was just added to the already-held assembly
+      # (add_grasp KEEPS both holders, unlike handover's swap). Backward: the pre-state held it
+      # with one FEWER grasp -- still held (>=1) and stable under gravity. This is the edge that
+      # lets the abstraction FORM a >=2-grasp brace, required for offset horizontal mates (e.g.
+      # car wheels: a single grasp cannot supply the yaw-cancelling couple). Without it the
+      # abstraction stays admissible only when bracing is OFF; with bracing on it would wrongly
+      # report inf (see [[cograsp-gap]]). Extra edges only relax the bound -> admissibility safe.
+      if self._bracing:
+        for pg in G:
+          Gs = tsub(G, pg)
+          if len(Gs) >= 1 and w_hold_ok(ideal, Gs, face):
+            yield (ideal, Gs, face, L), 1.0
       # inverse fused HANDOVER (cost 2): solo-held; the grasp was swapped
       if face is Hf and len(G) == 1 and len(L) <= self.R - 2:
         pg_new = G[0]
@@ -1358,7 +1371,7 @@ class CollapsedLabeledHeuristic:
   H = "H"                                                  # face value for held-in-air
 
   def __init__(self, assembly, n_robots, grasp_table, gripper_path=None, verbose=False,
-               max_states=2_000_000, clearance=0.02, gripper_kind=None):
+               max_states=2_000_000, clearance=0.02, gripper_kind=None, bracing=False):
     import heapq
     import time as _time
 
@@ -1366,6 +1379,7 @@ class CollapsedLabeledHeuristic:
     self.assembly = assembly
     self.R = n_robots
     self.misses = 0
+    self._bracing = bracing                                # model the add_grasp (co-grasp) edge
     self._clearance = clearance
     self._gk = gripper_kind
     objs = list(assembly.objects)
@@ -1468,12 +1482,12 @@ class CollapsedLabeledHeuristic:
         ok = w_hold_ok(ideal_s_key, G2, face)
         if ok and wrench.PARAMS.get("check_inserter", True):
           st_q = held_single(q, gq)
-          ok = _group_stable(st_q, assembly, frozenset({q}), self._gk,
-                             applied=[_inserter_load(st_q, assembly, q, onto)])
+          ok = _group_stable_loaded(st_q, assembly, frozenset({q}), self._gk,
+                                    _inserter_load_variants(st_q, assembly, q, onto))
         if ok:
           st_t = crafted(ideal_s_key, G2, face)
-          ok = _group_stable(st_t, assembly, set(ideal_s_key), self._gk,
-                             applied=[_insertion_load(st_t, assembly, q, onto)])
+          ok = _group_stable_loaded(st_t, assembly, set(ideal_s_key), self._gk,
+                                    _insertion_load_variants(st_t, assembly, q, onto))
         hit = self._wfacts[key] = ok
       return hit
 
@@ -1517,6 +1531,14 @@ class CollapsedLabeledHeuristic:
         for pg in self.valid[ideal]:
           if pg not in G:
             yield (ideal, tadd(G, pg), face, L), 1.0
+      # inverse ADD_GRASP (bracing only): pre-state held the assembly with one FEWER grasp --
+      # forms the >=2-grasp brace offset horizontal mates need (see LabeledDisassemblyHeuristic
+      # and [[cograsp-gap]]). Extra edges only relax the bound -> admissibility safe.
+      if self._bracing:
+        for pg in G:
+          Gs = tsub(G, pg)
+          if len(Gs) >= 1 and w_hold_ok(ideal, Gs, face):
+            yield (ideal, Gs, face, L), 1.0
       # inverse fused HANDOVER (cost 2): solo-held; the grasp was swapped
       if face is Hf and len(G) == 1 and len(L) <= self.R - 2:
         pg_new = G[0]
@@ -1780,7 +1802,8 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
                            use_heuristic=True, canonical=False, weight=1.0, robot_ik=None,
                            wrench=False, wrench_aware_h=True, handovers=True,
                            allow_place=True, cost_bound=None, deadline=None,
-                           anonymous=False, labeled_h=False, collapsed_h=False):
+                           anonymous=False, labeled_h=False, collapsed_h=False,
+                           bracing=False):
   """EXACT (weighted) A* over scene-graph states from the initial scene to a completed
   assembly -- the reference baseline. Priority is f = g + weight * h.
     - weight = 1.0 : ordinary A*, returns a minimum-cost plan.
@@ -1849,7 +1872,7 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
       h_lab = cls(assembly, len(robots), grasp_table,
                   gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
                   verbose=verbose,
-                  gripper_kind=gk if wrench_aware_h else None)
+                  gripper_kind=gk if wrench_aware_h else None, bracing=bracing)
       h_abs = None
 
   def h_fn(state):
@@ -1862,7 +1885,8 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
 
   def succ_fn(s):
     return successors(s, assembly, robots, grasp_table=grasp_table, canonical=canonical,
-                      gripper_kind=gk, handovers=handovers, allow_place=allow_place)
+                      gripper_kind=gk, handovers=handovers, allow_place=allow_place,
+                      bracing=bracing)
 
   # FULLY LAZY feasibility: the cheap geometric check moved from PUSH to POP (edge check),
   # like the IK before it -- profiling showed ~20 pushed edges per expansion, each paying a

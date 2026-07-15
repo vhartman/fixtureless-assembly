@@ -59,6 +59,22 @@ PARAMS = {
                        "vacuum":     {"F_push": 100.0, "F_pull": 25.0, "mu": 0.15,
                                       "T_axis": 0.8, "T_lat": 0.8}},
     },
+    # CURVED-surface torque derate: a grip on a cylinder side / sphere (a "curved" grasp,
+    # per part_grasp_surfaces) resists far less TORQUE than a flat hold -- the part rolls/
+    # pivots in the jaws or cup. None/1.0 => off (byte-identical); e.g. 0.25 => a curved
+    # grasp's COUPLE capability is quartered (force caps unchanged). This is what makes
+    # holding a car by a WHEEL (a curved grip) fail under an off-centre insertion torque
+    # while a flat body-grasp survives.
+    "curved_grasp_torque_scale": None,
+    # INSERTION UNCERTAINTY (robust seating): None => the mate reaction is the clean nominal
+    # force along the mate axis (byte-identical). Else a dict {"lateral":a, "offset":r}: real
+    # seating is misaligned, modelled as an uncertainty BOX transverse to the mate axis -- an
+    # angular tilt (shear up to a*insert_force) and a positional shift (axial force off-centre
+    # up to r metres, a couple). The state must be stable at EVERY CORNER of that box; since
+    # the balanceable-wrench set is convex, checking corners is EXACT (no sampling). a>0 alone
+    # => a 4-corner box; a,r>0 => 16 corners. Adds an unavoidable shear+torque no favourable
+    # lever can cancel, so a weak grasp holding far from the mate fails -- emergently.
+    "insertion_uncertainty": None,
     # insertion (mating) reaction: ONE magnitude for now, but read per-mate from a dict so
     # individual mates can override it later without touching call sites. `_default` applies
     # to any mate not listed.
@@ -82,11 +98,20 @@ def insert_force(part):
 # model here is a bounded polytope of this form; models are selected via PARAMS + the
 # grasp_capability / table_capability dispatchers (the LP itself is model-agnostic).
 # ---------------------------------------------------------------------------------------
+def _cross3(a, b):
+  # explicit 3-vector cross product. np.cross is astonishingly slow for single 3-vectors
+  # (axis-normalization / moveaxis overhead dwarfs the arithmetic) and this is the hottest
+  # line in a wrench search -- _force_gen alone calls it hundreds of thousands of times.
+  return np.array([a[1] * b[2] - a[2] * b[1],
+                   a[2] * b[0] - a[0] * b[2],
+                   a[0] * b[1] - a[1] * b[0]])
+
+
 def _force_gen(direction, point):
   # generator wrench of a unit force along `direction` applied at world `point`.
   d = np.asarray(direction, float)
   p = np.asarray(point, float)
-  return np.concatenate([d, np.cross(p, d)])
+  return np.concatenate([d, _cross3(p, d)])
 
 
 def _couple_gen(axis):
@@ -171,16 +196,27 @@ def cap_asymmetric_grasp(point, n, t1, t2, F_push, F_pull, mu, T_axis, T_lat):
 
 
 # --- model selection: dispatch a contact to its configured capability builder --------------
-def grasp_capability(point, n, t1, t2, gripper_kind):
+def grasp_capability(point, n, t1, t2, gripper_kind, surface="flat"):
   # build the grasp cap per PARAMS['grasp_model']. `point` is the grasp/contact point; n,t1,t2
   # the grasp frame (used only by the directional/asymmetric models; isotropic ignores them).
+  # `surface` ("flat"|"curved") lets a curved contact be derated -- see below.
   model = PARAMS["grasp_model"]
   p = PARAMS["grasp"][model][gripper_kind]
   if model == "isotropic":
-    return cap_grasp_box(point, **p)
-  if model == "asymmetric":
-    return cap_asymmetric_grasp(point, n, t1, t2, **p)
-  return cap_friction_grasp(point, n, t1, t2, **p)
+    G, ub = cap_grasp_box(point, **p)
+  elif model == "asymmetric":
+    G, ub = cap_asymmetric_grasp(point, n, t1, t2, **p)
+  else:
+    G, ub = cap_friction_grasp(point, n, t1, t2, **p)
+  scale = PARAMS.get("curved_grasp_torque_scale")
+  if scale is not None and surface == "curved":
+    # a curved grip resists less TORQUE: derate the COUPLE generators only -- the columns with
+    # no linear-force part (built by _couple_gen). Model-agnostic: works for every builder
+    # above. Force capabilities are left untouched. scale in [0,1].
+    is_couple = np.all(np.abs(G[:3, :]) < 1e-12, axis=0)
+    ub = ub.copy()
+    ub[is_couple] = ub[is_couple] * float(scale)
+  return G, ub
 
 
 _TABLE_BUILDERS = {"unilateral": cap_table_unilateral}
@@ -198,14 +234,14 @@ def gravity_wrench(masses_points):
   w = np.zeros(6)
   for m, c in masses_points:
     f = np.array([0.0, 0.0, -m * GRAVITY])
-    w += np.concatenate([f, np.cross(np.asarray(c, float), f)])
+    w += np.concatenate([f, _cross3(np.asarray(c, float), f)])
   return w
 
 
 def point_force_wrench(force_vec, point):
   # wrench about the origin of a force applied at a world point (e.g. insertion reaction).
   f = np.asarray(force_vec, float)
-  return np.concatenate([f, np.cross(np.asarray(point, float), f)])
+  return np.concatenate([f, _cross3(np.asarray(point, float), f)])
 
 
 def equilibrium_feasible(caps, w_external, tol=1e-6):
@@ -218,8 +254,18 @@ def equilibrium_feasible(caps, w_external, tol=1e-6):
     return bool(np.linalg.norm(w_external) <= tol)
   G = np.hstack([c[0] for c in caps])                   # 6 x K
   ub = np.concatenate([c[1] for c in caps])             # K
-  K = G.shape[1]
-  bounds = [(0.0, None if not np.isfinite(u) else float(u)) for u in ub]
-  res = linprog(c=np.zeros(K), A_eq=G, b_eq=-np.asarray(w_external, float),
+  return equilibrium_feasible_matrices(G, ub, w_external, tol)
+
+
+def equilibrium_feasible_matrices(G, ub, w_external, tol=1e-6, bounds=None):
+  """The LP feasibility test on the already-assembled generator matrix (G [6xK], ub [K]).
+  The contact-INDEPENDENT parts (G, ub, and the derived `bounds` list) can be built ONCE and
+  reused across many external loads -- e.g. the corners of an insertion-uncertainty box --
+  so the caller (`_group_stable`/`_grounding_caps`) hoists them out of the per-load loop."""
+  if G.shape[1] == 0:
+    return bool(np.linalg.norm(w_external) <= tol)
+  if bounds is None:
+    bounds = [(0.0, None if not np.isfinite(u) else float(u)) for u in ub]
+  res = linprog(c=np.zeros(G.shape[1]), A_eq=G, b_eq=-np.asarray(w_external, float),
                 bounds=bounds, method="highs")
   return bool(res.success)

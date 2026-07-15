@@ -1204,21 +1204,34 @@ class State:
 
   # --- identity ---
   def key(self):
+    # MEMOIZED: a State is never structurally edited after it is first queried (successors
+    # finish their edits before yielding, same invariant _state_part_poses relies on), so the
+    # identity key is stable once computed. It was being rebuilt on every __hash__/__eq__ --
+    # millions of times in a search -- and the sorts dominated the profile. Cached lazily so
+    # the (rare) construction paths that never hash a state pay nothing. _ANON_ROBOTS is fixed
+    # for the duration of a solve, so it cannot change under a cached key.
+    k = getattr(self, "_key", None)
+    if k is not None:
+      return k
     parent, supports = self.parent, self.supports
     if _ANON_ROBOTS:                                       # LATE-BINDING: robot-anonymous key
       parent, supports = _relabel_robots(parent, supports)  # merge robot permutations
-    return (
+    k = self._key = (
         tuple(sorted(parent.items())),
         tuple(sorted(self.grasp.items())),
         tuple(sorted(self.place.items())),
         tuple(sorted((p, tuple(sorted(cs))) for p, cs in supports.items())),
     )
+    return k
 
   def __eq__(self, other):
     return isinstance(other, State) and self.key() == other.key()
 
   def __hash__(self):
-    return hash(self.key())
+    h = getattr(self, "_hash", None)
+    if h is None:
+      h = self._hash = hash(self.key())
+    return h
 
   def __repr__(self):
     def where(group):
@@ -1427,12 +1440,12 @@ def assembles(state, assembly, robots, gripper_kind=None):
       #       -- is transmittable through its grasp(s). Passing `group` to _group_stable prices
       #       in a heavy module's gravity automatically; for a single part it is the old check.
       d = assembly.mate_axis(p)
-      if not _group_stable(state, assembly, target, gripper_kind,
-                           applied=[_insertion_load(state, assembly, p, onto, d)]):
+      if not _group_stable_loaded(state, assembly, target, gripper_kind,
+                                  _insertion_load_variants(state, assembly, p, onto, d)):
         continue
-      if wrench.PARAMS.get("check_inserter", True) and not _group_stable(
+      if wrench.PARAMS.get("check_inserter", True) and not _group_stable_loaded(
           state, assembly, group, gripper_kind,
-          applied=[_inserter_load(state, assembly, p, onto, d)]):
+          _inserter_load_variants(state, assembly, p, onto, d)):
         continue
     if _group_is_on_table(state, target) and not _on_table_mateable_cached(
         assembly, p, _placement_face(state, target)):
@@ -1815,36 +1828,138 @@ def reset_wrench_cache():
   _WRENCH_CACHE.clear()
 
 
-def _group_stable(state, assembly, group, gripper_kind, applied=()):
-  # static-equilibrium feasibility for a subassembly: can its grounding contacts balance
-  # gravity plus any `applied` [(force_vec_world, point_world), ...] (e.g. insertion)?
+def _grounding_caps(state, assembly, group, gripper_kind):
+  # Everything in the stability LP that does NOT depend on the applied load: the grounding
+  # generator matrix (G [6xK], ub [K]) + its precomputed linprog `bounds` and rounded cache-
+  # key BYTES, the group centroid, and the gravity wrench. CACHED per (state, subassembly,
+  # gripper_kind) -- so a robust multi-corner insertion check (16 corners share the SAME
+  # contacts, only w_ext differs) and any repeated query on one state build the caps, run the
+  # capability constructors (the np.cross-heavy _force_gen calls that dominated the profile),
+  # hstack, and hash the generator matrix ONCE instead of per call.
+  cache = getattr(state, "_gcaps", None)
+  if cache is None:
+    cache = state._gcaps = {}
+  ckey = (_subasm_key(group), gripper_kind)
+  hit = cache.get(ckey)
+  if hit is not None:
+    return hit
   poses = _state_part_poses(state, assembly, lift=0.0)
   members = sorted(group, key=_part_index)                 # stable order -> stable cache key
   pos = {p: np.asarray(poses[p][:3], dtype=float) for p in members}
   centroid = np.mean([pos[p] for p in members], axis=0)    # canonicalise position away
-
-  w_ext = wrench.gravity_wrench([(assembly.mass(p), pos[p] - centroid) for p in members])
-  for f, pt in applied:
-    w_ext = w_ext + wrench.point_force_wrench(f, np.asarray(pt, dtype=float) - centroid)
-
+  w_grav = wrench.gravity_wrench([(assembly.mass(p), pos[p] - centroid) for p in members])
   caps = []
   if any(("table",) in state.supports.get(p, ()) for p in members):
     fp = _table_footprint(assembly, poses, members)
     caps.append(wrench.table_capability([np.asarray(x, dtype=float) - centroid for x in fp]))
+  derate = wrench.PARAMS.get("curved_grasp_torque_scale") is not None
   for p in members:
     for c in sorted(state.supports.get(p, ())):
       if c[0] == "grasp":
         gp, n, t1, t2 = _grasp_frame(assembly, c[2], poses[c[2]], c[3])  # c=(grasp,r,gpart,gid)
-        caps.append(wrench.grasp_capability(gp - centroid, n, t1, t2, gripper_kind))
-
+        surf = _grasp_surface(assembly.part_shape(c[2]), c[3]) if derate else "flat"
+        caps.append(wrench.grasp_capability(gp - centroid, n, t1, t2, gripper_kind, surface=surf))
   G = np.hstack([c[0] for c in caps]) if caps else np.zeros((6, 0))
   ub = np.concatenate([c[1] for c in caps]) if caps else np.zeros(0)
-  key = (np.round(G, 4).tobytes(), np.round(ub, 4).tobytes(), np.round(w_ext, 4).tobytes())
-  if key in _WRENCH_CACHE:
-    return _WRENCH_CACHE[key]
-  res = wrench.equilibrium_feasible(caps, w_ext)
+  bounds = [(0.0, None if not np.isfinite(u) else float(u)) for u in ub]
+  gbytes = (np.round(G, 4).tobytes(), np.round(ub, 4).tobytes())
+  hit = cache[ckey] = (centroid, w_grav, G, ub, bounds, gbytes)
+  return hit
+
+
+def _group_stable(state, assembly, group, gripper_kind, applied=()):
+  # static-equilibrium feasibility for a subassembly: can its grounding contacts balance
+  # gravity plus any `applied` [(force_vec_world, point_world), ...] (e.g. insertion)? The
+  # load-independent contacts come from _grounding_caps (cached); here we only add the applied
+  # load to the gravity wrench and hit the LP cache / solve.
+  centroid, w_grav, G, ub, bounds, gbytes = _grounding_caps(state, assembly, group, gripper_kind)
+  w_ext = w_grav
+  for f, pt in applied:
+    w_ext = w_ext + wrench.point_force_wrench(f, np.asarray(pt, dtype=float) - centroid)
+  key = (gbytes[0], gbytes[1], np.round(w_ext, 4).tobytes())
+  hit = _WRENCH_CACHE.get(key)
+  if hit is not None:
+    return hit
+  res = wrench.equilibrium_feasible_matrices(G, ub, w_ext, bounds=bounds)
   _WRENCH_CACHE[key] = res
   return res
+
+
+_SURFACE_CACHE = {}
+
+
+def _grasp_surface(spec, grasp_id):
+  # "flat" | "curved" surface a grasp contacts, memoized (part_grasp_surfaces depends only on
+  # the shape KIND and the roll count). Only consulted when curved_grasp_torque_scale is set.
+  key = (spec[0], _ROLLS_PER_FACE)
+  surfaces = _SURFACE_CACHE.get(key)
+  if surfaces is None:
+    surfaces = _SURFACE_CACHE[key] = part_grasp_surfaces(spec)
+  return surfaces[grasp_id]
+
+
+def _group_stable_loaded(state, assembly, group, gripper_kind, load_variants):
+  # ROBUST stability under an UNCERTAIN applied load: the group must balance EVERY worst-case
+  # realization in `load_variants` (a list of (force_world, point) corners from
+  # _insertion_uncertainty_variants). With insertion_uncertainty off that list is the single
+  # nominal load, so this is exactly the old one-shot _group_stable check.
+  return all(_group_stable(state, assembly, group, gripper_kind, applied=[lv])
+             for lv in load_variants)
+
+
+def _cross3(a, b):
+  # explicit 3-vector cross (np.cross carries huge per-call dispatch overhead; see wrench._cross3)
+  return np.array([a[1] * b[2] - a[2] * b[1],
+                   a[2] * b[0] - a[0] * b[2],
+                   a[0] * b[1] - a[1] * b[0]])
+
+
+def _transverse_basis(dvec):
+  # two orthonormal vectors spanning the plane perpendicular to (unit) `dvec`.
+  d = np.asarray(dvec, dtype=float)
+  d = d / (np.linalg.norm(d) + 1e-12)
+  ref = np.array([0.0, 0.0, 1.0]) if abs(d[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+  t1 = _cross3(ref, d)
+  t1 /= (np.linalg.norm(t1) + 1e-12)
+  return t1, _cross3(d, t1)
+
+
+def _insertion_uncertainty_variants(f_world, point, mag):
+  # the seating force as an UNCERTAINTY POLYTOPE, returned as its CORNERS. Real seating is
+  # misaligned in two independent ways: the press direction TILTS (angular) -> a transverse
+  # shear up to lateral*mag, and the contact point SHIFTS (positional) -> the axial force
+  # lands up to offset metres off-centre (a transverse couple). Each is one axis of a box in
+  # the plane transverse to the mate axis; the box has 2 (lateral only) or 4 (lateral+offset)
+  # dimensions, so 4 or 16 corners. Because the set of balanceable external wrenches is CONVEX,
+  # requiring every CORNER stable (_group_stable_loaded) is EXACT for the box -- no sampling,
+  # no tunable count. (The box is a conservative OUTER polytope of the true circular cone/disk,
+  # so it rejects marginally more, in the safe direction.) Off => [(nominal)], byte-identical.
+  unc = wrench.PARAMS.get("insertion_uncertainty")
+  f_world = np.asarray(f_world, dtype=float)
+  point = np.asarray(point, dtype=float)
+  if not unc:
+    return [(f_world, point)]
+  t1, t2 = _transverse_basis(f_world)
+  lat = float(unc.get("lateral", 0.0)) * mag              # transverse-force half-widths (N)
+  off = float(unc.get("offset", 0.0))                     # application-offset half-widths (m)
+  gens = []                                               # (apply-to, axis, half-width)
+  if lat > 0.0:
+    gens += [("f", t1, lat), ("f", t2, lat)]              # angular tilt -> transverse force
+  if off > 0.0:
+    gens += [("p", t1, off), ("p", t2, off)]              # positional shift -> off-centre couple
+  if not gens:
+    return [(f_world, point)]
+  out = []
+  for bits in range(1 << len(gens)):                      # every sign combination = a box corner
+    fv, pv = f_world.copy(), point.copy()
+    for i, (kind, axis, amt) in enumerate(gens):
+      s = 1.0 if (bits >> i) & 1 else -1.0
+      if kind == "f":
+        fv = fv + s * amt * axis
+      else:
+        pv = pv + s * amt * axis
+    out.append((fv, pv))
+  return out
 
 
 def _insertion_load(state, assembly, part, onto, d=None):
@@ -1882,6 +1997,19 @@ def _inserter_load(state, assembly, part, onto, d=None):
   point = np.asarray(poses[part][:3], dtype=float) \
       + R @ (np.asarray(d, dtype=float) * half_d)           # at the pressing face (real lever)
   return f_world, point
+
+
+def _insertion_load_variants(state, assembly, part, onto, d=None):
+  # the target-side insertion reaction, as a list of worst-case realizations under the
+  # insertion-uncertainty model (a singleton = the nominal load when the flag is off).
+  f_world, point = _insertion_load(state, assembly, part, onto, d)
+  return _insertion_uncertainty_variants(f_world, point, wrench.insert_force(part))
+
+
+def _inserter_load_variants(state, assembly, part, onto, d=None):
+  # the inserter-side seating reaction (on the held part), likewise as worst-case realizations.
+  f_world, point = _inserter_load(state, assembly, part, onto, d)
+  return _insertion_uncertainty_variants(f_world, point, wrench.insert_force(part))
 
 
 # reference anchor poses for the wrench precompute: absolute position is irrelevant (the
@@ -1922,8 +2050,8 @@ def precompute_stable_faces(assembly, gripper_kind):
         st = context_scatter_state(assembly, S, f, poses)
         if not _group_stable(st, assembly, S, gripper_kind):
           continue                                          # S topples resting on face f
-        if not _group_stable(st, assembly, S, gripper_kind,
-                             applied=[_insertion_load(st, assembly, p, onto)]):
+        if not _group_stable_loaded(st, assembly, S, gripper_kind,
+                                    _insertion_load_variants(st, assembly, p, onto)):
           continue                                          # topples under the insertion
         faces.add(f)
       table[(_subasm_key(S), p)] = frozenset(faces)

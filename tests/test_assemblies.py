@@ -40,13 +40,14 @@ def _solve(kind, n, robots, weight, wrench, model, insert):
   return plan, asm, C, robots_list, gk
 
 
-def _replay_ok(plan, asm, C, robots_list, gk):
+def _replay_ok(plan, asm, C, robots_list, gk, bracing=False):
   """Independently re-derive the plan: every action must be an enumerated successor that
   passes the cheap feasibility layer, and the final state must be the goal."""
   checker, grasp_table = A._search_context(C, asm, robots_list)
   s = A.get_initial_state(C, asm)
   for act in plan:
-    succ = [ns for a, ns in A.successors(s, asm, robots_list, grasp_table, gripper_kind=gk)
+    succ = [ns for a, ns in A.successors(s, asm, robots_list, grasp_table, gripper_kind=gk,
+                                         bracing=bracing)
             if a == act]
     assert succ, f"action is not an enumerated successor: {act}"
     ns = succ[0]
@@ -134,6 +135,101 @@ def _two_module_state(asm, C, robots, held_top):
   poses = A.get_initial_state(C, asm).poses
   return A.State(parent=parent, place={"obj_0": ("slot", 0, 0)}, supports=supports,
                  poses=dict(poses))
+
+
+def test_wrench_uncertainty_flags():
+  """The two toggleable insertion-robustness knobs. OFF => byte-identical (a singleton load
+  variant); the CURVED-torque derate makes holding the car by a WHEEL (a curved grip) unable
+  to resist an off-centre insertion torque that a flat BODY grip still takes -- the emergent
+  'don't hold by the wheel' without forbidding any action by hand."""
+  A.set_seed(0); A.set_rolls_per_face(2)
+  car = A.make_assembly("car", 5)
+  sw = A.part_grasp_surfaces(car.part_shape("obj_1"))
+  sb = A.part_grasp_surfaces(car.part_shape("obj_0"))
+  g_wheel = next(i for i, s in enumerate(sw) if s == "curved")
+  g_body = next(i for i, s in enumerate(sb) if s == "flat")
+  poses = A._flat_poses(car)
+
+  def held(holder, gid):                                    # {obj_0,obj_1,obj_2} held in air
+    parent, supports, place = {}, {}, {}
+    for q in car.objects:
+      if q in ("obj_0", "obj_1", "obj_2"):
+        parent[q] = ("gripper", "zz") if q == "obj_0" else ("part", "obj_0")
+        supports[q] = frozenset() if q == "obj_0" else frozenset({("mate", "obj_0")})
+      else:
+        parent[q] = ("table",); supports[q] = frozenset({("table",)})
+        place[q] = ("slot", A._part_index(q), A._IDENTITY_FACE)
+    supports[holder] = supports[holder] | {("grasp", "zz", holder, gid)}
+    return A.State(parent=parent, place=place, supports=supports, poses=dict(poses))
+
+  def gate(holder, gid):
+    st = held(holder, gid)
+    return A._group_stable_loaded(st, car, {"obj_0", "obj_1", "obj_2"}, "two_finger",
+                                  A._insertion_load_variants(st, car, "obj_3", "obj_0"))
+
+  saved = (W.PARAMS.get("grasp_model"), W.PARAMS.get("curved_grasp_torque_scale"),
+           W.PARAMS.get("insertion_uncertainty"))
+  try:
+    W.PARAMS["grasp_model"] = "isotropic"
+    W.PARAMS["curved_grasp_torque_scale"] = None
+    W.PARAMS["insertion_uncertainty"] = None
+    st = held("obj_0", g_body)
+    # off: one load variant, and both holds feasible (the pre-change behaviour)
+    assert len(A._insertion_load_variants(st, car, "obj_3", "obj_0")) == 1
+    assert gate("obj_1", g_wheel) and gate("obj_0", g_body)
+    # curved derate: the WHEEL grip can no longer resist the insertion torque; body still can
+    W.PARAMS["curved_grasp_torque_scale"] = 0.2
+    assert not gate("obj_1", g_wheel)
+    assert gate("obj_0", g_body)
+    # insertion noise = an uncertainty BOX, returned as its CORNERS (exact, no sampling):
+    # lateral only => a 2-D box => 4 corners; lateral+offset => a 4-D box => 16 corners.
+    W.PARAMS["insertion_uncertainty"] = {"lateral": 0.3, "offset": 0.0}
+    assert len(A._insertion_load_variants(st, car, "obj_3", "obj_0")) == 4
+    W.PARAMS["insertion_uncertainty"] = {"lateral": 0.3, "offset": 0.004}
+    assert len(A._insertion_load_variants(st, car, "obj_3", "obj_0")) == 16
+  finally:
+    W.PARAMS["grasp_model"], W.PARAMS["curved_grasp_torque_scale"], \
+        W.PARAMS["insertion_uncertainty"] = saved
+
+
+def test_cograsp_bracing():
+  """The add_grasp (co-grasp) primitive + its labeled-h edge. An OFFSET HORIZONTAL mate (a car
+  wheel: ±y press at an x-offset -> a yaw moment) needs TWO braces -- a single grasp can't supply
+  the yaw couple and the frictionless table gives no lateral help. So WITHOUT bracing the instance
+  is infeasible (labeled-h h(s0)=inf); WITH bracing (+ the abstraction's inverse-add_grasp edge)
+  it's feasible and a real plan uses add_grasp. `bracing` must also toggle the primitive."""
+  import solver as S
+  A.set_seed(0); A.set_rolls_per_face(2)                    # two-finger
+  saved = (W.PARAMS.get("grasp_model"), W.PARAMS.get("insertion_uncertainty"),
+           W.PARAMS["insert_force"].get("_default"))
+  try:
+    W.PARAMS["grasp_model"] = "asymmetric"; W.PARAMS["insert_force"]["_default"] = 20.0
+    W.PARAMS["insertion_uncertainty"] = {"lateral": 0.05, "offset": 0.0}
+    asm = A.make_assembly("car-mini", 3)
+    C = make_four_robot_env(num_robots=3, floating_ee=True, vacuum=False)
+    A.add_disassembled_obj(C, asm, spacing=0.2)
+    robots = A.get_robots(C); gk = A.gripper_kind(C)
+    checker, gt = S._search_context(C, asm, robots)
+    s0 = A.get_initial_state(C, asm)
+    # the primitive is gated by `bracing`: add_grasp on a held body appears only when it's on
+    held = next(ns for a, ns in A.picks(s0, asm, robots) if a[2] == "obj_0")
+    def has_addgrasp(bracing):
+      return any(a[0] == "add_grasp" and a[2] == "obj_0" for a, _ in
+                 A.successors(held, asm, robots, gt, gripper_kind=gk, bracing=bracing))
+    assert not has_addgrasp(False) and has_addgrasp(True), "bracing must toggle add_grasp"
+    # WITHOUT bracing: soundly infeasible (labeled-h abstraction has no co-grasp edge)
+    gp = getattr(checker, "fact_gripper_path", checker.gripper_path)
+    h_off = S.LabeledDisassemblyHeuristic(asm, len(robots), gt, gripper_path=gp,
+                                          gripper_kind=gk, bracing=False)
+    assert h_off.value(s0) == float("inf"), "offset horizontal mate needs a co-grasp brace"
+    # WITH bracing: a real plan exists, uses add_grasp, and replays to the goal
+    plan = A.solve_assembly_problem(C, asm, robots=robots, weight=10.0, verbose=False,
+                                    wrench=True, robot_ik=None, labeled_h=True, bracing=True)
+    assert plan is not None and any(a[0] == "add_grasp" for a in plan)
+    assert _replay_ok(plan, asm, C, robots_list=robots, gk=gk, bracing=True)
+  finally:
+    (W.PARAMS["grasp_model"], W.PARAMS["insertion_uncertainty"],
+     W.PARAMS["insert_force"]["_default"]) = saved
 
 
 def test_mini_car_two_finger():
