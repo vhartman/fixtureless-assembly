@@ -67,6 +67,11 @@ GEOMETRIC = [
     ("cube", 8, 3, 3.0, 18),
     ("arch-seq", 7, 2, 3.0, 16),
     ("arch-seq", 7, 3, 3.0, 16),
+    ("cuboid-tower", 3, 2, 3.0, 4),                        # NON-CUBE: jenga tower (2:1:1 boxes,
+    ("cuboid-tower", 4, 2, 3.0, 8),                        # 2/level, levels rotated 90 deg)
+    ("cuboid-tower", 6, 2, 3.0, 13),
+    ("car", 3, 2, 3.0, 8),                                 # ROTATED shapes: sideways wheels
+    ("car", 5, 2, float("inf"), 15),                       # full car (wA* too slow for the suite)
     ("cube-plates", 4, 2, 3.0, 7),
     ("cube-plates", 6, 2, 3.0, 13),
     # 8-part: the two-plate build is FORCED (top plate assembled as a unit, then joined), which
@@ -82,6 +87,8 @@ WRENCH = [
     ("cross", 4, 2, 3.0, "asymmetric", 10.0, 12),
     ("arch-seq", 5, 2, 3.0, "asymmetric", 10.0, 14),
     ("cube-plates", 4, 2, 3.0, "asymmetric", 10.0, 12),
+    ("cuboid-tower", 4, 2, 3.0, "asymmetric", 10.0, 10),   # shaped support polygon + levers
+    ("car", 3, 2, 3.0, "asymmetric", 10.0, 9),             # axial wheel press, rim contacts
 ]
 
 
@@ -113,20 +120,63 @@ def _two_module_state(asm, C, robots, held_top):
   assembled cube, and real scatter/table heights."""
   full = A._search_context(C, asm, robots)[1][A._subasm_key(list(asm.objects))]
   gid = next(g for p, g, _pose in full if p == "obj_4")
-  # bottom chain 0->1->3->2 (complete, on table); top chain 4->5->7->6 (held subset).
-  top_parent = {"obj_5": ("part", "obj_4"), "obj_7": ("part", "obj_5"), "obj_6": ("part", "obj_7")}
-  parent = {"obj_0": ("table",), "obj_1": ("part", "obj_0"), "obj_3": ("part", "obj_1"),
-            "obj_2": ("part", "obj_3"), "obj_4": ("gripper", "a1")}
+  # serpentine chains in chain-order naming: bottom 0->1->2->3, top 4->5->6->7 (held subset).
+  top_parent = {"obj_5": ("part", "obj_4"), "obj_6": ("part", "obj_5"), "obj_7": ("part", "obj_6")}
+  parent = {"obj_0": ("table",), "obj_1": ("part", "obj_0"), "obj_2": ("part", "obj_1"),
+            "obj_3": ("part", "obj_2"), "obj_4": ("gripper", "a1")}
   supports = {"obj_0": frozenset({("table",)}), "obj_1": frozenset({("mate", "obj_0")}),
-              "obj_3": frozenset({("mate", "obj_1")}), "obj_2": frozenset({("mate", "obj_3")}),
+              "obj_2": frozenset({("mate", "obj_1")}), "obj_3": frozenset({("mate", "obj_2")}),
               "obj_4": frozenset({("grasp", "a1", "obj_4", gid)})}
-  for x in ("obj_5", "obj_7", "obj_6"):
+  for x in ("obj_5", "obj_6", "obj_7"):
     if x in held_top:
       parent[x] = top_parent[x]
       supports[x] = frozenset({("mate", top_parent[x][1])})
   poses = A.get_initial_state(C, asm).poses
   return A.State(parent=parent, place={"obj_0": ("slot", 0, 0)}, supports=supports,
                  poses=dict(poses))
+
+
+def test_mini_car_two_finger():
+  """car-mini + the TWO-FINGER gripper: the scaled wheels (diameter 0.048 < the ~0.078
+  finger gap) are graspable ACROSS THE DIAMETER -- the curved-surface radial grasps the
+  vacuum filters out. Asserts the radial grasps exist in the table and a plan solves."""
+  A.set_seed(0)
+  A.set_rolls_per_face(2)                                  # two-finger
+  asm = A.make_assembly("car-mini", 3)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=False)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  checker, gt = A._search_context(C, asm, robots)
+  wheel_ids = sorted(g for _p, g, _pose in gt[("obj_1",)])
+  radial = {0, 1, 2, 3, 6, 7, 8, 9}                        # non-cap directions x rolls
+  assert radial <= set(wheel_ids), f"radial wheel grasps missing: {wheel_ids}"
+  plan = A.solve_assembly_problem(C, asm, robots=robots, weight=3.0, verbose=False,
+                                  robot_ik=None)
+  assert plan is not None and len(plan) <= 8 + SLACK
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+
+
+def test_part_shapes():
+  """Shape plumbing: per-part specs flow into every consumer, cubes stay byte-identical.
+  (a) the cube grasp DB reproduces cube_grasp_pose exactly for both roll settings;
+  (b) cuboid grasps sit at per-face standoffs (end caps at w + offset, side faces w/2 + o);
+  (c) rest heights are orientation-aware (laid-down w/2, tipped upright w)."""
+  import numpy as np
+  for rolls in (1, 2):
+    A.set_rolls_per_face(rolls)
+    db = A.part_grasp_poses(("box", [0.05, 0.05, 0.05, 0.005]), rolls=rolls)
+    assert len(db) == 6 * rolls
+    for gid in range(6 * rolls):
+      assert np.allclose(db[gid], A.cube_grasp_pose(gid, 0.05), atol=1e-12)
+  A.set_rolls_per_face(1)
+  asm = A.make_assembly("cuboid-tower", 4)
+  assert asm.part_shape("obj_0") == ("box", [0.1, 0.05, 0.05, 0.005])
+  standoffs = [round(float(np.linalg.norm(g[:3])), 3)
+               for g in A.part_grasp_poses(asm.part_shape("obj_0"))]
+  assert standoffs == [0.06, 0.06, 0.035, 0.035, 0.035, 0.035], standoffs
+  flat = A._group_rest_height(asm, {"obj_0"}, "obj_0", A._IDENTITY_FACE)
+  upright = A._group_rest_height(asm, {"obj_0"}, "obj_0", 0)
+  assert abs(flat - 0.025) < 1e-9 and abs(upright - 0.05) < 1e-9, (flat, upright)
 
 
 def test_module_connect():
@@ -148,7 +198,7 @@ def test_module_connect():
   assert {"obj_4", "obj_5", "obj_6", "obj_7"} in subs, "top plate is not a module ideal"
 
   # (a) COMPLETE top module -> a single `assemble` joins it and reaches the goal.
-  s_full = _two_module_state(asm, C, robots, {"obj_5", "obj_7", "obj_6"})
+  s_full = _two_module_state(asm, C, robots, {"obj_5", "obj_6", "obj_7"})
   joins = [(a, ns) for a, ns in A.assembles(s_full, asm, robots)
            if a[2] == "obj_4" and a[3] == "obj_0" and A.cheap_feasible(a, s_full, ns, asm, checker)]
   assert joins, "no cheap-feasible module join for the complete top plate"
@@ -157,8 +207,8 @@ def test_module_connect():
   assert len(next(iter(ns.subassemblies()))) == 8, "join did not fuse into one 8-part body"
   assert ns.is_goal(asm), "joined state is not the goal"
 
-  # (b) PARTIAL top module (missing the last chain cube obj_6) -> the join is FORBIDDEN.
-  s_part = _two_module_state(asm, C, robots, {"obj_5", "obj_7"})
+  # (b) PARTIAL top module (missing the last chain cube obj_7) -> the join is FORBIDDEN.
+  s_part = _two_module_state(asm, C, robots, {"obj_5", "obj_6"})
   partial = [a for a, _ns in A.assembles(s_part, asm, robots)
              if a[2] == "obj_4" and a[3] == "obj_0"]
   assert not partial, "a partial top plate must not be joinable (forcing broken)"

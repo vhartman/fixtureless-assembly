@@ -1366,7 +1366,7 @@ def places(state, assembly, robots):
       continue
     r = state.parent[root][1]
     ref = reference_part(group)                           # canonical on-table root
-    for face in range(len(_FACE_DOWN_QUATS)):             # one placement per resting face
+    for face in rest_faces(assembly, group):              # one placement per STABLE resting face
       ns = _copy_edit_support(state)
       for p in group:                                     # open r's grasp on this group
         ns.supports[p] = frozenset(
@@ -1738,6 +1738,60 @@ def _table_footprint(assembly, poses, group, tol=1e-3):
   return [x for cs in by_part.values() for x in cs if x[2] <= zmin + tol]
 
 
+def _rest_layout_poses(assembly, group, ref, face, anchor_q):
+  # world poses of every part when `group` rests on the table at placement `face` composed
+  # onto anchor_q, with the anchor at the origin. Mirrors the on-table branch of
+  # _state_part_poses (so rest_faces judges the SAME geometry the search/checker will build).
+  anchor_pose = np.concatenate([np.zeros(3), np.asarray(anchor_q, dtype=float)])
+  base_pose = _group_rest_pose(assembly, group, ref, anchor_pose, face)
+  base_in_asm = assembly.position_in_base(ref)
+  return {p: _pose_compose(base_pose,
+                           np.concatenate([assembly.position_in_base(p) - base_in_asm,
+                                           [1.0, 0.0, 0.0, 0.0]]))
+          for p in group}
+
+
+def _rest_stable(assembly, group, ref, face, anchor_q, tol=1e-4, span_tol=1e-3):
+  # Does `group` rest STABLY on the table at placement `face` (composed onto anchor_q)? The
+  # parts touching the table (lowest support points) must span a 2-D polygon, not degenerate
+  # to a line or a point -- only then can the contact resist tipping about a horizontal axis.
+  # This is exactly what excludes a lone CYLINDER resting on its curved side (a line contact)
+  # or a sphere (a point), while a box on any face (>=3 non-collinear corners) and a multi-
+  # wheel group (>=3 contact points, e.g. the car on its wheels) stay stable. Same geometric
+  # criterion trimesh.compute_stable_poses uses for meshes -- the off-axis generalisation is
+  # the deferred change 2 [[rest-pose-offaxis-change2]].
+  poses = _rest_layout_poses(assembly, group, ref, face, anchor_q)
+  low = np.asarray(_table_footprint(assembly, poses, group, tol=tol))
+  if len(low) < 3:
+    return False                                             # point / line contact
+  xy = low[:, :2] - low[:, :2].mean(axis=0)
+  return float(np.linalg.svd(xy, compute_uv=False)[1]) > span_tol
+
+
+def rest_faces(assembly, group):
+  # PRECOMPUTED per-subassembly rest-pose TABLE: the canonical placement faces (a subset of
+  # range(len(_FACE_DOWN_QUATS))) on which `group` rests STABLY, accounting for the reference
+  # part's scatter anchor (so a wheel scattered cap-down is judged in its cap-down frame).
+  # Replaces the old implicit "every one of the 6 faces is placeable" enumeration -- places(),
+  # precompute_stable_faces and both labeled heuristics look placements up here, so the search
+  # and the abstraction stay consistent (same faces => admissibility preserved). Cached on the
+  # assembly, keyed by subassembly, like the grasp table.
+  #   change-1 era: entries are still the 6 canonical face rotations, only stability-filtered;
+  #   turning them into arbitrary per-group quats is change 2 [[rest-pose-offaxis-change2]].
+  cache = getattr(assembly, "_rest_faces_cache", None)
+  if cache is None:
+    cache = assembly._rest_faces_cache = {}
+  key = _subasm_key(group)
+  hit = cache.get(key)
+  if hit is None:
+    grp = set(group)
+    ref = reference_part(grp)
+    anchor_q = assembly.scatter_orientations.get(ref, np.array([1.0, 0.0, 0.0, 0.0]))
+    hit = cache[key] = tuple(f for f in range(len(_FACE_DOWN_QUATS))
+                             if _rest_stable(assembly, grp, ref, f, anchor_q))
+  return hit
+
+
 def _grasp_frame(assembly, part, part_pose, grasp_id):
   # world frame of a grasp on a part: contact point (the grasped part's centre, matching the
   # original isotropic model) plus the APPROACH axis (grasp local z) and the two LATERAL axes
@@ -1862,7 +1916,7 @@ def precompute_stable_faces(assembly, gripper_kind):
         continue                                            # S must be an order ideal for p
       onto = rel[0]
       faces = set()
-      for f in range(len(_FACE_DOWN_QUATS)):
+      for f in rest_faces(assembly, S):                     # only STABLE rest faces of S
         if not _on_table_mateable_cached(assembly, p, f):
           continue                                          # mate site not reachable at f
         st = context_scatter_state(assembly, S, f, poses)

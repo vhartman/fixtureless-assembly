@@ -949,7 +949,7 @@ class AbstractionHeuristic:
     # most permissive over faces (exists-a-face): only then is every real action abstract-
     # feasible (relaxation -> admissibility preserved).
     on_table_ok = {p: any(_on_table_mateable_cached(assembly, p, f)
-                          for f in range(len(_FACE_DOWN_QUATS)))
+                          for f in rest_faces(assembly, _mate_closure(assembly, p) or {base}))
                    for p in objs if p != base}
 
     # WRENCH-AWARE gate: with the stability model on, an on-table mate also needs to be
@@ -1128,7 +1128,11 @@ class LabeledDisassemblyHeuristic:
             clearance=self._clearance)
       return hit
 
-    FACES = list(range(len(_FACE_DOWN_QUATS)))
+    # placement faces are now looked up PER SUBASSEMBLY in the stable rest-pose table
+    # (rest_faces) instead of the old global 0..5 -- so the abstraction offers exactly the
+    # resting orientations the real places()/precompute_stable_faces do (e.g. a lone cylinder
+    # only cap-down). Same faces on both sides => still a relaxation => still admissible.
+    rf = lambda g: rest_faces(self.assembly, set(g))
     Hf = self.H
 
     # ---- WRENCH facts (gripper_kind set): gate the abstract mates/releases with the SAME
@@ -1228,12 +1232,12 @@ class LabeledDisassemblyHeuristic:
       # does not track loose parts' resting faces (they can be reoriented via place+pick),
       # so the gate is EXISTS-a-face -- optimistic about the reorientation cost, admissible.
       for q, gq in L:
-        if any(pick_ok((q,), f, (q, gq)) for f in FACES):
+        if any(pick_ok((q,), f, (q, gq)) for f in rf((q,))):
           yield (ideal, G, face, tsub(L, (q, gq))), 1.0
       # inverse LIFT: held solo -> was resting on some face and got picked
       if face is Hf and len(G) == 1:
         pg = G[0]
-        for f in FACES:
+        for f in rf(ideal):
           if pick_ok(ideal, f, pg):
             yield (ideal, (), f, L), 1.0
       # inverse PLACE-ASSEMBLY: on table now -> was held by one more grasp in the air
@@ -1268,7 +1272,7 @@ class LabeledDisassemblyHeuristic:
     vg_full = self.valid[all_parts]
     for k in range(self.R + 1):
       for combo in combinations(vg_full, k):
-        for face in [Hf] + FACES:
+        for face in [Hf] + list(rf(all_parts)):
           if face is Hf and len(combo) < 1:
             continue
           st = (all_parts, combo, face, ())
@@ -1393,7 +1397,11 @@ class CollapsedLabeledHeuristic:
             clearance=self._clearance)
       return hit
 
-    FACES = list(range(len(_FACE_DOWN_QUATS)))
+    # placement faces are now looked up PER SUBASSEMBLY in the stable rest-pose table
+    # (rest_faces) instead of the old global 0..5 -- so the abstraction offers exactly the
+    # resting orientations the real places()/precompute_stable_faces do (e.g. a lone cylinder
+    # only cap-down). Same faces on both sides => still a relaxation => still admissible.
+    rf = lambda g: rest_faces(self.assembly, set(g))
     Hf = self.H
 
     # per-PART loose-pickability: exists-a-face AND exists-a-grasp (the collapse of the fine
@@ -1404,7 +1412,7 @@ class CollapsedLabeledHeuristic:
       hit = self._loose_pickable.get(q)
       if hit is None:
         hit = self._loose_pickable[q] = any(
-            pick_ok((q,), f, (q, g)) for g in self.single[q] for f in FACES)
+            pick_ok((q,), f, (q, g)) for g in self.single[q] for f in rf((q,)))
       return hit
 
     # ---- WRENCH facts: identical to the fine class (G stays labeled, so these are exact).
@@ -1496,7 +1504,7 @@ class CollapsedLabeledHeuristic:
       # inverse LIFT: held solo -> was resting on some face and got picked (G-labeled, exact)
       if face is Hf and len(G) == 1:
         pg = G[0]
-        for f in FACES:
+        for f in rf(ideal):
           if pick_ok(ideal, f, pg):
             yield (ideal, (), f, L), 1.0
       # inverse PLACE-ASSEMBLY: on table now -> was held by one more grasp in the air
@@ -1530,7 +1538,7 @@ class CollapsedLabeledHeuristic:
     vg_full = self.valid[all_parts]
     for k in range(self.R + 1):
       for combo in combinations(vg_full, k):
-        for face in [Hf] + FACES:
+        for face in [Hf] + list(rf(all_parts)):
           if face is Hf and len(combo) < 1:
             continue
           st = (all_parts, combo, face, ())
