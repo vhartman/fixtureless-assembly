@@ -255,8 +255,14 @@ class RobotIK:
       # break that symmetry -> full pose (6-DOF).
       self.symmetric[r] = "vacuum" in tool_center
       self.robot_base[r] = r + "_ur_base"              # UR base frame; parented to the table
-      self.robot_arm[r] = "ur5" if (r + "_ur_arm_ur5") in names else "ur10"
-      self.base_link[r] = r + "_ur_base_link"          # ssik solves in base_link's frame
+      # a FLOATING EE has no arm at all: no base_link frame, no kinematic chain -> analytic
+      # IK / reach bounds are meaningless for it (robot_arm=None disables every ssik path).
+      if (r + "_ur_base_link") in names:
+        self.robot_arm[r] = "ur5" if (r + "_ur_arm_ur5") in names else "ur10"
+        self.base_link[r] = r + "_ur_base_link"        # ssik solves in base_link's frame
+      else:
+        self.robot_arm[r] = None
+        self.base_link[r] = None
     # SINGLE-ACTIVE-ARM IK optimisations (pick/place move only one arm). Both default ON;
     # flip either OFF for debugging (they change the IK scene, not the plan semantics):
     #   single_arm_ik           : restrict the KOMO to the active arm's joints (others frozen)
@@ -275,6 +281,18 @@ class RobotIK:
     self.reach_precheck = True
     self.precheck_eq_min = 3.0                            # residual gate (see above)
     self.precheck_rejects = 0                             # rejects caught by the precheck
+    self._reach_bounds = {}                               # robot -> sound max-reach (lazy)
+    self.reach_rejects = 0                                # rejects by the reach-sphere bound
+    self.analytic_rejects = 0                             # rejects by empty ssik solution sets
+    self.seed_restart_cap = 2                             # random restarts left after seeds (see _solve_ik)
+    self.braced_analytic = True                           # per-arm analytic for BRACED place/assemble
+    # DEPTH-GATED collision reject on the exact analytic branches (None = off). The full
+    # solve's tolerant pose eq can rescue a GRAZING branch (measured: rescues sat at <=10mm
+    # penetration) but never a deep one (unrescued failures >=14mm, median 55mm) -- so if
+    # EVERY branch penetrates deeper than this gate, reject before any KOMO. 15mm keeps every
+    # measured rescue while killing the deep-collision failure path.
+    self.collision_reject_depth = 0.015
+    self.collision_rejects = 0                            # rejects by the depth gate
     self._ik_cache = {}                                   # (action, scene sig) -> (ok, witness)
     self.fail_recorder = None                             # viser recorder for failed binds
     self.fail_log_cap = 300
@@ -494,6 +512,12 @@ class RobotIK:
       if r["feasible"]:
         self._last_res = r
         return True, komo.getPath()[-1]
+    if seeds:
+      # the analytic seed set ENUMERATES every exact pose branch (up to 8), so random restarts
+      # can only re-derive branches already tried -- their residual value is exploring the eq
+      # TOLERANCE slack (a nearby collision-free near-pose). A few tries cover that; the full
+      # budget is for UNSEEDED solves where restarts must find the branches themselves.
+      restarts = min(restarts, self.seed_restart_cap)
     r = ry.NLP_Solver(komo.nlp(), verbose=0).solve().dict()
     if r["feasible"]:
       self._last_res = r
@@ -506,6 +530,148 @@ class RobotIK:
         return True, komo.getPath()[-1]
     self._last_res = r
     return False, None
+
+  def _attached_arm_targets(self, C, s0, assembly, group, anchor_part, anchor_target, mover):
+    # World tool poses of EVERY arm attached to `group` (the mover + any braces), at the group
+    # pose that puts `anchor_part` at `anchor_target` (a 7-pose). The group is RIGID and the
+    # target pose is FIXED, so each attached gripper's pose is fully determined:
+    #   mover : rides the kinematic attach -> anchor_target o (anchor -> gripper, from scene)
+    #   brace : pinned at its grasp by _add_grasp_maintenance -> anchor_target o
+    #           (anchor -> grasped part) o ee_target(brace, part, grasp)
+    # This is what makes a braced move DECOMPOSE per-arm for reachability: once the group pose
+    # is pinned, the relaxed (collision-free) problem is exactly "each arm reaches its fixed
+    # pose" -- there is no residual coupling between the arms.
+    apose = np.asarray(C.getFrame(anchor_part).getPose(), dtype=float)
+    ainv = _pose_invert(apose)
+    gpose = np.asarray(C.getFrame(self.gripper_frame[mover]).getPose(), dtype=float)
+    out = {mover: _pose_compose(anchor_target, _pose_compose(ainv, gpose))}
+    gparts = set(group)
+    for rr, (pt, gid) in self.holders(s0).items():
+      if rr == mover or pt not in gparts:
+        continue
+      ptpose = np.asarray(C.getFrame(pt).getPose(), dtype=float)
+      pt_land = _pose_compose(anchor_target, _pose_compose(ainv, ptpose))
+      out[rr] = _pose_compose(pt_land, np.asarray(self.ee_target(rr, pt, gid, assembly),
+                                                  dtype=float))
+    return out
+
+  def _compose_full_seeds(self, C, arm_seeds, cap=8):
+    # Full joint-vector warm starts for a MULTI-ARM KOMO from per-arm analytic solutions:
+    # each attached arm's 6 joints overwritten with one of its solutions (cartesian product,
+    # closest-to-current-config first, capped -- the product is the complete enumeration of
+    # the exact pose branches when it fits under the cap).
+    import itertools
+    q0 = np.asarray(C.getJointState(), dtype=float)
+    names = C.getJointNames()
+    idx = {r: [i for i, n in enumerate(names) if n.startswith(r + "_")] for r in arm_seeds}
+    if any(len(ix) != 6 for ix in idx.values()):
+      return []
+    robots = sorted(arm_seeds)
+    combos = []
+    for combo in itertools.product(*(arm_seeds[r] for r in robots)):
+      q = q0.copy()
+      d = 0.0
+      for r, qr in zip(robots, combo):
+        q[idx[r]] = qr
+        d += float(np.linalg.norm(q0[idx[r]] - qr))
+      combos.append((d, q))
+    combos.sort(key=lambda t: t[0])
+    return [q for _, q in combos[:cap]]
+
+  def _probe_branch_combos(self, C, arm_seeds, exclude=(), cap=8, probe_cap=256):
+    # DEPTH-GATED collision probe over the FULL cartesian product of the involved arms'
+    # exact analytic branches. Posing EVERY involved arm at one of its branches is a
+    # CONSISTENT candidate solution of the whole skill (each tool at its true pose, the
+    # moved group at its true target) -- so ALL collision pairs are evaluated at real
+    # geometry, INCLUDING ARM-ARM between the placer and its brace (the dominant failure
+    # mode seen in practice). Returns (reject, seeds):
+    #   reject : every combo penetrates beyond its gate -> the bind has no near-pose rescue
+    #            (only claimed when the FULL product was probed);
+    #   seeds  : the `cap` best combos as full warm starts, shallowest penetration first
+    #            (ties: closest to the current config) -- collision-INFORMED seeding.
+    # Gates: `collision_reject_depth` vs the static scene (measured rescue ceiling ~10mm);
+    # DOUBLED for involved-involved pairs (both arms can graze-shift under the tolerant eq,
+    # so their relative clearance can change by the sum). `exclude` = robots whose pairs are
+    # ignored: UNINVOLVED arms in a multi-arm KOMO are free DOFs that can dodge (in the
+    # restricted single-arm case they are frozen AND contact-stripped, so exclude=()).
+    # Self-collision pairs of an involved arm fall under the doubled involved-involved gate
+    # (conservative -- rejecting them needs 2x the depth; a graze-shift reshapes the wrist).
+    import itertools
+    gate = self.collision_reject_depth
+    q0 = np.asarray(C.getJointState(), dtype=float)
+    names = C.getJointNames()
+    idx = {r: [i for i, n in enumerate(names) if n.startswith(r + "_")] for r in arm_seeds}
+    if (not arm_seeds or any(len(ix) != 6 for ix in idx.values())
+        or any(not s for s in arm_seeds.values())):
+      return False, []
+    robots = sorted(arm_seeds)
+    n_combos = int(np.prod([len(arm_seeds[r]) for r in robots]))
+    if gate is None or n_combos > probe_cap:
+      return False, self._compose_full_seeds(C, arm_seeds, cap=cap)  # too many: no reject
+    xpre = tuple(o + "_" for o in exclude)
+    ipre = tuple(r + "_" for r in robots)
+    scored = []
+    try:
+      for combo in itertools.product(*(arm_seeds[r] for r in robots)):
+        qq = q0.copy()
+        d0 = 0.0
+        for r, qr in zip(robots, combo):
+          qq[idx[r]] = qr
+          d0 += float(np.linalg.norm(q0[idx[r]] - np.asarray(qr)))
+        C.setJointState(qq)
+        C.computeCollisions()
+        excess = 0.0                                      # penetration beyond the pair's gate
+        for fa, fb, d in C.getCollisions(0.0):
+          if d >= 0.0 or (xpre and (fa.startswith(xpre) or fb.startswith(xpre))):
+            continue
+          g = 2.0 * gate if (fa.startswith(ipre) and fb.startswith(ipre)) else gate
+          excess = max(excess, -d - g)
+        scored.append((excess, d0, qq))
+    finally:
+      C.setJointState(q0)
+    if all(s[0] > 0.0 for s in scored):
+      self.collision_rejects += 1
+      return True, []                                     # every exact combo deeply colliding
+    scored.sort(key=lambda t: (t[0], t[1]))
+    return False, [q for _, _, q in scored[:cap]]
+
+  def _reach_bound(self, robot):
+    # SOUND kinematic max-reach for ANY arm (no analytic IK required): the tool centre can
+    # never be farther from the arm base than the SUM of the fixed link translations along
+    # the base_link -> gripper chain (revolute joints only reorient those rigid offsets, so
+    # ||p_ee - p_base|| <= sum ||t_i||). An OVERESTIMATE of the true max reach (the offsets
+    # are not colinear at full stretch), so a target beyond it is unreachable FOR SURE.
+    # inf when the robot has no arm chain (floating EE) -> the filter never fires.
+    b = self._reach_bounds.get(robot)
+    if b is not None:
+      return b
+    b = np.inf
+    try:
+      f = self.C.getFrame(self.gripper_frame[robot])
+      base = self.base_link[robot]
+      total = 0.0
+      while f is not None and f.name != base:
+        total += float(np.linalg.norm(f.getRelativePosition()))
+        f = f.getParent()
+      if f is not None:                                   # reached base_link -> chain complete
+        b = total
+    except Exception:
+      pass
+    self._reach_bounds[robot] = b
+    return b
+
+  def _reach_reject(self, C, robot, p_world):
+    # instant (~us) gross-unreachability reject for a FIXED tool target position. Sound for
+    # every robot (pure kinematics, model-derived); catches only what NO configuration can
+    # reach -- the analytic reject (when calibrated) subsumes it with exact geometry.
+    b = self._reach_bound(robot)
+    if not np.isfinite(b):
+      return False
+    base = np.asarray(C.getFrame(self.base_link[robot]).getPosition(), dtype=float)
+    if np.linalg.norm(np.asarray(p_world, dtype=float) - base) <= b:
+      return False
+    self.reach_rejects += 1
+    return True
 
   def _analytic_reject_ok(self, robot):
     # may we use analytic IK for an EXACT reachability REJECT on a FIXED-target reach? Only when
@@ -540,6 +706,14 @@ class RobotIK:
     try:
       lo, hi = C.getJointLimits()
       lo, hi = np.asarray(lo, float), np.asarray(hi, float)
+      if len(lo) != 6:
+        # UNRESTRICTED scene (e.g. an assemble reject probe): select this robot's 6 arm limits
+        # by joint-name prefix -- without this the length mismatch silently skipped the filter.
+        idx = [i for i, n in enumerate(C.getJointNames()) if n.startswith(robot + "_")]
+        if len(idx) == 6:
+          lo, hi = lo[idx], hi[idx]
+        else:
+          lo = hi = None
     except Exception:
       lo = hi = None
     out = []
@@ -617,6 +791,12 @@ class RobotIK:
     robot_ee_name = self.gripper_frame[robot]
     part_name = part
 
+    # the part sits on the table (FIXED target) -> the sound reach-sphere bound applies for
+    # any arm, calibrated or not (the analytic reject below subsumes it when available).
+    part_pose = np.asarray(C.getFrame(part_name).getPose(), dtype=float)
+    if self._reach_reject(C, robot, _pose_compose(part_pose, ee_target)[:3]):
+      return False, None
+
     # the gripper is SUPPOSED to touch the part it grasps (two-finger palm/fingers close
     # around it), so exclude the target part from collision -- otherwise the collision
     # objective forbids the grasp itself.
@@ -660,7 +840,12 @@ class RobotIK:
     seeds = self._analytic_seeds(C, robot, ee_target, part_name)
     if self._analytic_reject_ok(robot):
       if not seeds:
+        self.analytic_rejects += 1
         return False, None                                # analytic: kinematically unreachable
+      reject, ranked = self._probe_branch_combos(C, {robot: seeds})
+      if reject:
+        return False, None                                # every exact branch deeply colliding
+      seeds = ranked or seeds                             # shallowest-collision branches first
     elif self.reach_precheck and self._reach_precheck_reject(action, C, build(False)):
       return False, None                                  # clear reach failure (relaxed solve)
 
@@ -764,25 +949,56 @@ class RobotIK:
         self._add_grasp_maintenance(komo, s0, assembly)   # braces ride along / stay pinned
       return komo
 
-    # analytic (ssik) IK: the place target is FULLY DETERMINED for the placer's tool too --
-    # the group lands at `target` and is RIGIDLY attached to the gripper, so the tool's world
-    # pose is target(ref) o (ref -> gripper), both known. Same contract as pick: an empty
-    # analytic solution set on a calibrated two-finger arm proves the pose kinematically
-    # unreachable -> reject with NO KOMO (replacing the relaxed reach precheck, the dominant
-    # cost of place binds); non-empty proves reachability -> skip the precheck and warm-start
-    # the collision solve. Braced (non-solo) places keep the old path: the KOMO then spans
-    # several arms, so a single-arm seed doesn't fit its joint vector.
-    seeds = []
-    if single:
-      gpose = np.asarray(C.getFrame(self.gripper_frame[robot]).getPose(), dtype=float)
-      rpose = np.asarray(C.getFrame(ref).getPose(), dtype=float)
-      ee_world = _pose_compose(target, _pose_compose(_pose_invert(rpose), gpose))
-      seeds = self._analytic_seeds(C, robot, ee_world, None)
-    if single and self._analytic_reject_ok(robot):
-      if not seeds:
-        return False, None                                # analytic: kinematically unreachable
-    elif self.reach_precheck and self._reach_precheck_reject(action, C, build(False)):
-      return False, None                                  # clear reach failure (relaxed solve)
+    # analytic (ssik) IK: the landing pose is FIXED and the group RIGID, so EVERY attached
+    # arm's tool pose is fully determined -- the placer's via the kinematic attach, each
+    # BRACE's via its pinned grasp (see _attached_arm_targets). The braced place therefore
+    # DECOMPOSES per-arm for reachability:
+    #   reject   : any calibrated arm with an EMPTY analytic set cannot reach its pose ->
+    #              the bind is infeasible, no KOMO at all (each arm must reach its pose);
+    #   precheck : when EVERY attached arm is calibrated (and nonempty), the relaxed problem
+    #              -- exactly "each arm reaches its fixed pose" -- is PROVEN feasible, so the
+    #              precheck (up to 13 relaxed multi-arm solves) is skipped;
+    #   seeds    : solo -> the placer's 6-dim solutions; braced -> full joint vectors composed
+    #              from the per-arm solutions (closest-to-current first).
+    # Any UNCALIBRATED attached arm (vacuum / no ssik) falls back to the relaxed precheck.
+    arm_targets = self._attached_arm_targets(C, s0, assembly, group, ref, target, robot)
+    for rr, ee in arm_targets.items():
+      if self._reach_reject(C, rr, ee[:3]):                # sound for any arm, ~us
+        return False, None
+    if not self.braced_analytic and not single:
+      arm_targets = {}                                     # ablation: braced -> old precheck path
+    arm_seeds = {}
+    all_calibrated = bool(arm_targets)
+    for rr, ee in arm_targets.items():
+      if self._analytic_reject_ok(rr):
+        sl = self._analytic_seeds(C, rr, ee, None)
+        if not sl:
+          self.analytic_rejects += 1
+          return False, None                              # analytic: kinematically unreachable
+        arm_seeds[rr] = sl
+      else:
+        all_calibrated = False
+    if all_calibrated:
+      # probe the FULL branch product: single -> the placer's branches (other arms frozen AND
+      # contact-stripped in the restricted scene, so nothing to exclude); braced -> all combos
+      # incl. ARM-ARM pairs between placer and brace (each combo is a consistent candidate:
+      # every tool at its true pose, the group at its landing pose). Uninvolved arms are free
+      # DOFs of the multi-arm KOMO (they can dodge) -> their pairs are excluded.
+      exclude = [] if single else [rr for rr in self.robots if rr not in arm_seeds]
+      reject, seeds = self._probe_branch_combos(C, arm_seeds, exclude=exclude)
+      if reject:
+        return False, None                                # every exact combo deeply colliding
+    else:
+      if arm_seeds.get(robot):                            # mover-only probe (others will move)
+        reject, ranked = self._probe_branch_combos(
+            C, {robot: arm_seeds[robot]},
+            exclude=[] if single else [rr for rr in self.robots if rr != robot])
+        if reject:
+          return False, None
+        arm_seeds[robot] = ranked or arm_seeds[robot]
+      seeds = arm_seeds.get(robot, []) if single else []
+      if self.reach_precheck and self._reach_precheck_reject(action, C, build(False)):
+        return False, None                                # clear reach failure (relaxed solve)
 
     komo = build(True)
     feasible, witness = self._solve_ik(komo, seeds=seeds)
@@ -860,7 +1076,53 @@ class RobotIK:
     for mp in moving:
       set_part_contact(C, mp, 0)
 
-    if self.reach_precheck:
+    # FIXED-target fast rejects: when the TARGET group rests on the table (no robot holds any
+    # of its parts) the mate pose is fixed in the world, and the moving group rides RIGIDLY on
+    # its gripper(s) -> EVERY attached arm's tool pose (mover AND braces) is fully determined
+    # (the same contract as place; a HELD target's pose is free -- the KOMO chooses it -- so
+    # no fixed pose exists and these filters must not fire). Per arm: reach bound (any robot),
+    # analytic reject (calibrated two-finger: empty set = unreachable = reject, no KOMO). When
+    # ALL attached arms are calibrated+nonempty, the relaxed precheck -- exactly "each arm
+    # reaches its fixed pose", no residual coupling -- is proven feasible and skipped.
+    reachable_proven = False
+    tgroup = next((g for g in s0.subassemblies() if onto in g), (onto,))
+    if not any(pt in tgroup for pt, _g in self.holders(s0).values()):
+      opose = np.asarray(C.getFrame(onto).getPose(), dtype=float)
+      part_target = _pose_compose(opose, np.concatenate([rel_pos, rel_quat]))
+      # like place: the mate pose is fixed and the moving group rigid, so EVERY attached
+      # arm's tool pose (mover AND braces) is fully determined -> per-arm reject; and when
+      # ALL attached arms are calibrated+nonempty the relaxed precheck is proven feasible.
+      arm_targets = self._attached_arm_targets(C, s0, assembly, moving, part_name,
+                                               part_target, robot)
+      for rr, ee in arm_targets.items():
+        if self._reach_reject(C, rr, ee[:3]):
+          return False, None
+      braced = len(arm_targets) > 1
+      if not self.braced_analytic and braced:
+        arm_targets = {robot: arm_targets[robot]}          # ablation: mover-only reject, no proof
+      reachable_proven = self.braced_analytic or not braced
+      arm_seeds = {}
+      for rr, ee in arm_targets.items():
+        if not self._analytic_reject_ok(rr):
+          reachable_proven = False                        # uncalibrated arm: precheck decides
+          continue
+        sl = self._analytic_seeds(C, rr, ee, None)
+        if not sl:
+          self.analytic_rejects += 1
+          return False, None                              # analytic: kinematically unreachable
+        arm_seeds[rr] = sl
+      # collision probe on the exact branches (assemble KOMO is multi-arm: uninvolved arms can
+      # dodge -> excluded). All attached arms calibrated -> full combo product incl. ARM-ARM;
+      # otherwise mover-only (the uncalibrated arms will co-move, their pairs excluded).
+      probe = arm_seeds if len(arm_seeds) == len(arm_targets) else (
+          {robot: arm_seeds[robot]} if robot in arm_seeds else {})
+      if probe:
+        reject, _ = self._probe_branch_combos(
+            C, probe, exclude=[rr for rr in self.robots if rr not in probe])
+        if reject:
+          return False, None                              # every exact combo deeply colliding
+
+    if self.reach_precheck and not reachable_proven:
       # relaxed (collision-free) reach: can the mate pose be reached AT ALL? A clear relaxed
       # failure rejects instantly -- skipping the whole bias sweep + restart fallback (the
       # most expensive failure path there is). Residual-gated like the other skills.
@@ -1469,7 +1731,8 @@ class CollapsedLabeledHeuristic:
   H = "H"                                                  # face value for held-in-air
 
   def __init__(self, assembly, n_robots, grasp_table, gripper_path=None, verbose=False,
-               max_states=2_000_000, clearance=0.02, gripper_kind=None, bracing=False):
+               max_states=2_000_000, clearance=0.02, gripper_kind=None, bracing=False,
+               collapse_grasps=False):
     import heapq
     import time as _time
 
@@ -1480,6 +1743,7 @@ class CollapsedLabeledHeuristic:
     self._bracing = bracing                                # model the add_grasp (co-grasp) edge
     self._clearance = clearance
     self._gk = gripper_kind
+    self._collapse = bool(collapse_grasps)                 # see GraspCollapsedHeuristic
     objs = list(assembly.objects)
     base = assembly.base
     all_parts = _subasm_key(objs)
@@ -1493,9 +1757,47 @@ class CollapsedLabeledHeuristic:
       return t[:i] + t[i + 1:]
 
     ideal_keys = [_subasm_key(s) for s in get_subassemblies(assembly) if base in s]
-    self.valid = {S: tuple(sorted((p, g) for p, g, _ in grasp_table[S]))
-                  for S in ideal_keys}
-    self.single = {q: tuple(sorted(g for _p, g, _ in grasp_table[(q,)])) for q in objs}
+    # OPTIONAL DENSE-GRASP LABEL COLLAPSE (collapse_grasps=True, the GraspCollapsedHeuristic):
+    # with the wrist-tilt variants on, grasp ids come in three blocks [base|+45|-45]; raw ids
+    # as ROBOT LABELS explode the coreachable product space ~3^R (measured 24x on cross-4/3R).
+    # The collapse labels by the BASE id and a fact is true if ANY variant assignment makes it
+    # true (an OR = a further RELAXATION -> admissibility preserved); the real search keeps
+    # the full variant set. Off (the default) => gcol is the identity and everything below
+    # reduces exactly to the raw-label behaviour (singleton variant groups).
+    nb = len(_problem._CUBE_FACE_NORMALS) * _problem._ROLLS_PER_FACE
+    gcol = (lambda g: g % nb) if (self._collapse and _problem._DENSE_GRASPS) \
+        else (lambda g: g)
+    self._gcollapse = gcol
+    self._vgroups = {}                                     # S_key -> {(p,gb): (raw g, ...)}
+    self.valid = {}
+    for S in ideal_keys:
+      groups = {}
+      for p, g, _ in grasp_table[S]:
+        groups.setdefault((p, gcol(g)), []).append(g)
+      self._vgroups[S] = {k: tuple(sorted(v)) for k, v in groups.items()}
+      self.valid[S] = tuple(sorted(groups))
+    self._svgroups = {}                                    # q -> {gb: (raw g, ...)}
+    self.single = {}
+    for q in objs:
+      groups = {}
+      for _p, g, _ in grasp_table[(q,)]:
+        groups.setdefault(gcol(g), []).append(g)
+      self._svgroups[q] = {k: tuple(sorted(v)) for k, v in groups.items()}
+      self.single[q] = tuple(sorted(groups))
+
+    def gvariants(S_key, pg):                              # raw variants of a collapsed label
+      m = self._vgroups.get(S_key)
+      if m is not None and pg in m:
+        return m[pg]
+      return self._svgroups.get(pg[0], {}).get(pg[1], (pg[1],))
+
+    import itertools as _it
+
+    def gcombos(S_key, G):                                 # every raw-variant assignment of G
+      if not G:
+        return [()]
+      return _it.product(*[[(p, g) for g in gvariants(S_key, (p, gb))]
+                           for p, gb in G])
 
     self._ee_path = gripper_path
     self._pick_cache = {}
@@ -1504,9 +1806,10 @@ class CollapsedLabeledHeuristic:
       key = (S_key, face, pg)
       hit = self._pick_cache.get(key)
       if hit is None:
-        hit = self._pick_cache[key] = _table_aware_pick_fact(
-            assembly, S_key, face, pg[0], pg[1], self._ee_path,
-            clearance=self._clearance)
+        hit = self._pick_cache[key] = any(
+            _table_aware_pick_fact(assembly, S_key, face, pg[0], g, self._ee_path,
+                                   clearance=self._clearance)
+            for g in gvariants(S_key, pg))
       return hit
 
     # placement faces are now looked up PER SUBASSEMBLY in the stable rest-pose table
@@ -1561,13 +1864,15 @@ class CollapsedLabeledHeuristic:
       return st
 
     def w_hold_ok(ideal_key, G, face):
+      # collapsed labels: stable if ANY raw-variant assignment of G is (OR = relaxation).
       if self._gk is None:
         return True
       key = ("H", ideal_key, G, face)
       hit = self._wfacts.get(key)
       if hit is None:
-        st = crafted(ideal_key, G, face)
-        hit = self._wfacts[key] = _group_stable(st, assembly, set(ideal_key), self._gk)
+        hit = self._wfacts[key] = any(
+            _group_stable(crafted(ideal_key, Gv, face), assembly, set(ideal_key), self._gk)
+            for Gv in gcombos(ideal_key, G))
       return hit
 
     def w_assemble_ok(ideal_s_key, G2, face, q, gq):
@@ -1579,13 +1884,18 @@ class CollapsedLabeledHeuristic:
         onto = assembly.relative_pose(q)[0]
         ok = w_hold_ok(ideal_s_key, G2, face)
         if ok and wrench.PARAMS.get("check_inserter", True):
-          st_q = held_single(q, gq)
-          ok = _group_stable_loaded(st_q, assembly, frozenset({q}), self._gk,
-                                    _inserter_load_variants(st_q, assembly, q, onto))
+          def ins_ok(graw):
+            st_q = held_single(q, graw)
+            return _group_stable_loaded(st_q, assembly, frozenset({q}), self._gk,
+                                        _inserter_load_variants(st_q, assembly, q, onto))
+          ok = any(ins_ok(graw)
+                   for graw in self._svgroups.get(q, {}).get(gq, (gq,)))
         if ok:
-          st_t = crafted(ideal_s_key, G2, face)
-          ok = _group_stable_loaded(st_t, assembly, set(ideal_s_key), self._gk,
-                                    _insertion_load_variants(st_t, assembly, q, onto))
+          def tgt_ok(G2v):
+            st_t = crafted(ideal_s_key, G2v, face)
+            return _group_stable_loaded(st_t, assembly, set(ideal_s_key), self._gk,
+                                        _insertion_load_variants(st_t, assembly, q, onto))
+          ok = any(tgt_ok(G2v) for G2v in gcombos(ideal_s_key, G2))
         hit = self._wfacts[key] = ok
       return hit
 
@@ -1689,8 +1999,14 @@ class CollapsedLabeledHeuristic:
   def abstract(self, state):
     main = next(g for g in state.subassemblies() if self.assembly.base in g)
     ideal = _subasm_key(main)
-    G = tuple(sorted((c[2], c[3]) for p in main
-                     for c in state.supports.get(p, ()) if c[0] == "grasp"))
+    if self._collapse:
+      # grasp ids collapsed to their BASE variant; set-dedup so two variants of the same
+      # base label map onto ONE abstract slot (fewer committed arms = more permissive).
+      G = tuple(sorted({(c[2], self._gcollapse(c[3])) for p in main
+                        for c in state.supports.get(p, ()) if c[0] == "grasp"}))
+    else:
+      G = tuple(sorted((c[2], c[3]) for p in main
+                       for c in state.supports.get(p, ()) if c[0] == "grasp"))
     on_table = any(("table",) in state.supports.get(p, ()) for p in main)
     face = _placement_face(state, main) if on_table else self.H
     L = tuple(sorted({c[2] for p in state.parent if p not in main
@@ -1704,6 +2020,18 @@ class CollapsedLabeledHeuristic:
       self.misses += 1
       return float("inf")
     return v
+
+
+class GraspCollapsedHeuristic(CollapsedLabeledHeuristic):
+  """CollapsedLabeledHeuristic PLUS the dense-grasp LABEL collapse: robot labels use the BASE
+  grasp id (wrist-tilt variants folded), facts are OR'd over the variant assignments (a
+  further relaxation -> still admissible). The cure for --dense-grasps' ~3^R coreachable-
+  state explosion (cross-4/3R floating: 408,771 states/52s raw -> 21,265/6s collapsed).
+  A separate class so the well-tested CollapsedLabeledHeuristic stays byte-identical."""
+
+  def __init__(self, *args, **kwargs):
+    kwargs["collapse_grasps"] = True
+    super().__init__(*args, **kwargs)
 
 
 _TABLE_PICK_FACT_CACHE = {}
@@ -1775,7 +2103,7 @@ def _table_aware_pick_fact(assembly, S_key, face, gpart, gid, gripper_path,
 
 def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
            edge_check_fn=None, weight=1.0, max_nodes=200000, verbose=True,
-           tag="A*", t0=None, cost_bound=None, deadline=None):
+           tag="A*", t0=None, cost_bound=None, deadline=None, order_key_fn=None):
   """Generic LAZY weighted-A* engine, shared by every search variant (exact + optimistic).
 
   The domain enters only through callbacks -- this function knows nothing about assemblies:
@@ -1808,15 +2136,25 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
   if goal_fn(start):
     return []
   tie = itertools.count()                                 # stable tie-break (shallower g first)
+  # optional ACTION-PREFERENCE tie-break, ranked between h and g: among equal-(f,h) nodes,
+  # expand the one whose generating action has the smaller key first. Pure ORDERING of the
+  # plateau -- claimed/pruning semantics untouched, so the w-bound and completeness hold.
+  if order_key_fn is None:
+    okey = lambda a: 0
+  else:
+    okey = lambda a: 0 if a is None else order_key_fn(a)
   claimed = {}
   came_from = {start: (None, None)}
   h0 = h_fn(start)
-  pq = [(f_value(0.0, h0), h0, 0.0, next(tie), start, None, None)]
+  # tie order within equal f: smaller h first (= effectively deeper, since g = f - w*h is
+  # determined by (f,h) at finite weight -- a separate g tie-break was measured a NO-OP),
+  # then the optional action preference, then insertion order.
+  pq = [(f_value(0.0, h0), h0, 0, 0.0, next(tie), start, None, None)]
   optimal = weight == 1.0
   expanded = 0
   edge_checks = 0
   while pq:
-    _f, _h, g, _, s, prev, action = heapq.heappop(pq)
+    _f, _h, _ok, g, _, s, prev, action = heapq.heappop(pq)
     if s in claimed:
       continue                                            # already claimed via a cheaper/earlier edge
     if cost_bound is not None and g + _h >= cost_bound:
@@ -1861,7 +2199,7 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
         continue                                          # provable dead end (admissible h)
       if cost_bound is not None and ng + hns >= cost_bound:
         continue                                          # sound prune vs the incumbent
-      heapq.heappush(pq, (f_value(ng, hns), hns, ng, next(tie), ns, s, act))
+      heapq.heappush(pq, (f_value(ng, hns), hns, okey(act), ng, next(tie), ns, s, act))
 
   if verbose:
     print(f"[{tag}] exhausted {len(claimed)} states with no plan "
@@ -1904,7 +2242,7 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
                            wrench=False, wrench_aware_h=True, handovers=True,
                            allow_place=True, cost_bound=None, deadline=None,
                            anonymous=False, labeled_h=False, collapsed_h=False,
-                           bracing=False):
+                           grasp_collapsed_h=False, bracing=False, part_order_bias=False):
   """EXACT (weighted) A* over scene-graph states from the initial scene to a completed
   assembly -- the reference baseline. Priority is f = g + weight * h.
     - weight = 1.0 : ordinary A*, returns a minimum-cost plan.
@@ -1954,13 +2292,17 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
   # LabeledDisassemblyHeuristic) -- strictly tighter where labels matter, at a build cost
   # of seconds. collapsed_h=True uses the IDENTITY-COLLAPSED variant instead (same
   # guarantees, weaker guidance, per-robot-scalable build; see CollapsedLabeledHeuristic).
-  # Same finite-weight gating as h_abs.
+  # Same finite-weight gating as h_abs -- RE-MEASURED 2026-07-16 (don't retry): lifting the
+  # gate and running greedy(weight=inf)+grasp_collapsed_h on dense cross-4/5 walked
+  # h-non-increasing wander to 1098/2238-action "plans", slower than w=5. Without g in f,
+  # greedy strolls the astronomical h-NEUTRAL state shell (robots x grasps); the g term is
+  # what forbids that, not a tie-break.
   h_lab = None
-  if (labeled_h or collapsed_h) and use_heuristic:
+  if (labeled_h or collapsed_h or grasp_collapsed_h) and use_heuristic:
     if math.isinf(weight):
-      warnings.warn("labeled_h requested but weight=inf (greedy): abstraction heuristics "
-                    "are gated to finite weights -- running WITHOUT it. Use e.g. weight=5.",
-                    stacklevel=2)
+      warnings.warn("labeled/collapsed heuristics are gated to finite weights (measured: "
+                    "greedy+labeled wanders h-neutral shells into 1000+-action plans). "
+                    "Running WITHOUT the abstraction. Use e.g. weight=5.", stacklevel=2)
     else:
       if gk is not None:
         reset_wrench_cache()                              # facts below use the wrench LP
@@ -1969,7 +2311,14 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
       # pick facts use the PLAIN floating EE even when the checker runs the wrist variant:
       # fact scenes hold ONE part at a free table spot (no clutter), so the wrist capsule
       # adds nothing there except unsound wrist-vs-table rejections (see _wrist_table_pair).
-      cls = CollapsedLabeledHeuristic if collapsed_h else LabeledDisassemblyHeuristic
+      cls = (GraspCollapsedHeuristic if grasp_collapsed_h
+             else CollapsedLabeledHeuristic if collapsed_h
+             else LabeledDisassemblyHeuristic)
+      if _problem._DENSE_GRASPS and not grasp_collapsed_h:
+        warnings.warn("labeled_h/collapsed_h with dense grasps label RAW grasp ids, so the "
+                      "tilt variants ~3x the label space per robot (build explodes ~3^R, "
+                      "measured 24x). Use grasp_collapsed_h (--grasp-collapsed-h): it folds "
+                      "variants onto their base grasp.")
       h_lab = cls(assembly, len(robots), grasp_table,
                   gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
                   verbose=verbose,
@@ -2023,12 +2372,18 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
          else "A*" if weight == 1.0 else f"wA*(w={weight:g})")
   set_anonymous_robots(anonymous)
   try:
+    # optional plateau tie-break: among equal-(f,h) frontier nodes, TOUCH EARLIER PARTS FIRST
+    # (lower part index = earlier in the mate order). Pure ordering, so the w-bound holds;
+    # the point is coherence on the huge equal-h plateaus (which loose part / grasp / robot
+    # to touch next is invisible to the abstraction, so without a preference the search
+    # floods the plateau breadth-first in insertion order).
+    okey = (lambda a: _part_index(a[2])) if part_order_bias else None
     return _astar(start,
                   goal_fn=lambda s: s.is_goal(assembly),
                   succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn, cheap_fn=None,
                   edge_check_fn=edge_check_fn,
                   weight=weight, max_nodes=max_nodes, verbose=verbose, tag=tag, t0=t0,
-                  cost_bound=cost_bound, deadline=deadline)
+                  cost_bound=cost_bound, deadline=deadline, order_key_fn=okey)
   finally:
     set_anonymous_robots(False)
 
@@ -2110,7 +2465,7 @@ def _part_mated(state, p):
 
 def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot_ik,
                   weight, max_nodes, verbose, gripper_kind=None, handovers=True,
-                  allow_place=True):
+                  allow_place=True, bracing=False, grasp_cap=None, h_extra=None):
   # a small COMPLETE search that adds part `p` to the assembly `ideal` and leaves it SETTLED:
   # p mated, no loose part left in a gripper, and the assembly ending held by at most one
   # carrier OR resting on the table -- WHICHEVER the search finds. It forces neither a
@@ -2127,14 +2482,25 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
 
   def h_fn(s):
     left = 0 if _part_mated(s, p) else 2                  # pick + mate remaining
-    return left + _num_loose_held(s, assembly) + max(0, _assembly_holders(s, assembly) - 1)
+    hv = left + _num_loose_held(s, assembly) + max(0, _assembly_holders(s, assembly) - 1)
+    if h_extra is not None:
+      # GUIDANCE from the labeled abstraction (full-assembly cost-to-go): prices the car's
+      # resting FACE and hold/brace grasps -- the decisions the counting h is blind to (it
+      # even penalizes the pick) -- and h=inf prunes states the FULL assembly cannot be
+      # finished from (sound for a milestone path even when the mini-goal is reachable).
+      hv = max(hv, h_extra(s))
+    return hv
 
   def succ_fn(s):
     for a, ns in successors(s, assembly, robots, grasp_table=grasp_table,
                             gripper_kind=gripper_kind, handovers=handovers,
-                            allow_place=allow_place):
-      if a[2] in relevant:                                # a[2] is the part every action acts on
-        yield a, ns
+                            allow_place=allow_place, bracing=bracing):
+      if a[2] not in relevant:                            # a[2] is the part every action acts on
+        continue
+      if (grasp_cap is not None and a[0] in ("pick", "add_grasp", "handover")
+          and a[3] >= grasp_cap):
+        continue                                          # grasp-WIDENING: only ids < cap this pass
+      yield a, ns
 
   def edge_check_fn(prev, act, ns):
     # fully lazy (cheap geometry + IK at POP; see solve_assembly_problem)
@@ -2153,8 +2519,9 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
     return None, None
   s = start
   for a in subplan:
-    s = next(ns for act, ns in successors(s, assembly, robots, gripper_kind=gripper_kind,
-                                          handovers=handovers, allow_place=allow_place)
+    s = next(ns for act, ns in successors(s, assembly, robots, grasp_table=grasp_table,
+                                          gripper_kind=gripper_kind, handovers=handovers,
+                                          allow_place=allow_place, bracing=bracing)
              if act == a)
   return subplan, s
 
@@ -2162,7 +2529,7 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
 def solve_assembly_problem_optimistic(C, assembly, robots=None, verbose=True,
                                       robot_ik=None, fallback=True, weight=float("inf"),
                                       max_nodes=20000, wrench=False, handovers=True,
-                                      allow_place=True, **exact_kw):
+                                      allow_place=True, bracing=False, **exact_kw):
   """OPTIMISTIC (Dogar-style) planner (see the section header): add the parts one at a time,
   each via its own small complete search that reorients/holds/picks/mates/sets-down, chained
   through the on-table assembly. This drops the exact search's cross-product blowup while
@@ -2188,6 +2555,12 @@ def solve_assembly_problem_optimistic(C, assembly, robots=None, verbose=True,
     sub, s2 = _add_one_part(s, p, ideal, assembly, robots, checker, grasp_table, robot_ik,
                             weight, max_nodes, verbose, gripper_kind=gk, handovers=handovers,
                             allow_place=allow_place)
+    if sub is None and bracing:
+      # braced retry (e.g. a car wheel under insertion noise: the mate needs a second grasp);
+      # unbraced-first keeps the cheap path cheap (add_grasp edges inflate the mini plateau).
+      sub, s2 = _add_one_part(s, p, ideal, assembly, robots, checker, grasp_table, robot_ik,
+                              weight, max_nodes, verbose, gripper_kind=gk, handovers=handovers,
+                              allow_place=allow_place, bracing=True)
     if sub is None:
       if verbose:
         print(f"[optimistic] could not add {p} in isolation -> falling back to exact")
@@ -2196,7 +2569,7 @@ def solve_assembly_problem_optimistic(C, assembly, robots=None, verbose=True,
       return solve_assembly_problem(C, assembly, robots=robots, verbose=verbose,
                                     robot_ik=robot_ik, weight=weight, max_nodes=max_nodes,
                                     wrench=wrench, handovers=handovers,
-                                    allow_place=allow_place, **exact_kw)
+                                    allow_place=allow_place, bracing=bracing, **exact_kw)
     plan += sub
     s = s2
     ideal.add(p)
@@ -2392,6 +2765,144 @@ def _add_one_part_declutter(start, p, ideal, assembly, robots, checker, grasp_ta
     movable |= new
     if verbose:
       print(f"    [declutter] {p}: blocked by {sorted(new)} -> relocating and re-planning")
+
+
+def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, robot_ik=None,
+                                      weight=5.0, max_nodes=20000, wrench=False,
+                                      handovers=True, allow_place=True, bracing=False,
+                                      max_repairs=100):
+  """MILESTONE (Dogar-style, abstraction-guided) planner. Two levels:
+
+    LEVEL 1: the assembly SEQUENCE. The labeled abstraction's backward Dijkstra (the same
+      dist table the exact search uses as its heuristic -- itself an assembly-by-disassembly
+      solve of the relaxed model, wrench facts included) is used as an ORACLE: among the
+      precedence-addable next parts, try them in order of the abstract cost-to-go AFTER
+      adding them (min over stable rest faces). Grasps/reach are ASSUMED feasible here.
+    LEVEL 2: the manipulation glue. Each chosen milestone is filled in by _add_one_part's
+      small complete search (pick/handover/brace/mate/set-down), from the previous
+      milestone's settled state.
+    REPAIR: if a milestone's fill-in fails, that (assembled-set, part) transition is
+      BLACKLISTED and the next-best candidate is tried -- repair happens at milestone
+      granularity (dozens of nodes) instead of the exact search's per-edge flooding.
+
+  Separate from the exact search by design (shares only _add_one_part + the heuristic
+  class). Complete up to milestone commitment (like the optimistic solver, an interleaving
+  that must overlap two parts' glue is out of scope); vs the optimistic solver it SEARCHES
+  the part order (wrench-informed) instead of committing to assembly_order, and supports
+  bracing in the fill-in. Returns the action list, or None (no silent exact fallback)."""
+  import time
+
+  t0 = time.perf_counter()
+  if robots is None:
+    robots = get_robots(C)
+  checker, grasp_table = _search_context(C, assembly, robots)
+  gk = gripper_kind(C) if wrench else None
+  if gk is not None:
+    reset_wrench_cache()
+  # the milestone oracle: GraspCollapsedHeuristic == CollapsedLabeledHeuristic when dense
+  # grasps are off, and the label-collapsed variant when they are on -- always the right one.
+  h_lab = GraspCollapsedHeuristic(assembly, len(robots), grasp_table,
+                                  gripper_path=getattr(checker, "fact_gripper_path",
+                                                       checker.gripper_path),
+                                  verbose=verbose, gripper_kind=gk, bracing=bracing)
+  Hf = h_lab.H
+
+  def oracle(ideal_set, q):
+    # abstract cost-to-go once `q` is mated and the grown assembly rests SETTLED on some
+    # stable face, nothing held (the state _add_one_part chains through). inf => the
+    # abstraction cannot finish from there (or never reached it backward) -> try last.
+    key = _subasm_key(ideal_set | {q})
+    faces = rest_faces(assembly, ideal_set | {q})
+    best = float("inf")
+    for f in faces:
+      d = h_lab.dist.get((key, (), f, ()))
+      if d is not None and d < best:
+        best = d
+    return best
+
+  # PHASED fill-in (iterative WIDENING, cheapest action set first): braces are rarely needed
+  # and their add_grasp edges inflate the mini plateau (measured: cross obj_5 35s unbraced vs
+  # budget-exhausted braced); with --dense-grasps the wrist-tilt variants triple the pick
+  # candidates and are likewise rarely needed. Each phase is a COMPLETE mini-search over its
+  # restricted action set (a failed narrow phase exhausts a SMALL space, so widening-on-
+  # failure has bounded overhead -- the reason this is safe here and NOT in the exact search,
+  # where exhausting a narrow full search is expensive and non-localized).
+  nb = len(_problem._CUBE_FACE_NORMALS) * _problem._ROLLS_PER_FACE
+  phases = []
+  for br in ([False, True] if bracing else [False]):
+    if _problem._DENSE_GRASPS:
+      phases.append((nb, br))                             # base grasps only
+    phases.append((None, br))                             # full grasp set
+
+  def fill(s, q, ideal):
+    for cap, br in phases:
+      sub, s2 = _add_one_part(s, q, ideal, assembly, robots, checker, grasp_table, robot_ik,
+                              weight, max_nodes, verbose, gripper_kind=gk,
+                              handovers=handovers, allow_place=allow_place, bracing=br,
+                              grasp_cap=cap, h_extra=h_lab.value)
+      if sub is not None:
+        return sub, s2
+    return None, None
+
+  objs = frozenset(assembly.objects)
+  plan = []
+  # chronological BACKJUMPING over milestones: each stack entry is a settled checkpoint
+  # (state, assembled set, plan length so far, and the (parent_key, part) decision that led
+  # here). A node with no workable candidate pops -- blacklisting the decision that led to it
+  # -- and the search reroutes from the parent.
+  stack = [(get_initial_state(C, assembly), frozenset({assembly.base}), 0, None)]
+  blacklist = set()                                       # (ideal_key, part) fill-ins that failed
+  repairs = 0
+  while stack:
+    s, ideal, plen, _via = stack[-1]
+    if ideal == objs:
+      if verbose:
+        print(f"[milestones] complete: {plen} actions in {time.perf_counter() - t0:.2f}s "
+              f"({repairs} repairs)")
+      return plan[:plen]
+    ideal_key = _subasm_key(ideal)
+    cands = [q for q in objs - ideal
+             if (_mate_closure(assembly, q) - {q}) <= ideal
+             and (ideal_key, q) not in blacklist]
+    cands.sort(key=lambda q: (oracle(set(ideal), q), _part_index(q)))
+    progressed = False
+    for q in cands:
+      tq = time.perf_counter()
+      sub, s2 = fill(s, q, ideal)
+      if sub is not None:
+        del plan[plen:]
+        plan.extend(sub)
+        stack.append((s2, ideal | {q}, len(plan), (ideal_key, q)))
+        progressed = True
+        if verbose:
+          print(f"[milestones] added {q} in {len(sub)} actions "
+                f"({time.perf_counter() - tq:.1f}s, {len(plan)} total)")
+        break
+      blacklist.add((ideal_key, q))
+      repairs += 1
+      if verbose:
+        print(f"[milestones] fill-in for {q} failed ({time.perf_counter() - tq:.1f}s) "
+              f"-> blacklisted ({repairs} repairs)")
+      if repairs > max_repairs:
+        if verbose:
+          print("[milestones] repair budget exhausted")
+        return None
+    if not progressed:
+      _s, _i, _p, via = stack.pop()                       # dead end: backjump + blame the
+      if via is not None:                                 # decision that created this node
+        blacklist.add(via)
+        repairs += 1
+        if verbose:
+          print(f"[milestones] dead end at {sorted(_i)} -> backjump, blacklist {via} "
+                f"({repairs} repairs)")
+        if repairs > max_repairs:
+          if verbose:
+            print("[milestones] repair budget exhausted")
+          return None
+  if verbose:
+    print(f"[milestones] search space exhausted with no plan "
+          f"in {time.perf_counter() - t0:.2f}s ({repairs} repairs)")
+  return None
 
 
 def solve_assembly_problem_optimistic_declutter(

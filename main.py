@@ -120,10 +120,27 @@ def parse_args():
   )
   parser.add_argument(
       "--ik-seeding", action="store_true",
-      help="With --real-ik: WARM-START each single-arm reach KOMO (pick/add_grasp) with analytic "
-           "closed-form IK (ssik), calibrated to the arm. Solves poses the KOMO otherwise can't "
-           "converge to (measured: ur5 real-arm picks 2/12 -> far more) and skips the redundant "
-           "reach precheck when a solution provably exists. ur5 only for now (ur10 uncalibrated).",
+      help="With --real-ik: use analytic closed-form IK (ssik) on every fixed-target skill "
+           "(pick/place/assemble-onto-table, incl. braced): exact per-arm reachability rejects "
+           "(replacing the relaxed precheck), collision-probed branch combos, and warm starts "
+           "for the KOMO. Calibrated arms only (ur5/ur10 two-finger); others keep the precheck.",
+  )
+  parser.add_argument(
+      "--dense-grasps", action="store_true",
+      help="TWO-FINGER only: add the +-45deg WRIST-TILTED variant of every face grasp -- the "
+           "pads keep the SAME flat face pinch (rotation is about the finger-closing axis "
+           "through the tool centre), only the wrist/approach swings into the diagonal "
+           "'between the faces'. 3x the grasp candidates (more IK/table work) in exchange "
+           "for approaches that clear obstacles a face-aligned wrist hits. Ignored with "
+           "--vacuum (rotationally symmetric).",
+  )
+  parser.add_argument(
+      "--ik-collision-gate", type=float, default=0.015, metavar="M",
+      help="With --ik-seeding: penetration depth (metres) beyond which an exact analytic branch "
+           "counts as DEEPLY colliding; a bind is rejected pre-KOMO only if EVERY branch combo "
+           "is deep (arm-arm pairs use 2x the gate). Default 0.015 -- measured: the full solve "
+           "rescues grazes up to ~0.010, never >=0.014. 0 = ANY penetration rejects "
+           "(aggressive: loses grazing rescues). Negative = off (probe/ranking only).",
   )
   parser.add_argument(
       "--full-ik", action="store_true",
@@ -136,6 +153,15 @@ def parse_args():
       help="Use the optimistic (Dogar-style) per-part search -- add one part at a time via "
            "its own small complete sub-search (reorient/hold/pick/mate/set-down), with exact "
            "fallback -- instead of the exact search. Much faster on the cases that blow up.",
+  )
+  parser.add_argument(
+      "--milestones", action="store_true",
+      help="MILESTONE planner: the labeled abstraction's backward (assembly-by-disassembly) "
+           "solve picks the next part to add (wrench-informed ORDER, grasps assumed "
+           "reachable); each milestone is filled in by a small per-part search "
+           "(pick/handover/brace/mate/set-down); a failed fill-in blacklists that milestone "
+           "and reroutes. Scales like --optimistic but with a SEARCHED part order, bracing "
+           "support, and repair instead of an exact-search fallback.",
   )
   parser.add_argument(
       "--declutter", action="store_true",
@@ -257,6 +283,22 @@ def parse_args():
            "version explodes at 4). Mutually exclusive with --labeled-h.",
   )
   parser.add_argument(
+      "--part-order-bias", action="store_true",
+      help="Plateau TIE-BREAK: among frontier nodes with equal f (and h), expand the one "
+           "whose action touches the LOWEST part index first -- i.e. prefer building in the "
+           "canonical part order. Pure ordering: the w-suboptimality bound and completeness "
+           "are untouched; it only decides which equally-promising node to try first, which "
+           "is what matters on the abstraction's large equal-h plateaus.",
+  )
+  parser.add_argument(
+      "--grasp-collapsed-h", action="store_true",
+      help="--collapsed-h PLUS the dense-grasp LABEL collapse: wrist-tilt variants fold onto "
+           "their base grasp id in the abstraction (facts OR'd over variants -- a further "
+           "relaxation, still admissible). THE heuristic to pair with --dense-grasps (raw "
+           "labels explode the build ~3x per robot; measured 24x on cross-4/3R). Without "
+           "--dense-grasps it behaves exactly like --collapsed-h.",
+  )
+  parser.add_argument(
       "--view-cheap-checks", action="store_true",
       help="Step through every (uncached) cheap collision check in a blocking C.view(True) "
            "window -- verdict, triggering action, and penetrating pairs in the overlay. "
@@ -291,7 +333,7 @@ _SAVE_CONFIG_FIELDS = (
     "assembly", "parts", "num_robots", "vacuum", "floating_ee", "robot", "robot_types",
     "scatter_spacing", "perturb_start_pose", "seed", "wrench", "grasp_model", "insert_force",
     "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
-    "bracing", "robust_mode",
+    "bracing", "robust_mode", "dense_grasps",
 )
 
 
@@ -306,7 +348,10 @@ def main():
   set_seed(args.seed)                           # reproducible numpy + rai (KOMO) RNG
   # grasp rolls are a property of the gripper: the vacuum is symmetric about its suction
   # axis (1 grasp per face); the two-finger has two in-plane orientations (90 deg apart).
+  # --dense-grasps additionally enables the +-45deg WRIST-TILTED variants (same face pinch,
+  # approach between the faces) -- see problem.set_dense_grasps.
   set_rolls_per_face(1 if args.vacuum else 2)
+  set_dense_grasps(args.dense_grasps and not args.vacuum)
   import wrench
   wrench.PARAMS["grasp_model"] = args.grasp_model  # capability model (used when --wrench)
   wrench.PARAMS["check_inserter"] = args.inserter_check
@@ -374,6 +419,8 @@ def main():
       robot_ik.reach_precheck = False
     if robot_ik is not None and args.ik_seeding:
       robot_ik.ik_seeding = True
+      robot_ik.collision_reject_depth = (
+          None if args.ik_collision_gate < 0 else args.ik_collision_gate)
     if args.view_cheap_checks:
       set_cheap_check_debug(True)
     fail_rec = None
@@ -384,7 +431,12 @@ def main():
       robot_ik.fail_log_seconds = args.log_ik_failures
       robot_ik.fail_log_stop = True                # abort the search when the window closes
     try:
-      if args.optimistic and args.declutter:
+      if args.milestones:
+        plan = solve_assembly_problem_milestones(
+            C, assembly, robots=robots, robot_ik=robot_ik, weight=args.weight,
+            wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
+            bracing=args.bracing)
+      elif args.optimistic and args.declutter:
         plan = solve_assembly_problem_optimistic_declutter(
             C, assembly, robots=robots, robot_ik=robot_ik, weight=args.weight,
             wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place)
@@ -392,21 +444,28 @@ def main():
         plan = solve_assembly_problem_optimistic(C, assembly, robots=robots,
                                                  robot_ik=robot_ik, weight=args.weight,
                                                  wrench=args.wrench, handovers=args.handovers,
-                                                 allow_place=args.allow_place)
+                                                 allow_place=args.allow_place,
+                                                 bracing=args.bracing,
+                                                 grasp_collapsed_h=args.grasp_collapsed_h,
+                                                 collapsed_h=args.collapsed_h,
+                                                 labeled_h=args.labeled_h)
       elif args.anytime is not None:
         plan, _cost, _opt = solve_assembly_problem_anytime(
             C, assembly, robots=robots, time_budget=args.anytime, robot_ik=robot_ik,
             wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
             anonymous=args.anon_robots, labeled_h=args.labeled_h,
-            collapsed_h=args.collapsed_h, wrench_aware_h=args.wrench_aware_h,
-            bracing=args.bracing)
+            collapsed_h=args.collapsed_h, grasp_collapsed_h=args.grasp_collapsed_h,
+            wrench_aware_h=args.wrench_aware_h, bracing=args.bracing,
+            part_order_bias=args.part_order_bias)
       else:
         plan = solve_assembly_problem(C, assembly, robots=robots, canonical=args.canonical,
                                       weight=args.weight, robot_ik=robot_ik, wrench=args.wrench,
                                       handovers=args.handovers, allow_place=args.allow_place,
                                       anonymous=args.anon_robots, labeled_h=args.labeled_h,
                                       collapsed_h=args.collapsed_h,
-                                      wrench_aware_h=args.wrench_aware_h, bracing=args.bracing)
+                                      grasp_collapsed_h=args.grasp_collapsed_h,
+                                      wrench_aware_h=args.wrench_aware_h, bracing=args.bracing,
+                                      part_order_bias=args.part_order_bias)
     except IKFailureLogDone:
       print(f"[ik-failures] window/cap reached -- search stopped for debugging "
             f"({len(fail_rec.steps)} failures collected).")

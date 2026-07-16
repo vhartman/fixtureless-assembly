@@ -168,8 +168,10 @@ def show_subassemblies(C, assembly, subassemblies, base_pose):
 
 def visualize_grasps(C, grasps, assembly, subassembly_base_pose, gripper_path=None):
   # for each subassembly, show its candidate grasps by placing a free-floating
-  # gripper (the first robot's end effector) at every grasp pose.
+  # gripper (the EE model matching the scene's gripper) at every grasp pose.
   # grasps: {subassembly (tuple): [pose, ...]}, each pose in the first obj's frame.
+  if gripper_path is None:
+    gripper_path = _scene_floating_ee_path(C)
 
   for subassembly, subassembly_grasps in grasps.items():
     C_viz = ry.Config()
@@ -194,9 +196,21 @@ def visualize_grasps(C, grasps, assembly, subassembly_base_pose, gripper_path=No
     C_viz.view(True)
 
 
+def _scene_floating_ee_path(C):
+  # the floating-EE model MATCHING the scene's real gripper (two-finger vs vacuum, detected
+  # from the frame names). Replays used to fall back to DEFAULT_FLOATING_EE (the vacuum
+  # file) and drew vacuum pens on two-finger runs.
+  import os
+  vacuum = any(n.endswith("_ur_vacuum") for n in C.getFrameNames())
+  return os.path.join(os.path.dirname(__file__), UR10_PATHS[(True, vacuum)])
+
+
 def visualize_state(C, state, assembly, gripper_path=None, view=True):
   """Render a search State: parts placed per the scene graph, plus a free-floating EE
-  at the grasp of every held subassembly. Returns the built config (views it if view)."""
+  at the grasp of every held subassembly (the EE model matching the scene's gripper,
+  unless an explicit gripper_path overrides). Returns the built config (views it if view)."""
+  if gripper_path is None:
+    gripper_path = _scene_floating_ee_path(C)
   C_viz = ry.Config()
   C_viz.addConfigurationCopy(C)
 

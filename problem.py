@@ -612,13 +612,26 @@ def get_subassemblies(assembly):
 DEFAULT_FLOATING_EE = "src/rai/ur10/ur10_vacuum_floating.g"
 
 # --- pose helpers, pose = [x, y, z, qw, qx, qy, qz] (rai convention) ---
+_QUAT_R_CACHE = {}                                          # quat bytes -> R (read-only shared)
+
+
 def _quat_to_R(q):
-  w, x, y, z = q
-  return np.array([
-      [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
-      [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
-      [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
-  ])
+  # MEMOIZED: profiles show millions of calls over a HANDFUL of distinct quats (identity, the
+  # 6 face-down rotations, a few anchors). Returned arrays are shared -- callers only read /
+  # rebind (audited); never mutate them in place. Bounded: cleared if it ever grows large.
+  qa = np.asarray(q, dtype=float)
+  key = qa.tobytes()
+  R = _QUAT_R_CACHE.get(key)
+  if R is None:
+    if len(_QUAT_R_CACHE) > 4096:
+      _QUAT_R_CACHE.clear()
+    w, x, y, z = qa
+    R = _QUAT_R_CACHE[key] = np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ])
+  return R
 
 
 def _quat_mul(a, b):
@@ -786,6 +799,23 @@ def set_rolls_per_face(n):
   _N_CUBE_GRASPS = len(_CUBE_FACE_NORMALS) * _ROLLS_PER_FACE
 
 
+# DENSE grasps (two-finger): add, per base face grasp, the two WRIST-TILTED variants -- the
+# pose rotated +-45 deg about the finger-CLOSING axis (grasp-local y, measured on the robotiq:
+# the pads separate along gripper y) THROUGH THE TOOL CENTER. The pads' normal is invariant
+# under a rotation about y, so the pinch stays a flat FACE grasp at the same contact -- only
+# the wrist/approach swings into the diagonal "between the faces" (reaches past obstacles a
+# face-aligned approach hits). NOT a roll about the approach axis (that would put the fingers
+# across the part's edges).
+_DENSE_GRASPS = False
+
+
+def set_dense_grasps(flag):
+  """Enable the +-45deg wrist-tilted grasp variants (two-finger). Call once at startup,
+  before any grasp precomputation (grasp ids index the per-part DB)."""
+  global _DENSE_GRASPS
+  _DENSE_GRASPS = bool(flag)
+
+
 _GRASP_POSE_CACHE = {}
 
 
@@ -891,7 +921,7 @@ def part_grasp_poses(spec, rolls=None, offset=0.01):
     rolls = _ROLLS_PER_FACE
   sq = _shape_quat(spec)
   key = ("DB", spec[0], tuple(spec[1]),
-         tuple(sq) if sq is not None else None, rolls, offset)
+         tuple(sq) if sq is not None else None, rolls, offset, _DENSE_GRASPS)
   hit = _GRASP_POSE_CACHE.get(key)
   if hit is not None:
     return hit
@@ -908,6 +938,18 @@ def part_grasp_poses(spec, rolls=None, offset=0.01):
         pose = np.concatenate([_quat_to_R(sq) @ pose[:3], _quat_mul(sq, pose[3:])])
       pose.setflags(write=False)
       poses.append(pose)
+  if _DENSE_GRASPS:
+    # wrist-tilted variants (see set_dense_grasps): SAME tool position + pinch, pose rotated
+    # +-45deg about the grasp's CLOSING axis (local y, in the part frame) through the tool
+    # center. Appended base-order per sign so grasp ids stay stable: [base | +45 | -45].
+    for sgn in (1.0, -1.0):
+      for base in list(poses[:len(_CUBE_FACE_NORMALS) * rolls]):
+        a = _quat_to_R(np.asarray(base[3:])) @ np.array([0.0, 1.0, 0.0])
+        half = sgn * (np.pi / 4.0) / 2.0
+        q_t = np.concatenate([[np.cos(half)], np.sin(half) * a])
+        tilted = np.concatenate([base[:3], _quat_mul(q_t, base[3:])])
+        tilted.setflags(write=False)
+        poses.append(tilted)
   hit = _GRASP_POSE_CACHE[key] = tuple(poses)
   return hit
 
@@ -935,6 +977,8 @@ def part_grasp_surfaces(spec, rolls=None):
     else:                                                  # sphere
       surf = "curved"
     out.extend([surf] * rolls)
+  if _DENSE_GRASPS:
+    out = out * 3                                          # tilted variants pinch the SAME faces
   return out
 
 
@@ -1666,9 +1710,23 @@ def _group_rest_lift(assembly, group, ref, face=_IDENTITY_FACE, anchor_q=None):
   # half extent at the ANCHOR's orientation (plus any float), so the lift is rest_height
   # (total orientation) minus that half extent -- for uniform cubes the halves cancel and
   # this is the classic -min_rel; for shaped parts a reorientation changes rest height too.
+  #
+  # MEMOIZED ON THE ASSEMBLY: a pure function of (group, ref, face, anchor_q) given fixed
+  # part shapes/offsets -- the heuristic build crafts a fresh context state per fact and
+  # re-derived the same lifts hundreds of thousands of times (the dominant build cost).
+  cache = getattr(assembly, "_rest_lift_cache", None)
+  if cache is None:
+    cache = assembly._rest_lift_cache = {}
+  key = (_subasm_key(group), ref, face,
+         None if anchor_q is None else np.round(np.asarray(anchor_q, dtype=float), 9).tobytes())
+  hit = cache.get(key)
+  if hit is not None:
+    return hit
   half_anchor = _shape_half_z(assembly.part_shape(ref),
                               _quat_to_R(anchor_q) if anchor_q is not None else np.eye(3))
-  return _group_rest_height(assembly, group, ref, face, anchor_q=anchor_q) - half_anchor
+  lift = _group_rest_height(assembly, group, ref, face, anchor_q=anchor_q) - half_anchor
+  cache[key] = lift
+  return lift
 
 
 def _placement_face(state, group):
@@ -1851,17 +1909,42 @@ def reset_wrench_cache():
 def _grounding_caps(state, assembly, group, gripper_kind):
   # Everything in the stability LP that does NOT depend on the applied load: the grounding
   # generator matrix (G [6xK], ub [K]) + its precomputed linprog `bounds` and rounded cache-
-  # key BYTES, the group centroid, and the gravity wrench. CACHED per (state, subassembly,
-  # gripper_kind) -- so a robust multi-corner insertion check (16 corners share the SAME
-  # contacts, only w_ext differs) and any repeated query on one state build the caps, run the
-  # capability constructors (the np.cross-heavy _force_gen calls that dominated the profile),
-  # hstack, and hash the generator matrix ONCE instead of per call.
+  # key BYTES, the group centroid, and the gravity wrench. TWO cache levels:
+  #   L1 per state (state._gcaps)      -- repeated queries on one state (16 noise corners).
+  #   L2 CONTENT-ADDRESSED on the ASSEMBLY -- everything except the centroid is TRANSLATION
+  #      INVARIANT (G/w_grav are centroid-relative), so the caps depend only on the group,
+  #      its ORIENTATION class (placement face + the reference part's anchor quat), which
+  #      grasps hold it, whether it touches the table, the gripper kind, and the grasp-model
+  #      params. The heuristic build crafts a FRESH context state per fact, so the L1 cache
+  #      alone recomputed identical geometry thousands of times ("should be lookups" -- now
+  #      it is; an L2 hit skips pose layout, footprint, and cap construction entirely).
   cache = getattr(state, "_gcaps", None)
   if cache is None:
     cache = state._gcaps = {}
   ckey = (_subasm_key(group), gripper_kind)
   hit = cache.get(ckey)
   if hit is not None:
+    return hit
+  members_sorted = _subasm_key(group)
+  base = reference_part(group)
+  on_table = any(("table",) in state.supports.get(p, ()) for p in group)
+  grasps = tuple(sorted((c[2], c[3]) for p in group
+                        for c in state.supports.get(p, ()) if c[0] == "grasp"))
+  anchor_q = np.round(np.asarray(state.poses[base][3:], dtype=float), 9).tobytes()
+  l2 = getattr(assembly, "_caps_cache", None)
+  if l2 is None:
+    l2 = assembly._caps_cache = {}
+  l2key = (members_sorted, on_table, _placement_face(state, group) if on_table else None,
+           anchor_q, grasps, gripper_kind, wrench.PARAMS.get("grasp_model"),
+           wrench.PARAMS.get("curved_grasp_torque_scale"), _ROLLS_PER_FACE)
+  anchor_pos = np.asarray(state.poses[base][:3], dtype=float)
+  l2hit = l2.get(l2key)
+  if l2hit is not None:
+    # the centroid is the ONLY translation-dependent output; its offset from the group's raw
+    # anchor position is content-invariant (rest lift + mean of rotated part offsets), so an
+    # L2 hit needs NO pose layout at all -- just re-anchor.
+    coff, w_grav, G, ub, bounds, gbytes = l2hit
+    hit = cache[ckey] = (anchor_pos + coff, w_grav, G, ub, bounds, gbytes)
     return hit
   poses = _state_part_poses(state, assembly, lift=0.0)
   members = sorted(group, key=_part_index)                 # stable order -> stable cache key
@@ -1886,6 +1969,7 @@ def _grounding_caps(state, assembly, group, gripper_kind):
   bounds = [(0.0, None if not np.isfinite(u) else float(u)) for u in ub]
   gbytes = (np.round(G, 4).tobytes(), np.round(ub, 4).tobytes())
   hit = cache[ckey] = (centroid, w_grav, G, ub, bounds, gbytes)
+  l2[l2key] = (centroid - anchor_pos,) + hit[1:]           # store the ANCHOR-RELATIVE centroid
   return hit
 
 
@@ -1913,8 +1997,9 @@ _SURFACE_CACHE = {}
 
 def _grasp_surface(spec, grasp_id):
   # "flat" | "curved" surface a grasp contacts, memoized (part_grasp_surfaces depends only on
-  # the shape KIND and the roll count). Only consulted when curved_grasp_torque_scale is set.
-  key = (spec[0], _ROLLS_PER_FACE)
+  # the shape KIND, the roll count, and dense mode). Only consulted when
+  # curved_grasp_torque_scale is set.
+  key = (spec[0], _ROLLS_PER_FACE, _DENSE_GRASPS)
   surfaces = _SURFACE_CACHE.get(key)
   if surfaces is None:
     surfaces = _SURFACE_CACHE[key] = part_grasp_surfaces(spec)
