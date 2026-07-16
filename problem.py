@@ -816,6 +816,39 @@ def set_dense_grasps(flag):
   _DENSE_GRASPS = bool(flag)
 
 
+# BRACE-FOR-ASSEMBLY-ONLY (experimental, OFF by default). Domain assumption: a brace (a 2nd
+# grasp via add_grasp) is EVER needed only to stabilise a target during an ASSEMBLE (regrasp is
+# the separate `handover`). So a brace should be added right before the assemble it enables and
+# dropped right after -- never carried around. The literal "must assemble right after add_grasp"
+# rule is PATH-DEPENDENT (non-Markovian). The equivalent STATE-BASED rule is Markovian and is
+# what we enforce: a state in which some group is held by >=2 grippers (a brace is present) may
+# only ASSEMBLE (consume the brace) or RELEASE (drop it) -- pick/place/handover/further-brace are
+# forbidden while braced. The brace is fully in the state, so identical states get identical
+# successors (no history). Effect: the search must pick/reorient the inserted part BEFORE
+# bracing, cannot interleave unrelated work while braced, and one brace may still serve several
+# consecutive assembles. COMPLETE under the assumption (any plan has a normal form with braces
+# added-used-dropped contiguously); if the assumption is ever false it can miss plans -> flagged.
+_BRACE_FOR_ASSEMBLY_ONLY = False
+
+
+def set_brace_for_assembly_only(flag):
+  global _BRACE_FOR_ASSEMBLY_ONLY
+  _BRACE_FOR_ASSEMBLY_ONLY = bool(flag)
+
+
+def _has_brace(state):
+  # True iff some subassembly is held by >=2 distinct grippers (a brace, per add_grasp).
+  for g in state.subassemblies():
+    holders = set()
+    for p in g:
+      for c in state.supports.get(p, ()):
+        if c[0] == "grasp":
+          holders.add(c[1])
+          if len(holders) >= 2:
+            return True
+  return False
+
+
 _GRASP_POSE_CACHE = {}
 
 
@@ -1637,16 +1670,25 @@ def successors(state, assembly, robots, grasp_table=None, canonical=False,
   # `bracing=` (off by default: it just adds branching everywhere). `release` reparents onto a
   # remaining holder either way. allow_place=False FORBIDS setting a held group back on the
   # table -> the search holds + regrasps in the air (no forced regime; just fewer options).
-  yield from picks(state, assembly, robots, grasp_table=grasp_table, canonical=canonical)
-  yield from assembles(state, assembly, robots, gripper_kind=gripper_kind)  # incl. module joins
-  if handovers:
-    yield from fused_handovers(state, assembly, robots, grasp_table=grasp_table)
-  if bracing:
-    yield from add_grasps(state, assembly, robots, grasp_table=grasp_table)
-  yield from releases(state, assembly, robots, gripper_kind=gripper_kind)
-  if allow_place:
-    yield from places(state, assembly, robots)
-  # deferred (unfused): set_downs
+  def _gen():
+    yield from picks(state, assembly, robots, grasp_table=grasp_table, canonical=canonical)
+    yield from assembles(state, assembly, robots, gripper_kind=gripper_kind)  # incl. module joins
+    if handovers:
+      yield from fused_handovers(state, assembly, robots, grasp_table=grasp_table)
+    if bracing:
+      yield from add_grasps(state, assembly, robots, grasp_table=grasp_table)
+    yield from releases(state, assembly, robots, gripper_kind=gripper_kind)
+    if allow_place:
+      yield from places(state, assembly, robots)
+    # deferred (unfused): set_downs
+
+  if _BRACE_FOR_ASSEMBLY_ONLY and _has_brace(state):
+    # a brace is present -> only consume it (assemble) or drop it (release); see the flag doc.
+    for a, ns in _gen():
+      if a[0] in ("assemble", "release"):
+        yield a, ns
+    return
+  yield from _gen()
 
 
 def assembly_order(assembly):

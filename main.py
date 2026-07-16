@@ -119,7 +119,7 @@ def parse_args():
            "replay the plan with the actual arm poses instead of floating-EE stand-ins.",
   )
   parser.add_argument(
-      "--ik-seeding", action="store_true",
+      "--no-ik-seeding", action="store_false", dest="ik_seeding",
       help="With --real-ik: use analytic closed-form IK (ssik) on every fixed-target skill "
            "(pick/place/assemble-onto-table, incl. braced): exact per-arm reachability rejects "
            "(replacing the relaxed precheck), collision-probed branch combos, and warm starts "
@@ -162,6 +162,16 @@ def parse_args():
            "(pick/handover/brace/mate/set-down); a failed fill-in blacklists that milestone "
            "and reroutes. Scales like --optimistic but with a SEARCHED part order, bracing "
            "support, and repair instead of an exact-search fallback.",
+  )
+  parser.add_argument(
+      "--brace-for-assembly-only", action="store_true",
+      help="EXPERIMENTAL (MEASURED HARMFUL, off by default): assume a brace (2nd grasp via "
+           "add_grasp) is only needed to stabilise an ASSEMBLE, so a braced state (>=2 grippers "
+           "on one group) may only assemble/release. Markovian and correct, BUT it backfires in "
+           "the forward search -- braced states reached before the part is positioned become "
+           "near-dead-ends the search thrashes on (car-mini fill branching exploded 20-50x). "
+           "The domain fact is right; the clean form is an atomic add_grasp+assemble MACRO, not "
+           "this filter. Kept for experimentation; prints when active.",
   )
   parser.add_argument(
       "--declutter", action="store_true",
@@ -352,6 +362,11 @@ def main():
   # approach between the faces) -- see problem.set_dense_grasps.
   set_rolls_per_face(1 if args.vacuum else 2)
   set_dense_grasps(args.dense_grasps and not args.vacuum)
+  set_brace_for_assembly_only(args.brace_for_assembly_only)
+  if args.brace_for_assembly_only:
+    print("[flag] --brace-for-assembly-only ACTIVE: a braced state (>=2 grippers on a group) "
+          "may only assemble/release. Prunes brace branching; can miss plans that carry a "
+          "brace across unrelated work (experimental).")
   import wrench
   wrench.PARAMS["grasp_model"] = args.grasp_model  # capability model (used when --wrench)
   wrench.PARAMS["check_inserter"] = args.inserter_check

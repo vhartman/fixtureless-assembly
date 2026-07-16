@@ -2465,7 +2465,8 @@ def _part_mated(state, p):
 
 def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot_ik,
                   weight, max_nodes, verbose, gripper_kind=None, handovers=True,
-                  allow_place=True, bracing=False, grasp_cap=None, h_extra=None):
+                  allow_place=True, bracing=False, grasp_cap=None, h_extra=None,
+                  part_grasp_allow=None, brace_allow=None):
   # a small COMPLETE search that adds part `p` to the assembly `ideal` and leaves it SETTLED:
   # p mated, no loose part left in a gripper, and the assembly ending held by at most one
   # carrier OR resting on the table -- WHICHEVER the search finds. It forces neither a
@@ -2491,6 +2492,12 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
       hv = max(hv, h_extra(s))
     return hv
 
+  def _held_grasp(s, part):                              # raw grasp id `part` is currently held by
+    for c in s.supports.get(part, ()):
+      if c[0] == "grasp" and c[2] == part:
+        return c[3]
+    return None
+
   def succ_fn(s):
     for a, ns in successors(s, assembly, robots, grasp_table=grasp_table,
                             gripper_kind=gripper_kind, handovers=handovers,
@@ -2500,6 +2507,19 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
       if (grasp_cap is not None and a[0] in ("pick", "add_grasp", "handover")
           and a[3] >= grasp_cap):
         continue                                          # grasp-WIDENING: only ids < cap this pass
+      if part_grasp_allow is not None and a[0] == "assemble" and a[2] == p:
+        # the abstraction's viable-inserter-grasp hint applies to the MATE -- the grasp `p` is
+        # HELD with when it seats -- NOT the pick: `p` may need a reorient pick with a
+        # non-viable grasp to reach a viable one (measured cross-7: obj_2 picks grasp 3 to
+        # reorient, then re-picks grasp 11 to mate; 11 is in the hint, 3 is not). So free
+        # pick/handover, gate only the mate's held grasp; the full unbraced phase (allow=None)
+        # is the completeness net when the relaxed hint misses the concrete-viable grasp.
+        g = _held_grasp(s, p)
+        if g is not None and g not in part_grasp_allow:
+          continue
+      if (brace_allow is not None and a[0] == "add_grasp"
+          and (a[2], a[3]) not in brace_allow):
+        continue                                          # only the abstraction's known G2 braces
       yield a, ns
 
   def edge_check_fn(prev, act, ns):
@@ -2820,26 +2840,62 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
         best = d
     return best
 
-  # PHASED fill-in (iterative WIDENING, cheapest action set first): braces are rarely needed
-  # and their add_grasp edges inflate the mini plateau (measured: cross obj_5 35s unbraced vs
-  # budget-exhausted braced); with --dense-grasps the wrist-tilt variants triple the pick
-  # candidates and are likewise rarely needed. Each phase is a COMPLETE mini-search over its
-  # restricted action set (a failed narrow phase exhausts a SMALL space, so widening-on-
-  # failure has bounded overhead -- the reason this is safe here and NOT in the exact search,
-  # where exhausting a narrow full search is expensive and non-localized).
+  # PHASED fill-in, cheapest/most-constrained action set FIRST but always widening to the full
+  # set before escalating to braces. Two ideas kept strictly separate after a measured bug:
+  #   * the abstraction's grasp hint (viable inserter grasps of q) is a RELAXED-MODEL guess --
+  #     it does NOT transfer to the concrete state (real reachability/clutter/orientation), so
+  #     it may EXCLUDE the true grasp (measured: cross-7 obj_2 hint=[10,11], concrete needs
+  #     another -> hinted unbraced fails in 1.3s, then the braced phase FLOODS). So the hint
+  #     only adds an EARLY narrow phase; a FULL unbraced phase always follows it, and always
+  #     precedes any braced phase. Hint right -> fast; hint wrong -> the full phase catches it.
+  #   * bracing is rarely needed and its add_grasp edges inflate the mini plateau, so braced
+  #     phases run LAST. The `unbraced_ok=False` skip is sound (the relaxed model is optimistic:
+  #     if it finds NO unbraced insertion, the more-constrained concrete cannot either).
   nb = len(_problem._CUBE_FACE_NORMALS) * _problem._ROLLS_PER_FACE
-  phases = []
-  for br in ([False, True] if bracing else [False]):
-    if _problem._DENSE_GRASPS:
-      phases.append((nb, br))                             # base grasps only
-    phases.append((None, br))                             # full grasp set
+
+  def hints(ideal_key, q):
+    # mine the abstraction's cached w_assemble facts ("A", target_key, G2, face, q, gq): the
+    # TRUE entries for THIS milestone give (a) the wrench-viable inserter grasps gq, (b) whether
+    # any works with an EMPTY target brace set (=> an unbraced insertion exists), and (c) the
+    # G2 BRACE CONFIGS -- the specific (part, grasp) braces that make the insertion feasible.
+    # (c) is the key to the braced fill: instead of regenerating EVERY add_grasp option (free
+    # robot x part x grasp -- measured 90-170/fill), constrain the brace to the abstraction's
+    # known set. Collapsed ids expand to raw variants. Facts cached lazily => absence = no info.
+    gqs, unbraced_ok, braces = set(), False, set()
+    for k, ok in h_lab._wfacts.items():
+      if ok and k[0] == "A" and k[1] == ideal_key and k[4] == q:
+        gqs.update(h_lab._svgroups.get(q, {}).get(k[5], (k[5],)))
+        unbraced_ok |= len(k[2]) == 0
+        for bp, bg in k[2]:                               # G2 = (part, collapsed grasp) braces
+          for rg in h_lab._svgroups.get(bp, {}).get(bg, (bg,)):
+            braces.add((bp, rg))
+    return (gqs or None), unbraced_ok, (braces or None)
 
   def fill(s, q, ideal):
-    for cap, br in phases:
+    allow, unbraced_ok, ballow = hints(_subasm_key(ideal), q)
+    dense = _problem._DENSE_GRASPS
+    # phases, narrowest first: (grasp_cap, bracing, mate_allow, brace_allow). A FULL phase (all
+    # grasps, no brace restriction) always precedes escalation -- the completeness net when a
+    # relaxed hint misses the concrete-viable grasp/brace.
+    phases = []
+    if not (bracing and allow is not None and not unbraced_ok):
+      if allow is not None:
+        phases.append((nb if dense else None, False, allow, None))   # hinted mate
+      if dense:
+        phases.append((nb, False, None, None))
+      phases.append((None, False, None, None))                       # full unbraced
+    if bracing:
+      if ballow is not None:                                         # abstraction knows the brace:
+        if allow is not None:
+          phases.append((nb if dense else None, True, allow, ballow))  # hinted mate + brace
+        phases.append((None, True, None, ballow))                    # any mate + hinted brace
+      phases.append((None, True, None, None))                        # full braced (net)
+    for cap, br, ma, ba in phases:
       sub, s2 = _add_one_part(s, q, ideal, assembly, robots, checker, grasp_table, robot_ik,
                               weight, max_nodes, verbose, gripper_kind=gk,
                               handovers=handovers, allow_place=allow_place, bracing=br,
-                              grasp_cap=cap, h_extra=h_lab.value)
+                              grasp_cap=cap, h_extra=h_lab.value, part_grasp_allow=ma,
+                              brace_allow=ba)
       if sub is not None:
         return sub, s2
     return None, None
