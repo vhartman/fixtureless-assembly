@@ -379,6 +379,19 @@ def parse_args():
            "--dense-grasps it behaves exactly like --collapsed-h.",
   )
   parser.add_argument(
+      "--sig-collapsed-h", action="store_true",
+      help="SIGNATURE grasp collapse + LABELED loose parts: grasp labels are equivalence "
+           "classes under the fact signature (press capability, pick-face vector, contact "
+           "patch, solo-hold, brace-side), and loose parts keep their class label -- the "
+           "fine labeled-h's plateau-killing pick/press discrimination at collapsed-h "
+           "scale. Facts OR over class members (relaxation -> admissible).",
+  )
+  parser.add_argument(
+      "--sig-components", type=str, default=None, metavar="CSV",
+      help="Ablation for --sig-collapsed-h: comma-separated subset of signature "
+           "components (press,pickface,contact,solohold,braceside). Default: all.",
+  )
+  parser.add_argument(
       "--geo-facts", action="store_true",
       help="Gate the labeled abstraction's backward Dijkstra with FLOATING-GRIPPER "
            "geometry: a labeled state (assembly at a rest face + its grasps/braces) whose "
@@ -476,6 +489,12 @@ def main():
 
   assembly = make_assembly(args.assembly, args.parts)
 
+  if args.sig_collapsed_h:
+    if args.sig_components:
+      set_sig_components([c.strip() for c in args.sig_components.split(",") if c.strip()])
+    print("[flag] --sig-collapsed-h ACTIVE: signature grasp-equivalence classes + labeled "
+          "loose parts (components: "
+          + (args.sig_components or "press,pickface,contact,solohold,braceside") + ").")
   if args.geo_facts:
     print("[flag] --geo-facts ACTIVE: labeled-abstraction backward relay gated on "
           "floating-gripper coexistence (gripper-vs-assembly/gripper/table); sound "
@@ -554,7 +573,8 @@ def main():
             wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
             bracing=args.bracing, labeled_h=args.labeled_h, collapsed_h=args.collapsed_h,
             grasp_collapsed_h=args.grasp_collapsed_h or not (args.labeled_h or args.collapsed_h),
-            stats_every=args.search_stats, geo_facts=args.geo_facts)
+            stats_every=args.search_stats, geo_facts=args.geo_facts,
+            sig_collapsed_h=args.sig_collapsed_h)
       elif args.lazy:
         plan = solve_assembly_problem_lazy(
             C, assembly, robots=robots, weight=args.weight, robot_ik=robot_ik,
@@ -562,12 +582,13 @@ def main():
             labeled_h=args.labeled_h, collapsed_h=args.collapsed_h,
             grasp_collapsed_h=args.grasp_collapsed_h,
             wrench_aware_h=args.wrench_aware_h, bracing=args.bracing,
-            geo_facts=args.geo_facts)
+            geo_facts=args.geo_facts, sig_collapsed_h=args.sig_collapsed_h)
       elif args.milestones:
         plan = solve_assembly_problem_milestones(
             C, assembly, robots=robots, robot_ik=robot_ik, weight=args.weight,
             wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
-            bracing=args.bracing, geo_facts=args.geo_facts)
+            bracing=args.bracing, geo_facts=args.geo_facts,
+            sig_collapsed_h=args.sig_collapsed_h)
       elif args.optimistic and args.declutter:
         plan = solve_assembly_problem_optimistic_declutter(
             C, assembly, robots=robots, robot_ik=robot_ik, weight=args.weight,
@@ -599,7 +620,8 @@ def main():
                                       wrench_aware_h=args.wrench_aware_h, bracing=args.bracing,
                                       part_order_bias=args.part_order_bias,
                                       stats_every=args.search_stats, por=args.por,
-                                      geo_facts=args.geo_facts)
+                                      geo_facts=args.geo_facts,
+                                      sig_collapsed_h=args.sig_collapsed_h)
     except IKFailureLogDone:
       print(f"[ik-failures] window/cap reached -- search stopped for debugging "
             f"({len(fail_rec.steps)} failures collected).")

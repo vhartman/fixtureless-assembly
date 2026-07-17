@@ -1775,6 +1775,135 @@ class LabeledDisassemblyHeuristic:
     return v
 
 
+_SIG_COMPONENTS = ("press", "pickface", "contact", "solohold", "braceside")
+
+
+def set_sig_components(components):
+  """Ablation hook for the signature collapse (--sig-components): which components
+  participate in the grasp-equivalence classes. Fewer components => coarser classes =>
+  smaller abstraction build, weaker discrimination."""
+  global _SIG_COMPONENTS
+  _SIG_COMPONENTS = tuple(components)
+
+
+def _sig_held_single_state(assembly, q, g):
+  # standalone copy of the heuristics' held_single crafted state: everything loose on the
+  # table, q held solo by grasp g (kinematic root irrelevant to the LP -- see crafted()).
+  parent, place, supports = {}, {}, {}
+  for p in assembly.objects:
+    parent[p] = ("table",)
+    supports[p] = frozenset({("table",)})
+    place[p] = ("slot", _part_index(p), _IDENTITY_FACE)
+  parent[q] = ("gripper", "zzq")
+  place.pop(q, None)
+  supports[q] = frozenset({("grasp", "zzq", q, g)})
+  return State(parent=parent, place=place, supports=supports,
+               poses=dict(_flat_poses(assembly)))
+
+
+def _sig_press_ok(assembly, q, g, gk):
+  # S1: can grasp g transmit the insertion press for q's OWN mate? (the per-state
+  # inserter gate of w_assemble_ok, evaluated once per (part, grasp))
+  onto = assembly.relative_pose(q)[0]
+  st = _sig_held_single_state(assembly, q, g)
+  return _group_stable_loaded(st, assembly, frozenset({q}), gk,
+                              _inserter_load_variants(st, assembly, q, onto))
+
+
+def _sig_solo_hold_ok(assembly, q, g, gk):
+  # S4: can grasp g on part q hold the FULL assembly alone in the air (endgame holder /
+  # handover-recipient capability)?
+  parent, supports = {}, {}
+  for p in assembly.objects:
+    if p == assembly.base:
+      parent[p] = ("gripper", "zzq")
+      supports[p] = frozenset()
+    else:
+      onto = assembly.relative_pose(p)[0]
+      parent[p] = ("part", onto)
+      supports[p] = frozenset({("mate", onto)})
+  supports[q] = supports[q] | {("grasp", "zzq", q, g)}
+  st = State(parent=parent, place={}, supports=supports,
+             poses=dict(_flat_poses(assembly)))
+  return _group_stable(st, assembly, set(assembly.objects), gk)
+
+
+def compute_grasp_signatures(assembly, grasp_table, gripper_kind=None, gripper_path=None,
+                             clearance=0.02, components=None):
+  """FACT-SIGNATURE grasp-equivalence classes, one map per part: {part: {raw_g: class}}.
+
+  Two grasps share a class iff they agree on every enabled signature component -- i.e. on
+  everything the abstraction's facts (are believed to) read from a grasp id:
+    press     -- S1: transmits the part's own insertion press (wrench LP, needs gk)
+    pickface  -- S2: per-rest-face table-aware pickability vector (splits wrist tilts
+                 that dip toward the table; the component g%%nb wrongly merges)
+    contact   -- S3: contact patch geometry (center, approach axis, closing axis up to
+                 sign) -- the holder/brace lever-arm class; merges wrist tilts (rotation
+                 ABOUT the closing axis), keeps faces/rolls apart
+    solohold  -- S4: can hold the full assembly alone in the air (wrench LP, needs gk)
+    braceside -- S5: alignment bits of the approach axis vs the assembly's mate axes
+                 (the 'hold the opposite end and push' brace role)
+  Classes are used as LABELS with the existing per-context OR over class members
+  (_vgroups/_svgroups), so an incomplete signature only degrades to the usual
+  OR-relaxation -- admissibility is never at stake. Returned class ids are per-part,
+  deterministic (sorted signatures)."""
+  comps = set(components if components is not None else _SIG_COMPONENTS)
+  ee = gripper_path or os.path.join(os.path.dirname(__file__), DEFAULT_FLOATING_EE)
+  axes = []
+  for r in assembly.objects:
+    rel = assembly.relative_pose(r)
+    if rel is None:
+      continue
+    t = np.asarray(rel[1], dtype=float)
+    n = np.linalg.norm(t)
+    if n > 1e-9:
+      u = tuple(np.round(t / n, 2))
+      if u not in axes:
+        axes.append(u)
+  axes.sort()
+  sigs = {}
+  for q in assembly.objects:
+    ids = sorted({g for _p, g, _ in grasp_table[(q,)]})
+    faces = list(rest_faces(assembly, {q}))
+    table = {}
+    for g in ids:
+      pose = grasp_pose(assembly, q, g)
+      R = _quat_to_R(np.asarray(pose[3:], dtype=float))
+      appr = R @ np.array([0.0, 0.0, 1.0])
+      close = R @ np.array([0.0, 1.0, 0.0])
+      for c in close:                                     # closing axis is sign-symmetric
+        if abs(c) > 1e-6:
+          close = close * np.sign(c)
+          break
+      sig = []
+      if "press" in comps and gripper_kind is not None and q != assembly.base:
+        sig.append(("press", bool(_sig_press_ok(assembly, q, g, gripper_kind))))
+      if "pickface" in comps:
+        sig.append(("faces", tuple(
+            bool(_table_aware_pick_fact(assembly, (q,), f, q, g, ee,
+                                        clearance=clearance)) for f in faces)))
+      if "contact" in comps:
+        # STATIC grip capability only: the pads' patch = (center, closing axis). The
+        # approach/wrist direction is deliberately EXCLUDED -- it does not change the
+        # grip wrench (tilt variants rotate about the closing axis, pads unchanged), and
+        # its clearance effects are what the pickface component measures with the true
+        # EE pose. Including it makes S3 the identity map (measured: 12/12, 36/36).
+        sig.append(("contact", tuple(np.round(np.asarray(pose[:3], dtype=float), 3)),
+                    tuple(np.round(close, 2))))
+      if "solohold" in comps and gripper_kind is not None and assembly.can_hold(q):
+        sig.append(("hold", bool(_sig_solo_hold_ok(assembly, q, g, gripper_kind))))
+      if "braceside" in comps:
+        # brace force is transmitted through the PADS (closing axis, sign-symmetric),
+        # not along the wrist approach.
+        sig.append(("brace", tuple(
+            int(abs(float(np.dot(close, np.asarray(a, dtype=float)))) > 0.9)
+            for a in axes)))
+      table[g] = tuple(sig)
+    classes = {s: i for i, s in enumerate(sorted(set(table.values()), key=repr))}
+    sigs[q] = {g: classes[table[g]] for g in ids}
+  return sigs
+
+
 class CollapsedLabeledHeuristic:
   """IDENTITY-COLLAPSED variant of LabeledDisassemblyHeuristic, for per-robot SCALING.
 
@@ -1813,7 +1942,8 @@ class CollapsedLabeledHeuristic:
 
   def __init__(self, assembly, n_robots, grasp_table, gripper_path=None, verbose=False,
                max_states=2_000_000, clearance=0.02, gripper_kind=None, bracing=False,
-               collapse_grasps=False, geo_checker=None):
+               collapse_grasps=False, geo_checker=None, grasp_classes=None,
+               labeled_loose=False):
     import heapq
     import time as _time
 
@@ -1846,15 +1976,21 @@ class CollapsedLabeledHeuristic:
     # the full variant set. Off (the default) => gcol is the identity and everything below
     # reduces exactly to the raw-label behaviour (singleton variant groups).
     nb = len(_problem._CUBE_FACE_NORMALS) * _problem._ROLLS_PER_FACE
-    gcol = (lambda g: g % nb) if (self._collapse and _problem._DENSE_GRASPS) \
-        else (lambda g: g)
+    if grasp_classes is not None:                          # SIGNATURE collapse (per part):
+      gcol = lambda p, g: grasp_classes.get(p, {}).get(g, 10000 + g)
+      self._collapse = True                                # abstract() must map via gcol
+    elif self._collapse and _problem._DENSE_GRASPS:
+      gcol = lambda p, g: g % nb
+    else:
+      gcol = lambda p, g: g
     self._gcollapse = gcol
+    self._labeled_loose = bool(labeled_loose)              # L keeps (part, class) labels
     self._vgroups = {}                                     # S_key -> {(p,gb): (raw g, ...)}
     self.valid = {}
     for S in ideal_keys:
       groups = {}
       for p, g, _ in grasp_table[S]:
-        groups.setdefault((p, gcol(g)), []).append(g)
+        groups.setdefault((p, gcol(p, g)), []).append(g)
       self._vgroups[S] = {k: tuple(sorted(v)) for k, v in groups.items()}
       self.valid[S] = tuple(sorted(groups))
     self._svgroups = {}                                    # q -> {gb: (raw g, ...)}
@@ -1862,7 +1998,7 @@ class CollapsedLabeledHeuristic:
     for q in objs:
       groups = {}
       for _p, g, _ in grasp_table[(q,)]:
-        groups.setdefault(gcol(g), []).append(g)
+        groups.setdefault(gcol(q, g), []).append(g)
       self._svgroups[q] = {k: tuple(sorted(v)) for k, v in groups.items()}
       self.single[q] = tuple(sorted(groups))
 
@@ -2018,22 +2154,45 @@ class CollapsedLabeledHeuristic:
           continue                                        # target had to be supported
         if not w_assemble_ok(tsub(ideal, q), G2, face, q, gq):
           continue                                        # wrench: press not transmittable
-        yield (tsub(ideal, q), G2, face, tadd(L, q)), 1.0
-      # inverse PICK-LOOSE: exists-a-face AND exists-a-grasp (the collapse)
-      for q in L:
-        if loose_pickable(q):
-          yield (ideal, G, face, tsub(L, q)), 1.0
+        yield (tsub(ideal, q), G2, face,
+               tadd(L, (q, gq) if self._labeled_loose else q)), 1.0
+      if self._labeled_loose:
+        # inverse PICK-LOOSE, labeled: the loose (part, class) must be pickable AS THAT
+        # CLASS (exists-a-face, OR over class variants) -- the pick/press linkage at class
+        # resolution; a swap is available via the LOOSE-HANDOVER edge below.
+        for q, gq in L:
+          if any(pick_ok((q,), f, (q, gq)) for f in rf((q,))):
+            yield (ideal, G, face, tsub(L, (q, gq))), 1.0
+      else:
+        # inverse PICK-LOOSE: exists-a-face AND exists-a-grasp (the collapse)
+        for q in L:
+          if loose_pickable(q):
+            yield (ideal, G, face, tsub(L, q)), 1.0
       # inverse LIFT: held solo -> was resting on some face and got picked (G-labeled, exact)
       if face is Hf and len(G) == 1:
         pg = G[0]
         for f in rf(ideal):
           if pick_ok(ideal, f, pg):
             yield (ideal, (), f, L), 1.0
+        # SAME-LABEL variant: collapsed labels DEDUP -- two concrete holders can share one
+        # label, so a second same-label grasp can lift the assembly with G unchanged.
+        # Needs >=2 raw variants (two arms cannot share one raw grasp pose) + a free arm.
+        if cap_used < self.R and len(gvariants(ideal, pg)) >= 2:
+          for f in rf(ideal):
+            if pick_ok(ideal, f, pg):
+              yield (ideal, G, f, L), 1.0
       # inverse PLACE-ASSEMBLY: on table now -> was held by one more grasp in the air
       if face is not Hf and cap_used < self.R:
         for pg in self.valid[ideal]:
           if pg not in G:
             yield (ideal, tadd(G, pg), Hf, L), 1.0
+        # SAME-LABEL variant: the placing holder shared its label with a remaining one, so
+        # the forward place leaves G UNCHANGED (Hf -> face) -- the distinct-label edge
+        # above cannot produce it. MEASURED: without this, coarse --sig-components classes
+        # made car-mini's s0 backward-unreachable => false INFEASIBLE (the coarser the
+        # collapse, the more same-label holder pairs; the fine class is immune).
+        if any(len(gvariants(ideal, pg)) >= 2 for pg in G):
+          yield (ideal, G, Hf, L), 1.0
       # inverse RELEASE: some grasp was just opened (wrench-gated on t staying supported)
       if cap_used < self.R and w_hold_ok(ideal, G, face):
         for pg in self.valid[ideal]:
@@ -2053,13 +2212,30 @@ class CollapsedLabeledHeuristic:
         for pg_old in self.valid[ideal]:
           if pg_old != pg_new:
             yield (ideal, (pg_old,), Hf, L), 2.0
-      # inverse PLACE-LOOSE: ONE edge per part (any valid grasp; existence suffices)
-      if cap_used < self.R:
-        for q in objs:
-          if q in ideal or q in L:
-            continue
-          if self.single[q]:
-            yield (ideal, G, face, tadd(L, q)), 1.0
+      if self._labeled_loose:
+        # inverse LOOSE-HANDOVER (cost 2): a loose part's grasp CLASS was swapped in the
+        # air (transiently free arm required) -- keeps the pick/press linkage admissible
+        # (+2 price, not a hard gate; mirrors the fine class edge).
+        if cap_used < self.R:
+          for q, gq in L:
+            for gq2 in self.single[q]:
+              if gq2 != gq:
+                yield (ideal, G, face, tadd(tsub(L, (q, gq)), (q, gq2))), 2.0
+        # inverse PLACE-LOOSE, labeled: one edge per (part, class)
+        if cap_used < self.R:
+          for q in objs:
+            if q in ideal or any(q == p for p, _ in L):
+              continue
+            for qg in self.single[q]:
+              yield (ideal, G, face, tadd(L, (q, qg))), 1.0
+      else:
+        # inverse PLACE-LOOSE: ONE edge per part (any valid grasp; existence suffices)
+        if cap_used < self.R:
+          for q in objs:
+            if q in ideal or q in L:
+              continue
+            if self.single[q]:
+              yield (ideal, G, face, tadd(L, q)), 1.0
 
     # goal states: identical seeding to the fine class (L=() either way)
     self.dist = {}
@@ -2093,7 +2269,8 @@ class CollapsedLabeledHeuristic:
     self.n_pick_facts = len(self._pick_cache)
     self.build_time = _time.perf_counter() - t0
     if verbose:
-      print(f"[collapsed-h] {self.n_states} coreachable states, {self.n_pick_facts} pick "
+      tag = "sig-h" if grasp_classes is not None else "collapsed-h"
+      print(f"[{tag}] {self.n_states} coreachable states, {self.n_pick_facts} pick "
             f"facts, built in {self.build_time:.2f}s")
 
   def abstract(self, state):
@@ -2102,15 +2279,22 @@ class CollapsedLabeledHeuristic:
     if self._collapse:
       # grasp ids collapsed to their BASE variant; set-dedup so two variants of the same
       # base label map onto ONE abstract slot (fewer committed arms = more permissive).
-      G = tuple(sorted({(c[2], self._gcollapse(c[3])) for p in main
+      G = tuple(sorted({(c[2], self._gcollapse(c[2], c[3])) for p in main
                         for c in state.supports.get(p, ()) if c[0] == "grasp"}))
     else:
       G = tuple(sorted((c[2], c[3]) for p in main
                        for c in state.supports.get(p, ()) if c[0] == "grasp"))
     on_table = any(("table",) in state.supports.get(p, ()) for p in main)
     face = _placement_face(state, main) if on_table else self.H
-    L = tuple(sorted({c[2] for p in state.parent if p not in main
-                      for c in state.supports.get(p, ()) if c[0] == "grasp"}))
+    if self._labeled_loose:
+      # loose parts keep their (part, grasp-class) label -- the fine class's pick/press
+      # discrimination at class resolution (the 2026-07-17 plateau finding).
+      L = tuple(sorted({(c[2], self._gcollapse(c[2], c[3])) for p in state.parent
+                        if p not in main
+                        for c in state.supports.get(p, ()) if c[0] == "grasp"}))
+    else:
+      L = tuple(sorted({c[2] for p in state.parent if p not in main
+                        for c in state.supports.get(p, ()) if c[0] == "grasp"}))
     return (ideal, G, face, L)
 
   def value(self, state):
@@ -2132,6 +2316,33 @@ class GraspCollapsedHeuristic(CollapsedLabeledHeuristic):
   def __init__(self, *args, **kwargs):
     kwargs["collapse_grasps"] = True
     super().__init__(*args, **kwargs)
+
+
+class SignatureCollapsedHeuristic(CollapsedLabeledHeuristic):
+  """FACT-SIGNATURE grasp collapse + LABELED LOOSE parts (--sig-collapsed-h).
+
+  The middle ground between the FINE labeled class (raw grasp alphabet -- kills the
+  plateau, explodes at R=4/--dense-grasps) and the blind collapses (small, but the bare-L
+  identity collapse discards exactly the pick/press discrimination; 2026-07-17 finding):
+  grasp labels are EQUIVALENCE CLASSES under the fact signature (see
+  compute_grasp_signatures / set_sig_components), and loose parts KEEP their class label,
+  with the loose-handover swap edge pricing class changes at the real fused cost.
+  Facts OR over class members via the inherited _vgroups/_svgroups machinery, so an
+  incomplete signature only coarsens the relaxation -- admissibility is preserved."""
+
+  def __init__(self, assembly, n_robots, grasp_table, **kwargs):
+    classes = compute_grasp_signatures(
+        assembly, grasp_table, gripper_kind=kwargs.get("gripper_kind"),
+        gripper_path=kwargs.get("gripper_path"),
+        clearance=kwargs.get("clearance", 0.02))
+    if kwargs.get("verbose"):
+      summary = ", ".join(f"{q}:{len(set(m.values()))}/{len(m)}"
+                          for q, m in sorted(classes.items()))
+      print(f"[sig-h] components=({','.join(_SIG_COMPONENTS)}); "
+            f"classes/raw grasps per part: {summary}")
+    kwargs["grasp_classes"] = classes
+    kwargs["labeled_loose"] = True
+    super().__init__(assembly, n_robots, grasp_table, **kwargs)
 
 
 _TABLE_PICK_FACT_CACHE = {}
@@ -2381,7 +2592,8 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
                            allow_place=True, cost_bound=None, deadline=None,
                            anonymous=False, labeled_h=False, collapsed_h=False,
                            grasp_collapsed_h=False, bracing=False, part_order_bias=False,
-                           stats_every=None, por=False, geo_facts=False):
+                           stats_every=None, por=False, geo_facts=False,
+                           sig_collapsed_h=False):
   """EXACT (weighted) A* over scene-graph states from the initial scene to a completed
   assembly -- the reference baseline. Priority is f = g + weight * h.
     - weight = 1.0 : ordinary A*, returns a minimum-cost plan.
@@ -2437,7 +2649,7 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
   # greedy strolls the astronomical h-NEUTRAL state shell (robots x grasps); the g term is
   # what forbids that, not a tie-break.
   h_lab = None
-  if (labeled_h or collapsed_h or grasp_collapsed_h) and use_heuristic:
+  if (labeled_h or collapsed_h or grasp_collapsed_h or sig_collapsed_h) and use_heuristic:
     if math.isinf(weight):
       warnings.warn("labeled/collapsed heuristics are gated to finite weights (measured: "
                     "greedy+labeled wanders h-neutral shells into 1000+-action plans). "
@@ -2450,10 +2662,11 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
       # pick facts use the PLAIN floating EE even when the checker runs the wrist variant:
       # fact scenes hold ONE part at a free table spot (no clutter), so the wrist capsule
       # adds nothing there except unsound wrist-vs-table rejections (see _wrist_table_pair).
-      cls = (GraspCollapsedHeuristic if grasp_collapsed_h
+      cls = (SignatureCollapsedHeuristic if sig_collapsed_h
+             else GraspCollapsedHeuristic if grasp_collapsed_h
              else CollapsedLabeledHeuristic if collapsed_h
              else LabeledDisassemblyHeuristic)
-      if _problem._DENSE_GRASPS and not grasp_collapsed_h:
+      if _problem._DENSE_GRASPS and not (grasp_collapsed_h or sig_collapsed_h):
         warnings.warn("labeled_h/collapsed_h with dense grasps label RAW grasp ids, so the "
                       "tilt variants ~3x the label space per robot (build explodes ~3^R, "
                       "measured 24x). Use grasp_collapsed_h (--grasp-collapsed-h): it folds "
@@ -2656,7 +2869,8 @@ def solve_assembly_problem_lazy(C, assembly, robots=None, max_nodes=200000, verb
                                 wrench=False, wrench_aware_h=True, handovers=True,
                                 allow_place=True, cost_bound=None, deadline=None,
                                 labeled_h=False, collapsed_h=False, grasp_collapsed_h=False,
-                                bracing=False, max_rounds=2000, geo_facts=False):
+                                bracing=False, max_rounds=2000, geo_facts=False,
+                                sig_collapsed_h=False):
   """LAZY-VALIDATION exact search (LazySP-style; spec 6.5). Same discrete model, heuristics
   and guarantees as `solve_assembly_problem`, but the EXPENSIVE per-edge feasibility (cheap
   geometry + IK) moves from every popped edge to CANDIDATE PLANS ONLY:
@@ -2689,9 +2903,10 @@ def solve_assembly_problem_lazy(C, assembly, robots=None, max_nodes=200000, verb
   if gk is not None:
     reset_wrench_cache()
   h_lab = None
-  if (labeled_h or collapsed_h or grasp_collapsed_h) and use_heuristic \
+  if (labeled_h or collapsed_h or grasp_collapsed_h or sig_collapsed_h) and use_heuristic \
       and not math.isinf(weight):
-    cls = (GraspCollapsedHeuristic if grasp_collapsed_h
+    cls = (SignatureCollapsedHeuristic if sig_collapsed_h
+           else GraspCollapsedHeuristic if grasp_collapsed_h
            else CollapsedLabeledHeuristic if collapsed_h
            else LabeledDisassemblyHeuristic)
     h_lab = cls(assembly, len(robots), grasp_table,
@@ -2777,7 +2992,7 @@ def solve_assembly_problem_bounded(C, assembly, robots=None, verbose=True, robot
                                    handovers=True, allow_place=True, bracing=False,
                                    labeled_h=False, collapsed_h=False,
                                    grasp_collapsed_h=True, stats_every=None,
-                                   geo_facts=False):
+                                   geo_facts=False, sig_collapsed_h=False):
   """INCUMBENT-BOUNDED exact search -- the principled wrapper around the fast decomposed
   solvers. Phase 1: the MILESTONE planner produces an incumbent plan fast (its greedy
   commitments carry no bound). Phase 2: the exact search runs with cost_bound = U (the
@@ -2794,7 +3009,8 @@ def solve_assembly_problem_bounded(C, assembly, robots=None, verbose=True, robot
   inc = solve_assembly_problem_milestones(
       C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik,
       weight=max(weight, 5.0), wrench=wrench, handovers=handovers,
-      allow_place=allow_place, bracing=bracing, geo_facts=geo_facts)
+      allow_place=allow_place, bracing=bracing, geo_facts=geo_facts,
+      sig_collapsed_h=sig_collapsed_h)
   U = sum(action_cost(a) for a in inc) if inc else None
   if verbose:
     print(f"[bounded] incumbent: {'cost %g (%d actions)' % (U, len(inc)) if inc else 'NONE'} "
@@ -2805,7 +3021,7 @@ def solve_assembly_problem_bounded(C, assembly, robots=None, verbose=True, robot
       max_nodes=max_nodes, wrench=wrench, handovers=handovers, allow_place=allow_place,
       bracing=bracing, labeled_h=labeled_h, collapsed_h=collapsed_h,
       grasp_collapsed_h=grasp_collapsed_h, cost_bound=U, stats_every=stats_every,
-      geo_facts=geo_facts)
+      geo_facts=geo_facts, sig_collapsed_h=sig_collapsed_h)
   if best is not None and (U is None or sum(action_cost(a) for a in best) < U):
     if verbose:
       print(f"[bounded] exact search IMPROVED the incumbent "
@@ -3220,7 +3436,8 @@ def _add_one_part_declutter(start, p, ideal, assembly, robots, checker, grasp_ta
 def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, robot_ik=None,
                                       weight=5.0, max_nodes=20000, wrench=False,
                                       handovers=True, allow_place=True, bracing=False,
-                                      max_repairs=100, geo_facts=False):
+                                      max_repairs=100, geo_facts=False,
+                                      sig_collapsed_h=False):
   """MILESTONE (Dogar-style, abstraction-guided) planner. Two levels:
 
     LEVEL 1: the assembly SEQUENCE. The labeled abstraction's backward Dijkstra (the same
@@ -3251,7 +3468,8 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
     reset_wrench_cache()
   # the milestone oracle: GraspCollapsedHeuristic == CollapsedLabeledHeuristic when dense
   # grasps are off, and the label-collapsed variant when they are on -- always the right one.
-  h_lab = GraspCollapsedHeuristic(assembly, len(robots), grasp_table,
+  h_cls = SignatureCollapsedHeuristic if sig_collapsed_h else GraspCollapsedHeuristic
+  h_lab = h_cls(assembly, len(robots), grasp_table,
                                   gripper_path=getattr(checker, "fact_gripper_path",
                                                        checker.gripper_path),
                                   verbose=verbose, gripper_kind=gk, bracing=bracing,
