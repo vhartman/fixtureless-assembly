@@ -1803,6 +1803,8 @@ class CollapsedLabeledHeuristic:
   linkage the fine class gets implicitly). With handovers enabled a press-capable but
   unpickable grasp is REAL-reachable (pick any grasp, hand over in the air), so that
   conjunction gate would be INADMISSIBLE. The collapse simply prices the swap optimistically.
+  (The fine class now models that swap EXPLICITLY -- inverse LOOSE-HANDOVER, cost 2 -- so
+  its linkage is an admissible +2 price rather than a hard gate; 2026-07-17.)
 
   Kept fully separate from the fine class (own flag `collapsed_h`) so the well-tested one
   stays untouched; the duplication is the price of that isolation."""
