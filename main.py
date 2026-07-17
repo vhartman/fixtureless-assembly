@@ -601,7 +601,8 @@ def main():
                                                  bracing=args.bracing,
                                                  grasp_collapsed_h=args.grasp_collapsed_h,
                                                  collapsed_h=args.collapsed_h,
-                                                 labeled_h=args.labeled_h)
+                                                 labeled_h=args.labeled_h,
+                                                 sig_collapsed_h=args.sig_collapsed_h)
       elif args.anytime is not None:
         plan, _cost, _opt = solve_assembly_problem_anytime(
             C, assembly, robots=robots, time_budget=args.anytime, robot_ik=robot_ik,
@@ -609,7 +610,8 @@ def main():
             anonymous=args.anon_robots, labeled_h=args.labeled_h,
             collapsed_h=args.collapsed_h, grasp_collapsed_h=args.grasp_collapsed_h,
             wrench_aware_h=args.wrench_aware_h, bracing=args.bracing,
-            part_order_bias=args.part_order_bias)
+            part_order_bias=args.part_order_bias,
+            sig_collapsed_h=args.sig_collapsed_h)
       else:
         plan = solve_assembly_problem(C, assembly, robots=robots, canonical=args.canonical,
                                       weight=args.weight, robot_ik=robot_ik, wrench=args.wrench,
