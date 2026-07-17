@@ -177,7 +177,8 @@ class Assembly:
     return self.position_in_base(parent) + np.asarray(rel_pos, dtype=float)
 
 def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, max_tries=200,
-                         spacing=1.0 / 7.0, per_row=8, random_init=None, float_height=0.015):
+                         spacing=1.0 / 7.0, per_row=8, random_init=None, float_height=0.015,
+                         min_sep=None):
   # scatter the assembly's parts on the table as loose cubes (test scene). Geometry
   # (cube_size / cube_radius) comes from the assembly, not a global. `spacing` = the x-pitch
   # of the scatter line (default = historical 1/7 m ~ 0.143); a knob for analysing how much
@@ -227,9 +228,17 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
           # FULL randomization (seeded, hence reproducible): uniform x/y in the central
           # square [-random_init, +random_init]^2 between the robots + a random yaw,
           # rejection-sampled collision-free against everything already placed (parts,
-          # table, robot bases/arms). Falls back to the nominal line spot if exhausted.
+          # table, robot bases/arms). `min_sep` additionally enforces a pairwise x/y
+          # SEPARATION from every earlier part (e.g. 0.2 so graspability/geometry of
+          # different parts provably cannot interact -- the POR independence assumption).
+          # Falls back to the nominal line spot if exhausted.
+          placed = [np.asarray(C.getFrame(q).getPosition()[:2])
+                    for q in assembly.objects[:i]]
           for _ in range(max_tries):
               xy = np.random.uniform(-float(random_init), float(random_init), size=2)
+              if min_sep is not None and any(
+                  np.linalg.norm(xy - p) < float(min_sep) for p in placed):
+                  continue
               yaw = np.random.uniform(-np.pi, np.pi)
               obj.setRelativePosition([xy[0], xy[1], pos[2]])
               obj.setRelativeQuaternion(list(_quat_mul(
@@ -1754,6 +1763,10 @@ def successors(state, assembly, robots, grasp_table=None, canonical=False,
   # remaining holder either way. allow_place=False FORBIDS setting a held group back on the
   # table -> the search holds + regrasps in the air (no forced regime; just fewer options).
   def _gen():
+    # ORDER MEASURED 2026-07-17 (assembles-first vs this picks-first): bit-identical searches
+    # on cross-6/cross-7; on car-mini 2.1x fewer expansions but a 33% WORSE plan (cost 20->28
+    # -- diving into the first workable mate commits before better variants are seen). Keep
+    # picks-first; emission order is a tie-break lottery, don't retune it.
     yield from picks(state, assembly, robots, grasp_table=grasp_table, canonical=canonical)
     yield from assembles(state, assembly, robots, gripper_kind=gripper_kind)  # incl. module joins
     if handovers:

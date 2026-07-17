@@ -2101,10 +2101,31 @@ def _table_aware_pick_fact(assembly, S_key, face, gpart, gid, gripper_path,
   return ok
 
 
+def _por_parts(a):
+  # parts an action's manipulation touches (assemble touches the mate target too)
+  return {a[2], a[3]} if a[0] == "assemble" else {a[2]}
+
+
+def _por_keep(a_in, b):
+  # PARTIAL-ORDER REDUCTION (sleep-set-lite, EXPERIMENTAL --por): among INDEPENDENT actions
+  # -- different robots AND disjoint parts -- every interleaving reaches the same state, so
+  # only the canonically SORTED one is expanded: prune successor `b` when it is independent
+  # of the incoming action `a_in` and precedes it in the fixed total (tuple) order; the
+  # b-before-a_in interleaving is generated elsewhere. KNOWN UNSOUND in general here:
+  # feasibility (IK/cheap geometry) is order-COUPLED through arm/part positions, so the
+  # pruned interleaving may be the only feasible one -- hence flag-gated, meant for spread
+  # scenes (--min-sep) with floating EEs where the independence assumption actually holds.
+  if a_in[1] == b[1]:
+    return True                                           # same robot: dependent
+  if _por_parts(a_in) & _por_parts(b):
+    return True                                           # shared part: dependent
+  return not (tuple(map(str, b)) < tuple(map(str, a_in)))
+
+
 def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
            edge_check_fn=None, weight=1.0, max_nodes=200000, verbose=True,
            tag="A*", t0=None, cost_bound=None, deadline=None, order_key_fn=None,
-           stats_every=None):
+           stats_every=None, por=False):
   """Generic LAZY weighted-A* engine, shared by every search variant (exact + optimistic).
 
   The domain enters only through callbacks -- this function knows nothing about assemblies:
@@ -2204,6 +2225,8 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
       return None
 
     for act, ns in succ_fn(s):
+      if por and action is not None and not _por_keep(action, act):
+        continue                                          # POR: sorted interleaving expanded elsewhere
       if ns in claimed:
         continue
       if cheap_fn is not None and not cheap_fn(s, act, ns):
@@ -2258,7 +2281,7 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
                            allow_place=True, cost_bound=None, deadline=None,
                            anonymous=False, labeled_h=False, collapsed_h=False,
                            grasp_collapsed_h=False, bracing=False, part_order_bias=False,
-                           stats_every=None):
+                           stats_every=None, por=False):
   """EXACT (weighted) A* over scene-graph states from the initial scene to a completed
   assembly -- the reference baseline. Priority is f = g + weight * h.
     - weight = 1.0 : ordinary A*, returns a minimum-cost plan.
@@ -2400,7 +2423,7 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
                   edge_check_fn=edge_check_fn,
                   weight=weight, max_nodes=max_nodes, verbose=verbose, tag=tag, t0=t0,
                   cost_bound=cost_bound, deadline=deadline, order_key_fn=okey,
-                  stats_every=stats_every)
+                  stats_every=stats_every, por=por)
   finally:
     set_anonymous_robots(False)
 

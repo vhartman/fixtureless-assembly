@@ -191,6 +191,20 @@ def parse_args():
            "branching (~N x places).",
   )
   parser.add_argument(
+      "--por", action="store_true",
+      help="EXPERIMENTAL partial-order reduction in the exact search: among INDEPENDENT "
+           "successor actions (different robots, disjoint parts) only the canonically sorted "
+           "interleaving is expanded. KNOWN UNSOUND in general (feasibility is order-coupled "
+           "through geometry) -- meant for spread scenes (--min-sep) with floating EEs where "
+           "independence actually holds. Prints when active.",
+  )
+  parser.add_argument(
+      "--min-sep", type=float, default=None, metavar="M",
+      help="With --random-init: enforce a pairwise x/y separation of at least M metres "
+           "between parts (e.g. 0.2), so part geometries/graspability provably cannot "
+           "interact -- the --por independence assumption.",
+  )
+  parser.add_argument(
       "--prefer-center", action="store_true",
       help="With --place-cells: offer the CELL placements (table centre first) BEFORE the "
            "classic scatter-anchor placement -- at equal f the FIFO tie-break then tries "
@@ -440,9 +454,12 @@ def main():
 
   assembly = make_assembly(args.assembly, args.parts)
 
+  if args.por:
+    print("[flag] --por ACTIVE: partial-order reduction over independent successor actions "
+          "(EXPERIMENTAL, unsound when part/arm geometries interact -- use --min-sep).")
   C = add_disassembled_obj(C, assembly, perturb_start_pose=args.perturb_start_pose,
                            spacing=args.scatter_spacing, random_init=args.random_init,
-                           float_height=args.part_float)
+                           float_height=args.part_float, min_sep=args.min_sep)
 
 
   if args.show_init:
@@ -547,7 +564,7 @@ def main():
                                       grasp_collapsed_h=args.grasp_collapsed_h,
                                       wrench_aware_h=args.wrench_aware_h, bracing=args.bracing,
                                       part_order_bias=args.part_order_bias,
-                                      stats_every=args.search_stats)
+                                      stats_every=args.search_stats, por=args.por)
     except IKFailureLogDone:
       print(f"[ik-failures] window/cap reached -- search stopped for debugging "
             f"({len(fail_rec.steps)} failures collected).")
