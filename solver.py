@@ -74,6 +74,12 @@ class CollisionChecker:
       template.getFrame(prefix + "ur_base").setPosition(_park_pos(i))
     self.template = template
     self._verdicts = {}                                    # discrete scene signature -> bool
+    # PERSISTENT scene reuse (2026-07-17): rai's stale-broadphase problem is solved by a
+    # global C.setJointState(C.getJointState()) round-trip before computeCollisions -- it
+    # refreshes ALL frame writes (even plain setPosition on jointless frames; measured
+    # ~0.005ms/query vs ~1.25ms for copy+rebuild, and the query cost was ~50% of floating
+    # searches). False falls back to the historical fresh-copy-per-query path.
+    self.persistent = True
 
   def _sig(self, state, extra_grasps):
     # DISCRETE signature of everything `_check` looks at, for verdict memoization. Per
@@ -110,8 +116,11 @@ class CollisionChecker:
     # can move it away). So held groups are parked far away -- internal collisions are
     # preserved (rigid), external ones vanish (conservative). On-table groups keep their
     # REAL poses (their pose is fixed), so table / neighbour collisions there do reject.
-    C_col = ry.Config()
-    C_col.addConfigurationCopy(self.template)
+    if self.persistent:
+      C_col = self.template                                # in-place repose + refresh below
+    else:
+      C_col = ry.Config()
+      C_col.addConfigurationCopy(self.template)
 
     part_poses = _state_part_poses(state, assembly, lift=0.0)
     for k, group in enumerate(state.subassemblies()):
@@ -136,7 +145,17 @@ class CollisionChecker:
       root = C_col.getFrame(prefix + "ur_base")
       root.setPosition(base_world[:3])
       root.setQuaternion(base_world[3:])
-    # any remaining slots stay parked (from the template) -> out of the way.
+    if self.persistent:
+      # in-place mutation keeps STALE poses from the previous query: explicitly RE-PARK the
+      # unused slots (parts are all reposed above every query), then force the global
+      # kinematics/proxy REFRESH -- without it rai serves stale collision results.
+      for i in range(len(grasps), len(self.slots)):
+        root = C_col.getFrame(self.slots[i] + "ur_base")
+        root.setPosition(_park_pos(i))
+        root.setQuaternion([1.0, 0.0, 0.0, 0.0])
+      C_col.setJointState(C_col.getJointState())
+      C_col.computeCollisions()
+    # (fresh-copy path: remaining slots stay parked from the template.)
     return C_col
 
   def _check(self, state, assembly, extra_grasps=(), note=""):
@@ -1412,6 +1431,36 @@ class AbstractionHeuristic:
     return self.dist.get(self.abstract(state), 0.0)
 
 
+def _labeled_geo_ok(checker, assembly, st, ideal_set, note=""):
+  """GEO-fact core (--geo-facts): floating-gripper COEXISTENCE check for a crafted labeled
+  state -- can all the state's grippers physically BE at their grasps on the assembly at
+  its rest face (table included; a held/Hf assembly is parked by the checker, so only its
+  pose-invariant internals count)? A floating gripper in collision is in collision under
+  EVERY robot/arm realization, so False refutes every concrete state mapping to the label
+  (sound relay gate, h stays admissible). Loose parts are RELOCATABLE, so they are parked
+  far away first -- their incidental synthetic slots must never reject. The verdict is
+  xy/yaw-invariant (gripper-vs-assembly is relative, the table is a z-plane), so the
+  synthetic anchor stands in for any concrete one -- PROVIDED the anchor z matches the
+  real scene's convention: rest heights are computed RELATIVE to the anchor pose, and the
+  real anchors carry the part-float offset (parts hover float_height above the table).
+  crafted()'s _flat_poses z is arbitrary, so the group anchor is replaced by the SAME
+  _initial_anchor lookup the real places() uses (problem.py) -- without it every
+  near-table gripper/part 'penetrates' by exactly the float height (measured on car-mini:
+  8206/10230 facts falsely False, h inflated past admissibility near the goal)."""
+  ref = reference_part(ideal_set)
+  init = getattr(assembly, "_initial_anchor", {}).get(ref)
+  if init is not None:
+    st.poses[ref] = np.asarray(init, dtype=float).copy()
+  i = 0
+  for p in assembly.objects:
+    if p not in ideal_set:
+      pose = np.asarray(st.poses[p], dtype=float).copy()
+      pose[1] += 1000.0 + 5.0 * i
+      st.poses[p] = pose
+      i += 1
+  return checker._check(st, assembly, note=note)
+
+
 class LabeledDisassemblyHeuristic:
   """GRASP-LABELED backward-disassembly abstraction (the tractability spike).
 
@@ -1443,7 +1492,8 @@ class LabeledDisassemblyHeuristic:
   H = "H"                                                  # face value for held-in-air
 
   def __init__(self, assembly, n_robots, grasp_table, gripper_path=None, verbose=False,
-               max_states=2_000_000, clearance=0.02, gripper_kind=None, bracing=False):
+               max_states=2_000_000, clearance=0.02, gripper_kind=None, bracing=False,
+               geo_checker=None):
     import heapq
     import time as _time
 
@@ -1570,8 +1620,25 @@ class LabeledDisassemblyHeuristic:
         hit = self._wfacts[key] = ok
       return hit
 
+    # ---- GEO facts (--geo-facts / geo_checker set): gate the backward RELAY on each
+    # labeled state's floating-gripper coexistence (see _labeled_geo_ok). Raw labels =>
+    # a direct check; keyed alongside the wrench facts. G empty => nothing to check (and
+    # a marginal rest-face graze must never kill a gripperless state).
+    def geo_ok(ideal_key, G, face):
+      if geo_checker is None or not G:
+        return True
+      key = ("G", ideal_key, G, face)
+      hit = self._wfacts.get(key)
+      if hit is None:
+        hit = self._wfacts[key] = _labeled_geo_ok(
+            geo_checker, assembly, crafted(ideal_key, G, face), set(ideal_key),
+            note=f"geo fact {ideal_key} G={G} face={face}")
+      return hit
+
     def preds(t):
       ideal, G, face, L = t
+      if not geo_ok(ideal, G, face):
+        return                                            # no concrete realization -> no relay
       cap_used = len(G) + len(L)
       # inverse ASSEMBLE: some (q,gq) in G was the inserter's brace; q maximal in ideal
       for q, gq in G:
@@ -1630,6 +1697,18 @@ class LabeledDisassemblyHeuristic:
         for pg_old in self.valid[ideal]:
           if pg_old != pg_new:
             yield (ideal, (pg_old,), Hf, L), 2.0
+      # inverse LOOSE-HANDOVER (cost 2): a loose part's grasp was swapped in the air
+      # (needs a transiently free arm, like the fused handover above). Without this edge a
+      # press-capable-but-unpickable insertion grasp DEAD-ENDS the backward relay although
+      # the real plan can pick any grasp and hand over -- i.e. the grasp-labeled class was
+      # INADMISSIBLE with handovers on (see the collapsed class doc); this edge restores
+      # the relaxation at the swap's real fused cost, keeping the pick/press linkage as a
+      # +2 PRICE instead of a hard gate.
+      if cap_used < self.R:
+        for q, gq in L:
+          for gq2 in self.single[q]:
+            if gq2 != gq:
+              yield (ideal, G, face, tadd(tsub(L, (q, gq)), (q, gq2))), 2.0
       # inverse PLACE-LOOSE: a loose part now on the table was held just before
       if cap_used < self.R:
         for q in objs:
@@ -1732,7 +1811,7 @@ class CollapsedLabeledHeuristic:
 
   def __init__(self, assembly, n_robots, grasp_table, gripper_path=None, verbose=False,
                max_states=2_000_000, clearance=0.02, gripper_kind=None, bracing=False,
-               collapse_grasps=False):
+               collapse_grasps=False, geo_checker=None):
     import heapq
     import time as _time
 
@@ -1899,8 +1978,27 @@ class CollapsedLabeledHeuristic:
         hit = self._wfacts[key] = ok
       return hit
 
+    # ---- GEO facts (--geo-facts / geo_checker set): gate the backward RELAY on each
+    # labeled state's floating-gripper coexistence (see _labeled_geo_ok). Collapsed
+    # labels: geometrically possible if ANY raw-variant assignment is (OR = a further
+    # relaxation, admissibility preserved -- the same pattern as w_hold_ok).
+    def geo_ok(ideal_key, G, face):
+      if geo_checker is None or not G:
+        return True
+      key = ("G", ideal_key, G, face)
+      hit = self._wfacts.get(key)
+      if hit is None:
+        hit = self._wfacts[key] = any(
+            _labeled_geo_ok(geo_checker, assembly, crafted(ideal_key, Gv, face),
+                            set(ideal_key),
+                            note=f"geo fact {ideal_key} G={Gv} face={face}")
+            for Gv in gcombos(ideal_key, G))
+      return hit
+
     def preds(t):
       ideal, G, face, L = t                               # L: bare part names
+      if not geo_ok(ideal, G, face):
+        return                                            # no concrete realization -> no relay
       cap_used = len(G) + len(L)
       # inverse ASSEMBLE: some (q,gq) in G was the inserter's brace; q maximal in ideal.
       # The predecessor holds q LOOSE -- as a bare name (its grasp identity is forgotten).
@@ -2281,7 +2379,7 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
                            allow_place=True, cost_bound=None, deadline=None,
                            anonymous=False, labeled_h=False, collapsed_h=False,
                            grasp_collapsed_h=False, bracing=False, part_order_bias=False,
-                           stats_every=None, por=False):
+                           stats_every=None, por=False, geo_facts=False):
   """EXACT (weighted) A* over scene-graph states from the initial scene to a completed
   assembly -- the reference baseline. Priority is f = g + weight * h.
     - weight = 1.0 : ordinary A*, returns a minimum-cost plan.
@@ -2361,7 +2459,8 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
       h_lab = cls(assembly, len(robots), grasp_table,
                   gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
                   verbose=verbose,
-                  gripper_kind=gk if wrench_aware_h else None, bracing=bracing)
+                  gripper_kind=gk if wrench_aware_h else None, bracing=bracing,
+                  geo_checker=checker if geo_facts else None)
       h_abs = None
 
   def h_fn(state):
@@ -2555,7 +2654,7 @@ def solve_assembly_problem_lazy(C, assembly, robots=None, max_nodes=200000, verb
                                 wrench=False, wrench_aware_h=True, handovers=True,
                                 allow_place=True, cost_bound=None, deadline=None,
                                 labeled_h=False, collapsed_h=False, grasp_collapsed_h=False,
-                                bracing=False, max_rounds=2000):
+                                bracing=False, max_rounds=2000, geo_facts=False):
   """LAZY-VALIDATION exact search (LazySP-style; spec 6.5). Same discrete model, heuristics
   and guarantees as `solve_assembly_problem`, but the EXPENSIVE per-edge feasibility (cheap
   geometry + IK) moves from every popped edge to CANDIDATE PLANS ONLY:
@@ -2596,7 +2695,8 @@ def solve_assembly_problem_lazy(C, assembly, robots=None, max_nodes=200000, verb
     h_lab = cls(assembly, len(robots), grasp_table,
                 gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
                 verbose=verbose,
-                gripper_kind=gk if wrench_aware_h else None, bracing=bracing)
+                gripper_kind=gk if wrench_aware_h else None, bracing=bracing,
+                geo_checker=checker if geo_facts else None)
     h_abs = None
 
   def h_fn(state):
@@ -2668,6 +2768,52 @@ def solve_assembly_problem_lazy(C, assembly, robots=None, max_nodes=200000, verb
   if verbose:
     print(f"[lazy] round budget ({max_rounds}) exhausted")
   return None
+
+
+def solve_assembly_problem_bounded(C, assembly, robots=None, verbose=True, robot_ik=None,
+                                   weight=1.0, max_nodes=200000, wrench=False,
+                                   handovers=True, allow_place=True, bracing=False,
+                                   labeled_h=False, collapsed_h=False,
+                                   grasp_collapsed_h=True, stats_every=None,
+                                   geo_facts=False):
+  """INCUMBENT-BOUNDED exact search -- the principled wrapper around the fast decomposed
+  solvers. Phase 1: the MILESTONE planner produces an incumbent plan fast (its greedy
+  commitments carry no bound). Phase 2: the exact search runs with cost_bound = U (the
+  incumbent's cost): `_astar` prunes g + h >= U with the UNWEIGHTED admissible h, which is
+  sound -- every prefix of an optimal plan has g + h <= optimal < U and survives -- and it
+  is precisely the high-g plateau shells that die. Returns the better plan.
+
+  GUARANTEE: result cost <= min(U, weight x optimal). With weight=1 the phase-2 search is
+  ordinary A*: finding nothing below U proves U cannot be beaten by more than the claim-once
+  approximation, and any found plan is optimal. The incumbent is returned as-is if phase 2
+  finds nothing better (bound-exhaustion / budget)."""
+  import time
+  t0 = time.perf_counter()
+  inc = solve_assembly_problem_milestones(
+      C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik,
+      weight=max(weight, 5.0), wrench=wrench, handovers=handovers,
+      allow_place=allow_place, bracing=bracing, geo_facts=geo_facts)
+  U = sum(action_cost(a) for a in inc) if inc else None
+  if verbose:
+    print(f"[bounded] incumbent: {'cost %g (%d actions)' % (U, len(inc)) if inc else 'NONE'} "
+          f"in {time.perf_counter() - t0:.1f}s -> exact search with cost_bound="
+      f"{U if U is not None else 'inf'}")
+  best = solve_assembly_problem(
+      C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik, weight=weight,
+      max_nodes=max_nodes, wrench=wrench, handovers=handovers, allow_place=allow_place,
+      bracing=bracing, labeled_h=labeled_h, collapsed_h=collapsed_h,
+      grasp_collapsed_h=grasp_collapsed_h, cost_bound=U, stats_every=stats_every,
+      geo_facts=geo_facts)
+  if best is not None and (U is None or sum(action_cost(a) for a in best) < U):
+    if verbose:
+      print(f"[bounded] exact search IMPROVED the incumbent "
+            f"({U} -> {sum(action_cost(a) for a in best):g}) "
+            f"in {time.perf_counter() - t0:.1f}s total")
+    return best
+  if verbose and inc is not None:
+    print(f"[bounded] incumbent stands (exact found nothing cheaper under the bound) "
+          f"in {time.perf_counter() - t0:.1f}s total")
+  return inc
 
 
 def solve_assembly_problem_anytime(C, assembly, robots=None, time_budget=60.0,
@@ -3072,7 +3218,7 @@ def _add_one_part_declutter(start, p, ideal, assembly, robots, checker, grasp_ta
 def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, robot_ik=None,
                                       weight=5.0, max_nodes=20000, wrench=False,
                                       handovers=True, allow_place=True, bracing=False,
-                                      max_repairs=100):
+                                      max_repairs=100, geo_facts=False):
   """MILESTONE (Dogar-style, abstraction-guided) planner. Two levels:
 
     LEVEL 1: the assembly SEQUENCE. The labeled abstraction's backward Dijkstra (the same
@@ -3106,7 +3252,8 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
   h_lab = GraspCollapsedHeuristic(assembly, len(robots), grasp_table,
                                   gripper_path=getattr(checker, "fact_gripper_path",
                                                        checker.gripper_path),
-                                  verbose=verbose, gripper_kind=gk, bracing=bracing)
+                                  verbose=verbose, gripper_kind=gk, bracing=bracing,
+                                  geo_checker=checker if geo_facts else None)
   Hf = h_lab.H
 
   def oracle(ideal_set, q):

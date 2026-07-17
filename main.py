@@ -218,6 +218,14 @@ def parse_args():
            "search only.",
   )
   parser.add_argument(
+      "--bounded", action="store_true",
+      help="INCUMBENT-BOUNDED search: the milestone planner produces a fast incumbent plan, "
+           "then the exact search runs with the incumbent's cost as a sound prune bound "
+           "(g+h >= U dies; optimal prefixes always survive). Result <= min(incumbent, "
+           "weight x optimal); with --weight 1 the phase-2 result is optimal. Combines the "
+           "decomposed solver's speed with the exact search's guarantee.",
+  )
+  parser.add_argument(
       "--lazy", action="store_true",
       help="LAZY-VALIDATION exact search (LazySP-style): search the discrete graph "
            "optimistically (no per-edge cheap-collision/IK), then validate only the CANDIDATE "
@@ -371,6 +379,20 @@ def parse_args():
            "--dense-grasps it behaves exactly like --collapsed-h.",
   )
   parser.add_argument(
+      "--geo-facts", action="store_true",
+      help="Gate the labeled abstraction's backward Dijkstra with FLOATING-GRIPPER "
+           "geometry: a labeled state (assembly at a rest face + its grasps/braces) whose "
+           "grippers cannot physically coexist (gripper-vs-assembly, gripper-vs-gripper, "
+           "gripper-vs-table) relays nothing backward. Sound and admissible, but MEASURED "
+           "MOSTLY HARMFUL as a speed feature: the h build pays 10-100s of collision "
+           "facts, the exact/lazy searches barely visit the killed labels, and on "
+           "car-mini the tightened h wrecks the w=5 greedy corridor (2.5k -> 80k "
+           "expansions; same dead-end-conversion effect as --brace-for-assembly-only). "
+           "Real value measured: milestone plan QUALITY (car-mini 31 -> 25 actions, "
+           "noisy cross 36 -> 32) and it lets the noise-0.05 cross exact search "
+           "terminate. Kept for experimentation; prints when active.",
+  )
+  parser.add_argument(
       "--view-cheap-checks", action="store_true",
       help="Step through every (uncached) cheap collision check in a blocking C.view(True) "
            "window -- verdict, triggering action, and penetrating pairs in the overlay. "
@@ -454,6 +476,10 @@ def main():
 
   assembly = make_assembly(args.assembly, args.parts)
 
+  if args.geo_facts:
+    print("[flag] --geo-facts ACTIVE: labeled-abstraction backward relay gated on "
+          "floating-gripper coexistence (gripper-vs-assembly/gripper/table); sound "
+          "necessary condition, h stays admissible.")
   if args.por:
     print("[flag] --por ACTIVE: partial-order reduction over independent successor actions "
           "(EXPERIMENTAL, unsound when part/arm geometries interact -- use --min-sep).")
@@ -522,18 +548,26 @@ def main():
       robot_ik.fail_log_seconds = args.log_ik_failures
       robot_ik.fail_log_stop = True                # abort the search when the window closes
     try:
-      if args.lazy:
+      if args.bounded:
+        plan = solve_assembly_problem_bounded(
+            C, assembly, robots=robots, robot_ik=robot_ik, weight=args.weight,
+            wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
+            bracing=args.bracing, labeled_h=args.labeled_h, collapsed_h=args.collapsed_h,
+            grasp_collapsed_h=args.grasp_collapsed_h or not (args.labeled_h or args.collapsed_h),
+            stats_every=args.search_stats, geo_facts=args.geo_facts)
+      elif args.lazy:
         plan = solve_assembly_problem_lazy(
             C, assembly, robots=robots, weight=args.weight, robot_ik=robot_ik,
             wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
             labeled_h=args.labeled_h, collapsed_h=args.collapsed_h,
             grasp_collapsed_h=args.grasp_collapsed_h,
-            wrench_aware_h=args.wrench_aware_h, bracing=args.bracing)
+            wrench_aware_h=args.wrench_aware_h, bracing=args.bracing,
+            geo_facts=args.geo_facts)
       elif args.milestones:
         plan = solve_assembly_problem_milestones(
             C, assembly, robots=robots, robot_ik=robot_ik, weight=args.weight,
             wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
-            bracing=args.bracing)
+            bracing=args.bracing, geo_facts=args.geo_facts)
       elif args.optimistic and args.declutter:
         plan = solve_assembly_problem_optimistic_declutter(
             C, assembly, robots=robots, robot_ik=robot_ik, weight=args.weight,
@@ -564,7 +598,8 @@ def main():
                                       grasp_collapsed_h=args.grasp_collapsed_h,
                                       wrench_aware_h=args.wrench_aware_h, bracing=args.bracing,
                                       part_order_bias=args.part_order_bias,
-                                      stats_every=args.search_stats, por=args.por)
+                                      stats_every=args.search_stats, por=args.por,
+                                      geo_facts=args.geo_facts)
     except IKFailureLogDone:
       print(f"[ik-failures] window/cap reached -- search stopped for debugging "
             f"({len(fail_rec.steps)} failures collected).")
