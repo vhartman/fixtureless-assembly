@@ -164,6 +164,14 @@ def parse_args():
            "support, and repair instead of an exact-search fallback.",
   )
   parser.add_argument(
+      "--lazy", action="store_true",
+      help="LAZY-VALIDATION exact search (LazySP-style): search the discrete graph "
+           "optimistically (no per-edge cheap-collision/IK), then validate only the CANDIDATE "
+           "PLAN's edges; a failed edge is blacklisted and the search reruns (heuristic built "
+           "once, caches warm). Same completeness and plan validity as the exact search; "
+           "wins when most eagerly-checked edges never end up in a plan.",
+  )
+  parser.add_argument(
       "--brace-for-assembly-only", action="store_true",
       help="EXPERIMENTAL (MEASURED HARMFUL, off by default): assume a brace (2nd grasp via "
            "add_grasp) is only needed to stabilise an ASSEMBLE, so a braced state (>=2 grippers "
@@ -446,7 +454,14 @@ def main():
       robot_ik.fail_log_seconds = args.log_ik_failures
       robot_ik.fail_log_stop = True                # abort the search when the window closes
     try:
-      if args.milestones:
+      if args.lazy:
+        plan = solve_assembly_problem_lazy(
+            C, assembly, robots=robots, weight=args.weight, robot_ik=robot_ik,
+            wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
+            labeled_h=args.labeled_h, collapsed_h=args.collapsed_h,
+            grasp_collapsed_h=args.grasp_collapsed_h,
+            wrench_aware_h=args.wrench_aware_h, bracing=args.bracing)
+      elif args.milestones:
         plan = solve_assembly_problem_milestones(
             C, assembly, robots=robots, robot_ik=robot_ik, weight=args.weight,
             wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,

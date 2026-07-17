@@ -2388,6 +2388,248 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
     set_anonymous_robots(False)
 
 
+class _IncrementalLazySearch:
+  """Persistent weighted-A* for the lazy-validation loop: LPA*-style INCREMENTAL repair
+  specialised to our only edge change -- single DELETIONS (blacklisting) of edges that lie
+  ON the current search tree. Instead of re-searching from scratch per blacklisted edge
+  (the measured cost of naive LazySP: ~0.3s x rounds), the heap, claims and parent tree
+  persist across rounds; deleting edge (s,a)->ns un-claims exactly the search-tree SUBTREE
+  rooted at ns and re-injects the recorded ALTERNATE entries into those nodes, then the
+  main loop simply continues from the retained frontier.
+
+  Exactness bookkeeping:
+    * claim-at-pop, one claim per state (same semantics/w-bound as _astar);
+    * an entry popped for an already-claimed state is NOT discarded but stored in
+      `alts[state]` -- the alternate routes a repair needs when that state is un-claimed;
+    * a popped entry is STALE-CHECKED against its parent: parent must be claimed, the edge
+      not blacklisted, and the entry's g must equal claimed[parent] + cost (a repair may
+      have re-claimed the parent at a different g -> re-push with corrected priority);
+    * successor lists are MEMOIZED per state (they depend only on the state), so
+      re-expanding a repaired region skips the wrench/support gates of `successors`."""
+
+  def __init__(self, start, goal_fn, succ_fn, cost_fn, h_fn, weight, blacklist,
+               cheap_gate=None):
+    import itertools
+    self.goal_fn, self.cost_fn, self.h_fn = goal_fn, cost_fn, h_fn
+    self.weight = weight
+    self.blacklist = blacklist                            # shared, grows externally
+    self.cheap_gate = cheap_gate                          # EAGER pop-time gate (cheap checks):
+    # laziness follows the COST HIERARCHY -- ~ms cheap-collision checks prune the optimistic
+    # tree exactly like the eager search (deferring them was measured to blow the search up
+    # 200k+ expansions on dense floating scenes), while ~100ms IK binds stay plan-lazy.
+    self._succ_raw = succ_fn                              # UNfiltered (blacklist at use time)
+    self._succ_cache = {}
+    self.tie = itertools.count()
+    self.pq = []
+    self.claimed = {}
+    self.came_from = {start: (None, None)}
+    self.children = {}
+    self.alts = {}
+    self.expanded = 0
+    self.budget_hit = False
+    h0 = h_fn(start)
+    self.pq.append((self._f(0.0, h0), h0, 0.0, next(self.tie), start, None, None))
+
+  def _f(self, g, hval):
+    import math
+    return hval if math.isinf(self.weight) else g + self.weight * hval
+
+  def _succ(self, s):
+    hit = self._succ_cache.get(s)
+    if hit is None:
+      hit = self._succ_cache[s] = list(self._succ_raw(s))
+    return hit
+
+  def search(self, max_nodes, deadline=None):
+    # run until a goal state is claimed (returns the Plan) or the frontier empties (None).
+    import heapq
+    import time
+    while self.pq:
+      entry = heapq.heappop(self.pq)
+      _f, _h, g, _, s, prev, action = entry
+      if s in self.claimed:
+        self.alts.setdefault(s, []).append(entry)         # keep as an alternate route
+        continue
+      if prev is not None:
+        if prev not in self.claimed or (prev, action) in self.blacklist:
+          continue                                        # stale: parent gone / edge deleted
+        g_true = self.claimed[prev] + self.cost_fn(action)
+        if g_true != g:                                   # parent re-claimed at another g
+          hs = self.h_fn(s)
+          heapq.heappush(self.pq, (self._f(g_true, hs), hs, g_true, next(self.tie),
+                                   s, prev, action))
+          continue
+        if self.cheap_gate is not None and not self.cheap_gate(prev, action, s):
+          self.blacklist.add((prev, action))              # cheap-infeasible: dead forever
+          continue
+      self.claimed[s] = g
+      if prev is not None:
+        self.came_from[s] = (prev, action)
+        self.children.setdefault(prev, []).append(s)
+      if self.goal_fn(s):
+        self._goal = s
+        return _reconstruct_plan(self.came_from, s)
+      self.expanded += 1
+      if self.expanded > max_nodes:
+        self.budget_hit = True
+        return None
+      if deadline is not None and time.perf_counter() > deadline:
+        self.budget_hit = True
+        return None
+      for a, ns in self._succ(s):
+        if (s, a) in self.blacklist:
+          continue
+        ng = g + self.cost_fn(a)
+        hns = self.h_fn(ns)
+        if hns == float("inf"):
+          continue
+        entry = (self._f(ng, hns), hns, ng, next(self.tie), ns, s, a)
+        if ns in self.claimed:
+          self.alts.setdefault(ns, []).append(entry)      # alternate for a future repair
+        else:
+          heapq.heappush(self.pq, entry)
+    return None
+
+  def delete_edge(self, s, a, ns):
+    # (s, a) was just blacklisted (caller added it). If it is the tree edge of ns, un-claim
+    # the SUBTREE rooted at ns (their g relied on the deleted edge) and re-inject each
+    # un-claimed node's alternates; everything else is untouched. Queued entries THROUGH the
+    # subtree are invalidated lazily by the stale checks at pop.
+    import heapq
+    if self.came_from.get(ns, (None, None)) != (s, a):
+      return                                              # not a tree edge: nothing to repair
+    stack = [ns]
+    while stack:
+      x = stack.pop()
+      if x not in self.claimed:
+        continue
+      del self.claimed[x]
+      self.came_from.pop(x, None)
+      stack.extend(self.children.pop(x, ()))
+      for alt in self.alts.pop(x, ()):
+        heapq.heappush(self.pq, alt)
+
+
+def solve_assembly_problem_lazy(C, assembly, robots=None, max_nodes=200000, verbose=True,
+                                use_heuristic=True, weight=1.0, robot_ik=None,
+                                wrench=False, wrench_aware_h=True, handovers=True,
+                                allow_place=True, cost_bound=None, deadline=None,
+                                labeled_h=False, collapsed_h=False, grasp_collapsed_h=False,
+                                bracing=False, max_rounds=2000):
+  """LAZY-VALIDATION exact search (LazySP-style; spec 6.5). Same discrete model, heuristics
+  and guarantees as `solve_assembly_problem`, but the EXPENSIVE per-edge feasibility (cheap
+  geometry + IK) moves from every popped edge to CANDIDATE PLANS ONLY:
+
+    repeat:
+      1. run the OPTIMISTIC search (wrench/support gates still live in `successors`; no
+         cheap-collision, no IK) minus the blacklist -> a candidate plan;
+      2. validate the plan's edges IN ORDER (cheap_feasible, then robot_ik.bind);
+      3. all pass -> done (the plan is exactly as validated as the eager search's);
+         first failure -> BLACKLIST that (state, action) edge and re-search.
+
+  Each failed round blacklists one genuinely-infeasible edge (never a sound one), so
+  completeness matches the eager search; termination: the edge set is finite. Re-searches
+  are cheap: the heuristic is built ONCE, `validated` edges skip re-checking, and the IK /
+  cheap / wrench caches stay warm. Pays off when the eager search burns most of its time
+  validating popped edges that never make it into a plan (measured: ~50% of runtime, 64%
+  of checked edges failing); loses when candidate plans are wildly infeasible (many rounds).
+  Returns a Plan with .states (replay-ready), or None."""
+  import math
+  import time
+
+  t0 = time.perf_counter()
+  if robots is None:
+    robots = get_robots(C)
+  gk = gripper_kind(C) if wrench else None
+  h_abs = AbstractionHeuristic(assembly, len(robots),
+                               gripper_kind=gk if wrench_aware_h else None) \
+      if use_heuristic and not math.isinf(weight) else None
+  checker, grasp_table = _search_context(C, assembly, robots)
+  if gk is not None:
+    reset_wrench_cache()
+  h_lab = None
+  if (labeled_h or collapsed_h or grasp_collapsed_h) and use_heuristic \
+      and not math.isinf(weight):
+    cls = (GraspCollapsedHeuristic if grasp_collapsed_h
+           else CollapsedLabeledHeuristic if collapsed_h
+           else LabeledDisassemblyHeuristic)
+    h_lab = cls(assembly, len(robots), grasp_table,
+                gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
+                verbose=verbose,
+                gripper_kind=gk if wrench_aware_h else None, bracing=bracing)
+    h_abs = None
+
+  def h_fn(state):
+    if not use_heuristic:
+      return 0.0
+    hv = heuristic(state, assembly)
+    if h_lab is not None:
+      return max(hv, h_lab.value(state))
+    return max(hv, h_abs.value(state)) if h_abs is not None else hv
+
+  blacklist = set()                                       # (state, action): validation-failed
+  validated = set()                                       # (state, action): validation-passed
+
+  def succ_raw(s):
+    return successors(s, assembly, robots, grasp_table=grasp_table,
+                      gripper_kind=gk, handovers=handovers,
+                      allow_place=allow_place, bracing=bracing)
+
+  start = get_initial_state(C, assembly)
+  if h_lab is not None and h_lab.value(start) == float("inf"):
+    if verbose:
+      print("[lazy] initial state provably cannot reach the goal (abstraction facts) -> "
+            "instance INFEASIBLE as configured.")
+    return None
+
+  engine = _IncrementalLazySearch(
+      start, goal_fn=lambda s: s.is_goal(assembly),
+      succ_fn=succ_raw, cost_fn=action_cost, h_fn=h_fn,
+      weight=weight, blacklist=blacklist,
+      cheap_gate=lambda prev, a, ns: cheap_feasible(a, prev, ns, assembly, checker))
+  n_checks = 0
+  for rounds in range(1, max_rounds + 1):
+    plan = engine.search(max_nodes, deadline=deadline)    # INCREMENTAL: continues the frontier
+    if plan is None:
+      if verbose:
+        why = "node/time budget hit" if engine.budget_hit else "optimistic graph exhausted"
+        print(f"[lazy] {why} after {rounds} rounds, {engine.expanded} expansions, "
+              f"{n_checks} IK validations, {time.perf_counter() - t0:.2f}s -- no plan")
+      return None
+    # only IK stays plan-lazy (cheap checks run eagerly inside the engine). FIRST-FAILURE
+    # selector (measured better than validate-the-whole-candidate: suffix edges after a
+    # failure mostly belong to futures that never recur -- 43.2s vs 28.6s on cross-7).
+    n_bad = 0
+    for s, a, ns in zip(plan.states, plan, plan.states[1:]):
+      key = (s, a)
+      if key in validated or robot_ik is None or a[0] not in _IK_ACTIONS:
+        continue
+      n_checks += 1
+      ok, _witness = robot_ik.bind(a, s, ns, assembly)
+      if not ok:
+        blacklist.add(key)
+        engine.delete_edge(s, a, ns)                      # LOCAL repair: un-claim ns's subtree
+        n_bad += 1
+        break
+      validated.add(key)
+    if n_bad == 0:
+      if verbose:
+        print(f"[lazy] found a {len(plan)}-action plan in {rounds} rounds, "
+              f"{engine.expanded} expansions, {n_checks} edge validations "
+              f"({len(blacklist)} blacklisted) in {time.perf_counter() - t0:.2f}s")
+      return plan
+    if verbose and rounds % 25 == 0:
+      print(f"[lazy] round {rounds}: {len(blacklist)} edges blacklisted, "
+            f"{n_checks} validations, {time.perf_counter() - t0:.1f}s")
+    if deadline is not None and time.perf_counter() > deadline:
+      if verbose:
+        print(f"[lazy] deadline reached after {rounds} rounds")
+      return None
+  if verbose:
+    print(f"[lazy] round budget ({max_rounds}) exhausted")
+  return None
+
+
 def solve_assembly_problem_anytime(C, assembly, robots=None, time_budget=60.0,
                                    weights=(float("inf"), 5.0, 2.0, 1.5, 1.0),
                                    verbose=True, **kw):
