@@ -37,6 +37,19 @@ def parse_args():
       help="Randomly perturb the object start poses (kept collision free).",
   )
   parser.add_argument(
+      "--part-float", type=float, default=0.015, metavar="M",
+      help="z offset of the scattered parts above the table top (metres, default 0.015 -- "
+           "the historical float). Propagates through placement anchors, so every later "
+           "set-down keeps the same hover.",
+  )
+  parser.add_argument(
+      "--random-init", type=float, nargs="?", const=0.45, default=None, metavar="HALF",
+      help="FULLY randomize the initial part positions: uniform x/y in the central square "
+           "[-HALF, +HALF]^2 between the robots (default 0.45 when given bare) plus a random "
+           "yaw, rejection-sampled collision-free. Seeded via --seed (reproducible). "
+           "Overrides the scatter line; --perturb-start-pose is ignored with it.",
+  )
+  parser.add_argument(
       "--scatter-spacing", type=float, default=1.0 / 7.0, metavar="M",
       help="x-pitch of the scatter line in metres (default 1/7 ~ 0.143, the historical "
            "layout). For analysing how much search/IK cost is scene density.",
@@ -48,6 +61,12 @@ def parse_args():
   parser.add_argument(
       "--disp-final", dest="disp_final", action="store_true",
       help="Show the final desired result.",
+  )
+  parser.add_argument(
+      "--show-init", action="store_true",
+      help="Open a blocking viewer on the INITIAL scene (after scatter/--random-init) before "
+           "anything else runs -- close the window to continue (e.g. into --solve). For "
+           "checking layouts, e.g. what --random-init sampled.",
   )
   parser.add_argument(
       "--show-successors", action="store_true",
@@ -162,6 +181,27 @@ def parse_args():
            "(pick/handover/brace/mate/set-down); a failed fill-in blacklists that milestone "
            "and reroutes. Scales like --optimistic but with a SEARCHED part order, bracing "
            "support, and repair instead of an exact-search fallback.",
+  )
+  parser.add_argument(
+      "--place-cells", type=int, nargs="?", const=4, default=0, metavar="N",
+      help="EXPERIMENTAL: offer up to N extra TRANSLATED placement anchors per (group, face) "
+           "near the table centre (default 4 when given bare), in addition to the classic "
+           "scatter-anchor placement. Motivation: parts at the scatter extremes get set down "
+           "where half the arms cannot reach; central cells make braced work reachable. Adds "
+           "branching (~N x places).",
+  )
+  parser.add_argument(
+      "--prefer-center", action="store_true",
+      help="With --place-cells: offer the CELL placements (table centre first) BEFORE the "
+           "classic scatter-anchor placement -- at equal f the FIFO tie-break then tries "
+           "central placements first. Pure successor ordering, no pruning.",
+  )
+  parser.add_argument(
+      "--search-stats", type=float, nargs="?", const=10.0, default=None, metavar="SEC",
+      help="Print periodic in-search statistics every SEC seconds (default 10 when given "
+           "bare): expanded/claimed/frontier sizes and per-action-kind edge-check + failure "
+           "counts; the same per-kind summary is printed with the final result. Exact "
+           "search only.",
   )
   parser.add_argument(
       "--lazy", action="store_true",
@@ -351,7 +391,7 @@ _SAVE_CONFIG_FIELDS = (
     "assembly", "parts", "num_robots", "vacuum", "floating_ee", "robot", "robot_types",
     "scatter_spacing", "perturb_start_pose", "seed", "wrench", "grasp_model", "insert_force",
     "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
-    "bracing", "robust_mode", "dense_grasps",
+    "bracing", "robust_mode", "dense_grasps", "random_init", "part_float",
 )
 
 
@@ -371,6 +411,12 @@ def main():
   set_rolls_per_face(1 if args.vacuum else 2)
   set_dense_grasps(args.dense_grasps and not args.vacuum)
   set_brace_for_assembly_only(args.brace_for_assembly_only)
+  set_extra_place_cells(args.place_cells)
+  set_prefer_center(args.prefer_center)
+  if args.place_cells:
+    print(f"[flag] --place-cells ACTIVE: {args.place_cells} extra translated placement "
+          f"anchors per (group, face)"
+          + (", CENTRE-FIRST ordering" if args.prefer_center else "") + ".")
   if args.brace_for_assembly_only:
     print("[flag] --brace-for-assembly-only ACTIVE: a braced state (>=2 grippers on a group) "
           "may only assemble/release. Prunes brace branching; can miss plans that carry a "
@@ -385,34 +431,6 @@ def main():
       else {"lateral": args.insertion_noise, "offset": args.insertion_offset})
   wrench.PARAMS["robust_mode"] = args.robust_mode
 
-  if args.test_pick_ik is not None:
-    robot, part, grasp = args.test_pick_ik.split(":")
-    visualize_pick_ik(part=part, grasp_id=int(grasp), robot=robot, n_parts=args.parts,
-                      num_robots=args.num_robots, vacuum=args.vacuum)
-    return
-
-  if args.test_assemble_ik is not None:
-    robot, part, grasp = args.test_assemble_ik.split(":")
-    visualize_assemble_ik(part=part, grasp_id=int(grasp), robot=robot, n_parts=args.parts,
-                          num_robots=args.num_robots, vacuum=args.vacuum)
-    return
-
-  if args.test_place_ik is not None:
-    fields = args.test_place_ik.split(":")
-    robot, part, grasp, n_asm = fields[:4]
-    face = int(fields[4]) if len(fields) > 4 else 5
-    visualize_place_ik(part=part, grasp_id=int(grasp), robot=robot,
-                       n_assembled=int(n_asm), n_parts=args.parts,
-                       num_robots=args.num_robots, vacuum=args.vacuum, face=face)
-    return
-
-  if args.test_assemble_held_ik is not None:
-    robot, part, grasp, target_robot, onto_grasp = args.test_assemble_held_ik.split(":")
-    visualize_assemble_ik(part=part, grasp_id=int(grasp), robot=robot,
-                          target_robot=target_robot, onto_grasp=int(onto_grasp),
-                          n_parts=args.parts, num_robots=args.num_robots, vacuum=args.vacuum)
-    return
-
   C = make_four_robot_env(
       num_robots=args.num_robots,
       floating_ee=args.floating_ee,
@@ -423,8 +441,41 @@ def main():
   assembly = make_assembly(args.assembly, args.parts)
 
   C = add_disassembled_obj(C, assembly, perturb_start_pose=args.perturb_start_pose,
-                           spacing=args.scatter_spacing)
+                           spacing=args.scatter_spacing, random_init=args.random_init,
+                           float_height=args.part_float)
 
+
+  if args.show_init:
+    C.view(True, "initial state (close to continue)")
+
+  # per-skill IK test popups run on THE ACTUAL CONFIGURED SCENE built above (robot type,
+  # scatter/--random-init layout, assembly). Note the popups solve real-arm IK: with
+  # --floating-ee the "arm" is the free-floating gripper itself.
+  if args.test_pick_ik is not None:
+    robot, part, grasp = args.test_pick_ik.split(":")
+    visualize_pick_ik(part=part, grasp_id=int(grasp), robot=robot, C=C, assembly=assembly)
+    return
+
+  if args.test_assemble_ik is not None:
+    robot, part, grasp = args.test_assemble_ik.split(":")
+    visualize_assemble_ik(part=part, grasp_id=int(grasp), robot=robot, C=C,
+                          assembly=assembly)
+    return
+
+  if args.test_place_ik is not None:
+    fields = args.test_place_ik.split(":")
+    robot, part, grasp, n_asm = fields[:4]
+    face = int(fields[4]) if len(fields) > 4 else 5
+    visualize_place_ik(part=part, grasp_id=int(grasp), robot=robot,
+                       n_assembled=int(n_asm), face=face, C=C, assembly=assembly)
+    return
+
+  if args.test_assemble_held_ik is not None:
+    robot, part, grasp, target_robot, onto_grasp = args.test_assemble_held_ik.split(":")
+    visualize_assemble_ik(part=part, grasp_id=int(grasp), robot=robot,
+                          target_robot=target_robot, onto_grasp=int(onto_grasp),
+                          C=C, assembly=assembly)
+    return
 
   if args.disp_final:
     display_final_assembly(C, assembly, [0, 0, 0.5])
@@ -495,7 +546,8 @@ def main():
                                       collapsed_h=args.collapsed_h,
                                       grasp_collapsed_h=args.grasp_collapsed_h,
                                       wrench_aware_h=args.wrench_aware_h, bracing=args.bracing,
-                                      part_order_bias=args.part_order_bias)
+                                      part_order_bias=args.part_order_bias,
+                                      stats_every=args.search_stats)
     except IKFailureLogDone:
       print(f"[ik-failures] window/cap reached -- search stopped for debugging "
             f"({len(fail_rec.steps)} failures collected).")

@@ -177,7 +177,7 @@ class Assembly:
     return self.position_in_base(parent) + np.asarray(rel_pos, dtype=float)
 
 def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, max_tries=200,
-                         spacing=1.0 / 7.0, per_row=8):
+                         spacing=1.0 / 7.0, per_row=8, random_init=None, float_height=0.015):
   # scatter the assembly's parts on the table as loose cubes (test scene). Geometry
   # (cube_size / cube_radius) comes from the assembly, not a global. `spacing` = the x-pitch
   # of the scatter line (default = historical 1/7 m ~ 0.143); a knob for analysing how much
@@ -192,12 +192,13 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
   for i, name in enumerate(assembly.objects):
       row, col = divmod(i, per_row)
       # scatter orientation (how the part initially LIES, e.g. wheels flat) and a
-      # SHAPE-AWARE height: table top + half extent at that orientation + the historical
-      # 15mm float (for the classic cube this is exactly the old fixed z of 0.07).
+      # SHAPE-AWARE height: table top + half extent at that orientation + `float_height`
+      # (historical default 15mm; for the classic cube that is exactly the old fixed 0.07).
+      # The float propagates through the placement ANCHORS, so every later set-down keeps it.
       scatter_q = assembly.scatter_orientations.get(name)
       spec = assembly.part_shape(name)
       Rs = _quat_to_R(scatter_q) if scatter_q is not None else np.eye(3)
-      z = table_half + _shape_half_z(spec, Rs) + 0.015
+      z = table_half + _shape_half_z(spec, Rs) + float_height
       pos = np.array([-0.5 + col * spacing, row * spacing, z])
 
       sq = _shape_quat(spec)
@@ -221,10 +222,26 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
       # ViserRecorder renders marker frames as viser axis frames (they have no mesh).
       C.addFrame(f"{name}_marker", name).setShape(ry.ST.marker, [cs * 1.5])
 
-      if perturb_start_pose:
+      base_q = scatter_q if scatter_q is not None else np.array([1.0, 0.0, 0.0, 0.0])
+      if random_init:
+          # FULL randomization (seeded, hence reproducible): uniform x/y in the central
+          # square [-random_init, +random_init]^2 between the robots + a random yaw,
+          # rejection-sampled collision-free against everything already placed (parts,
+          # table, robot bases/arms). Falls back to the nominal line spot if exhausted.
+          for _ in range(max_tries):
+              xy = np.random.uniform(-float(random_init), float(random_init), size=2)
+              yaw = np.random.uniform(-np.pi, np.pi)
+              obj.setRelativePosition([xy[0], xy[1], pos[2]])
+              obj.setRelativeQuaternion(list(_quat_mul(
+                  np.array([np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)]), base_q)))
+              if C.getCollisionFree():
+                  break
+          else:
+              obj.setRelativePosition([pos[0], pos[1], pos[2]])
+              obj.setRelativeQuaternion(list(base_q))
+      elif perturb_start_pose:
           # rejection-sample a perturbation that keeps the config collision free (the yaw
           # composes ONTO the scatter orientation, so e.g. flat wheels stay flat)
-          base_q = scatter_q if scatter_q is not None else np.array([1.0, 0.0, 0.0, 0.0])
           for _ in range(max_tries):
               dxy = np.random.uniform(-pos_noise, pos_noise, size=2)
               yaw = np.random.uniform(-np.pi, np.pi)
@@ -531,8 +548,8 @@ class CarAssembly(Assembly):
     # wheels at the four side positions: x = +-1.2w (front/back), y = +-1.2w so the inner
     # cap just touches the body side (body half-depth w + half wheel length 0.2w), the
     # axle slightly below the body's midline.
-    slots = [(1.2 * w, 1.2 * w), (1.2 * w, -1.2 * w),
-             (-1.2 * w, 1.2 * w), (-1.2 * w, -1.2 * w)]
+    slots = [(1.4 * w, 1.2 * w), (1.4 * w, -1.2 * w),
+             (-1.4 * w, 1.2 * w), (-1.4 * w, -1.2 * w)]
     # wheels start FLAT on the table (cap down): rotate the part -90 deg about x so the
     # axle (part y) points up. The assembled orientation stays identity (axle sideways).
     q_flat = np.array([np.cos(np.pi / 4.0), -np.sin(np.pi / 4.0), 0.0, 0.0])
@@ -814,6 +831,35 @@ def set_dense_grasps(flag):
   before any grasp precomputation (grasp ids index the per-part DB)."""
   global _DENSE_GRASPS
   _DENSE_GRASPS = bool(flag)
+
+
+# EXTRA PLACE CELLS (experimental, OFF by default): classic `place` always lands a group at
+# its reference part's ORIGINAL scatter anchor -- parts at the scatter extremes then get set
+# down at the table edge where half the arms cannot reach them. With N > 0, places() ALSO
+# offers up to N TRANSLATED anchors from the fixed cell list below (near the table centre,
+# the most-reachable region). Cell placements are distinguished in the STATE via the place
+# slot tag ("slot", ("cell", k), face) -- poses are NOT part of the state key -- and carry
+# the landing anchor in the state's pose payload (the same mechanism declutter stowing uses).
+# Infeasible cells (occupied / colliding) are rejected by the cheap layer like any placement.
+_EXTRA_PLACE_CELLS = 0
+_PLACE_CELL_XY = ((0.0, 0.0), (0.0, 0.35), (0.0, -0.35), (0.3, 0.0), (-0.3, 0.0),
+                  (0.3, 0.35), (-0.3, -0.35), (-0.3, 0.35), (0.3, -0.35))
+_PREFER_CENTER = False
+
+
+def set_extra_place_cells(n):
+  """Offer up to n extra TRANSLATED placement anchors per (group, face) in places().
+  Cell 0 is the TABLE CENTRE (0, 0) -- the most-reachable spot for every arm."""
+  global _EXTRA_PLACE_CELLS
+  _EXTRA_PLACE_CELLS = int(n)
+
+
+def set_prefer_center(flag):
+  """With extra place cells active: yield the CELL placements (centre first) BEFORE the
+  classic scatter-anchor placement, so at equal f the search tries central placements
+  first (successor order is the FIFO tie-break). Pure ordering -- no pruning."""
+  global _PREFER_CENTER
+  _PREFER_CENTER = bool(flag)
 
 
 # BRACE-FOR-ASSEMBLY-ONLY (experimental, OFF by default). Domain assumption: a brace (a 2nd
@@ -1364,6 +1410,12 @@ def get_initial_state(C, assembly):
     place[p] = ("slot", i, _IDENTITY_FACE)
     supports[p] = frozenset({("table",)})
     poses[p] = np.asarray(C.getFrame(p).getPose())
+  # ORIGINAL anchors, recorded on the assembly: the CLASSIC place restores its ref part's
+  # pose to this anchor, so the state key <-> world-pose mapping stays a BIJECTION even when
+  # cell/stow placements have moved the pose payload around (poses are NOT part of the key;
+  # without the restore, a classic re-place after a cell placement would alias two different
+  # worlds under one key).
+  assembly._initial_anchor = {p: np.asarray(v, dtype=float).copy() for p, v in poses.items()}
   return State(parent=parent, place=place, supports=supports, poses=poses)
 
 
@@ -1479,16 +1531,47 @@ def places(state, assembly, robots):
     r = state.parent[root][1]
     ref = reference_part(group)                           # canonical on-table root
     for face in rest_faces(assembly, group):              # one placement per STABLE resting face
-      ns = _copy_edit_support(state)
-      for p in group:                                     # open r's grasp on this group
-        ns.supports[p] = frozenset(
-            c for c in ns.supports[p] if not (c[0] == "grasp" and c[1] == r))
-      ns.grasp.pop(root, None)
-      ns.parent = _rerooted(ns.parent, ref)               # canonical tree orientation
-      ns.parent[ref] = ("table",)
-      ns.place[ref] = ("slot", _part_index(ref), face)
-      ns.supports[ref] = ns.supports[ref] | {("table",)}
-      yield ("place", r, root, face), ns
+      def landed(slot_tag):
+        ns = _copy_edit_support(state)
+        for p in group:                                   # open r's grasp on this group
+          ns.supports[p] = frozenset(
+              c for c in ns.supports[p] if not (c[0] == "grasp" and c[1] == r))
+        ns.grasp.pop(root, None)
+        ns.parent = _rerooted(ns.parent, ref)             # canonical tree orientation
+        ns.parent[ref] = ("table",)
+        ns.place[ref] = ("slot", slot_tag, face)
+        ns.supports[ref] = ns.supports[ref] | {("table",)}
+        return ns
+      def classic():
+        ns = landed(_part_index(ref))
+        # RESTORE ref's ORIGINAL anchor: poses are not part of the state key, so the classic
+        # slot tag must always mean the original anchor pose -- otherwise a classic re-place
+        # after a cell/stow placement would ALIAS two different worlds under one key.
+        orig = getattr(assembly, "_initial_anchor", {}).get(ref)
+        if orig is not None:
+          ns.poses = dict(ns.poses)
+          ns.poses[ref] = orig.copy()
+        return ("place", r, root, face), ns
+
+      def cell(k):
+        # TRANSLATED anchor (see _EXTRA_PLACE_CELLS): same placement, landing at table cell
+        # k -- the anchor override rides the pose payload, the cell id the slot tag.
+        ns = landed(("cell", k))
+        anchor = np.asarray(state.poses[ref], dtype=float).copy()
+        anchor[0], anchor[1] = _PLACE_CELL_XY[k]
+        ns.poses = dict(ns.poses)
+        ns.poses[ref] = anchor
+        return ("place", r, root, face, k), ns
+
+      n_cells = min(_EXTRA_PLACE_CELLS, len(_PLACE_CELL_XY))
+      if _PREFER_CENTER and n_cells:
+        for k in range(n_cells):
+          yield cell(k)
+        yield classic()
+      else:
+        yield classic()
+        for k in range(n_cells):
+          yield cell(k)
 
 
 def assembles(state, assembly, robots, gripper_kind=None):
@@ -1764,9 +1847,15 @@ def _group_rest_lift(assembly, group, ref, face=_IDENTITY_FACE, anchor_q=None):
   hit = cache.get(key)
   if hit is not None:
     return hit
+  # half_anchor cancels the half-extent encoded in the anchor's z -> always at the anchor's
+  # TRUE orientation. The rest HEIGHT uses the actual landing orientation: for a REAL face
+  # that is yawZ(anchor) o face (see _group_rest_pose), whose world-z extents equal the
+  # face-only ones (z is yaw-invariant) -> anchor_q=None there; the identity face keeps the
+  # anchor orientation (initial scatter poses).
   half_anchor = _shape_half_z(assembly.part_shape(ref),
                               _quat_to_R(anchor_q) if anchor_q is not None else np.eye(3))
-  lift = _group_rest_height(assembly, group, ref, face, anchor_q=anchor_q) - half_anchor
+  hq = anchor_q if face == _IDENTITY_FACE else None
+  lift = _group_rest_height(assembly, group, ref, face, anchor_q=hq) - half_anchor
   cache[key] = lift
   return lift
 
@@ -1778,12 +1867,30 @@ def _placement_face(state, group):
   return pl[2] if pl is not None and len(pl) > 2 else _IDENTITY_FACE
 
 
+def _anchor_yaw_quat(q):
+  # the WORLD-Z yaw component of an anchor orientation (the only part of a placement anchor
+  # that is free on the table; everything else is decided by the resting face).
+  R = _quat_to_R(np.asarray(q, dtype=float))
+  yaw = np.arctan2(R[1, 0], R[0, 0])
+  return np.array([np.cos(yaw / 2.0), 0.0, 0.0, np.sin(yaw / 2.0)])
+
+
 def _group_rest_pose(assembly, group, ref, anchor_pose, face):
   # the reference part's full rest pose for a placement: anchor x/y, rotated so `face`
-  # points down (composed onto the anchor's own orientation, so a perturbed initial yaw
-  # is preserved), lifted so the group's lowest part touches the table.
+  # points down, lifted so the group's lowest part touches the table.
+  #
+  # ORIENTATION composition (fixed 2026-07-17): for the IDENTITY face the anchor orientation
+  # is preserved as-is (initial states: scatter orientations like flat wheels + any random
+  # yaw). For a REAL face, only the anchor's WORLD-Z YAW survives, composed AFTER the face
+  # rotation: q = yawZ(anchor) o face_quat. The old `face o anchor` composite rotated a yawed
+  # anchor's z-axis OUT of vertical (a pre-yaw about part-z is a TILT once the face quat maps
+  # that axis horizontal) -- --random-init's yaws produced tilted 'rest' poses that the
+  # wrench gates then rightly rejected as unstable.
   anchor_pose = np.asarray(anchor_pose, dtype=float)
-  q = _quat_mul(_FACE_DOWN_QUATS[face], anchor_pose[3:])
+  if face == _IDENTITY_FACE:
+    q = anchor_pose[3:]
+  else:
+    q = _quat_mul(_anchor_yaw_quat(anchor_pose[3:]), _FACE_DOWN_QUATS[face])
   pos = anchor_pose[:3].copy()
   pos[2] += _group_rest_lift(assembly, group, ref, face, anchor_q=anchor_pose[3:])
   return np.concatenate([pos, q])

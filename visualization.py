@@ -556,14 +556,24 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
 
 
 
+def _ik_test_scene(C, assembly, n_parts, num_robots, vacuum):
+  # the IK test popups run on the ACTUAL configured scene when main passes (C, assembly) --
+  # robot type, scatter/--random-init layout, part shapes all as configured. The legacy
+  # self-built cube-cross env remains the fallback for direct calls.
+  if C is None:
+    C = make_four_robot_env(num_robots=num_robots, floating_ee=False, vacuum=vacuum)
+    assembly = CubeCrossAssembly(n_parts=n_parts)
+    add_disassembled_obj(C, assembly)
+  return C, assembly
+
+
 def visualize_pick_ik(part="obj_3", grasp_id=0, robot=None, n_parts=7, num_robots=2,
-                      vacuum=False):
+                      vacuum=False, C=None, assembly=None):
   """Set up the real-robot env and pop up the pick IK for one (robot, part, grasp) so you
-  can eyeball whether the grasp is sensible. Needs a display. floating_ee stays False --
-  the IK needs a real arm to solve for; vacuum picks the real vacuum EE instead."""
-  C = make_four_robot_env(num_robots=num_robots, floating_ee=False, vacuum=vacuum)
-  assembly = CubeCrossAssembly(n_parts=n_parts)
-  add_disassembled_obj(C, assembly)
+  can eyeball whether the grasp is sensible. Needs a display. Pass (C, assembly) to run on
+  an existing configured scene (e.g. --random-init); the self-built cube-cross env with a
+  real arm is the fallback."""
+  C, assembly = _ik_test_scene(C, assembly, n_parts, num_robots, vacuum)
   robots = get_robots(C)
   if robot is None:
     robot = robots[0]
@@ -576,17 +586,16 @@ def visualize_pick_ik(part="obj_3", grasp_id=0, robot=None, n_parts=7, num_robot
 
 def visualize_assemble_ik(part="obj_1", onto=None, robot=None, grasp_id=0,
                           target_robot=None, onto_grasp=1, n_parts=7,
-                          num_robots=2, vacuum=False):
+                          num_robots=2, vacuum=False, C=None, assembly=None):
   """Pop up the assemble IK: `robot` holds `part` at `grasp_id` and mates it onto `onto`
-  (its manual parent, by default). Needs a display.
+  (its manual parent, by default). Needs a display. Pass (C, assembly) to run on an
+  existing configured scene.
 
   By default `onto` sits on the table at its scanned pose (a fixed target). If
   `target_robot` is given, that robot instead HOLDS `onto` (at `onto_grasp`) -- so both
   cubes are in the air and the assemble IK co-optimizes both arms (adder + target holder)
   to bring the mate together."""
-  C = make_four_robot_env(num_robots=num_robots, floating_ee=False, vacuum=vacuum)
-  assembly = CubeCrossAssembly(n_parts=n_parts)
-  add_disassembled_obj(C, assembly)
+  C, assembly = _ik_test_scene(C, assembly, n_parts, num_robots, vacuum)
   robots = get_robots(C)
   if robot is None:
     robot = robots[0]
@@ -609,14 +618,14 @@ def visualize_assemble_ik(part="obj_1", onto=None, robot=None, grasp_id=0,
 
 
 def visualize_place_ik(part="obj_1", grasp_id=0, robot=None, n_assembled=1, n_parts=7,
-                       num_robots=2, vacuum=False, face=_IDENTITY_FACE):
+                       num_robots=2, vacuum=False, face=_IDENTITY_FACE, C=None,
+                       assembly=None):
   """Pop up the place IK: with `n_assembled` parts already mated onto the base (0 = none),
   `robot` picks the subassembly BY `part` at `grasp_id` (re-rooting; for n_assembled=0 the
   part is a loose singleton) and sets it down on the table resting on placement `face`
-  (5 = upright/identity). Needs a display."""
-  C = make_four_robot_env(num_robots=num_robots, floating_ee=False, vacuum=vacuum)
-  assembly = CubeCrossAssembly(n_parts=n_parts)
-  add_disassembled_obj(C, assembly)
+  (5 = upright/identity). Needs a display. Pass (C, assembly) to run on an existing
+  configured scene."""
+  C, assembly = _ik_test_scene(C, assembly, n_parts, num_robots, vacuum)
   robots = get_robots(C)
   if robot is None:
     robot = robots[0]
@@ -640,8 +649,17 @@ def visualize_place_ik(part="obj_1", grasp_id=0, robot=None, n_assembled=1, n_pa
     return False
   _, held = match[0]
 
+  # the REAL place successor (its pose payload is the landing anchor _ik_place reads --
+  # binding with s1=None crashes on s1.poses since the payload mechanism landed).
+  pl = [(a, ns) for a, ns in places(held, assembly, robots)
+        if a[1] == robot and a[3] == face and len(a) == 4]
+  if not pl:
+    print(f"no place successor for {robot} at face {face} from this state")
+    return False
+  act, s1 = pl[0]
+
   rik = RobotIK(C, robots, debug_view=True)
-  ok, _witness = rik.bind(("place", robot, part, face), held, None, assembly)
+  ok, _witness = rik.bind(act, held, s1, assembly)
   print(f"place IK ({robot} sets down {part}, {n_assembled} parts assembled, "
         f"grasp {grasp_id}, face {face}): feasible={ok}")
   return ok

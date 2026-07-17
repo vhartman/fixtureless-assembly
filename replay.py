@@ -43,7 +43,9 @@ def build_scene(cfg):
                           robot_types=cfg.get("robot_types") or cfg.get("robot", "ur10"))
   assembly = make_assembly(cfg["assembly"], cfg["parts"])
   C = add_disassembled_obj(C, assembly, perturb_start_pose=cfg["perturb_start_pose"],
-                           spacing=cfg["scatter_spacing"])
+                           spacing=cfg["scatter_spacing"],
+                           random_init=cfg.get("random_init"),
+                           float_height=cfg.get("part_float", 0.015))
   return C, assembly
 
 

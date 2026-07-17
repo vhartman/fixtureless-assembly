@@ -906,7 +906,7 @@ class RobotIK:
     # placement FACE the action names. The target is the pose the DISCRETE model will
     # assume afterwards (scene_for/_pose_on_table's rest pose anchored at the lowest-index
     # part's initial table x/y) -- the IK must land the group exactly there.
-    _, robot, root, face = action
+    robot, root, face = action[1], action[2], action[3]   # 5th field (cell id) may be present
     C = self.scene_for(s0, assembly)                      # group attached to robot's gripper
     group = next(g for g in s0.subassemblies() if root in g)
     ref = min(group, key=_part_index)                     # scene_for's on-table reference
@@ -2103,7 +2103,8 @@ def _table_aware_pick_fact(assembly, S_key, face, gpart, gid, gripper_path,
 
 def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
            edge_check_fn=None, weight=1.0, max_nodes=200000, verbose=True,
-           tag="A*", t0=None, cost_bound=None, deadline=None, order_key_fn=None):
+           tag="A*", t0=None, cost_bound=None, deadline=None, order_key_fn=None,
+           stats_every=None):
   """Generic LAZY weighted-A* engine, shared by every search variant (exact + optimistic).
 
   The domain enters only through callbacks -- this function knows nothing about assemblies:
@@ -2153,7 +2154,15 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
   optimal = weight == 1.0
   expanded = 0
   edge_checks = 0
+  kind_stats = {}                                         # action kind -> [checked, failed]
+  next_stats = (time.perf_counter() + stats_every) if stats_every else None
   while pq:
+    if next_stats is not None and time.perf_counter() > next_stats:
+      next_stats = time.perf_counter() + stats_every
+      per_kind = "  ".join(f"{k}:{c}({x}f)" for k, (c, x) in sorted(kind_stats.items()))
+      print(f"[{tag} stats {time.perf_counter() - t0:.0f}s] expanded={expanded} "
+            f"claimed={len(claimed)} frontier={len(pq)} checks={edge_checks}  {per_kind}",
+            flush=True)
     _f, _h, _ok, g, _, s, prev, action = heapq.heappop(pq)
     if s in claimed:
       continue                                            # already claimed via a cheaper/earlier edge
@@ -2165,7 +2174,10 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
       return None
     if action is not None and edge_check_fn is not None:
       edge_checks += 1
+      ks = kind_stats.setdefault(action[0], [0, 0])
+      ks[0] += 1
       if not edge_check_fn(prev, action, s):
+        ks[1] += 1
         continue                                          # infeasible edge -- other queued edges remain
     claimed[s] = g
     if action is not None:
@@ -2179,6 +2191,9 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
         print(f"[{tag}] found a {len(plan)}-action plan (cost {g:g}, {bound}); "
               f"expanded {expanded} nodes, {len(claimed)} states claimed, "
               f"{edge_checks} edge checks in {time.perf_counter() - t0:.2f}s")
+        if kind_stats:
+          per_kind = "  ".join(f"{k}:{c}({x}f)" for k, (c, x) in sorted(kind_stats.items()))
+          print(f"[{tag}] edge checks by kind (f=failed): {per_kind}")
       return plan
 
     expanded += 1
@@ -2242,7 +2257,8 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
                            wrench=False, wrench_aware_h=True, handovers=True,
                            allow_place=True, cost_bound=None, deadline=None,
                            anonymous=False, labeled_h=False, collapsed_h=False,
-                           grasp_collapsed_h=False, bracing=False, part_order_bias=False):
+                           grasp_collapsed_h=False, bracing=False, part_order_bias=False,
+                           stats_every=None):
   """EXACT (weighted) A* over scene-graph states from the initial scene to a completed
   assembly -- the reference baseline. Priority is f = g + weight * h.
     - weight = 1.0 : ordinary A*, returns a minimum-cost plan.
@@ -2383,7 +2399,8 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
                   succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn, cheap_fn=None,
                   edge_check_fn=edge_check_fn,
                   weight=weight, max_nodes=max_nodes, verbose=verbose, tag=tag, t0=t0,
-                  cost_bound=cost_bound, deadline=deadline, order_key_fn=okey)
+                  cost_bound=cost_bound, deadline=deadline, order_key_fn=okey,
+                  stats_every=stats_every)
   finally:
     set_anonymous_robots(False)
 
