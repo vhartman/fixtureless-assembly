@@ -2433,6 +2433,16 @@ def _por_keep(a_in, b):
   return not (tuple(map(str, b)) < tuple(map(str, a_in)))
 
 
+_LAST_SEARCH_OUTCOME = None    # "found" | "exhausted" | "budget" | "deadline" -- set by
+                               # _astar/_pea_star at exit; read by the iter-bound driver
+                               # (exhausted = proof, budget/deadline = no proof).
+
+
+def _outcome(kind):
+  global _LAST_SEARCH_OUTCOME
+  _LAST_SEARCH_OUTCOME = kind
+
+
 def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
            edge_check_fn=None, weight=1.0, max_nodes=200000, verbose=True,
            tag="A*", t0=None, cost_bound=None, deadline=None, order_key_fn=None,
@@ -2467,6 +2477,7 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
     return hval if math.isinf(weight) else g + weight * hval
 
   if goal_fn(start):
+    _outcome("found")
     return []
   tie = itertools.count()                                 # stable tie-break (shallower g first)
   # optional ACTION-PREFERENCE tie-break, ranked between h and g: among equal-(f,h) nodes,
@@ -2503,6 +2514,7 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
     if deadline is not None and time.perf_counter() > deadline:
       if verbose:
         print(f"[{tag}] deadline reached after {expanded} expansions")
+      _outcome("deadline")
       return None
     if action is not None and edge_check_fn is not None:
       edge_checks += 1
@@ -2526,6 +2538,7 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
         if kind_stats:
           per_kind = "  ".join(f"{k}:{c}({x}f)" for k, (c, x) in sorted(kind_stats.items()))
           print(f"[{tag}] edge checks by kind (f=failed): {per_kind}")
+      _outcome("found")
       return plan
 
     expanded += 1
@@ -2533,6 +2546,7 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
       if verbose:
         print(f"[{tag}] gave up after {max_nodes} expansions ({len(claimed)} states "
               f"claimed) in {time.perf_counter() - t0:.2f}s")
+      _outcome("budget")
       return None
 
     for act, ns in succ_fn(s):
@@ -2553,7 +2567,306 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
   if verbose:
     print(f"[{tag}] exhausted {len(claimed)} states with no plan "
           f"in {time.perf_counter() - t0:.2f}s")
+  _outcome("exhausted")
   return None
+
+
+def _pea_star(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
+              edge_check_fn=None, weight=1.0, max_nodes=200000, verbose=True,
+              tag="PEA*", t0=None, cost_bound=None, deadline=None, order_key_fn=None,
+              stats_every=None, por=False):
+  """PARTIAL-EXPANSION A* (PEA*): identical semantics and guarantees to _astar
+  (claim-at-pop, lazy edge checks, weight, cost_bound, POR), but the OPEN list holds only
+  each expansion's current f-BAND: successors with f above the popped node's F are NOT
+  pushed -- the node is re-queued ONCE at the smallest such f and regenerates its
+  successors when that band comes up. Frontier memory drops by ~the branching factor
+  (compute-for-memory: succ_fn/h_fn re-run per band; both are cached/cheap here).
+  Motivation (measured, cube-plates-2x2x3): every finite-weight A* OOMs at 8GB because
+  the open list holds the full interleaving-lattice frontier -- the states are cheap, the
+  PUSHES are the memory. A successor with f=X is pushed no later than its parent's band
+  reaches X <= the global minimum reaching X, so ordering/completeness/w-bound are all
+  preserved."""
+  import heapq
+  import itertools
+  import math
+  import time
+
+  if t0 is None:
+    t0 = time.perf_counter()
+
+  def f_value(g, hval):
+    return hval if math.isinf(weight) else g + weight * hval
+
+  if goal_fn(start):
+    _outcome("found")
+    return []
+  EPS = 1e-9
+  tie = itertools.count()
+  if order_key_fn is None:
+    okey = lambda a: 0
+  else:
+    okey = lambda a: 0 if a is None else order_key_fn(a)
+  claimed = {}
+  came_from = {start: (None, None)}
+  h0 = h_fn(start)
+  # entry: (F, h, okey, g, tie, state, prev, action, band_lo)
+  #   band_lo None  => EDGE entry (validate + claim at pop, then expand band (-inf, F])
+  #   band_lo set   => RE-EXPANSION of a claimed node over band (band_lo, F]
+  pq = [(f_value(0.0, h0), h0, 0, 0.0, next(tie), start, None, None, None)]
+  expanded = 0
+  edge_checks = 0
+  reexpansions = 0
+  next_stats = (time.perf_counter() + stats_every) if stats_every else None
+  while pq:
+    if next_stats is not None and time.perf_counter() > next_stats:
+      next_stats = time.perf_counter() + stats_every
+      print(f"[{tag} stats {time.perf_counter() - t0:.0f}s] expanded={expanded} "
+            f"(+{reexpansions} re) claimed={len(claimed)} frontier={len(pq)} "
+            f"checks={edge_checks}", flush=True)
+    F, _h, _ok, g, _, s, prev, action, band_lo = heapq.heappop(pq)
+    if deadline is not None and time.perf_counter() > deadline:
+      if verbose:
+        print(f"[{tag}] deadline reached after {expanded} expansions")
+      _outcome("deadline")
+      return None
+    if band_lo is None:
+      if s in claimed:
+        continue
+      if cost_bound is not None and g + _h >= cost_bound:
+        continue
+      if action is not None and edge_check_fn is not None:
+        edge_checks += 1
+        if not edge_check_fn(prev, action, s):
+          continue
+      claimed[s] = g
+      if action is not None:
+        came_from[s] = (prev, action)
+      if goal_fn(s):
+        plan = _reconstruct_plan(came_from, s)
+        if verbose:
+          bound = ("optimal" if weight == 1.0 else
+                   "greedy, no bound" if math.isinf(weight)
+                   else f"cost <= {weight:g}x optimal")
+          print(f"[{tag}] found a {len(plan)}-action plan (cost {g:g}, {bound}); "
+                f"expanded {expanded} nodes (+{reexpansions} re-expansions), "
+                f"{len(claimed)} states claimed, {edge_checks} edge checks, peak-ish "
+                f"frontier {len(pq)} in {time.perf_counter() - t0:.2f}s")
+        _outcome("found")
+        return plan
+      lo = None                                           # first expansion: no lower cut
+      expanded += 1
+      if expanded > max_nodes:
+        if verbose:
+          print(f"[{tag}] gave up after {max_nodes} expansions ({len(claimed)} states "
+                f"claimed) in {time.perf_counter() - t0:.2f}s")
+        _outcome("budget")
+        return None
+    else:
+      if s not in claimed:
+        continue                                          # superseded (should not happen)
+      g = claimed[s]
+      lo = band_lo
+      reexpansions += 1
+    gen_action = came_from.get(s, (None, None))[1]
+    next_F = None
+    for act, ns in succ_fn(s):
+      if por and gen_action is not None and not _por_keep(gen_action, act):
+        continue
+      if ns in claimed:
+        continue
+      if cheap_fn is not None and not cheap_fn(s, act, ns):
+        continue
+      ng = g + cost_fn(act)
+      hns = h_fn(ns)
+      if hns == float("inf"):
+        continue
+      if cost_bound is not None and ng + hns >= cost_bound:
+        continue
+      fns = f_value(ng, hns)
+      if fns <= F + EPS and (lo is None or fns > lo + EPS):
+        heapq.heappush(pq, (fns, hns, okey(act), ng, next(tie), ns, s, act, None))
+      elif fns > F + EPS and (next_F is None or fns < next_F):
+        next_F = fns
+    if next_F is not None:
+      heapq.heappush(pq, (next_F, _h, 0, g, next(tie), s, None, None, F))
+  if verbose:
+    print(f"[{tag}] exhausted {len(claimed)} states with no plan "
+          f"in {time.perf_counter() - t0:.2f}s")
+  _outcome("exhausted")
+  return None
+
+
+def _beam(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None, edge_check_fn=None,
+          width=8, weight=float("inf"), max_nodes=200000, verbose=True, tag="beam",
+          t0=None, deadline=None):
+  """LEVEL-SYNCHRONOUS BEAM SEARCH over the same callbacks as _astar -- the memory-bounded
+  generalization of greedy (width=1 ~ greedy, width=inf ~ wA*). Motivation (measured,
+  cube-plates-2x2x3): on long horizons every finite-weight A* OOMs on the INTERLEAVING
+  LATTICE frontier while the h gradient is near-perfect -- greedy works but is brittle
+  (h-neutral wander on other instances). Beam keeps <= width states per level (memory
+  width x branching), scores candidates by f = h (weight=inf) or g + weight*h, and
+  VALIDATES edges in score order only until `width` survivors are found (lazy: losers
+  never pay edge_check_fn). NO completeness/quality bound -- pair with the incumbent-
+  bounded phase for certificates. Returns the action list or None (dead beam / budget)."""
+  import math
+  import time
+  if t0 is None:
+    t0 = time.perf_counter()
+  if goal_fn(start):
+    return []
+
+  def f_value(g, hval):
+    return hval if math.isinf(weight) else g + weight * hval
+
+  came_from = {start: (None, None)}
+  seen = {start}
+  frontier = [(0.0, start)]
+  expanded = 0
+  edge_checks = 0
+  depth = 0
+  while frontier:
+    depth += 1
+    cands = []
+    for g, s in frontier:
+      expanded += 1
+      if expanded > max_nodes:
+        if verbose:
+          print(f"[{tag}] gave up after {max_nodes} expansions (depth {depth}) "
+                f"in {time.perf_counter() - t0:.2f}s")
+        return None
+      for act, ns in succ_fn(s):
+        if ns in seen:
+          continue
+        if cheap_fn is not None and not cheap_fn(s, act, ns):
+          continue
+        ng = g + cost_fn(act)
+        hns = h_fn(ns)
+        if hns == float("inf"):
+          continue
+        cands.append((f_value(ng, hns), hns, ng, ns, s, act))
+    cands.sort(key=lambda c: (c[0], c[1]))
+    kept = []
+    for fv, hns, ng, ns, s, act in cands:
+      if len(kept) >= width:
+        break                                             # losers never pay the edge check
+      if ns in seen:
+        continue                                          # duplicate candidate within level
+      if deadline is not None and time.perf_counter() > deadline:
+        if verbose:
+          print(f"[{tag}] deadline reached at depth {depth}")
+        return None
+      if edge_check_fn is not None:
+        edge_checks += 1
+        if not edge_check_fn(s, act, ns):
+          continue
+      seen.add(ns)
+      came_from[ns] = (s, act)
+      if goal_fn(ns):
+        plan = _reconstruct_plan(came_from, ns)
+        if verbose:
+          print(f"[{tag} w={width}] found a {len(plan)}-action plan (cost {ng:g}, no "
+                f"bound); expanded {expanded} nodes, {edge_checks} edge checks, depth "
+                f"{depth} in {time.perf_counter() - t0:.2f}s")
+        return plan
+      kept.append((ng, ns))
+    frontier = kept
+  if verbose:
+    print(f"[{tag} w={width}] beam died at depth {depth} ({expanded} expanded) "
+          f"in {time.perf_counter() - t0:.2f}s")
+  return None
+
+
+def _dfbnb(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None, edge_check_fn=None,
+           bound, verbose=True, tag="dfbnb", t0=None, max_nodes=200000, deadline=None,
+           trans_cap=2_000_000):
+  """DEPTH-FIRST BRANCH-AND-BOUND under an incumbent bound -- the LINEAR-MEMORY
+  certificate engine for long horizons (the bounded A* fit under 8GB on cube-plates-2x2x3
+  only barely: ~5GB open list). Children are ordered best-h-first; every edge is
+  validated eagerly at descent (depth-first = it is on the current path); g + h >= bound
+  prunes with the UNWEIGHTED admissible h, so exhaustion PROVES no plan cheaper than the
+  final bound exists (claim-once-free: dominance pruning via a transposition table keyed
+  state -> best g, LRU-capped -- eviction only costs re-expansion, never correctness).
+  ANYTIME: each goal hit tightens the bound and search continues. Returns
+  (best_plan_or_None, proven: bool)."""
+  import time
+  from collections import OrderedDict
+  if t0 is None:
+    t0 = time.perf_counter()
+  if goal_fn(start):
+    return [], True
+  best_plan = None
+  best_cost = bound
+  trans = OrderedDict()
+  trans[start] = 0.0
+  expanded = 0
+  edge_checks = 0
+  # stack entries: (state, g, child iterator); path actions tracked alongside
+  def children(s, g):
+    out = []
+    for act, ns in succ_fn(s):
+      if cheap_fn is not None and not cheap_fn(s, act, ns):
+        continue
+      ng = g + cost_fn(act)
+      hns = h_fn(ns)
+      if hns == float("inf") or ng + hns >= best_cost:
+        continue
+      out.append((hns, ng, act, ns))
+    out.sort(key=lambda c: (c[0], c[1]))
+    return iter(out)
+
+  stack = [(start, 0.0, children(start, 0.0))]
+  path_actions = []
+  on_path = {start}
+  proven = True
+  while stack:
+    s, g, it = stack[-1]
+    if deadline is not None and time.perf_counter() > deadline:
+      proven = False
+      break
+    step = next(it, None)
+    if step is None:
+      stack.pop()
+      on_path.discard(s)
+      if path_actions:
+        path_actions.pop()
+      continue
+    hns, ng, act, ns = step
+    if ng + hns >= best_cost:                             # bound may have tightened since sort
+      continue
+    if ns in on_path:
+      continue                                            # cycle on the current path
+    tg = trans.get(ns)
+    if tg is not None and tg <= ng:
+      trans.move_to_end(ns)
+      continue                                            # dominated: seen at <= g before
+    if edge_check_fn is not None:
+      edge_checks += 1
+      if not edge_check_fn(s, act, ns):
+        continue
+    trans[ns] = ng
+    trans.move_to_end(ns)
+    while len(trans) > trans_cap:
+      trans.popitem(last=False)                           # LRU eviction: pruning only
+    if goal_fn(ns):
+      best_cost = ng
+      best_plan = path_actions + [act]
+      if verbose:
+        print(f"[{tag}] incumbent improved: cost {ng:g} ({len(best_plan)} actions) at "
+              f"{time.perf_counter() - t0:.1f}s ({expanded} expanded)")
+      continue                                            # keep searching under tighter bound
+    expanded += 1
+    if expanded > max_nodes:
+      proven = False
+      break
+    stack.append((ns, ng, children(ns, ng)))
+    path_actions.append(act)
+    on_path.add(ns)
+  if verbose:
+    print(f"[{tag}] done: {'cost %g (%d actions)' % (best_cost, len(best_plan)) if best_plan else 'no plan under bound'}"
+          f"{', PROVEN best under bound' if proven and stack == [] else ', budget/deadline hit (not proven)' if not proven else ', PROVEN'}"
+          f"; {expanded} expanded, {edge_checks} edge checks, "
+          f"{len(trans)} transpositions in {time.perf_counter() - t0:.2f}s")
+  return best_plan, proven and not stack
 
 
 def _search_context(C, assembly, robots):
@@ -2593,7 +2906,8 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
                            anonymous=False, labeled_h=False, collapsed_h=False,
                            grasp_collapsed_h=False, bracing=False, part_order_bias=False,
                            stats_every=None, por=False, geo_facts=False,
-                           sig_collapsed_h=False):
+                           sig_collapsed_h=False, beam_width=None, dfbnb=False,
+                           pea=False, iter_bound=False):
   """EXACT (weighted) A* over scene-graph states from the initial scene to a completed
   assembly -- the reference baseline. Priority is f = g + weight * h.
     - weight = 1.0 : ordinary A*, returns a minimum-cost plan.
@@ -2731,11 +3045,61 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
     # to touch next is invisible to the abstraction, so without a preference the search
     # floods the plateau breadth-first in insertion order).
     okey = (lambda a: _part_index(a[2])) if part_order_bias else None
-    return _astar(start,
-                  goal_fn=lambda s: s.is_goal(assembly),
+    goal_fn = lambda s: s.is_goal(assembly)
+    if beam_width is not None:
+      return _beam(start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost,
+                   h_fn=h_fn, cheap_fn=None, edge_check_fn=edge_check_fn,
+                   width=beam_width, weight=weight, max_nodes=max_nodes,
+                   verbose=verbose, t0=t0, deadline=deadline)
+    if dfbnb:
+      if cost_bound is None:
+        warnings.warn("dfbnb requires an incumbent cost_bound (use the bounded driver); "
+                      "falling back to the A* engine.")
+      else:
+        plan, _proven = _dfbnb(start, goal_fn=goal_fn, succ_fn=succ_fn,
+                               cost_fn=action_cost, h_fn=h_fn, cheap_fn=None,
+                               edge_check_fn=edge_check_fn, bound=cost_bound,
+                               verbose=verbose, t0=t0, max_nodes=max_nodes,
+                               deadline=deadline)
+        return plan
+    engine = _pea_star if pea else _astar
+    etag = ("PEA*" if pea else tag)
+    if iter_bound:
+      # ITERATIVE COST-BOUND DEEPENING: ascending passes with cost_bound = h(s0)+1, +2, ...
+      # Each pass's memory is exactly its bound's SUBLEVEL SET (the minimum any algorithm
+      # needs to prove that bound); exhausting bound B proves no plan of cost <= B-1, so
+      # the FIRST plan found is OPTIMAL -- regardless of the inner weight, which only
+      # orders exploration inside the sublevel set (integer action costs; step 1).
+      import math as _math
+      B = h_fn(start) + 1.0
+      if _math.isinf(B):
+        return None
+      while True:
+        if verbose:
+          print(f"[iter-bound] pass at cost_bound={B:g}", flush=True)
+        plan = engine(start,
+                      goal_fn=goal_fn,
+                      succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn, cheap_fn=None,
+                      edge_check_fn=edge_check_fn,
+                      weight=weight, max_nodes=max_nodes, verbose=verbose, tag=etag,
+                      t0=t0, cost_bound=B, deadline=deadline, order_key_fn=okey,
+                      stats_every=stats_every, por=por)
+        if plan is not None:
+          if verbose:
+            print(f"[iter-bound] cost {sum(action_cost(a) for a in plan):g} plan is "
+                  f"PROVEN OPTIMAL (every lower bound exhausted).")
+          return plan
+        if _LAST_SEARCH_OUTCOME != "exhausted":
+          if verbose:
+            print(f"[iter-bound] pass at {B:g} ended on '{_LAST_SEARCH_OUTCOME}' -> "
+                  f"stopping WITHOUT a proof.")
+          return None
+        B += 1.0
+    return engine(start,
+                  goal_fn=goal_fn,
                   succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn, cheap_fn=None,
                   edge_check_fn=edge_check_fn,
-                  weight=weight, max_nodes=max_nodes, verbose=verbose, tag=tag, t0=t0,
+                  weight=weight, max_nodes=max_nodes, verbose=verbose, tag=etag, t0=t0,
                   cost_bound=cost_bound, deadline=deadline, order_key_fn=okey,
                   stats_every=stats_every, por=por)
   finally:
@@ -2992,7 +3356,8 @@ def solve_assembly_problem_bounded(C, assembly, robots=None, verbose=True, robot
                                    handovers=True, allow_place=True, bracing=False,
                                    labeled_h=False, collapsed_h=False,
                                    grasp_collapsed_h=True, stats_every=None,
-                                   geo_facts=False, sig_collapsed_h=False):
+                                   geo_facts=False, sig_collapsed_h=False,
+                                   beam_width=None, dfbnb=False, pea=False):
   """INCUMBENT-BOUNDED exact search -- the principled wrapper around the fast decomposed
   solvers. Phase 1: the MILESTONE planner produces an incumbent plan fast (its greedy
   commitments carry no bound). Phase 2: the exact search runs with cost_bound = U (the
@@ -3011,6 +3376,29 @@ def solve_assembly_problem_bounded(C, assembly, robots=None, verbose=True, robot
       weight=max(weight, 5.0), wrench=wrench, handovers=handovers,
       allow_place=allow_place, bracing=bracing, geo_facts=geo_facts,
       sig_collapsed_h=sig_collapsed_h)
+  if inc is None:
+    # GREEDY fallback incumbent: milestones cannot handle every structure (e.g. module
+    # joins, see cube-plates), but an unbounded phase-2 is a MEMORY BOMB on long horizons
+    # (measured cube-plates-2x2x3: every finite weight OOMs at 8GB unbounded, while
+    # greedy solves in seconds and its cost as bound lets w=5 COMPLETE in ~3min).
+    if verbose:
+      print("[bounded] no milestone incumbent -> greedy (weight=inf) fallback incumbent")
+    inc = solve_assembly_problem(
+        C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik,
+        weight=float("inf"), max_nodes=max_nodes, wrench=wrench, handovers=handovers,
+        allow_place=allow_place, bracing=bracing)
+  if inc is None and beam_width is not None:
+    # BEAM last-resort incumbent (measured 2x2x3: greedy beats beam -- its global
+    # best-first frontier can back up where a fixed-width beam must commit; beam only
+    # helps when greedy itself dies, so it runs LAST, at weight=inf ranking).
+    if verbose:
+      print(f"[bounded] no greedy incumbent -> beam (width {beam_width}) incumbent")
+    inc = solve_assembly_problem(
+        C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik,
+        weight=float("inf"), max_nodes=max_nodes, wrench=wrench, handovers=handovers,
+        allow_place=allow_place, bracing=bracing, labeled_h=labeled_h,
+        collapsed_h=collapsed_h, grasp_collapsed_h=grasp_collapsed_h,
+        geo_facts=geo_facts, sig_collapsed_h=sig_collapsed_h, beam_width=beam_width)
   U = sum(action_cost(a) for a in inc) if inc else None
   if verbose:
     print(f"[bounded] incumbent: {'cost %g (%d actions)' % (U, len(inc)) if inc else 'NONE'} "
@@ -3021,7 +3409,7 @@ def solve_assembly_problem_bounded(C, assembly, robots=None, verbose=True, robot
       max_nodes=max_nodes, wrench=wrench, handovers=handovers, allow_place=allow_place,
       bracing=bracing, labeled_h=labeled_h, collapsed_h=collapsed_h,
       grasp_collapsed_h=grasp_collapsed_h, cost_bound=U, stats_every=stats_every,
-      geo_facts=geo_facts, sig_collapsed_h=sig_collapsed_h)
+      geo_facts=geo_facts, sig_collapsed_h=sig_collapsed_h, dfbnb=dfbnb, pea=pea)
   if best is not None and (U is None or sum(action_cost(a) for a in best) < U):
     if verbose:
       print(f"[bounded] exact search IMPROVED the incumbent "
@@ -3551,6 +3939,36 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
 
   objs = frozenset(assembly.objects)
   plan = []
+  # MODULE support (proper-DAG assemblies, e.g. cube-plates): a connect ROOT q stands for
+  # its whole module -- the order ideal {p : q in closure(p)} that must be built DETACHED
+  # and joined as a unit (assembles() already does the join; only this sequencer was
+  # part-by-part-onto-main before, so it dead-ended on every connect root). A root becomes
+  # a candidate once the join's OUT-OF-MODULE requirements (the plate below complete) are
+  # in `ideal`; taking it runs a composite milestone: sub-fills over the module's parts on
+  # the table (each settled -- the fill goal's loose-held=0 forces the set-down), then the
+  # JOIN fill (pick up the finished module by any member, mate its seam, release).
+  connect = getattr(assembly, "connect_parts", set()) & objs
+  # NOTE _mate_closure(p) EXCLUDES p itself, so the root must be added explicitly (without
+  # it the module misses its root, `grown` never includes it, and the sequencer loops on a
+  # trivially-complete 0-action module forever -- measured).
+  modules = {r: frozenset(p for p in objs if r in _mate_closure(assembly, p)) | {r}
+             for r in connect}
+
+  def fill_module(s, root, ideal):
+    seq = sorted(modules[root] - {root},
+                 key=lambda m: (len(_mate_closure(assembly, m)), _part_index(m)))
+    parts_plan, s_cur, built = [], s, {root}
+    for m in seq:
+      sub, s_cur = fill(s_cur, m, built)                  # module-relative fill (detached)
+      if sub is None:
+        return None, None
+      parts_plan.extend(sub)
+      built.add(m)
+    sub, s_end = fill(s_cur, root, set(ideal) | set(modules[root]))   # the JOIN
+    if sub is None:
+      return None, None
+    return parts_plan + sub, s_end
+
   # chronological BACKJUMPING over milestones: each stack entry is a settled checkpoint
   # (state, assembled set, plan length so far, and the (parent_key, part) decision that led
   # here). A node with no workable candidate pops -- blacklisting the decision that led to it
@@ -3567,20 +3985,29 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
       return plan[:plen]
     ideal_key = _subasm_key(ideal)
     cands = [q for q in objs - ideal
-             if (_mate_closure(assembly, q) - {q}) <= ideal
-             and (ideal_key, q) not in blacklist]
+             if (ideal_key, q) not in blacklist
+             and ((q in connect and (assembly.connect_requires.get(q, set())
+                                     - modules[q]) <= ideal)
+                  if q in connect
+                  else (_mate_closure(assembly, q) - {q}) <= ideal)]
     cands.sort(key=lambda q: (oracle(set(ideal), q), _part_index(q)))
     progressed = False
     for q in cands:
       tq = time.perf_counter()
-      sub, s2 = fill(s, q, ideal)
+      if q in connect:
+        sub, s2 = fill_module(s, q, ideal)
+      else:
+        sub, s2 = fill(s, q, ideal)
+      grown = (ideal | modules[q]) if q in connect else (ideal | {q})
       if sub is not None:
         del plan[plen:]
         plan.extend(sub)
-        stack.append((s2, ideal | {q}, len(plan), (ideal_key, q)))
+        stack.append((s2, grown, len(plan), (ideal_key, q)))
         progressed = True
         if verbose:
-          print(f"[milestones] added {q} in {len(sub)} actions "
+          what = (f"module {q} ({len(modules[q])} parts, incl. join)"
+                  if q in connect else q)
+          print(f"[milestones] added {what} in {len(sub)} actions "
                 f"({time.perf_counter() - tq:.1f}s, {len(plan)} total)")
         break
       blacklist.add((ideal_key, q))

@@ -379,6 +379,42 @@ def parse_args():
            "--dense-grasps it behaves exactly like --collapsed-h.",
   )
   parser.add_argument(
+      "--pea", action="store_true",
+      help="PARTIAL-EXPANSION A* engine: identical guarantees and ordering to the exact "
+           "search, but the open list holds only each node's current f-BAND -- successors "
+           "above it are regenerated later instead of stored. Frontier memory / ~branching "
+           "factor, for long horizons where the plain open list OOMs (compute-for-memory "
+           "trade; succ/h are cached). Composes with --bounded (phase-2 engine).",
+  )
+  parser.add_argument(
+      "--iter-bound", action="store_true",
+      help="ITERATIVE COST-BOUND DEEPENING: run exact passes at cost_bound = h(s0)+1, +2, "
+           "... until a plan appears -- the FIRST plan found is PROVEN OPTIMAL (each "
+           "exhausted pass is a lower-bound proof; the inner --weight only orders "
+           "exploration inside each pass). Per-pass memory = that bound's sublevel set, "
+           "the minimum any optimality proof needs. Combine with --pea for the smallest "
+           "footprint. Integer action costs assumed (step 1).",
+  )
+  parser.add_argument(
+      "--beam", type=int, default=None, metavar="N",
+      help="BEAM SEARCH engine (width N): keeps <= N states per depth level (memory-"
+           "bounded). MEASURED WORSE THAN GREEDY on the long-horizon benchmark "
+           "(cube-plates-2x2x3: greedy cost 33/63 exp vs beam-8 cost 43 at w=inf, 59 at "
+           "w=5, beam-1 cost 116 -- greedy's GLOBAL frontier backs up where a beam must "
+           "commit, and its frontier stays tiny anyway). Kept as the LAST-RESORT "
+           "incumbent fallback in --bounded (fires only if greedy also fails) and for "
+           "experimentation.",
+  )
+  parser.add_argument(
+      "--dfbnb", action="store_true",
+      help="DEPTH-FIRST BRANCH-AND-BOUND certificate engine (implies --bounded): linear "
+           "memory + LRU transposition table, anytime. MEASURED SLOWER than the bounded "
+           "A* it replaces (cube-plates-2x2x3, same bound 33: A* PROVES in 192s floating "
+           "/ ~1000s real-ik; dfbnb exhausts its node budget unfinished at 350s / times "
+           "out at 1500s -- DFS re-enters the interleaving lattice that A*'s claim-at-pop "
+           "kills globally). Use only if the A* open list truly cannot fit memory.",
+  )
+  parser.add_argument(
       "--sig-collapsed-h", action="store_true",
       help="SIGNATURE grasp collapse + LABELED loose parts: grasp labels are equivalence "
            "classes under the fact signature (press capability, pick-face vector, contact "
@@ -489,6 +525,18 @@ def main():
 
   assembly = make_assembly(args.assembly, args.parts)
 
+  if args.pea:
+    print("[flag] --pea ACTIVE: partial-expansion A* engine (banded open list; same "
+          "guarantees, frontier memory / ~branching factor).")
+  if args.iter_bound:
+    print("[flag] --iter-bound ACTIVE: iterative cost-bound deepening -- first plan found "
+          "is proven optimal; --weight only orders exploration within passes.")
+  if args.beam is not None:
+    print(f"[flag] --beam ACTIVE: beam search, width {args.beam} (memory-bounded, no "
+          f"quality bound{'; incumbent fallback for --bounded' if args.bounded or args.dfbnb else ''}).")
+  if args.dfbnb:
+    print("[flag] --dfbnb ACTIVE: depth-first branch-and-bound certificate phase "
+          "(implies --bounded).")
   if args.sig_collapsed_h:
     if args.sig_components:
       set_sig_components([c.strip() for c in args.sig_components.split(",") if c.strip()])
@@ -567,14 +615,15 @@ def main():
       robot_ik.fail_log_seconds = args.log_ik_failures
       robot_ik.fail_log_stop = True                # abort the search when the window closes
     try:
-      if args.bounded:
+      if args.bounded or args.dfbnb:
         plan = solve_assembly_problem_bounded(
             C, assembly, robots=robots, robot_ik=robot_ik, weight=args.weight,
             wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
             bracing=args.bracing, labeled_h=args.labeled_h, collapsed_h=args.collapsed_h,
             grasp_collapsed_h=args.grasp_collapsed_h or not (args.labeled_h or args.collapsed_h),
             stats_every=args.search_stats, geo_facts=args.geo_facts,
-            sig_collapsed_h=args.sig_collapsed_h)
+            sig_collapsed_h=args.sig_collapsed_h, beam_width=args.beam,
+            dfbnb=args.dfbnb, pea=args.pea)
       elif args.lazy:
         plan = solve_assembly_problem_lazy(
             C, assembly, robots=robots, weight=args.weight, robot_ik=robot_ik,
@@ -623,7 +672,9 @@ def main():
                                       part_order_bias=args.part_order_bias,
                                       stats_every=args.search_stats, por=args.por,
                                       geo_facts=args.geo_facts,
-                                      sig_collapsed_h=args.sig_collapsed_h)
+                                      sig_collapsed_h=args.sig_collapsed_h,
+                                      beam_width=args.beam, pea=args.pea,
+                                      iter_bound=args.iter_bound)
     except IKFailureLogDone:
       print(f"[ik-failures] window/cap reached -- search stopped for debugging "
             f"({len(fail_rec.steps)} failures collected).")
