@@ -501,6 +501,15 @@ def parse_args():
            "Requires --real-ik.",
   )
   parser.add_argument(
+      "--witness-clearance", type=float, default=0.0, metavar="W",
+      help="Per-step CLEARANCE weight for --optimize-witnesses (0=off, ~1.0 works). "
+           "Among candidate witnesses, prefer configs that keep the active arm clear of "
+           "the OTHER robots and the TABLE (parts excluded -- intended contact). Score = "
+           "SUM over arm-link pairs of min(gap, 0.4m) via C.eval(FS.distance) (sum not "
+           "min: the gripper is pinned near the object; the cap ignores already-far "
+           "pairs). Traded against movement by this weight. Best with the dp-* modes.",
+  )
+  parser.add_argument(
       "--sig-collapsed-h", action="store_true",
       help="SIGNATURE grasp collapse + LABELED loose parts: grasp labels are equivalence "
            "classes under the fact signature (press capability, pick-face vector, contact "
@@ -832,7 +841,7 @@ def main():
               C, assembly, plan, robots, robot_ik, cost=args.optimize_witnesses,
               gripper_kind=gripper_kind(C) if args.wrench else None,
               handovers=args.handovers, allow_place=args.allow_place,
-              bracing=args.bracing)
+              bracing=args.bracing, clear_weight=args.witness_clearance)
       if args.view or args.viser:
         recorder = None
         if args.viser:

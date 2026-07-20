@@ -1502,7 +1502,7 @@ class AbstractionHeuristic:
 def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
                        pull_weight=1.0, ee_rot_weight=0.3, sweeps=2, verbose=True,
                        gripper_kind=None, handovers=True, allow_place=True, bracing=False,
-                       grasp_table=None):
+                       grasp_table=None, clear_weight=0.0, clear_margin=0.4):
   """POST-PASS witness optimization (v1 of the witness-optimization plan): the DISCRETE
   plan is FIXED; each IK action is re-solved warm-pulled toward the ACTIVE arm's previous
   configuration, minimizing per-step active-arm movement in 'joint' space or 'ee' space
@@ -1529,6 +1529,36 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
     q = np.array([qmap.get(n, home_map[n]) for n in names])
     fkC.setJointState(q)
     return np.asarray(fkC.getFrame(robot_ik.gripper_frame[r]).getPose(), dtype=float)
+
+  robotset = set(robots)
+  # collidable frames per robot (the ur_coll* capsules + gripper), from the flat pair list.
+  _collset = set(fkC.getCollidablePairs())
+  coll_frames = {r: [f for f in _collset if f.startswith(r + "_")] for r in robots}
+  _table = [f for f in _collset if f in ("table",)]      # fixed obstacle; parts excluded
+  other_frames = {r: [f for rr in robots if rr != r for f in coll_frames[rr]] + _table
+                  for r in robots}
+
+  def clearance(witness, r):
+    # PER-STEP CLEARANCE of the ACTIVE arm `r` (posed at `witness`) from the OTHER robots
+    # (at home) AND the table. C.eval(FS.distance) per frame pair = a TRUE signed gap valid
+    # when separated. SUM over pairs (not min): the gripper is pinned near the grasped
+    # object so it is almost always the closest thing -- min would fixate on that
+    # un-improvable distance; summing optimizes the ARM-BODY separation, which has real DOF
+    # freedom. PARTS are EXCLUDED (no optimization DOFs -- the arm touches them on purpose);
+    # the TABLE is INCLUDED (a fixed obstacle the arm should not drag along).
+    wmap = dict(zip(names, witness))
+    q = np.array([wmap[n] if n in arm_joints[r] else home_map[n] for n in names])
+    fkC.setJointState(q)
+    total_gap = 0.0
+    for fa in coll_frames[r]:
+      for fb in other_frames[r]:
+        v, _ = fkC.eval(ry.FS.distance, [fa, fb])
+        # CAP each pair at clear_margin: a gap beyond the margin is "clear enough" and
+        # contributes a constant, so far pairs (incl. links high above the table, and the
+        # base mounted ON the table) can't dominate the sum -- it focuses on pairs still
+        # inside the danger zone (< margin), which is where separation actually matters.
+        total_gap += min(-float(v[0]), clear_margin)
+    return total_gap
 
   dp = cost.startswith("dp-")
   metric = cost[3:] if dp else cost
@@ -1572,6 +1602,14 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
 
   before = total(wit)
 
+  def clearance_stats(ws):
+    vals = [clearance(ws[i], plan[i][1]) for i, a in enumerate(plan)
+            if ws[i] is not None]
+    return (min(vals) if vals else float("nan"),
+            float(np.mean(vals)) if vals else float("nan"))
+
+  cl_before = clearance_stats(wit) if clear_weight > 0 else (None, None)
+
   if dp:
     # LADDER-GRAPH DP (Viterbi): per step harvest multiple feasible candidate witnesses,
     # then choose the globally optimal combination. The objective is a chain -- each
@@ -1584,7 +1622,7 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
         C, assembly, plan, robots, robot_ik, cost=metric, pull_weight=pull_weight,
         ee_rot_weight=ee_rot_weight, sweeps=sweeps, verbose=False,
         gripper_kind=gripper_kind, handovers=handovers, allow_place=allow_place,
-        bracing=bracing, grasp_table=grasp_table)
+        bracing=bracing, grasp_table=grasp_table)  # warm start (no clearance filter)
     cands = {}
     for i, a in enumerate(plan):
       if wit[i] is None:
@@ -1625,7 +1663,8 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
       for j, i in enumerate(ks):
         layer_cost, layer_bp, layer_maps = [], [], []
         for c_idx, w in enumerate(cands[i]):
-          costs = [best_prev[p] + dist_r(prev_maps[p], w, r)
+          node = -clear_weight * clearance(w, r) if clear_weight > 0 else 0.0
+          costs = [best_prev[p] + dist_r(prev_maps[p], w, r) + node
                    for p in range(len(prev_maps))]
           p_best = int(np.argmin(costs))
           layer_cost.append(costs[p_best])
@@ -1645,9 +1684,14 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
         sel = bp_all[j][sel]
     after = total(wit)
     if verbose:
+      tail = ""
+      if clear_weight > 0:
+        cmin, cmean = clearance_stats(wit)
+        tail = (f"; clearance min {cl_before[0]:.3f}->{cmin:.3f} "
+                f"mean {cl_before[1]:.3f}->{cmean:.3f}")
       print(f"[witopt] dp-{metric} cost: {before:.3f} -> {after:.3f}  "
             f"(ladder of {n_cand} candidates over "
-            f"{sum(1 for w in wit if w is not None)} steps) "
+            f"{sum(1 for w in wit if w is not None)} steps){tail} "
             f"in {time.perf_counter() - t0:.1f}s")
     return wit, {"before": before, "after": after, "improved": -1, "fallback": 0}
 
@@ -1661,7 +1705,9 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
         if wit[i] is None:
           continue
         r = a[1]
-        old_c = step_cost(qmap, wit[i], r)
+        def obj(w):
+          return step_cost(qmap, w, r) - clear_weight * clearance(w, r)
+        old_c = obj(wit[i])
         pe = fk_ee(qmap, r)
         robot_ik._opt_pull = {
             "mode": cost, "robot": r,
@@ -1671,7 +1717,7 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
         }
         ok, w2 = robot_ik.bind(a, states[i], states[i + 1], assembly)
         robot_ik._opt_pull = None
-        if ok and w2 is not None and step_cost(qmap, w2, r) < old_c - 1e-9:
+        if ok and w2 is not None and obj(w2) < old_c - 1e-9:
           wit[i] = w2
           improved += 1
           changed = True
@@ -1686,9 +1732,14 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
     robot_ik._opt_pull = None
   after = total(wit)
   if verbose:
+    tail = ""
+    if clear_weight > 0:
+      cmin, cmean = clearance_stats(wit)
+      tail = (f"; clearance min {cl_before[0]:.3f}->{cmin:.3f} "
+              f"mean {cl_before[1]:.3f}->{cmean:.3f}")
     print(f"[witopt] {cost} cost: {before:.3f} -> {after:.3f}  "
           f"({improved} steps improved, {fallback} pulled re-solves failed -> originals "
-          f"kept) in {time.perf_counter() - t0:.1f}s")
+          f"kept){tail} in {time.perf_counter() - t0:.1f}s")
   return wit, {"before": before, "after": after, "improved": improved,
                "fallback": fallback}
 
