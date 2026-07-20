@@ -1493,7 +1493,7 @@ class LabeledDisassemblyHeuristic:
 
   def __init__(self, assembly, n_robots, grasp_table, gripper_path=None, verbose=False,
                max_states=2_000_000, clearance=0.02, gripper_kind=None, bracing=False,
-               geo_checker=None):
+               geo_checker=None, dist_cap=None):
     import heapq
     import time as _time
 
@@ -1741,7 +1741,9 @@ class LabeledDisassemblyHeuristic:
         raise RuntimeError(f"labeled abstraction exceeded {max_states} states")
       for s, c in preds(t):
         nd = d + c
-        if nd < self.dist.get(s, float("inf")):
+        if dist_cap is not None and nd > dist_cap:
+          continue                                        # CORRIDOR cap: miss => dist > cap,
+        if nd < self.dist.get(s, float("inf")):           # h=inf sound under cost_bound<=cap
           self.dist[s] = nd
           heapq.heappush(pq, (nd, id(s), s))
 
@@ -1943,7 +1945,7 @@ class CollapsedLabeledHeuristic:
   def __init__(self, assembly, n_robots, grasp_table, gripper_path=None, verbose=False,
                max_states=2_000_000, clearance=0.02, gripper_kind=None, bracing=False,
                collapse_grasps=False, geo_checker=None, grasp_classes=None,
-               labeled_loose=False):
+               labeled_loose=False, dist_cap=None):
     import heapq
     import time as _time
 
@@ -2261,7 +2263,9 @@ class CollapsedLabeledHeuristic:
         raise RuntimeError(f"collapsed labeled abstraction exceeded {max_states} states")
       for s, c in preds(t):
         nd = d + c
-        if nd < self.dist.get(s, float("inf")):
+        if dist_cap is not None and nd > dist_cap:
+          continue                                        # CORRIDOR cap: miss => dist > cap,
+        if nd < self.dist.get(s, float("inf")):           # h=inf sound under cost_bound<=cap
           self.dist[s] = nd
           heapq.heappush(pq, (nd, id(s), s))
 
@@ -2446,7 +2450,7 @@ def _outcome(kind):
 def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
            edge_check_fn=None, weight=1.0, max_nodes=200000, verbose=True,
            tag="A*", t0=None, cost_bound=None, deadline=None, order_key_fn=None,
-           stats_every=None, por=False):
+           stats_every=None, por=False, pathmax=False):
   """Generic LAZY weighted-A* engine, shared by every search variant (exact + optimistic).
 
   The domain enters only through callbacks -- this function knows nothing about assemblies:
@@ -2560,6 +2564,13 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
       hns = h_fn(ns)
       if hns == float("inf"):
         continue                                          # provable dead end (admissible h)
+      if pathmax and _h - (ng - g) > hns:
+        # PATHMAX consistency repair: h may not drop faster than the edge cost (triangle
+        # inequality keeps this admissible). The labeled h is INCONSISTENT (measured:
+        # 15/32 plan steps h-neutral, then 2-3-point plunges); smoothing the profile
+        # turns each stall's f-bump -- and the frontier sweep it forces -- into a smooth
+        # decline, leaving only ~slack-many bumps.
+        hns = _h - (ng - g)
       if cost_bound is not None and ng + hns >= cost_bound:
         continue                                          # sound prune vs the incumbent
       heapq.heappush(pq, (f_value(ng, hns), hns, okey(act), ng, next(tie), ns, s, act))
@@ -2574,7 +2585,7 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
 def _pea_star(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
               edge_check_fn=None, weight=1.0, max_nodes=200000, verbose=True,
               tag="PEA*", t0=None, cost_bound=None, deadline=None, order_key_fn=None,
-              stats_every=None, por=False):
+              stats_every=None, por=False, pathmax=False):
   """PARTIAL-EXPANSION A* (PEA*): identical semantics and guarantees to _astar
   (claim-at-pop, lazy edge checks, weight, cost_bound, POR), but the OPEN list holds only
   each expansion's current f-BAND: successors with f above the popped node's F are NOT
@@ -2680,6 +2691,8 @@ def _pea_star(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
       hns = h_fn(ns)
       if hns == float("inf"):
         continue
+      if pathmax and _h - (ng - g) > hns:
+        hns = _h - (ng - g)                               # pathmax (see _astar)
       if cost_bound is not None and ng + hns >= cost_bound:
         continue
       fns = f_value(ng, hns)
@@ -2907,7 +2920,8 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
                            grasp_collapsed_h=False, bracing=False, part_order_bias=False,
                            stats_every=None, por=False, geo_facts=False,
                            sig_collapsed_h=False, beam_width=None, dfbnb=False,
-                           pea=False, iter_bound=False):
+                           pea=False, iter_bound=False, pathmax=False,
+                           h_dist_cap=None):
   """EXACT (weighted) A* over scene-graph states from the initial scene to a completed
   assembly -- the reference baseline. Priority is f = g + weight * h.
     - weight = 1.0 : ordinary A*, returns a minimum-cost plan.
@@ -2989,7 +3003,7 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
                   gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
                   verbose=verbose,
                   gripper_kind=gk if wrench_aware_h else None, bracing=bracing,
-                  geo_checker=checker if geo_facts else None)
+                  geo_checker=checker if geo_facts else None, dist_cap=h_dist_cap)
       h_abs = None
 
   def h_fn(state):
@@ -3083,7 +3097,7 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
                       edge_check_fn=edge_check_fn,
                       weight=weight, max_nodes=max_nodes, verbose=verbose, tag=etag,
                       t0=t0, cost_bound=B, deadline=deadline, order_key_fn=okey,
-                      stats_every=stats_every, por=por)
+                      stats_every=stats_every, por=por, pathmax=pathmax)
         if plan is not None:
           if verbose:
             print(f"[iter-bound] cost {sum(action_cost(a) for a in plan):g} plan is "
@@ -3101,7 +3115,7 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
                   edge_check_fn=edge_check_fn,
                   weight=weight, max_nodes=max_nodes, verbose=verbose, tag=etag, t0=t0,
                   cost_bound=cost_bound, deadline=deadline, order_key_fn=okey,
-                  stats_every=stats_every, por=por)
+                  stats_every=stats_every, por=por, pathmax=pathmax)
   finally:
     set_anonymous_robots(False)
 
@@ -3357,7 +3371,8 @@ def solve_assembly_problem_bounded(C, assembly, robots=None, verbose=True, robot
                                    labeled_h=False, collapsed_h=False,
                                    grasp_collapsed_h=True, stats_every=None,
                                    geo_facts=False, sig_collapsed_h=False,
-                                   beam_width=None, dfbnb=False, pea=False):
+                                   beam_width=None, dfbnb=False, pea=False,
+                                   pathmax=False, corridor_h=False):
   """INCUMBENT-BOUNDED exact search -- the principled wrapper around the fast decomposed
   solvers. Phase 1: the MILESTONE planner produces an incumbent plan fast (its greedy
   commitments carry no bound). Phase 2: the exact search runs with cost_bound = U (the
@@ -3409,7 +3424,8 @@ def solve_assembly_problem_bounded(C, assembly, robots=None, verbose=True, robot
       max_nodes=max_nodes, wrench=wrench, handovers=handovers, allow_place=allow_place,
       bracing=bracing, labeled_h=labeled_h, collapsed_h=collapsed_h,
       grasp_collapsed_h=grasp_collapsed_h, cost_bound=U, stats_every=stats_every,
-      geo_facts=geo_facts, sig_collapsed_h=sig_collapsed_h, dfbnb=dfbnb, pea=pea)
+      geo_facts=geo_facts, sig_collapsed_h=sig_collapsed_h, dfbnb=dfbnb, pea=pea,
+      pathmax=pathmax, h_dist_cap=(U if corridor_h else None))
   if best is not None and (U is None or sum(action_cost(a) for a in best) < U):
     if verbose:
       print(f"[bounded] exact search IMPROVED the incumbent "
@@ -3500,7 +3516,8 @@ def _part_mated(state, p):
 def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot_ik,
                   weight, max_nodes, verbose, gripper_kind=None, handovers=True,
                   allow_place=True, bracing=False, grasp_cap=None, h_extra=None,
-                  part_grasp_allow=None, brace_allow=None):
+                  part_grasp_allow=None, brace_allow=None, deadline=None,
+                  lazy_fill=False, cost_bound=None, forbid_assemble=None):
   # a small COMPLETE search that adds part `p` to the assembly `ideal` and leaves it SETTLED:
   # p mated, no loose part left in a gripper, and the assembly ending held by at most one
   # carrier OR resting on the table -- WHICHEVER the search finds. It forces neither a
@@ -3554,7 +3571,12 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
       if (brace_allow is not None and a[0] == "add_grasp"
           and (a[2], a[3]) not in brace_allow):
         continue                                          # only the abstraction's known G2 braces
-      yield a, ns
+      if forbid_assemble is not None and a[0] == "assemble" and a[2] in forbid_assemble:
+        continue                                          # e.g. the module JOIN belongs to the
+      yield a, ns                                         # dedicated join fill (tiny space =>
+                                                          # cheap lazy rounds; measured 96 join
+                                                          # refusals x full re-search inside the
+                                                          # obj_11 fill = the 118s bottleneck)
 
   def edge_check_fn(prev, act, ns):
     # fully lazy (cheap geometry + IK at POP; see solve_assembly_problem)
@@ -3565,10 +3587,77 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
       return ok
     return True
 
+  def _replay(sub):
+    s = start
+    for a in sub:
+      s = next(ns for act, ns in successors(s, assembly, robots, grasp_table=grasp_table,
+                                            gripper_kind=gripper_kind, handovers=handovers,
+                                            allow_place=allow_place, bracing=bracing)
+               if act == a)
+    return s
+
+  if lazy_fill and robot_ik is not None:
+    # LAZY-VALIDATED fill (LazySP hybrid, mirroring the global lazy search): the fill's
+    # inner search pays only the CHEAP gate at pop; real IK runs on CANDIDATE subplan
+    # edges only, failures are blacklisted and the (tiny) search reruns. Imports the
+    # measured lazy economics (61 validations vs 19,515 eager checks on the cross) into
+    # the fills -- the 2x2x3 module-fill bottleneck (325-373s/fill at R=4-real was
+    # dominated by failed IK binds at pop).
+    bl = set()
+    ok_cache = set()                                      # (state, action) IK-validated
+
+    def succ_lazy(s):
+      for a, ns in succ_fn(s):
+        if (s, a) not in bl:
+          yield a, ns
+
+    def cheap_only(prev, act, ns):
+      return cheap_feasible(act, prev, ns, assembly, checker)
+
+    for _round in range(200):
+      subplan = _astar(start, goal_fn=goal_fn, succ_fn=succ_lazy, cost_fn=action_cost,
+                       h_fn=h_fn, cheap_fn=None, edge_check_fn=cheap_only,
+                       weight=weight, max_nodes=max_nodes, verbose=False,
+                       tag=f"add {p} lazy", deadline=deadline, cost_bound=cost_bound)
+      if subplan is None:
+        return None, None
+      s = start
+      valid = True
+      for a in subplan:
+        ns = next(n2 for act2, n2 in successors(s, assembly, robots,
+                                                grasp_table=grasp_table,
+                                                gripper_kind=gripper_kind,
+                                                handovers=handovers,
+                                                allow_place=allow_place, bracing=bracing)
+                  if act2 == a)
+        if a[0] in _IK_ACTIONS and (s, a) not in ok_cache:
+          okb, _w = robot_ik.bind(a, s, ns, assembly)
+          if not okb:
+            # VALIDATE-ALL per round: binds are checks, not state changes, so the suffix
+            # states stay well-defined -- keep replaying and blacklist EVERY failing edge
+            # this round. Collapses rounds from #failures to #failure-layers (measured:
+            # first-failure needed 130 rounds/145s on the obj_11 fill). The global lazy
+            # search measured validate-all HARMFUL -- there the doomed-suffix IK cost
+            # dominates; in a tiny fill the re-search dominates, inverting the trade.
+            bl.add((s, a))
+            valid = False
+          else:
+            ok_cache.add((s, a))
+        s = ns
+      if valid:
+        if verbose and _round >= 10:
+          from collections import Counter
+          kinds = Counter((a[0], a[1], a[3] if len(a) > 3 else None) for _s, a in bl)
+          top = ", ".join(f"{k}:{c}" for k, c in kinds.most_common(6))
+          print(f"[fill {p}] lazy converged after {_round + 1} rounds; refuted binds "
+                f"by (kind, robot, arg): {top}")
+        return subplan, s
+    return None, None
+
   subplan = _astar(start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
                    cheap_fn=None, edge_check_fn=edge_check_fn,
                    weight=weight, max_nodes=max_nodes, verbose=False,
-                   tag=f"add {p}")
+                   tag=f"add {p}", deadline=deadline, cost_bound=cost_bound)
   if subplan is None:
     return None, None
   s = start
@@ -3578,6 +3667,102 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
                                           allow_place=allow_place, bracing=bracing)
              if act == a)
   return subplan, s
+
+
+def _add_parts(start, ps, ideal, assembly, robots, checker, grasp_table, robot_ik,
+               weight, max_nodes, gripper_kind=None, handovers=True,
+               allow_place=True, bracing=False, deadline=None,
+               lazy_fill=False, cost_bound=None):
+  # WIDTH-k milestone fill (adaptive-width completeness net): add ALL parts in `ps` in ONE
+  # joint mini-search -- for plans that must INTERLEAVE several parts' glue, which the
+  # width-1 fill cannot express (the milestone commitment's documented gap). Invoked with
+  # growing k only after every smaller width failed at the node, BEFORE backjumping:
+  # escalation on proof of local failure; k = n is the flat exact search, so completeness
+  # is recovered in the limit. No hint phases (hints are per-part); one full phase.
+  ps = tuple(ps)
+  relevant = set(ideal) | set(ps)
+
+  def goal_fn(s):
+    return (all(_part_mated(s, p) for p in ps)
+            and _num_loose_held(s, assembly) == 0
+            and _assembly_holders(s, assembly) <= 1)
+
+  def h_fn(s):
+    left = sum(0 if _part_mated(s, p) else 2 for p in ps)
+    return left + _num_loose_held(s, assembly) + max(0, _assembly_holders(s, assembly) - 1)
+
+  def succ_fn(s):
+    for a, ns in successors(s, assembly, robots, grasp_table=grasp_table,
+                            gripper_kind=gripper_kind, handovers=handovers,
+                            allow_place=allow_place, bracing=bracing):
+      if a[2] in relevant:
+        yield a, ns
+
+  def edge_check_fn(prev, act, ns):
+    if not cheap_feasible(act, prev, ns, assembly, checker):
+      return False
+    if robot_ik is not None and act[0] in _IK_ACTIONS:
+      ok, _w = robot_ik.bind(act, prev, ns, assembly)
+      return ok
+    return True
+
+  def _replay_upto(sub):
+    s = start
+    for a in sub:
+      s = next(ns for act, ns in successors(s, assembly, robots, grasp_table=grasp_table,
+                                            gripper_kind=gripper_kind, handovers=handovers,
+                                            allow_place=allow_place, bracing=bracing)
+               if act == a)
+    return s
+
+  if lazy_fill and robot_ik is not None:
+    bl = set()                                            # (state, action) IK-refuted edges
+    ok_cache = set()
+
+    def succ_lazy(s):
+      for a, ns in succ_fn(s):
+        if (s, a) not in bl:
+          yield a, ns
+
+    def cheap_only(prev, act, ns):
+      return cheap_feasible(act, prev, ns, assembly, checker)
+
+    for _round in range(200):
+      subplan = _astar(start, goal_fn=goal_fn, succ_fn=succ_lazy, cost_fn=action_cost,
+                       h_fn=h_fn, cheap_fn=None, edge_check_fn=cheap_only, weight=weight,
+                       max_nodes=max_nodes, verbose=False,
+                       tag="add " + "+".join(ps) + " lazy", deadline=deadline,
+                       cost_bound=cost_bound)
+      if subplan is None:
+        return None, None
+      s = start
+      valid = True
+      for a in subplan:
+        ns = next(n2 for act2, n2 in successors(s, assembly, robots,
+                                                grasp_table=grasp_table,
+                                                gripper_kind=gripper_kind,
+                                                handovers=handovers,
+                                                allow_place=allow_place, bracing=bracing)
+                  if act2 == a)
+        if a[0] in _IK_ACTIONS and (s, a) not in ok_cache:
+          okb, _w = robot_ik.bind(a, s, ns, assembly)
+          if not okb:
+            bl.add((s, a))                                # validate-all (see _add_one_part)
+            valid = False
+          else:
+            ok_cache.add((s, a))
+        s = ns
+      if valid:
+        return subplan, s
+    return None, None
+
+  subplan = _astar(start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost,
+                   h_fn=h_fn, cheap_fn=None, edge_check_fn=edge_check_fn, weight=weight,
+                   max_nodes=max_nodes, verbose=False, tag="add " + "+".join(ps),
+                   deadline=deadline, cost_bound=cost_bound)
+  if subplan is None:
+    return None, None
+  return subplan, _replay_upto(subplan)
 
 
 def solve_assembly_problem_optimistic(C, assembly, robots=None, verbose=True,
@@ -3825,7 +4010,9 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
                                       weight=5.0, max_nodes=20000, wrench=False,
                                       handovers=True, allow_place=True, bracing=False,
                                       max_repairs=100, geo_facts=False,
-                                      sig_collapsed_h=False):
+                                      sig_collapsed_h=False, deadline=None,
+                                      fill_window=2, lazy_fills=True,
+                                      cost_bound=None):
   """MILESTONE (Dogar-style, abstraction-guided) planner. Two levels:
 
     LEVEL 1: the assembly SEQUENCE. The labeled abstraction's backward Dijkstra (the same
@@ -3908,7 +4095,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
             braces.add((bp, rg))
     return (gqs or None), unbraced_ok, (braces or None)
 
-  def fill(s, q, ideal):
+  def fill(s, q, ideal, fb=None, forbid=None):
     allow, unbraced_ok, ballow = hints(_subasm_key(ideal), q)
     dense = _problem._DENSE_GRASPS
     # phases, narrowest first: (grasp_cap, bracing, mate_allow, brace_allow). A FULL phase (all
@@ -3932,7 +4119,8 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
                               weight, max_nodes, verbose, gripper_kind=gk,
                               handovers=handovers, allow_place=allow_place, bracing=br,
                               grasp_cap=cap, h_extra=h_lab.value, part_grasp_allow=ma,
-                              brace_allow=ba)
+                              brace_allow=ba, deadline=deadline, lazy_fill=lazy_fills,
+                              cost_bound=fb, forbid_assemble=forbid)
       if sub is not None:
         return sub, s2
     return None, None
@@ -3954,17 +4142,19 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
   modules = {r: frozenset(p for p in objs if r in _mate_closure(assembly, p)) | {r}
              for r in connect}
 
-  def fill_module(s, root, ideal):
+  def fill_module(s, root, ideal, fb=None):
     seq = sorted(modules[root] - {root},
                  key=lambda m: (len(_mate_closure(assembly, m)), _part_index(m)))
     parts_plan, s_cur, built = [], s, {root}
     for m in seq:
-      sub, s_cur = fill(s_cur, m, built)                  # module-relative fill (detached)
+      sub, s_cur = fill(s_cur, m, built, fb=fb, forbid={root})   # build only; JOIN comes last
       if sub is None:
         return None, None
       parts_plan.extend(sub)
+      if fb is not None:
+        fb -= sum(action_cost(a) for a in sub)            # global bound: spend as we go
       built.add(m)
-    sub, s_end = fill(s_cur, root, set(ideal) | set(modules[root]))   # the JOIN
+    sub, s_end = fill(s_cur, root, set(ideal) | set(modules[root]), fb=fb)   # the JOIN
     if sub is None:
       return None, None
     return parts_plan + sub, s_end
@@ -3977,6 +4167,11 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
   blacklist = set()                                       # (ideal_key, part) fill-ins that failed
   repairs = 0
   while stack:
+    if deadline is not None and time.perf_counter() > deadline:
+      if verbose:
+        print(f"[milestones] deadline reached after {repairs} repairs "
+              f"({time.perf_counter() - t0:.1f}s) -> no plan")
+      return None
     s, ideal, plen, _via = stack[-1]
     if ideal == objs:
       if verbose:
@@ -3992,12 +4187,18 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
                   else (_mate_closure(assembly, q) - {q}) <= ideal)]
     cands.sort(key=lambda q: (oracle(set(ideal), q), _part_index(q)))
     progressed = False
+    fb = None
+    if cost_bound is not None:
+      fb = cost_bound - sum(action_cost(a) for a in plan[:plen])
+      if fb <= 0:
+        stack.pop()                                       # prefix already >= bound
+        continue
     for q in cands:
       tq = time.perf_counter()
       if q in connect:
-        sub, s2 = fill_module(s, q, ideal)
+        sub, s2 = fill_module(s, q, ideal, fb=fb)
       else:
-        sub, s2 = fill(s, q, ideal)
+        sub, s2 = fill(s, q, ideal, fb=fb)
       grown = (ideal | modules[q]) if q in connect else (ideal | {q})
       if sub is not None:
         del plan[plen:]
@@ -4019,6 +4220,57 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
         if verbose:
           print("[milestones] repair budget exhausted")
         return None
+    if fill_window >= 2 and not progressed:
+      # WIDTH-k WINDOWS (adaptive-width escalation): every single-part candidate failed at
+      # this node -- before backjumping, try adding k parts in ONE joint fill (see
+      # _add_parts), k escalating 2..fill_window only as each smaller width exhausts.
+      # Singles always get priority; windows fire only on proof of width-1 failure.
+      for w in range(2, fill_window + 1):
+        if progressed:
+          break
+        wins = [(p,) for p in sorted(objs - ideal)
+                if p not in connect and (_mate_closure(assembly, p) - {p}) <= ideal]
+        for _ in range(w - 1):
+          wins = [t + (q,) for t in wins for q in sorted(objs - ideal - set(t))
+                  if q not in connect
+                  and (_mate_closure(assembly, q) - {q}) <= ideal | set(t)]
+        uniq, seen_sets = [], set()
+        for t in wins:                                    # one canonical ORDER per part-set
+          fs = frozenset(t)
+          if fs not in seen_sets and (ideal_key, tuple(sorted(t))) not in blacklist:
+            seen_sets.add(fs)
+            uniq.append(t)
+        uniq.sort(key=lambda t: (oracle(set(ideal) | set(t[:-1]), t[-1]),
+                                 tuple(_part_index(p) for p in t)))
+        if len(uniq) > 100:
+          if verbose:
+            print(f"[milestones] width-{w} windows capped 100/{len(uniq)}")
+          uniq = uniq[:100]
+        for t in uniq:
+          tq = time.perf_counter()
+          sub, s2 = _add_parts(s, t, ideal, assembly, robots, checker, grasp_table,
+                               robot_ik, weight, max_nodes, gripper_kind=gk,
+                               handovers=handovers, allow_place=allow_place,
+                               bracing=bracing, deadline=deadline,
+                               lazy_fill=lazy_fills, cost_bound=fb)
+          if sub is not None:
+            del plan[plen:]
+            plan.extend(sub)
+            stack.append((s2, ideal | set(t), len(plan), (ideal_key, tuple(sorted(t)))))
+            progressed = True
+            if verbose:
+              print(f"[milestones] added WINDOW {t} in {len(sub)} actions "
+                    f"({time.perf_counter() - tq:.1f}s, {len(plan)} total)")
+            break
+          blacklist.add((ideal_key, tuple(sorted(t))))
+          repairs += 1
+          if verbose:
+            print(f"[milestones] window {t} failed ({time.perf_counter() - tq:.1f}s) "
+                  f"-> blacklisted ({repairs} repairs)")
+          if repairs > max_repairs:
+            if verbose:
+              print("[milestones] repair budget exhausted")
+            return None
     if not progressed:
       _s, _i, _p, via = stack.pop()                       # dead end: backjump + blame the
       if via is not None:                                 # decision that created this node
@@ -4035,6 +4287,395 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
     print(f"[milestones] search space exhausted with no plan "
           f"in {time.perf_counter() - t0:.2f}s ({repairs} repairs)")
   return None
+
+
+def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_budget=300.0,
+                                              verbose=True, robot_ik=None, weight=5.0,
+                                              wrench=False, handovers=True,
+                                              allow_place=True, bracing=False,
+                                              geo_facts=False, sig_collapsed_h=False,
+                                              labeled_h=False, collapsed_h=False,
+                                              grasp_collapsed_h=False, fill_window=2):
+  """THE SINGLE RECIPE (--milestones-anytime SEC): adaptive-width milestones under a hard
+  deadline, then spend whatever budget remains on principled add-ons -- one algorithm plus
+  its own refinements, not a solver lottery:
+
+    1. MILESTONES (DAG modules + width-2 windows), deadline = the full budget. The only
+       method with 100%% coverage on every measured instance/robot-count/embodiment.
+    2. If it produced a plan and time remains: BOUNDED IMPROVEMENT -- the exact search
+       under the incumbent's cost (PEA* engine: memory-safe), deadline = remaining budget.
+       Returns the better plan; the incumbent survives a deadline hit by construction.
+    3. If milestones itself was cut by the deadline: PEA-GREEDY net (weight=inf, banded
+       frontier => no OOM) with the remaining time -- fast plan or honest None.
+
+  Result <= min(milestone cost, weight x optimal) when phase 2 completes; always the best
+  plan found; never OOM; never hangs past the budget."""
+  import math
+  import time
+  t0 = time.perf_counter()
+  t_end = t0 + time_budget
+  # NET RESERVE: milestones must NOT get the whole budget -- if the deadline cuts it,
+  # the greedy net needs time to run (measured: giving milestones deadline=t_end left
+  # -0.3s for the net => 'no plan' despite greedy solving the instance in 23s).
+  t_mile = t_end - min(60.0, 0.25 * time_budget)
+  inc = solve_assembly_problem_milestones(
+      C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik,
+      weight=max(weight, 5.0), wrench=wrench, handovers=handovers,
+      allow_place=allow_place, bracing=bracing, geo_facts=geo_facts,
+      sig_collapsed_h=sig_collapsed_h, deadline=t_mile, fill_window=fill_window)
+  remaining = t_end - time.perf_counter()
+  if inc is None:
+    if remaining > 5.0:
+      if verbose:
+        print(f"[mile-anytime] milestones cut/failed -> PEA-greedy net "
+              f"({remaining:.0f}s left)")
+      return solve_assembly_problem(
+          C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik,
+          weight=float("inf"), wrench=wrench, handovers=handovers,
+          allow_place=allow_place, bracing=bracing, pea=True, deadline=t_end)
+    if verbose:
+      print("[mile-anytime] no plan within budget")
+    return None
+  U = sum(action_cost(a) for a in inc)
+  if remaining > 10.0:
+    if verbose:
+      print(f"[mile-anytime] incumbent cost {U:g} ({len(inc)} actions) "
+            f"in {time.perf_counter() - t0:.1f}s -> bounded improvement, "
+            f"{remaining:.0f}s left")
+    best = solve_assembly_problem(
+        C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik, weight=weight,
+        wrench=wrench, handovers=handovers, allow_place=allow_place, bracing=bracing,
+        labeled_h=labeled_h, collapsed_h=collapsed_h,
+        grasp_collapsed_h=grasp_collapsed_h, sig_collapsed_h=sig_collapsed_h,
+        geo_facts=geo_facts, cost_bound=U, pea=True, deadline=t_end)
+    if best is not None and sum(action_cost(a) for a in best) < U:
+      if verbose:
+        print(f"[mile-anytime] improved {U:g} -> {sum(action_cost(a) for a in best):g} "
+              f"in {time.perf_counter() - t0:.1f}s total")
+      return best
+  if verbose:
+    print(f"[mile-anytime] returning the milestone plan (cost {U:g}) "
+          f"in {time.perf_counter() - t0:.1f}s total")
+  return inc
+
+
+def _refill_window(start, ps, ideal, target, assembly, robots, checker, grasp_table,
+                   robot_ik, weight, max_nodes, h_lab, gripper_kind=None, handovers=True,
+                   allow_place=True, bracing=False, deadline=None, cost_bound=None):
+  """Re-fill the window's parts `ps` from state `start`. If `target` is a State, the search
+  must arrive at THAT EXACT settled state (so the plan's suffix splices back unchanged); if
+  target is None the goal is the real assembly goal (the k=m / whole-plan window). Uses the
+  LABELED heuristic: to the real goal it is h_lab(s); to a fixed intermediate target it is
+  max(0, h_lab(s) - h_lab(target)) -- admissible because the abstraction distance is
+  consistent (h_lab(s) <= cost(s->target) + h_lab(target)). Lazy-validated like the fills."""
+  ps = tuple(ps)
+  relevant = set(ideal) | set(ps)
+  # DIFFERENTIAL (landmark) heuristic, uniform across all k: h(s) = h_abs(s) - h_abs(target),
+  # the same abstraction distance the whole system uses, with the goal as landmark --
+  # admissible by consistency (h_abs(s) <= cost(s->target) + h_abs(target)). For the k=m
+  # window target IS the goal, so h_abs(target)=0 and this is plain h_abs(s). No special
+  # cases. `h_lab` is the CLI-selected abstraction (sig-press at R=4 -- no explosion).
+  h_tgt = h_lab.value(target) if target is not None else 0.0
+  if target is not None:
+    tkey = target.key()
+    def goal_fn(s):
+      return s.key() == tkey
+  else:
+    def goal_fn(s):
+      return s.is_goal(assembly)
+
+  def h_fn(s):
+    return max(0.0, h_lab.value(s) - h_tgt)
+
+  def succ_fn(s):
+    for a, ns in successors(s, assembly, robots, grasp_table=grasp_table,
+                            gripper_kind=gripper_kind, handovers=handovers,
+                            allow_place=allow_place, bracing=bracing):
+      if a[2] in relevant:
+        yield a, ns
+
+  def cheap_only(prev, act, ns):
+    return cheap_feasible(act, prev, ns, assembly, checker)
+
+  if robot_ik is not None:                                # LAZY-validated (see _add_parts)
+    bl, ok_cache = set(), set()
+
+    def succ_lazy(s):
+      for a, ns in succ_fn(s):
+        if (s, a) not in bl:
+          yield a, ns
+
+    for _round in range(200):
+      subplan = _pea_star(start, goal_fn=goal_fn, succ_fn=succ_lazy, cost_fn=action_cost,
+                          h_fn=h_fn, cheap_fn=None, edge_check_fn=cheap_only, weight=weight,
+                          max_nodes=max_nodes, verbose=False, tag="lns refill",
+                          deadline=deadline, cost_bound=cost_bound)
+      if subplan is None:
+        return None
+      s = start
+      valid = True
+      for a in subplan:
+        ns = next(n2 for act2, n2 in successors(s, assembly, robots,
+                                                grasp_table=grasp_table,
+                                                gripper_kind=gripper_kind,
+                                                handovers=handovers,
+                                                allow_place=allow_place, bracing=bracing)
+                  if act2 == a)
+        if a[0] in _IK_ACTIONS and (s, a) not in ok_cache:
+          okb, _w = robot_ik.bind(a, s, ns, assembly)
+          if not okb:
+            bl.add((s, a))
+            valid = False
+          else:
+            ok_cache.add((s, a))
+        s = ns
+      if valid:
+        return subplan
+    return None
+
+  def edge_check_fn(prev, act, ns):
+    return cheap_feasible(act, prev, ns, assembly, checker)
+  return _pea_star(start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
+                   cheap_fn=None, edge_check_fn=edge_check_fn, weight=weight,
+                   max_nodes=max_nodes, verbose=False, tag="lns refill", deadline=deadline,
+                   cost_bound=cost_bound)
+
+
+def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weight,
+                 max_nodes, verbose, h_lab, gripper_kind=None, handovers=True,
+                 allow_place=True, bracing=False, deadline=None, t0=None, k_max=None):
+  """LARGE-NEIGHBORHOOD improvement -- ONE axis (neighborhood size k in contiguous
+  milestone segments), the LABELED heuristic throughout, FIXED endpoints from the current
+  best plan (so the suffix splices without recompute). Segments partition the plan at
+  SETTLED checkpoints (a part newly mated, nothing loose held, <=1 holder). For k=1..m a
+  window of k consecutive segments is re-filled from its start checkpoint to its END
+  checkpoint EXACTLY (k=m: to the real goal), bounded by the window's current cost --
+  strict improvements accepted, suffix spliced verbatim. Growing k covers reorderings a
+  small contiguous window can't reach; k=m is the whole-plan bounded search (the proof).
+  Since endpoints and per-segment parts are fixed, the checkpoint STATES are invariant
+  under accepts (only action indices shift), so m and the segment structure are stable."""
+  import time
+  if t0 is None:
+    t0 = time.perf_counter()
+
+  def cost(pl):
+    return sum(action_cost(a) for a in pl)
+
+  def checkpoints(pl):
+    # -> (states[0..m], bnds[0..m] action indices, seg_parts[0..m-1])
+    s = get_initial_state(C, assembly)
+    states, bnds, mated_prev = [s], [0], {p for p in assembly.objects if _part_mated(s, p)}
+    seg_parts, start_i = [], 0
+    for i, a in enumerate(pl):
+      s = next(ns for act, ns in successors(s, assembly, robots, grasp_table=grasp_table,
+                                            gripper_kind=gripper_kind, handovers=handovers,
+                                            allow_place=allow_place, bracing=bracing)
+               if act == a)
+      mated = {p for p in assembly.objects if _part_mated(s, p)}
+      if (mated > mated_prev and _num_loose_held(s, assembly) == 0
+          and _assembly_holders(s, assembly) <= 1):
+        states.append(s)
+        bnds.append(i + 1)
+        seg_parts.append(tuple(sorted(mated - mated_prev)))
+        mated_prev = mated
+    if bnds[-1] != len(pl):                               # trailing actions -> last segment
+      states.append(s)
+      bnds.append(len(pl))
+      seg_parts.append(tuple(sorted({p for p in assembly.objects if _part_mated(s, p)}
+                                    - (set().union(*seg_parts) if seg_parts else set())
+                                    - {assembly.base})))
+    return states, bnds, seg_parts
+
+  cur = list(plan)
+  # Standard LNS: grow k from 1; on ANY accepted improvement RESTART the sweep (the plan --
+  # and hence its segment partition -- changes, since a cheaper window may settle
+  # differently, so nothing about the old indexing survives). k grows only within a sweep
+  # that produced no improvement; when a full k=1..km sweep improves nothing, we are at a
+  # fixpoint for the neighborhoods tried. The k=m window [0,m] (start=s0, end=goal, so
+  # UNPINNED -- see is_last) is just the last iteration = the full bounded search; no
+  # separate proof rung. Pinning is per-window (is_last), NOT a global flag.
+  while True:
+    if deadline is not None and time.perf_counter() > deadline:
+      return cur
+    states, bnds, seg_parts = checkpoints(cur)
+    m = len(seg_parts)
+    km = m if k_max is None else min(k_max, m)
+    accepted = False
+    for k in range(1, km + 1):
+      if accepted:
+        break
+      for i in range(m - k + 1):
+        if deadline is not None and time.perf_counter() > deadline:
+          return cur
+        window_parts = sorted({p for sp in seg_parts[i:i + k] for p in sp})
+        old_cost = cost(cur[bnds[i]:bnds[i + k]])
+        is_last = (i + k == m)
+        ideal0 = {p for p in assembly.objects if _part_mated(states[i], p)}
+        sub = _refill_window(states[i], window_parts, ideal0,
+                             None if is_last else states[i + k], assembly, robots, checker,
+                             grasp_table, robot_ik, weight, max_nodes, h_lab,
+                             gripper_kind=gripper_kind, handovers=handovers,
+                             allow_place=allow_place, bracing=bracing, deadline=deadline,
+                             cost_bound=old_cost)
+        if sub is not None and cost(sub) < old_cost:
+          cur = cur[:bnds[i]] + list(sub) + cur[bnds[i + k]:]
+          if verbose:
+            print(f"[lns] k={k} seg[{i}:{i + k}] {tuple(window_parts)}: "
+                  f"-{old_cost - cost(sub):g} -> total {cost(cur):g} at "
+                  f"{time.perf_counter() - t0:.1f}s", flush=True)
+          accepted = True
+          break
+    if not accepted:
+      return cur
+
+
+def solve_assembly_problem_ladder(C, assembly, robots=None, time_budget=900.0,
+                                  verbose=True, robot_ik=None, weight=5.0, wrench=False,
+                                  handovers=True, allow_place=True, bracing=False,
+                                  geo_facts=False, sig_collapsed_h=False, labeled_h=False,
+                                  collapsed_h=False, grasp_collapsed_h=False,
+                                  lns=False, rwa_proof=False):
+  """THE LADDER (--ladder SEC): the unified anytime solver -- ONE commitment axis (fill
+  window k), ONE monotone thread (the incumbent bound U). Rungs:
+
+    k=1  milestones, lazy fills, bound U propagated INTO the fills
+         (G0 + g_fill + max(mini-h, h_lab) >= U prunes -- any plan returned is strictly
+         cheaper than U by construction)
+    k=2  same with width-2 windows (less commitment)
+    k=n  the limit: bounded exact search at WEIGHT 1 (PEA* engine). Under a bound the
+         weight only orders exploration -- the sublevel set is fixed -- so w=1 costs no
+         more to exhaust and its FIRST goal pop is optimal-under-U; exhaustion PROVES U
+         optimal (claim-once caveat). No luck involved.
+
+  Budget: rungs 1-2 share the first ~55%% (each cut by its slice), the proof rung gets
+  the rest. Returns the best plan found; prints PROVEN OPTIMAL when the last rung
+  exhausts."""
+  import time
+  t0 = time.perf_counter()
+  t_end = t0 + time_budget
+  U, best = None, None
+  slices = {1: t0 + 0.35 * time_budget, 2: t0 + 0.55 * time_budget}
+  rungs = (1,) if lns else (1, 2)
+  for k in rungs:
+    if time.perf_counter() > slices[k] - 5.0:
+      continue
+    if verbose:
+      print(f"[ladder] rung k={k}"
+            + (f" under bound {U:g}" if U is not None else "") , flush=True)
+    plan = solve_assembly_problem_milestones(
+        C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik,
+        weight=max(weight, 5.0), wrench=wrench, handovers=handovers,
+        allow_place=allow_place, bracing=bracing, geo_facts=geo_facts,
+        sig_collapsed_h=sig_collapsed_h, deadline=slices[k], fill_window=k,
+        lazy_fills=True, cost_bound=U)
+    if plan is not None:
+      U = sum(action_cost(a) for a in plan)
+      best = plan
+      if verbose:
+        print(f"[ladder] rung k={k}: cost {U:g} ({len(plan)} actions) at "
+              f"{time.perf_counter() - t0:.1f}s", flush=True)
+    elif verbose:
+      print(f"[ladder] rung k={k}: nothing cheaper", flush=True)
+  if lns and best is None and time.perf_counter() < slices[2] - 5.0:
+    # FEASIBILITY fallback only (LNS subsumes k=2 for improvement): wider windows
+    if verbose:
+      print("[ladder] no incumbent -> k=2 feasibility rung", flush=True)
+    plan = solve_assembly_problem_milestones(
+        C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik,
+        weight=max(weight, 5.0), wrench=wrench, handovers=handovers,
+        allow_place=allow_place, bracing=bracing, geo_facts=geo_facts,
+        sig_collapsed_h=sig_collapsed_h, deadline=slices[2], fill_window=2,
+        lazy_fills=True)
+    if plan is not None:
+      U = sum(action_cost(a) for a in plan)
+      best = plan
+  if lns and best is not None and time.perf_counter() < t_end - 5.0:
+    checker, grasp_table = _search_context(C, assembly, robots)
+    gk = gripper_kind(C) if wrench else None
+    if gk is not None:
+      reset_wrench_cache()
+    # CLI-SELECTED abstraction (respects --labeled-h/--collapsed-h/--sig-collapsed-h; safe
+    # grasp-collapsed default) -> sig-press at R=4, NO explosion. Built once; used as the
+    # differential landmark heuristic for every window (see _refill_window).
+    h_cls = (SignatureCollapsedHeuristic if sig_collapsed_h
+             else CollapsedLabeledHeuristic if collapsed_h
+             else LabeledDisassemblyHeuristic if labeled_h
+             else GraspCollapsedHeuristic)
+    h_lab = h_cls(assembly, len(robots), grasp_table,
+                  gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
+                  verbose=False, gripper_kind=gk, bracing=bracing)
+    improved = _lns_improve(best, C, assembly, robots, checker, grasp_table, robot_ik,
+                            max(weight, 5.0), 20000, verbose, h_lab, gripper_kind=gk,
+                            handovers=handovers, allow_place=allow_place,
+                            bracing=bracing, deadline=t_end, t0=t0)
+    ci = sum(action_cost(a) for a in improved)
+    if ci < U:
+      if verbose:
+        print(f"[ladder] LNS: {U:g} -> {ci:g} at {time.perf_counter() - t0:.1f}s",
+              flush=True)
+      best, U = improved, ci
+    elif verbose:
+      print(f"[ladder] LNS: no improvement (fixpoint) at "
+            f"{time.perf_counter() - t0:.1f}s", flush=True)
+  if rwa_proof and time.perf_counter() < t_end - 5.0:
+    # RWA*-UNDER-BOUND proof rung: w=5 passes under the current bound -- each FIND
+    # strictly tightens U (fast, measured ~30s where w=1 found nothing in 800s), and any
+    # pass that EXHAUSTS is the optimality proof (exhaustion is weight-neutral: the bound
+    # fixes the sublevel set, weight only orders it).
+    while time.perf_counter() < t_end - 5.0:
+      if verbose:
+        print(f"[ladder] proof pass (w=5, PEA*"
+              + (f", bound {U:g}" if U is not None else "")
+              + f"), {t_end - time.perf_counter():.0f}s left", flush=True)
+      res = solve_assembly_problem(
+          C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik, weight=5.0,
+          wrench=wrench, handovers=handovers, allow_place=allow_place, bracing=bracing,
+          labeled_h=labeled_h, collapsed_h=collapsed_h,
+          grasp_collapsed_h=grasp_collapsed_h, sig_collapsed_h=sig_collapsed_h,
+          geo_facts=geo_facts, cost_bound=U, pea=True, deadline=t_end)
+      if res is not None:
+        best = res
+        U = sum(action_cost(a) for a in res)
+        if verbose:
+          print(f"[ladder] proof pass improved to {U:g} at "
+                f"{time.perf_counter() - t0:.1f}s", flush=True)
+        continue
+      if _LAST_SEARCH_OUTCOME == "exhausted" and U is not None:
+        if verbose:
+          print(f"[ladder] PROVEN OPTIMAL: cost {U:g} (bound exhausted, w=5) "
+                f"in {time.perf_counter() - t0:.1f}s total")
+      elif verbose:
+        print(f"[ladder] proof pass ended on '{_LAST_SEARCH_OUTCOME}' -> best "
+              f"{U if U is not None else float('nan'):g} in "
+              f"{time.perf_counter() - t0:.1f}s total")
+      break
+    return best
+  if time.perf_counter() < t_end - 5.0:
+    if verbose:
+      print(f"[ladder] proof rung (w=1, PEA*"
+            + (f", bound {U:g}" if U is not None else "")
+            + f"), {t_end - time.perf_counter():.0f}s left", flush=True)
+    res = solve_assembly_problem(
+        C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik, weight=1.0,
+        wrench=wrench, handovers=handovers, allow_place=allow_place, bracing=bracing,
+        labeled_h=labeled_h, collapsed_h=collapsed_h,
+        grasp_collapsed_h=grasp_collapsed_h, sig_collapsed_h=sig_collapsed_h,
+        geo_facts=geo_facts, cost_bound=U, pea=True, deadline=t_end)
+    if res is not None:
+      best = res
+      U = sum(action_cost(a) for a in res)
+      if verbose:
+        print(f"[ladder] PROVEN OPTIMAL: cost {U:g} "
+              f"in {time.perf_counter() - t0:.1f}s total (w=1 first pop under bound)")
+    elif _LAST_SEARCH_OUTCOME == "exhausted" and U is not None:
+      if verbose:
+        print(f"[ladder] PROVEN OPTIMAL: cost {U:g} (bound exhausted) "
+              f"in {time.perf_counter() - t0:.1f}s total")
+    elif verbose:
+      print(f"[ladder] proof rung ended on '{_LAST_SEARCH_OUTCOME}' -> "
+            f"best cost {U if U is not None else float('nan'):g} WITHOUT proof "
+            f"in {time.perf_counter() - t0:.1f}s total")
+  return best
 
 
 def solve_assembly_problem_optimistic_declutter(

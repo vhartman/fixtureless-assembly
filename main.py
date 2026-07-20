@@ -379,6 +379,66 @@ def parse_args():
            "--dense-grasps it behaves exactly like --collapsed-h.",
   )
   parser.add_argument(
+      "--ladder-lns", type=float, nargs="?", const=900.0, default=None, metavar="SEC",
+      help="THE LADDER v2: k=1 milestones (lazy fills) -> LNS sweeps over the incumbent "
+           "(segment re-fills of width 1,2 bounded by old segment cost, cascade to "
+           "reconvergence -- gradual strict improvements) -> RWA*-under-bound proof rung "
+           "(w=5 passes: finds tighten U fast, any EXHAUSTED pass is the optimality "
+           "proof; exhaustion is weight-neutral). k=2 milestone rung runs only as a "
+           "feasibility fallback. --ladder is retained unchanged as the baseline.",
+  )
+  parser.add_argument(
+      "--ladder", type=float, nargs="?", const=900.0, default=None, metavar="SEC",
+      help="THE LADDER: unified anytime solver -- one commitment axis (fill window k), "
+           "one monotone incumbent bound U. Rungs: k=1 milestones (lazy fills, bound "
+           "propagated into fills), k=2 windows, then the k=n limit = bounded exact at "
+           "WEIGHT 1 (PEA*) whose first goal pop is optimal-under-U and whose exhaustion "
+           "PROVES U optimal. Budget split ~35/20/45%%. Default 900s.",
+  )
+  parser.add_argument(
+      "--milestones-anytime", type=float, nargs="?", const=300.0, default=None,
+      metavar="SEC",
+      help="THE SINGLE RECIPE: adaptive-width milestones (DAG modules + width-2 window "
+           "fills on width-1 failure) under a hard deadline (default 300s), then bounded "
+           "improvement (PEA*, memory-safe) with the remaining budget; PEA-greedy net if "
+           "milestones itself was cut. Always returns the best plan found within SEC; "
+           "never OOMs; result <= min(milestone cost, weight x optimal) when the "
+           "improvement pass completes. Use --weight inf for greedy fills (fastest).",
+  )
+  parser.add_argument(
+      "--no-lazy-fills", action="store_false", dest="lazy_fills",
+      help="Disable LAZY-VALIDATED milestone fills (default on): fills search with the "
+           "cheap gate only and run real IK on candidate subplan edges (LazySP hybrid, "
+           "IK failures blacklisted + rerun) -- the measured fix for module fills "
+           "spending minutes on failed IK binds at pop.",
+  )
+  parser.add_argument(
+      "--fill-window", type=int, default=2, metavar="K",
+      help="Milestone fill window escalation limit (default 2): on width-1 failure, try "
+           "JOINT fills of 2..K parts (escalating only as each smaller width exhausts) "
+           "before backjumping -- covers interleaved-glue plans, the milestone "
+           "commitment's completeness gap; K=n would be the flat exact search. "
+           "1 disables windows.",
+  )
+  parser.add_argument(
+      "--corridor-h", action="store_true",
+      help="With --bounded: cap the phase-2 heuristic's backward Dijkstra at the "
+           "incumbent's cost U (beyond-cap states never pushed; miss => h=inf, sound "
+           "under the bound). MEASURED INEFFECTIVE: the abstract spaces are WIDE at "
+           "shallow depth (R=4 cross still >2M states at cap 35; 2x2x3 table unchanged "
+           "at 204k), and the pruning is redundant with cost_bound + exact h values. "
+           "Harmless; kept for depth-heavy instances. The real version of the idea needs "
+           "a TWO-SIDED corridor (forward+backward abstract dist <= U) to cut width.",
+  )
+  parser.add_argument(
+      "--pathmax", action="store_true",
+      help="PATHMAX consistency repair in the exact engines: h(child) >= h(parent) - "
+           "edge cost (triangle inequality => still admissible; all guarantees "
+           "unchanged). MEASURED NEUTRAL: pathmax only RAISES h after too-fast drops -- "
+           "it cannot touch the h-STALL steps, which are the actual f-bumps (sanities "
+           "bit-identical; cube-plates-2x2x3 unchanged). Kept as a safe no-cost option.",
+  )
+  parser.add_argument(
       "--pea", action="store_true",
       help="PARTIAL-EXPANSION A* engine: identical guarantees and ordering to the exact "
            "search, but the open list holds only each node's current f-BAND -- successors "
@@ -525,6 +585,21 @@ def main():
 
   assembly = make_assembly(args.assembly, args.parts)
 
+  if args.ladder_lns is not None:
+    print(f"[flag] --ladder-lns ACTIVE: budget {args.ladder_lns:g}s (k=1 -> LNS sweeps "
+          f"-> RWA*-under-bound proof).")
+  if args.ladder is not None:
+    print(f"[flag] --ladder ACTIVE: budget {args.ladder:g}s (k=1 -> k=2 -> w=1 proof "
+          f"rung, monotone incumbent bound).")
+  if args.milestones_anytime is not None:
+    print(f"[flag] --milestones-anytime ACTIVE: budget {args.milestones_anytime:g}s "
+          f"(adaptive-width milestones -> bounded improvement -> PEA-greedy net).")
+  if args.corridor_h:
+    print("[flag] --corridor-h ACTIVE: phase-2 heuristic built only up to the incumbent "
+          "bound (misses prune); requires --bounded.")
+  if args.pathmax:
+    print("[flag] --pathmax ACTIVE: h consistency repair (h_child >= h_parent - cost); "
+          "admissible, fewer f-bumps/frontier sweeps.")
   if args.pea:
     print("[flag] --pea ACTIVE: partial-expansion A* engine (banded open list; same "
           "guarantees, frontier memory / ~branching factor).")
@@ -615,7 +690,32 @@ def main():
       robot_ik.fail_log_seconds = args.log_ik_failures
       robot_ik.fail_log_stop = True                # abort the search when the window closes
     try:
-      if args.bounded or args.dfbnb:
+      if args.ladder_lns is not None:
+        plan = solve_assembly_problem_ladder(
+            C, assembly, robots=robots, time_budget=args.ladder_lns, robot_ik=robot_ik,
+            weight=args.weight, wrench=args.wrench, handovers=args.handovers,
+            allow_place=args.allow_place, bracing=args.bracing,
+            geo_facts=args.geo_facts, sig_collapsed_h=args.sig_collapsed_h,
+            labeled_h=args.labeled_h, collapsed_h=args.collapsed_h,
+            grasp_collapsed_h=args.grasp_collapsed_h, lns=True, rwa_proof=False)
+      elif args.ladder is not None:
+        plan = solve_assembly_problem_ladder(
+            C, assembly, robots=robots, time_budget=args.ladder, robot_ik=robot_ik,
+            weight=args.weight, wrench=args.wrench, handovers=args.handovers,
+            allow_place=args.allow_place, bracing=args.bracing,
+            geo_facts=args.geo_facts, sig_collapsed_h=args.sig_collapsed_h,
+            labeled_h=args.labeled_h, collapsed_h=args.collapsed_h,
+            grasp_collapsed_h=args.grasp_collapsed_h)
+      elif args.milestones_anytime is not None:
+        plan = solve_assembly_problem_milestones_anytime(
+            C, assembly, robots=robots, time_budget=args.milestones_anytime,
+            robot_ik=robot_ik, weight=args.weight, wrench=args.wrench,
+            handovers=args.handovers, allow_place=args.allow_place,
+            bracing=args.bracing, geo_facts=args.geo_facts,
+            sig_collapsed_h=args.sig_collapsed_h, labeled_h=args.labeled_h,
+            collapsed_h=args.collapsed_h, grasp_collapsed_h=args.grasp_collapsed_h,
+            fill_window=args.fill_window)
+      elif args.bounded or args.dfbnb:
         plan = solve_assembly_problem_bounded(
             C, assembly, robots=robots, robot_ik=robot_ik, weight=args.weight,
             wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
@@ -623,7 +723,8 @@ def main():
             grasp_collapsed_h=args.grasp_collapsed_h or not (args.labeled_h or args.collapsed_h),
             stats_every=args.search_stats, geo_facts=args.geo_facts,
             sig_collapsed_h=args.sig_collapsed_h, beam_width=args.beam,
-            dfbnb=args.dfbnb, pea=args.pea)
+            dfbnb=args.dfbnb, pea=args.pea, pathmax=args.pathmax,
+            corridor_h=args.corridor_h)
       elif args.lazy:
         plan = solve_assembly_problem_lazy(
             C, assembly, robots=robots, weight=args.weight, robot_ik=robot_ik,
@@ -637,7 +738,8 @@ def main():
             C, assembly, robots=robots, robot_ik=robot_ik, weight=args.weight,
             wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
             bracing=args.bracing, geo_facts=args.geo_facts,
-            sig_collapsed_h=args.sig_collapsed_h)
+            sig_collapsed_h=args.sig_collapsed_h, fill_window=args.fill_window,
+            lazy_fills=args.lazy_fills)
       elif args.optimistic and args.declutter:
         plan = solve_assembly_problem_optimistic_declutter(
             C, assembly, robots=robots, robot_ik=robot_ik, weight=args.weight,
@@ -674,7 +776,8 @@ def main():
                                       geo_facts=args.geo_facts,
                                       sig_collapsed_h=args.sig_collapsed_h,
                                       beam_width=args.beam, pea=args.pea,
-                                      iter_bound=args.iter_bound)
+                                      iter_bound=args.iter_bound,
+                                      pathmax=args.pathmax)
     except IKFailureLogDone:
       print(f"[ik-failures] window/cap reached -- search stopped for debugging "
             f"({len(fail_rec.steps)} failures collected).")
