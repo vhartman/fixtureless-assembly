@@ -413,6 +413,12 @@ def parse_args():
            "spending minutes on failed IK binds at pop.",
   )
   parser.add_argument(
+      "--lns-segments", action="store_true",
+      help="LNS neighborhood unit = SETTLED segments instead of the default OBJECT unit "
+           "(k = consecutive mated parts). Baseline/ablation; segments coarsen unevenly "
+           "under hold-through re-fills.",
+  )
+  parser.add_argument(
       "--fill-window", type=int, default=2, metavar="K",
       help="Milestone fill window escalation limit (default 2): on width-1 failure, try "
            "JOINT fills of 2..K parts (escalating only as each smaller width exhausts) "
@@ -697,7 +703,8 @@ def main():
             allow_place=args.allow_place, bracing=args.bracing,
             geo_facts=args.geo_facts, sig_collapsed_h=args.sig_collapsed_h,
             labeled_h=args.labeled_h, collapsed_h=args.collapsed_h,
-            grasp_collapsed_h=args.grasp_collapsed_h, lns=True, rwa_proof=False)
+            grasp_collapsed_h=args.grasp_collapsed_h, lns=True, rwa_proof=False,
+            lns_object=not args.lns_segments)
       elif args.ladder is not None:
         plan = solve_assembly_problem_ladder(
             C, assembly, robots=robots, time_budget=args.ladder, robot_ik=robot_ik,

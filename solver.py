@@ -4443,17 +4443,24 @@ def _refill_window(start, ps, ideal, target, assembly, robots, checker, grasp_ta
 
 def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weight,
                  max_nodes, verbose, h_lab, gripper_kind=None, handovers=True,
-                 allow_place=True, bracing=False, deadline=None, t0=None, k_max=None):
-  """LARGE-NEIGHBORHOOD improvement -- ONE axis (neighborhood size k in contiguous
-  milestone segments), the LABELED heuristic throughout, FIXED endpoints from the current
-  best plan (so the suffix splices without recompute). Segments partition the plan at
-  SETTLED checkpoints (a part newly mated, nothing loose held, <=1 holder). For k=1..m a
-  window of k consecutive segments is re-filled from its start checkpoint to its END
-  checkpoint EXACTLY (k=m: to the real goal), bounded by the window's current cost --
-  strict improvements accepted, suffix spliced verbatim. Growing k covers reorderings a
-  small contiguous window can't reach; k=m is the whole-plan bounded search (the proof).
-  Since endpoints and per-segment parts are fixed, the checkpoint STATES are invariant
-  under accepts (only action indices shift), so m and the segment structure are stable."""
+                 allow_place=True, bracing=False, deadline=None, t0=None, k_max=None,
+                 object_unit=True):
+  """LARGE-NEIGHBORHOOD improvement -- ONE axis: neighborhood size k.
+
+  object_unit (default): k = number of consecutive MATED PARTS. Cut points are the states
+  right after each assemble, so k=1 is one object, k=n is the whole plan. A window of k
+  parts is re-filled from its start state to the EXACT state after the k-th part (k=n: to
+  the goal), touching only the parts the window's actions touch, bounded by the window's
+  current cost. Endpoints are pinned exactly (stricter -- may reproduce a held boundary
+  state), which is relaxed automatically at higher k as boundaries reach the goal.
+
+  object_unit=False (baseline): k = SETTLED segments (a part mated, nothing loose, <=1
+  holder); coarser and uneven (segments merge under hold-through re-fills). Kept for
+  ablation.
+
+  Growing k covers reorderings a small window can't reach; k=n is the whole-plan bounded
+  search. Standard LNS: RESTART the sweep on any accept (the plan, hence its partition,
+  changes). No separate proof rung -- the k=n window is the last iteration."""
   import time
   if t0 is None:
     t0 = time.perf_counter()
@@ -4461,16 +4468,40 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
   def cost(pl):
     return sum(action_cost(a) for a in pl)
 
-  def checkpoints(pl):
-    # -> (states[0..m], bnds[0..m] action indices, seg_parts[0..m-1])
+  def _step(s, a):
+    return next(ns for act, ns in successors(s, assembly, robots, grasp_table=grasp_table,
+                                             gripper_kind=gripper_kind, handovers=handovers,
+                                             allow_place=allow_place, bracing=bracing)
+                if act == a)
+
+  def checkpoints_object(pl):
+    # cut after every assemble (mate): states[0..n], bnds[0..n], seg_parts[0..n-1] = the
+    # part(s) mated in each cut. n = number of assembles. Last boundary extends to len(pl)
+    # so trailing release-to-settle actions live in the final window (which targets goal).
+    s = get_initial_state(C, assembly)
+    states, bnds = [s], [0]
+    mated_prev = {p for p in assembly.objects if _part_mated(s, p)}
+    seg_parts = []
+    for i, a in enumerate(pl):
+      s = _step(s, a)
+      mated = {p for p in assembly.objects if _part_mated(s, p)}
+      if mated > mated_prev:
+        states.append(s)
+        bnds.append(i + 1)
+        seg_parts.append(tuple(sorted(mated - mated_prev)))
+        mated_prev = mated
+    if bnds[-1] != len(pl):                               # trailing actions -> final window
+      bnds[-1] = len(pl)
+      states[-1] = s
+    return states, bnds, seg_parts
+
+  def checkpoints_segment(pl):
+    # SETTLED-segment partition (baseline): cut only at settled checkpoints.
     s = get_initial_state(C, assembly)
     states, bnds, mated_prev = [s], [0], {p for p in assembly.objects if _part_mated(s, p)}
-    seg_parts, start_i = [], 0
+    seg_parts = []
     for i, a in enumerate(pl):
-      s = next(ns for act, ns in successors(s, assembly, robots, grasp_table=grasp_table,
-                                            gripper_kind=gripper_kind, handovers=handovers,
-                                            allow_place=allow_place, bracing=bracing)
-               if act == a)
+      s = _step(s, a)
       mated = {p for p in assembly.objects if _part_mated(s, p)}
       if (mated > mated_prev and _num_loose_held(s, assembly) == 0
           and _assembly_holders(s, assembly) <= 1):
@@ -4478,22 +4509,13 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
         bnds.append(i + 1)
         seg_parts.append(tuple(sorted(mated - mated_prev)))
         mated_prev = mated
-    if bnds[-1] != len(pl):                               # trailing actions -> last segment
-      states.append(s)
-      bnds.append(len(pl))
-      seg_parts.append(tuple(sorted({p for p in assembly.objects if _part_mated(s, p)}
-                                    - (set().union(*seg_parts) if seg_parts else set())
-                                    - {assembly.base})))
+    if bnds[-1] != len(pl):
+      bnds[-1] = len(pl)
+      states[-1] = s
     return states, bnds, seg_parts
 
+  checkpoints = checkpoints_object if object_unit else checkpoints_segment
   cur = list(plan)
-  # Standard LNS: grow k from 1; on ANY accepted improvement RESTART the sweep (the plan --
-  # and hence its segment partition -- changes, since a cheaper window may settle
-  # differently, so nothing about the old indexing survives). k grows only within a sweep
-  # that produced no improvement; when a full k=1..km sweep improves nothing, we are at a
-  # fixpoint for the neighborhoods tried. The k=m window [0,m] (start=s0, end=goal, so
-  # UNPINNED -- see is_last) is just the last iteration = the full bounded search; no
-  # separate proof rung. Pinning is per-window (is_last), NOT a global flag.
   while True:
     if deadline is not None and time.perf_counter() > deadline:
       return cur
@@ -4507,11 +4529,16 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
       for i in range(m - k + 1):
         if deadline is not None and time.perf_counter() > deadline:
           return cur
-        window_parts = sorted({p for sp in seg_parts[i:i + k] for p in sp})
-        old_cost = cost(cur[bnds[i]:bnds[i + k]])
+        span = cur[bnds[i]:bnds[i + k]]
+        old_cost = cost(span)
         is_last = (i + k == m)
         ideal0 = {p for p in assembly.objects if _part_mated(states[i], p)}
-        sub = _refill_window(states[i], window_parts, ideal0,
+        # RELEVANT parts the re-fill may touch = everything the window's actions touch
+        # (mated-in-window + any staged/released part) beyond what is already mated. This
+        # makes reaching the exact end state possible regardless of interleaving.
+        ps = {a[2] for a in span} - ideal0
+        parts_mated = sorted({p for sp in seg_parts[i:i + k] for p in sp})
+        sub = _refill_window(states[i], ps, ideal0,
                              None if is_last else states[i + k], assembly, robots, checker,
                              grasp_table, robot_ik, weight, max_nodes, h_lab,
                              gripper_kind=gripper_kind, handovers=handovers,
@@ -4520,7 +4547,7 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
         if sub is not None and cost(sub) < old_cost:
           cur = cur[:bnds[i]] + list(sub) + cur[bnds[i + k]:]
           if verbose:
-            print(f"[lns] k={k} seg[{i}:{i + k}] {tuple(window_parts)}: "
+            print(f"[lns] k={k} parts[{i}:{i + k}] {tuple(parts_mated)}: "
                   f"-{old_cost - cost(sub):g} -> total {cost(cur):g} at "
                   f"{time.perf_counter() - t0:.1f}s", flush=True)
           accepted = True
@@ -4534,7 +4561,7 @@ def solve_assembly_problem_ladder(C, assembly, robots=None, time_budget=900.0,
                                   handovers=True, allow_place=True, bracing=False,
                                   geo_facts=False, sig_collapsed_h=False, labeled_h=False,
                                   collapsed_h=False, grasp_collapsed_h=False,
-                                  lns=False, rwa_proof=False):
+                                  lns=False, rwa_proof=False, lns_object=True):
   """THE LADDER (--ladder SEC): the unified anytime solver -- ONE commitment axis (fill
   window k), ONE monotone thread (the incumbent bound U). Rungs:
 
@@ -4607,7 +4634,8 @@ def solve_assembly_problem_ladder(C, assembly, robots=None, time_budget=900.0,
     improved = _lns_improve(best, C, assembly, robots, checker, grasp_table, robot_ik,
                             max(weight, 5.0), 20000, verbose, h_lab, gripper_kind=gk,
                             handovers=handovers, allow_place=allow_place,
-                            bracing=bracing, deadline=t_end, t0=t0)
+                            bracing=bracing, deadline=t_end, t0=t0,
+                            object_unit=lns_object)
     ci = sum(action_cost(a) for a in improved)
     if ci < U:
       if verbose:
@@ -4617,6 +4645,8 @@ def solve_assembly_problem_ladder(C, assembly, robots=None, time_budget=900.0,
     elif verbose:
       print(f"[ladder] LNS: no improvement (fixpoint) at "
             f"{time.perf_counter() - t0:.1f}s", flush=True)
+    return best                                           # k=n window IS the full search;
+                                                          # no vestigial w=1 proof rung
   if rwa_proof and time.perf_counter() < t_end - 5.0:
     # RWA*-UNDER-BOUND proof rung: w=5 passes under the current bound -- each FIND
     # strictly tightens U (fast, measured ~30s where w=1 found nothing in 800s), and any
