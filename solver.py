@@ -1722,9 +1722,16 @@ class LabeledDisassemblyHeuristic:
     pq = []
     from itertools import combinations
     vg_full = self.valid[all_parts]
-    for k in range(self.R + 1):
+    # GOAL SPEC (set_goal): on_table restricts goal states to a resting FACE (not held-in-
+    # air Hf); hands_off restricts to ZERO holders. Seeding exactly the image of the real
+    # goals keeps h admissible AND tight (guides toward placing down). Default seeds all.
+    _gm = _problem._GOAL_MODE
+    _on_tab = _gm["on_table"] or _gm["pose"] is not None
+    _faces = list(rf(all_parts)) if _on_tab else [Hf] + list(rf(all_parts))
+    _kmax = 0 if _gm["hands_off"] else self.R
+    for k in range(_kmax + 1):
       for combo in combinations(vg_full, k):
-        for face in [Hf] + list(rf(all_parts)):
+        for face in _faces:
           if face is Hf and len(combo) < 1:
             continue
           st = (all_parts, combo, face, ())
@@ -2244,9 +2251,16 @@ class CollapsedLabeledHeuristic:
     pq = []
     from itertools import combinations
     vg_full = self.valid[all_parts]
-    for k in range(self.R + 1):
+    # GOAL SPEC (set_goal): on_table restricts goal states to a resting FACE (not held-in-
+    # air Hf); hands_off restricts to ZERO holders. Seeding exactly the image of the real
+    # goals keeps h admissible AND tight (guides toward placing down). Default seeds all.
+    _gm = _problem._GOAL_MODE
+    _on_tab = _gm["on_table"] or _gm["pose"] is not None
+    _faces = list(rf(all_parts)) if _on_tab else [Hf] + list(rf(all_parts))
+    _kmax = 0 if _gm["hands_off"] else self.R
+    for k in range(_kmax + 1):
       for combo in combinations(vg_full, k):
-        for face in [Hf] + list(rf(all_parts)):
+        for face in _faces:
           if face is Hf and len(combo) < 1:
             continue
           st = (all_parts, combo, face, ())
@@ -3669,6 +3683,53 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
   return subplan, s
 
 
+def _settle_to_goal(start, assembly, robots, checker, grasp_table, robot_ik, weight,
+                    max_nodes, gripper_kind=None, handovers=True, bracing=False,
+                    deadline=None, lazy_fill=False):
+  # FINAL SETTLE milestone: from a complete-but-not-yet-goal state (e.g. still held, or a
+  # holder remaining), reach is_goal -- i.e. place the assembly on the table and release
+  # (set_goal(on_table=True)). No new part is added; only place/release/handover/add_grasp
+  # on the finished assembly. Small search (a place + release chain). Returns (subplan, end)
+  # or (None, None) if the goal is unreachable (e.g. the assembly cannot stand alone).
+  if start.is_goal(assembly):
+    return [], start
+  main = set(assembly.objects)
+
+  def goal_fn(s):
+    return s.is_goal(assembly)
+
+  def h_fn(s):
+    on_t = _group_is_on_table(s, main)
+    return (0 if on_t else 1) + _assembly_holders(s, assembly)   # place + releases left
+
+  def succ_fn(s):
+    for a, ns in successors(s, assembly, robots, grasp_table=grasp_table,
+                            gripper_kind=gripper_kind, handovers=handovers,
+                            allow_place=True, bracing=bracing):
+      yield a, ns                                          # all parts already mated
+
+  def edge_check_fn(prev, act, ns):
+    if not cheap_feasible(act, prev, ns, assembly, checker):
+      return False
+    if robot_ik is not None and act[0] in _IK_ACTIONS:
+      ok, _w = robot_ik.bind(act, prev, ns, assembly)
+      return ok
+    return True
+
+  subplan = _astar(start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
+                   cheap_fn=None, edge_check_fn=edge_check_fn, weight=weight,
+                   max_nodes=max_nodes, verbose=False, tag="settle", deadline=deadline)
+  if subplan is None:
+    return None, None
+  s = start
+  for a in subplan:
+    s = next(ns for act, ns in successors(s, assembly, robots, grasp_table=grasp_table,
+                                          gripper_kind=gripper_kind, handovers=handovers,
+                                          allow_place=True, bracing=bracing)
+             if act == a)
+  return subplan, s
+
+
 def _add_parts(start, ps, ideal, assembly, robots, checker, grasp_table, robot_ik,
                weight, max_nodes, gripper_kind=None, handovers=True,
                allow_place=True, bracing=False, deadline=None,
@@ -4174,10 +4235,30 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
       return None
     s, ideal, plen, _via = stack[-1]
     if ideal == objs:
+      final = plan[:plen]
+      s_final = s
+      if not s.is_goal(assembly):
+        # FINAL SETTLE (set_goal on_table): all parts mated but the assembly is not yet at
+        # the goal (still held / a holder remains) -> place it down and release. On failure
+        # (cannot stand alone at this build), treat as a dead end and backjump.
+        sub, s2 = _settle_to_goal(s, assembly, robots, checker, grasp_table, robot_ik,
+                                  max(weight, 5.0), max_nodes, gripper_kind=gk,
+                                  handovers=handovers, bracing=bracing,
+                                  lazy_fill=lazy_fills, deadline=deadline)
+        if sub is None:
+          if verbose:
+            print(f"[milestones] final settle-to-table FAILED -> backjump", flush=True)
+          _s, _i, _p, via = stack.pop()
+          if via is not None:
+            blacklist.add(via)
+            repairs += 1
+          continue
+        final = final + sub
+        s_final = s2
       if verbose:
-        print(f"[milestones] complete: {plen} actions in {time.perf_counter() - t0:.2f}s "
-              f"({repairs} repairs)")
-      return plan[:plen]
+        print(f"[milestones] complete: {len(final)} actions in "
+              f"{time.perf_counter() - t0:.2f}s ({repairs} repairs)")
+      return final
     ideal_key = _subasm_key(ideal)
     cands = [q for q in objs - ideal
              if (ideal_key, q) not in blacklist
@@ -4522,6 +4603,15 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
     states, bnds, seg_parts = checkpoints(cur)
     m = len(seg_parts)
     km = m if k_max is None else min(k_max, m)
+    # LOWER-BOUND certificates (h admissible): if the plan cost has reached h(s0), it is
+    # PROVABLY optimal -- stop; per window, if the span cost equals its differential lower
+    # bound max(0, h(start)-h(target)), that window is provably unimprovable -- skip it.
+    h0 = h_lab.value(states[0])
+    if cost(cur) <= h0:
+      if verbose:
+        print(f"[lns] PROVEN OPTIMAL: cost {cost(cur):g} == heuristic lower bound "
+              f"h(s0) at {time.perf_counter() - t0:.1f}s", flush=True)
+      return cur
     accepted = False
     for k in range(1, km + 1):
       if accepted:
@@ -4532,6 +4622,10 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
         span = cur[bnds[i]:bnds[i + k]]
         old_cost = cost(span)
         is_last = (i + k == m)
+        h_start = h_lab.value(states[i])
+        h_tgt = 0.0 if is_last else h_lab.value(states[i + k])
+        if old_cost <= max(0.0, h_start - h_tgt):
+          continue                                        # window already at its lower bound
         ideal0 = {p for p in assembly.objects if _part_mated(states[i], p)}
         # RELEVANT parts the re-fill may touch = everything the window's actions touch
         # (mated-in-window + any staged/released part) beyond what is already mated. This
@@ -4631,6 +4725,12 @@ def solve_assembly_problem_ladder(C, assembly, robots=None, time_budget=900.0,
     h_lab = h_cls(assembly, len(robots), grasp_table,
                   gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
                   verbose=False, gripper_kind=gk, bracing=bracing)
+    h0 = h_lab.value(get_initial_state(C, assembly))
+    if U <= h0:
+      if verbose:
+        print(f"[ladder] PROVEN OPTIMAL: incumbent cost {U:g} == heuristic lower bound "
+              f"h(s0) -- skipping LNS ({time.perf_counter() - t0:.1f}s)", flush=True)
+      return best
     improved = _lns_improve(best, C, assembly, robots, checker, grasp_table, robot_ik,
                             max(weight, 5.0), 20000, verbose, h_lab, gripper_kind=gk,
                             handovers=handovers, allow_place=allow_place,
@@ -4645,6 +4745,11 @@ def solve_assembly_problem_ladder(C, assembly, robots=None, time_budget=900.0,
     elif verbose:
       print(f"[ladder] LNS: no improvement (fixpoint) at "
             f"{time.perf_counter() - t0:.1f}s", flush=True)
+    if verbose:
+      gap = U - h0
+      print(f"[ladder] certificate: cost {U:g}, lower bound h(s0)={h0:g} -> "
+            + ("PROVEN OPTIMAL" if gap <= 0 else f"within {gap:g} of optimal"),
+            flush=True)
     return best                                           # k=n window IS the full search;
                                                           # no vestigial w=1 proof rung
   if rwa_proof and time.perf_counter() < t_end - 5.0:

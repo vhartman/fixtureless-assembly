@@ -481,6 +481,12 @@ def parse_args():
            "kills globally). Use only if the A* open list truly cannot fit memory.",
   )
   parser.add_argument(
+      "--no-goal-on-table", action="store_false", dest="goal_on_table",
+      help="GOAL: require the finished assembly to REST ON THE TABLE and be released "
+           "(hands-off), not merely complete-in-air. Default goal is complete (held "
+           "counts). Extensible to a specific target pose later (set_goal(pose=...)).",
+  )
+  parser.add_argument(
       "--sig-collapsed-h", action="store_true",
       help="SIGNATURE grasp collapse + LABELED loose parts: grasp labels are equivalence "
            "classes under the fact signature (press capability, pick-face vector, contact "
@@ -581,6 +587,10 @@ def main():
       None if args.insertion_noise is None
       else {"lateral": args.insertion_noise, "offset": args.insertion_offset})
   wrench.PARAMS["robust_mode"] = args.robust_mode
+  set_goal(on_table=args.goal_on_table)
+  if args.goal_on_table:
+    print("[flag] --goal-on-table ACTIVE: the finished assembly must rest on the table "
+          "and be released (hands-off).")
 
   C = make_four_robot_env(
       num_robots=args.num_robots,

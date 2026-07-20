@@ -871,6 +871,30 @@ def set_prefer_center(flag):
   _PREFER_CENTER = bool(flag)
 
 
+# GOAL SPEC (configurable; extensible to a specific target pose). DEFAULT (module and
+# CLI alike): the finished assembly must REST ON THE TABLE, hands-off (placed AND
+# released). set_goal(on_table=False) restores the historical complete-in-air goal
+# (--no-goal-on-table on the CLI). `pose` is the hook for a future specific target
+# placement (face / cell / anchor) -- see _goal_pose_matches.
+_GOAL_MODE = {"on_table": True, "hands_off": True, "pose": None}
+
+
+def set_goal(on_table=True, hands_off=None, pose=None):
+  """Configure the search goal. on_table: the completed assembly must rest on the table.
+  hands_off: no gripper may hold it (defaults to on_table -- 'placed' means set down AND
+  released). pose: (future) a specific target placement on the table; None = any placement."""
+  _GOAL_MODE["on_table"] = bool(on_table) or pose is not None
+  _GOAL_MODE["hands_off"] = bool(on_table if hands_off is None else hands_off)
+  _GOAL_MODE["pose"] = pose
+
+
+def _goal_pose_matches(state, group, pose, assembly):
+  """Whether the on-table `group` sits at the target `pose`. STUB for the future specific-
+  pose goal -- when `pose` describes a placement (face / cell / anchor xy+yaw), compare it
+  to the group's actual placement here. `pose is None` never reaches this."""
+  raise NotImplementedError("specific goal pose not implemented yet")
+
+
 # BRACE-FOR-ASSEMBLY-ONLY (experimental, OFF by default). Domain assumption: a brace (a 2nd
 # grasp via add_grasp) is EVER needed only to stabilise a target during an ASSEMBLE (regrasp is
 # the separate `handover`). So a brace should be added right before the assemble it enables and
@@ -1351,10 +1375,23 @@ class State:
     return len(comps) == 1 and set(comps[0]) == set(assembly.objects)
 
   def is_goal(self, assembly):
-    # the assembly is complete: every part joined into a single subassembly. We do NOT
-    # require it to rest on the table or be hands-off -- held-in-the-air counts as done.
-    # (Every reachable state is supported by construction anyway.)
-    return self.is_complete(assembly)
+    # the assembly is complete: every part joined into a single subassembly. By default we
+    # do NOT require it to rest on the table -- held-in-the-air counts (every reachable
+    # state is supported by construction anyway). set_goal(on_table=True) additionally
+    # demands it rest ON THE TABLE, hands-off by default, and (future) at a specific pose.
+    if not self.is_complete(assembly):
+      return False
+    g = _GOAL_MODE
+    if not (g["on_table"] or g["pose"] is not None):
+      return True
+    main = set(assembly.objects)                          # the single group (complete)
+    if not _group_is_on_table(self, main):
+      return False
+    if g["hands_off"] and _group_holders(self, main):
+      return False
+    if g["pose"] is not None and not _goal_pose_matches(self, main, g["pose"], assembly):
+      return False
+    return True
 
   # --- identity ---
   def key(self):
