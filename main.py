@@ -487,6 +487,15 @@ def parse_args():
            "counts). Extensible to a specific target pose later (set_goal(pose=...)).",
   )
   parser.add_argument(
+      "--optimize-witnesses", nargs="?", const="joint", default=None,
+      choices=["joint", "ee"], metavar="MODE",
+      help="POST-optimize the plan's IK witnesses (discrete plan FIXED): re-solve each IK "
+           "action pulled toward the ACTIVE arm's previous configuration, minimizing "
+           "per-step movement in 'joint' space (default) or 'ee' space (position + "
+           "weighted orientation). Feasibility-safe (search witnesses kept on any "
+           "failure); idle arms stay home-pinned as in the search. Requires --real-ik.",
+  )
+  parser.add_argument(
       "--sig-collapsed-h", action="store_true",
       help="SIGNATURE grasp collapse + LABELED loose parts: grasp labels are equivalence "
            "classes under the fact signature (press capability, pick-face vector, contact "
@@ -809,6 +818,16 @@ def main():
         print("  ", step)
       if args.save is not None:
         save_plan(args.save, args, plan)
+      opt_witnesses = None
+      if plan is not None and args.optimize_witnesses is not None:
+        if robot_ik is None:
+          print("[witopt] --optimize-witnesses needs --real-ik; skipping.")
+        else:
+          opt_witnesses, _rep = optimize_witnesses(
+              C, assembly, plan, robots, robot_ik, cost=args.optimize_witnesses,
+              gripper_kind=gripper_kind(C) if args.wrench else None,
+              handovers=args.handovers, allow_place=args.allow_place,
+              bracing=args.bracing)
       if args.view or args.viser:
         recorder = None
         if args.viser:
@@ -816,7 +835,8 @@ def main():
           recorder = ViserRecorder()
         if args.real_ik:
           visualize_plan_ik(C, assembly, plan, robots=robots, robot_ik=robot_ik,
-                            recorder=recorder, bracing=args.bracing)
+                            recorder=recorder, bracing=args.bracing,
+                            witnesses=opt_witnesses)
         else:
           visualize_plan(C, assembly, plan, recorder=recorder, bracing=args.bracing)
         if recorder is not None:

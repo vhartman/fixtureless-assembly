@@ -357,7 +357,7 @@ def _write_robot_dofs(C, robot, q_full):
 
 
 def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
-                      recorder=None, bracing=False):
+                      recorder=None, bracing=False, witnesses=None):
   """Replay a plan on a SINGLE persistent config: for each action we solve the skill IK,
   write the active arms' DOFs into the live config (so the arms keep their poses between
   steps), and mirror the scene-graph re-parenting with C.attach (so grabbed parts stay
@@ -449,7 +449,11 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
         return
     # a stow is a place aside: run the place IK (which now targets the recorded stow pose).
     bind_action = ("place",) + tuple(action[1:]) if action[0] == "stow" else action
-    _ok, witness = robot_ik.bind(bind_action, s, nxt, assembly)
+    if witnesses is not None and i - 1 < len(witnesses) and witnesses[i - 1] is not None:
+      witness = witnesses[i - 1]                          # precomputed (e.g. optimize_witnesses)
+      _ok = True                                          # by construction: kept witnesses are feasible
+    else:
+      _ok, witness = robot_ik.bind(bind_action, s, nxt, assembly)
     # 1) active arms -> the solved config; every other arm -> home, EXCEPT arms that must
     #    stay with their grasp. A KINEMATIC holder of a SOLO-held group may ride home (the
     #    group travels with it, out of the way). But if the group has OTHER holders

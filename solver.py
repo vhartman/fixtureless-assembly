@@ -313,6 +313,14 @@ class RobotIK:
     self.collision_reject_depth = 0.015
     self.collision_rejects = 0                            # rejects by the depth gate
     self._ik_cache = {}                                   # (action, scene sig) -> (ok, witness)
+    # WITNESS-OPTIMIZATION pull spec (post-pass only; None during search => every solve is
+    # byte-identical to today). Set by optimize_witnesses: {'mode': 'joint'|'ee',
+    # 'robot': r, 'qmap': {joint_name: prev_val}, 'ee_pos': xyz, 'ee_quat': wxyz,
+    # 'weight': w, 'rot_weight': wr}. _add_pull injects a LOW-WEIGHT sos objective pulling
+    # the ACTIVE arm toward its previous configuration (joint) or its previous EE pose
+    # (position + weighted orientation) -- costs, never constraints, so feasibility never
+    # yields to smoothness.
+    self._opt_pull = None
     self.fail_recorder = None                             # viser recorder for failed binds
     self.fail_log_cap = 300
     self.fail_log_seconds = 60.0                          # window from the FIRST failure
@@ -480,9 +488,10 @@ class RobotIK:
     # also makes the stochastic restarts deterministic within a solve (same query -> same
     # verdict), which the search prefers anyway.
     key = (action, self._scene_sig(s0))
-    hit = self._ik_cache.get(key)
-    if hit is not None:
-      return hit
+    if self._opt_pull is None:                            # pulled re-solves are step-specific:
+      hit = self._ik_cache.get(key)                       # never read/write the cache for them
+      if hit is not None:
+        return hit
     if kind == "pick":
       res = self._ik_pick(action, s0, s1, assembly, seed)
     elif kind == "place":
@@ -491,7 +500,8 @@ class RobotIK:
       res = self._ik_assemble(action, s0, s1, assembly, seed)
     else:                                                 # add_grasp / handover: 2nd arm
       res = self._ik_add_grasp(action, s0, s1, assembly, seed)
-    self._ik_cache[key] = res
+    if self._opt_pull is None:
+      self._ik_cache[key] = res
     return res
 
   def _scene_sig(self, state):
@@ -515,6 +525,25 @@ class RobotIK:
   def _holders_of_group(self, state, group):
     # robots grasping any part of `group`
     return [r for r, (pt, _gid) in self.holders(state).items() if pt in group]
+
+  def _add_pull(self, komo, C, robot):
+    # inject the witness-optimization pull (no-op unless optimize_witnesses set _opt_pull
+    # for THIS robot). Weights ~1e0 vs constraint weights 1e1: cost never beats feasibility.
+    p = self._opt_pull
+    if p is None or p.get("robot") != robot:
+      return
+    if p["mode"] == "joint":
+      names = C.getJointNames()
+      cur = C.getJointState()
+      target = np.array([p["qmap"].get(n, cur[i]) for i, n in enumerate(names)])
+      komo.addObjective([1, 1], ry.FS.qItself, [], ry.OT.sos, [p["weight"]], target)
+    else:                                                 # 'ee': position + weighted quat
+      ee = self.gripper_frame[robot]
+      komo.addObjective([1, 1], ry.FS.position, [ee], ry.OT.sos, [p["weight"]],
+                        np.asarray(p["ee_pos"], dtype=float))
+      komo.addObjective([1, 1], ry.FS.quaternion, [ee], ry.OT.sos,
+                        [p["weight"] * p["rot_weight"]],
+                        np.asarray(p["ee_quat"], dtype=float))
 
   def _solve_ik(self, komo, restarts=12, seeds=None):
     # solve a skill KOMO, retrying from fresh inits until one converges. KOMO seeds its guess
@@ -839,6 +868,7 @@ class RobotIK:
         )
       komo.addControlObjective([], 0, 1e-1)
       komo.addControlObjective([], 1, 1e-1)
+      self._add_pull(komo, C, robot)                      # witness-opt pull (no-op in search)
       # 6-DOF: gripper tool-center must sit at the (approach-corrected) grasp on the part:
       #   pose(ee) relative to pose(part) == ee_target.
       komo.addObjective(
@@ -899,6 +929,7 @@ class RobotIK:
         komo.addObjective([], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [1e1], [-0.0])
       komo.addControlObjective([], 0, 1e-1)
       komo.addControlObjective([], 1, 1e-1)
+      self._add_pull(komo, C, robot)                      # witness-opt pull (no-op in search)
       komo.addObjective([1, 1], ry.FS.positionRel, [self.gripper_frame[robot], gpart],
                         ry.OT.eq, [1e1], ee_target[:3])
       komo.addObjective([1, 1], ry.FS.quaternionRel, [self.gripper_frame[robot], gpart],
@@ -960,6 +991,7 @@ class RobotIK:
         )
       komo.addControlObjective([], 0, 1e-1)
       komo.addControlObjective([], 1, 1e-1)
+      self._add_pull(komo, C, robot)                      # witness-opt pull (no-op in search)
       # object-pose constraint (like assemble, not an EE pose): the group's reference part
       # must reach its canonical table pose, axis-aligned.
       komo.addObjective([1, 1], ry.FS.position, [ref], ry.OT.eq, [1e1], target[:3])
@@ -1156,12 +1188,14 @@ class RobotIK:
     feasible, witness = False, None
     for bias in biases:                                   # deterministic orientation sweep
       komo = self._assemble_komo(C, part_name, onto, rel_pos, rel_quat, bias)
+      self._add_pull(komo, C, robot)                    # witness-opt pull (no-op in search)
       self._add_grasp_maintenance(komo, s0, assembly)     # braces pinned at their grasps
       feasible, witness = self._solve_ik(komo, restarts=0)  # one biased solve per orientation
       if feasible:
         break
     if not feasible:                                      # fallback: unbiased random restarts
       komo = self._assemble_komo(C, part_name, onto, rel_pos, rel_quat, None)
+      self._add_pull(komo, C, robot)                    # witness-opt pull (no-op in search)
       self._add_grasp_maintenance(komo, s0, assembly)
       feasible, witness = self._solve_ik(komo, restarts=6)
     if not feasible:
@@ -1429,6 +1463,117 @@ class AbstractionHeuristic:
 
   def value(self, state):
     return self.dist.get(self.abstract(state), 0.0)
+
+
+def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
+                       pull_weight=1.0, ee_rot_weight=0.3, sweeps=2, verbose=True,
+                       gripper_kind=None, handovers=True, allow_place=True, bracing=False,
+                       grasp_table=None):
+  """POST-PASS witness optimization (v1 of the witness-optimization plan): the DISCRETE
+  plan is FIXED; each IK action is re-solved warm-pulled toward the ACTIVE arm's previous
+  configuration, minimizing per-step active-arm movement in 'joint' space or 'ee' space
+  (position + ee_rot_weight * orientation angle). Idle arms stay home-pinned exactly as in
+  the search (NO repinning -- it destroys feasibility in many-robot scenes; continuity
+  enters ONLY as a low-weight cost on the active arm). FEASIBILITY-SAFE: the search's own
+  witness is kept whenever the pulled re-solve fails or is costlier. Sequential sweeps
+  (greedy in time -- v2 joint KOMO later). Returns (witnesses, report): witnesses[i] is
+  the witness for plan[i] (None for non-IK actions), report = before/after totals."""
+  import time
+  t0 = time.perf_counter()
+  if grasp_table is None:
+    _checker, grasp_table = _search_context(C, assembly, robots)
+  # PRIVATE FK config: robot_ik.C is the base every scene_for/bind copies ("arms at home")
+  # and the replay's start view -- mutating it corrupts both (measured: weird start pose,
+  # shifted collision context for pulled re-solves). All FK probes run on this copy.
+  fkC = ry.Config()
+  fkC.addConfigurationCopy(robot_ik.C)
+  names = list(fkC.getJointNames())
+  home_map = dict(zip(names, robot_ik.home))
+  arm_joints = {r: [n for n in names if n.startswith(r + "_")] for r in robots}
+
+  def fk_ee(qmap, r):
+    q = np.array([qmap.get(n, home_map[n]) for n in names])
+    fkC.setJointState(q)
+    return np.asarray(fkC.getFrame(robot_ik.gripper_frame[r]).getPose(), dtype=float)
+
+  def step_cost(qmap_prev, witness, r):
+    wmap = dict(zip(names, witness))
+    if cost == "joint":
+      return float(np.sqrt(sum((wmap[n] - qmap_prev.get(n, home_map[n])) ** 2
+                               for n in arm_joints[r])))
+    pe = fk_ee(qmap_prev, r)
+    we = fk_ee(wmap, r)
+    dq = min(1.0, abs(float(np.dot(pe[3:], we[3:]))))
+    return (float(np.linalg.norm(we[:3] - pe[:3]))
+            + ee_rot_weight * 2.0 * float(np.arccos(dq)))
+
+  states = [get_initial_state(C, assembly)]
+  for a in plan:
+    states.append(next(ns for act, ns in successors(
+        states[-1], assembly, robots, grasp_table=grasp_table,
+        gripper_kind=gripper_kind, handovers=handovers, allow_place=allow_place,
+        bracing=bracing) if act == a))
+
+  wit = [None] * len(plan)
+  for i, a in enumerate(plan):                            # baseline = the search's witnesses
+    if a[0] in _IK_ACTIONS:
+      ok, w = robot_ik.bind(a, states[i], states[i + 1], assembly)
+      wit[i] = w if ok else None
+
+  def total(ws):
+    qmap = dict(home_map)
+    tot = 0.0
+    for i, a in enumerate(plan):
+      if ws[i] is None:
+        continue
+      r = a[1]
+      tot += step_cost(qmap, ws[i], r)
+      wmap = dict(zip(names, ws[i]))
+      for n in arm_joints[r]:
+        qmap[n] = wmap[n]                                 # only the ACTIVE arm advances
+    return tot
+
+  before = total(wit)
+  improved = 0
+  fallback = 0
+  try:
+    for _sweep in range(sweeps):
+      changed = False
+      qmap = dict(home_map)
+      for i, a in enumerate(plan):
+        if wit[i] is None:
+          continue
+        r = a[1]
+        old_c = step_cost(qmap, wit[i], r)
+        pe = fk_ee(qmap, r)
+        robot_ik._opt_pull = {
+            "mode": cost, "robot": r,
+            "qmap": {n: qmap.get(n, home_map[n]) for n in arm_joints[r]},
+            "ee_pos": pe[:3], "ee_quat": pe[3:],
+            "weight": pull_weight, "rot_weight": ee_rot_weight,
+        }
+        ok, w2 = robot_ik.bind(a, states[i], states[i + 1], assembly)
+        robot_ik._opt_pull = None
+        if ok and w2 is not None and step_cost(qmap, w2, r) < old_c - 1e-9:
+          wit[i] = w2
+          improved += 1
+          changed = True
+        elif not ok:
+          fallback += 1                                   # keep the original witness
+        wmap = dict(zip(names, wit[i]))
+        for n in arm_joints[r]:
+          qmap[n] = wmap[n]
+      if not changed:
+        break
+  finally:
+    robot_ik._opt_pull = None
+  after = total(wit)
+  if verbose:
+    print(f"[witopt] {cost} cost: {before:.3f} -> {after:.3f}  "
+          f"({improved} steps improved, {fallback} pulled re-solves failed -> originals "
+          f"kept) in {time.perf_counter() - t0:.1f}s")
+  return wit, {"before": before, "after": after, "improved": improved,
+               "fallback": fallback}
 
 
 def _labeled_geo_ok(checker, assembly, st, ideal_set, note=""):
