@@ -11,6 +11,16 @@ UR10_PATHS = {
     (True, True): "./src/rai/ur10/ur10_vacuum_floating.g",
 }
 
+# UR10 with a RESTRICTED workspace (tighter shoulder-lift/elbow limits). Only the REAL-arm
+# variants differ (the two *_limited .g files override two joint limits); the FLOATING
+# variants have no arm joints so the limits are moot -> reuse the standard ur10 floating.
+UR10_LIMITED_PATHS = {
+    (False, False): "./src/rai/ur10/ur10_two_finger_limited.g",
+    (False, True): "./src/rai/ur10/ur10_vacuum_limited.g",
+    (True, False): "./src/rai/ur10/ur10_two_finger_floating.g",
+    (True, True): "./src/rai/ur10/ur10_vacuum_floating.g",
+}
+
 # Cheap-collision EE stand-in PAIRED with the actual robot model, keyed like UR10_PATHS
 # by (floating_ee, vacuum) of the env. Real arms -> the *_wrist variant (the wrist-3 link
 # exists on the real robot, so the cheap model carries its calibrated capsule, radius .035
@@ -52,7 +62,7 @@ UR5_PATHS = {
 }
 
 # Prefix used by each robot type's .g file.
-ROBOT_PREFIXES = {"ur5": "ur_", "ur10": "ur_", "kuka": "kuka_"}
+ROBOT_PREFIXES = {"ur5": "ur_", "ur10": "ur_", "ur10_limited": "ur_", "kuka": "kuka_"}
 
 # Placement on the table: {robot_type: (rotation, position)} per robot slot.
 # Two layouts, one for <=4 robots and a tighter one for 5-6 robots.
@@ -116,6 +126,8 @@ def color_gripper(C, prefix, color):
 def _robot_path(robot_type, floating_ee, vacuum):
     if robot_type == "ur10":
         return os.path.join(HERE, UR10_PATHS[(floating_ee, vacuum)])
+    if robot_type == "ur10_limited":
+        return os.path.join(HERE, UR10_LIMITED_PATHS[(floating_ee, vacuum)])
     if robot_type == "ur5":
         return os.path.join(HERE, UR5_PATHS[(floating_ee, vacuum)])
     return os.path.join(HERE, "./src/rai/kuka_drake/kuka_two_finger.g")
@@ -152,7 +164,7 @@ def make_four_robot_env(
 
     for i in range(num_robots):
         robot_type = robot_types[i]
-        place = layout[robot_type]
+        place = layout["ur10" if robot_type == "ur10_limited" else robot_type]
         prefix = f"a{i + 1}_"
 
         C.addFile(

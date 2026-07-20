@@ -22,8 +22,9 @@ def parse_args():
       help="Use the vacuum end-effector instead of the two-finger gripper.",
   )
   parser.add_argument(
-      "--robot", choices=["ur10", "ur5"], default="ur10",
-      help="Robot arm for all robots: ur10 (default) or ur5. With --floating-ee the arm is "
+      "--robot", choices=["ur10", "ur10_limited", "ur5"], default="ur10",
+      help="Robot arm for all robots: ur10 (default), ur10_limited (ur10 with a tighter "
+           "shoulder-lift/elbow workspace), or ur5. With --floating-ee the arm is "
            "irrelevant (a generic floating gripper); it matters for the real arm (no --floating-ee "
            "/ --real-ik) -- note the ur5 has a much shorter reach (~0.85 m vs ~1.3 m).",
   )
@@ -488,12 +489,16 @@ def parse_args():
   )
   parser.add_argument(
       "--optimize-witnesses", nargs="?", const="joint", default=None,
-      choices=["joint", "ee"], metavar="MODE",
+      choices=["joint", "ee", "dp-joint", "dp-ee"], metavar="MODE",
       help="POST-optimize the plan's IK witnesses (discrete plan FIXED): re-solve each IK "
            "action pulled toward the ACTIVE arm's previous configuration, minimizing "
            "per-step movement in 'joint' space (default) or 'ee' space (position + "
-           "weighted orientation). Feasibility-safe (search witnesses kept on any "
-           "failure); idle arms stay home-pinned as in the search. Requires --real-ik.",
+           "weighted orientation). dp-joint/dp-ee: LADDER-DP -- harvest multiple feasible "
+           "candidates per step (assemble orientation biases, fresh re-solves, the greedy "
+           "pass) and pick the globally optimal combination by per-robot Viterbi "
+           "(DP >= greedy >= original by construction). Feasibility-safe (search "
+           "witnesses kept on any failure); idle arms stay home-pinned as in the search. "
+           "Requires --real-ik.",
   )
   parser.add_argument(
       "--sig-collapsed-h", action="store_true",

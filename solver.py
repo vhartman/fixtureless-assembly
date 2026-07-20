@@ -526,6 +526,40 @@ class RobotIK:
     # robots grasping any part of `group`
     return [r for r, (pt, _gid) in self.holders(state).items() if pt in group]
 
+  def candidate_witnesses(self, action, s0, s1, assembly, resolves=4, limit=8):
+    # CANDIDATE HARVEST for the ladder-DP witness optimization: multiple feasible
+    # witnesses for one step. Sources: the cached original (the feasibility anchor);
+    # for ASSEMBLE every orientation bias of the existing sweep (real diversity: each
+    # bias settles the held assembly differently); for the fixed-target skills a few
+    # fresh re-solves (analytic seeds first as always; random restarts explore distinct
+    # basins run-to-run). Every candidate is feasible by construction (the solver's own
+    # verdict). Deduped on rounded joints.
+    kind = action[0]
+    if kind not in _IK_ACTIONS:
+      return []
+    cands = []
+    ok, w = self.bind(action, s0, s1, assembly)           # original (cached)
+    if ok and w is not None:
+      cands.append(w)
+    if kind == "assemble":
+      for bias in _ASSEMBLE_BIAS_ORIENTATIONS:
+        ok, w = self._ik_assemble(action, s0, s1, assembly, None, bias_axes=bias)
+        if ok and w is not None:
+          cands.append(w)
+    else:
+      fn = {"pick": self._ik_pick, "place": self._ik_place}.get(kind, self._ik_add_grasp)
+      for _ in range(resolves):
+        ok, w = fn(action, s0, s1, assembly, None)
+        if ok and w is not None:
+          cands.append(w)
+    uniq, seen = [], set()
+    for w in cands:
+      key = tuple(np.round(np.asarray(w, dtype=float), 3))
+      if key not in seen:
+        seen.add(key)
+        uniq.append(w)
+    return uniq[:limit]
+
   def _add_pull(self, komo, C, robot):
     # inject the witness-optimization pull (no-op unless optimize_witnesses set _opt_pull
     # for THIS robot). Weights ~1e0 vs constraint weights 1e1: cost never beats feasibility.
@@ -1496,9 +1530,12 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
     fkC.setJointState(q)
     return np.asarray(fkC.getFrame(robot_ik.gripper_frame[r]).getPose(), dtype=float)
 
+  dp = cost.startswith("dp-")
+  metric = cost[3:] if dp else cost
+
   def step_cost(qmap_prev, witness, r):
     wmap = dict(zip(names, witness))
-    if cost == "joint":
+    if metric == "joint":
       return float(np.sqrt(sum((wmap[n] - qmap_prev.get(n, home_map[n])) ** 2
                                for n in arm_joints[r])))
     pe = fk_ee(qmap_prev, r)
@@ -1534,6 +1571,86 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
     return tot
 
   before = total(wit)
+
+  if dp:
+    # LADDER-GRAPH DP (Viterbi): per step harvest multiple feasible candidate witnesses,
+    # then choose the globally optimal combination. The objective is a chain -- each
+    # step's cost couples only to the ACTIVE arm's previous configuration -- and only
+    # a[1]'s joints advance the reference (same semantics as the greedy pass), so each
+    # robot's steps form an INDEPENDENT chain: exact per-robot Viterbi, no combinatorics.
+    # The greedy pass runs first and its witnesses join the ladder alongside the search
+    # originals, so DP >= greedy >= original by construction.
+    g_wit, _g_rep = optimize_witnesses(
+        C, assembly, plan, robots, robot_ik, cost=metric, pull_weight=pull_weight,
+        ee_rot_weight=ee_rot_weight, sweeps=sweeps, verbose=False,
+        gripper_kind=gripper_kind, handovers=handovers, allow_place=allow_place,
+        bracing=bracing, grasp_table=grasp_table)
+    cands = {}
+    for i, a in enumerate(plan):
+      if wit[i] is None:
+        continue
+      cs = robot_ik.candidate_witnesses(a, states[i], states[i + 1], assembly)
+      if g_wit[i] is not None:
+        cs.append(g_wit[i])
+      seen, uniq = set(), []
+      for w in cs:
+        key = tuple(np.round(np.asarray(w, dtype=float), 3))
+        if key not in seen:
+          seen.add(key)
+          uniq.append(w)
+      cands[i] = uniq
+
+    def dist_r(qmap_prev, witness, r):
+      wmap = dict(zip(names, witness))
+      if metric == "joint":
+        return float(np.sqrt(sum((wmap[n] - qmap_prev.get(n, home_map[n])) ** 2
+                                 for n in arm_joints[r])))
+      pe = fk_ee(qmap_prev, r)
+      we = fk_ee(wmap, r)
+      dq = min(1.0, abs(float(np.dot(pe[3:], we[3:]))))
+      return (float(np.linalg.norm(we[:3] - pe[:3]))
+              + ee_rot_weight * 2.0 * float(np.arccos(dq)))
+
+    n_cand = 0
+    for r in robots:                                      # independent chain per robot
+      ks = [i for i, a in enumerate(plan) if wit[i] is not None and a[1] == r]
+      if not ks:
+        continue
+      n_cand += sum(len(cands[i]) for i in ks)
+      # Viterbi forward: best[j] = (cost-to-here, backpointer) per candidate of step ks[j]
+      layers = []
+      prev_maps = [dict(home_map)]
+      best_prev = [0.0]
+      bp_all = []
+      for j, i in enumerate(ks):
+        layer_cost, layer_bp, layer_maps = [], [], []
+        for c_idx, w in enumerate(cands[i]):
+          costs = [best_prev[p] + dist_r(prev_maps[p], w, r)
+                   for p in range(len(prev_maps))]
+          p_best = int(np.argmin(costs))
+          layer_cost.append(costs[p_best])
+          layer_bp.append(p_best)
+          wmap = dict(zip(names, w))
+          m2 = dict(prev_maps[p_best])
+          for n in arm_joints[r]:
+            m2[n] = wmap[n]
+          layer_maps.append(m2)
+        bp_all.append(layer_bp)
+        best_prev, prev_maps = layer_cost, layer_maps
+        layers.append(list(range(len(cands[i]))))
+      # backtrack
+      sel = int(np.argmin(best_prev))
+      for j in range(len(ks) - 1, -1, -1):
+        wit[ks[j]] = cands[ks[j]][sel]
+        sel = bp_all[j][sel]
+    after = total(wit)
+    if verbose:
+      print(f"[witopt] dp-{metric} cost: {before:.3f} -> {after:.3f}  "
+            f"(ladder of {n_cand} candidates over "
+            f"{sum(1 for w in wit if w is not None)} steps) "
+            f"in {time.perf_counter() - t0:.1f}s")
+    return wit, {"before": before, "after": after, "improved": -1, "fallback": 0}
+
   improved = 0
   fallback = 0
   try:

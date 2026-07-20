@@ -87,7 +87,7 @@ WRENCH = [
     ("cross", 3, 2, 3.0, "asymmetric", 10.0, 7),
     ("cross", 4, 2, 3.0, "asymmetric", 10.0, 12),
     ("arch-seq", 5, 2, 3.0, "asymmetric", 10.0, 14),
-    ("cube-plates", 4, 2, 3.0, "asymmetric", 10.0, 12),
+    ("cube-plates", 4, 2, 3.0, "asymmetric", 10.0, 16),   # +place/+release: on-table goal
     ("cuboid-tower", 4, 2, 3.0, "asymmetric", 10.0, 10),   # shaped support polygon + levers
     ("car", 3, 2, 3.0, "asymmetric", 10.0, 9),             # axial wheel press, rim contacts
 ]
@@ -377,7 +377,8 @@ def test_module_connect():
   act, ns = joins[0]
   assert act[0] == "assemble", "the join must be a plain `assemble`, not a separate action"
   assert len(next(iter(ns.subassemblies()))) == 8, "join did not fuse into one 8-part body"
-  assert ns.is_goal(asm), "joined state is not the goal"
+  assert ns.is_complete(asm), "join did not complete the assembly"   # still held ->
+  # not is_goal under the on-table default; this test checks the JOIN, not the goal
 
   # (b) PARTIAL top module (missing the last chain cube obj_7) -> the join is FORBIDDEN.
   s_part = _two_module_state(asm, C, robots, {"obj_5", "obj_6"})
