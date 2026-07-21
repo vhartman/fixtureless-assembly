@@ -559,6 +559,12 @@ def parse_args():
            "(display_path_viser: step slider + playback). Blocks. Port = --viser-port.",
   )
   parser.add_argument(
+      "--mp-collision-view", action="store_true",
+      help="With --mp-viser: show only PRIMITIVE (collision) shapes -- capsules/boxes/"
+           "cylinders/ssBox -- and hide the file-loaded visual meshes "
+           "(display_path_viser primitives_only). See exactly what the planner collides.",
+  )
+  parser.add_argument(
       "--mp-modes", action="store_true",
       help="With --motion-plan: instead of planning, step through the exported problem's MODES "
            "(each posed at its task goal keyframe) in mr_bench's own viser viewer "
@@ -943,8 +949,10 @@ def main():
               from multi_robot_multi_goal_planning.problems.util import interpolate_path
               disp = interpolate_path(mp_path, 0.05, kind="euclidean")
               print(f"[motion-plan] serving interpolated path ({len(disp)} states) on "
-                    f"http://localhost:{args.viser_port}")
-              prob.display_path_viser(disp, port=args.viser_port)
+                    f"http://localhost:{args.viser_port}"
+                    + (" (collision shapes only)" if args.mp_collision_view else ""))
+              prob.display_path_viser(disp, port=args.viser_port,
+                                      primitives_only=args.mp_collision_view)
           else:
             print("[motion-plan] NO path found")
       # --motion-plan owns the display (via --mp-viser); don't ALSO fire the search-replay

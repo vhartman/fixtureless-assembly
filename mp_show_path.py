@@ -41,6 +41,8 @@ pa.add_argument("--shortcut-iters", type=int, default=1000, help="shortcut itera
 pa.add_argument("--shortcut-res", type=float, default=None,
                 help="shortcut collision resolution (default: env collision_resolution)")
 pa.add_argument("--no-serve", dest="serve", action="store_false", help="plan only, no viewer")
+pa.add_argument("--collision-view", action="store_true",
+                help="show only PRIMITIVE (collision) shapes, hide file-loaded visual meshes")
 pa.add_argument("--port", type=int, default=8080, help="viser port (default: 8080)")
 args = pa.parse_args()
 
@@ -83,4 +85,4 @@ if args.serve:
     disp = interpolate_path(path, 0.05, kind="euclidean")     # dense path for smooth playback
     print(f"[viser] serving interpolated path ({len(disp)} states) on "
           f"http://localhost:{args.port}  (Ctrl-C to stop)")
-    prob.display_path_viser(disp, port=args.port)
+    prob.display_path_viser(disp, port=args.port, primitives_only=args.collision_view)
