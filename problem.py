@@ -1790,6 +1790,22 @@ def releases(state, assembly, robots, gripper_kind=None):
         yield ("release", r, p), ns
 
 
+# LRU ROBOT ORDERING (utilization debugging knob). Successor generators iterate robots in
+# roster order, and the greedy/milestone searches take the FIRST feasible successor -- so the
+# first free robot wins every tie and plans over-use a1 while the rest idle. With this on,
+# `successors` orders robots LEAST-RECENTLY-USED first (recency tracked as a non-identity
+# payload on yielded states: _lru_last/_lru_step; State.key() ignores it). Deterministic (no
+# RNG; stable sort keeps roster order for ties), pure successor ORDERING -- the reachable set,
+# heuristics, and w-bounds are untouched. Expect: better robot spread (-> depgraph-export
+# parallelism), possibly slightly worse action counts (forced alternation can add reaches).
+_LRU_ROBOTS = False
+
+
+def set_lru_robots(on=True):
+  global _LRU_ROBOTS
+  _LRU_ROBOTS = bool(on)
+
+
 def successors(state, assembly, robots, grasp_table=None, canonical=False,
                gripper_kind=None, handovers=True, allow_place=True, bracing=False):
   # handovers=True (default) enables regrasp-in-air via the FUSED `handover`: a free robot
@@ -1799,6 +1815,10 @@ def successors(state, assembly, robots, grasp_table=None, canonical=False,
   # `bracing=` (off by default: it just adds branching everywhere). `release` reparents onto a
   # remaining holder either way. allow_place=False FORBIDS setting a held group back on the
   # table -> the search holds + regrasps in the air (no forced regime; just fewer options).
+  if _LRU_ROBOTS:
+    _last = getattr(state, "_lru_last", {})
+    robots = sorted(robots, key=lambda r: _last.get(r, -1))  # stable: ties keep roster order
+
   def _gen():
     # ORDER MEASURED 2026-07-17 (assembles-first vs this picks-first): bit-identical searches
     # on cross-6/cross-7; on car-mini 2.1x fewer expansions but a 33% WORSE plan (cost 20->28
@@ -1815,13 +1835,30 @@ def successors(state, assembly, robots, grasp_table=None, canonical=False,
       yield from places(state, assembly, robots)
     # deferred (unfused): set_downs
 
-  if _BRACE_FOR_ASSEMBLY_ONLY and _has_brace(state):
-    # a brace is present -> only consume it (assemble) or drop it (release); see the flag doc.
-    for a, ns in _gen():
-      if a[0] in ("assemble", "release"):
-        yield a, ns
+  def _filtered():
+    if _BRACE_FOR_ASSEMBLY_ONLY and _has_brace(state):
+      # a brace is present -> only consume it (assemble) or drop it (release); see the flag doc.
+      for a, ns in _gen():
+        if a[0] in ("assemble", "release"):
+          yield a, ns
+      return
+    yield from _gen()
+
+  if not _LRU_ROBOTS:
+    yield from _filtered()
     return
-  yield from _gen()
+  # stamp the LRU payload on every successor: the acting robot (and a handover's GIVER, read
+  # off the pre-state's grasp contact) used at step k+1. Non-identity payload -- key() ignores.
+  _step = getattr(state, "_lru_step", 0) + 1
+  for a, ns in _filtered():
+    nl = dict(_last)
+    nl[a[1]] = _step
+    if a[0] == "handover":
+      for c in state.supports.get(a[2], ()):
+        if c[0] == "grasp":
+          nl[c[1]] = _step
+    ns._lru_last, ns._lru_step = nl, _step
+    yield a, ns
 
 
 def assembly_order(assembly):

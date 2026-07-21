@@ -1753,6 +1753,147 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
                "fallback": fallback}
 
 
+def utilization_report(C, assembly, plan, robots, witnesses=None, verbose=True,
+                       gripper_kind=None, handovers=True, allow_place=True, bracing=False):
+  """SCHEDULED-MAKESPAN utilization metric (report only -- no optimization). List-schedules
+  the plan on its RESOURCE partial order: each action starts when every action sharing a
+  resource with it has finished; resources = the involved robots (actor + holders of the
+  moved/target group) and every part of the touched group(s) in pre+post state (the same
+  last-writer order mp_export._dependency_graph exports). Same-robot actions serialize;
+  different-robot actions on independent parts overlap -- so makespan/busy%% quantify how
+  parallelizable the plan is, which the action-count objective ignores.
+
+  Durations: with `witnesses`, an action costs the max over its involved arms of the
+  joint-space distance from that arm's previous commanded config (releases: 0 -- gripper
+  open); units = radians. Without witnesses, 1.0 per action (structural parallelism only).
+  Returns {makespan, serial, speedup, busy: {r: time}, durations}."""
+  states = [get_initial_state(C, assembly)]
+  for a in plan:
+    states.append(next(ns for act, ns in successors(
+        states[-1], assembly, robots, gripper_kind=gripper_kind, handovers=handovers,
+        allow_place=allow_place, bracing=bracing) if act == a))
+
+  def holders_of(st, part):
+    grp = next((g for g in st.subassemblies() if part in g), {part})
+    hs = set()
+    for p in grp:
+      for c in st.supports.get(p, ()):
+        if c[0] == "grasp":
+          hs.add(c[1])
+    return hs, grp
+
+  names = list(C.getJointNames())
+  idx = {r: [j for j, n in enumerate(names) if n.startswith(r + "_")] for r in robots}
+  cur = {r: np.asarray(C.getJointState())[idx[r]].copy() for r in robots}
+
+  finish, busy, durs, ends = {}, {r: 0.0 for r in robots}, [], []
+  for i, a in enumerate(plan):
+    kind, actor = a[0], a[1]
+    inv = {actor}
+    res = set()
+    target = [a[2]] + ([a[3]] if kind == "assemble" else [])
+    for st in (states[i], states[i + 1]):
+      for p in target:
+        hs, grp = holders_of(st, p)
+        inv |= hs
+        res |= set(grp)
+    res |= inv
+    if witnesses is not None:
+      w = witnesses[i] if i < len(witnesses) else None
+      if w is None:
+        dur = 0.0                                          # release/no-IK: gripper open only
+      else:
+        w = np.asarray(w)
+        dur = max(float(np.linalg.norm(w[idx[r]] - cur[r])) for r in inv)
+        for r in inv:
+          cur[r] = w[idx[r]].copy()
+    else:
+      dur = 1.0
+    start = max((finish.get(x, 0.0) for x in res), default=0.0)
+    end = start + dur
+    for x in res:
+      finish[x] = end
+    for r in inv:
+      busy[r] += dur
+    durs.append(dur)
+    ends.append(end)
+
+  makespan = max(ends) if ends else 0.0
+  serial = sum(durs)
+  speedup = serial / makespan if makespan > 0 else 1.0
+  if verbose:
+    unit = "rad (witness joint-dist)" if witnesses is not None else "actions (unit durations)"
+    frac = lambda r: f"{busy[r] / makespan * 100:.0f}%" if makespan > 0 else "-"
+    print(f"[utilization] makespan {makespan:.2f} vs serial {serial:.2f} -> "
+          f"speedup {speedup:.2f}x of {len(robots)} robots "
+          f"(parallel efficiency {speedup / len(robots) * 100:.0f}%); units: {unit}")
+    print("[utilization] busy: " + "  ".join(f"{r} {busy[r]:.2f} ({frac(r)})"
+                                             for r in robots))
+  return {"makespan": makespan, "serial": serial, "speedup": speedup,
+          "busy": dict(busy), "durations": durs}
+
+
+def hoist_releases(C, assembly, plan, robots, gripper_kind=None, handovers=True,
+                   allow_place=True, bracing=False, verbose=True):
+  """POST-PASS plan rewrite (search untouched): bubble every `release` as EARLY as legal.
+  The search never prefers early releases -- release placement is invisible to both cost
+  (#actions unchanged) and h (release-neutral), so greedy emits them just-in-time (arm
+  loiters holding until next needed). But an early release frees the ROBOT resource sooner
+  (shorter robot chains in the scheduled makespan / depgraph export) and retracts the arm
+  out of the workspace (less idle-arm clutter for the motion planner).
+
+  Sound-by-construction: a release swaps one position earlier only if (a) it is applicable
+  in the earlier state per the REAL successor generator (which enforces wrench stability --
+  a needed hold cannot release early), (b) the swapped-past action is still applicable
+  after the release, (c) both re-ordered edges pass the search's own cheap geometric check,
+  and (d) the state after the pair is IDENTICAL (key) to before -- so the plan suffix and
+  final state are untouched. Returns a new Plan with a consistent .states trajectory."""
+  checker, grasp_table = _search_context(C, assembly, robots)
+
+  def apply(s, a):
+    return next((ns for act, ns in successors(
+        s, assembly, robots, grasp_table=grasp_table, gripper_kind=gripper_kind,
+        handovers=handovers, allow_place=allow_place, bracing=bracing) if act == a), None)
+
+  acts = list(plan)
+  states = [get_initial_state(C, assembly)]
+  for a in acts:                                           # re-simulate (don't trust payloads)
+    ns = apply(states[-1], a)
+    if ns is None:
+      if verbose:
+        print("[hoist] plan does not re-simulate under these successor flags; skipped.")
+      return plan
+    states.append(ns)
+
+  moved, shifts = 0, 0
+  for j in range(len(acts)):
+    if acts[j][0] != "release":
+      continue
+    i = j
+    while i > 0:
+      rel, prev_a = acts[i], acts[i - 1]
+      s0 = states[i - 1]
+      s_mid = apply(s0, rel)
+      if s_mid is None or not cheap_feasible(rel, s0, s_mid, assembly, checker):
+        break
+      s_after = apply(s_mid, prev_a)
+      if s_after is None or s_after != states[i + 1] or \
+         not cheap_feasible(prev_a, s_mid, s_after, assembly, checker):
+        break
+      acts[i - 1], acts[i] = rel, prev_a
+      states[i] = s_mid                                    # states[i+1] proven identical
+      shifts += 1
+      i -= 1
+    if i != j:
+      moved += 1
+  if verbose:
+    print(f"[hoist] releases: {moved} moved earlier ({shifts} positions total) "
+          f"of {sum(1 for a in acts if a[0] == 'release')}.")
+  out = Plan(acts)
+  out.states = states
+  return out
+
+
 def _labeled_geo_ok(checker, assembly, st, ideal_set, note=""):
   """GEO-fact core (--geo-facts): floating-gripper COEXISTENCE check for a crafted labeled
   state -- can all the state's grippers physically BE at their grasps on the assembly at

@@ -248,6 +248,12 @@ def table_capability(points):
 # ---------------------------------------------------------------------------------------
 def gravity_wrench(masses_points):
   # total gravity wrench about the origin for [(mass, com_world), ...].
+  # PARAMS["ignore_gravity"]: WEIGHTLESS mode -- drop the part-weight load entirely, so the
+  # only external wrench a hold must resist is the INSERTION reaction (and other applied
+  # loads). Isolates insertion/bracing feasibility from gravity (e.g. probe whether a grasp
+  # fails on weight vs. on the press force). Fixed for a solve, so the LP cache stays valid.
+  if PARAMS.get("ignore_gravity"):
+    return np.zeros(6)
   w = np.zeros(6)
   for m, c in masses_points:
     f = np.array([0.0, 0.0, -m * GRAVITY])

@@ -20,7 +20,6 @@ ACTION -> TASK map (confirmed with the user 2026-07-20):
                                 CONSTRAINT -- supported on another mr_bench branch; goto now)
   handover(rB,p,g)   -> handover, robots=[rA_giver, rB], frames=[gripper(rB), p]
 """
-import os
 import sys
 import json
 
@@ -32,28 +31,10 @@ _MRBENCH_SRC = "/home/valentin/git/postdoc/robotic-venv/mr_bench/src"
 def _ensure_mrbench():
   if _MRBENCH_SRC not in sys.path:
     sys.path.insert(0, _MRBENCH_SRC)
-  # STUB the mr_planner_core compiled extension (a VAMP planner built for py3.10; our venv
-  # is py3.12). problems/__init__.py eagerly imports mr_vamp_env behind find_spec(...) --
-  # the 3.10 package IS found but its .so fails to load. We never use the VAMP env, so a
-  # bare stub module (find_spec returns its __spec__, `import mr_planner_core` gets it) lets
-  # the package import cleanly. No mr_bench change.
-  import types
-  import importlib.util as _ilu
-  for _name in ("mr_planner_core",):                        # the compiled ext itself
-    if _name not in sys.modules:
-      _m = types.ModuleType(_name)
-      _m.__spec__ = _ilu.spec_from_loader(_name, loader=None)
-      sys.modules[_name] = _m
-  # STUB the unused VAMP submodule wholesale: problems/__init__ does `from . import
-  # mr_vamp_env` (its find_spec(mr_planner_core) guard passes since the 3.10 package is on
-  # disk), and mr_vamp_env's body imports mr_planner_core's .so AND meshcat. We never use
-  # it, so pre-seed sys.modules with an empty module under its full name -> the import binds
-  # the stub and never runs the body. No mr_bench change.
-  _vamp = "multi_robot_multi_goal_planning.problems.mr_vamp_env"
-  if _vamp not in sys.modules:
-    _mv = types.ModuleType(_vamp)
-    _mv.__spec__ = _ilu.spec_from_loader(_vamp, loader=None)
-    sys.modules[_vamp] = _mv
+  # A3 FIXED mr_bench-side: problems/__init__.py now guards the optional mr_vamp_env /
+  # pinocchio / mujoco imports with try/except ImportError (not find_spec), so the VAMP .so
+  # failing to load in this venv no longer breaks the package import. The sys.modules stub we
+  # used to pre-seed is gone.
   try:
     import multi_robot_multi_goal_planning  # noqa: F401
   except ImportError as e:
@@ -269,55 +250,15 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
     def __init__(self):
       self.C = ry.Config()
       self.C.addConfigurationCopy(C_start)
-      # RE-PARENT the robotiq's finger collision frames (finger1/2 capsules + inner-finger
-      # PAD boxes) onto the surviving robotiq base link. Their kinematic PARENT is a MESH
-      # frame, and rai_env.__init__'s delete_visual_only_frames deletes every mesh frame ->
-      # the finger collision shapes ORPHAN (parent=NONE) and FLOAT in the air at the gripper's
-      # start height. We keep the shapes (real finger collision for transit) but hang them off
-      # a non-mesh ancestor (*_ur_robotiq_arg2f_base_link, ST.none, survives) so they follow
-      # the gripper. unLink()+setParent(...,True) preserves each frame's WORLD pose exactly,
-      # so the fingers stay put at their open-gripper location (fixed in transit). Done BEFORE
-      # rai_env.__init__ so nothing orphans.
-      for _f in list(self.C.getFrameNames()):
-        if (_f.endswith("_ur_finger1") or _f.endswith("_ur_finger2")
-            or "_inner_finger_pad" in _f):
-          _pre = _f.split("_ur_")[0]
-          _base = self.C.getFrame(_pre + "_ur_robotiq_arg2f_base_link")
-          if _base is not None:
-            self.C.getFrame(_f).unLink()
-            self.C.getFrame(_f).setParent(_base, True)
-      # Give SHAPELESS part frames a PRIMITIVE collision box (car-mini etc.). A part `obj_X`
-      # may be ST.none with its collision geometry on a rigid `obj_X__shape` child (a rotated
-      # cylinder wheel). mr_bench's set_to_mode does setContact(-1) on the attached PART frame;
-      # on a shapeless frame rai fabricates a DEGENERATE ST.mesh (0 vertices) -> FCL
-      # 'collision object with no vertices' crash in computeCollisions. We give obj_X an ssBox
-      # = the AXIS-ALIGNED BOUNDING BOX of the child's mesh (transformed by its relative pose)
-      # in the part frame: an ssBox is a PRIMITIVE (info shape != "mesh") so it survives
-      # rai_env's delete_visual_only_frames (which deletes every "mesh" frame -- a plain
-      # setMesh here would get obj_X itself DELETED). The child's own contact is dropped so the
-      # part carries the single collision proxy. Cross parts (ST.ssBox, not shapeless) skip.
-      def _quat_R(q):
-        w, x, y, z = q
-        return np.array([[1-2*(y*y+z*z), 2*(x*y-z*w),   2*(x*z+y*w)],
-                         [2*(x*y+z*w),   1-2*(x*x+z*z), 2*(y*z-x*w)],
-                         [2*(x*z-y*w),   2*(y*z+x*w),   1-2*(x*x+y*y)]])
-      for _sf in [f for f in self.C.getFrameNames() if f.endswith("__shape")]:
-        _pf = self.C.getFrame(_sf[:-len("__shape")])
-        _s = self.C.getFrame(_sf)
-        if _pf is None or str(_pf.getShapeType()) != "ST.none":
-          continue
-        _V = np.asarray(_s.getMeshPoints())
-        if _V.ndim < 2 or len(_V) == 0:
-          continue
-        _Vp = _V @ _quat_R(np.asarray(_s.getRelativeQuaternion())).T \
-            + np.asarray(_s.getRelativePosition())
-        _e = _Vp.max(0) - _Vp.min(0)                         # AABB full extents
-        # ssBox sits at the part-frame origin, valid because the child shape is CENTRED there
-        # (car wheels: AABB centre ~0). An off-centre shape would need a child frame instead.
-        _pf.setShape(ry.ST.ssBox, [float(_e[0]), float(_e[1]), float(_e[2]), 0.002])
-        _pf.setContact(1)
-        _s.setContact(0)
       self.robots = list(robots)
+      # Default rai_env.__init__ (delete_visual_only=True): mr_bench's delete_visual_only_frames
+      # is now COLLISION-AWARE (A2 fix) -- it keeps every non-visual frame AND its ancestors, so
+      # the robotiq finger collision capsules (children of mesh frames) survive with their
+      # parents instead of orphaning. So we no longer need to keep the full visual scene, and
+      # genuinely-decorative meshes are pruned from the collision config. (A5 also fixed:
+      # set_to_mode guards setContact against shapeless frames -> car-mini's obj_X stays
+      # shapeless while its obj_X__shape cylinder keeps the wheel collision. All three of our
+      # old workarounds -- finger re-parent, ssBox baking, sys.modules stub -- are removed.)
       rai_env.__init__(self)                               # -> robot_idx, start_pos, limits
       self.manipulating_env = True
       self.tasks, seq_names = build_tasks(
@@ -351,66 +292,6 @@ def run_motion_planner(problem, runtime=30.0, verbose=True):
   return path, info
 
 
-def _patch_mrbench_numpy2():
-  """Runtime compat shim (NOT a source edit to mr_bench). numpy>=2 -- our venv is 2.4, pinned
-  by numba -- raises 'setting an array element with a sequence' when a size-1 array is assigned
-  into a scalar array slot; numpy<2 (what mr_bench targets) broadcast it silently.
-  env.batch_config_cost returns a size-1 array for single-pair queries, which BiRRT's
-  extend/connect write straight into the scalar Node cost array. Every Node cost write funnels
-  through Node.cost.setter -> operation.costs[id] = value, so coercing size-1 -> float there
-  fixes all sites. Pure compatibility; no numeric change. Recommend an mr_bench-side fix later."""
-  import numpy as _np
-  from multi_robot_multi_goal_planning.planners import rrtstar_base as _rb
-  if getattr(_rb.Node, "_np2_cost_patched", False):
-    return
-  _prop = _rb.Node.cost
-  def _set(self, value):
-    v = _np.asarray(value)
-    self.operation.costs[self.id] = v.reshape(-1)[0] if v.size == 1 else value
-  _rb.Node.cost = property(_prop.fget, _set)
-  _rb.Node._np2_cost_patched = True
-
-
-def _patch_mrbench_optimize():
-  """Runtime shim (NOT a source edit to mr_bench) so optimize=True doesn't crash. In
-  BaseRRTstar.tree_extension the path-improvement loop calls
-  `near(mode, node, np.where(get_node_ids_subtree()==parent.id))` -- passing the np.where
-  TUPLE as the scalar `n_nearest_idx`. When `parent` lives in the OTHER bidirectional subtree
-  (A vs B, or a swapped tree) the lookup is EMPTY, and near()'s `n_nearest_idx not in indices`
-  then broadcasts an empty (1,0) array against the near-set -> ValueError (numpy>=2). We patch
-  BaseRRTstar.near to coerce n_nearest_idx to a scalar and, when the parent isn't in this
-  subtree, simply not force-insert it (the radius near-set still drives find_parent/rewire, so
-  optimization proceeds, just without pinning that one absent parent). Only reached with
-  optimize=True. Proper mr_bench fix: search the subtree matching tree.order and handle the
-  not-found case in tree_extension."""
-  import numpy as _np
-  from multi_robot_multi_goal_planning.planners import rrtstar_base as _rb
-  if getattr(_rb.BaseRRTstar, "_near_idx_patched", False):
-    return
-
-  def _near(self, mode, n_new, n_nearest_idx, set_dists=None, tree=""):
-    batch_subtree = self.trees[mode].get_batch_subtree(tree)
-    if set_dists is None:
-      set_dists = _rb.batch_config_dist(n_new.state.q, batch_subtree,
-                                        self.config.distance_metric)
-    vertices = self.trees[mode].get_number_of_nodes_in_tree()
-    r = _np.minimum(self.gamma_rrtstar * (_np.log(vertices) / vertices) ** (1 / self.d),
-                    self.eta)
-    indices = _rb.find_nearest_indices(set_dists, r)
-    # coerce np.where(...) tuple / array -> scalar; skip the force-insert if absent (empty)
-    _ix = n_nearest_idx[0] if isinstance(n_nearest_idx, tuple) else n_nearest_idx
-    _ix = _np.ravel(_np.asarray(_ix))
-    if _ix.size and int(_ix[0]) not in indices:
-      indices = _np.insert(indices, 0, int(_ix[0]))
-    node_indices = self.trees[mode].get_node_ids_subtree(tree)[indices]
-    n_near_costs = self.operation.costs[node_indices]
-    N_near_batch = batch_subtree[indices]
-    return N_near_batch, n_near_costs, node_indices
-
-  _rb.BaseRRTstar.near = _near
-  _rb.BaseRRTstar._near_idx_patched = True
-
-
 def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
               shortcut_resolution=None, optimize=False, verbose=True):
   """Run Bidirectional RRT* to the FIRST solution (optimize=False), then optionally apply
@@ -427,8 +308,6 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
   the wall-clock (measured: 46s -> 4.6s, identical cost). We default `shortcut_resolution` to
   the env's collision_resolution so shortcutting checks no finer than the planner did."""
   _ensure_mrbench()
-  _patch_mrbench_numpy2()
-  _patch_mrbench_optimize()                                # safe no-op for scalar near() calls
   from multi_robot_multi_goal_planning.planners.planner_birrtstar import BidirectionalRRTstar
   from multi_robot_multi_goal_planning.planners.rrtstar_base import BaseRRTConfig
   from multi_robot_multi_goal_planning.planners.shortcutting import robot_mode_shortcut

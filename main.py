@@ -314,6 +314,12 @@ def parse_args():
            "10 N held side-mates are free, at 30 N only press-aligned grasps survive.",
   )
   parser.add_argument(
+      "--ignore-gravity", action="store_true",
+      help="With --wrench: WEIGHTLESS parts -- drop the gravity load from every stability "
+           "check, so a hold must only resist the INSERTION reaction (and other applied "
+           "loads), not part weight. Isolates insertion/bracing feasibility from gravity.",
+  )
+  parser.add_argument(
       "--curved-torque-scale", type=float, default=None, metavar="S",
       help="With --wrench: derate the TORQUE (couple) a CURVED grasp (cylinder side / sphere) "
            "can resist to S x that of a flat hold (force caps unchanged). E.g. 0.25. Models "
@@ -510,6 +516,33 @@ def parse_args():
            "pairs). Traded against movement by this weight. Best with the dp-* modes.",
   )
   parser.add_argument(
+      "--lru-robots", action="store_true",
+      help="Order robots LEAST-RECENTLY-USED first in successor generation (utilization "
+           "knob): the greedy/milestone searches take the first feasible successor, so the "
+           "fixed roster order makes a1 win every tie and idles the rest. LRU alternation "
+           "spreads actions across arms -- with the depgraph export that IS parallelism "
+           "(different robots on independent parts stay unordered for the motion planner). "
+           "Deterministic (no RNG, stable ties); pure successor ordering, search space "
+           "unchanged. May cost a few extra actions (forced alternation).",
+  )
+  parser.add_argument(
+      "--hoist-releases", action="store_true",
+      help="POST-PASS after --solve (before witness optimization): bubble every `release` as "
+           "EARLY in the plan as legal -- applicable per the real successor generator (wrench "
+           "stability: a needed hold cannot release early), cheap-geometry-checked, and only "
+           "where the swapped pair provably commutes (identical state after). Frees arms "
+           "sooner (shorter robot chains in the schedule / depgraph, less idle-arm clutter "
+           "for motion planning). Plan length and final state unchanged.",
+  )
+  parser.add_argument(
+      "--utilization", action="store_true",
+      help="After --solve, report the plan's SCHEDULED-MAKESPAN utilization: list-schedule "
+           "the actions on their resource partial order (robots + touched parts -- the same "
+           "order the depgraph export uses) and print makespan vs serial time, speedup, and "
+           "per-robot busy%%. Durations = witness joint-distances when --optimize-witnesses "
+           "ran, else 1/action. Report only; no behavior change.",
+  )
+  parser.add_argument(
       "--witness-robot-collisions", action="store_true",
       help="During --optimize-witnesses, keep the OTHER robots' collision geometry ON (the "
            "search strips it on solo steps for speed). Re-solved witnesses then AVOID the idle "
@@ -663,6 +696,11 @@ def main():
     print("[flag] --brace-for-assembly-only ACTIVE: a braced state (>=2 grippers on a group) "
           "may only assemble/release. Prunes brace branching; can miss plans that carry a "
           "brace across unrelated work (experimental).")
+  if args.lru_robots:
+    from problem import set_lru_robots
+    set_lru_robots(True)
+    print("[flag] --lru-robots ACTIVE: successor robots ordered least-recently-used first "
+          "(deterministic tie-break; spreads actions across arms).")
   import wrench
   wrench.PARAMS["grasp_model"] = args.grasp_model  # capability model (used when --wrench)
   wrench.PARAMS["check_inserter"] = args.inserter_check
@@ -672,6 +710,10 @@ def main():
       None if args.insertion_noise is None
       else {"lateral": args.insertion_noise, "offset": args.insertion_offset})
   wrench.PARAMS["robust_mode"] = args.robust_mode
+  wrench.PARAMS["ignore_gravity"] = args.ignore_gravity
+  if args.ignore_gravity:
+    print("[flag] --ignore-gravity ACTIVE: parts weightless in the wrench check "
+          "(only insertion/applied loads must be resisted).")
   set_goal(on_table=args.goal_on_table)
   if args.goal_on_table:
     print("[flag] --goal-on-table ACTIVE: the finished assembly must rest on the table "
@@ -899,6 +941,14 @@ def main():
       print(f"plan ({len(plan)} actions):")
       for step in plan:
         print("  ", step)
+      if args.hoist_releases:
+        # BEFORE save/witnesses/utilization/motion-plan, so all downstream consumers see the
+        # hoisted plan (witnesses are solved for the hoisted states).
+        from solver import hoist_releases
+        plan = hoist_releases(C, assembly, plan, robots,
+                              gripper_kind=gripper_kind(C) if args.wrench else None,
+                              handovers=args.handovers, allow_place=args.allow_place,
+                              bracing=args.bracing)
       if args.save is not None:
         save_plan(args.save, args, plan)
       opt_witnesses = None
@@ -912,6 +962,12 @@ def main():
               handovers=args.handovers, allow_place=args.allow_place,
               bracing=args.bracing, clear_weight=args.witness_clearance,
               robot_collisions=args.witness_robot_collisions)
+      if plan is not None and args.utilization:
+        from solver import utilization_report
+        utilization_report(C, assembly, plan, robots, witnesses=opt_witnesses,
+                           gripper_kind=gripper_kind(C) if args.wrench else None,
+                           handovers=args.handovers, allow_place=args.allow_place,
+                           bracing=args.bracing)
       if plan is not None and args.motion_plan:
         if robot_ik is None:
           print("[motion-plan] needs --real-ik (for the IK witnesses); skipping.")
