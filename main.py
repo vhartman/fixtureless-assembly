@@ -510,6 +510,62 @@ def parse_args():
            "pairs). Traded against movement by this weight. Best with the dp-* modes.",
   )
   parser.add_argument(
+      "--witness-robot-collisions", action="store_true",
+      help="During --optimize-witnesses, keep the OTHER robots' collision geometry ON (the "
+           "search strips it on solo steps for speed). Re-solved witnesses then AVOID the idle "
+           "arms instead of passing through them -- important before motion planning, where "
+           "mr_bench validates every arm. Note idle arms are at HOME in the witness scene.",
+  )
+  parser.add_argument(
+      "--motion-plan", action="store_true",
+      help="After --solve, EXPORT the plan (+ witnesses) to the mr_bench motion planner "
+           "(mp_export) and run Bidirectional RRT* to a collision-free multi-robot path. "
+           "Reuses THIS run's scene/witness flags (--assembly/--parts/--num-robots/--robot/"
+           "--optimize-witnesses/--witness-clearance/--vacuum/--goal-on-table). Needs "
+           "--real-ik (for the IK witnesses); if --optimize-witnesses is not given, RAW "
+           "search witnesses are used. See the --mp-* flags for planner options.",
+  )
+  parser.add_argument(
+      "--mp-sequence", action="store_true",
+      help="With --motion-plan: export a FIXED-SEQUENCE problem (total order) instead of the "
+           "default DEPENDENCY GRAPH (partial order, planner may reorder independent actions).",
+  )
+  parser.add_argument(
+      "--mp-optimize", action="store_true",
+      help="With --motion-plan: RRT* COST optimization until --mp-runtime (default: stop at "
+           "the first solution). Improves path cost; uses the tree-extension shim.",
+  )
+  parser.add_argument(
+      "--mp-runtime", type=float, default=60.0, metavar="SEC",
+      help="With --motion-plan: BiRRT search budget in seconds (default: 60). Bounds ONLY the "
+           "tree search, NOT shortcutting.",
+  )
+  parser.add_argument(
+      "--mp-no-shortcut", action="store_true",
+      help="With --motion-plan: skip the shortcutting post-process (fastest to a raw path).",
+  )
+  parser.add_argument(
+      "--mp-shortcut-iters", type=int, default=1000, metavar="N",
+      help="With --motion-plan: shortcut iteration cap (default 1000; NOT time-bounded).",
+  )
+  parser.add_argument(
+      "--mp-shortcut-res", type=float, default=None, metavar="R",
+      help="With --motion-plan: shortcut collision resolution (default: env collision_resolution, "
+           "~10x faster than mr_bench's own 0.001 for identical quality).",
+  )
+  parser.add_argument(
+      "--mp-viser", action="store_true",
+      help="With --motion-plan: serve the found PATH in mr_bench's own viser viewer "
+           "(display_path_viser: step slider + playback). Blocks. Port = --viser-port.",
+  )
+  parser.add_argument(
+      "--mp-modes", action="store_true",
+      help="With --motion-plan: instead of planning, step through the exported problem's MODES "
+           "(each posed at its task goal keyframe) in mr_bench's own viser viewer "
+           "(scripts/show_problems.py::visualize_modes). Good for debugging the export / "
+           "spotting per-mode collisions. Blocks. Port = --viser-port.",
+  )
+  parser.add_argument(
       "--sig-collapsed-h", action="store_true",
       help="SIGNATURE grasp collapse + LABELED loose parts: grasp labels are equivalence "
            "classes under the fact signature (press capability, pick-face vector, contact "
@@ -719,6 +775,13 @@ def main():
       robot_ik.ik_seeding = True
       robot_ik.collision_reject_depth = (
           None if args.ik_collision_gate < 0 else args.ik_collision_gate)
+    if robot_ik is not None and args.witness_robot_collisions:
+      # keep the OTHER robots' collision ON in the SEARCH's IK too (not just the post-opt pass):
+      # the search's witnesses then avoid the idle arms from the start. (optimize_witnesses gets
+      # robot_collisions too; with this already set, that toggle is a consistent no-op.)
+      robot_ik.strip_inactive_collision = False
+      print("[flag] --witness-robot-collisions ACTIVE: other robots' collision kept ON in IK "
+            "(search + witness opt); idle arms are at HOME in the IK scene.")
     if args.view_cheap_checks:
       set_cheap_check_debug(True)
     fail_rec = None
@@ -841,8 +904,52 @@ def main():
               C, assembly, plan, robots, robot_ik, cost=args.optimize_witnesses,
               gripper_kind=gripper_kind(C) if args.wrench else None,
               handovers=args.handovers, allow_place=args.allow_place,
-              bracing=args.bracing, clear_weight=args.witness_clearance)
-      if args.view or args.viser:
+              bracing=args.bracing, clear_weight=args.witness_clearance,
+              robot_collisions=args.witness_robot_collisions)
+      if plan is not None and args.motion_plan:
+        if robot_ik is None:
+          print("[motion-plan] needs --real-ik (for the IK witnesses); skipping.")
+        else:
+          import mp_export as MP
+          gk = gripper_kind(C) if args.wrench else None
+          # witnesses: the optimized set if --optimize-witnesses was given, else RAW (sweeps=0)
+          mp_wit = opt_witnesses
+          if mp_wit is None:
+            mp_wit, _ = optimize_witnesses(
+                C, assembly, plan, robots, robot_ik, cost="ee", sweeps=0,
+                gripper_kind=gk, handovers=args.handovers, allow_place=args.allow_place,
+                bracing=args.bracing, verbose=False,
+                robot_collisions=args.witness_robot_collisions)
+          prob = MP.make_problem(C, assembly, plan, mp_wit, robots, robot_ik, gk,
+                                 bracing=args.bracing, depgraph=not args.mp_sequence)
+          print(f"[motion-plan] {'SEQUENCE' if args.mp_sequence else 'DEPGRAPH'} problem, "
+                f"{len(prob.tasks)} tasks")
+          if args.mp_modes:
+            import os as _os, sys as _sys
+            MP._ensure_mrbench()
+            _sys.path.insert(0, _os.path.join(_os.path.dirname(MP._MRBENCH_SRC), "scripts"))
+            from show_problems import visualize_modes
+            print(f"[motion-plan] serving MODES on http://localhost:{args.viser_port}")
+            visualize_modes(prob, use_viser=True)
+            return
+          mp_path, _ = MP.run_birrt(
+              prob, runtime=args.mp_runtime, shortcut=not args.mp_no_shortcut,
+              shortcut_iters=args.mp_shortcut_iters, shortcut_resolution=args.mp_shortcut_res,
+              optimize=args.mp_optimize)
+          if mp_path:
+            print(f"[motion-plan] path {len(mp_path)} states, "
+                  f"reaches terminal={prob.is_terminal_mode(mp_path[-1].mode)}")
+            if args.mp_viser:
+              from multi_robot_multi_goal_planning.problems.util import interpolate_path
+              disp = interpolate_path(mp_path, 0.05, kind="euclidean")
+              print(f"[motion-plan] serving interpolated path ({len(disp)} states) on "
+                    f"http://localhost:{args.viser_port}")
+              prob.display_path_viser(disp, port=args.viser_port)
+          else:
+            print("[motion-plan] NO path found")
+      # --motion-plan owns the display (via --mp-viser); don't ALSO fire the search-replay
+      # viz, which would open the BLOCKING rai viewer (args.view defaults True).
+      if (args.view or args.viser) and not args.motion_plan:
         recorder = None
         if args.viser:
           from viser_view import ViserRecorder

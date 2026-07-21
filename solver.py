@@ -1502,7 +1502,8 @@ class AbstractionHeuristic:
 def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
                        pull_weight=1.0, ee_rot_weight=0.3, sweeps=2, verbose=True,
                        gripper_kind=None, handovers=True, allow_place=True, bracing=False,
-                       grasp_table=None, clear_weight=0.0, clear_margin=0.4):
+                       grasp_table=None, clear_weight=0.0, clear_margin=0.4,
+                       robot_collisions=False):
   """POST-PASS witness optimization (v1 of the witness-optimization plan): the DISCRETE
   plan is FIXED; each IK action is re-solved warm-pulled toward the ACTIVE arm's previous
   configuration, minimizing per-step active-arm movement in 'joint' space or 'ee' space
@@ -1514,6 +1515,12 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
   the witness for plan[i] (None for non-IK actions), report = before/after totals."""
   import time
   t0 = time.perf_counter()
+  # robot_collisions=True: keep the OTHER robots' collision geometry ON while re-solving each
+  # witness (the search strips it on solo steps for speed), so the witnesses AVOID the idle
+  # arms rather than passing through them. Restored before returning.
+  _strip0 = robot_ik.strip_inactive_collision
+  if robot_collisions:
+    robot_ik.strip_inactive_collision = False
   if grasp_table is None:
     _checker, grasp_table = _search_context(C, assembly, robots)
   # PRIVATE FK config: robot_ik.C is the base every scene_for/bind copies ("arms at home")
@@ -1693,6 +1700,7 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
             f"(ladder of {n_cand} candidates over "
             f"{sum(1 for w in wit if w is not None)} steps){tail} "
             f"in {time.perf_counter() - t0:.1f}s")
+    robot_ik.strip_inactive_collision = _strip0
     return wit, {"before": before, "after": after, "improved": -1, "fallback": 0}
 
   improved = 0
@@ -1740,6 +1748,7 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
     print(f"[witopt] {cost} cost: {before:.3f} -> {after:.3f}  "
           f"({improved} steps improved, {fallback} pulled re-solves failed -> originals "
           f"kept){tail} in {time.perf_counter() - t0:.1f}s")
+  robot_ik.strip_inactive_collision = _strip0
   return wit, {"before": before, "after": after, "improved": improved,
                "fallback": fallback}
 
