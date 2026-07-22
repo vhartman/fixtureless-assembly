@@ -229,7 +229,7 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
       # uniformly-colored cubes are visible. A child frame -> follows the part wherever
       # the state graph moves it; no contact shape, so the planner never sees it. The
       # ViserRecorder renders marker frames as viser axis frames (they have no mesh).
-      C.addFrame(f"{name}_marker", name).setShape(ry.ST.marker, [cs * 1.5])
+      C.addFrame(f"{name}_marker", name).setShape(ry.ST.marker, [cs * 1.0])
 
       base_q = scatter_q if scatter_q is not None else np.array([1.0, 0.0, 0.0, 0.0])
       if random_init:
@@ -639,11 +639,15 @@ class ChairAssembly(Assembly):
     # get a lie-flat SCATTER orientation (axis -> world x) so BOTH end grasps are reachable on
     # the table -- without it a leg stands upright, only its top cap is graspable, and that grasp
     # jams the gripper against the seat at the mate (see the leg-mate diagnosis).
-    q_seat = [0.707, 0.707, 0.008, 0.0]
-    q_leg  = [0.0, 1.0, 0.006, -0.006]
+    # seat/legs SNAPPED to exact axis rotations: chair.g's d(90 90 1 0) axis is (90,1,0) --
+    # x with accidental authoring noise (~0.5deg) that breaks flush table contact (rest-pose
+    # tolerance is 1e-4). The posts' d(90 1 -0.2 0) recline and the backrest's tilt are
+    # DESIGN, kept verbatim (placement_quat rests their shapes flush regardless).
+    q_seat = [np.sqrt(0.5), np.sqrt(0.5), 0.0, 0.0]
+    q_leg  = [0.0, 1.0, 0.0, 0.0]
     q_back = [0.703, 0.073, 0.075, 0.703]
     q_post = [0.011, 0.99, -0.093, -0.103]
-    leg_scatter  = np.array([0.7029, 0.0, -0.7113, 0.0])
+    leg_scatter  = np.array([np.sqrt(0.5), 0.0, -np.sqrt(0.5), 0.0])   # exact: axis -> world x
     post_scatter = np.array([0.63, 0.0, -0.7766, 0.0])
     self.part_shapes["obj_0"] = ("box", [0.38 * s, 0.05 * s, 0.35 * s, r], q_seat)
     self.masses["obj_0"] = 0.4
@@ -657,12 +661,19 @@ class ChairAssembly(Assembly):
       self.mate_axes[p] = np.array([0.0, 0.0, 1.0])         # leg pressed up onto the seat bottom
     self.assembly_dependencies = {p: ["obj_0"] for p in leg_off}
     if self.n_parts >= 8:
-      # backrest joins the seat (the sub-assembly join); posts mate onto the backrest.
+      # backrest joins the seat as a MODULE (user-specified DAG: posts mate onto the BACK,
+      # then the back+posts subassembly joins the seat as a unit) -- the connect mechanism,
+      # like cube-plates: obj_5's mate onto the seat is the JOIN, and it requires BOTH posts
+      # present (in the held module), so the module is built detached first.
       self.part_shapes["obj_5"] = ("box", [0.23 * s, 0.05 * s, 0.20 * s, r], q_back)
+      self.connect_parts.add("obj_5")
+      self.connect_requires["obj_5"] = {"obj_6", "obj_7"}
       self.scatter_orientations["obj_5"] = np.array([0.7772, 0.0, 0.6292, 0.0])  # backrest lies flat
       self.assembly_relative_poses["obj_5"] = ["obj_0", np.array([0.19, 0.0, 0.25]) * s]
       self.mate_axes["obj_5"] = np.array([0.0, 0.0, -1.0])  # sub-assembly lowered onto the seat
-      self.assembly_dependencies["obj_5"] = ["obj_0"]
+      # NO assembly_dependencies for obj_5: a dependency would drag obj_0 into the POSTS'
+      # mate closure (dependencies_of feeds _mate_closure) and forbid building the module
+      # detached. The join precedence lives ENTIRELY in connect_requires (cube-plates rule).
       post_off = {"obj_6": [-0.009, 0.152, -0.052], "obj_7": [-0.006, -0.148, -0.052]}
       for p, off in post_off.items():
         self.part_shapes[p] = ("cylinder", [0.33 * s, 0.025 * s], q_post)
@@ -907,6 +918,31 @@ def _grasp_quat_for_normal(normal):
 # Face 5 (normal [0,0,-1]) is the identity -- the default upright placement.
 _FACE_DOWN_QUATS = [_align_quat(n, np.array([0.0, 0.0, -1.0])) for n in _CUBE_FACE_NORMALS]
 _IDENTITY_FACE = 5
+
+
+def _quat_conj(q):
+  q = np.asarray(q, dtype=float)
+  return np.array([q[0], -q[1], -q[2], -q[3]])
+
+
+def placement_quat(assembly, group, ref, face):
+  # REST-POSE ANCHOR (change-2-lite, [[rest-pose-offaxis-change2]]): the world orientation of
+  # the reference PART FRAME for placement id `face` -- rest poses are computed FROM THE
+  # SHAPE, not from the bookkeeping part frame.
+  #   * SINGLETONS with a rotated shape: compose the INVERSE of the part's own shape rotation,
+  #     so `face` puts the SHAPE's face flush on the table (a reclined post rests on its cap;
+  #     the 90deg-rotated seat plate rests flat). Unrotated shapes: byte-identical.
+  #   * MULTI-part groups: the canonical face-down rotation of the axis-aligned structure
+  #     (members' shapes sit however the assembly puts them) -- unchanged.
+  #   * face 5 (_IDENTITY_FACE) keeps its established semantics "as anchored/scattered"
+  #     (_group_rest_pose preserves the anchor orientation there), so it is NOT composed --
+  #     placement ids 0..4 are shape faces, 5 is the anchor pose.
+  # Mesh shapes later swap the enumerator (stable-pose analysis), not this plumbing.
+  q = _FACE_DOWN_QUATS[face]
+  if face == _IDENTITY_FACE or len(group) > 1:
+    return q
+  sq = _shape_quat(assembly.part_shape(ref))
+  return q if sq is None else _quat_mul(q, _quat_conj(sq))
 
 
 # grasps per cube face. 1 = a single (vacuum-like) grasp; 2 = the two in-plane
@@ -2019,7 +2055,7 @@ def _slot_holds_alone(assembly, part, face):
     if d is None:
       cache[key] = True                                    # no mate axis: nothing to check
     else:
-      R = _quat_to_R(np.asarray(_FACE_DOWN_QUATS[face], dtype=float))
+      R = _quat_to_R(np.asarray(placement_quat(assembly, (part,), part, face), dtype=float))
       kind, params = assembly.part_shape(part)
       if kind == "box":
         half = float(np.dot(np.abs(d), np.asarray(params[:3], dtype=float))) / 2.0
@@ -2203,7 +2239,7 @@ def _group_rest_height(assembly, group, ref, face=_IDENTITY_FACE, anchor_q=None)
   # (part-bottom-to-ref-center), shape-aware via each part's half extent along world z at
   # that total orientation. For an all-cube identity-anchor group this is cs/2 - min_rel
   # (the classic rule). anchor_q=None means identity (all classic callers).
-  R = _quat_to_R(_FACE_DOWN_QUATS[face])
+  R = _quat_to_R(placement_quat(assembly, group, ref, face))
   if anchor_q is not None:
     R = R @ _quat_to_R(np.asarray(anchor_q, dtype=float))
   ref_off = assembly.position_in_base(ref)
@@ -2273,7 +2309,10 @@ def _group_rest_pose(assembly, group, ref, anchor_pose, face):
   if face == _IDENTITY_FACE:
     q = anchor_pose[3:]
   else:
-    q = _quat_mul(_anchor_yaw_quat(anchor_pose[3:]), _FACE_DOWN_QUATS[face])
+    # placement_quat: rest poses come from the SHAPE (a rotated singleton's face rests
+    # flush), not the bookkeeping part frame -- see its doc.
+    q = _quat_mul(_anchor_yaw_quat(anchor_pose[3:]),
+                  placement_quat(assembly, group, ref, face))
   pos = anchor_pose[:3].copy()
   pos[2] += _group_rest_lift(assembly, group, ref, face, anchor_q=anchor_pose[3:])
   return np.concatenate([pos, q])
@@ -2385,10 +2424,35 @@ def _rest_stable(assembly, group, ref, face, anchor_q, tol=1e-4, span_tol=1e-3):
   # the deferred change 2 [[rest-pose-offaxis-change2]].
   poses = _rest_layout_poses(assembly, group, ref, face, anchor_q)
   low = np.asarray(_table_footprint(assembly, poses, group, tol=tol))
-  if len(low) < 3:
-    return False                                             # point / line contact
-  xy = low[:, :2] - low[:, :2].mean(axis=0)
-  return float(np.linalg.svd(xy, compute_uv=False)[1]) > span_tol
+  if len(low) >= 3:
+    xy = low[:, :2] - low[:, :2].mean(axis=0)
+    if float(np.linalg.svd(xy, compute_uv=False)[1]) > span_tol:
+      return True                                            # 2-D support polygon: stable
+  # NEUTRAL (rolling) rest -- change-2-lite: a lone CYLINDER on its curved side (line
+  # contact) or a SPHERE (point) does not TIP: as it rolls, the contact follows the curved
+  # surface and the COM stays above it (neutral equilibrium) -- it stays put when placed,
+  # which is what a rest pose means here. Real scatters rest cylinders exactly this way
+  # (the chair's legs/posts lie flat), so the table must offer it. A BOX on an edge/corner
+  # genuinely tips and is still rejected (this branch is curved-singletons only). The
+  # cylinder must be lying on the SIDE (axis horizontal) with its COM over the contact
+  # line's span; a tilted cylinder rests on a rim point and tips -> rejected.
+  if len(group) == 1 and len(low) >= 1:
+    spec = assembly.part_shape(ref)
+    if spec[0] == "sphere":
+      return True
+    if spec[0] == "cylinder":
+      pose = np.asarray(poses[ref], dtype=float)
+      R = _quat_to_R(pose[3:])
+      sq = _shape_quat(spec)
+      if sq is not None:
+        R = R @ _quat_to_R(sq)
+      axis = R[:, 2]                                         # cylinder axis, world frame
+      if abs(axis[2]) < 0.05:                                # lying on its side
+        d2 = axis[:2] / (np.linalg.norm(axis[:2]) + 1e-12)
+        t = low[:, :2] @ d2
+        c = float(pose[:2] @ d2)
+        return float(t.min()) - span_tol <= c <= float(t.max()) + span_tol
+  return False
 
 
 def rest_faces(assembly, group):
@@ -2796,7 +2860,7 @@ def _on_table_mateable(assembly, part, tol=None, face=_IDENTITY_FACE):
   # the placement rule: rotated so `face` points down, lifted so ITS lowest part touches
   # the table. `part` is then posed at its rotated mate offset -- does the mate fit?
   context = _mate_closure(assembly, part)
-  q = _FACE_DOWN_QUATS[face]
+  q = placement_quat(assembly, context or {assembly.base}, assembly.base, face)
   R = _quat_to_R(q)
   rest = _group_rest_height(assembly, context or {assembly.base}, assembly.base, face)
   base_pos = np.array([0.0, 0.0, top + rest])

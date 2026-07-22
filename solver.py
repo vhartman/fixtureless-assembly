@@ -2133,16 +2133,6 @@ class LabeledDisassemblyHeuristic:
             clearance=self._clearance)
       return hit
 
-    def scatter_ok(pg):
-      # pick fact at the part's INITIAL SCATTER orientation (see _scatter_pick_fact): the
-      # rest pose reality actually gives loose parts, which the canonical faces may miss.
-      key = ("SCATTER", pg)
-      hit = self._pick_cache.get(key)
-      if hit is None:
-        hit = self._pick_cache[key] = _scatter_pick_fact(
-            assembly, pg[0], pg[1], self._ee_path, clearance=self._clearance)
-      return hit
-
     # placement faces are now looked up PER SUBASSEMBLY in the stable rest-pose table
     # (rest_faces) instead of the old global 0..5 -- so the abstraction offers exactly the
     # resting orientations the real places()/precompute_stable_faces do (e.g. a lone cylinder
@@ -2263,10 +2253,10 @@ class LabeledDisassemblyHeuristic:
       # inverse PICK-LOOSE: some (q,gq) in L was just picked off the table. The abstraction
       # does not track loose parts' resting faces (they can be reoriented via place+pick),
       # so the gate is EXISTS-a-face -- optimistic about the reorientation cost, admissible.
-      # The SCATTER orientation counts as a face (reality rests loose parts there first).
+      # (rest_faces is shape-frame + neutral-rest aware via placement_quat, so scatter-style
+      # side-lying poses are ordinary faces here -- no separate scatter fact needed.)
       for q, gq in L:
-        if (any(pick_ok((q,), f, (q, gq)) for f in rf((q,)))
-            or scatter_ok((q, gq))):
+        if any(pick_ok((q,), f, (q, gq)) for f in rf((q,))):
           yield (ideal, G, face, tsub(L, (q, gq))), 1.0
       # inverse LIFT: held solo -> was resting on some face and got picked
       if face is Hf and len(G) == 1:
@@ -2671,25 +2661,11 @@ class CollapsedLabeledHeuristic:
     # class's per-(part,grasp) gate). Lazy: most parts are decided by their first grasp.
     self._loose_pickable = {}
 
-    def scatter_ok(pg):
-      # pick fact at the part's INITIAL SCATTER orientation (see _scatter_pick_fact): the
-      # rest pose reality actually gives loose parts, which the canonical faces may miss
-      # (e.g. the chair's reclined posts). OR over the collapsed label's raw variants.
-      key = ("SCATTER", pg)
-      hit = self._pick_cache.get(key)
-      if hit is None:
-        hit = self._pick_cache[key] = any(
-            _scatter_pick_fact(assembly, pg[0], g, self._ee_path,
-                               clearance=self._clearance)
-            for g in gvariants((pg[0],), pg))
-      return hit
-
     def loose_pickable(q):
       hit = self._loose_pickable.get(q)
       if hit is None:
         hit = self._loose_pickable[q] = any(
-            pick_ok((q,), f, (q, g)) for g in self.single[q] for f in rf((q,))) or any(
-            scatter_ok((q, g)) for g in self.single[q])
+            pick_ok((q,), f, (q, g)) for g in self.single[q] for f in rf((q,)))
       return hit
 
     # ---- WRENCH facts: identical to the fine class (G stays labeled, so these are exact).
@@ -2804,11 +2780,11 @@ class CollapsedLabeledHeuristic:
       if self._labeled_loose:
         # inverse PICK-LOOSE, labeled: the loose (part, class) must be pickable AS THAT
         # CLASS (exists-a-face, OR over class variants) -- the pick/press linkage at class
-        # resolution; a swap is available via the LOOSE-HANDOVER edge below. The SCATTER
-        # orientation counts as a face (reality rests loose parts there first).
+        # resolution; a swap is available via the LOOSE-HANDOVER edge below. (rest_faces is
+        # shape-frame + neutral-rest aware via placement_quat -- scatter-style side-lying
+        # poses are ordinary faces here.)
         for q, gq in L:
-          if (any(pick_ok((q,), f, (q, gq)) for f in rf((q,)))
-              or scatter_ok((q, gq))):
+          if any(pick_ok((q,), f, (q, gq)) for f in rf((q,))):
             yield (ideal, G, face, tsub(L, (q, gq))), 1.0
       else:
         # inverse PICK-LOOSE: exists-a-face AND exists-a-grasp (the collapse)
@@ -3056,9 +3032,9 @@ def _table_aware_pick_fact(assembly, S_key, face, gpart, gid, gripper_path,
   tmpl, base_rel_tool, q_corr, top = _fact_template(gripper_path, assembly)
   C = ry.Config()
   C.addConfigurationCopy(tmpl)
-  q = _FACE_DOWN_QUATS[face]
-  R = _quat_to_R(q)
   ref = S_key[0]
+  q = _problem.placement_quat(assembly, S_key, ref, face)   # shape-frame rest (change-2-lite)
+  R = _quat_to_R(q)
   rest = _group_rest_height(assembly, set(S_key), ref, face)
   ref_off = assembly.position_in_base(ref)
   base_pos = np.array([0.0, 0.0, top + rest + clearance])
@@ -3079,38 +3055,10 @@ def _table_aware_pick_fact(assembly, S_key, face, gpart, gid, gripper_path,
   return ok
 
 
-def _scatter_pick_fact(assembly, part, gid, gripper_path, clearance=0.0):
-  # can the floating EE sit at grasp (part, gid) while the LOOSE part rests at its INITIAL
-  # SCATTER orientation (identity when none is set), without hitting the table or the part?
-  # The canonical rest-face facts CANNOT represent this pose for shape-rotated parts: the
-  # chair's reclined posts rest flat only via their scatter quat (their part frame has NO
-  # stable canonical face, rest_faces() = {}), yet the real scatter demonstrably rests and
-  # picks them there. An abstraction fact must be AT LEAST as permissive as any real
-  # context, so the labeled heuristics' pick-loose gates OR this fact in -- without it every
-  # state with such a part still on the table is backward-unreachable (h=inf) and e.g. the
-  # milestone fills prune to death in 0.0s (found via the chair).
-  aq = assembly.scatter_orientations.get(part)
-  aq = np.array([1.0, 0.0, 0.0, 0.0]) if aq is None else np.asarray(aq, dtype=float)
-  key = (id(assembly), "SCATTER", part, gid, gripper_path, round(clearance, 4))
-  hit = _TABLE_PICK_FACT_CACHE.get(key)
-  if hit is not None:
-    return hit
-  tmpl, base_rel_tool, q_corr, top = _fact_template(gripper_path, assembly)
-  C = ry.Config()
-  C.addConfigurationCopy(tmpl)
-  pos = np.array([0.0, 0.0, top + _problem._shape_half_z(assembly.part_shape(part),
-                                                         _quat_to_R(aq)) + clearance])
-  f = C.getFrame(part)
-  f.setPosition(pos)
-  f.setQuaternion(list(aq))
-  grasp_world = _pose_compose(np.concatenate([pos, aq]), grasp_pose(assembly, part, gid))
-  base_world = _ee_root_pose(grasp_world, base_rel_tool, q_corr)
-  root = C.getFrame("eeFACT_ur_base")
-  root.setPosition(base_world[:3])
-  root.setQuaternion(base_world[3:])
-  ok = all(d >= -_CHEAP_PENETRATION_TOL for _a, _b, d in C.getCollisions())
-  _TABLE_PICK_FACT_CACHE[key] = ok
-  return ok
+
+# (the interim `_scatter_pick_fact` -- pick facts at the raw scatter orientation -- was
+# removed: placement_quat + neutral rests made scatter-style poses ordinary rest-table
+# faces, so the canonical exists-a-face pick gates cover them; see chair history.)
 
 
 def _por_parts(a):
@@ -4214,24 +4162,47 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
                   weight, max_nodes, verbose, gripper_kind=None, handovers=True,
                   allow_place=True, bracing=False, grasp_cap=None, h_extra=None,
                   part_grasp_allow=None, brace_allow=None, deadline=None,
-                  lazy_fill=False, cost_bound=None, forbid_assemble=None):
+                  lazy_fill=False, cost_bound=None, forbid_assemble=None, settle_ref=None):
   # a small COMPLETE search that adds part `p` to the assembly `ideal` and leaves it SETTLED:
   # p mated, no loose part left in a gripper, and the assembly ending held by at most one
   # carrier OR resting on the table -- WHICHEVER the search finds. It forces neither a
   # set-down nor a hold; holding-through and setting-down are just options (allow_place=False
   # drops the set-down option, so the assembly naturally stays held). It may only touch `p`
   # and the assembly (parts in `ideal`). Returns (subplan, end_state), gripper_kind => wrench.
+  #
+  # `settle_ref`: which component "the assembly" above refers to -- default the BASE
+  # component; a MODULE sub-fill passes its module root, so a module built IN THE AIR (held
+  # by one carrier) counts as settled. Without this, the held module itself counted as
+  # "loose held" and the goal FORCED a table set-down -- fine for the floating-EE checks,
+  # IK-infeasible for real arms on the chair's back+posts module: every module fill died.
   relevant = set(ideal) | {p}
+  settle = settle_ref if settle_ref is not None else assembly.base
+
+  def _comps(s):
+    # (main, settle) components; identical when settle_ref is None/base (byte-identical
+    # goal for all non-module fills).
+    main = next((g for g in s.subassemblies() if assembly.base in g), frozenset())
+    mod = main if settle in main else next(
+        (g for g in s.subassemblies() if settle in g), frozenset())
+    return main, mod
+
+  def _loose_and_holders(s):
+    main, mod = _comps(s)
+    loose = sum(1 for q in s.bodies() if q not in main and q not in mod
+                for c in s.supports.get(q, ()) if c[0] == "grasp")
+    holders = sum(1 for q in mod for c in s.supports.get(q, ()) if c[0] == "grasp")
+    return loose, holders
 
   def goal_fn(s):
-    # p joined, nothing loose left in hand, and the assembly down to <=1 holder (a clean
-    # rest point for the next step -- prevents inserter grasps / braces piling up).
-    return (_part_mated(s, p) and _num_loose_held(s, assembly) == 0
-            and _assembly_holders(s, assembly) <= 1)
+    # p joined, nothing loose left in hand, and the settling component down to <=1 holder
+    # (a clean rest point for the next step -- prevents inserter grasps / braces piling up).
+    loose, holders = _loose_and_holders(s)
+    return _part_mated(s, p) and loose == 0 and holders <= 1
 
   def h_fn(s):
     left = 0 if _part_mated(s, p) else 2                  # pick + mate remaining
-    hv = left + _num_loose_held(s, assembly) + max(0, _assembly_holders(s, assembly) - 1)
+    loose, holders = _loose_and_holders(s)
+    hv = left + loose + max(0, holders - 1)
     if h_extra is not None:
       # GUIDANCE from the labeled abstraction (full-assembly cost-to-go): prices the car's
       # resting FACE and hold/brace grasps -- the decisions the counting h is blind to (it
@@ -4839,7 +4810,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
             braces.add((bp, rg))
     return (gqs or None), unbraced_ok, (braces or None)
 
-  def fill(s, q, ideal, fb=None, forbid=None):
+  def fill(s, q, ideal, fb=None, forbid=None, settle=None):
     allow, unbraced_ok, ballow = hints(_subasm_key(ideal), q)
     dense = _problem._DENSE_GRASPS
     # phases, narrowest first: (grasp_cap, bracing, mate_allow, brace_allow). A FULL phase (all
@@ -4864,7 +4835,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
                               handovers=handovers, allow_place=allow_place, bracing=br,
                               grasp_cap=cap, h_extra=h_lab.value, part_grasp_allow=ma,
                               brace_allow=ba, deadline=deadline, lazy_fill=lazy_fills,
-                              cost_bound=fb, forbid_assemble=forbid)
+                              cost_bound=fb, forbid_assemble=forbid, settle_ref=settle)
       if sub is not None:
         return sub, s2
     return None, None
@@ -4891,7 +4862,10 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
                  key=lambda m: (len(_mate_closure(assembly, m)), _part_index(m)))
     parts_plan, s_cur, built = [], s, {root}
     for m in seq:
-      sub, s_cur = fill(s_cur, m, built, fb=fb, forbid={root})   # build only; JOIN comes last
+      # settle=root: the module may end each sub-fill HELD by one carrier (built in the
+      # air); the base-centric default would count the held module as loose and force a
+      # table set-down -- IK-infeasible for real arms on e.g. the chair's back+posts module.
+      sub, s_cur = fill(s_cur, m, built, fb=fb, forbid={root}, settle=root)
       if sub is None:
         return None, None
       parts_plan.extend(sub)
