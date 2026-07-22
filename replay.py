@@ -68,7 +68,12 @@ def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=T
     recorder = ViserRecorder()
   brace = bool(cfg.get("bracing"))                           # match the search that made the plan
   if use_ik:
-    visualize_plan_ik(C, assembly, plan, robots=robots, robot_ik=RobotIK(C, robots),
+    rik = RobotIK(C, robots)
+    rik.pre_insertion_delta = float(cfg.get("pre_insertion") or 0.0)  # pre-skill split config (export/replay)
+    rik.pre_pick_delta = float(cfg.get("pre_pick") or 0.0)
+    rik.pre_place_delta = float(cfg.get("pre_place") or 0.0)
+    rik.pre_add_grasp_delta = float(cfg.get("pre_add_grasp") or 0.0)
+    visualize_plan_ik(C, assembly, plan, robots=robots, robot_ik=rik,
                       recorder=recorder, bracing=brace)
   else:
     visualize_plan(C, assembly, plan, robots=robots, recorder=recorder, bracing=brace)

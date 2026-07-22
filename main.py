@@ -535,6 +535,41 @@ def parse_args():
            "unchanged. May cost a few extra actions (forced alternation).",
   )
   parser.add_argument(
+      "--skill", type=float, nargs="?", const=0.05, default=0.0, metavar="DELTA",
+      help="Shorthand: enable ALL pre-skill splits (--pre-pick/--pre-place/--pre-add-grasp/"
+           "--pre-insertion) at DELTA metres (default 0.05) -- treat pick, place, brace, and "
+           "mate as skills. An explicit per-skill --pre-* flag overrides this for that skill. "
+           "Default off.",
+  )
+  parser.add_argument(
+      "--pre-insertion", type=float, nargs="?", const=0.05, default=0.0, metavar="DELTA",
+      help="PRE-INSERTION funnel (EXPORT/REPLAY only; the SEARCH is unchanged): split every "
+           "`assemble` into a GOTO to the funnel-mouth pose T_pre (the mate witness backed off "
+           "DELTA metres along the mate axis, default 0.05) followed by the REAL mate at the "
+           "seated witness. The motion planner then connects the free-space approach to T_pre "
+           "and only the short T_pre->seated seating motion is contact-rich -- on the mr_bench "
+           "SKILLS branch that second task becomes the insertion skill. The mate pose, wrench "
+           "gate, and plan are all untouched. Default off (0 = single un-split assemble).",
+  )
+  parser.add_argument(
+      "--pre-pick", type=float, nargs="?", const=0.05, default=0.0, metavar="DELTA",
+      help="Like --pre-insertion, for PICK (EXPORT/REPLAY only): split each pick into a GOTO to "
+           "the pre-grasp pose (gripper retracted DELTA m along its -approach axis, default "
+           "0.05) + the real grasp at the pick witness. Default off.",
+  )
+  parser.add_argument(
+      "--pre-place", type=float, nargs="?", const=0.05, default=0.0, metavar="DELTA",
+      help="Like --pre-insertion, for PLACE (EXPORT/REPLAY only): split each place into a GOTO "
+           "to the pre-place pose (object lifted DELTA m in +z off its rest pose, default 0.05) "
+           "+ the real set-down at the place witness. Default off.",
+  )
+  parser.add_argument(
+      "--pre-add-grasp", type=float, nargs="?", const=0.05, default=0.0, metavar="DELTA",
+      help="Like --pre-pick, for ADD_GRASP (the brace/handover reach; EXPORT/REPLAY only): split "
+           "each add_grasp into a GOTO to the pre-grasp (gripper retracted DELTA m along its "
+           "-approach axis, default 0.05) + the real brace reach. Default off.",
+  )
+  parser.add_argument(
       "--hoist-releases", action="store_true",
       help="POST-PASS after --solve (before witness optimization): bubble every `release` as "
            "EARLY in the plan as legal -- applicable per the real successor generator (wrench "
@@ -676,6 +711,7 @@ _SAVE_CONFIG_FIELDS = (
     "scatter_spacing", "perturb_start_pose", "seed", "wrench", "grasp_model", "insert_force",
     "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
     "bracing", "robust_mode", "dense_grasps", "random_init", "part_float", "inhand_reorient",
+    "pre_insertion", "pre_pick", "pre_place", "pre_add_grasp",
 )
 
 
@@ -845,6 +881,32 @@ def main():
       robot_ik.strip_inactive_collision = False
       print("[flag] --witness-robot-collisions ACTIVE: other robots' collision kept ON in IK "
             "(search + witness opt); idle arms are at HOME in the IK scene.")
+    if args.skill > 0.0:
+      # shorthand: fill in every pre-skill split not set explicitly, then let the per-skill
+      # blocks below apply/announce them (an explicit --pre-* keeps its own value).
+      for _f in ("pre_insertion", "pre_pick", "pre_place", "pre_add_grasp"):
+        if getattr(args, _f) <= 0.0:
+          setattr(args, _f, args.skill)
+      print(f"[flag] --skill {args.skill:g} ACTIVE: enabling all pre-skill splits (pick, place, "
+            "add_grasp, assemble) as skills.")
+    if robot_ik is not None and args.pre_insertion > 0.0:
+      robot_ik.pre_insertion_delta = args.pre_insertion
+      print(f"[flag] --pre-insertion ACTIVE: MP export splits each assemble into a goto to the "
+            f"funnel mouth ({args.pre_insertion:g}m back along the mate axis) + the real mate at "
+            "the seated witness. Search/plan/wrench unchanged.")
+    if robot_ik is not None and args.pre_pick > 0.0:
+      robot_ik.pre_pick_delta = args.pre_pick
+      print(f"[flag] --pre-pick ACTIVE: MP export splits each pick into a goto to the pre-grasp "
+            f"({args.pre_pick:g}m gripper retract) + the real grasp. Search/plan unchanged.")
+    if robot_ik is not None and args.pre_place > 0.0:
+      robot_ik.pre_place_delta = args.pre_place
+      print(f"[flag] --pre-place ACTIVE: MP export splits each place into a goto to the pre-place "
+            f"({args.pre_place:g}m lift) + the real set-down. Search/plan unchanged.")
+    if robot_ik is not None and args.pre_add_grasp > 0.0:
+      robot_ik.pre_add_grasp_delta = args.pre_add_grasp
+      print(f"[flag] --pre-add-grasp ACTIVE: MP export splits each add_grasp into a goto to the "
+            f"pre-grasp ({args.pre_add_grasp:g}m gripper retract) + the real brace reach. "
+            "Search/plan unchanged.")
     if args.view_cheap_checks:
       set_cheap_check_debug(True)
     fail_rec = None

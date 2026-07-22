@@ -137,10 +137,29 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
 
   from visualization import _active_robots
 
-  tasks, seq = [], []
+  pre_pick = getattr(robot_ik, "pre_pick_delta", 0.0) > 0.0       # --pre-pick:      split pick
+  pre_place = getattr(robot_ik, "pre_place_delta", 0.0) > 0.0     # --pre-place:     split place
+  pre_add_grasp = getattr(robot_ik, "pre_add_grasp_delta", 0.0) > 0.0  # --pre-add-grasp: split brace reach
+  pre_ins = getattr(robot_ik, "pre_insertion_delta", 0.0) > 0.0   # --pre-insertion: split assemble
+
+  def split_skill(a, i, wit, involved, name, kind, mk_skill):
+    # --pre-*: prepend a GOTO to the pre-skill FUNNEL pose (skill witness backed off along its
+    # approach axis) before the REAL skill task. Pure motion first (the collision-free approach
+    # the free-space planner connects to), then the unchanged skill at the real witness -- so the
+    # scene graph ends exactly like the un-split task; only the last DELTA is contact-rich (on the
+    # mr_bench SKILLS branch the second task becomes the skill). goal_for mutates cur: T_pre then
+    # the real witness, so downstream keyframes see the real skill config.
+    pre_wit = robot_ik.pre_skill_witness(a, states[i], states[i + 1], assembly, wit)
+    pan = f"{i:02d}_pre_{kind}_{'_'.join(str(x) for x in a[1:])}"
+    pre_goal = goal_for(involved, pre_wit if pre_wit is not None else wit)   # cur := T_pre
+    return [(pan, Task(pan, involved, pre_goal, type="goto")),
+            (name, mk_skill(goal_for(involved, wit)))]                       # cur := real witness
+
+  tasks, seq, step_names = [], [], []                             # step_names[i] = names of plan step i
   for i, a in enumerate(plan):
     kind, r = a[0], a[1]
     wit = witnesses[i]
+    emit = None                                                   # None => single task `t`; else [(name,Task)]
     name = f"{i:02d}_{kind}_{'_'.join(str(x) for x in a[1:])}"
     # ALL robots whose witness pose must be applied this keyframe: the actor PLUS the
     # holder(s) of the group the action moves (e.g. an assemble's `onto` group is held by
@@ -149,13 +168,26 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
     # `goal_for` poses each in task-robot order at its witness config, pinning the holder.
     involved = _active_robots(a, states[i], robot_ik) or [r]
     if kind == "pick":
-      t = Task(name, involved, goal_for(involved, wit), type="pick",
-               frames=[robot_ik.gripper_frame[r], _root_of(states[i], a[2], mate_parent)])
+      # --pre-pick splits into a goto to the retracted pre-grasp + the real pick (grasp+attach).
+      frames = [robot_ik.gripper_frame[r], _root_of(states[i], a[2], mate_parent)]
+      mk = lambda g: Task(name, involved, g, type="pick", frames=frames)
+      emit = split_skill(a, i, wit, involved, name, kind, mk) if pre_pick else None
+      if emit is None:
+        t = mk(goal_for(involved, wit))
     elif kind == "place":
-      t = Task(name, involved, goal_for(involved, wit), type="place",
-               frames=["table", _root_of(states[i], a[2], mate_parent)])
+      # --pre-place splits into a goto to the lifted pre-place + the real place (set-down+attach).
+      frames = ["table", _root_of(states[i], a[2], mate_parent)]
+      mk = lambda g: Task(name, involved, g, type="place", frames=frames)
+      emit = split_skill(a, i, wit, involved, name, kind, mk) if pre_place else None
+      if emit is None:
+        t = mk(goal_for(involved, wit))
     elif kind == "assemble":
-      t = Task(name, involved, goal_for(involved, wit), type="place", frames=[a[3], a[2]])
+      # --pre-insertion splits into a goto to the funnel mouth + the real mate (seats at `wit`).
+      frames = [a[3], a[2]]
+      mk = lambda g: Task(name, involved, g, type="place", frames=frames)
+      emit = split_skill(a, i, wit, involved, name, kind, mk) if pre_ins else None
+      if emit is None:
+        t = mk(goal_for(involved, wit))
     elif kind == "inhand_reorient":
       # IN-PLACE skill: the arm KEEPS its config (goal_for with wit=None keeps cur[r]); the
       # part's pose IN the gripper snaps to the NEW grasp transform. mr_bench mechanics: the
@@ -190,9 +222,13 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       t = Task(name, rel_robots, goal_for(rel_robots, None), type="place",
                frames=[_support_frame(states[i + 1], root), root])
     elif kind == "add_grasp":
-      # TODO(mp): a brace should be a RELATIVE-POSE CONSTRAINT gripper<->object, not a
-      # goto keyframe (other mr_bench branch). goto = motion to the brace pose for now.
-      t = Task(name, involved, goal_for(involved, wit), type="goto")
+      # TODO(mp): a brace should be a RELATIVE-POSE CONSTRAINT gripper<->object, not a goto
+      # keyframe (other mr_bench branch). goto = motion to the brace pose for now.
+      # --pre-add-grasp splits into a goto to the retracted pre-grasp + the real brace reach.
+      mk = lambda g: Task(name, involved, g, type="goto")
+      emit = split_skill(a, i, wit, involved, name, kind, mk) if pre_add_grasp else None
+      if emit is None:
+        t = mk(goal_for(involved, wit))
     elif kind == "handover":
       rB = r
       rA = _holder_of(states[i], a[2])
@@ -200,9 +236,14 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       t = Task(name, task_robots, goal_for(task_robots, wit), type="handover",
                frames=[robot_ik.gripper_frame[rB], _root_of(states[i], a[2], mate_parent)])
     else:
+      step_names.append([])                                   # non-exported: keep index alignment
       continue
-    tasks.append(t)
-    seq.append(name)
+    if emit is None:
+      emit = [(name, t)]
+    for nm, tk in emit:
+      tasks.append(tk)
+      seq.append(nm)
+    step_names.append([nm for nm, _ in emit])
 
   # terminal: all robots return home (a clean, always-reachable end mode)
   from multi_robot_multi_goal_planning.problems.planning_env import Task as _T
@@ -211,13 +252,13 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
             _SG(np.concatenate([np.asarray(home_state)[robot_idx[r]] for r in robots])))
   tasks.append(term)
   seq.append("terminal")
-  return tasks, seq
+  return tasks, seq, step_names
 
 
 # ---------------------------------------------------------------------------
 # problem instance
 # ---------------------------------------------------------------------------
-def _dependency_graph(plan, states, seq_names, robots, robot_ik):
+def _dependency_graph(plan, states, step_names, robots, robot_ik):
   """Build a mr_bench DependencyGraph = the PARTIAL order our linear plan is one linearization
   of. Sound-by-construction: for every action we chain it AFTER the last action that touched
   any RESOURCE it shares -- (a) each robot in the task (per-arm order), and (b) every part in
@@ -228,20 +269,27 @@ def _dependency_graph(plan, states, seq_names, robots, robot_ik):
   from multi_robot_multi_goal_planning.problems.core.dependency_graph import DependencyGraph
   from visualization import _active_robots
   g = DependencyGraph()
-  for nm in seq_names:
-    g.add_node(nm)
+  for nms in step_names:                                     # step_names[i] = task names of plan[i]
+    for nm in nms:
+      g.add_node(nm)
+  g.add_node("terminal")
   last = {}                                                  # resource -> most-recent task name
   for i, a in enumerate(plan):
-    nm = seq_names[i]
+    nms = step_names[i]
+    if not nms:
+      continue                                               # non-exported action (no task)
+    first, leaf = nms[0], nms[-1]                            # a pre-insertion assemble => 2 tasks
+    for prev, nm in zip(nms, nms[1:]):
+      g.add_dependency(nm, prev)                             # chain within the step (pre-assemble -> assemble)
     res = set(_active_robots(a, states[i], robot_ik) or [a[1]])
     named = [a[2]] + ([a[3]] if a[0] == "assemble" else [])
     for st in (states[i], states[i + 1]):
       for p in named:
         res |= set(next((grp for grp in st.subassemblies() if p in grp), {p}))
     for r in res:
-      if last.get(r) not in (None, nm):
-        g.add_dependency(nm, last[r])                        # nm depends on last writer of r
-      last[r] = nm
+      if last.get(r) not in (None, first):
+        g.add_dependency(first, last[r])                     # step's FIRST task waits on r's last writer
+      last[r] = leaf                                         # step's LAST task becomes r's new writer
   for nm in set(last.values()):                              # terminal after every leaf
     g.add_dependency("terminal", nm)
   return g
@@ -276,12 +324,12 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
       # old workarounds -- finger re-parent, ssBox baking, sys.modules stub -- are removed.)
       rai_env.__init__(self)                               # -> robot_idx, start_pos, limits
       self.manipulating_env = True
-      self.tasks, seq_names = build_tasks(
+      self.tasks, seq, step_names = build_tasks(
           assembly, plan, witnesses, states, self.robots, self.robot_idx, robot_ik, home)
       if depgraph:
-        self.graph = _dependency_graph(plan, states, seq_names, self.robots, robot_ik)
+        self.graph = _dependency_graph(plan, states, step_names, self.robots, robot_ik)
       else:
-        self.sequence = self._make_sequence_from_names(seq_names)
+        self.sequence = self._make_sequence_from_names(seq)   # flat order (incl. terminal)
       self.collision_tolerance = 0.01
       BaseModeLogic.__init__(self)
       self.prev_mode = self.start_mode

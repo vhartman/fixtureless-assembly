@@ -305,6 +305,20 @@ class RobotIK:
     self.analytic_rejects = 0                             # rejects by empty ssik solution sets
     self.seed_restart_cap = 2                             # random restarts left after seeds (see _solve_ik)
     self.braced_analytic = True                           # per-arm analytic for BRACED place/assemble
+    # PRE-INSERTION funnel (--pre-insertion), EXPORT/REPLAY ONLY: metres to back off along the
+    # mate axis for the pre-assemble GOTO waypoint. 0.0 = off. The SEARCH is untouched -- the
+    # mate is still verified/witnessed at the real seated pose (`_ik_assemble` backoff defaults
+    # to 0). The exporter splits each assemble into (pre_assemble goto -> T_pre) + (assemble ->
+    # mated witness), so MP plans the free approach to the funnel mouth and the short seating
+    # mode (which the mr_bench skills branch replaces with the real insertion skill).
+    self.pre_insertion_delta = 0.0
+    # sibling pre-skill backoffs (same export-split mechanism, own flags): pick retracts the
+    # gripper along -approach (its +z tool axis points INTO the object), place LIFTS the object
+    # +z (world) off its rest pose. 0.0 = that skill is not split.
+    self.pre_pick_delta = 0.0
+    self.pre_place_delta = 0.0
+    self.pre_add_grasp_delta = 0.0   # brace/handover reach: retract like pick (-z_EE)
+    self.pre_insertion_pull = 1.0   # qItself pull weight tying T_pre to the skill witness (<1e1)
     # DEPTH-GATED collision reject on the exact analytic branches (None = off). The full
     # solve's tolerant pose eq can rescue a GRAZING branch (measured: rescues sat at <=10mm
     # penetration) but never a deep one (unrescued failures >=14mm, median 55mm) -- so if
@@ -381,6 +395,13 @@ class RobotIK:
     full_names = C.getJointNames()
     C.selectJointsBySubtree(C.getFrame(self.robot_base[robot]))
     return full_names
+
+  def _restrict_seed(self, w, C_restricted, full_names):
+    # inverse of _expand_witness: a FULL config `w` (ordered like full_names) -> the restricted
+    # arm's joint sub-vector (ordered like C_restricted's joints), so a full-config warm start
+    # can seed a single-arm KOMO.
+    idx = {nm: i for i, nm in enumerate(full_names)}
+    return np.array([w[idx[nm]] for nm in C_restricted.getJointNames()], dtype=float)
 
   def _expand_witness(self, C_restricted, w, full_names):
     # map a single-arm solution `w` (ordered like the restricted config's joints) back to the
@@ -855,7 +876,7 @@ class RobotIK:
              f"sos={res.get('sos', float('nan')):.3f}")
     self.fail_recorder.record(C, label)
 
-  def _ik_pick(self, action, s0, s1, assembly, seed):
+  def _ik_pick(self, action, s0, s1, assembly, seed, backoff=0.0, warm=None):
     # simple IK: ONE robot (the picker) reaches a fixed grasp pose on an on-table part.
     # Every other robot -- free or holding something else -- stays at home (an obstacle).
     #
@@ -873,6 +894,12 @@ class RobotIK:
     # align the grasp's +z approach with THIS EE's real approach axis (identity for the
     # two-finger, a rotation for the vacuum) -- so the tool-center is oriented correctly.
     ee_target = np.concatenate([grasp[:3], _quat_mul(grasp[3:], self.q_correction[robot])])
+    # PRE-PICK backoff (--pre-pick, export/replay): RETRACT the tool-center along -approach.
+    # The corrected EE +z points from the standoff INTO the part, so backing off is -z_EE, in
+    # the PART frame (ee_target is EE-relative-to-part). Gives the pre-grasp funnel-mouth pose.
+    if backoff > 0.0:
+      ee_target = ee_target.copy()
+      ee_target[:3] = ee_target[:3] - backoff * (_quat_to_R(ee_target[3:]) @ np.array([0.0, 0.0, 1.0]))
 
     robot_ee_name = self.gripper_frame[robot]
     part_name = part
@@ -937,6 +964,10 @@ class RobotIK:
       return False, None                                  # clear reach failure (relaxed solve)
 
     komo = build(True)
+    if warm is not None:                                   # couple pre-pick to the pick witness
+      wseed = self._restrict_seed(warm, C, full_names) if full_names is not None \
+          else np.asarray(warm, dtype=float)
+      seeds = [wseed] + list(seeds or [])
     feasible, witness = self._solve_ik(komo, seeds=seeds)
     if self.single_arm_ik:
       witness = self._expand_witness(C, witness, full_names)  # restricted -> full joint vector
@@ -949,7 +980,7 @@ class RobotIK:
 
     return feasible, witness
 
-  def _ik_add_grasp(self, action, s0, s1, assembly, seed):
+  def _ik_add_grasp(self, action, s0, s1, assembly, seed, backoff=0.0, warm=None):
     # a SECOND robot reaches a grasp on an ALREADY-HELD subassembly (the handover / brace
     # primitive). Like a pick, but the target is held (posed by its current holder) rather
     # than resting on the table: scene_for attaches the group to its kinematic holder, that
@@ -959,6 +990,11 @@ class RobotIK:
     C = self.scene_for(s0, assembly)                      # group held at its current holder(s)
     grasp = grasp_pose(assembly, gpart, grasp_id)
     ee_target = np.concatenate([grasp[:3], _quat_mul(grasp[3:], self.q_correction[robot])])
+    # PRE-ADD-GRASP backoff (--pre-add-grasp): RETRACT the tool-center along -approach (-z_EE),
+    # exactly like pre-pick -- the pre-grasp funnel mouth for the brace/handover reach.
+    if backoff > 0.0:
+      ee_target = ee_target.copy()
+      ee_target[:3] = ee_target[:3] - backoff * (_quat_to_R(ee_target[3:]) @ np.array([0.0, 0.0, 1.0]))
     set_part_contact(C, gpart, 0)                        # the new gripper is meant to touch gpart
 
     def build(collisions):
@@ -979,7 +1015,8 @@ class RobotIK:
       return False, None                                  # clear reach failure (relaxed solve)
 
     komo = build(True)
-    feasible, witness = self._solve_ik(komo)
+    feasible, witness = self._solve_ik(          # `warm` (full config) couples pre-add-grasp to
+        komo, seeds=([np.asarray(warm, dtype=float)] if warm is not None else None))  # the grasp
     if not feasible:
       self._log_failure(action, C, komo)
 
@@ -989,7 +1026,7 @@ class RobotIK:
 
     return feasible, witness
 
-  def _ik_place(self, action, s0, s1, assembly, seed):
+  def _ik_place(self, action, s0, s1, assembly, seed, backoff=0.0, warm=None):
     # ONE robot (the placer) sets its held subassembly onto the table, resting on the
     # placement FACE the action names. The target is the pose the DISCRETE model will
     # assume afterwards (scene_for/_pose_on_table's rest pose anchored at the lowest-index
@@ -1004,6 +1041,12 @@ class RobotIK:
     anchor = s1.poses.get(ref)
     anchor = np.asarray(anchor) if anchor is not None else np.asarray(self.C.getFrame(ref).getPose())
     target = _group_rest_pose(assembly, group, ref, anchor, face)
+    # PRE-PLACE backoff (--pre-place, export/replay): LIFT the group +z (world) off its rest
+    # pose -> the object hovers above its landing spot (the pre-place funnel mouth), and the
+    # place skill lowers the last DELTA.
+    if backoff > 0.0:
+      target = target.copy()
+      target[2] = target[2] + backoff
 
     # SINGLE ACTIVE ARM: like pick, a place moves only the placer -- BUT only when the placer
     # is the group's SOLE holder. If another robot BRACES the group, that arm must co-move as
@@ -1090,6 +1133,10 @@ class RobotIK:
         return False, None                                # clear reach failure (relaxed solve)
 
     komo = build(True)
+    if warm is not None:                                   # couple pre-place to the place witness
+      wseed = self._restrict_seed(warm, C, full_names) if full_names is not None \
+          else np.asarray(warm, dtype=float)
+      seeds = [wseed] + list(seeds or [])
     feasible, witness = self._solve_ik(komo, seeds=seeds)
     if single:
       witness = self._expand_witness(C, witness, full_names)  # restricted -> full joint vector
@@ -1134,7 +1181,7 @@ class RobotIK:
       komo.addObjective([1, 1], ry.FS.vectorX, [onto], ry.OT.sos, [_ASSEMBLE_ORIENT_BIAS_W], list(x_dir))
     return komo
 
-  def _ik_assemble(self, action, s0, s1, assembly, seed, bias_axes=None):
+  def _ik_assemble(self, action, s0, s1, assembly, seed, bias_axes=None, backoff=0.0, warm=None):
     # solve for the added part's mate pose: the SEAM (`part`) must reach its mate pose
     # relative to the target subassembly. `part` may be a single cube OR the seam of a whole
     # held MODULE (a plate) -- in the latter case the module is rigid in the scene, so the
@@ -1155,6 +1202,15 @@ class RobotIK:
     # relative orientation is identity). relative_pose returns (parent, position_3vec).
     rel_pos = np.asarray(assembly.relative_pose(part)[1], dtype=float)
     rel_quat = np.array([1.0, 0.0, 0.0, 0.0])
+    # PRE-INSERTION backoff (export/replay only; `backoff`=0 in the search -> the SEARCH always
+    # witnesses the REAL mated pose). When >0, solve the T_pre = T_mate shifted by -backoff*
+    # mate_axis funnel-mouth keyframe (the seat direction is +mate_axis, so backing off is
+    # -mate_axis). Parts stay axis-aligned (rel_quat=identity), so the base-frame mate_axis is
+    # also the offset direction in `onto`'s frame -> a pure translation of rel_pos.
+    if backoff > 0.0:
+      d = assembly.mate_axis(part)
+      if d is not None:
+        rel_pos = rel_pos - backoff * np.asarray(d, dtype=float)
 
     # the mate seats the moving group flush against the target, so those contacts are intended
     # -- exclude the WHOLE moving group from collision (a single cube, or every cube of a
@@ -1228,14 +1284,17 @@ class RobotIK:
       komo = self._assemble_komo(C, part_name, onto, rel_pos, rel_quat, bias)
       self._add_pull(komo, C, robot)                    # witness-opt pull (no-op in search)
       self._add_grasp_maintenance(komo, s0, assembly)     # braces pinned at their grasps
-      feasible, witness = self._solve_ik(komo, restarts=0)  # one biased solve per orientation
+      feasible, witness = self._solve_ik(              # `warm` (e.g. the mated witness for a
+          komo, restarts=0,                            # pre-insertion goto) warm-starts the solve
+          seeds=([warm] if warm is not None else None))  # so it settles in the SAME IK basin
       if feasible:
         break
     if not feasible:                                      # fallback: unbiased random restarts
       komo = self._assemble_komo(C, part_name, onto, rel_pos, rel_quat, None)
       self._add_pull(komo, C, robot)                    # witness-opt pull (no-op in search)
       self._add_grasp_maintenance(komo, s0, assembly)
-      feasible, witness = self._solve_ik(komo, restarts=6)
+      feasible, witness = self._solve_ik(
+          komo, restarts=6, seeds=([warm] if warm is not None else None))
     if not feasible:
       self._log_failure(action, C, komo)
 
@@ -1244,6 +1303,44 @@ class RobotIK:
         komo.view(True, f"assemble IK: {robot} mates {part} -> {onto}")
 
     return feasible, witness
+
+  def pre_skill_witness(self, action, s0, s1, assembly, skill_witness=None):
+    """EXPORT/REPLAY helper for --pre-pick/--pre-place/--pre-insertion: the PRE-skill GOTO
+    keyframe -- the skill witness backed off along its approach axis (pick: -z_EE retract;
+    place: +z lift; assemble: -mate_axis). Returns the full-config witness, or None (skill not
+    split / IK failed -- caller falls back to the skill witness). Solved on demand; NOT used by
+    the search (whose witness is always the real skill pose).
+
+    COUPLED to the skill witness: the pre-skill solve is WARM-STARTED from `skill_witness` and
+    given a full-config qItself pull toward it, so the goto config differs from the skill ONLY
+    by the actor's delta backoff. Without this, the two independent solves can land in different
+    IK basins (a whole wrist revolution measured for assemble) -> a long, possibly-colliding
+    'skill' motion between the two keyframes."""
+    kind = action[0]
+    delta = {"pick": self.pre_pick_delta, "place": self.pre_place_delta,
+             "add_grasp": self.pre_add_grasp_delta,
+             "assemble": self.pre_insertion_delta}.get(kind, 0.0)
+    if delta <= 0.0:
+      return None
+    warm = None
+    if skill_witness is not None:
+      warm = np.asarray(skill_witness, dtype=float)
+      names = self.C.getJointNames()
+      self._opt_pull = {"mode": "joint", "robot": action[1],
+                        "qmap": {n: float(warm[i]) for i, n in enumerate(names)},
+                        "weight": self.pre_insertion_pull, "rot_weight": 1.0}
+    try:
+      if kind == "pick":
+        ok, w = self._ik_pick(action, s0, s1, assembly, None, backoff=delta, warm=warm)
+      elif kind == "place":
+        ok, w = self._ik_place(action, s0, s1, assembly, None, backoff=delta, warm=warm)
+      elif kind == "add_grasp":
+        ok, w = self._ik_add_grasp(action, s0, s1, assembly, None, backoff=delta, warm=warm)
+      else:
+        ok, w = self._ik_assemble(action, s0, s1, assembly, None, backoff=delta, warm=warm)
+    finally:
+      self._opt_pull = None
+    return w if ok else None
 
 
 # actions that move a part into a possibly-colliding pose (so they need the CHEAP geometry
