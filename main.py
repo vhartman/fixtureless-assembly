@@ -80,7 +80,7 @@ def parse_args():
   parser.add_argument(
       "--assembly",
       choices=["cross", "cube", "arch", "arch-seq", "cube-plates", "cube-plates-2x2x3",
-               "cuboid-tower", "car", "car-mini", "slot-pin"],
+               "cuboid-tower", "car", "car-mini", "slot-pin", "chair"],
       default="cross",
       help="Assembly to build: cross (cube cross, 7), cube (2x2x2 grid, 8), "
            "arch (two pillars + lintel, 7 -- known-flawed star model), "
@@ -526,6 +526,14 @@ def parse_args():
            "bounded/exact optimality proofs remain valid.",
   )
   parser.add_argument(
+      "--allow-curved-grasps", action="store_true",
+      help="Let a VACUUM keep CURVED-surface grasps (normally dropped -- a suction cup cannot "
+           "seal on a cylinder/sphere side, so only the flat end-caps survive). Idealised knob "
+           "to test whether curved-side grasps make thin cylinder parts (e.g. the chair legs) "
+           "graspable by the vacuum. No effect on the two-finger (it keeps curved grasps "
+           "already). Must be set before the grasp table is built (it is). Default off.",
+  )
+  parser.add_argument(
       "--staged-mates", action="store_true",
       help="Enable STAGED/PARTIAL mates (A11): a mate listed in the assembly's staged_mates "
            "({part: fastener}) is only a SLOT (lateral walls + seat, no couples, no extraction "
@@ -726,6 +734,7 @@ _SAVE_CONFIG_FIELDS = (
     "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
     "bracing", "robust_mode", "dense_grasps", "random_init", "part_float", "inhand_reorient",
     "pre_insertion", "pre_pick", "pre_place", "pre_add_grasp", "staged_mates",
+    "allow_curved_grasps",
 )
 
 
@@ -760,6 +769,11 @@ def main():
     set_lru_robots(True)
     print("[flag] --lru-robots ACTIVE: successor robots ordered least-recently-used first "
           "(deterministic tie-break; spreads actions across arms).")
+  if args.allow_curved_grasps:
+    from problem import set_allow_curved_grasps
+    set_allow_curved_grasps(True)
+    print("[flag] --allow-curved-grasps ACTIVE: vacuum keeps curved-surface grasps (idealised "
+          "suction on cylinders/spheres).")
   if args.staged_mates:
     from problem import set_staged_mates
     set_staged_mates(True)

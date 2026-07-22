@@ -128,6 +128,10 @@ def display_final_assembly(C, assembly, base_pose):
     )
 
     C_final.getFrame(obj).setRelativePosition(parent[1])
+    # ASSEMBLED part frames are axis-aligned (the shape's own rotation lives on the __shape
+    # child); reset the relative orientation so a SCATTER orientation set for the table layout
+    # (e.g. legs laid flat) does not leak into the assembled view.
+    C_final.getFrame(obj).setRelativeQuaternion([1.0, 0.0, 0.0, 0.0])
 
     # keep the object's color, just lower its opacity (shape may live on a __shape child)
     sf = C_final.getFrame(part_shape_frame(C_final, obj))
@@ -136,6 +140,7 @@ def display_final_assembly(C, assembly, base_pose):
     sf.setColor([rgb[0], rgb[1], rgb[2], 0.3])
 
   C_final.getFrame(assembly.base).setPosition(base_pose)
+  C_final.getFrame(assembly.base).setQuaternion([1.0, 0.0, 0.0, 0.0])
 
   C_final.view(True)
 
@@ -155,6 +160,7 @@ def show_subassemblies(C, assembly, subassemblies, base_pose):
         )
 
         C_final.getFrame(obj).setRelativePosition(parent[1])
+        C_final.getFrame(obj).setRelativeQuaternion([1.0, 0.0, 0.0, 0.0])  # see display_final_assembly
 
       # keep the object's color, just lower its opacity (shape may live on a __shape child)
       sf = C_final.getFrame(part_shape_frame(C_final, obj))

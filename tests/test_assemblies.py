@@ -487,3 +487,78 @@ def test_staged_mates():
     assert plan_lab is not None and len(plan_lab) == len(plan)
   finally:
     A.set_staged_mates(False)
+
+
+def test_staged_press_noise():
+  """Per-part PRESS check on staged parts (+--insertion-noise corners): pressing the pin
+  onto the mated-but-unfastened bar. UPRIGHT geometry: the nominal press is vertical at
+  zero lever -> the slot walls take it even UNHELD; a noisy press adds shear -> a couple at
+  the interface lever -> the point slot fails -> the bar must be HELD while its fastener is
+  pressed, even though it rests stably. A grasped bar passes both. (The 1-robot slot-up
+  route dies under wrench for the same reason: there the press is lateral, so even the
+  NOMINAL press torques the unheld bar -- checked via the end-to-end matrix, not here.)"""
+  A.set_seed(0)
+  A.set_rolls_per_face(1)
+  W.PARAMS["grasp_model"] = "isotropic"
+  W.PARAMS["insert_force"]["_default"] = 10.0
+  asm = A.make_assembly("slot-pin", 3)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  gk = A.gripper_kind(C)
+  _, gt = A._search_context(C, asm, robots)
+  s0 = A.get_initial_state(C, asm)
+
+  def apply(s, match):
+    return next(ns for a, ns in A.successors(s, asm, robots, gt) if match(a))
+
+  held = apply(apply(s0, lambda a: a[0] == "pick" and a[2] == "obj_1"),
+               lambda a: a[0] == "assemble" and a[2] == "obj_1")   # bar mated, grasp kept
+  unheld = apply(held, lambda a: a[0] == "release" and a[2] == "obj_1")  # flag off: legal
+
+  A.set_staged_mates(True)
+  try:
+    nom = A._insertion_load_variants(held, asm, "obj_2", "obj_1")
+    assert len(nom) == 1, "noise off must yield the single nominal load"
+    assert A._staged_press_stable(held, asm, "obj_1", gk, nom), "grasped bar must take the press"
+    # UNHELD upright fails even nominally: the point slot's wall reaction acts at the SEAT
+    # (offset from the centroid), so a single contact only carries forces along the
+    # centroid<->seat line -- a vertical press through a SIDE slot is unbalanceable. (This is
+    # the same fact as _slot_holds_alone(upright)=False; the release gate already forbids
+    # reaching this state, the press gate is consistent with it.)
+    assert not A._staged_press_stable(unheld, asm, "obj_1", gk, nom)
+    W.PARAMS["insertion_uncertainty"] = {"lateral": 0.3}
+    noisy = A._insertion_load_variants(held, asm, "obj_2", "obj_1")
+    assert len(noisy) > 1, "noise on must yield box corners"
+    assert A._staged_press_stable(held, asm, "obj_1", gk, noisy), \
+        "a grasp on the bar must absorb the noisy press"
+  finally:
+    W.PARAMS["insertion_uncertainty"] = None
+    A.set_staged_mates(False)
+
+  # the NOISE-FLIP itself, isolated at the wrench level (the slot-pin geometry has no state
+  # where nominal passes unheld -- the pin presses PERPENDICULAR to the bar's slot): a press
+  # ALONG the slot axis of a slot-opening-UP part. Nominal = pure compression into the seat,
+  # zero torque -> feasible with NO grasp; the noise corners add lateral shear at the
+  # centroid<->seat lever -> a couple the point slot cannot resist -> infeasible.
+  import numpy as np
+  h, m, F = 0.025, 0.1, 10.0
+  seat, axis = np.array([0.0, 0.0, -h]), np.array([0.0, 0.0, -1.0])   # slot opening UP
+  G, ub = W.cap_slot(seat, axis)
+  bounds = [(0.0, None) for _ in ub]
+  grav = W.gravity_wrench([(m, np.zeros(3))])
+
+  def press_ok(variants):
+    return all(W.equilibrium_feasible_matrices(
+        G, ub, grav + W.point_force_wrench(f, p), bounds=bounds) for f, p in variants)
+
+  f_nom, pt = np.array([0.0, 0.0, -F]), np.array([0.0, 0.0, h])       # pressed down, from above
+  assert press_ok(A._insertion_uncertainty_variants(f_nom, pt, F)), \
+      "axis-aligned nominal press must be pure compression (noise off)"
+  W.PARAMS["insertion_uncertainty"] = {"lateral": 0.3}
+  try:
+    corners = A._insertion_uncertainty_variants(f_nom, pt, F)
+    assert len(corners) > 1
+    assert not press_ok(corners), "noisy shear couple must defeat the unheld point slot"
+  finally:
+    W.PARAMS["insertion_uncertainty"] = None

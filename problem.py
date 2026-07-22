@@ -608,6 +608,70 @@ class SlotPinAssembly(Assembly):
     self.masses = {"obj_0": 0.3}                           # heavy base: group stays on its feet
 
 
+class ChairAssembly(Assembly):
+  """A CHAIR with sensible non-cube shapes, GEOMETRY IMPORTED FROM chair.g (a rai scene the
+  user modelled): a flat SEAT plate, four CYLINDER LEGS below its corners, a reclined BACKREST
+  plate, and two reclined POSTS joining the backrest to the seat. Each part's world ORIENTATION
+  from chair.g rides in its shape quaternion (the part frame stays axis-aligned, mates stay
+  translation-only -- the same `__shape`-child trick the car's wheels use); positions are the
+  chair.g world poses re-anchored to the seat at the origin. Verified collision-free assembled.
+
+  DAG (user-specified): the 4 legs mate onto the seat; the 2 posts mate onto the backrest; and
+  the backrest sub-assembly (back + 2 posts) then joins the seat. Part counts: 5 = a STOOL
+  (seat + 4 legs), 8 = the full chair (+ backrest + 2 posts)."""
+
+  def __init__(self, n_parts=8, cube_radius=0.005, scale=0.25):
+    self.n_parts = 5 if n_parts < 8 else 8
+    # chair.g is modelled at a realistic ~0.4 m; the planner's table/reach/scatter are built
+    # for ~0.05 m parts, so scale the whole chair down (shape preserved) to fit -- else parts
+    # overlap in the scatter line and are out of reach. Orientations are scale-invariant.
+    self.scale = scale
+    self.cube_size = 0.38 * scale                            # ~ the seat width, for scatter pitch
+    self.cube_radius = cube_radius
+    super().__init__()
+
+  def define(self):
+    s = self.scale
+    r = self.cube_radius * s
+    self.objects = [f"obj_{i}" for i in range(self.n_parts)]
+    self.base = "obj_0"                                     # the seat
+    # shape orientations = chair.g world quats (wxyz); part frames stay axis-aligned. Cylinders
+    # get a lie-flat SCATTER orientation (axis -> world x) so BOTH end grasps are reachable on
+    # the table -- without it a leg stands upright, only its top cap is graspable, and that grasp
+    # jams the gripper against the seat at the mate (see the leg-mate diagnosis).
+    q_seat = [0.707, 0.707, 0.008, 0.0]
+    q_leg  = [0.0, 1.0, 0.006, -0.006]
+    q_back = [0.703, 0.073, 0.075, 0.703]
+    q_post = [0.011, 0.99, -0.093, -0.103]
+    leg_scatter  = np.array([0.7029, 0.0, -0.7113, 0.0])
+    post_scatter = np.array([0.63, 0.0, -0.7766, 0.0])
+    self.part_shapes["obj_0"] = ("box", [0.38 * s, 0.05 * s, 0.35 * s, r], q_seat)
+    self.masses["obj_0"] = 0.4
+    # 4 legs, seat-relative offsets (chair.g world pos - seat world pos [0,0,1]); pressed UP.
+    leg_off = {"obj_1": [0.150, -0.148, -0.182], "obj_2": [-0.150, -0.152, -0.178],
+               "obj_3": [-0.154, 0.148, -0.178], "obj_4": [0.146, 0.152, -0.182]}
+    for p, off in leg_off.items():
+      self.part_shapes[p] = ("cylinder", [0.30 * s, 0.025 * s], q_leg)
+      self.scatter_orientations[p] = leg_scatter
+      self.assembly_relative_poses[p] = ["obj_0", np.array(off) * s]
+      self.mate_axes[p] = np.array([0.0, 0.0, 1.0])         # leg pressed up onto the seat bottom
+    self.assembly_dependencies = {p: ["obj_0"] for p in leg_off}
+    if self.n_parts >= 8:
+      # backrest joins the seat (the sub-assembly join); posts mate onto the backrest.
+      self.part_shapes["obj_5"] = ("box", [0.23 * s, 0.05 * s, 0.20 * s, r], q_back)
+      self.scatter_orientations["obj_5"] = np.array([0.7772, 0.0, 0.6292, 0.0])  # backrest lies flat
+      self.assembly_relative_poses["obj_5"] = ["obj_0", np.array([0.19, 0.0, 0.25]) * s]
+      self.mate_axes["obj_5"] = np.array([0.0, 0.0, -1.0])  # sub-assembly lowered onto the seat
+      self.assembly_dependencies["obj_5"] = ["obj_0"]
+      post_off = {"obj_6": [-0.009, 0.152, -0.052], "obj_7": [-0.006, -0.148, -0.052]}
+      for p, off in post_off.items():
+        self.part_shapes[p] = ("cylinder", [0.33 * s, 0.025 * s], q_post)
+        self.scatter_orientations[p] = post_scatter
+        self.assembly_relative_poses[p] = ["obj_5", np.array(off) * s]   # post -> backrest
+        self.mate_axes[p] = np.array([0.0, 0.0, -1.0])
+        self.assembly_dependencies[p] = ["obj_5"]
+
+
 def make_assembly(kind, n_parts):
   """Assembly factory for the CLI: cross (cube cross), cube (2x2x2 grid), arch (bridge --
   known-flawed star, see class doc), arch-seq (arch shape built as a sequential chain),
@@ -625,7 +689,8 @@ def make_assembly(kind, n_parts):
            # fingers can take a wheel ACROSS THE DIAMETER (radial side grasp) -- the
            # grasp-DB's curved-surface entries, which the two-finger keeps (vacuum drops).
            "car-mini": (lambda n_parts: CarAssembly(n_parts=n_parts, width=0.03), 5),
-           "slot-pin": (SlotPinAssembly, 3)}
+           "slot-pin": (SlotPinAssembly, 3),
+           "chair": (ChairAssembly, 8)}
   cls, max_n = kinds[kind]
   return cls(n_parts=min(n_parts, max_n))
 
@@ -1214,8 +1279,10 @@ def compute_cube_grasps(assembly, subassembly, offset=0.01,
   # a VACUUM cannot seal on curved surfaces -> restrict it to flat-surface grasps (grasp
   # ids stay positions in the FULL per-shape DB, so id-based lookups are unaffected -- the
   # table simply never contains curved candidates for the vacuum). The two-finger grasps
-  # curved surfaces fine and keeps everything.
-  vacuum = "vacuum" in os.path.basename(gripper_path)
+  # curved surfaces fine and keeps everything. --allow-curved-grasps overrides the drop (an
+  # idealised suction on cylinders/spheres, e.g. to test whether curved-side grasps unblock
+  # thin cylinder legs a real cup could not seal on).
+  vacuum = "vacuum" in os.path.basename(gripper_path) and not _ALLOW_CURVED_GRASPS
 
   labeled = []
   for obj in subassembly:
@@ -1710,6 +1777,18 @@ def assembles(state, assembly, robots, gripper_kind=None):
       if wrench.PARAMS.get("check_inserter", True) and not _inserter_stable(
           state, assembly, group, gripper_kind, p, onto, d):
         continue
+      if (_STAGED_MATES and onto in assembly.staged_mates
+          and assembly.staged_mates[onto] not in target):
+        # (c) [--staged-mates] the press lands ON a staged, still-unfastened part: the GROUP
+        # check above treats it as welded, but its OWN contacts (slot + grasps on it) must
+        # take the press -- at every insertion-noise corner. Nominal press along the slot
+        # axis is pure compression (passes unheld); a NOISY press adds shear + couple the
+        # point slot cannot resist -> the part must be HELD while its fastener is hammered
+        # in, even if it rests stably. (p == the fastener still counts: it fastens only
+        # AFTER seating; the press happens before the weld.)
+        if not _staged_press_stable(state, assembly, onto, gripper_kind,
+                                    _insertion_load_variants(state, assembly, p, onto, d)):
+          continue
     if _group_is_on_table(state, target) and not _on_table_mateable_cached(
         assembly, p, _placement_face(state, target)):
       # the mate would jam the seam into the table at the target's CURRENT rest pose/face
@@ -1914,6 +1993,18 @@ def set_staged_mates(on=True):
   _STAGED_MATES = bool(on)
 
 
+# ALLOW CURVED GRASPS (--allow-curved-grasps): let a VACUUM keep curved-surface grasps
+# (normally dropped, since a suction cup cannot seal on a cylinder/sphere side). An idealised
+# test knob -- e.g. to check whether curved-side grasps make thin cylinder legs graspable.
+# Read in compute_cube_grasps; must be set BEFORE the grasp table is built.
+_ALLOW_CURVED_GRASPS = False
+
+
+def set_allow_curved_grasps(on=True):
+  global _ALLOW_CURVED_GRASPS
+  _ALLOW_CURVED_GRASPS = bool(on)
+
+
 def _slot_holds_alone(assembly, part, face):
   # LP fact, memoized per (part, face): can the SLOT capability alone balance `part`'s gravity
   # when the assembly rests on placement face `face` (identity face = held/upright)? Gravity
@@ -1942,6 +2033,48 @@ def _slot_holds_alone(assembly, part, face):
       bounds = [(0.0, None) for _ in ub]
       cache[key] = wrench.equilibrium_feasible_matrices(G, ub, w, bounds=bounds)
   return cache[key]
+
+
+def _staged_press_stable(state, assembly, q, gripper_kind, load_variants):
+  # per-part ROBUST press check for a staged, unfastened part q that a mate is being pressed
+  # onto (v1 scope: q == the mate target `onto`). The group-level _insertion_stable treats q
+  # as welded into the target; here q's OWN contacts -- its slot, any grasps on q, the table
+  # if q touches it -- must balance q's gravity plus EVERY realization of the press reaction
+  # (the insertion-noise corners; a singleton nominal load when the flag is off). All wrenches
+  # about q's centroid (gravity torque-free there), verdicts memoized in _WRENCH_CACHE.
+  d = assembly.mate_axis(q)
+  if d is None:
+    return True                                            # base/free part: no slot to check
+  poses = _state_part_poses(state, assembly, lift=0.0)
+  pos = np.asarray(poses[q][:3], dtype=float)
+  Rq = _quat_to_R(np.asarray(poses[q][3:], dtype=float))
+  d = np.asarray(d, dtype=float)
+  seat = Rq @ (d * _shape_half_extent_along(assembly.part_shape(q), d))
+  caps = [wrench.cap_slot(seat, Rq @ d)]
+  derate = wrench.PARAMS.get("curved_grasp_torque_scale") is not None
+  for c in sorted(state.supports.get(q, ())):
+    if c[0] == "grasp":
+      gp, n, t1, t2 = _grasp_frame(assembly, c[2], poses[c[2]], c[3])
+      surf = _grasp_surface(assembly.part_shape(c[2]), c[3]) if derate else "flat"
+      caps.append(wrench.grasp_capability(gp - pos, n, t1, t2, gripper_kind, surface=surf))
+  if ("table",) in state.supports.get(q, ()):
+    fp = _table_footprint(assembly, poses, [q])
+    caps.append(wrench.table_capability([np.asarray(x, dtype=float) - pos for x in fp]))
+  G = np.hstack([c[0] for c in caps])
+  ub = np.concatenate([c[1] for c in caps])
+  bounds = [(0.0, None if not np.isfinite(u) else float(u)) for u in ub]
+  gbytes = (np.round(G, 4).tobytes(), np.round(ub, 4).tobytes())
+  w_grav = wrench.gravity_wrench([(assembly.mass(q), np.zeros(3))])
+  for f, pt in load_variants:
+    w = w_grav + wrench.point_force_wrench(f, np.asarray(pt, dtype=float) - pos)
+    key = (gbytes[0], gbytes[1], np.round(w, 4).tobytes())
+    hit = _WRENCH_CACHE.get(key)
+    if hit is None:
+      hit = _WRENCH_CACHE[key] = wrench.equilibrium_feasible_matrices(
+          G, ub, w, bounds=bounds, geo_key=gbytes)
+    if not hit:
+      return False
+  return True
 
 
 def _staged_ok(state, assembly):

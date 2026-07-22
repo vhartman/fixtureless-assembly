@@ -2133,6 +2133,16 @@ class LabeledDisassemblyHeuristic:
             clearance=self._clearance)
       return hit
 
+    def scatter_ok(pg):
+      # pick fact at the part's INITIAL SCATTER orientation (see _scatter_pick_fact): the
+      # rest pose reality actually gives loose parts, which the canonical faces may miss.
+      key = ("SCATTER", pg)
+      hit = self._pick_cache.get(key)
+      if hit is None:
+        hit = self._pick_cache[key] = _scatter_pick_fact(
+            assembly, pg[0], pg[1], self._ee_path, clearance=self._clearance)
+      return hit
+
     # placement faces are now looked up PER SUBASSEMBLY in the stable rest-pose table
     # (rest_faces) instead of the old global 0..5 -- so the abstraction offers exactly the
     # resting orientations the real places()/precompute_stable_faces do (e.g. a lone cylinder
@@ -2253,8 +2263,10 @@ class LabeledDisassemblyHeuristic:
       # inverse PICK-LOOSE: some (q,gq) in L was just picked off the table. The abstraction
       # does not track loose parts' resting faces (they can be reoriented via place+pick),
       # so the gate is EXISTS-a-face -- optimistic about the reorientation cost, admissible.
+      # The SCATTER orientation counts as a face (reality rests loose parts there first).
       for q, gq in L:
-        if any(pick_ok((q,), f, (q, gq)) for f in rf((q,))):
+        if (any(pick_ok((q,), f, (q, gq)) for f in rf((q,)))
+            or scatter_ok((q, gq))):
           yield (ideal, G, face, tsub(L, (q, gq))), 1.0
       # inverse LIFT: held solo -> was resting on some face and got picked
       if face is Hf and len(G) == 1:
@@ -2659,11 +2671,25 @@ class CollapsedLabeledHeuristic:
     # class's per-(part,grasp) gate). Lazy: most parts are decided by their first grasp.
     self._loose_pickable = {}
 
+    def scatter_ok(pg):
+      # pick fact at the part's INITIAL SCATTER orientation (see _scatter_pick_fact): the
+      # rest pose reality actually gives loose parts, which the canonical faces may miss
+      # (e.g. the chair's reclined posts). OR over the collapsed label's raw variants.
+      key = ("SCATTER", pg)
+      hit = self._pick_cache.get(key)
+      if hit is None:
+        hit = self._pick_cache[key] = any(
+            _scatter_pick_fact(assembly, pg[0], g, self._ee_path,
+                               clearance=self._clearance)
+            for g in gvariants((pg[0],), pg))
+      return hit
+
     def loose_pickable(q):
       hit = self._loose_pickable.get(q)
       if hit is None:
         hit = self._loose_pickable[q] = any(
-            pick_ok((q,), f, (q, g)) for g in self.single[q] for f in rf((q,)))
+            pick_ok((q,), f, (q, g)) for g in self.single[q] for f in rf((q,))) or any(
+            scatter_ok((q, g)) for g in self.single[q])
       return hit
 
     # ---- WRENCH facts: identical to the fine class (G stays labeled, so these are exact).
@@ -2778,9 +2804,11 @@ class CollapsedLabeledHeuristic:
       if self._labeled_loose:
         # inverse PICK-LOOSE, labeled: the loose (part, class) must be pickable AS THAT
         # CLASS (exists-a-face, OR over class variants) -- the pick/press linkage at class
-        # resolution; a swap is available via the LOOSE-HANDOVER edge below.
+        # resolution; a swap is available via the LOOSE-HANDOVER edge below. The SCATTER
+        # orientation counts as a face (reality rests loose parts there first).
         for q, gq in L:
-          if any(pick_ok((q,), f, (q, gq)) for f in rf((q,))):
+          if (any(pick_ok((q,), f, (q, gq)) for f in rf((q,)))
+              or scatter_ok((q, gq))):
             yield (ideal, G, face, tsub(L, (q, gq))), 1.0
       else:
         # inverse PICK-LOOSE: exists-a-face AND exists-a-grasp (the collapse)
@@ -3042,6 +3070,40 @@ def _table_aware_pick_fact(assembly, S_key, face, gpart, gid, gripper_path,
     f.setQuaternion(q)
     poses[p] = np.concatenate([pos, q])
   grasp_world = _pose_compose(poses[gpart], grasp_pose(assembly, gpart, gid))
+  base_world = _ee_root_pose(grasp_world, base_rel_tool, q_corr)
+  root = C.getFrame("eeFACT_ur_base")
+  root.setPosition(base_world[:3])
+  root.setQuaternion(base_world[3:])
+  ok = all(d >= -_CHEAP_PENETRATION_TOL for _a, _b, d in C.getCollisions())
+  _TABLE_PICK_FACT_CACHE[key] = ok
+  return ok
+
+
+def _scatter_pick_fact(assembly, part, gid, gripper_path, clearance=0.0):
+  # can the floating EE sit at grasp (part, gid) while the LOOSE part rests at its INITIAL
+  # SCATTER orientation (identity when none is set), without hitting the table or the part?
+  # The canonical rest-face facts CANNOT represent this pose for shape-rotated parts: the
+  # chair's reclined posts rest flat only via their scatter quat (their part frame has NO
+  # stable canonical face, rest_faces() = {}), yet the real scatter demonstrably rests and
+  # picks them there. An abstraction fact must be AT LEAST as permissive as any real
+  # context, so the labeled heuristics' pick-loose gates OR this fact in -- without it every
+  # state with such a part still on the table is backward-unreachable (h=inf) and e.g. the
+  # milestone fills prune to death in 0.0s (found via the chair).
+  aq = assembly.scatter_orientations.get(part)
+  aq = np.array([1.0, 0.0, 0.0, 0.0]) if aq is None else np.asarray(aq, dtype=float)
+  key = (id(assembly), "SCATTER", part, gid, gripper_path, round(clearance, 4))
+  hit = _TABLE_PICK_FACT_CACHE.get(key)
+  if hit is not None:
+    return hit
+  tmpl, base_rel_tool, q_corr, top = _fact_template(gripper_path, assembly)
+  C = ry.Config()
+  C.addConfigurationCopy(tmpl)
+  pos = np.array([0.0, 0.0, top + _problem._shape_half_z(assembly.part_shape(part),
+                                                         _quat_to_R(aq)) + clearance])
+  f = C.getFrame(part)
+  f.setPosition(pos)
+  f.setQuaternion(list(aq))
+  grasp_world = _pose_compose(np.concatenate([pos, aq]), grasp_pose(assembly, part, gid))
   base_world = _ee_root_pose(grasp_world, base_rel_tool, q_corr)
   root = C.getFrame("eeFACT_ur_base")
   root.setPosition(base_world[:3])

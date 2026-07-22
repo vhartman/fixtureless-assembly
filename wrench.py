@@ -147,22 +147,30 @@ def cap_rigid_weld(point):
   return np.array(G).T, np.full(len(G), np.inf)
 
 
-def cap_slot(point, press_axis):
-  # PARTIAL (staged) mate -- a SLOT/pocket, v1 point-contact model: the walls constrain the
-  # part LATERALLY (bilateral, both walls), the seat bottom pushes BACK against the press
-  # (unilateral along -press_axis: it resists seating deeper, never holds against extraction),
-  # and -- being a point contact -- NO couples: a cantilevered part tips out under its own
+def cap_slot(point, press_axis, depth=0.0, F_wall=np.inf):
+  # PARTIAL (staged) mate -- a SLOT/pocket. Default (depth=0) is the v1 POINT-CONTACT model:
+  # the walls constrain the part LATERALLY (bilateral, both walls), the seat bottom pushes
+  # BACK against the press (unilateral along -press_axis: it resists seating deeper, never
+  # holds against extraction), and NO couples -- a cantilevered part tips out under its own
   # gravity moment. This is what makes "pushed-through-but-unpinned" (A11) expressible; the
   # fastener upgrades the mate to cap_rigid_weld (the group becomes one rigid body again).
-  # Extension: a DEEP slot = several points along the insertion depth (patch -> couples).
+  # DEEP-SLOT extension (dormant, not wired to any flag yet): depth>0 duplicates the wall
+  # forces at the slot MOUTH (point - depth*axis), giving couple capability ~ depth*F_wall
+  # about the lateral axes -- pass a FINITE F_wall with it, else any depth>0 resists every
+  # moment (rigid unbounded walls) and the staging phenomenon disappears.
   d = np.asarray(press_axis, float)
   d = d / (np.linalg.norm(d) + 1e-12)
   ref = np.array([0.0, 0.0, 1.0]) if abs(d[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
   t1 = _cross3(ref, d); t1 /= np.linalg.norm(t1)
   t2 = _cross3(d, t1)
-  G = [_force_gen(s * t, point) for t in (t1, t2) for s in (+1.0, -1.0)]
-  G.append(_force_gen(-d, point))                          # seat pushes back, only
-  return np.array(G).T, np.full(len(G), np.inf)
+  pts = [np.asarray(point, float)]
+  if depth > 0.0:
+    pts.append(np.asarray(point, float) - depth * d)       # the mouth: second wall contact
+  G = [_force_gen(s * t, p) for p in pts for t in (t1, t2) for s in (+1.0, -1.0)]
+  ub = [F_wall] * len(G)
+  G.append(_force_gen(-d, pts[0]))                         # seat pushes back, only
+  ub.append(np.inf)
+  return np.array(G).T, np.array(ub, float)
 
 
 def cap_table_unilateral(points):
