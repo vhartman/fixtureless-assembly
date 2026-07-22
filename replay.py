@@ -35,15 +35,24 @@ def apply_wrench_params(cfg):
 def build_scene(cfg):
   # reconstruct the exact environment the plan was solved in (same seed => same scatter/perturb)
   set_seed(cfg["seed"])
-  set_rolls_per_face(1 if cfg["vacuum"] else 2)
-  set_dense_grasps(bool(cfg.get("dense_grasps")) and not cfg["vacuum"])
+  # mixed EEs: cfg["grippers"] = per-robot CSV (see main --grippers); rolls follow the
+  # two-finger whenever any two-finger arm exists, exactly like the solve.
+  ks = [k.strip() for k in (cfg.get("grippers") or "").split(",") if k.strip()]
+  gripper_list = None
+  if ks:
+    ks = (ks + [ks[-1]] * cfg["num_robots"])[:cfg["num_robots"]]
+    gripper_list = [k == "vacuum" for k in ks]
+  any_tf = (gripper_list is not None and not all(gripper_list)) or \
+      (gripper_list is None and not cfg["vacuum"])
+  set_rolls_per_face(2 if any_tf else 1)
+  set_dense_grasps(bool(cfg.get("dense_grasps")) and any_tf)
   set_inhand_reorient(bool(cfg.get("inhand_reorient")))    # plan may contain reorient edges
   from problem import set_staged_mates, set_allow_curved_grasps
   set_staged_mates(bool(cfg.get("staged_mates")))          # staged-mate invariant, as searched
   set_allow_curved_grasps(bool(cfg.get("allow_curved_grasps")))  # grasp table must match the search
   apply_wrench_params(cfg)
   C = make_four_robot_env(num_robots=cfg["num_robots"], floating_ee=cfg["floating_ee"],
-                          vacuum=cfg["vacuum"],
+                          vacuum=gripper_list if gripper_list is not None else cfg["vacuum"],
                           robot_types=cfg.get("robot_types") or cfg.get("robot", "ur10"))
   assembly = make_assembly(cfg["assembly"], cfg["parts"])
   C = add_disassembled_obj(C, assembly, perturb_start_pose=cfg["perturb_start_pose"],

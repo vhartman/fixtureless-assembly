@@ -56,8 +56,21 @@ class CollisionChecker:
   collision implies an arm collision), but it does NOT see the arms or reachability --
   that is the RobotIK (L3) layer."""
 
-  def __init__(self, assembly, robots, gripper_path=None):
+  def __init__(self, assembly, robots, gripper_path=None, robot_gripper_paths=None):
     self.gripper_path = gripper_path or os.path.join(os.path.dirname(__file__), DEFAULT_FLOATING_EE)
+    # MIXED END EFFECTORS: robot_gripper_paths = {robot: cheap-EE path} loads each robot's
+    # slot with ITS OWN gripper stand-in (vacuum pen vs two-finger palm differ a lot); None
+    # (uniform scenes) keeps every slot on self.gripper_path -- byte-identical behaviour.
+    self.robots_order = list(robots)
+    paths = [robot_gripper_paths.get(r, self.gripper_path) for r in robots] \
+        if robot_gripper_paths else [self.gripper_path] * len(robots)
+    self.mixed = len(set(paths)) > 1
+    # robot -> gripper KIND (the geometry class): same-kind arms are interchangeable in a
+    # floating-EE check, so verdict signatures and slot assignment key on the KIND, not the
+    # robot -- two vacuum arms share one verdict, exactly like the uniform identity-free key.
+    self._robot_kind = {r: ("vacuum" if "vacuum" in os.path.basename(p) else "two_finger")
+                        for r, p in zip(robots, paths)}
+    self._slot_kind = [self._robot_kind[r] for r in robots]
 
     template = make_world()                                # floor + table, same as the real env
     for obj in assembly.objects:                           # the parts (posed per query)
@@ -66,10 +79,12 @@ class CollisionChecker:
     # one free-floating gripper slot per robot (at most one active grasp per robot),
     # pre-loaded and parked far away so unused slots touch nothing.
     self.slots = [f"eeSLOT{i}_" for i in range(len(robots))]
-    for prefix in self.slots:
-      template.addFile(self.gripper_path, namePrefix=prefix)
-    _, self.base_rel_tool, self.q_correction = _gripper_rest_transforms(template, self.slots[0]) \
-        if self.slots else (None, None, None)
+    for prefix, path in zip(self.slots, paths):
+      template.addFile(path, namePrefix=prefix)
+    # per-slot tool transforms (grippers may differ under mixed EEs; identical when uniform)
+    self._slot_tool = [_gripper_rest_transforms(template, prefix)[1:] for prefix in self.slots]
+    self._slot_of = {r: i for i, r in enumerate(self.robots_order)}
+    self.base_rel_tool, self.q_correction = self._slot_tool[0] if self.slots else (None, None)
     for i, prefix in enumerate(self.slots):
       template.getFrame(prefix + "ur_base").setPosition(_park_pos(i))
     self.template = template
@@ -93,8 +108,13 @@ class CollisionChecker:
     parts = []
     for group in state.subassemblies():
       members = tuple(sorted(group))
-      grasps = tuple(sorted((c[2], c[3]) for p in group
-                            for c in state.supports.get(p, ()) if c[0] == "grasp"))
+      # mixed EEs: the holder's gripper KIND decides which geometry stands there -- key on
+      # the kind, NOT the robot (same-kind arms share verdicts, like the uniform identity-
+      # free key). Uniform scenes keep the plain (part, gid) key.
+      grasps = tuple(sorted(
+          ((self._robot_kind.get(c[1]), c[2], c[3]) if self.mixed else (c[2], c[3]))
+          for p in group
+          for c in state.supports.get(p, ()) if c[0] == "grasp"))
       on_table = any(("table",) in state.supports.get(p, ()) for p in group)
       if on_table:
         ref = reference_part(group)
@@ -102,7 +122,12 @@ class CollisionChecker:
         parts.append(("T", members, state.place.get(ref), anchor, grasps))
       else:
         parts.append(("H", members, grasps))
-    return (tuple(sorted(parts)), tuple(sorted(extra_grasps)))
+    # extras likewise: robot -> kind (3-tuples), so the pick gate's verdicts are shared
+    # across same-kind arms.
+    ex = tuple(sorted((self._robot_kind.get(g[0], g[0]),) + tuple(g[1:]) if len(g) == 3
+                      else tuple(g) for g in extra_grasps)) if self.mixed \
+        else tuple(sorted(tuple(g) for g in extra_grasps))
+    return (tuple(sorted(parts)), ex)
 
   def _scene_for(self, state, assembly, extra_grasps=()):
     # build the floating-EE collision config for a state: parts posed per the state's scene
@@ -135,21 +160,42 @@ class CollisionChecker:
       f.setPosition(pose[:3])
       f.setQuaternion(pose[3:])
 
-    grasps = [(c[2], c[3]) for p in state.bodies()
-              for c in state.supports.get(p, ()) if c[0] == "grasp"]
-    grasps += list(extra_grasps)
-    for prefix, (gpart, grasp_id) in zip(self.slots, grasps):   # move a slot onto each grasp
+    # each grasp goes to a slot of ITS HOLDER'S GRIPPER KIND (same-kind arms are
+    # interchangeable floating-EE geometry; with uniform grippers any assignment matches the
+    # old sequential zip). extra_grasps entries may be (gpart, gid) or (robot, gpart, gid);
+    # robot-less extras take any free slot (callers pass the robot when it matters).
+    used = set()
+    assigns = []                                           # (slot_idx, gpart, grasp_id)
+    robot_grasps = [(c[1], c[2], c[3]) for p in state.bodies()
+                    for c in state.supports.get(p, ()) if c[0] == "grasp"]
+    extras = [g if len(g) == 3 else (None, g[0], g[1]) for g in extra_grasps]
+
+    def _slot_for(r):
+      kind = self._robot_kind.get(r) if r is not None else None
+      for j in range(len(self.slots)):
+        if j not in used and (kind is None or self._slot_kind[j] == kind):
+          return j
+      return next(j for j in range(len(self.slots)) if j not in used)
+
+    for r, gpart, gid in robot_grasps + extras:
+      i = _slot_for(r)
+      used.add(i)
+      assigns.append((i, gpart, gid))
+    for i, gpart, grasp_id in assigns:
       grasp_world = _pose_compose(np.asarray(part_poses[gpart], dtype=float),
                                   grasp_pose(assembly, gpart, grasp_id))
-      base_world = _ee_root_pose(grasp_world, self.base_rel_tool, self.q_correction)
-      root = C_col.getFrame(prefix + "ur_base")
+      brt, qc = self._slot_tool[i]
+      base_world = _ee_root_pose(grasp_world, brt, qc)
+      root = C_col.getFrame(self.slots[i] + "ur_base")
       root.setPosition(base_world[:3])
       root.setQuaternion(base_world[3:])
     if self.persistent:
       # in-place mutation keeps STALE poses from the previous query: explicitly RE-PARK the
       # unused slots (parts are all reposed above every query), then force the global
       # kinematics/proxy REFRESH -- without it rai serves stale collision results.
-      for i in range(len(grasps), len(self.slots)):
+      for i in range(len(self.slots)):
+        if i in used:
+          continue
         root = C_col.getFrame(self.slots[i] + "ur_base")
         root.setPosition(_park_pos(i))
         root.setQuaternion([1.0, 0.0, 0.0, 0.0])
@@ -191,14 +237,17 @@ class CollisionChecker:
   def collision_free(self, state, assembly, note=""):
     return self._check(state, assembly, note=note)
 
-  def pick_collision_free(self, s0, gpart, grasp_id, assembly, note=""):
+  def pick_collision_free(self, s0, gpart, grasp_id, assembly, note="", robot=None):
     # cheap gate for PICK edges: place a floating EE at the candidate grasp with the part
     # at its CURRENT (pre-pick, on-table) pose, in the actual environment. This is what
     # the precomputed grasp table does NOT see -- it checks a grasp only against its own
     # subassembly (no table, no neighbours), so e.g. a two-finger side grasp whose lower
     # finger dips below the cube (into the table) passes precompute yet can never be
     # picked. Rejecting it here costs ~2ms instead of a full (restarted) IK solve.
-    return self._check(s0, assembly, extra_grasps=[(gpart, grasp_id)], note=note)
+    # `robot`: the acting robot -- under mixed EEs its own gripper geometry stands at the
+    # candidate (None = any slot, the uniform behaviour).
+    extra = [(robot, gpart, grasp_id)] if robot is not None else [(gpart, grasp_id)]
+    return self._check(s0, assembly, extra_grasps=extra, note=note)
 
 
 def _wrist_table_pair(a, b):
@@ -325,6 +374,11 @@ class RobotIK:
     # EVERY branch penetrates deeper than this gate, reject before any KOMO. 15mm keeps every
     # measured rescue while killing the deep-collision failure path.
     self.collision_reject_depth = 0.015
+    # HARD-reject depth (see _probe_branch_combos): only when EVERY exact branch penetrates
+    # beyond this does the probe reject without a KOMO. Conservative on purpose (near the
+    # measured unrescued MEDIAN 55mm): the old single 15mm gate falsely rejected feasible
+    # thin-cylinder pinches near the table (chair posts/legs) that the soft solve rescues.
+    self.collision_deep_reject = 0.05
     self.collision_rejects = 0                            # rejects by the depth gate
     self._ik_cache = {}                                   # (action, scene sig) -> (ok, witness)
     # WITNESS-OPTIMIZATION pull spec (post-pass only; None during search => every solve is
@@ -728,19 +782,28 @@ class RobotIK:
         C.setJointState(qq)
         C.computeCollisions()
         excess = 0.0                                      # penetration beyond the pair's gate
+        deep = 0.0                                        # ... beyond the HARD-reject gate
         for fa, fb, d in C.getCollisions(0.0):
           if d >= 0.0 or (xpre and (fa.startswith(xpre) or fb.startswith(xpre))):
             continue
-          g = 2.0 * gate if (fa.startswith(ipre) and fb.startswith(ipre)) else gate
+          both = fa.startswith(ipre) and fb.startswith(ipre)
+          g = 2.0 * gate if both else gate
+          gd = 2.0 * self.collision_deep_reject if both else self.collision_deep_reject
           excess = max(excess, -d - g)
-        scored.append((excess, d0, qq))
+          deep = max(deep, -d - gd)
+        scored.append((excess, d0, qq, deep))
     finally:
       C.setJointState(q0)
-    if all(s[0] > 0.0 for s in scored):
+    # HARD reject only when every combo penetrates beyond the DEEP gate (~the measured
+    # unrescued median). The shallow gate stays a RANKING signal: the chair's thin table-
+    # adjacent cylinder pinches are rescued by the soft KOMO from well beyond 15mm, so the
+    # 15mm band must fall through to the solve (with the ranked seeds), never hard-reject --
+    # the cheap layers must not reject what the full solve can do.
+    if all(s[3] > 0.0 for s in scored):
       self.collision_rejects += 1
-      return True, []                                     # every exact combo deeply colliding
+      return True, []                                     # every exact combo VERY deeply colliding
     scored.sort(key=lambda t: (t[0], t[1]))
-    return False, [q for _, _, q in scored[:cap]]
+    return False, [q for _, _, q, _ in scored[:cap]]
 
   def _reach_bound(self, robot):
     # SOUND kinematic max-reach for ANY arm (no analytic IK required): the tool centre can
@@ -952,15 +1015,18 @@ class RobotIK:
     # set proves reachability -> skip the precheck and warm-start the collision solve below. Vacuum
     # / uncalibrated / no-ssik fall back to the relaxed precheck.
     seeds = self._analytic_seeds(C, robot, ee_target, part_name)
-    if self._analytic_reject_ok(robot):
-      if not seeds:
-        self.analytic_rejects += 1
-        return False, None                                # analytic: kinematically unreachable
+    if self._analytic_reject_ok(robot) and seeds:
       reject, ranked = self._probe_branch_combos(C, {robot: seeds})
       if reject:
         return False, None                                # every exact branch deeply colliding
       seeds = ranked or seeds                             # shallowest-collision branches first
     elif self.reach_precheck and self._reach_precheck_reject(action, C, build(False)):
+      # includes the EMPTY-analytic-set case: an empty EXACT set does NOT prove the SOFT
+      # solve fails -- the tolerant pose eq settles within tolerance of exactly-unreachable
+      # poses (measured: the chair posts' thin-cylinder side pinch). Only the residual-gated
+      # relaxed precheck may reject there (clear misses only); borderline falls to the solve.
+      if not seeds:
+        self.analytic_rejects += 1
       return False, None                                  # clear reach failure (relaxed solve)
 
     komo = build(True)
@@ -1105,8 +1171,8 @@ class RobotIK:
       if self._analytic_reject_ok(rr):
         sl = self._analytic_seeds(C, rr, ee, None)
         if not sl:
-          self.analytic_rejects += 1
-          return False, None                              # analytic: kinematically unreachable
+          all_calibrated = False                          # EMPTY exact set: borderline, not a
+          continue                                        # proof -- precheck decides (see pick)
         arm_seeds[rr] = sl
       else:
         all_calibrated = False
@@ -1253,8 +1319,8 @@ class RobotIK:
           continue
         sl = self._analytic_seeds(C, rr, ee, None)
         if not sl:
-          self.analytic_rejects += 1
-          return False, None                              # analytic: kinematically unreachable
+          reachable_proven = False                        # EMPTY exact set: borderline, not a
+          continue                                        # proof -- precheck decides (see pick)
         arm_seeds[rr] = sl
       # collision probe on the exact branches (assemble KOMO is multi-arm: uninvolved arms can
       # dodge -> excluded). All attached arms calibrated -> full combo product incl. ARM-ARM;
@@ -1356,13 +1422,14 @@ _OPENING_ACTIONS = {"place", "set_down", "stow"}
 
 
 def _opening_grasp(action, s0):
-  # the (gpart, grasp_id) that action's robot is about to open, read from s0.
+  # the (robot, gpart, grasp_id) that action's robot is about to open, read from s0 (the
+  # robot rides along so mixed-EE scenes stand the RIGHT gripper at the opening grasp).
   r, root = action[1], action[2]
   group = next((g for g in s0.subassemblies() if root in g), (root,))
   for p in group:
     for c in s0.supports.get(p, ()):
       if c[0] == "grasp" and c[1] == r:
-        return (c[2], c[3])
+        return (c[1], c[2], c[3])
   return None
 
 # actions that place a NEW gripper at a grasp (checked cheaply like a pick: the EE at the
@@ -1392,7 +1459,8 @@ def cheap_feasible(action, s0, s1, assembly, checker):
     if not checker._check(s1, assembly, extra_grasps=extra, note=f"result of {action}"):
       return False
   if action[0] in _GRASP_ACTIONS and not checker.pick_collision_free(
-      s0, action[2], action[3], assembly, note=f"grasp candidate of {action}"):
+      s0, action[2], action[3], assembly, note=f"grasp candidate of {action}",
+      robot=action[1]):
     return False
   if action[0] == "inhand_reorient":
     # v1 gate: the RESULT state (part held at its NEW grasp, everything else unchanged) must
@@ -1497,6 +1565,8 @@ class AbstractionHeuristic:
   abstract goal distance <= real remaining cost: ADMISSIBLE. Combine with max()."""
 
   def __init__(self, assembly, n_robots, gripper_kind=None):
+    if isinstance(gripper_kind, dict):
+      gripper_kind = None                                  # mixed EEs v1: topological facts
     self.assembly = assembly
     self.R = n_robots
     objs = list(assembly.objects)
@@ -2037,6 +2107,25 @@ def _labeled_geo_ok(checker, assembly, st, ideal_set, note=""):
   return checker._check(st, assembly, note=note)
 
 
+def _kind_budget_ok(label_kinds, kind_counts, G, L):
+  # MIXED-EE arm budget for the labeled abstractions: every held label needs an arm whose
+  # kind is in the label's usability mask. With two kinds, Hall's condition reduces to
+  # "single-kind labels do not exceed that kind's arm count" (flexible labels take either).
+  # Every forward-reachable state satisfies this (each real grasp IS held by a usable arm),
+  # so excluding violators keeps h ADMISSIBLE while pricing e.g. "two wide plates cannot
+  # both be held when only one vacuum arm exists".
+  need = {}
+  for coll in (G, L):
+    for e in coll:
+      if not isinstance(e, tuple):
+        continue                                           # pure-collapse L: bare part names
+      m = label_kinds.get((e[0], e[1]))
+      if m is not None and len(m) == 1:
+        k = next(iter(m))
+        need[k] = need.get(k, 0) + 1
+  return all(n <= kind_counts.get(k, 0) for k, n in need.items())
+
+
 def _staged_valid_labeled(assembly, ideal, G, face, held_face):
   # STAGED-MATE gate for the labeled abstractions (--staged-mates): the exact abstract mirror
   # of the forward successor invariant (_problem._staged_ok) -- an abstract state where a
@@ -2098,6 +2187,10 @@ class LabeledDisassemblyHeuristic:
     self._bracing = bracing                                # model the add_grasp (co-grasp) edge
     self._clearance = clearance                            # see _table_aware_pick_fact
     self._gk = gripper_kind                                # non-None => WRENCH facts active
+    if isinstance(self._gk, dict):
+      # MIXED EEs v1: per-kind wrench facts are not modeled yet -- fall back to the
+      # TOPOLOGICAL facts (optimistic => admissible; forward gates stay exact).
+      self._gk = None
     objs = list(assembly.objects)
     base = assembly.base
     # STATES ARE SORTED TUPLES (ideal, G, face, L) -- tuples hash ~2x faster than
@@ -2117,6 +2210,15 @@ class LabeledDisassemblyHeuristic:
     self.valid = {S: tuple(sorted((p, g) for p, g, _ in grasp_table[S]))
                   for S in ideal_keys}
     self.single = {q: tuple(sorted(g for _p, g, _ in grasp_table[(q,)])) for q in objs}
+    # MIXED EEs: per-(part, raw grasp) kind mask + arm counts, for _kind_budget_ok.
+    self._kind_counts = None
+    self._label_kinds = {}
+    _kmask = getattr(grasp_table, "kinds_of", None)
+    if _kmask is not None:
+      from collections import Counter
+      self._kind_counts = dict(Counter(getattr(grasp_table, "robot_kinds", {}).values()))
+      self._label_kinds = {(q, g): frozenset(_kmask.get(((q,), q, g), ()))
+                           for q in objs for g in self.single[q]}
 
     # lazy, cached table-aware pick fact -- keyed PER PART deliberately (no identical-parts
     # aliasing: per-part shapes/meshes and forces are coming; the template reuse makes the
@@ -2124,13 +2226,24 @@ class LabeledDisassemblyHeuristic:
     self._ee_path = gripper_path
     self._pick_cache = {}
 
+    # MIXED EEs: _ee_path may be a {kind: fact-EE path} dict; a pick fact then ORs over the
+    # kinds in the GRASP'S mask (usable-by-any-present-arm => optimistic => admissible).
+    self._kinds_of = getattr(grasp_table, "kinds_of", None)
+
+    def fact_paths(S_key, pg):
+      if not isinstance(self._ee_path, dict):
+        return (self._ee_path,)
+      ks = (self._kinds_of or {}).get((S_key, pg[0], pg[1])) or self._ee_path.keys()
+      return tuple(self._ee_path[k] for k in sorted(ks))
+
     def pick_ok(S_key, face, pg):
       key = (S_key, face, pg)
       hit = self._pick_cache.get(key)
       if hit is None:
-        hit = self._pick_cache[key] = _table_aware_pick_fact(
-            assembly, S_key, face, pg[0], pg[1], self._ee_path,
-            clearance=self._clearance)
+        hit = self._pick_cache[key] = any(
+            _table_aware_pick_fact(assembly, S_key, face, pg[0], pg[1], pth,
+                                   clearance=self._clearance)
+            for pth in fact_paths(S_key, pg))
       return hit
 
     # placement faces are now looked up PER SUBASSEMBLY in the stable rest-pose table
@@ -2362,6 +2475,9 @@ class LabeledDisassemblyHeuristic:
           continue                                        # CORRIDOR cap: miss => dist > cap,
         if _staged_gate and not _staged_valid_labeled(assembly, s[0], s[1], s[2], Hf):
           continue                                        # staged-mate invariant (admissible)
+        if self._kind_counts is not None and not _kind_budget_ok(
+            self._label_kinds, self._kind_counts, s[1], s[3]):
+          continue                                        # mixed-EE arm budget (admissible)
         if nd < self.dist.get(s, float("inf")):           # h=inf sound under cost_bound<=cap
           self.dist[s] = nd
           heapq.heappush(pq, (nd, id(s), s))
@@ -2470,6 +2586,9 @@ def compute_grasp_signatures(assembly, grasp_table, gripper_kind=None, gripper_p
   deterministic (sorted signatures)."""
   comps = set(components if components is not None else _SIG_COMPONENTS)
   ee = gripper_path or os.path.join(os.path.dirname(__file__), DEFAULT_FLOATING_EE)
+  # mixed EEs: a {kind: path} dict -> the pickface component records one vector PER KIND
+  # (kind-tagged, so signatures split exactly where the kinds disagree).
+  ee_paths = sorted(ee.items()) if isinstance(ee, dict) else [(None, ee)]
   axes = []
   for r in assembly.objects:
     rel = assembly.relative_pose(r)
@@ -2497,12 +2616,22 @@ def compute_grasp_signatures(assembly, grasp_table, gripper_kind=None, gripper_p
           close = close * np.sign(c)
           break
       sig = []
+      # MIXED EEs: the grasp's KIND-USABILITY mask always joins the signature (independent
+      # of --sig-components): grasps usable by different gripper sets are NOT interchangeable
+      # as labels -- collapsing a vacuum-only cap grasp with a two-finger-only side pinch
+      # would tell the abstraction any arm can serve either, and the fills then burn real-IK
+      # binds discovering "wrong arm" one refutation at a time. Uniform scenes have no mask
+      # (kinds_of is None) -> component absent -> byte-identical classes.
+      kmask = getattr(grasp_table, "kinds_of", None)
+      if kmask is not None:
+        sig.append(("gripper", tuple(sorted(kmask.get(((q,), q, g), ())))))
       if "press" in comps and gripper_kind is not None and q != assembly.base:
         sig.append(("press", bool(_sig_press_ok(assembly, q, g, gripper_kind))))
       if "pickface" in comps:
         sig.append(("faces", tuple(
-            bool(_table_aware_pick_fact(assembly, (q,), f, q, g, ee,
-                                        clearance=clearance)) for f in faces)))
+            (k, tuple(bool(_table_aware_pick_fact(assembly, (q,), f, q, g, pth,
+                                                  clearance=clearance)) for f in faces))
+            for k, pth in ee_paths)))
       if "contact" in comps:
         # STATIC grip capability only: the pads' patch = (center, closing axis). The
         # approach/wrist direction is deliberately EXCLUDED -- it does not change the
@@ -2575,6 +2704,8 @@ class CollapsedLabeledHeuristic:
     self._bracing = bracing                                # model the add_grasp (co-grasp) edge
     self._clearance = clearance
     self._gk = gripper_kind
+    if isinstance(self._gk, dict):
+      self._gk = None                                      # mixed EEs v1: topological facts
     self._collapse = bool(collapse_grasps)                 # see GraspCollapsedHeuristic
     objs = list(assembly.objects)
     base = assembly.base
@@ -2622,6 +2753,20 @@ class CollapsedLabeledHeuristic:
         groups.setdefault(gcol(q, g), []).append(g)
       self._svgroups[q] = {k: tuple(sorted(v)) for k, v in groups.items()}
       self.single[q] = tuple(sorted(groups))
+    # MIXED EEs: per-(part, label) kind-usability mask (union over the class's raw variants)
+    # + arm counts per kind, for the _kind_budget_ok validity gate. None when uniform.
+    self._kind_counts = None
+    self._label_kinds = {}
+    _kmask = getattr(grasp_table, "kinds_of", None)
+    if _kmask is not None:
+      from collections import Counter
+      self._kind_counts = dict(Counter(getattr(grasp_table, "robot_kinds", {}).values()))
+      for q in objs:
+        for lbl, variants in self._svgroups[q].items():
+          m = set()
+          for g in variants:
+            m |= set(_kmask.get(((q,), q, g), ()))
+          self._label_kinds[(q, lbl)] = frozenset(m)
 
     def gvariants(S_key, pg):                              # raw variants of a collapsed label
       m = self._vgroups.get(S_key)
@@ -2640,14 +2785,24 @@ class CollapsedLabeledHeuristic:
     self._ee_path = gripper_path
     self._pick_cache = {}
 
+    # MIXED EEs: same OR-over-mask-kinds as the fine class (see there), composed with the
+    # collapsed label's raw variants.
+    self._kinds_of = getattr(grasp_table, "kinds_of", None)
+
+    def fact_paths(S_key, part, g):
+      if not isinstance(self._ee_path, dict):
+        return (self._ee_path,)
+      ks = (self._kinds_of or {}).get((S_key, part, g)) or self._ee_path.keys()
+      return tuple(self._ee_path[k] for k in sorted(ks))
+
     def pick_ok(S_key, face, pg):
       key = (S_key, face, pg)
       hit = self._pick_cache.get(key)
       if hit is None:
         hit = self._pick_cache[key] = any(
-            _table_aware_pick_fact(assembly, S_key, face, pg[0], g, self._ee_path,
+            _table_aware_pick_fact(assembly, S_key, face, pg[0], g, pth,
                                    clearance=self._clearance)
-            for g in gvariants(S_key, pg))
+            for g in gvariants(S_key, pg) for pth in fact_paths(S_key, pg[0], g))
       return hit
 
     # placement faces are now looked up PER SUBASSEMBLY in the stable rest-pose table
@@ -2904,6 +3059,9 @@ class CollapsedLabeledHeuristic:
           continue                                        # CORRIDOR cap: miss => dist > cap,
         if _staged_gate and not _staged_valid_labeled(assembly, s[0], s[1], s[2], Hf):
           continue                                        # staged-mate invariant (admissible)
+        if self._kind_counts is not None and not _kind_budget_ok(
+            self._label_kinds, self._kind_counts, s[1], s[3]):
+          continue                                        # mixed-EE arm budget (admissible)
         if nd < self.dist.get(s, float("inf")):           # h=inf sound under cost_bound<=cap
           self.dist[s] = nd
           heapq.heappush(pq, (nd, id(s), s))
@@ -2974,8 +3132,15 @@ class SignatureCollapsedHeuristic(CollapsedLabeledHeuristic):
   incomplete signature only coarsens the relaxation -- admissibility is preserved."""
 
   def __init__(self, assembly, n_robots, grasp_table, **kwargs):
+    # MIXED EEs v1: the signature's WRENCH facts (press/solohold) craft probe states with a
+    # placeholder robot, which a {robot: kind} map cannot price -> evaluate them kind-less
+    # (skipped, like wrench-off). The GRIPPER MASK component still splits classes by kind,
+    # and the fine/collapsed guard handles the inherited facts the same way.
+    sig_gk = kwargs.get("gripper_kind")
+    if isinstance(sig_gk, dict):
+      sig_gk = None
     classes = compute_grasp_signatures(
-        assembly, grasp_table, gripper_kind=kwargs.get("gripper_kind"),
+        assembly, grasp_table, gripper_kind=sig_gk,
         gripper_path=kwargs.get("gripper_path"),
         clearance=kwargs.get("clearance", 0.02))
     if kwargs.get("verbose"):
@@ -3534,27 +3699,74 @@ def _search_context(C, assembly, robots):
   # slimmer than the two-finger, so it would let grasps through that the real palm/fingers
   # rule out (neighbouring cubes, finger-under-the-cube-into-the-table).
   names = C.getFrameNames()
-  vacuum = any(n.endswith("_ur_vacuum") for n in names)
   # ...and mirror the ROBOT model: real arms get the wrist-extended cheap EE, a floating-EE
   # env gets the plain one (no wrist exists in that model). The wrist-3 capsule is arm-SPECIFIC,
   # so a real UR5 arm (detected via its ur_arm_ur5 marker) gets the ur5-calibrated cheap wrist,
   # not the ur10 one. See cheap_ee_path / UR5_CHEAP_EE_PATHS in env.py.
   floating = not any(n.endswith("_ur_wrist_3_joint") for n in names)
   is_ur5 = any(n.endswith("_ur_arm_ur5") for n in names)
-  ee_path = cheap_ee_path(is_ur5, floating, vacuum)
-  checker = CollisionChecker(assembly, robots, gripper_path=ee_path)
-  # plain-EE variant for the labeled-h pick facts (clutter-free scenes; see the h_lab
-  # construction in solve_assembly_problem for why the wrist is excluded there).
-  checker.fact_gripper_path = os.path.join(os.path.dirname(__file__),
-                                           UR10_PATHS[(True, vacuum)])
-  grasp_table = precompute_grasps(assembly, gripper_path=ee_path)
-  return checker, grasp_table
+  kinds = robot_gripper_kinds(C, robots)
+  distinct = sorted(set(kinds.values()))
+  ee_path = {k: cheap_ee_path(is_ur5, floating, k == "vacuum") for k in distinct}
+  fact_path = {k: os.path.join(os.path.dirname(__file__), UR10_PATHS[(True, k == "vacuum")])
+               for k in distinct}
+  if len(distinct) == 1:                                   # UNIFORM: byte-identical to before
+    k = distinct[0]
+    checker = CollisionChecker(assembly, robots, gripper_path=ee_path[k])
+    # plain-EE variant for the labeled-h pick facts (clutter-free scenes; see the h_lab
+    # construction in solve_assembly_problem for why the wrist is excluded there).
+    checker.fact_gripper_path = fact_path[k]
+    return checker, precompute_grasps(assembly, gripper_path=ee_path[k])
+  # MIXED END EFFECTORS: per-robot cheap-EE slots; the grasp table is the UNION over kinds
+  # with a per-grasp kind MASK (a grasp enters kind k's set iff k's EE stands there
+  # collision-free vs the subassembly). Successor generators gate (robot, grasp) pairs on
+  # the mask; heuristic facts OR over a grasp's mask kinds (admissible).
+  checker = CollisionChecker(assembly, robots, gripper_path=ee_path[distinct[0]],
+                             robot_gripper_paths={r: ee_path[kinds[r]] for r in robots})
+  checker.fact_gripper_path = fact_path                    # dict per kind (mixed)
+  per_kind = {k: precompute_grasps(assembly, gripper_path=ee_path[k]) for k in distinct}
+  table = GraspTable()
+  table.kinds_of = {}
+  table.robot_kinds = dict(kinds)
+  rolls = _problem._ROLLS_PER_FACE
+  dense = _problem._DENSE_GRASPS
+  for key in set().union(*(t.keys() for t in per_kind.values())):
+    merged = {}
+    for k in distinct:
+      for p, g, pose in per_kind[k].get(key, ()):
+        if k == "vacuum" and rolls > 1 and not dense and g % rolls != 0:
+          continue  # the pen is roll-symmetric: rolls of one face are IK-identical
+                    # duplicates for the vacuum -- and vacuum binds are the expensive
+                    # ones (no analytic reject) -> keep roll 0 only in ITS mask. The
+                    # two-finger keeps every roll (its pads genuinely differ per roll).
+        merged.setdefault((p, g), (p, g, pose))
+        table.kinds_of.setdefault((key, p, g), set())
+        table.kinds_of[(key, p, g)].add(k)
+    table[key] = sorted(merged.values(), key=lambda t: (t[0], t[1]))
+  table.kinds_of = {kk: frozenset(v) for kk, v in table.kinds_of.items()}
+  return checker, table
 
 
 def gripper_kind(C):
-  # which gripper the scene uses, as the key into wrench.PARAMS['grasp'].
+  # which gripper the scene uses, as the key into wrench.PARAMS['grasp']. MIXED scenes have
+  # no single answer -- use robot_gripper_kinds and thread the map (accepted wherever a
+  # gripper_kind flows; scalar stays the uniform fast path).
   return "vacuum" if any(n.endswith("_ur_vacuum") for n in C.getFrameNames()) \
       else "two_finger"
+
+
+def robot_gripper_kinds(C, robots):
+  # {robot: "vacuum" | "two_finger"} read off the scene (each robot's own gripper frames).
+  names = set(C.getFrameNames())
+  return {r: ("vacuum" if f"{r}_ur_vacuum" in names else "two_finger") for r in robots}
+
+
+def wrench_kind_arg(C, robots):
+  # the `gripper_kind` value to thread into the wrench gates: the plain scalar for uniform
+  # scenes (byte-identical caches), the per-robot map only when genuinely mixed.
+  kinds = robot_gripper_kinds(C, robots)
+  distinct = set(kinds.values())
+  return kinds if len(distinct) > 1 else next(iter(distinct))
 
 
 def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=True,
@@ -3597,7 +3809,7 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
     )
   if robots is None:
     robots = get_robots(C)
-  gk = gripper_kind(C) if wrench else None                # None => topological baseline
+  gk = wrench_kind_arg(C, robots) if wrench else None      # scalar; {robot: kind} when MIXED
 
   # abstraction heuristic: exact backward solve of a relaxed model. max() with the simple
   # counting heuristic keeps admissibility. Used only for FINITE weights: A*/wA* consume h
@@ -3918,7 +4130,7 @@ def solve_assembly_problem_lazy(C, assembly, robots=None, max_nodes=200000, verb
   t0 = time.perf_counter()
   if robots is None:
     robots = get_robots(C)
-  gk = gripper_kind(C) if wrench else None
+  gk = wrench_kind_arg(C, robots) if wrench else None
   h_abs = AbstractionHeuristic(assembly, len(robots),
                                gripper_kind=gk if wrench_aware_h else None) \
       if use_heuristic and not math.isinf(weight) else None
@@ -4186,9 +4398,9 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
         (g for g in s.subassemblies() if settle in g), frozenset())
     return main, mod
 
-  def _loose_and_holders(s):
+  def _loose_and_holders(s, exclude=None):
     main, mod = _comps(s)
-    loose = sum(1 for q in s.bodies() if q not in main and q not in mod
+    loose = sum(1 for q in s.bodies() if q not in main and q not in mod and q != exclude
                 for c in s.supports.get(q, ()) if c[0] == "grasp")
     holders = sum(1 for q in mod for c in s.supports.get(q, ()) if c[0] == "grasp")
     return loose, holders
@@ -4200,15 +4412,35 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
     return _part_mated(s, p) and loose == 0 and holders <= 1
 
   def h_fn(s):
-    left = 0 if _part_mated(s, p) else 2                  # pick + mate remaining
-    loose, holders = _loose_and_holders(s)
+    # LOCAL lower bound with a MONOTONE gradient along the intended fill (found via the
+    # chair's module fill): p's own pick is priced by `left`, NOT the loose count -- the old
+    # `left=2 + loose(incl p)` made picking p RAISE h (2->3) while shuffling the target
+    # between table faces kept it flat, so the mini search flooded the pick/place lattice
+    # below the goal branch's f and exhausted max_nodes (mixed EEs' doubled grasp alphabet
+    # tipped it; uniform squeaked under). left: mated 0 / held 1 (mate remains) / else 2.
+    if _part_mated(s, p):
+      left = 0
+    elif any(c[0] == "grasp" and c[2] == p for c in s.supports.get(p, ())):
+      left = 1
+    else:
+      left = 2
+    loose, holders = _loose_and_holders(s, exclude=p)
     hv = left + loose + max(0, holders - 1)
     if h_extra is not None:
-      # GUIDANCE from the labeled abstraction (full-assembly cost-to-go): prices the car's
-      # resting FACE and hold/brace grasps -- the decisions the counting h is blind to (it
-      # even penalizes the pick) -- and h=inf prunes states the FULL assembly cannot be
-      # finished from (sound for a milestone path even when the mini-goal is reachable).
-      hv = max(hv, h_extra(s))
+      # The labeled abstraction (FULL-assembly cost-to-go) keeps exactly two roles here:
+      #   * h=inf PRUNES states the full assembly cannot be finished from (sound);
+      #   * its VARIATION tie-breaks locally-equal siblings -- the resting-FACE and
+      #     hold/brace pricing the counting h is blind to.
+      # It must NOT join via max(): for a MODULE fill it is a large CONSTANT (module-
+      # internal progress is invisible to the base-ideal abstraction), and max(local, he)
+      # flattened h -> the mini search degenerated to uniform-cost and exhausted max_nodes
+      # on the chair's back+posts module under mixed EEs (a 4-action solution in plain
+      # sight, "fill-in failed" every time). As an EPSILON term (<= 0.1, below one local
+      # step) it orders siblings without ever drowning the local gradient.
+      he = h_extra(s)
+      if he == float("inf"):
+        return float("inf")
+      hv = hv + min(he, 1e3) * 1e-4
     return hv
 
   def _held_grasp(s, part):                              # raw grasp id `part` is currently held by
@@ -4496,7 +4728,7 @@ def solve_assembly_problem_optimistic(C, assembly, robots=None, verbose=True,
   if robots is None:
     robots = get_robots(C)
   checker, grasp_table = _search_context(C, assembly, robots)
-  gk = gripper_kind(C) if wrench else None
+  gk = wrench_kind_arg(C, robots) if wrench else None
   if gk is not None:
     reset_wrench_cache()
 
@@ -4753,7 +4985,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
   if robots is None:
     robots = get_robots(C)
   checker, grasp_table = _search_context(C, assembly, robots)
-  gk = gripper_kind(C) if wrench else None
+  gk = wrench_kind_arg(C, robots) if wrench else None
   if gk is not None:
     reset_wrench_cache()
   # the milestone oracle: GraspCollapsedHeuristic == CollapsedLabeledHeuristic when dense
@@ -5369,7 +5601,7 @@ def solve_assembly_problem_ladder(C, assembly, robots=None, time_budget=900.0,
       best = plan
   if lns and best is not None and time.perf_counter() < t_end - 5.0:
     checker, grasp_table = _search_context(C, assembly, robots)
-    gk = gripper_kind(C) if wrench else None
+    gk = wrench_kind_arg(C, robots) if wrench else None
     if gk is not None:
       reset_wrench_cache()
     # CLI-SELECTED abstraction (respects --labeled-h/--collapsed-h/--sig-collapsed-h; safe
@@ -5486,7 +5718,7 @@ def solve_assembly_problem_optimistic_declutter(
   if robots is None:
     robots = get_robots(C)
   checker, grasp_table = _search_context(C, assembly, robots)
-  gk = gripper_kind(C) if wrench else None
+  gk = wrench_kind_arg(C, robots) if wrench else None
   if gk is not None:
     reset_wrench_cache()
 

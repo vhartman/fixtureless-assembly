@@ -158,6 +158,13 @@ def make_four_robot_env(
         robot_types = [robot_types] * num_robots
     assert num_robots <= len(robot_types)
 
+    # MIXED END EFFECTORS: `vacuum` may be a per-robot list (like robot_types), e.g.
+    # [True, False, False] = a1 vacuum + a2/a3 two-finger. A scalar keeps the uniform
+    # behaviour byte-identical.
+    if isinstance(vacuum, (bool, int)):
+        vacuum = [bool(vacuum)] * num_robots
+    assert num_robots <= len(vacuum)
+
     C = make_world()
 
     layout = LAYOUT_6 if num_robots > 4 else LAYOUT_4
@@ -168,7 +175,7 @@ def make_four_robot_env(
         prefix = f"a{i + 1}_"
 
         C.addFile(
-            _robot_path(robot_type, floating_ee, vacuum), namePrefix=prefix
+            _robot_path(robot_type, floating_ee, vacuum[i]), namePrefix=prefix
         ).setParent(C.getFrame("table")).setRelativePosition(
             place["pos"][i]
         ).setRelativeQuaternion(place["rot"][i]).setJoint(ry.JT.rigid)

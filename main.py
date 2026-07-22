@@ -22,6 +22,16 @@ def parse_args():
       help="Use the vacuum end-effector instead of the two-finger gripper.",
   )
   parser.add_argument(
+      "--grippers", default=None, metavar="CSV",
+      help="MIXED END EFFECTORS: per-robot gripper kinds, comma-separated (vacuum|two_finger), "
+           "e.g. 'vacuum,two_finger,two_finger' for a1..a3. Fewer entries than robots: the "
+           "last one repeats. Overrides --vacuum. Each grasp is kind-mask filtered (a robot "
+           "only takes grasps its own gripper can stand at, collision-checked per kind); the "
+           "wrench model prices each grasp with its holder's capability; the labeled "
+           "heuristics stay admissible (pick facts OR over kinds; wrench facts fall back to "
+           "topological under mixed). Incompatible with --anon-robots (identity matters).",
+  )
+  parser.add_argument(
       "--robot", choices=["ur10", "ur10_limited", "ur5"], default="ur10",
       help="Robot arm for all robots: ur10 (default), ur10_limited (ur10 with a tighter "
            "shoulder-lift/elbow workspace), or ur5. With --floating-ee the arm is "
@@ -734,7 +744,7 @@ _SAVE_CONFIG_FIELDS = (
     "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
     "bracing", "robust_mode", "dense_grasps", "random_init", "part_float", "inhand_reorient",
     "pre_insertion", "pre_pick", "pre_place", "pre_add_grasp", "staged_mates",
-    "allow_curved_grasps",
+    "allow_curved_grasps", "grippers",
 )
 
 
@@ -747,12 +757,33 @@ def save_plan(path, args, plan):
 def main():
   args = parse_args()
   set_seed(args.seed)                           # reproducible numpy + rai (KOMO) RNG
+  # MIXED END EFFECTORS (--grippers): per-robot vacuum/two_finger list; overrides --vacuum.
+  gripper_list = None
+  if args.grippers:
+    ks = [k.strip() for k in args.grippers.split(",") if k.strip()]
+    bad = [k for k in ks if k not in ("vacuum", "two_finger")]
+    if bad:
+      raise SystemExit(f"--grippers: unknown kind(s) {bad} (vacuum|two_finger)")
+    ks = (ks + [ks[-1]] * args.num_robots)[:args.num_robots]   # last entry repeats
+    gripper_list = [k == "vacuum" for k in ks]
+    if len(set(ks)) > 1:
+      if args.anon_robots:
+        raise SystemExit("--grippers (mixed) is incompatible with --anon-robots: "
+                         "robot identity decides which gripper stands at a grasp.")
+      print(f"[flag] --grippers ACTIVE (MIXED EEs): {', '.join(f'a{i+1}={k}' for i, k in enumerate(ks))}. "
+            "Grasps are kind-mask filtered per robot; wrench prices each grasp with its "
+            "holder's capability; labeled-h pick facts OR over kinds (admissible).")
+    else:
+      args.vacuum = ks[0] == "vacuum"                      # uniform via --grippers = plain path
+
   # grasp rolls are a property of the gripper: the vacuum is symmetric about its suction
   # axis (1 grasp per face); the two-finger has two in-plane orientations (90 deg apart).
   # --dense-grasps additionally enables the +-45deg WRIST-TILTED variants (same face pinch,
-  # approach between the faces) -- see problem.set_dense_grasps.
-  set_rolls_per_face(1 if args.vacuum else 2)
-  set_dense_grasps(args.dense_grasps and not args.vacuum)
+  # approach between the faces) -- see problem.set_dense_grasps. MIXED scenes take the
+  # two-finger's 2 rolls whenever any two-finger arm exists (the vacuum ignores rolls).
+  any_two_finger = (gripper_list is not None and not all(gripper_list)) or not args.vacuum
+  set_rolls_per_face(2 if any_two_finger else 1)
+  set_dense_grasps(args.dense_grasps and any_two_finger)
   set_brace_for_assembly_only(args.brace_for_assembly_only)
   set_extra_place_cells(args.place_cells)
   set_prefer_center(args.prefer_center)
@@ -807,7 +838,7 @@ def main():
   C = make_four_robot_env(
       num_robots=args.num_robots,
       floating_ee=args.floating_ee,
-      vacuum=args.vacuum,
+      vacuum=gripper_list if gripper_list is not None else args.vacuum,
       robot_types=args.robot_types or args.robot,   # --robot for all; --robot-types overrides
   )
 
@@ -1057,7 +1088,7 @@ def main():
         # hoisted plan (witnesses are solved for the hoisted states).
         from solver import hoist_releases
         plan = hoist_releases(C, assembly, plan, robots,
-                              gripper_kind=gripper_kind(C) if args.wrench else None,
+                              gripper_kind=wrench_kind_arg(C, robots) if args.wrench else None,
                               handovers=args.handovers, allow_place=args.allow_place,
                               bracing=args.bracing)
       if args.save is not None:
@@ -1069,14 +1100,14 @@ def main():
         else:
           opt_witnesses, _rep = optimize_witnesses(
               C, assembly, plan, robots, robot_ik, cost=args.optimize_witnesses,
-              gripper_kind=gripper_kind(C) if args.wrench else None,
+              gripper_kind=wrench_kind_arg(C, robots) if args.wrench else None,
               handovers=args.handovers, allow_place=args.allow_place,
               bracing=args.bracing, clear_weight=args.witness_clearance,
               robot_collisions=args.witness_robot_collisions)
       if plan is not None and args.utilization:
         from solver import utilization_report
         utilization_report(C, assembly, plan, robots, witnesses=opt_witnesses,
-                           gripper_kind=gripper_kind(C) if args.wrench else None,
+                           gripper_kind=wrench_kind_arg(C, robots) if args.wrench else None,
                            handovers=args.handovers, allow_place=args.allow_place,
                            bracing=args.bracing)
       if plan is not None and args.motion_plan:
@@ -1084,7 +1115,7 @@ def main():
           print("[motion-plan] needs --real-ik (for the IK witnesses); skipping.")
         else:
           import mp_export as MP
-          gk = gripper_kind(C) if args.wrench else None
+          gk = wrench_kind_arg(C, robots) if args.wrench else None
           # witnesses: the optimized set if --optimize-witnesses was given, else RAW (sweeps=0)
           mp_wit = opt_witnesses
           if mp_wit is None:

@@ -620,7 +620,7 @@ class ChairAssembly(Assembly):
   the backrest sub-assembly (back + 2 posts) then joins the seat. Part counts: 5 = a STOOL
   (seat + 4 legs), 8 = the full chair (+ backrest + 2 posts)."""
 
-  def __init__(self, n_parts=8, cube_radius=0.005, scale=0.25):
+  def __init__(self, n_parts=8, cube_radius=0.005, scale=0.4):
     self.n_parts = 5 if n_parts < 8 else 8
     # chair.g is modelled at a realistic ~0.4 m; the planner's table/reach/scatter are built
     # for ~0.05 m parts, so scale the whole chair down (shape preserved) to fit -- else parts
@@ -1261,6 +1261,25 @@ def _subasm_key(group):
   return tuple(sorted(group, key=_part_index))
 
 
+class GraspTable(dict):
+  """{subassembly_key: [(part, grasp_id, pose), ...]} plus, for MIXED-end-effector scenes,
+  per-grasp KIND masks: kinds_of[(S_key, part, gid)] = frozenset of gripper kinds whose EE
+  can stand at that grasp (collision-checked per kind), and robot_kinds = {robot: kind}.
+  Uniform scenes use a plain dict (masks None) -- zero behavioural change. `usable` is the
+  one gate the successor generators call."""
+
+  kinds_of = None                                          # {(S_key, part, gid): frozenset}
+  robot_kinds = None                                       # {robot: "vacuum"|"two_finger"}
+
+  def usable(self, S_key, part, gid, robot):
+    if self.kinds_of is None or self.robot_kinds is None:
+      return True                                          # uniform: everything for everyone
+    kind = self.robot_kinds.get(robot)
+    if kind is None:
+      return True
+    return kind in self.kinds_of.get((S_key, part, gid), ())
+
+
 def precompute_grasps(assembly, offset=0.01, gripper_path=None):
   """Pregenerate the reachable grasps for EVERY subassembly that can arise, once, up
   front (design doc: G = pregenerate_grasps). Returns {subassembly_key: labeled grasps}.
@@ -1664,6 +1683,12 @@ def _rerooted(parent, new_root):
   return newp
 
 
+def _grasp_usable(grasp_table, key, gpart, gid, robot):
+  # MIXED-EE gate: may `robot`'s gripper stand at this table grasp? Plain-dict tables /
+  # on-the-fly grasps (uniform scenes) always pass.
+  return not isinstance(grasp_table, GraspTable) or grasp_table.usable(key, gpart, gid, robot)
+
+
 def picks(state, assembly, robots, grasp_table=None, canonical=False):
   # a free robot grabs an on-table, not-yet-held subassembly on a collision-free face of
   # ANY of its parts, and lifts it (that part -> gripper; the tree is re-rooted there).
@@ -1690,6 +1715,8 @@ def picks(state, assembly, robots, grasp_table=None, canonical=False):
         compute_cube_grasps(assembly, key, return_labeled=True)
     for r in free:
       for gpart, grasp_id, _pose in labeled:              # grasp ANY part of the group
+        if not _grasp_usable(grasp_table, key, gpart, grasp_id, r):
+          continue                                        # mixed EEs: not this robot's gripper
         ns = _copy_edit_support(state)
         ns.parent = _rerooted(ns.parent, gpart)
         ns.parent[gpart] = ("gripper", r)
@@ -1872,6 +1899,8 @@ def add_grasps(state, assembly, robots, grasp_table=None):
       for gpart, grasp_id, _pose in labeled:              # grasp ANY free face of the group
         if (gpart, grasp_id) in taken:
           continue                                        # that grasp is already occupied
+        if not _grasp_usable(grasp_table, key, gpart, grasp_id, r):
+          continue                                        # mixed EEs: not this robot's gripper
         ns = _copy_edit_support(state)
         ns.supports[gpart] = ns.supports[gpart] | {("grasp", r, gpart, grasp_id)}
         yield ("add_grasp", r, gpart, grasp_id), ns
@@ -1901,6 +1930,8 @@ def fused_handovers(state, assembly, robots, grasp_table=None):
       for gpart, grasp_id, _pose in labeled:                # B grabs any free face...
         if (gpart, grasp_id) in taken:
           continue
+        if not _grasp_usable(grasp_table, key, gpart, grasp_id, rB):
+          continue                                          # mixed EEs: not B's gripper
         ns = _copy_edit_support(state)
         ns.supports[root] = frozenset(                      # ...A lets go...
             c for c in ns.supports[root] if not (c[0] == "grasp" and c[1] == rA))
@@ -2002,6 +2033,8 @@ def inhand_reorients(state, assembly, robots, grasp_table=None):
     for _gpart, gid, _pose in labeled:                     # _gpart == p (singleton group)
       if gid == old_gid:
         continue                                           # (A) any other grasp reachable
+      if not _grasp_usable(grasp_table, key, p, gid, r):
+        continue                                           # mixed EEs: not r's gripper
       ns = _copy_edit_support(state)
       ns.grasp[p] = gid
       ns.supports[p] = frozenset(
@@ -2088,11 +2121,12 @@ def _staged_press_stable(state, assembly, q, gripper_kind, load_variants):
   seat = Rq @ (d * _shape_half_extent_along(assembly.part_shape(q), d))
   caps = [wrench.cap_slot(seat, Rq @ d)]
   derate = wrench.PARAMS.get("curved_grasp_torque_scale") is not None
+  kind_of = gripper_kind.get if isinstance(gripper_kind, dict) else (lambda _r: gripper_kind)
   for c in sorted(state.supports.get(q, ())):
     if c[0] == "grasp":
       gp, n, t1, t2 = _grasp_frame(assembly, c[2], poses[c[2]], c[3])
       surf = _grasp_surface(assembly.part_shape(c[2]), c[3]) if derate else "flat"
-      caps.append(wrench.grasp_capability(gp - pos, n, t1, t2, gripper_kind, surface=surf))
+      caps.append(wrench.grasp_capability(gp - pos, n, t1, t2, kind_of(c[1]), surface=surf))
   if ("table",) in state.supports.get(q, ()):
     fp = _table_footprint(assembly, poses, [q])
     caps.append(wrench.table_capability([np.asarray(x, dtype=float) - pos for x in fp]))
@@ -2514,24 +2548,33 @@ def _grounding_caps(state, assembly, group, gripper_kind):
   #      params. The heuristic build crafts a FRESH context state per fact, so the L1 cache
   #      alone recomputed identical geometry thousands of times ("should be lookups" -- now
   #      it is; an L2 hit skips pose layout, footprint, and cap construction entirely).
+  # MIXED EEs: gripper_kind may be a {robot: kind} MAP -- each grasp contact is priced with
+  # its holder's kind. kind_of normalizes; cache keys replace the robot by its KIND (two
+  # same-kind arms share caps, exactly like the old identity-free key). Scalars unchanged.
+  if isinstance(gripper_kind, dict):
+    kind_of = gripper_kind.get
+    gk_key = tuple(sorted(gripper_kind.items()))
+  else:
+    kind_of = lambda _r: gripper_kind
+    gk_key = gripper_kind
   cache = getattr(state, "_gcaps", None)
   if cache is None:
     cache = state._gcaps = {}
-  ckey = (_subasm_key(group), gripper_kind)
+  ckey = (_subasm_key(group), gk_key)
   hit = cache.get(ckey)
   if hit is not None:
     return hit
   members_sorted = _subasm_key(group)
   base = reference_part(group)
   on_table = any(("table",) in state.supports.get(p, ()) for p in group)
-  grasps = tuple(sorted((c[2], c[3]) for p in group
+  grasps = tuple(sorted((kind_of(c[1]), c[2], c[3]) for p in group
                         for c in state.supports.get(p, ()) if c[0] == "grasp"))
   anchor_q = np.round(np.asarray(state.poses[base][3:], dtype=float), 9).tobytes()
   l2 = getattr(assembly, "_caps_cache", None)
   if l2 is None:
     l2 = assembly._caps_cache = {}
   l2key = (members_sorted, on_table, _placement_face(state, group) if on_table else None,
-           anchor_q, grasps, gripper_kind, wrench.PARAMS.get("grasp_model"),
+           anchor_q, grasps, wrench.PARAMS.get("grasp_model"),
            wrench.PARAMS.get("curved_grasp_torque_scale"), _ROLLS_PER_FACE)
   anchor_pos = np.asarray(state.poses[base][:3], dtype=float)
   l2hit = l2.get(l2key)
@@ -2559,7 +2602,8 @@ def _grounding_caps(state, assembly, group, gripper_kind):
           continue                                          # no_hold part can't brace a group
         gp, n, t1, t2 = _grasp_frame(assembly, c[2], poses[c[2]], c[3])  # c=(grasp,r,gpart,gid)
         surf = _grasp_surface(assembly.part_shape(c[2]), c[3]) if derate else "flat"
-        caps.append(wrench.grasp_capability(gp - centroid, n, t1, t2, gripper_kind, surface=surf))
+        caps.append(wrench.grasp_capability(gp - centroid, n, t1, t2, kind_of(c[1]),
+                                            surface=surf))
   G = np.hstack([c[0] for c in caps]) if caps else np.zeros((6, 0))
   ub = np.concatenate([c[1] for c in caps]) if caps else np.zeros(0)
   bounds = [(0.0, None if not np.isfinite(u) else float(u)) for u in ub]
