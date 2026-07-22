@@ -54,11 +54,14 @@ from env import make_four_robot_env
 # action -> Task
 # ---------------------------------------------------------------------------
 def _states_along_plan(C, assembly, plan, robots, gk, bracing):
+  # re-derive with the SEARCH's grasp table: the on-the-fly fallback enumerates fewer grasps
+  # (rest-face pruning), so e.g. an inhand_reorient to a table-blocked grasp would not match.
+  _checker, grasp_table = S._search_context(C, assembly, robots)
   s = A.get_initial_state(C, assembly)
   states = [s]
   for a in plan:
-    s = next(ns for act, ns in A.successors(s, assembly, robots, gripper_kind=gk,
-                                            handovers=True, allow_place=True,
+    s = next(ns for act, ns in A.successors(s, assembly, robots, grasp_table=grasp_table,
+                                            gripper_kind=gk, handovers=True, allow_place=True,
                                             bracing=bracing) if act == a)
     states.append(s)
   return states
@@ -153,6 +156,18 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
                frames=["table", _root_of(states[i], a[2], mate_parent)])
     elif kind == "assemble":
       t = Task(name, involved, goal_for(involved, wit), type="place", frames=[a[3], a[2]])
+    elif kind == "inhand_reorient":
+      # IN-PLACE skill: the arm KEEPS its config (goal_for with wit=None keeps cur[r]); the
+      # part's pose IN the gripper snaps to the NEW grasp transform. mr_bench mechanics: the
+      # part is already gripper-parented (from its pick), so the make_appear side effect sets
+      # the new RELATIVE pose (= inverse of the grasp EE transform), and the type="pick"
+      # re-attach to the same gripper keeps that world pose (re-derives the same relative).
+      # v1: lone parts only, so the attach child is the part itself.
+      _g = A.grasp_pose(assembly, a[2], a[3])
+      _ee = np.concatenate([_g[:3], P._quat_mul(_g[3:], robot_ik.q_correction[r])])
+      t = Task(name, [r], goal_for([r], None), type="pick",
+               frames=[robot_ik.gripper_frame[r], a[2]],
+               side_effect="make_appear", side_effect_data=P._pose_invert(_ee))
     elif kind == "release":
       # DETACH: re-parent the released object to its post-release support (table or a
       # CONTINUING holder's gripper). We pin BOTH the releasing arm AND every remaining holder

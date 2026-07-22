@@ -480,6 +480,10 @@ class RobotIK:
     kind = action[0]
     if kind == "release":
       return True, None                                   # no new reach
+    if kind == "inhand_reorient":
+      # in-place skill: the arm keeps its config; the part rotates IN the gripper (no IK
+      # target of its own -- downstream actions solve IK against the new grasp).
+      return True, None
     # VERDICT + WITNESS CACHE on a discrete scene signature: the search re-probes the SAME
     # (action, scene) from many parent states, and a FAILED solve costs ~135ms (initial +
     # 12 restarts) vs ~5ms for a success -- measured 81 re-probed pick failures per 40
@@ -1293,6 +1297,13 @@ def cheap_feasible(action, s0, s1, assembly, checker):
   if action[0] in _GRASP_ACTIONS and not checker.pick_collision_free(
       s0, action[2], action[3], assembly, note=f"grasp candidate of {action}"):
     return False
+  if action[0] == "inhand_reorient":
+    # v1 gate: the RESULT state (part held at its NEW grasp, everything else unchanged) must
+    # be collision-free. Deliberately NOT the _GRASP_ACTIONS candidate check -- that would
+    # test the new EE against the holder's OWN old EE on the same part, which is meaningless
+    # for an in-hand transition (the fingers move continuously, they never coexist).
+    if not checker._check(s1, assembly, note=f"result of {action}"):
+      return False
   return True
 
 
@@ -1343,6 +1354,7 @@ _ACTION_COST = {
     "add_grasp": 1.0, "set_down": 1.0,
     "stow": 1.0,                  # relocate a blocker aside (decluttering search only)
     "handover": 2.0,             # fused regrasp-in-air = a close + an open (== add_grasp;release)
+    "inhand_reorient": 1.0,      # one skill invocation (v1; refine when the skill has a model)
 }
 
 
@@ -1767,11 +1779,15 @@ def utilization_report(C, assembly, plan, robots, witnesses=None, verbose=True,
   joint-space distance from that arm's previous commanded config (releases: 0 -- gripper
   open); units = radians. Without witnesses, 1.0 per action (structural parallelism only).
   Returns {makespan, serial, speedup, busy: {r: time}, durations}."""
+  # re-derive with the SEARCH's grasp table: the on-the-fly fallback enumerates fewer grasps
+  # (rest-face pruning), so a plan action (e.g. an inhand_reorient to a table-blocked grasp)
+  # may not re-derive without it.
+  _checker, grasp_table = _search_context(C, assembly, robots)
   states = [get_initial_state(C, assembly)]
   for a in plan:
     states.append(next(ns for act, ns in successors(
-        states[-1], assembly, robots, gripper_kind=gripper_kind, handovers=handovers,
-        allow_place=allow_place, bracing=bracing) if act == a))
+        states[-1], assembly, robots, grasp_table=grasp_table, gripper_kind=gripper_kind,
+        handovers=handovers, allow_place=allow_place, bracing=bracing) if act == a))
 
   def holders_of(st, part):
     grp = next((g for g in st.subassemblies() if part in g), {part})

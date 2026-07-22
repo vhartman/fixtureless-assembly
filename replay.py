@@ -37,6 +37,7 @@ def build_scene(cfg):
   set_seed(cfg["seed"])
   set_rolls_per_face(1 if cfg["vacuum"] else 2)
   set_dense_grasps(bool(cfg.get("dense_grasps")) and not cfg["vacuum"])
+  set_inhand_reorient(bool(cfg.get("inhand_reorient")))    # plan may contain reorient edges
   apply_wrench_params(cfg)
   C = make_four_robot_env(num_robots=cfg["num_robots"], floating_ee=cfg["floating_ee"],
                           vacuum=cfg["vacuum"],

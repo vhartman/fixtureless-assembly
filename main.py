@@ -516,6 +516,15 @@ def parse_args():
            "pairs). Traded against movement by this weight. Best with the dp-* modes.",
   )
   parser.add_argument(
+      "--inhand-reorient", action="store_true",
+      help="Enable the IN-HAND REORIENT macro action: a robot rotates its held LONE part to "
+           "any other grasp WITHOUT place+pick (kills table-regrasp cycles). V1 assumptions: "
+           "full in-hand connectivity (any grasp -> any grasp), unchanged grip capability "
+           "during the transition, lone solo-held parts only. The labeled heuristics do not "
+           "model this edge -> h may be inadmissible; greedy/milestones/LNS fine, do NOT "
+           "trust bounded-search optimality proofs with this on.",
+  )
+  parser.add_argument(
       "--lru-robots", action="store_true",
       help="Order robots LEAST-RECENTLY-USED first in successor generation (utilization "
            "knob): the greedy/milestone searches take the first feasible successor, so the "
@@ -666,7 +675,7 @@ _SAVE_CONFIG_FIELDS = (
     "assembly", "parts", "num_robots", "vacuum", "floating_ee", "robot", "robot_types",
     "scatter_spacing", "perturb_start_pose", "seed", "wrench", "grasp_model", "insert_force",
     "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
-    "bracing", "robust_mode", "dense_grasps", "random_init", "part_float",
+    "bracing", "robust_mode", "dense_grasps", "random_init", "part_float", "inhand_reorient",
 )
 
 
@@ -701,6 +710,12 @@ def main():
     set_lru_robots(True)
     print("[flag] --lru-robots ACTIVE: successor robots ordered least-recently-used first "
           "(deterministic tie-break; spreads actions across arms).")
+  if args.inhand_reorient:
+    from problem import set_inhand_reorient
+    set_inhand_reorient(True)
+    print("[flag] --inhand-reorient ACTIVE: held lone parts may rotate to any other grasp "
+          "in hand (v1: full connectivity, unchanged grip capability, solo-held lone parts). "
+          "Labeled h unaware of this edge -> may be inadmissible; ignore optimality proofs.")
   import wrench
   wrench.PARAMS["grasp_model"] = args.grasp_model  # capability model (used when --wrench)
   wrench.PARAMS["check_inserter"] = args.inserter_check

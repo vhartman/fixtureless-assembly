@@ -1806,6 +1806,57 @@ def set_lru_robots(on=True):
   _LRU_ROBOTS = bool(on)
 
 
+# IN-HAND REORIENTATION (Tier-2 skills backlog, v1). New macro action
+# ("inhand_reorient", r, p, new_gid): a robot rotates its held part to a DIFFERENT grasp
+# without place+pick -- kills table-regrasp cycles (pick wrong face -> place -> re-pick).
+# V1 SIMPLIFYING ASSUMPTIONS (each an explicit extension point):
+#   (A) FULL in-hand connectivity: any grasp -> any other grasp of the part. Later: a
+#       per-part in-hand connectivity graph gates which (old_gid, new_gid) pairs the skill
+#       can actually reach (finger gaiting / pivoting limits).
+#   (B) NO transition capability change: grip support is assumed unchanged mid-reorient.
+#       Later: a reduced TRANSITION wrench capability (grip momentarily weakened) and
+#       optional EXTERNAL support (extrinsic dexterity) via the swappable-cap machinery.
+#   (C) LONE parts only (single-part group, single grasp): one gripper cannot in-hand
+#       re-grasp a multi-part assembly, and a braced part's other grasps would tear.
+# NOTE the labeled/collapsed heuristics do NOT model this edge, so with the flag on they
+# may OVERESTIMATE (inadmissible): greedy/milestones/LNS guidance is fine; do not trust
+# bounded-search optimality proofs.
+_INHAND_REORIENT = False
+
+
+def set_inhand_reorient(on=True):
+  global _INHAND_REORIENT
+  _INHAND_REORIENT = bool(on)
+
+
+def inhand_reorients(state, assembly, robots, grasp_table=None):
+  # a robot rotates its held LONE part onto another grasp of the same part (v1 assumptions
+  # in the flag doc above). Only when the part is SOLO-held (its single grasp contact is the
+  # kinematic holder's) -- a second grasp (brace) would be torn by the rotation.
+  for group in state.subassemblies():
+    if len(group) != 1:
+      continue                                             # (C) lone parts only
+    p = next(iter(group))
+    carrier = state.parent.get(p)
+    if carrier is None or carrier[0] != "gripper":
+      continue
+    r = carrier[1]
+    if len([c for c in state.supports.get(p, ()) if c[0] == "grasp"]) != 1:
+      continue                                             # braced: reorient would tear it
+    old_gid = state.grasp.get(p)
+    key = _subasm_key(group)
+    labeled = grasp_table[key] if grasp_table is not None else \
+        compute_cube_grasps(assembly, key, return_labeled=True)
+    for _gpart, gid, _pose in labeled:                     # _gpart == p (singleton group)
+      if gid == old_gid:
+        continue                                           # (A) any other grasp reachable
+      ns = _copy_edit_support(state)
+      ns.grasp[p] = gid
+      ns.supports[p] = frozenset(
+          c for c in ns.supports[p] if c[0] != "grasp") | {("grasp", r, p, gid)}
+      yield ("inhand_reorient", r, p, gid), ns
+
+
 def successors(state, assembly, robots, grasp_table=None, canonical=False,
                gripper_kind=None, handovers=True, allow_place=True, bracing=False):
   # handovers=True (default) enables regrasp-in-air via the FUSED `handover`: a free robot
@@ -1830,6 +1881,8 @@ def successors(state, assembly, robots, grasp_table=None, canonical=False,
       yield from fused_handovers(state, assembly, robots, grasp_table=grasp_table)
     if bracing:
       yield from add_grasps(state, assembly, robots, grasp_table=grasp_table)
+    if _INHAND_REORIENT:
+      yield from inhand_reorients(state, assembly, robots, grasp_table=grasp_table)
     yield from releases(state, assembly, robots, gripper_kind=gripper_kind)
     if allow_place:
       yield from places(state, assembly, robots)

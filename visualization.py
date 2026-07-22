@@ -319,8 +319,8 @@ def _active_robots(action, s, rik):
   # the replay -- where that group sits elsewhere -- tears the grasp. Unrelated braces
   # simply keep their pose (their group does not move during this action).
   kind = action[0]
-  if kind == "pick":
-    return [action[1]]                                    # picks move no held group
+  if kind in ("pick", "inhand_reorient"):
+    return [action[1]]                                    # picks/reorients move no held group
   if kind in ("place", "stow"):                            # stow = a place aside (declutter)
     r, root = action[1], action[2]
     group = next((g for g in s.subassemblies() if root in g), frozenset())
@@ -519,6 +519,11 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
       # pin the freshly grasped group exactly onto the gripper (covers IK residual and a
       # failed re-solve -- otherwise a bad relative offset gets baked into the attach and
       # trails the arm forever).
+      group = next(g for g in nxt.subassemblies() if action[2] in g)
+      _align_group_to_holder(nxt, group, action[1], action[2], action[3])
+    elif action[0] == "inhand_reorient":
+      # the in-hand skill's net effect: the held part rotates in the gripper to its NEW
+      # grasp transform (no arm motion is solved for the reorient itself).
       group = next(g for g in nxt.subassemblies() if action[2] in g)
       _align_group_to_holder(nxt, group, action[1], action[2], action[3])
     elif action[0] in ("place", "stow"):
