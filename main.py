@@ -520,9 +520,9 @@ def parse_args():
       help="Enable the IN-HAND REORIENT macro action: a robot rotates its held LONE part to "
            "any other grasp WITHOUT place+pick (kills table-regrasp cycles). V1 assumptions: "
            "full in-hand connectivity (any grasp -> any grasp), unchanged grip capability "
-           "during the transition, lone solo-held parts only. The labeled heuristics do not "
-           "model this edge -> h may be inadmissible; greedy/milestones/LNS fine, do NOT "
-           "trust bounded-search optimality proofs with this on.",
+           "during the transition, lone solo-held parts only. The labeled/collapsed "
+           "heuristics MODEL this edge (inverse-reorient, cost 1) -> h stays admissible; "
+           "bounded/exact optimality proofs remain valid.",
   )
   parser.add_argument(
       "--lru-robots", action="store_true",
@@ -715,7 +715,7 @@ def main():
     set_inhand_reorient(True)
     print("[flag] --inhand-reorient ACTIVE: held lone parts may rotate to any other grasp "
           "in hand (v1: full connectivity, unchanged grip capability, solo-held lone parts). "
-          "Labeled h unaware of this edge -> may be inadmissible; ignore optimality proofs.")
+          "Labeled/collapsed h model the inverse-reorient edge (cost 1) -> h stays admissible.")
   import wrench
   wrench.PARAMS["grasp_model"] = args.grasp_model  # capability model (used when --wrench)
   wrench.PARAMS["check_inserter"] = args.inserter_check

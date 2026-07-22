@@ -385,3 +385,46 @@ def test_module_connect():
   partial = [a for a, _ns in A.assembles(s_part, asm, robots)
              if a[2] == "obj_4" and a[3] == "obj_0"]
   assert not partial, "a partial top plate must not be joinable (forcing broken)"
+
+
+def test_inhand_reorient():
+  """v1 IN-HAND REORIENT macro (flag-gated): a held lone part offers a reorient edge to
+  every other grasp (full-connectivity assumption); the edge is well-formed and passes the
+  cheap layer; a solve with the flag on still reaches the goal and re-derives; and with the
+  flag OFF no reorient edges are emitted (default path untouched)."""
+  A.set_seed(0)
+  A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 4)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  checker, gt = A._search_context(C, asm, robots)
+  s0 = A.get_initial_state(C, asm)
+  act, held = next((a, ns) for a, ns in A.picks(s0, asm, robots, grasp_table=gt)
+                   if A.cheap_feasible(a, s0, ns, asm, checker))
+  p, old_gid = act[2], act[3]
+
+  # flag OFF (default): no reorient successors anywhere
+  assert not [a for a, _ in A.successors(held, asm, robots, gt)
+              if a[0] == "inhand_reorient"], "reorient emitted with flag off"
+
+  A.set_inhand_reorient(True)
+  try:
+    re = [(a, ns) for a, ns in A.successors(held, asm, robots, gt)
+          if a[0] == "inhand_reorient"]
+    assert re, "no reorient edges from a held lone part"
+    assert all(a[1] == act[1] and a[2] == p and a[3] != old_gid for a, _ in re), \
+        "reorient must keep the holder + part and change the grasp"
+    a2, ns2 = re[0]
+    assert ns2.grasp[p] == a2[3], "new grasp not recorded"
+    assert ns2.parent[p] == ("gripper", act[1]), "part must stay gripper-parented"
+    grasps = [c for c in ns2.supports[p] if c[0] == "grasp"]
+    assert grasps == [("grasp", act[1], p, a2[3])], "supports must carry exactly the new grasp"
+    assert A.cheap_feasible(a2, held, ns2, asm, checker)
+
+    plan = A.solve_assembly_problem(C, asm, robots=robots, weight=3.0, verbose=False,
+                                    wrench=False, robot_ik=None)
+    assert plan is not None
+    assert _replay_ok(plan, asm, C, robots, None)
+  finally:
+    A.set_inhand_reorient(False)

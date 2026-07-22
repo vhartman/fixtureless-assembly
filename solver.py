@@ -2188,6 +2188,19 @@ class LabeledDisassemblyHeuristic:
           for gq2 in self.single[q]:
             if gq2 != gq:
               yield (ideal, G, face, tadd(tsub(L, (q, gq)), (q, gq2))), 2.0
+      # inverse IN-HAND REORIENT (cost 1, gated on --inhand-reorient): a loose part's grasp
+      # was swapped IN HAND -- no place+pick, NO free arm (unlike the handover above, hence no
+      # cap_used gate). v1 FULL connectivity => any grasp reachable from any other at +1; scope
+      # = loose singleton parts (L), matching the real action's lone-part restriction. GATED:
+      # without the flag the capability does not exist, so the edge must be ABSENT (else h is
+      # optimistic about a disabled skill). Extra edges only relax => admissible; the +1 cost
+      # dominates the +2 loose-handover for the same swap when on. Upgrades to a connectivity
+      # GRAPH later by gating gq2 on the (q, gq, gq2) reachable set instead of "any other".
+      if _problem._INHAND_REORIENT:
+        for q, gq in L:
+          for gq2 in self.single[q]:
+            if gq2 != gq:
+              yield (ideal, G, face, tadd(tsub(L, (q, gq)), (q, gq2))), 1.0
       # inverse PLACE-LOOSE: a loose part now on the table was held just before
       if cap_used < self.R:
         for q in objs:
@@ -2709,6 +2722,14 @@ class CollapsedLabeledHeuristic:
             for gq2 in self.single[q]:
               if gq2 != gq:
                 yield (ideal, G, face, tadd(tsub(L, (q, gq)), (q, gq2))), 2.0
+        # inverse IN-HAND REORIENT (cost 1, gated): loose part's grasp CLASS swapped in hand,
+        # no free arm needed (see the fine class for the full rationale). Pure-collapse mode
+        # forgets loose grasps entirely -> reorient is a no-op there, so only labeled_loose.
+        if _problem._INHAND_REORIENT:
+          for q, gq in L:
+            for gq2 in self.single[q]:
+              if gq2 != gq:
+                yield (ideal, G, face, tadd(tsub(L, (q, gq)), (q, gq2))), 1.0
         # inverse PLACE-LOOSE, labeled: one edge per (part, class)
         if cap_used < self.R:
           for q in objs:
