@@ -2037,6 +2037,24 @@ def _labeled_geo_ok(checker, assembly, st, ideal_set, note=""):
   return checker._check(st, assembly, note=note)
 
 
+def _staged_valid_labeled(assembly, ideal, G, face, held_face):
+  # STAGED-MATE gate for the labeled abstractions (--staged-mates): the exact abstract mirror
+  # of the forward successor invariant (_problem._staged_ok) -- an abstract state where a
+  # staged part p is assembled (p in ideal), its fastener is NOT, no grasp in G is on p, and
+  # the slot alone cannot hold p at `face` (held -> identity convention, same as forward) is
+  # the image of NO forward-reachable state, so excluding it keeps h ADMISSIBLE while pricing
+  # the hold-until-fastened arm commitment (states that drop p early become unreachable
+  # backward => their h rises / goes inf). G keeps (part, ...) in both the fine and collapsed
+  # classes, so the p-has-a-grasp test is faithful under label collapse.
+  for p, fx in assembly.staged_mates.items():
+    if p in ideal and fx not in ideal:
+      if not any(g[0] == p for g in G):
+        f = _problem._IDENTITY_FACE if face == held_face else face
+        if not _problem._slot_holds_alone(assembly, p, f):
+          return False
+  return True
+
+
 class LabeledDisassemblyHeuristic:
   """GRASP-LABELED backward-disassembly abstraction (the tractability spike).
 
@@ -2327,6 +2345,7 @@ class LabeledDisassemblyHeuristic:
           self.dist[st] = 0.0
           heapq.heappush(pq, (0.0, id(st), st))
 
+    _staged_gate = _problem._STAGED_MATES and bool(assembly.staged_mates)
     popped = 0
     while pq:
       d, _, t = heapq.heappop(pq)
@@ -2339,6 +2358,8 @@ class LabeledDisassemblyHeuristic:
         nd = d + c
         if dist_cap is not None and nd > dist_cap:
           continue                                        # CORRIDOR cap: miss => dist > cap,
+        if _staged_gate and not _staged_valid_labeled(assembly, s[0], s[1], s[2], Hf):
+          continue                                        # staged-mate invariant (admissible)
         if nd < self.dist.get(s, float("inf")):           # h=inf sound under cost_bound<=cap
           self.dist[s] = nd
           heapq.heappush(pq, (nd, id(s), s))
@@ -2864,6 +2885,7 @@ class CollapsedLabeledHeuristic:
           self.dist[st] = 0.0
           heapq.heappush(pq, (0.0, id(st), st))
 
+    _staged_gate = _problem._STAGED_MATES and bool(assembly.staged_mates)
     popped = 0
     while pq:
       d, _, t = heapq.heappop(pq)
@@ -2876,6 +2898,8 @@ class CollapsedLabeledHeuristic:
         nd = d + c
         if dist_cap is not None and nd > dist_cap:
           continue                                        # CORRIDOR cap: miss => dist > cap,
+        if _staged_gate and not _staged_valid_labeled(assembly, s[0], s[1], s[2], Hf):
+          continue                                        # staged-mate invariant (admissible)
         if nd < self.dist.get(s, float("inf")):           # h=inf sound under cost_bound<=cap
           self.dist[s] = nd
           heapq.heappush(pq, (nd, id(s), s))

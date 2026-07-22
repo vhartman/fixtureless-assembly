@@ -147,6 +147,24 @@ def cap_rigid_weld(point):
   return np.array(G).T, np.full(len(G), np.inf)
 
 
+def cap_slot(point, press_axis):
+  # PARTIAL (staged) mate -- a SLOT/pocket, v1 point-contact model: the walls constrain the
+  # part LATERALLY (bilateral, both walls), the seat bottom pushes BACK against the press
+  # (unilateral along -press_axis: it resists seating deeper, never holds against extraction),
+  # and -- being a point contact -- NO couples: a cantilevered part tips out under its own
+  # gravity moment. This is what makes "pushed-through-but-unpinned" (A11) expressible; the
+  # fastener upgrades the mate to cap_rigid_weld (the group becomes one rigid body again).
+  # Extension: a DEEP slot = several points along the insertion depth (patch -> couples).
+  d = np.asarray(press_axis, float)
+  d = d / (np.linalg.norm(d) + 1e-12)
+  ref = np.array([0.0, 0.0, 1.0]) if abs(d[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+  t1 = _cross3(ref, d); t1 /= np.linalg.norm(t1)
+  t2 = _cross3(d, t1)
+  G = [_force_gen(s * t, point) for t in (t1, t2) for s in (+1.0, -1.0)]
+  G.append(_force_gen(-d, point))                          # seat pushes back, only
+  return np.array(G).T, np.full(len(G), np.inf)
+
+
 def cap_table_unilateral(points):
   # UNILATERAL table support: at each support point, a normal force that can only PUSH UP
   # (+z), never pull, and no tangential (frictionless) component. The set of such points is

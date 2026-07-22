@@ -87,6 +87,14 @@ class Assembly:
     # on the car, but you can't then hang the car off it for later steps. NOT a physics change
     # (mates stay rigid welds); just a discrete restriction on which grasps count as support.
     self.no_hold = set()
+    # STAGED MATES (A11, --staged-mates): {part: fastener_part}. `part`'s mate is only a
+    # PARTIAL contact -- a slot (wrench.cap_slot: lateral walls + seat, NO couples, no
+    # extraction resistance) -- until `fastener_part` is mated into the same subassembly,
+    # which upgrades it to the usual rigid weld. Until then the part may fall out of its own
+    # group (gravity moment / extraction component), so the search must keep a grasp on it or
+    # rest the assembly on a face where the slot alone balances gravity -- discovered, not
+    # scripted (see _staged_ok). Empty (default) + flag off => byte-identical behavior.
+    self.staged_mates = {}
     self.define()
     for p in self.objects:                                 # fill physics defaults
       self.masses.setdefault(p, self.DEFAULT_MASS)
@@ -572,6 +580,34 @@ class CarAssembly(Assembly):
     self.assembly_dependencies = {}
 
 
+class SlotPinAssembly(Assembly):
+  """STAGED-MATE test assembly (A11): base + a CANTILEVER bar slotted into its side + a PIN
+  that fastens the bar. The bar's mate is staged (a slot until the pin lands): unheld and
+  unpinned, its own gravity moment tips it out of the slot -- so with --staged-mates the
+  search must keep a hand on the bar until the pin is assembled (or rest the assembly slot-
+  opening-up). Without the flag it behaves like any rigid-weld 3-chain.
+  """
+
+  def __init__(self, n_parts=3, spacing=0.055, cube_size=0.05, cube_radius=0.005):
+    assert 2 <= n_parts <= 3, "slot-pin is base + bar + pin"
+    self.n_parts = n_parts
+    self.spacing = spacing
+    self.cube_size = cube_size
+    self.cube_radius = cube_radius
+    super().__init__()
+
+  def define(self):
+    self.objects = [f"obj_{i}" for i in range(self.n_parts)]
+    self.base = "obj_0"
+    o = self.spacing
+    self.assembly_dependencies = {f"obj_{i}": [f"obj_{i - 1}"] for i in range(1, self.n_parts)}
+    self.assembly_relative_poses = {"obj_1": ["obj_0", np.array([o, 0.0, 0.0])]}
+    if self.n_parts >= 3:
+      self.assembly_relative_poses["obj_2"] = ["obj_1", np.array([0.0, 0.0, o])]
+      self.staged_mates = {"obj_1": "obj_2"}               # bar is a slot until the pin lands
+    self.masses = {"obj_0": 0.3}                           # heavy base: group stays on its feet
+
+
 def make_assembly(kind, n_parts):
   """Assembly factory for the CLI: cross (cube cross), cube (2x2x2 grid), arch (bridge --
   known-flawed star, see class doc), arch-seq (arch shape built as a sequential chain),
@@ -588,7 +624,8 @@ def make_assembly(kind, n_parts):
            # 0.8w*2 = 0.048, comfortably inside the two-finger's ~0.078 inner gap, so the
            # fingers can take a wheel ACROSS THE DIAMETER (radial side grasp) -- the
            # grasp-DB's curved-surface entries, which the two-finger keeps (vacuum drops).
-           "car-mini": (lambda n_parts: CarAssembly(n_parts=n_parts, width=0.03), 5)}
+           "car-mini": (lambda n_parts: CarAssembly(n_parts=n_parts, width=0.03), 5),
+           "slot-pin": (SlotPinAssembly, 3)}
   cls, max_n = kinds[kind]
   return cls(n_parts=min(n_parts, max_n))
 
@@ -1857,6 +1894,77 @@ def inhand_reorients(state, assembly, robots, grasp_table=None):
       yield ("inhand_reorient", r, p, gid), ns
 
 
+# STAGED / PARTIAL MATES (A11, --staged-mates). A staged mate (assembly.staged_mates:
+# {part: fastener}) is only a SLOT until the fastener is mated into the same group: the part
+# is geometrically in place (kinematics/scene graph rigid, unchanged) but the FORCE model
+# treats it as separable -- its own supports must balance its own gravity. V1 model, applied
+# uniformly forward and in the labeled heuristics (so h mirrors the exact reachable set):
+#   * a grasp ON the part counts as holding it (topological, like the no-wrench baseline);
+#   * otherwise the SLOT alone must balance the part's gravity at the group's orientation --
+#     a pure per-(part, face) LP fact (wrench.cap_slot vs gravity; gripper-independent), so
+#     resting the assembly slot-opening-UP is discovered as an alternative to holding.
+# Enforced as a SUCCESSOR filter (one point, every action gated) => the invariant "no
+# reachable state has an unheld, unfastened, slot-insufficient part" holds globally; the
+# fastener's own assemble upgrades the mate implicitly (fastener in group => check skipped).
+_STAGED_MATES = False
+
+
+def set_staged_mates(on=True):
+  global _STAGED_MATES
+  _STAGED_MATES = bool(on)
+
+
+def _slot_holds_alone(assembly, part, face):
+  # LP fact, memoized per (part, face): can the SLOT capability alone balance `part`'s gravity
+  # when the assembly rests on placement face `face` (identity face = held/upright)? Gravity
+  # acts at the part's centroid (zero torque about it), so the slot's point forces at the seat
+  # must supply (m*g*z, 0) -- orientation is everything, the masses/lever lengths cancel.
+  cache = getattr(assembly, "_slot_fact", None)
+  if cache is None:
+    cache = assembly._slot_fact = {}
+  key = (part, face)
+  if key not in cache:
+    d = assembly.mate_axis(part)
+    if d is None:
+      cache[key] = True                                    # no mate axis: nothing to check
+    else:
+      R = _quat_to_R(np.asarray(_FACE_DOWN_QUATS[face], dtype=float))
+      kind, params = assembly.part_shape(part)
+      if kind == "box":
+        half = float(np.dot(np.abs(d), np.asarray(params[:3], dtype=float))) / 2.0
+      elif kind == "cylinder":
+        half = abs(d[2]) * params[0] / 2.0 + (1 - abs(d[2])) * params[1]
+      else:                                                # sphere
+        half = params[0]
+      seat = R @ (half * np.asarray(d, dtype=float))       # seat face center, centroid-relative
+      G, ub = wrench.cap_slot(seat, R @ np.asarray(d, dtype=float))
+      w = wrench.gravity_wrench([(assembly.mass(part), np.zeros(3))])
+      bounds = [(0.0, None) for _ in ub]
+      cache[key] = wrench.equilibrium_feasible_matrices(G, ub, w, bounds=bounds)
+  return cache[key]
+
+
+def _staged_ok(state, assembly):
+  # the staged-mate support invariant (see block comment above). True when no group contains
+  # a mated-but-unfastened staged part that is neither grasped nor slot-supported at the
+  # group's orientation (held groups use the identity/upright convention, like the rest of
+  # the discrete model).
+  for group in state.subassemblies():
+    for p, fastener in assembly.staged_mates.items():
+      if p not in group or fastener in group:
+        continue                                           # absent, or fastened -> weld
+      sup = state.supports.get(p, ())
+      if not any(c[0] == "mate" for c in sup):
+        continue                                           # p not mated yet (loose/held alone)
+      if any(c[0] == "grasp" and c[2] == p for c in sup):
+        continue                                           # a hand on p holds it (v1)
+      face = _placement_face(state, group) if _group_is_on_table(state, group) \
+          else _IDENTITY_FACE
+      if not _slot_holds_alone(assembly, p, face):
+        return False
+  return True
+
+
 def successors(state, assembly, robots, grasp_table=None, canonical=False,
                gripper_kind=None, handovers=True, allow_place=True, bracing=False):
   # handovers=True (default) enables regrasp-in-air via the FUSED `handover`: a free robot
@@ -1889,13 +1997,15 @@ def successors(state, assembly, robots, grasp_table=None, canonical=False,
     # deferred (unfused): set_downs
 
   def _filtered():
+    it = _gen()
     if _BRACE_FOR_ASSEMBLY_ONLY and _has_brace(state):
       # a brace is present -> only consume it (assemble) or drop it (release); see the flag doc.
-      for a, ns in _gen():
-        if a[0] in ("assemble", "release"):
-          yield a, ns
-      return
-    yield from _gen()
+      it = (x for x in it if x[0][0] in ("assemble", "release"))
+    if _STAGED_MATES and assembly.staged_mates:
+      # staged-mate invariant: gate EVERY successor here (one point, all actions) -- see
+      # _staged_ok. Off / no staged mates => generator passes through untouched.
+      it = (x for x in it if _staged_ok(x[1], assembly))
+    yield from it
 
   if not _LRU_ROBOTS:
     yield from _filtered()

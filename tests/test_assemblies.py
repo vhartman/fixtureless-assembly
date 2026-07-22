@@ -428,3 +428,62 @@ def test_inhand_reorient():
     assert _replay_ok(plan, asm, C, robots, None)
   finally:
     A.set_inhand_reorient(False)
+
+
+def test_staged_mates():
+  """STAGED/PARTIAL mates (A11, flag-gated): slot-pin's bar mate is a SLOT until the pin
+  lands. Flag ON: (a) the orientation fact -- upright the slot cannot hold the bar alone,
+  slot-opening-up it can; (b) releasing the bar's grasp before the pin is NOT a successor
+  (hold-until-fastened emerges), and is again once the pin is mated; (c) the exact solve
+  reaches the goal, re-derives, and orders the bar's release AFTER the pin; (d) the gated
+  labeled h finds the same optimal cost (admissibility spot check). Flag OFF: the early
+  release IS offered (baseline untouched)."""
+  import numpy as np
+  A.set_seed(0)
+  A.set_rolls_per_face(1)
+  asm = A.make_assembly("slot-pin", 3)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  s0 = A.get_initial_state(C, asm)
+  _, gt = A._search_context(C, asm, robots)
+
+  # (a) the per-(part, face) slot fact
+  assert not A._slot_holds_alone(asm, "obj_1", A._IDENTITY_FACE), "upright cantilever held?!"
+  up = next(f for f, n in enumerate(A._CUBE_FACE_NORMALS) if np.allclose(n, [-1.0, 0, 0]))
+  assert A._slot_holds_alone(asm, "obj_1", up), "slot-opening-up face must hold the bar"
+
+  def apply(s, match):
+    return next(ns for a, ns in A.successors(s, asm, robots, gt) if match(a))
+
+  def bar_releases(s):
+    return [a for a, _ in A.successors(s, asm, robots, gt)
+            if a[0] == "release" and a[2] == "obj_1"]
+
+  s1 = apply(s0, lambda a: a[0] == "pick" and a[2] == "obj_1")
+  s2 = apply(s1, lambda a: a[0] == "assemble" and a[2] == "obj_1")   # mated, unfastened
+  assert bar_releases(s2), "flag off: the early release must be offered (baseline)"
+
+  A.set_staged_mates(True)
+  try:
+    # (b) hold-until-fastened: no release while unfastened; legal again after the pin
+    assert not bar_releases(s2), "unfastened bar released -- staged gate failed"
+    s3 = apply(s2, lambda a: a[0] == "pick" and a[2] == "obj_2")
+    s4 = apply(s3, lambda a: a[0] == "assemble" and a[2] == "obj_2")
+    assert bar_releases(s4), "release must be legal once fastened"
+
+    # (c) end-to-end: solves, re-derives, and the ordering is forced in the plan
+    plan = A.solve_assembly_problem(C, asm, robots=robots, weight=1.0, verbose=False,
+                                    wrench=False, robot_ik=None)
+    assert plan is not None
+    assert _replay_ok(plan, asm, C, robots, None)
+    i_pin = next(i for i, a in enumerate(plan) if a[0] == "assemble" and a[2] == "obj_2")
+    i_rel = next(i for i, a in enumerate(plan) if a[0] == "release" and a[2] == "obj_1")
+    assert i_pin < i_rel, "bar released before the pin landed"
+
+    # (d) gated labeled h: same optimal cost as the plain-h exact solve
+    plan_lab = A.solve_assembly_problem(C, asm, robots=robots, weight=1.0, verbose=False,
+                                        wrench=False, robot_ik=None, labeled_h=True)
+    assert plan_lab is not None and len(plan_lab) == len(plan)
+  finally:
+    A.set_staged_mates(False)

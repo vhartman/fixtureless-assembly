@@ -80,7 +80,7 @@ def parse_args():
   parser.add_argument(
       "--assembly",
       choices=["cross", "cube", "arch", "arch-seq", "cube-plates", "cube-plates-2x2x3",
-               "cuboid-tower", "car", "car-mini"],
+               "cuboid-tower", "car", "car-mini", "slot-pin"],
       default="cross",
       help="Assembly to build: cross (cube cross, 7), cube (2x2x2 grid, 8), "
            "arch (two pillars + lintel, 7 -- known-flawed star model), "
@@ -89,7 +89,8 @@ def parse_args():
            "cube-plates-2x2x3 (three stacked 2x2 plates, 12 cubes -- use --parts 12), "
            "cuboid-tower (jenga-style: 2 laid cuboids per level, levels rotated 90deg, up to 8), "
            "car (cuboid body + 4 sideways cylinder wheels, 5), "
-           "car-mini (car scaled to w=0.03: wheels fit ACROSS the two-finger gap). "
+           "car-mini (car scaled to w=0.03: wheels fit ACROSS the two-finger gap), "
+           "slot-pin (base + cantilever bar + fastening pin -- the --staged-mates testbed). "
            "Default: cross.",
   )
   parser.add_argument(
@@ -525,6 +526,19 @@ def parse_args():
            "bounded/exact optimality proofs remain valid.",
   )
   parser.add_argument(
+      "--staged-mates", action="store_true",
+      help="Enable STAGED/PARTIAL mates (A11): a mate listed in the assembly's staged_mates "
+           "({part: fastener}) is only a SLOT (lateral walls + seat, no couples, no extraction "
+           "resistance) until its fastener is mated into the same group -- so an inserted-but-"
+           "unpinned part falls out unless a hand stays on it or the assembly rests slot-"
+           "opening-up. Enforced as a successor filter (every action gated); the labeled/"
+           "collapsed heuristics model the same invariant -> h stays admissible, and the "
+           "hold-until-fastened behavior is DISCOVERED, not scripted. No new actions; the "
+           "fastener's own assemble upgrades the mate to a weld implicitly. Assemblies "
+           "without staged_mates (all but slot-pin) are unaffected. Default off (byte-"
+           "identical behavior).",
+  )
+  parser.add_argument(
       "--lru-robots", action="store_true",
       help="Order robots LEAST-RECENTLY-USED first in successor generation (utilization "
            "knob): the greedy/milestone searches take the first feasible successor, so the "
@@ -711,7 +725,7 @@ _SAVE_CONFIG_FIELDS = (
     "scatter_spacing", "perturb_start_pose", "seed", "wrench", "grasp_model", "insert_force",
     "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
     "bracing", "robust_mode", "dense_grasps", "random_init", "part_float", "inhand_reorient",
-    "pre_insertion", "pre_pick", "pre_place", "pre_add_grasp",
+    "pre_insertion", "pre_pick", "pre_place", "pre_add_grasp", "staged_mates",
 )
 
 
@@ -746,6 +760,12 @@ def main():
     set_lru_robots(True)
     print("[flag] --lru-robots ACTIVE: successor robots ordered least-recently-used first "
           "(deterministic tie-break; spreads actions across arms).")
+  if args.staged_mates:
+    from problem import set_staged_mates
+    set_staged_mates(True)
+    print("[flag] --staged-mates ACTIVE: staged mates are SLOTS until their fastener lands "
+          "(unheld unfastened part falls out unless the slot faces up); successor filter + "
+          "labeled-h gate, admissible. Assemblies without staged_mates are unaffected.")
   if args.inhand_reorient:
     from problem import set_inhand_reorient
     set_inhand_reorient(True)
