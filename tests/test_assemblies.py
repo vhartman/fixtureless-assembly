@@ -562,3 +562,71 @@ def test_staged_press_noise():
     assert not press_ok(corners), "noisy shear couple must defeat the unheld point slot"
   finally:
     W.PARAMS["insertion_uncertainty"] = None
+
+
+def test_milestone_fill_releases_inherited_grasp():
+  """Regression for the STRANDED-ARM milestone-fill bug (root-caused 2026-07-24 via captured-
+  state replay). A milestone fill may ENTER holding a part it does not own: the previous fill
+  can end held-through (<=1 holder persists), so the next fill inherits a grasp on a part
+  OUTSIDE its own `relevant = ideal u {p}` (e.g. an arm still bracing the settled stool while
+  the backrest MODULE is filled). The fill's successor filter drops actions on non-relevant
+  parts -- but `release` MUST stay exempt, else that arm is STRANDED for the whole fill (a
+  module needing >1 arm then goes infeasible -> the 60-repair backjump cascade, 380s).
+
+  Crafted so the exemption is FORCED: a1 braces obj_2 (a resting, NON-relevant part), so the
+  fill goal (nothing loose) is unreachable UNLESS obj_2's grasp is released. WITH the exemption
+  the fill succeeds and its subplan releases obj_2; WITHOUT it the fill returns None (loose
+  never clears) and this test fails -- the direct guard for the one-line fix. (Fast: one
+  crafted state, one mini-fill.)"""
+  import solver as S
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 3)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  checker, gt = S._search_context(C, asm, robots)
+  s0 = A.get_initial_state(C, asm)
+  gid = next(g for _p, g, _pose in gt[("obj_2",)])
+  # a1 braces obj_2 while it rests: an INHERITED grasp on a part outside the fill's relevant set
+  sup = dict(s0.supports)
+  sup["obj_2"] = frozenset(sup["obj_2"]) | {("grasp", "a1", "obj_2", gid)}
+  start = A.State(parent=dict(s0.parent), place=dict(s0.place), supports=sup, poses=dict(s0.poses))
+  assert any(a[2] == "obj_2" for a, _ in A.releases(start, asm, robots)), \
+      "precondition: bracing a resting part must itself be releasable"
+
+  # fill obj_1 into ideal={obj_0}; obj_2 (braced by a1) is NON-relevant to this fill
+  sub, end = S._add_one_part(start, "obj_1", {"obj_0"}, asm, robots, checker, gt, None,
+                             weight=5.0, max_nodes=20000, verbose=False)
+  assert sub is not None, "fill STRANDED: inherited non-relevant grasp could not be released"
+  assert any(a[0] == "release" and a[2] == "obj_2" for a in sub), \
+      "the fill must clear the inherited grasp via the release exemption"
+  assert S._part_mated(end, "obj_1"), "fill did not mate its part"
+  assert not any(c[0] == "grasp" for c in end.supports.get("obj_2", ())), "obj_2 left stranded"
+
+  # control: WITHOUT the inherited brace the same fill needs NO release of obj_2 -- proving the
+  # release above is caused by the inherited grasp, not incidental to building obj_1.
+  sub0, _ = S._add_one_part(s0, "obj_1", {"obj_0"}, asm, robots, checker, gt, None,
+                            weight=5.0, max_nodes=20000, verbose=False)
+  assert sub0 is not None and not any(a[0] == "release" and a[2] == "obj_2" for a in sub0)
+
+
+def test_milestone_module_fill():
+  """The MILESTONE planner on a MODULE assembly -- the solver family the stranded-arm fix lives
+  in (the net had no milestone case before). cube-plates-8 builds the top plate {obj_4..7} as a
+  DETACHED module, then JOINS it; module fills inherit grasps across milestones exactly as the
+  fixed path requires. Asserts a valid, goal-reaching plan that actually performs the module
+  join (so the module path is genuinely exercised), within a loose time bound -- the bug
+  manifested as a ~20x slowdown, so the bound also guards the repair-cascade regression."""
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cube-plates", 8)
+  C = make_four_robot_env(num_robots=3, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  t0 = time.time()
+  plan = A.solve_assembly_problem_milestones(C, asm, robots=robots, weight=5.0, verbose=False)
+  assert plan is not None, "milestones found no plan for the module assembly"
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None), "milestone plan misses the goal"
+  assert any(a[0] == "assemble" and a[2] == "obj_4" and a[3] == "obj_0" for a in plan), \
+      "plan never performs the module join -- the module path was not exercised"
+  assert len(plan) <= 21 + SLACK, f"milestone plan length {len(plan)} >> baseline 21 (regression?)"
+  assert time.time() - t0 < 40.0, "milestone module fill got unexpectedly slow (repair cascade?)"

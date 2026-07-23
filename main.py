@@ -9,19 +9,31 @@ def parse_args():
   parser = argparse.ArgumentParser(
       description="Spawn a multi-robot UR10 environment."
   )
-  parser.add_argument(
+  g_scene   = parser.add_argument_group("scene & problem", "assembly, parts, robots, grippers, initial layout, goal")
+  g_solver  = parser.add_argument_group("solver / engine", "which search algorithm runs + suboptimality weight")
+  g_search  = parser.add_argument_group("search tuning", "heuristics, ordering, pruning, fill windows, action toggles")
+  g_phys    = parser.add_argument_group("physics / wrench model", "static-equilibrium stability, grasp caps, bracing, staged mates")
+  g_ik      = parser.add_argument_group("IK & feasibility", "real-robot IK in the search feasibility loop")
+  g_witness = parser.add_argument_group("witness optimization", "post-solve IK-keyframe smoothing (discrete plan fixed)")
+  g_skills  = parser.add_argument_group("skills / pre-insertion splits", "export & replay funnel splits (search unchanged)")
+  g_mp      = parser.add_argument_group("motion-plan export (mr_bench)", "hand the plan to the multi-robot motion planner")
+  g_viz     = parser.add_argument_group("visualization", "viewers, grasp/rest-pose catalogs, schematic views")
+  g_diag    = parser.add_argument_group("diagnostics & IK tests", "one-off IK probes, in-search stats, debug knobs")
+  g_output  = parser.add_argument_group("output & persistence", "metrics, plan post-passes, save/replay")
+
+  g_scene.add_argument(
       "--num-robots", type=int, default=4,
       help="Number of robots to spawn (max 6). Default: 4",
   )
-  parser.add_argument(
+  g_scene.add_argument(
       "--floating-ee", action="store_true",
       help="Use free-floating end-effectors instead of the full arm.",
   )
-  parser.add_argument(
+  g_scene.add_argument(
       "--vacuum", action="store_true",
       help="Use the vacuum end-effector instead of the two-finger gripper.",
   )
-  parser.add_argument(
+  g_scene.add_argument(
       "--grippers", default=None, metavar="CSV",
       help="MIXED END EFFECTORS: per-robot gripper kinds, comma-separated (vacuum|two_finger), "
            "e.g. 'vacuum,two_finger,two_finger' for a1..a3. Fewer entries than robots: the "
@@ -31,67 +43,67 @@ def parse_args():
            "heuristics stay admissible (pick facts OR over kinds; wrench facts fall back to "
            "topological under mixed). Incompatible with --anon-robots (identity matters).",
   )
-  parser.add_argument(
+  g_scene.add_argument(
       "--robot", choices=["ur10", "ur10_limited", "ur5"], default="ur10",
       help="Robot arm for all robots: ur10 (default), ur10_limited (ur10 with a tighter "
            "shoulder-lift/elbow workspace), or ur5. With --floating-ee the arm is "
            "irrelevant (a generic floating gripper); it matters for the real arm (no --floating-ee "
            "/ --real-ik) -- note the ur5 has a much shorter reach (~0.85 m vs ~1.3 m).",
   )
-  parser.add_argument(
+  g_scene.add_argument(
       "--robot-types", default=None,
       help="Advanced: comma-free per-slot override of the robot type (defaults to --robot for "
            "every slot). Rarely needed.",
   )
-  parser.add_argument(
+  g_scene.add_argument(
       "--perturb-start-pose", action="store_true",
       help="Randomly perturb the object start poses (kept collision free).",
   )
-  parser.add_argument(
+  g_scene.add_argument(
       "--part-float", type=float, default=0.015, metavar="M",
       help="z offset of the scattered parts above the table top (metres, default 0.015 -- "
            "the historical float). Propagates through placement anchors, so every later "
            "set-down keeps the same hover.",
   )
-  parser.add_argument(
+  g_scene.add_argument(
       "--random-init", type=float, nargs="?", const=0.45, default=None, metavar="HALF",
       help="FULLY randomize the initial part positions: uniform x/y in the central square "
            "[-HALF, +HALF]^2 between the robots (default 0.45 when given bare) plus a random "
            "yaw, rejection-sampled collision-free. Seeded via --seed (reproducible). "
            "Overrides the scatter line; --perturb-start-pose is ignored with it.",
   )
-  parser.add_argument(
+  g_scene.add_argument(
       "--scatter-spacing", type=float, default=1.0 / 7.0, metavar="M",
       help="x-pitch of the scatter line in metres (default 1/7 ~ 0.143, the historical "
            "layout). For analysing how much search/IK cost is scene density.",
   )
-  parser.add_argument(
+  g_viz.add_argument(
       "--no-view", dest="view", action="store_false",
       help="Do not open the interactive viewer.",
   )
-  parser.add_argument(
+  g_viz.add_argument(
       "--disp-final", dest="disp_final", action="store_true",
       help="Show the final desired result.",
   )
-  parser.add_argument(
+  g_viz.add_argument(
       "--show-init", action="store_true",
       help="Open a blocking viewer on the INITIAL scene (after scatter/--random-init) before "
            "anything else runs -- close the window to continue (e.g. into --solve). For "
            "checking layouts, e.g. what --random-init sampled.",
   )
-  parser.add_argument(
+  g_viz.add_argument(
       "--viz-grasps", action="store_true",
       help="GRASP CATALOG in viser (add --viser): one scrubbable step per part showing every "
            "candidate grasp as a floating EE (green=flat / orange=curved surface; with "
            "--wrench, green=mate-viable / grey=not). No search. Prints per-part counts.",
   )
-  parser.add_argument(
+  g_viz.add_argument(
       "--viz-rest-poses", action="store_true",
       help="REST-POSE CATALOG in viser (add --viser): each group (singletons, connect "
            "modules, full assembly) laid out on the table in every stable rest pose, one "
            "step per (group,face). A group with NO steps is an unparkable subassembly. No search.",
   )
-  parser.add_argument(
+  g_viz.add_argument(
       "--mate-sequence-viz", action="store_true",
       help="SCHEMATIC mate-sequence view (no search): walk the DAG's assembly order, and at "
            "each mate draw the contact interface point(s) (green crosses), the insertion "
@@ -100,15 +112,15 @@ def parse_args():
            "--viser for the scrubbable web view; prints per-mate press + peak moment. A way "
            "to sanity-check interface points and joint loads before ever solving.",
   )
-  parser.add_argument(
+  g_viz.add_argument(
       "--show-successors", action="store_true",
       help="Visualize a few successor states of the initial search state, then exit.",
   )
-  parser.add_argument(
+  g_scene.add_argument(
       "--parts", type=int, default=7,
       help="Number of parts in the assembly (clamped per type). Default: 7.",
   )
-  parser.add_argument(
+  g_scene.add_argument(
       "--assembly",
       choices=["cross", "cube", "arch", "arch-seq", "cube-plates", "cube-plates-2x2x3",
                "cuboid-tower", "car", "car-mini", "slot-pin", "chair"],
@@ -124,40 +136,40 @@ def parse_args():
            "slot-pin (base + cantilever bar + fastening pin -- the --staged-mates testbed). "
            "Default: cross.",
   )
-  parser.add_argument(
+  g_solver.add_argument(
       "--solve", action="store_true",
       help="Run the A* assembly search and print the plan.",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--canonical", action="store_true",
       help="Break robot symmetry in the search (lowest-index free robot). TEST-ONLY: "
            "unsound once robots have fixed bases -- emits a warning.",
   )
-  parser.add_argument(
+  g_solver.add_argument(
       "--weight", type=float, default=1.0,
       help="Weighted-A* factor f=g+w*h: 1=optimal, >1 faster & bounded-suboptimal, "
            "inf=greedy best-first. Use a large value (e.g. 5 or inf) for fast solutions.",
   )
-  parser.add_argument(
+  g_diag.add_argument(
       "--test-pick-ik", nargs="?", const="a1:obj_1:0", default=None,
       metavar="ROBOT:PART:GRASP",
       help="Pop up the real-robot pick IK for a (robot, part, grasp) and exit, e.g. "
            "--test-pick-ik a1:obj_1:0 (default a1:obj_1:0).",
   )
-  parser.add_argument(
+  g_diag.add_argument(
       "--test-assemble-ik", nargs="?", const="a1:obj_1:0", default=None,
       metavar="ROBOT:PART:GRASP",
       help="Pop up the real-robot assemble IK: robot holds PART at GRASP and mates it "
            "onto its manual parent, then exit, e.g. --test-assemble-ik a1:obj_1:0.",
   )
-  parser.add_argument(
+  g_diag.add_argument(
       "--test-assemble-held-ik", nargs="?", const="a1:obj_1:0:a2:1", default=None,
       metavar="ROBOT:PART:GRASP:TARGET_ROBOT:ONTO_GRASP",
       help="Like --test-assemble-ik but the target (manual parent) is HELD by TARGET_ROBOT "
            "at ONTO_GRASP, so both cubes are in the air and both arms co-optimize. "
            "E.g. --test-assemble-held-ik a1:obj_1:0:a2:1.",
   )
-  parser.add_argument(
+  g_diag.add_argument(
       "--test-place-ik", nargs="?", const="a1:obj_1:0:1:5", default=None,
       metavar="ROBOT:PART:GRASP:N_ASSEMBLED[:FACE]",
       help="Pop up the real-robot place IK: with N_ASSEMBLED parts already mated, ROBOT "
@@ -165,19 +177,19 @@ def parse_args():
            "placement FACE (0-5, 5=upright default), then exit. "
            "E.g. --test-place-ik a1:obj_1:0:1:0.",
   )
-  parser.add_argument(
+  g_ik.add_argument(
       "--real-ik", action="store_true",
       help="Run the search with real-robot IK in the feasibility loop (RobotIK), and "
            "replay the plan with the actual arm poses instead of floating-EE stand-ins.",
   )
-  parser.add_argument(
+  g_ik.add_argument(
       "--no-ik-seeding", action="store_false", dest="ik_seeding",
       help="With --real-ik: use analytic closed-form IK (ssik) on every fixed-target skill "
            "(pick/place/assemble-onto-table, incl. braced): exact per-arm reachability rejects "
            "(replacing the relaxed precheck), collision-probed branch combos, and warm starts "
            "for the KOMO. Calibrated arms only (ur5/ur10 two-finger); others keep the precheck.",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--dense-grasps", action="store_true",
       help="TWO-FINGER only: add the +-45deg WRIST-TILTED variant of every face grasp -- the "
            "pads keep the SAME flat face pinch (rotation is about the finger-closing axis "
@@ -186,7 +198,7 @@ def parse_args():
            "for approaches that clear obstacles a face-aligned wrist hits. Ignored with "
            "--vacuum (rotationally symmetric).",
   )
-  parser.add_argument(
+  g_ik.add_argument(
       "--ik-collision-gate", type=float, default=0.015, metavar="M",
       help="With --ik-seeding: penetration depth (metres) beyond which an exact analytic branch "
            "counts as DEEPLY colliding; a bind is rejected pre-KOMO only if EVERY branch combo "
@@ -194,19 +206,19 @@ def parse_args():
            "rescues grazes up to ~0.010, never >=0.014. 0 = ANY penetration rejects "
            "(aggressive: loses grazing rescues). Negative = off (probe/ranking only).",
   )
-  parser.add_argument(
+  g_ik.add_argument(
       "--full-ik", action="store_true",
       help="DEBUG: disable the single-active-arm pick-IK optimisations (restrict-to-arm + "
            "strip inactive-robot collision). Uses the full multi-arm KOMO instead. Slower; "
            "for checking the optimisations against the reference.",
   )
-  parser.add_argument(
+  g_solver.add_argument(
       "--optimistic", action="store_true",
       help="Use the optimistic (Dogar-style) per-part search -- add one part at a time via "
            "its own small complete sub-search (reorient/hold/pick/mate/set-down), with exact "
            "fallback -- instead of the exact search. Much faster on the cases that blow up.",
   )
-  parser.add_argument(
+  g_solver.add_argument(
       "--milestones", action="store_true",
       help="MILESTONE planner: the labeled abstraction's backward (assembly-by-disassembly) "
            "solve picks the next part to add (wrench-informed ORDER, grasps assumed "
@@ -215,7 +227,7 @@ def parse_args():
            "and reroutes. Scales like --optimistic but with a SEARCHED part order, bracing "
            "support, and repair instead of an exact-search fallback.",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--place-cells", type=int, nargs="?", const=4, default=0, metavar="N",
       help="EXPERIMENTAL: offer up to N extra TRANSLATED placement anchors per (group, face) "
            "near the table centre (default 4 when given bare), in addition to the classic "
@@ -223,7 +235,7 @@ def parse_args():
            "where half the arms cannot reach; central cells make braced work reachable. Adds "
            "branching (~N x places).",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--por", action="store_true",
       help="EXPERIMENTAL partial-order reduction in the exact search: among INDEPENDENT "
            "successor actions (different robots, disjoint parts) only the canonically sorted "
@@ -231,26 +243,26 @@ def parse_args():
            "through geometry) -- meant for spread scenes (--min-sep) with floating EEs where "
            "independence actually holds. Prints when active.",
   )
-  parser.add_argument(
+  g_scene.add_argument(
       "--min-sep", type=float, default=None, metavar="M",
       help="With --random-init: enforce a pairwise x/y separation of at least M metres "
            "between parts (e.g. 0.2), so part geometries/graspability provably cannot "
            "interact -- the --por independence assumption.",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--prefer-center", action="store_true",
       help="With --place-cells: offer the CELL placements (table centre first) BEFORE the "
            "classic scatter-anchor placement -- at equal f the FIFO tie-break then tries "
            "central placements first. Pure successor ordering, no pruning.",
   )
-  parser.add_argument(
+  g_diag.add_argument(
       "--search-stats", type=float, nargs="?", const=10.0, default=None, metavar="SEC",
       help="Print periodic in-search statistics every SEC seconds (default 10 when given "
            "bare): expanded/claimed/frontier sizes and per-action-kind edge-check + failure "
            "counts; the same per-kind summary is printed with the final result. Exact "
            "search only.",
   )
-  parser.add_argument(
+  g_solver.add_argument(
       "--bounded", action="store_true",
       help="INCUMBENT-BOUNDED search: the milestone planner produces a fast incumbent plan, "
            "then the exact search runs with the incumbent's cost as a sound prune bound "
@@ -258,7 +270,7 @@ def parse_args():
            "weight x optimal); with --weight 1 the phase-2 result is optimal. Combines the "
            "decomposed solver's speed with the exact search's guarantee.",
   )
-  parser.add_argument(
+  g_solver.add_argument(
       "--lazy", action="store_true",
       help="LAZY-VALIDATION exact search (LazySP-style): search the discrete graph "
            "optimistically (no per-edge cheap-collision/IK), then validate only the CANDIDATE "
@@ -266,7 +278,7 @@ def parse_args():
            "once, caches warm). Same completeness and plan validity as the exact search; "
            "wins when most eagerly-checked edges never end up in a plan.",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--brace-for-assembly-only", action="store_true",
       help="EXPERIMENTAL (MEASURED HARMFUL, off by default): assume a brace (2nd grasp via "
            "add_grasp) is only needed to stabilise an ASSEMBLE, so a braced state (>=2 grippers "
@@ -276,19 +288,19 @@ def parse_args():
            "The domain fact is right; the clean form is an atomic add_grasp+assemble MACRO, not "
            "this filter. Kept for experimentation; prints when active.",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--declutter", action="store_true",
       help="With --optimistic: allow each per-part step to RELOCATE blocking loose parts "
            "(stow them aside on demand) instead of only touching that part and the assembly. "
            "Removes the 'nothing else is in the way' assumption.",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--wrench", action="store_true",
       help="Turn on the static-equilibrium (stability) model: support-gate assemble/release "
            "with the insertion reaction, so sideways mates on a resting assembly need a hold "
            "(mating becomes perpendicular unless braced). Default off (topological baseline).",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--grasp-model", choices=["isotropic", "directional", "asymmetric"],
       default="isotropic",
       help="Grasp wrench-capability model (with --wrench): isotropic = the original "
@@ -297,7 +309,7 @@ def parse_args():
            "along the approach axis (pressing into the palm/cup is structural, pull-off is "
            "the weak suction/friction path).",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--vacuum-scale", type=float, default=None, metavar="FACTOR",
       help="With --wrench: scale ALL of the VACUUM's capability by this factor (every force "
            "AND torque cap -- push, pull, lateral, couples -- across whichever grasp model "
@@ -305,7 +317,7 @@ def parse_args():
            "= a cup a tenth as capable everywhere: still picks a light part but holds almost "
            "nothing against gravity or a press. Default off (factor 1).",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--tf-close-torque", type=float, default=None, metavar="NM",
       help="With --wrench --grasp-model asymmetric: override the two-finger's torque cap "
            "ABOUT THE CLOSING AXIS (the line joining the two finger contacts) -- the axis a "
@@ -313,29 +325,29 @@ def parse_args():
            "part rotates out of the jaws. Default (unset) keeps it equal to T_lat (0.4 Nm); "
            "a small value (e.g. 0.05) models a grip that cannot resist out-of-hand twist.",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--no-handovers", dest="handovers", action="store_false",
       help="Disable the add_grasp/handover primitives (regrasp-in-air). On by default; "
            "turning it off gives a leaner reference search (no second-grasp branching).",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--no-place", dest="allow_place", action="store_false",
       help="Forbid setting a held assembly back on the table: the search must hold it and "
            "regrasp in the air (handovers become mandatory -- the Dogar hold-and-work "
            "regime). Meaningful for the exact search; the optimistic search needs to set down.",
   )
-  parser.add_argument(
+  g_solver.add_argument(
       "--anytime", type=float, nargs="?", const=60.0, default=None, metavar="SECONDS",
       help="Anytime mode (exact search): restarting weighted A* -- a fast suboptimal plan "
            "first, then keep improving it (and possibly prove optimality) until the time "
            "budget runs out. Optional value = budget in seconds (default 60).",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--no-wrench-aware-h", dest="wrench_aware_h", action="store_false",
       help="With --wrench: build the heuristic (h_abs or --labeled-h) WITHOUT the wrench "
            "facts, for comparison. Default: wrench-aware whenever --wrench is on.",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--bracing", action="store_true",
       help="Enable the add_grasp (co-grasp) primitive: a free robot adds a SECOND gripper to "
            "an already-held assembly and KEEPS it (unlike handover, which swaps). Needed for "
@@ -343,37 +355,37 @@ def parse_args():
            "yaw-cancelling couple so two braces are required. Off by default (adds branching). "
            "Exact search only (solve/anytime); the labeled-h abstraction models it when on.",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--labeled-h", action="store_true",
       help="EXACT search only: use the grasp+face-LABELED disassembly abstraction as the "
            "heuristic (strictly tighter than the default abstraction; one-time build of "
            "seconds). Finite weights only (like the default abstraction).",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--anon-robots", action="store_true",
       help="LATE BINDING: search with a robot-anonymous state key -- robot-permutation "
            "states merge, so adding (idle) robots does not blow up the search. Sound for "
            "interchangeable floating grippers; with --real-ik treat the plan as a candidate.",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--insert-force", type=float, default=10.0, metavar="N",
       help="Insertion (mating) reaction magnitude in newtons (with --wrench). Default 10. "
            "Sets what binds: e.g. two-finger caps are shear 15 / pull 25 / push 100, so at "
            "10 N held side-mates are free, at 30 N only press-aligned grasps survive.",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--ignore-gravity", action="store_true",
       help="With --wrench: WEIGHTLESS parts -- drop the gravity load from every stability "
            "check, so a hold must only resist the INSERTION reaction (and other applied "
            "loads), not part weight. Isolates insertion/bracing feasibility from gravity.",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--curved-torque-scale", type=float, default=None, metavar="S",
       help="With --wrench: derate the TORQUE (couple) a CURVED grasp (cylinder side / sphere) "
            "can resist to S x that of a flat hold (force caps unchanged). E.g. 0.25. Models "
            "'a wheel grip pivots in the jaws'; off by default (flat and curved treated alike).",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--grasp-compliance", type=float, nargs="?", const=3.5, default=None, metavar="VACUUM",
       help="GRASP COMPLIANCE (with --wrench and --insertion-noise): inflate the insertion-"
            "uncertainty box by this factor (default 3.5) whenever a VACUUM grasp holds a body "
@@ -382,7 +394,7 @@ def parse_args():
            "avoiding the vacuum for tight assembly becomes EMERGENT (it may still do loose "
            "mates), not a hardcoded prohibition. Two-finger stays 1.0. Default off.",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--insertion-noise", type=float, nargs="?", const=0.2, default=None, metavar="LATERAL",
       help="With --wrench: model MISALIGNED seating as a worst-case uncertainty BOX -- an "
            "angular tilt gives a shear up to LATERAL x insert_force transverse to the mate "
@@ -390,13 +402,13 @@ def parse_args():
            "of the box (exact, by convexity -- no sampling). Adds an unavoidable shear/torque "
            "so a weak grasp holding far from the mate fails. Off by default.",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--insertion-offset", type=float, default=0.0, metavar="M",
       help="With --insertion-noise: add the second (positional) box axis -- the axial press "
            "also lands off-CENTRE by up to M metres (a transverse couple = insert_force x M). "
            "0 (default) => a 4-corner lateral-only box; >0 => a 16-corner box.",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--robust-mode", choices=("corners", "affine"), default="corners",
       help="How the insertion-uncertainty box is checked. 'corners' (default): EXACT -- every box "
            "corner must be balanceable, contacts free to rechoose their force split per "
@@ -404,13 +416,13 @@ def parse_args():
            "open-loop / fixed-compliance grasp that cannot sense the seating error and "
            "re-optimize) must cover the whole box; a single LP, stricter, still sound.",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--no-inserter-check", dest="inserter_check", action="store_false",
       help="With --wrench: skip the inserter-side check (whether the pressing arm's own "
            "grasp can transmit the seating reaction) -- equivalent to giving that grasp "
            "unbounded capability. The target-side stability check stays on.",
   )
-  parser.add_argument(
+  g_diag.add_argument(
       "--log-ik-failures", type=float, nargs="?", const=60.0, default=None,
       metavar="SECONDS",
       help="With --real-ik: record FAILED IK binds of the search (the skill's scene posed "
@@ -419,14 +431,14 @@ def parse_args():
            "stops after SECONDS (default 60, measured from the first failure) or 300 "
            "entries, whichever first.",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--collapsed-h", action="store_true",
       help="Use the IDENTITY-COLLAPSED labeled disassembly heuristic (loose held parts "
            "tracked WITHOUT grasp ids). Same admissibility/completeness guarantees as "
            "--labeled-h, weaker guidance, but the build scales in #robots (the fine "
            "version explodes at 4). Mutually exclusive with --labeled-h.",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--part-order-bias", action="store_true",
       help="Plateau TIE-BREAK: among frontier nodes with equal f (and h), expand the one "
            "whose action touches the LOWEST part index first -- i.e. prefer building in the "
@@ -434,7 +446,7 @@ def parse_args():
            "are untouched; it only decides which equally-promising node to try first, which "
            "is what matters on the abstraction's large equal-h plateaus.",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--grasp-collapsed-h", action="store_true",
       help="--collapsed-h PLUS the dense-grasp LABEL collapse: wrist-tilt variants fold onto "
            "their base grasp id in the abstraction (facts OR'd over variants -- a further "
@@ -442,7 +454,7 @@ def parse_args():
            "labels explode the build ~3x per robot; measured 24x on cross-4/3R). Without "
            "--dense-grasps it behaves exactly like --collapsed-h.",
   )
-  parser.add_argument(
+  g_solver.add_argument(
       "--ladder-lns", type=float, nargs="?", const=900.0, default=None, metavar="SEC",
       help="THE LADDER v2: k=1 milestones (lazy fills) -> LNS sweeps over the incumbent "
            "(segment re-fills of width 1,2 bounded by old segment cost, cascade to "
@@ -451,7 +463,7 @@ def parse_args():
            "proof; exhaustion is weight-neutral). k=2 milestone rung runs only as a "
            "feasibility fallback. --ladder is retained unchanged as the baseline.",
   )
-  parser.add_argument(
+  g_solver.add_argument(
       "--ladder", type=float, nargs="?", const=900.0, default=None, metavar="SEC",
       help="THE LADDER: unified anytime solver -- one commitment axis (fill window k), "
            "one monotone incumbent bound U. Rungs: k=1 milestones (lazy fills, bound "
@@ -459,7 +471,7 @@ def parse_args():
            "WEIGHT 1 (PEA*) whose first goal pop is optimal-under-U and whose exhaustion "
            "PROVES U optimal. Budget split ~35/20/45%%. Default 900s.",
   )
-  parser.add_argument(
+  g_solver.add_argument(
       "--milestones-anytime", type=float, nargs="?", const=300.0, default=None,
       metavar="SEC",
       help="THE SINGLE RECIPE: adaptive-width milestones (DAG modules + width-2 window "
@@ -469,20 +481,20 @@ def parse_args():
            "never OOMs; result <= min(milestone cost, weight x optimal) when the "
            "improvement pass completes. Use --weight inf for greedy fills (fastest).",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--no-lazy-fills", action="store_false", dest="lazy_fills",
       help="Disable LAZY-VALIDATED milestone fills (default on): fills search with the "
            "cheap gate only and run real IK on candidate subplan edges (LazySP hybrid, "
            "IK failures blacklisted + rerun) -- the measured fix for module fills "
            "spending minutes on failed IK binds at pop.",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--lns-segments", action="store_true",
       help="LNS neighborhood unit = SETTLED segments instead of the default OBJECT unit "
            "(k = consecutive mated parts). Baseline/ablation; segments coarsen unevenly "
            "under hold-through re-fills.",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--fill-window", type=int, default=2, metavar="K",
       help="Milestone fill window escalation limit (default 2): on width-1 failure, try "
            "JOINT fills of 2..K parts (escalating only as each smaller width exhausts) "
@@ -490,7 +502,7 @@ def parse_args():
            "commitment's completeness gap; K=n would be the flat exact search. "
            "1 disables windows.",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--corridor-h", action="store_true",
       help="With --bounded: cap the phase-2 heuristic's backward Dijkstra at the "
            "incumbent's cost U (beyond-cap states never pushed; miss => h=inf, sound "
@@ -500,7 +512,7 @@ def parse_args():
            "Harmless; kept for depth-heavy instances. The real version of the idea needs "
            "a TWO-SIDED corridor (forward+backward abstract dist <= U) to cut width.",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--pathmax", action="store_true",
       help="PATHMAX consistency repair in the exact engines: h(child) >= h(parent) - "
            "edge cost (triangle inequality => still admissible; all guarantees "
@@ -508,7 +520,7 @@ def parse_args():
            "it cannot touch the h-STALL steps, which are the actual f-bumps (sanities "
            "bit-identical; cube-plates-2x2x3 unchanged). Kept as a safe no-cost option.",
   )
-  parser.add_argument(
+  g_solver.add_argument(
       "--pea", action="store_true",
       help="PARTIAL-EXPANSION A* engine: identical guarantees and ordering to the exact "
            "search, but the open list holds only each node's current f-BAND -- successors "
@@ -516,7 +528,7 @@ def parse_args():
            "factor, for long horizons where the plain open list OOMs (compute-for-memory "
            "trade; succ/h are cached). Composes with --bounded (phase-2 engine).",
   )
-  parser.add_argument(
+  g_solver.add_argument(
       "--iter-bound", action="store_true",
       help="ITERATIVE COST-BOUND DEEPENING: run exact passes at cost_bound = h(s0)+1, +2, "
            "... until a plan appears -- the FIRST plan found is PROVEN OPTIMAL (each "
@@ -525,7 +537,7 @@ def parse_args():
            "the minimum any optimality proof needs. Combine with --pea for the smallest "
            "footprint. Integer action costs assumed (step 1).",
   )
-  parser.add_argument(
+  g_solver.add_argument(
       "--beam", type=int, default=None, metavar="N",
       help="BEAM SEARCH engine (width N): keeps <= N states per depth level (memory-"
            "bounded). MEASURED WORSE THAN GREEDY on the long-horizon benchmark "
@@ -535,7 +547,7 @@ def parse_args():
            "incumbent fallback in --bounded (fires only if greedy also fails) and for "
            "experimentation.",
   )
-  parser.add_argument(
+  g_solver.add_argument(
       "--dfbnb", action="store_true",
       help="DEPTH-FIRST BRANCH-AND-BOUND certificate engine (implies --bounded): linear "
            "memory + LRU transposition table, anytime. MEASURED SLOWER than the bounded "
@@ -544,13 +556,13 @@ def parse_args():
            "out at 1500s -- DFS re-enters the interleaving lattice that A*'s claim-at-pop "
            "kills globally). Use only if the A* open list truly cannot fit memory.",
   )
-  parser.add_argument(
+  g_scene.add_argument(
       "--no-goal-on-table", action="store_false", dest="goal_on_table",
       help="GOAL: require the finished assembly to REST ON THE TABLE and be released "
            "(hands-off), not merely complete-in-air. Default goal is complete (held "
            "counts). Extensible to a specific target pose later (set_goal(pose=...)).",
   )
-  parser.add_argument(
+  g_witness.add_argument(
       "--optimize-witnesses", nargs="?", const="joint", default=None,
       choices=["joint", "ee", "dp-joint", "dp-ee"], metavar="MODE",
       help="POST-optimize the plan's IK witnesses (discrete plan FIXED): re-solve each IK "
@@ -563,7 +575,7 @@ def parse_args():
            "witnesses kept on any failure); idle arms stay home-pinned as in the search. "
            "Requires --real-ik.",
   )
-  parser.add_argument(
+  g_witness.add_argument(
       "--witness-clearance", type=float, default=0.0, metavar="W",
       help="Per-step CLEARANCE weight for --optimize-witnesses (0=off, ~1.0 works). "
            "Among candidate witnesses, prefer configs that keep the active arm clear of "
@@ -572,7 +584,7 @@ def parse_args():
            "min: the gripper is pinned near the object; the cap ignores already-far "
            "pairs). Traded against movement by this weight. Best with the dp-* modes.",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--inhand-reorient", action="store_true",
       help="Enable the IN-HAND REORIENT macro action: a robot rotates its held LONE part to "
            "any other grasp WITHOUT place+pick (kills table-regrasp cycles). V1 assumptions: "
@@ -581,7 +593,7 @@ def parse_args():
            "heuristics MODEL this edge (inverse-reorient, cost 1) -> h stays admissible; "
            "bounded/exact optimality proofs remain valid.",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--brace-resting", action="store_true",
       help="With --bracing: allow add_grasp on a TABLE-RESTING assembly (steadying it "
            "against a press), not only on held ones. Physically routine; without it a "
@@ -589,7 +601,7 @@ def parse_args():
            "single milestone fills fail where windows (that never release) succeed on "
            "press-heavy configs. Default off.",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--useful-grasps", action="store_true",
       help="SPEC 6.2 (reduced): compute each part's MATE-VIABLE grasp set U[p] (collision-"
            "free at the op x press-transmitting per kind, wrench-aware) and (a) ORDER every "
@@ -597,13 +609,13 @@ def parse_args():
            "non-U grasp at +1 in the milestone fill h (the forced regrasp, admissible). "
            "Ordering + pricing only; nothing is removed -- completeness untouched. Default off.",
   )
-  parser.add_argument(
+  g_diag.add_argument(
       "--fill-touch-all", action="store_true",
       help="DEBUG: let a milestone fill act on ANY loose part (move a blocking scatter part "
            "aside), not just the ideal+the one being added. Big fill-search blow-up; use only "
            "to test whether the ideal-only restriction is what makes a fill fail.",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--mixed-wrench-h", action="store_true",
       help="With mixed --grippers + --wrench: build the PER-KIND wrench heuristic (facts + "
            "signature components evaluate each grasp's kind mask -- admissible, force-aware). "
@@ -612,7 +624,7 @@ def parse_args():
            "Default OFF = the fast topological fallback (wrench facts skipped under mixed). "
            "Turn on only when the search backtracks on force-feasibility the h can't see.",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--dominance", action="store_true",
       help="DOMINANCE pruning (spec 8.3, 'same node modulo free robots'): among currently-"
            "FREE arms of the same gripper kind, only the lowest-index one acts (idle twins "
@@ -621,7 +633,7 @@ def parse_args():
            "arms the twins sit at different table sides and the pruning may cost plans "
            "(a warning is printed). Default off.",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--allow-curved-grasps", action="store_true",
       help="Let a VACUUM keep CURVED-surface grasps (normally dropped -- a suction cup cannot "
            "seal on a cylinder/sphere side, so only the flat end-caps survive). Idealised knob "
@@ -629,7 +641,7 @@ def parse_args():
            "graspable by the vacuum. No effect on the two-finger (it keeps curved grasps "
            "already). Must be set before the grasp table is built (it is). Default off.",
   )
-  parser.add_argument(
+  g_phys.add_argument(
       "--staged-mates", action="store_true",
       help="Enable STAGED/PARTIAL mates (A11): a mate listed in the assembly's staged_mates "
            "({part: fastener}) is only a SLOT (lateral walls + seat, no couples, no extraction "
@@ -642,7 +654,7 @@ def parse_args():
            "without staged_mates (all but slot-pin) are unaffected. Default off (byte-"
            "identical behavior).",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--lru-robots", action="store_true",
       help="Order robots LEAST-RECENTLY-USED first in successor generation (utilization "
            "knob): the greedy/milestone searches take the first feasible successor, so the "
@@ -652,14 +664,14 @@ def parse_args():
            "Deterministic (no RNG, stable ties); pure successor ordering, search space "
            "unchanged. May cost a few extra actions (forced alternation).",
   )
-  parser.add_argument(
+  g_skills.add_argument(
       "--skill", type=float, nargs="?", const=0.05, default=0.0, metavar="DELTA",
       help="Shorthand: enable ALL pre-skill splits (--pre-pick/--pre-place/--pre-add-grasp/"
            "--pre-insertion) at DELTA metres (default 0.05) -- treat pick, place, brace, and "
            "mate as skills. An explicit per-skill --pre-* flag overrides this for that skill. "
            "Default off.",
   )
-  parser.add_argument(
+  g_skills.add_argument(
       "--pre-insertion", type=float, nargs="?", const=0.05, default=0.0, metavar="DELTA",
       help="PRE-INSERTION funnel (EXPORT/REPLAY only; the SEARCH is unchanged): split every "
            "`assemble` into a GOTO to the funnel-mouth pose T_pre (the mate witness backed off "
@@ -669,25 +681,25 @@ def parse_args():
            "SKILLS branch that second task becomes the insertion skill. The mate pose, wrench "
            "gate, and plan are all untouched. Default off (0 = single un-split assemble).",
   )
-  parser.add_argument(
+  g_skills.add_argument(
       "--pre-pick", type=float, nargs="?", const=0.05, default=0.0, metavar="DELTA",
       help="Like --pre-insertion, for PICK (EXPORT/REPLAY only): split each pick into a GOTO to "
            "the pre-grasp pose (gripper retracted DELTA m along its -approach axis, default "
            "0.05) + the real grasp at the pick witness. Default off.",
   )
-  parser.add_argument(
+  g_skills.add_argument(
       "--pre-place", type=float, nargs="?", const=0.05, default=0.0, metavar="DELTA",
       help="Like --pre-insertion, for PLACE (EXPORT/REPLAY only): split each place into a GOTO "
            "to the pre-place pose (object lifted DELTA m in +z off its rest pose, default 0.05) "
            "+ the real set-down at the place witness. Default off.",
   )
-  parser.add_argument(
+  g_skills.add_argument(
       "--pre-add-grasp", type=float, nargs="?", const=0.05, default=0.0, metavar="DELTA",
       help="Like --pre-pick, for ADD_GRASP (the brace/handover reach; EXPORT/REPLAY only): split "
            "each add_grasp into a GOTO to the pre-grasp (gripper retracted DELTA m along its "
            "-approach axis, default 0.05) + the real brace reach. Default off.",
   )
-  parser.add_argument(
+  g_output.add_argument(
       "--hoist-releases", action="store_true",
       help="POST-PASS after --solve (before witness optimization): bubble every `release` as "
            "EARLY in the plan as legal -- applicable per the real successor generator (wrench "
@@ -696,7 +708,7 @@ def parse_args():
            "sooner (shorter robot chains in the schedule / depgraph, less idle-arm clutter "
            "for motion planning). Plan length and final state unchanged.",
   )
-  parser.add_argument(
+  g_output.add_argument(
       "--utilization", action="store_true",
       help="After --solve, report the plan's SCHEDULED-MAKESPAN utilization: list-schedule "
            "the actions on their resource partial order (robots + touched parts -- the same "
@@ -704,14 +716,14 @@ def parse_args():
            "per-robot busy%%. Durations = witness joint-distances when --optimize-witnesses "
            "ran, else 1/action. Report only; no behavior change.",
   )
-  parser.add_argument(
+  g_witness.add_argument(
       "--witness-robot-collisions", action="store_true",
       help="During --optimize-witnesses, keep the OTHER robots' collision geometry ON (the "
            "search strips it on solo steps for speed). Re-solved witnesses then AVOID the idle "
            "arms instead of passing through them -- important before motion planning, where "
            "mr_bench validates every arm. Note idle arms are at HOME in the witness scene.",
   )
-  parser.add_argument(
+  g_mp.add_argument(
       "--motion-plan", action="store_true",
       help="After --solve, EXPORT the plan (+ witnesses) to the mr_bench motion planner "
            "(mp_export) and run Bidirectional RRT* to a collision-free multi-robot path. "
@@ -720,53 +732,53 @@ def parse_args():
            "--real-ik (for the IK witnesses); if --optimize-witnesses is not given, RAW "
            "search witnesses are used. See the --mp-* flags for planner options.",
   )
-  parser.add_argument(
+  g_mp.add_argument(
       "--mp-sequence", action="store_true",
       help="With --motion-plan: export a FIXED-SEQUENCE problem (total order) instead of the "
            "default DEPENDENCY GRAPH (partial order, planner may reorder independent actions).",
   )
-  parser.add_argument(
+  g_mp.add_argument(
       "--mp-optimize", action="store_true",
       help="With --motion-plan: RRT* COST optimization until --mp-runtime (default: stop at "
            "the first solution). Improves path cost; uses the tree-extension shim.",
   )
-  parser.add_argument(
+  g_mp.add_argument(
       "--mp-runtime", type=float, default=60.0, metavar="SEC",
       help="With --motion-plan: BiRRT search budget in seconds (default: 60). Bounds ONLY the "
            "tree search, NOT shortcutting.",
   )
-  parser.add_argument(
+  g_mp.add_argument(
       "--mp-no-shortcut", action="store_true",
       help="With --motion-plan: skip the shortcutting post-process (fastest to a raw path).",
   )
-  parser.add_argument(
+  g_mp.add_argument(
       "--mp-shortcut-iters", type=int, default=1000, metavar="N",
       help="With --motion-plan: shortcut iteration cap (default 1000; NOT time-bounded).",
   )
-  parser.add_argument(
+  g_mp.add_argument(
       "--mp-shortcut-res", type=float, default=None, metavar="R",
       help="With --motion-plan: shortcut collision resolution (default: env collision_resolution, "
            "~10x faster than mr_bench's own 0.001 for identical quality).",
   )
-  parser.add_argument(
+  g_mp.add_argument(
       "--mp-viser", action="store_true",
       help="With --motion-plan: serve the found PATH in mr_bench's own viser viewer "
            "(display_path_viser: step slider + playback). Blocks. Port = --viser-port.",
   )
-  parser.add_argument(
+  g_mp.add_argument(
       "--mp-collision-view", action="store_true",
       help="With --mp-viser: show only PRIMITIVE (collision) shapes -- capsules/boxes/"
            "cylinders/ssBox -- and hide the file-loaded visual meshes "
            "(display_path_viser primitives_only). See exactly what the planner collides.",
   )
-  parser.add_argument(
+  g_mp.add_argument(
       "--mp-modes", action="store_true",
       help="With --motion-plan: instead of planning, step through the exported problem's MODES "
            "(each posed at its task goal keyframe) in mr_bench's own viser viewer "
            "(scripts/show_problems.py::visualize_modes). Good for debugging the export / "
            "spotting per-mode collisions. Blocks. Port = --viser-port.",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--sig-collapsed-h", action="store_true",
       help="SIGNATURE grasp collapse + LABELED loose parts: grasp labels are equivalence "
            "classes under the fact signature (press capability, pick-face vector, contact "
@@ -774,12 +786,12 @@ def parse_args():
            "fine labeled-h's plateau-killing pick/press discrimination at collapsed-h "
            "scale. Facts OR over class members (relaxation -> admissible).",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--sig-components", type=str, default=None, metavar="CSV",
       help="Ablation for --sig-collapsed-h: comma-separated subset of signature "
            "components (press,pickface,contact,solohold,braceside). Default: all.",
   )
-  parser.add_argument(
+  g_search.add_argument(
       "--geo-facts", action="store_true",
       help="Gate the labeled abstraction's backward Dijkstra with FLOATING-GRIPPER "
            "geometry: a labeled state (assembly at a rest face + its grasps/braces) whose "
@@ -793,28 +805,28 @@ def parse_args():
            "noisy cross 36 -> 32) and it lets the noise-0.05 cross exact search "
            "terminate. Kept for experimentation; prints when active.",
   )
-  parser.add_argument(
+  g_viz.add_argument(
       "--view-cheap-checks", action="store_true",
       help="Step through every (uncached) cheap collision check in a blocking C.view(True) "
            "window -- verdict, triggering action, and penetrating pairs in the overlay. "
            "Both FREE and COLLIDING results are shown; each distinct scene appears once. "
            "Use with small instances: the search blocks on every window.",
   )
-  parser.add_argument(
+  g_viz.add_argument(
       "--viser", action="store_true",
       help="Display via a viser web viewer (http://localhost:<port>) instead of the rai "
            "window: the whole replay is recorded and served with a step slider / playback "
            "controls (no per-step blocking windows).",
   )
-  parser.add_argument(
+  g_viz.add_argument(
       "--viser-port", type=int, default=8080,
       help="Port for the viser server (with --viser). Default: 8080.",
   )
-  parser.add_argument(
+  g_scene.add_argument(
       "--seed", type=int, default=0,
       help="RNG seed for numpy + rai (KOMO IK), for reproducible runs. Default: 0.",
   )
-  parser.add_argument(
+  g_output.add_argument(
       "--save", metavar="PATH", default=None,
       help="After --solve, write the plan + the scene config (assembly, parts, robots, seed, "
            "wrench settings, ...) to PATH as JSON, so it can be replayed later without "

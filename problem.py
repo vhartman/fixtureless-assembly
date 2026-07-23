@@ -790,6 +790,38 @@ class ChairAssembly(Assembly):
       self.mate_interfaces["obj_5"] = np.mean(bottoms, axis=0)
 
 
+# ============================================================================================
+# TODO -- NON-TOP-DOWN ASSEMBLY FAMILY (shared-shaft / coaxial capture).
+# Motivation: assemblies that CANNOT be built as a top-down table stack -- at some step the
+# mate axis is not vertical-down onto a table-resting piece, so the growing subassembly must
+# be HELD in the air (and often braced by a second arm). The car already proves horizontal
+# (+-y) mates work [[CarAssembly]]; these push the same idea in non-car directions for
+# experiment diversity. All three want the co-grasp / two-arm brace path (see cograsp-gap).
+#
+# TODO(1) CarThruAxleAssembly -- the car, but the two wheels of a side share ONE continuous
+#   through-axle instead of each pressing onto its own stub. Minimal delta from CarAssembly:
+#   add a rod part on the shared axis; both wheels mate onto the SAME rod (same +-y axis), so
+#   the wheel/rod stack is captured coaxially and never rests to receive a part from above.
+#   Tests: coaxial capture + forced inner->outer ordering on one axis. Closest to today's car.
+#
+# TODO(2) BarbellAssembly -- a horizontal BAR; weight plates (thin cylinders) slide on from
+#   BOTH ends, a COLLAR caps each side to trap them. Symmetric two-ended loading; plates are
+#   heavy. This is the natural home for the OVERLOAD / wrench-magnitude story (stack enough
+#   plates and the holding grasp or a joint is overloaded -- ties to finite-mate-strength).
+#   Parts: bar (long cylinder, base) + N plates (mate +-x onto the bar) + 2 collars (cap).
+#   Tests: symmetric horizontal skewer + load stacking. Simplest to author, good control.
+#
+# TODO(3) SpoolShaftAssembly -- a SHAFT carrying a spool (+ spacers) mounted BETWEEN two
+#   bearing BLOCKS. The spool is a MOVABLE part (rides/rotates on the shaft) -- what the user
+#   liked: it is not fixed like a wheld weld. The shaft cannot be added last from the top --
+#   the second block TRAPS it, so the shaft goes in axially and the blocks close around it.
+#   Parts: 2 blocks (boxes, table-resting supports) + shaft (cylinder) threading the spool
+#   (cylinder, no_hold: it rotates) -> shaft mates axially into block bores. Tests: shaft
+#   captured BETWEEN supports (capture by the supports, not by end collars) + a free-riding
+#   part. May want staged-mates once the second block closes (see skills-and-staged-mates).
+# ============================================================================================
+
+
 def make_assembly(kind, n_parts):
   """Assembly factory for the CLI: cross (cube cross), cube (2x2x2 grid), arch (bridge --
   known-flawed star, see class doc), arch-seq (arch shape built as a sequential chain),
