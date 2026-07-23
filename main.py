@@ -604,13 +604,6 @@ def parse_args():
            "to test whether the ideal-only restriction is what makes a fill fail.",
   )
   parser.add_argument(
-      "--fill-max-holders", type=int, default=1, metavar="N",
-      help="Milestone fill goal: the settling component may end held by up to N arms "
-           "(default 1). N=2 lets a fill leave a BRACE in place for the next fill instead "
-           "of forcing its release -- a direct test of whether the <=1-holder rule is what "
-           "makes brace-dependent mates backtrack.",
-  )
-  parser.add_argument(
       "--mixed-wrench-h", action="store_true",
       help="With mixed --grippers + --wrench: build the PER-KIND wrench heuristic (facts + "
            "signature components evaluate each grasp's kind mask -- admissible, force-aware). "
@@ -909,10 +902,6 @@ def main():
     from solver import set_fill_touch_all
     set_fill_touch_all(True)
     print("[flag] --fill-touch-all: fills may move any loose part (debug; slow).")
-  if args.fill_max_holders != 1:
-    from solver import set_fill_max_holders
-    set_fill_max_holders(args.fill_max_holders)
-    print(f"[flag] --fill-max-holders={args.fill_max_holders}: fills may end held by that many arms.")
   if args.mixed_wrench_h:
     from solver import set_mixed_wrench_h
     set_mixed_wrench_h(True)

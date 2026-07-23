@@ -2587,14 +2587,6 @@ _MIXED_WRENCH_H = False                                    # --mixed-wrench-h: p
                                                           # fast topological fallback.
 
 
-_FILL_MAX_HOLDERS = 1                                      # milestone fill goal: the settling
-                                                          # component ends held by <= this many
-                                                          # arms. 1 = historical (a kept brace
-                                                          # must be released before the fill
-                                                          # completes); 2 lets a brace PERSIST
-                                                          # into the next fill.
-
-
 _FILL_TOUCH_ALL = False                                    # --fill-touch-all (debug): let a
                                                           # fill act on ANY loose part, not
                                                           # just ideal+{p} -- so it can move a
@@ -2627,11 +2619,6 @@ def _capture_fill_failure(s, q, ideal, tag):
 def set_fill_touch_all(on=True):
   global _FILL_TOUCH_ALL
   _FILL_TOUCH_ALL = bool(on)
-
-
-def set_fill_max_holders(n):
-  global _FILL_MAX_HOLDERS
-  _FILL_MAX_HOLDERS = int(n)
 
 
 def set_mixed_wrench_h(on=True):
@@ -4591,58 +4578,6 @@ def _part_mated(state, p):
   return any(c[0] == "mate" for c in state.supports.get(p, ()))
 
 
-def _fill_fail_reason(q, ideal, assembly, gripper_kind):
-  """Diagnose a failed milestone fill: is the mate of `q` onto its parent GENUINELY
-  wrench-infeasible in this `ideal` context, or did the fill just not find it? Checks the
-  target group `ideal` resisting q's insertion press (a) resting on the table per face, and
-  (b) held by 1 or 2 arms. Returns a short string for the log."""
-  onto = assembly.relative_pose(q)[0] if assembly.relative_pose(q) else None
-  if onto is None or onto not in ideal:
-    return f"onto={onto} not in ideal"
-  # the probe held-states use synthetic robot ids -> a {robot:kind} MAP can't price them;
-  # evaluate the hold checks with a scalar USABLE kind (two-finger sorts last past vacuum).
-  hk = (sorted(set(gripper_kind.values()))[-1] if isinstance(gripper_kind, dict)
-        else gripper_kind)
-  poses = _flat_poses(assembly)
-
-  def rest_state(face):
-    parent, place, supports = {}, {}, {}
-    for r in assembly.objects:
-      if r in ideal:
-        if r == assembly.base:
-          parent[r] = ("table",); supports[r] = frozenset({("table",)}); place[r] = ("slot", 0, face)
-        else:
-          o = assembly.relative_pose(r)[0]
-          parent[r] = ("part", o); supports[r] = frozenset({("mate", o)})
-      else:
-        parent[r] = ("table",); supports[r] = frozenset({("table",)}); place[r] = ("slot", _part_index(r), _IDENTITY_FACE)
-    return State(parent=parent, place=place, supports=supports, poses=dict(poses))
-
-  faces = sorted(rest_faces(assembly, set(ideal)))
-  rest_ok = [f for f in faces
-             if _insertion_stable(rest_state(f), assembly, set(ideal), hk, q, onto)]
-
-  # held by N arms: base held + (N-1) braces (any distinct grasps on the group)
-  def held_state(n):
-    parent, supports = {}, {}
-    for r in assembly.objects:
-      if r in ideal:
-        if r == assembly.base:
-          parent[r] = ("gripper", "zz0"); supports[r] = frozenset()
-        else:
-          o = assembly.relative_pose(r)[0]; parent[r] = ("part", o); supports[r] = frozenset({("mate", o)})
-      else:
-        parent[r] = ("table",); supports[r] = frozenset({("table",)})
-    supports[assembly.base] = frozenset({("grasp", "zz0", assembly.base, 0)})
-    if n >= 2:
-      supports[assembly.base] = supports[assembly.base] | {("grasp", "zz1", assembly.base, 1)}
-    return State(parent=parent, place={}, supports=supports, poses=dict(poses))
-  held1 = _insertion_stable(held_state(1), assembly, set(ideal), hk, q, onto)
-  held2 = _insertion_stable(held_state(2), assembly, set(ideal), hk, q, onto)
-  return (f"target={sorted(ideal)} restfaces={faces} press-resisted: "
-          f"resting-on={rest_ok or 'NONE'}, held-by-1={held1}, held-by-2={held2}")
-
-
 def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot_ik,
                   weight, max_nodes, verbose, gripper_kind=None, handovers=True,
                   allow_place=True, bracing=False, grasp_cap=None, h_extra=None,
@@ -4682,7 +4617,7 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
     # p joined, nothing loose left in hand, and the settling component down to <=1 holder
     # (a clean rest point for the next step -- prevents inserter grasps / braces piling up).
     loose, holders = _loose_and_holders(s)
-    return _part_mated(s, p) and loose == 0 and holders <= _FILL_MAX_HOLDERS
+    return _part_mated(s, p) and loose == 0 and holders <= 1
 
   def h_fn(s):
     # LOCAL lower bound with a MONOTONE gradient along the intended fill (found via the
@@ -4706,7 +4641,7 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
     else:
       left = 2
     loose, holders = _loose_and_holders(s, exclude=p)
-    hv = left + loose + max(0, holders - _FILL_MAX_HOLDERS)
+    hv = left + loose + max(0, holders - 1)
     if h_extra is not None:
       # The labeled abstraction (FULL-assembly cost-to-go) keeps exactly two roles here:
       #   * h=inf PRUNES states the full assembly cannot be finished from (sound);
@@ -5478,14 +5413,8 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
       repairs += 1
       _capture_fill_failure(s, q, ideal, f"repair{repairs}")
       if verbose:
-        why = ""
-        if gk is not None:                                 # connect roots too: the JOIN is an
-          try:                                             # assemble of q onto its parent
-            why = "  | " + _fill_fail_reason(q, ideal, assembly, gk)
-          except Exception as _e:
-            why = f"  | (diag err: {_e})"
         print(f"[milestones] fill-in for {q} failed ({time.perf_counter() - tq:.1f}s) "
-              f"-> blacklisted ({repairs} repairs){why}")
+              f"-> blacklisted ({repairs} repairs)")
       if repairs > max_repairs:
         if verbose:
           print("[milestones] repair budget exhausted")
