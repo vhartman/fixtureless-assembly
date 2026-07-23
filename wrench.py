@@ -64,7 +64,7 @@ PARAMS = {
         # => an insertion reaction is "free" when it COMPRESSES the grasp: emergent grasp-side
         # selection (e.g. brace the assembly from BELOW when a part is pressed on from above).
         "asymmetric": {"two_finger": {"F_push": 100.0, "F_pull": 25.0, "mu": 0.6,
-                                      "T_axis": 0.4, "T_lat": 0.4},
+                                      "T_axis": 0.4, "T_lat": 0.4, "T_close": 0.4},
                        "vacuum":     {"F_push": 100.0, "F_pull": 25.0, "mu": 0.15,
                                       "T_axis": 0.8, "T_lat": 0.8}},
     },
@@ -92,6 +92,21 @@ PARAMS = {
     #             re-optimize. A single LP (vs 2^k corner solves); sound but stricter. See
     #             equilibrium_robust_affine. Ignored when insertion_uncertainty is None.
     "robust_mode": "corners",
+    # GRASP COMPLIANCE (--grasp-compliance): per-kind multiplier on the INSERTION-UNCERTAINTY
+    # box when that kind holds a body in the press's load path. A suction cup is a COMPLIANT
+    # contact -- it deflects under contact loads, so the same commanded seating wanders more:
+    # picking/carrying (gravity only, no accuracy demand) is unaffected, but assembling with
+    # a vacuum-held target/inserter must survive a LARGER misalignment box. None = off
+    # (byte-identical); needs insertion_uncertainty to have any effect (it scales the box).
+    # Avoidance of imprecise-holder assembly is then EMERGENT, not a hardcoded prohibition.
+    "grasp_compliance": None,                           # e.g. {"two_finger": 1.0, "vacuum": 3.5}
+    # VACUUM SEAL: the cup can only grip a FLAT face at least as large as its seal -- a face
+    # smaller than the cup leaves the seal partially open (no vacuum, no grip). The grasp
+    # generator drops vacuum candidates whose contacted face's smallest extent is below this
+    # diameter (metres). Cube faces (50mm) pass; the chair's 20mm cylinder caps do not.
+    # The force/torque numbers above assume a FULL seal, so this gate is what keeps them
+    # honest on small parts.
+    "vacuum_seal_diameter": 0.025,
     # insertion (mating) reaction: ONE magnitude for now, but read per-mate from a dict so
     # individual mates can override it later without touching call sites. `_default` applies
     # to any mate not listed.
@@ -214,7 +229,7 @@ def cap_friction_grasp(point, n, t1, t2, F_axial, mu, T_axis, T_lat):
   return np.array(G).T, np.array(ub, float)
 
 
-def cap_asymmetric_grasp(point, n, t1, t2, F_push, F_pull, mu, T_axis, T_lat):
+def cap_asymmetric_grasp(point, n, t1, t2, F_push, F_pull, mu, T_axis, T_lat, T_close=None):
   # DIRECTIONAL + PUSH/PULL asymmetry. Grasp local z (`n`) points from the gripper INTO the
   # part, so a contact force ON the part
   #   along +n  = the palm / cup housing PUSHING the part -- a structural stop, not a
@@ -232,7 +247,13 @@ def cap_asymmetric_grasp(point, n, t1, t2, F_push, F_pull, mu, T_axis, T_lat):
   for vec in (t1, t2):
     for s in (+1.0, -1.0):
       G.append(_force_gen(s * vec, point)); ub.append(mu * F_pull)
-  for axis, T in ((n, T_axis), (t1, T_lat), (t2, T_lat)):
+  # torque caps per axis. t2 is the CLOSING axis (the line joining the two finger contacts):
+  # the contacts are collinear on it, so they form NO couple to resist rotation ABOUT it --
+  # only pad spin-friction does, so a two-finger's out-of-hand torque there is genuinely
+  # weak. T_close (default = T_lat) makes that separately tunable; the vacuum is roll-
+  # symmetric so it leaves T_close == T_lat.
+  T_close = T_lat if T_close is None else T_close
+  for axis, T in ((n, T_axis), (t1, T_lat), (t2, T_close)):
     for s in (+1.0, -1.0):
       G.append(_couple_gen(s * axis)); ub.append(T)
   return np.array(G).T, np.array(ub, float)
@@ -367,6 +388,19 @@ def _extract_basis(G, ub, x, tol=1e-7):
   nb_vals = np.where(x[nb] > tol, ub[nb], 0.0)              # snap each nonbasic to its bound
   const = G[:, nb] @ nb_vals                                # constant wrench from pinned nonbasics
   return (basic, Binv, ub[basic], const)
+
+
+def equilibrium_solution(G, ub, w_external, bounds=None):
+  """Like equilibrium_feasible_matrices but returns (feasible, x) -- the actual generator
+  multipliers of one balancing solution. VISUALIZATION-ONLY cold path (no caches, no
+  warm starts): the per-contact forces drawn by --show-wrenches come from x."""
+  if G.shape[1] == 0:
+    return bool(np.linalg.norm(w_external) < 1e-9), np.zeros(0)
+  if bounds is None:
+    bounds = [(0.0, None if not np.isfinite(u) else float(u)) for u in ub]
+  res = linprog(c=np.zeros(G.shape[1]), A_eq=G, b_eq=-np.asarray(w_external, dtype=float),
+                bounds=bounds, method="highs")
+  return bool(res.status == 0), (res.x if res.status == 0 else np.zeros(G.shape[1]))
 
 
 def equilibrium_feasible_matrices(G, ub, w_external, tol=1e-6, bounds=None, geo_key=None):

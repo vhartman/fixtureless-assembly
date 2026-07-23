@@ -80,6 +80,27 @@ def parse_args():
            "checking layouts, e.g. what --random-init sampled.",
   )
   parser.add_argument(
+      "--viz-grasps", action="store_true",
+      help="GRASP CATALOG in viser (add --viser): one scrubbable step per part showing every "
+           "candidate grasp as a floating EE (green=flat / orange=curved surface; with "
+           "--wrench, green=mate-viable / grey=not). No search. Prints per-part counts.",
+  )
+  parser.add_argument(
+      "--viz-rest-poses", action="store_true",
+      help="REST-POSE CATALOG in viser (add --viser): each group (singletons, connect "
+           "modules, full assembly) laid out on the table in every stable rest pose, one "
+           "step per (group,face). A group with NO steps is an unparkable subassembly. No search.",
+  )
+  parser.add_argument(
+      "--mate-sequence-viz", action="store_true",
+      help="SCHEMATIC mate-sequence view (no search): walk the DAG's assembly order, and at "
+           "each mate draw the contact interface point(s) (green crosses), the insertion "
+           "PRESS the seating must exert (orange), and the MOMENT that press makes about the "
+           "joined part (blue -- nonzero when the interface is off the press axis). Add "
+           "--viser for the scrubbable web view; prints per-mate press + peak moment. A way "
+           "to sanity-check interface points and joint loads before ever solving.",
+  )
+  parser.add_argument(
       "--show-successors", action="store_true",
       help="Visualize a few successor states of the initial search state, then exit.",
   )
@@ -277,6 +298,22 @@ def parse_args():
            "the weak suction/friction path).",
   )
   parser.add_argument(
+      "--vacuum-scale", type=float, default=None, metavar="FACTOR",
+      help="With --wrench: scale ALL of the VACUUM's capability by this factor (every force "
+           "AND torque cap -- push, pull, lateral, couples -- across whichever grasp model "
+           "is active), leaving the friction ratio mu and the two-finger untouched. e.g. 0.1 "
+           "= a cup a tenth as capable everywhere: still picks a light part but holds almost "
+           "nothing against gravity or a press. Default off (factor 1).",
+  )
+  parser.add_argument(
+      "--tf-close-torque", type=float, default=None, metavar="NM",
+      help="With --wrench --grasp-model asymmetric: override the two-finger's torque cap "
+           "ABOUT THE CLOSING AXIS (the line joining the two finger contacts) -- the axis a "
+           "pinch resists worst, since the collinear contacts form no couple there and the "
+           "part rotates out of the jaws. Default (unset) keeps it equal to T_lat (0.4 Nm); "
+           "a small value (e.g. 0.05) models a grip that cannot resist out-of-hand twist.",
+  )
+  parser.add_argument(
       "--no-handovers", dest="handovers", action="store_false",
       help="Disable the add_grasp/handover primitives (regrasp-in-air). On by default; "
            "turning it off gives a leaner reference search (no second-grasp branching).",
@@ -335,6 +372,15 @@ def parse_args():
       help="With --wrench: derate the TORQUE (couple) a CURVED grasp (cylinder side / sphere) "
            "can resist to S x that of a flat hold (force caps unchanged). E.g. 0.25. Models "
            "'a wheel grip pivots in the jaws'; off by default (flat and curved treated alike).",
+  )
+  parser.add_argument(
+      "--grasp-compliance", type=float, nargs="?", const=3.5, default=None, metavar="VACUUM",
+      help="GRASP COMPLIANCE (with --wrench and --insertion-noise): inflate the insertion-"
+           "uncertainty box by this factor (default 3.5) whenever a VACUUM grasp holds a body "
+           "in the press's load path -- the cup deflects under contact forces, so a vacuum-"
+           "held target/inserter wanders more while seating. Picks/carries are unaffected; "
+           "avoiding the vacuum for tight assembly becomes EMERGENT (it may still do loose "
+           "mates), not a hardcoded prohibition. Two-finger stays 1.0. Default off.",
   )
   parser.add_argument(
       "--insertion-noise", type=float, nargs="?", const=0.2, default=None, metavar="LATERAL",
@@ -534,6 +580,53 @@ def parse_args():
            "during the transition, lone solo-held parts only. The labeled/collapsed "
            "heuristics MODEL this edge (inverse-reorient, cost 1) -> h stays admissible; "
            "bounded/exact optimality proofs remain valid.",
+  )
+  parser.add_argument(
+      "--brace-resting", action="store_true",
+      help="With --bracing: allow add_grasp on a TABLE-RESTING assembly (steadying it "
+           "against a press), not only on held ones. Physically routine; without it a "
+           "released brace on a resting group is IRREVERSIBLE, which is exactly why "
+           "single milestone fills fail where windows (that never release) succeed on "
+           "press-heavy configs. Default off.",
+  )
+  parser.add_argument(
+      "--useful-grasps", action="store_true",
+      help="SPEC 6.2 (reduced): compute each part's MATE-VIABLE grasp set U[p] (collision-"
+           "free at the op x press-transmitting per kind, wrench-aware) and (a) ORDER every "
+           "pick/handover candidate U-first -- the transit gradient -- and (b) price a held "
+           "non-U grasp at +1 in the milestone fill h (the forced regrasp, admissible). "
+           "Ordering + pricing only; nothing is removed -- completeness untouched. Default off.",
+  )
+  parser.add_argument(
+      "--fill-touch-all", action="store_true",
+      help="DEBUG: let a milestone fill act on ANY loose part (move a blocking scatter part "
+           "aside), not just the ideal+the one being added. Big fill-search blow-up; use only "
+           "to test whether the ideal-only restriction is what makes a fill fail.",
+  )
+  parser.add_argument(
+      "--fill-max-holders", type=int, default=1, metavar="N",
+      help="Milestone fill goal: the settling component may end held by up to N arms "
+           "(default 1). N=2 lets a fill leave a BRACE in place for the next fill instead "
+           "of forcing its release -- a direct test of whether the <=1-holder rule is what "
+           "makes brace-dependent mates backtrack.",
+  )
+  parser.add_argument(
+      "--mixed-wrench-h", action="store_true",
+      help="With mixed --grippers + --wrench: build the PER-KIND wrench heuristic (facts + "
+           "signature components evaluate each grasp's kind mask -- admissible, force-aware). "
+           "PRECISE but SLOW (class split + kind LPs: ~35k->340k abstract states, ~2s->75s+ "
+           "build on chair-8) and measured NOT to help the pathological weak-vacuum config. "
+           "Default OFF = the fast topological fallback (wrench facts skipped under mixed). "
+           "Turn on only when the search backtracks on force-feasibility the h can't see.",
+  )
+  parser.add_argument(
+      "--dominance", action="store_true",
+      help="DOMINANCE pruning (spec 8.3, 'same node modulo free robots'): among currently-"
+           "FREE arms of the same gripper kind, only the lowest-index one acts (idle twins "
+           "are permutation-symmetric). Kills the x2-x3 idle-twin branching of pick/brace/"
+           "handover transits. SOUND for floating EEs (identical arms); with REAL fixed-base "
+           "arms the twins sit at different table sides and the pruning may cost plans "
+           "(a warning is printed). Default off.",
   )
   parser.add_argument(
       "--allow-curved-grasps", action="store_true",
@@ -744,7 +837,9 @@ _SAVE_CONFIG_FIELDS = (
     "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
     "bracing", "robust_mode", "dense_grasps", "random_init", "part_float", "inhand_reorient",
     "pre_insertion", "pre_pick", "pre_place", "pre_add_grasp", "staged_mates",
-    "allow_curved_grasps", "grippers",
+    "allow_curved_grasps", "grippers", "grasp_compliance",
+    "vacuum_scale", "tf_close_torque", "dominance", "useful_grasps", "brace_resting",
+    "mixed_wrench_h",
 )
 
 
@@ -800,6 +895,33 @@ def main():
     set_lru_robots(True)
     print("[flag] --lru-robots ACTIVE: successor robots ordered least-recently-used first "
           "(deterministic tie-break; spreads actions across arms).")
+  if args.brace_resting:
+    from problem import set_brace_resting
+    set_brace_resting(True)
+    print("[flag] --brace-resting ACTIVE: resting assemblies may be braced (add_grasp), "
+          "matching the abstraction's resting+braced states.")
+  if args.useful_grasps:
+    from problem import set_useful_grasps_enabled
+    set_useful_grasps_enabled(True)
+    print("[flag] --useful-grasps ACTIVE: mate-viable grasp sets ordered first + fill-h "
+          "regrasp pricing (spec 6.2).")
+  if args.fill_touch_all:
+    from solver import set_fill_touch_all
+    set_fill_touch_all(True)
+    print("[flag] --fill-touch-all: fills may move any loose part (debug; slow).")
+  if args.fill_max_holders != 1:
+    from solver import set_fill_max_holders
+    set_fill_max_holders(args.fill_max_holders)
+    print(f"[flag] --fill-max-holders={args.fill_max_holders}: fills may end held by that many arms.")
+  if args.mixed_wrench_h:
+    from solver import set_mixed_wrench_h
+    set_mixed_wrench_h(True)
+    print("[flag] --mixed-wrench-h ACTIVE: per-kind wrench heuristic (precise, slower build).")
+  if args.dominance:
+    from problem import set_dominance
+    set_dominance(True)
+    warn = "" if args.floating_ee else " WARNING: real fixed-base arms are not exact twins -- may prune plans."
+    print(f"[flag] --dominance ACTIVE: one free arm per gripper kind acts (idle-twin symmetry).{warn}")
   if args.allow_curved_grasps:
     from problem import set_allow_curved_grasps
     set_allow_curved_grasps(True)
@@ -819,6 +941,25 @@ def main():
           "Labeled/collapsed h model the inverse-reorient edge (cost 1) -> h stays admissible.")
   import wrench
   wrench.PARAMS["grasp_model"] = args.grasp_model  # capability model (used when --wrench)
+  if args.vacuum_scale is not None:
+    vs = float(args.vacuum_scale)                          # scale EVERY vacuum force+torque cap
+    for _model in wrench.PARAMS["grasp"].values():         # all models; mu (a ratio) is left as-is
+      vac = _model.get("vacuum")
+      if vac:
+        for _k in vac:
+          if _k != "mu":
+            vac[_k] = vac[_k] * vs
+    print(f"[flag] --vacuum-scale ACTIVE: vacuum capability x{vs:g} (all forces + torques; "
+          "two-finger and mu unchanged).")
+  if args.tf_close_torque is not None:
+    wrench.PARAMS["grasp"]["asymmetric"]["two_finger"]["T_close"] = float(args.tf_close_torque)
+    print(f"[flag] --tf-close-torque ACTIVE: two-finger closing-axis torque cap = "
+          f"{args.tf_close_torque:g} Nm (was 0.4). Models a pinch that rotates out of hand.")
+  if args.grasp_compliance is not None:
+    wrench.PARAMS["grasp_compliance"] = {"two_finger": 1.0, "vacuum": float(args.grasp_compliance)}
+    print(f"[flag] --grasp-compliance ACTIVE: vacuum-held load paths inflate the insertion-"
+          f"uncertainty box x{args.grasp_compliance:g} (two-finger 1.0). Effective with "
+          "--wrench + --insertion-noise; picks/carries unaffected.")
   wrench.PARAMS["check_inserter"] = args.inserter_check
   wrench.PARAMS["insert_force"]["_default"] = args.insert_force
   wrench.PARAMS["curved_grasp_torque_scale"] = args.curved_torque_scale
@@ -923,7 +1064,37 @@ def main():
 
   if args.disp_final:
     display_final_assembly(C, assembly, [0, 0, 0.5])
-    
+
+  if args.viz_grasps or args.viz_rest_poses:
+    rec = None
+    if args.viser:
+      from viser_view import ViserRecorder
+      rec = ViserRecorder()
+    if args.viz_grasps:
+      U = None
+      if args.wrench:
+        from solver import _search_context     # local import ONLY of names not module-global
+        _chk, _gt = _search_context(C, assembly, get_robots(C))  # -- shadowing wrench_kind_arg
+        U = compute_useful_grasps(assembly, _gt, wrench_kind_arg(C, get_robots(C)))  # here made
+        #                                                        # it function-local everywhere
+      visualize_grasps_viser(C, assembly, recorder=rec, view=args.view, useful=U)
+    if args.viz_rest_poses:
+      visualize_rest_poses_viser(C, assembly, recorder=rec, view=args.view)
+    if rec is not None:
+      rec.serve(port=args.viser_port)
+    return
+
+  if args.mate_sequence_viz:
+    # schematic DAG mate-sequence: interface points + per-mate insertion wrench, NO search.
+    rec = None
+    if args.viser:
+      from viser_view import ViserRecorder
+      rec = ViserRecorder()
+    visualize_mate_sequence(C, assembly, recorder=rec, view=args.view)
+    if rec is not None:
+      rec.serve(port=args.viser_port)
+    return
+
   if args.show_successors:
     visualize_successor_states(C, assembly)
     return
@@ -1160,12 +1331,16 @@ def main():
         if args.viser:
           from viser_view import ViserRecorder
           recorder = ViserRecorder()
+        # wrench arrows are computed whenever the capability model is on; a viser GUI
+        # checkbox ("Show wrenches") toggles their display per step.
+        wgk = wrench_kind_arg(C, robots) if args.wrench else None
         if args.real_ik:
           visualize_plan_ik(C, assembly, plan, robots=robots, robot_ik=robot_ik,
                             recorder=recorder, bracing=args.bracing,
-                            witnesses=opt_witnesses)
+                            witnesses=opt_witnesses, wrench_gk=wgk)
         else:
-          visualize_plan(C, assembly, plan, recorder=recorder, bracing=args.bracing)
+          visualize_plan(C, assembly, plan, recorder=recorder, bracing=args.bracing,
+                         wrench_gk=wgk)
         if recorder is not None:
           recorder.serve(port=args.viser_port)
     return

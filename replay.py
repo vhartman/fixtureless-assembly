@@ -30,6 +30,20 @@ def apply_wrench_params(cfg):
       None if cfg["insertion_noise"] is None
       else {"lateral": cfg["insertion_noise"], "offset": cfg["insertion_offset"]})
   wrench.PARAMS["robust_mode"] = cfg.get("robust_mode", "corners")
+  gc = cfg.get("grasp_compliance")
+  wrench.PARAMS["grasp_compliance"] = (
+      None if gc is None else {"two_finger": 1.0, "vacuum": float(gc)})
+  vs = cfg.get("vacuum_scale")                              # scale every vacuum force+torque cap
+  if vs is not None:
+    for _model in wrench.PARAMS["grasp"].values():
+      vac = _model.get("vacuum")
+      if vac:
+        for _k in vac:
+          if _k != "mu":
+            vac[_k] = vac[_k] * float(vs)
+  tfc = cfg.get("tf_close_torque")                          # two-finger closing-axis torque cap
+  if tfc is not None:
+    wrench.PARAMS["grasp"]["asymmetric"]["two_finger"]["T_close"] = float(tfc)
 
 
 def build_scene(cfg):
@@ -50,6 +64,11 @@ def build_scene(cfg):
   from problem import set_staged_mates, set_allow_curved_grasps
   set_staged_mates(bool(cfg.get("staged_mates")))          # staged-mate invariant, as searched
   set_allow_curved_grasps(bool(cfg.get("allow_curved_grasps")))  # grasp table must match the search
+  from problem import set_dominance, set_useful_grasps_enabled
+  set_dominance(bool(cfg.get("dominance")))                # successor set must match the search
+  set_useful_grasps_enabled(bool(cfg.get("useful_grasps")))  # ordering must match the search
+  from problem import set_brace_resting
+  set_brace_resting(bool(cfg.get("brace_resting")))         # action space must match the search
   apply_wrench_params(cfg)
   C = make_four_robot_env(num_robots=cfg["num_robots"], floating_ee=cfg["floating_ee"],
                           vacuum=gripper_list if gripper_list is not None else cfg["vacuum"],

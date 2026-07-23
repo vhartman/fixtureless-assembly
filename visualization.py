@@ -177,6 +177,183 @@ def show_subassemblies(C, assembly, subassemblies, base_pose):
 
     C_final.view(True)
 
+def visualize_mate_sequence(C, assembly, base_pose=(0.0, 0.0, 0.6), recorder=None,
+                            view=True):
+  """SCHEMATIC mate-sequence view (no planner): walk the DAG's assembly_order, attaching
+  each part at its assembled pose, and at every step draw the MATE being formed --
+    * green crosses  : the mate's contact interface point(s) (mate_interface_points),
+    * orange arrow   : the insertion PRESS the seating must exert (insert_force along the
+                       mate axis, at the interface),
+    * blue arrow     : the MOMENT that press makes about the joined part's centre (nonzero
+                       exactly when the interface is OFF the press axis -- the out-of-hand
+                       torque case), lengths proportional (see _WF_SCALE etc).
+  Structure only -- reads the DAG + geometry + wrench.insert_force, runs no search. With a
+  ViserRecorder it records the steps (returns it, serve() for the web view); else it opens
+  the blocking rai viewer per step. A quick way to sanity-check interface points and joint
+  loads for a new assembly before ever solving it."""
+  import wrench as _w
+  base = assembly.base
+  order = [p for p in assembly_order(assembly) if p != base]
+
+  C_seq = ry.Config()
+  C_seq.addConfigurationCopy(C)
+  # start from the disassembled scene but PARK every part far away; reveal them as mated.
+  for p in assembly.objects:
+    C_seq.getFrame(p).setPosition([0.0, -900.0 - 3.0 * _part_index(p), 1.0])
+    C_seq.getFrame(p).setQuaternion([1.0, 0.0, 0.0, 0.0])
+  C_seq.getFrame(base).setPosition(list(base_pose))
+  C_seq.getFrame(base).setQuaternion([1.0, 0.0, 0.0, 0.0])
+
+  def _mate_vectors(part):
+    # the press + its moment for the just-formed mate, at the drawn geometry.
+    d = assembly.mate_axis(part)
+    if d is None:
+      return []
+    d = np.asarray(d, dtype=float)
+    R = _quat_to_R(np.asarray(C_seq.getFrame(part).getQuaternion(), dtype=float))
+    f = _w.insert_force(part) * (R @ d)                    # world press ON the target
+    c = np.asarray(C_seq.getFrame(part).getPosition(), dtype=float)
+    out = []
+    for off in assembly.mate_interface_points(part, d):
+      pt = c + R @ off
+      fn = np.linalg.norm(f)
+      if fn > 1e-9:
+        L = min(_WMAX, _WF_SCALE * fn)
+        out.append((pt, pt + f / fn * L, _WP_RGB))         # press arrow (orange)
+      m = np.cross(pt - c, f)                              # moment about the part centre
+      mn = np.linalg.norm(m)
+      if mn > 1e-9:
+        L = min(_WMAX, _WT_SCALE * mn)
+        out.append((c, c + m / mn * L, _WT_RGB))           # moment arrow (blue)
+    return out
+
+  def show(label, mated, new=None):
+    vecs = _mate_vectors(new) if new is not None else []
+    ifs = []
+    for p in mated:
+      if p == base:
+        continue
+      d = assembly.mate_axis(p)
+      if d is None:
+        continue
+      R = _quat_to_R(np.asarray(C_seq.getFrame(p).getQuaternion(), dtype=float))
+      cp = np.asarray(C_seq.getFrame(p).getPosition(), dtype=float)
+      for off in assembly.mate_interface_points(p, d):
+        pt = cp + R @ off
+        for ax in np.eye(3):
+          ifs.append((pt - ax * _IF_R, pt + ax * _IF_R, _IF_RGB))
+    if recorder is not None:
+      recorder.record(C_seq, label, vectors=vecs, interfaces=ifs)
+    elif view:
+      C_seq.view(True, label)
+
+  show(f"0: base {base}", [base])
+  mated = [base]
+  for i, p in enumerate(order, 1):
+    parent = assembly.relative_pose(p)[0]                  # attach at the assembled pose
+    C_seq.getFrame(p).setPosition(
+        (np.asarray(C_seq.getFrame(parent).getPosition(), dtype=float)
+         + assembly.position_in_base(p) - assembly.position_in_base(parent)))
+    C_seq.getFrame(p).setQuaternion([1.0, 0.0, 0.0, 0.0])
+    mated.append(p)
+    d = assembly.mate_axis(p)
+    fmag = _w.insert_force(p)
+    m = 0.0
+    if d is not None:
+      dd = np.asarray(d, dtype=float)
+      for off in assembly.mate_interface_points(p, dd):
+        m = max(m, float(np.linalg.norm(np.cross(off, dd))) * fmag)
+    print(f"[mate {i}/{len(order)}] {p} <- {parent}  press={fmag:.1f}N  peak-moment={m:.3f}Nm")
+    show(f"{i}: mate {p} <- {parent}", mated, new=p)
+  return recorder
+
+
+def visualize_grasps_viser(C, assembly, recorder=None, view=True, useful=None):
+  """GRASP CATALOG (scrubbable): one step per part, its shape rendered mid-air with a
+  free-floating EE at every candidate grasp of the part's DB. Coloring: if `useful` (a
+  {part: set of mate-viable grasp ids}, e.g. solver.compute_useful_grasps) is given, green =
+  mate-viable / grey = not; else green = FLAT surface / orange = CURVED (part_grasp_surfaces).
+  A quick way to eyeball what grasps exist per part and which can seat the mate. With a
+  ViserRecorder it records + returns it (serve() for the web view); else blocking rai view."""
+  import problem as _p
+  gpath = _scene_floating_ee_path(C)
+  base = np.array([0.0, 0.0, 0.6, 1.0, 0.0, 0.0, 0.0])     # part parked mid-air, identity
+  GREEN, ORANGE, GREY = [0.2, 0.8, 0.3, 1], [0.95, 0.55, 0.1, 1], [0.6, 0.6, 0.6, 1]
+
+  def show(part):
+    Cv = make_world()
+    add_part_frame(Cv, part, assembly.part_shape(part))
+    Cv.getFrame(part).setPosition(base[:3]); Cv.getFrame(part).setQuaternion(base[3:])
+    spec = assembly.part_shape(part)
+    surf = _p.part_grasp_surfaces(spec)
+    ids = list(range(len(_p.part_grasp_poses(spec))))
+    U = (useful or {}).get(part)
+    for gid in ids:
+      gw = _pose_compose(base, grasp_pose(assembly, part, gid))
+      pref = f"g{gid}_"
+      place_floating_ee(Cv, gw, gpath, prefix=pref)
+      col = (GREEN if gid in U else GREY) if U is not None else \
+          (GREEN if surf[gid] == "flat" else ORANGE)
+      color_gripper(Cv, pref, col)
+    nflat = sum(1 for s in surf if s == "flat")
+    tag = f" useful={sorted(U)}" if U is not None else f" ({nflat} flat, {len(ids)-nflat} curved)"
+    label = f"{part} [{spec[0]}]: {len(ids)} grasps{tag}"
+    if recorder is not None:
+      recorder.record(Cv, label)
+    elif view:
+      Cv.view(True, label)
+    print(f"[grasp-viz] {label}")
+
+  for part in assembly.objects:
+    show(part)
+  return recorder
+
+
+def visualize_rest_poses_viser(C, assembly, recorder=None, view=True, groups=None):
+  """REST-POSE CATALOG (scrubbable): for each group, one step per STABLE rest face, the group
+  laid out resting on the table in that pose (rest_faces + _rest_layout_poses -- exactly what
+  the search/checker use). Default groups: every singleton, each connect-module, the stool,
+  and the full assembly -- so an EMPTY rest set (an unparkable subassembly, e.g. a bad
+  backrest module) is immediately visible as a group with zero steps. Records + returns the
+  recorder (serve() for viser); else blocking rai view."""
+  base = make_world()
+  ttop = base.getFrame("table").getPosition()[2] + base.getFrame("table").getSize()[2] / 2.0
+  objs = list(assembly.objects)
+  if groups is None:
+    groups = [(f"{p}", {p}) for p in objs]                 # singletons
+    for r in getattr(assembly, "connect_parts", set()):
+      groups.append((f"module<{r}>", {p for p in objs if r in _mate_closure(assembly, p)} | {r}))
+    stool = {p for p in objs if assembly.relative_pose(p) and
+             assembly.relative_pose(p)[0] == assembly.base} | {assembly.base}
+    groups.append(("base+direct", stool))
+    groups.append(("FULL", set(objs)))
+
+  n = 0
+  for name, grp in groups:
+    faces = sorted(rest_faces(assembly, grp))
+    if not faces:
+      print(f"[rest-viz] {name} ({len(grp)} parts): NO REST POSE (unparkable)")
+      continue
+    ref = reference_part(grp)
+    anchor_q = assembly.scatter_orientations.get(ref, np.array([1.0, 0.0, 0.0, 0.0]))
+    for f in faces:
+      Cv = make_world()
+      poses = _rest_layout_poses(assembly, grp, ref, f, anchor_q)
+      for p, pose in poses.items():
+        add_part_frame(Cv, p, assembly.part_shape(p))
+        Cv.getFrame(p).setPosition(np.asarray(pose[:3]) + [0, 0, ttop])
+        Cv.getFrame(p).setQuaternion(pose[3:])
+      label = f"{name} ({len(grp)}p): rest face {f} of {faces}"
+      if recorder is not None:
+        recorder.record(Cv, label)
+      elif view:
+        Cv.view(True, label)
+      n += 1
+    print(f"[rest-viz] {name} ({len(grp)} parts): rest faces {faces}")
+  print(f"[rest-viz] {n} rest poses total")
+  return recorder
+
+
 def visualize_grasps(C, grasps, assembly, subassembly_base_pose, gripper_path=None):
   # for each subassembly, show its candidate grasps by placing a free-floating
   # gripper (the EE model matching the scene's gripper) at every grasp pose.
@@ -281,8 +458,82 @@ def visualize_successor_states(C, assembly, robots=None, per_depth=3):
       break
 
 
+
+# --- wrench arrows (--show-wrenches) ------------------------------------------------------
+_WF_SCALE, _WT_SCALE, _WMAX = 0.05, 1.0, 0.2               # m per N / m per Nm / length cap
+_WF_RGB, _WT_RGB, _WP_RGB = (230, 60, 40), (60, 110, 240), (255, 160, 20)
+
+
+def _wrench_vectors(state, assembly, gk, applied=(), poses=None):
+  # (start, end, rgb) arrow segments for the recorder: contact FORCES red, COUPLES blue,
+  # applied PRESS orange; lengths proportional (capped). One entry per contact from
+  # state_contact_wrenches; infeasible groups get a short magenta marker.
+  vecs = []
+  for pt, f, t, label in state_contact_wrenches(state, assembly, gk,
+                                                applied=applied, poses=poses):
+    if label == "!infeasible":
+      vecs.append((pt, pt + np.array([0.0, 0.0, 0.1]), (255, 0, 255)))
+      continue
+    fn = float(np.linalg.norm(f))
+    if fn > 1e-6:
+      L = min(_WMAX, _WF_SCALE * fn)
+      vecs.append((pt, pt + f / fn * L, _WP_RGB if label == "press" else _WF_RGB))
+    tn = float(np.linalg.norm(t))
+    if tn > 1e-6:
+      L = min(_WMAX, _WT_SCALE * tn)
+      vecs.append((pt, pt + t / tn * L, _WT_RGB))
+  return vecs
+
+
+_IF_RGB, _IF_R = (40, 200, 90), 0.024                     # interface cross: green, 24mm
+
+
+def _interface_vectors(Cv, assembly, state):
+  # small green CROSSES at the mate interface of every currently-MATED part (world point =
+  # part pose + R @ mate_interface), for debugging where the model applies seam loads.
+  vecs = []
+  for p in assembly.objects:
+    if not any(c[0] == "mate" for c in state.supports.get(p, ())):
+      continue
+    d = assembly.mate_axis(p)
+    if d is None:
+      continue
+    R = _quat_to_R(np.asarray(Cv.getFrame(p).getQuaternion(), dtype=float))
+    base = np.asarray(Cv.getFrame(p).getPosition(), dtype=float)
+    for off in assembly.mate_interface_points(p, d):       # every contact point of the mate
+      pt = base + R @ off
+      for ax in np.eye(3):
+        vecs.append((pt - ax * _IF_R, pt + ax * _IF_R, _IF_RGB))
+  return vecs
+
+
+def _press_applied(Cv, assembly, action):
+  # the insertion press of an `assemble` action as an applied load for the arrows, computed
+  # from the RENDERED config (so it sits on the drawn geometry): insert_force along the
+  # mate axis, at the MATE INTERFACE (the part's face along the press axis -- matching
+  # _insertion_load's application point), acting on the target group (hint = onto).
+  import wrench as _w
+  if action[0] != "assemble":
+    return ()
+  part, onto = action[2], action[3]
+  d = assembly.mate_axis(part)
+  if d is None:
+    return ()
+  d = np.asarray(d, dtype=float)
+  R = _quat_to_R(np.asarray(Cv.getFrame(onto).getQuaternion(), dtype=float))
+  return ((_w.insert_force(part) * (R @ d),
+           np.asarray(Cv.getFrame(part).getPosition(), dtype=float)
+           + R @ assembly.mate_interface(part, d),
+           onto),)
+
+
+def _cv_poses(Cv, assembly):
+  return {p: np.concatenate([Cv.getFrame(p).getPosition(), Cv.getFrame(p).getQuaternion()])
+          for p in assembly.objects}
+
+
 def visualize_plan(C, assembly, plan, robots=None, gripper_path=None, recorder=None,
-                   bracing=False):
+                   bracing=False, wrench_gk=None):
   """Replay a plan (list of actions from solve_assembly_problem) step by step, opening
   the viewer on the initial state and on the state after each action. Each view() is
   blocking -- close the window to advance to the next step. With `recorder` (a
@@ -291,10 +542,16 @@ def visualize_plan(C, assembly, plan, robots=None, gripper_path=None, recorder=N
   if robots is None:
     robots = get_robots(C)
 
-  def show(state, label):
+  def show(state, label, action=None):
     C_viz = visualize_state(C, state, assembly, gripper_path, view=recorder is None)
     if recorder is not None:
-      recorder.record(C_viz, label)
+      vecs = None
+      if wrench_gk is not None:
+        ap = _press_applied(C_viz, assembly, action) if action is not None else ()
+        vecs = _wrench_vectors(state, assembly, wrench_gk, applied=ap,
+                               poses=_cv_poses(C_viz, assembly))
+      recorder.record(C_viz, label, vectors=vecs,
+                      interfaces=_interface_vectors(C_viz, assembly, state))
 
   # PREFER the state trajectory the search RECORDED (plan.states): walking it can't disagree
   # with the search about which actions exist. Only when it is absent (e.g. a plan loaded from
@@ -319,7 +576,7 @@ def visualize_plan(C, assembly, plan, robots=None, gripper_path=None, recorder=N
         return
     s = nxt
     print(f"[{i}/{len(plan)}] {action} -> {s}")
-    show(s, f"{i}: {action[0]} {' '.join(map(str, action[1:]))}")
+    show(s, f"{i}: {action[0]} {' '.join(map(str, action[1:]))}", action=action)
 
 
 def _active_robots(action, s, rik):
@@ -368,7 +625,7 @@ def _write_robot_dofs(C, robot, q_full):
 
 
 def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
-                      recorder=None, bracing=False, witnesses=None):
+                      recorder=None, bracing=False, witnesses=None, wrench_gk=None):
   """Replay a plan on a SINGLE persistent config: for each action we solve the skill IK,
   write the active arms' DOFs into the live config (so the arms keep their poses between
   steps), and mirror the scene-graph re-parenting with C.attach (so grabbed parts stay
@@ -395,7 +652,10 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
   s = recorded[0] if recorded else get_initial_state(C, assembly)
   print(f"[0/{len(plan)}] initial: {s}")
   if recorder is not None:
-    recorder.record(Cv, "0: initial")
+    vecs0 = _wrench_vectors(s, assembly, wrench_gk, poses=_cv_poses(Cv, assembly)) \
+        if wrench_gk is not None else None
+    recorder.record(Cv, "0: initial", vectors=vecs0,
+                    interfaces=_interface_vectors(Cv, assembly, s))
   elif view:
     Cv.view(True, "0: initial")
 
@@ -568,7 +828,13 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
         _seat_rest(nxt, g)
     print(f"[{i}/{len(plan)}] {action} (feasible={_ok}) -> {nxt}")
     if recorder is not None:
-      recorder.record(Cv, f"{i}: {action[0]} {' '.join(map(str, action[1:]))}")
+      vecs = None
+      if wrench_gk is not None:
+        vecs = _wrench_vectors(nxt, assembly, wrench_gk,
+                               applied=_press_applied(Cv, assembly, action),
+                               poses=_cv_poses(Cv, assembly))
+      recorder.record(Cv, f"{i}: {action[0]} {' '.join(map(str, action[1:]))}", vectors=vecs,
+                      interfaces=_interface_vectors(Cv, assembly, nxt))
     elif view:
       Cv.view(True, f"{i}: {action[0]} {' '.join(map(str, action[1:]))}")
     s = nxt

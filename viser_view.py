@@ -29,8 +29,11 @@ class ViserRecorder:
     self.markers = {}                     # name -> axes_length (rai ST.marker frames)
     self.steps = []                       # [{name: (pos3, wxyz4)}]
     self.labels = []                      # one per step
+    self.step_vectors = []                # one list per step: (start3, end3, rgb) arrows
+                                          # (forces red, torques blue, press orange)
+    self.step_interfaces = []             # one list per step: mate-interface crosses (green)
 
-  def record(self, C, label=""):
+  def record(self, C, label="", vectors=None, interfaces=None):
     """Snapshot every mesh-bearing frame of `C` as one step. Geometry is captured the
     first time a frame name is seen (assumed rigid thereafter). rai ST.marker frames
     have no mesh; they are tracked separately and served as viser axis frames."""
@@ -65,6 +68,8 @@ class ViserRecorder:
                       np.array(frame.getQuaternion(), dtype=np.float32))  # ry = [w,x,y,z]
     self.steps.append(snap)
     self.labels.append(label)
+    self.step_vectors.append(list(vectors) if vectors else [])
+    self.step_interfaces.append(list(interfaces) if interfaces else [])
 
   def serve(self, port=8080, pause_time=0.5):
     """Open the viser server and block until Stop is pressed (or Ctrl-C)."""
@@ -87,8 +92,47 @@ class ViserRecorder:
       handles[name] = server.scene.add_frame(
           name=f"frames/{name}", axes_length=0.5 * size, axes_radius=0.04 * size)
 
+    # wrench arrows (--show-wrenches): one line-segment batch per step, toggled with the
+    # step like the meshes. Older viser without add_line_segments -> skipped with a note.
+    vec_handles = [None] * len(self.steps)
+    if any(self.step_vectors):
+      try:
+        for i, vecs in enumerate(self.step_vectors):
+          if not vecs:
+            continue
+          pts = np.array([[list(s), list(e)] for s, e, _c in vecs], dtype=np.float32)
+          cols = np.array([[list(c), list(c)] for _s, _e, c in vecs], dtype=np.uint8)
+          vec_handles[i] = server.scene.add_line_segments(
+              name=f"wrench/step{i}", points=pts, colors=cols, line_width=4.0,
+              visible=False)
+      except Exception as e:                              # viser too old for line segments
+        print(f"[viser] wrench arrows unavailable ({e}); update viser to see them")
+        vec_handles = [None] * len(self.steps)
+    if_handles = [None] * len(self.steps)
+    if any(self.step_interfaces):
+      try:
+        for i, vecs in enumerate(self.step_interfaces):
+          if not vecs:
+            continue
+          pts = np.array([[list(s), list(e)] for s, e, _c in vecs], dtype=np.float32)
+          cols = np.array([[list(c), list(c)] for _s, _e, c in vecs], dtype=np.uint8)
+          if_handles[i] = server.scene.add_line_segments(
+              name=f"interfaces/step{i}", points=pts, colors=cols, line_width=3.0,
+              visible=False)
+      except Exception:
+        if_handles = [None] * len(self.steps)
+
     step_slider = server.gui.add_slider("Step", min=0, max=len(self.steps) - 1,
                                         step=1, initial_value=0)
+    wrench_checkbox = None
+    if any(vh is not None for vh in vec_handles):
+      wrench_checkbox = server.gui.add_checkbox("Show wrenches", initial_value=True)
+    markers_checkbox = None
+    if self.markers:
+      markers_checkbox = server.gui.add_checkbox("Show markers", initial_value=True)
+    if_checkbox = None
+    if any(vh is not None for vh in if_handles):
+      if_checkbox = server.gui.add_checkbox("Show mate interfaces", initial_value=True)
     play_checkbox = server.gui.add_checkbox("Play", initial_value=False)
     pause_field = server.gui.add_number("Pause time (s)", initial_value=pause_time,
                                         min=0.0, step=0.05)
@@ -100,12 +144,21 @@ class ViserRecorder:
     def set_step(i):
       i = max(0, min(int(i), len(self.steps) - 1))
       snap = self.steps[i]
+      show_w = wrench_checkbox is None or wrench_checkbox.value
+      for j, vh in enumerate(vec_handles):
+        if vh is not None:
+          vh.visible = (j == i and show_w)
+      show_if = if_checkbox is None or if_checkbox.value
+      for j, vh in enumerate(if_handles):
+        if vh is not None:
+          vh.visible = (j == i and show_if)
+      show_m = markers_checkbox is None or markers_checkbox.value
       for name, h in handles.items():
         pose = snap.get(name)
         if pose is None:
           h.visible = False              # frame absent in this step (e.g. schematic EE)
         else:
-          h.visible = True
+          h.visible = show_m if name in self.markers else True
           h.position, h.wxyz = pose
       label_md.content = f"**Step {i} / {len(self.steps) - 1}**  \n{self.labels[i]}"
 
@@ -132,6 +185,21 @@ class ViserRecorder:
     def _(event):
       if not play_checkbox.value:
         set_step(event.target.value)
+
+    if wrench_checkbox is not None:
+      @wrench_checkbox.on_update
+      def _(_):
+        set_step(step_slider.value)
+
+    if markers_checkbox is not None:
+      @markers_checkbox.on_update
+      def _(_):
+        set_step(step_slider.value)
+
+    if if_checkbox is not None:
+      @if_checkbox.on_update
+      def _(_):
+        set_step(step_slider.value)
 
     set_step(0)
     print(f"[viser] open http://localhost:{port} -- Stop in the GUI or Ctrl-C to exit.")

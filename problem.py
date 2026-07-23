@@ -59,6 +59,8 @@ class Assembly:
     self.masses = {}
     self.mate_types = {}
     self.mate_axes = {}
+    self.mate_interfaces = {}                # part -> PART-FRAME contact-patch offset (see
+                                             # mate_interface); {} = geometric default
     # PER-PART SHAPES: {part: (kind, params)} -- ("box", [sx, sy, sz, corner_r]),
     # ("cylinder", [length, radius]) (axis = local z), ("sphere", [radius]). Anything unset
     # defaults to the assembly's cube (cube_size/cube_radius) after define(), so classic
@@ -127,6 +129,84 @@ class Assembly:
     # part goes in; the planner does not get to choose. Subclasses may override in define().
     a = self.mate_axes.get(part)
     return None if a is None else np.asarray(a, dtype=float)
+
+  def mate_contact_interface(self, part, n_axial=48, n_ang=32):
+    """COMPUTED contact patch: the PART-FRAME point of `part`'s shape surface CLOSEST to its
+    mate parent's shape at the assembled relative pose ('touches == is close to'). The
+    physical interface for non-face mates -- e.g. a pin lying alongside a plate contacts on
+    its SIDE at the overlap height, off the central axis, not at its end cap. Sampled
+    surface (analytic point-to-shape distances), one-time per part; assign the result to
+    mate_interfaces[part] in define(). Face-glued cubes keep the half-extent default (their
+    contact is a full face; its centre equals the default)."""
+    parent, rel = self.relative_pose(part)
+    rel = np.asarray(rel, dtype=float)
+    spec_p, spec_o = self.part_shape(part), self.part_shape(parent)
+
+    def surface_points(spec):
+      kind, params = spec[0], spec[1]
+      sq = _shape_quat(spec)
+      Rs = np.eye(3) if sq is None else _quat_to_R(np.asarray(sq, dtype=float))
+      pts = []
+      if kind == "cylinder":
+        L, r = float(params[0]), float(params[1])
+        for z in np.linspace(-L / 2.0, L / 2.0, n_axial):
+          for a in np.linspace(0.0, 2.0 * np.pi, n_ang, endpoint=False):
+            pts.append(Rs @ np.array([r * np.cos(a), r * np.sin(a), z]))
+      else:                                                # box (sphere: centre suffices)
+        hx, hy, hz = [float(v) / 2.0 for v in params[:3]]
+        for axis, h in ((0, hx), (1, hy), (2, hz)):
+          for s in (-h, h):
+            u = [i for i in range(3) if i != axis]
+            hu, hv = (hx, hy, hz)[u[0]], (hx, hy, hz)[u[1]]
+            for a in np.linspace(-hu, hu, 12):
+              for b in np.linspace(-hv, hv, 12):
+                q = np.zeros(3); q[axis] = s; q[u[0]] = a; q[u[1]] = b
+                pts.append(Rs @ q)
+      return np.asarray(pts)
+
+    def dist_to_shape(pts_local, spec):
+      # distance of points (in the shape OWNER's part frame) to the shape's surface-or-interior
+      kind, params = spec[0], spec[1]
+      sq = _shape_quat(spec)
+      Rs = np.eye(3) if sq is None else _quat_to_R(np.asarray(sq, dtype=float))
+      q = pts_local @ Rs                                   # into the shape's own frame
+      if kind == "cylinder":
+        L, r = float(params[0]), float(params[1])
+        dr = np.maximum(np.linalg.norm(q[:, :2], axis=1) - r, 0.0)
+        dz = np.maximum(np.abs(q[:, 2]) - L / 2.0, 0.0)
+        return np.sqrt(dr * dr + dz * dz)
+      half = np.array([float(v) / 2.0 for v in params[:3]])
+      dd = np.maximum(np.abs(q) - half, 0.0)
+      return np.linalg.norm(dd, axis=1)
+
+    pts = surface_points(spec_p)                           # part-frame samples of part surface
+    d = dist_to_shape(pts + rel, spec_o)                   # parent centre at -rel in part frame
+    return pts[int(np.argmin(d))]
+
+  def mate_interface_points(self, part, d=None):
+    # LIST of part-frame contact-patch offsets (from the part's centre) for `part`'s mate --
+    # where the seam transmits the seating reaction. mate_interfaces[part] may be a single
+    # offset (a 3-vector) OR a list of them (a mate that touches at several places, e.g. a
+    # bracket pinned at two points). Default: one point on the part's face along the press
+    # axis (exact for face-glued cubes). Set mate_interfaces[part] explicitly for off-axis
+    # or multi-point contacts (e.g. the chair posts join the backrest at their TOP END).
+    mi = self.mate_interfaces.get(part)
+    if mi is not None:
+      arr = np.asarray(mi, dtype=float)
+      return [arr] if arr.ndim == 1 else [np.asarray(p, dtype=float) for p in arr]
+    if d is None:
+      d = self.mate_axis(part)
+    d = np.asarray(d, dtype=float)
+    return [d * _shape_half_extent_along(self.part_shape(part), d)]
+
+  def mate_interface(self, part, d=None):
+    # the SINGLE point at which the net insertion press acts, for the wrench load: the
+    # CENTROID of the mate's contact points. For one point this is that point (unchanged);
+    # for several, the centroid carries the same NET force+moment as an equal split of a
+    # parallel press across them (exact for the seating reaction; finite-mate-strength would
+    # instead treat each point as its own reaction -- reserved). See mate_interface_points.
+    pts = self.mate_interface_points(part, d)
+    return pts[0] if len(pts) == 1 else np.mean(pts, axis=0)
 
   def _default_mate_axis(self, part):
     # sensible default assembly direction: PRESS AGAINST AN ALREADY-BUILT FLANKING NEIGHBOR
@@ -242,18 +322,25 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
           # Falls back to the nominal line spot if exhausted.
           placed = [np.asarray(C.getFrame(q).getPosition()[:2])
                     for q in assembly.objects[:i]]
-          for _ in range(max_tries):
-              xy = np.random.uniform(-float(random_init), float(random_init), size=2)
-              if min_sep is not None and any(
-                  np.linalg.norm(xy - p) < float(min_sep) for p in placed):
-                  continue
-              yaw = np.random.uniform(-np.pi, np.pi)
-              obj.setRelativePosition([xy[0], xy[1], pos[2]])
-              obj.setRelativeQuaternion(list(_quat_mul(
-                  np.array([np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)]), base_q)))
-              if C.getCollisionFree():
-                  break
-          else:
+          # Two-stage sampling so a crowded square never DETERMINISTICALLY parks the last
+          # parts on the nominal line (min_sep 0.4 fits only ~5 parts in a 1x1 square, so the
+          # module -- always placed last -- used to land on the fixed line every seed). Stage
+          # 1: honour min_sep. Stage 2 (only if stage 1 exhausts): drop min_sep, keep
+          # collision-free + random. The fixed line is the last resort, now rarely reached.
+          def _try(enforce_sep):
+              for _ in range(max_tries):
+                  xy = np.random.uniform(-float(random_init), float(random_init), size=2)
+                  if enforce_sep and min_sep is not None and any(
+                      np.linalg.norm(xy - p) < float(min_sep) for p in placed):
+                      continue
+                  yaw = np.random.uniform(-np.pi, np.pi)
+                  obj.setRelativePosition([xy[0], xy[1], pos[2]])
+                  obj.setRelativeQuaternion(list(_quat_mul(
+                      np.array([np.cos(yaw / 2), 0.0, 0.0, np.sin(yaw / 2)]), base_q)))
+                  if C.getCollisionFree():
+                      return True
+              return False
+          if not (_try(True) or _try(False)):
               obj.setRelativePosition([pos[0], pos[1], pos[2]])
               obj.setRelativeQuaternion(list(base_q))
       elif perturb_start_pose:
@@ -620,7 +707,7 @@ class ChairAssembly(Assembly):
   the backrest sub-assembly (back + 2 posts) then joins the seat. Part counts: 5 = a STOOL
   (seat + 4 legs), 8 = the full chair (+ backrest + 2 posts)."""
 
-  def __init__(self, n_parts=8, cube_radius=0.005, scale=0.4):
+  def __init__(self, n_parts=8, cube_radius=0.005, scale=0.5):
     self.n_parts = 5 if n_parts < 8 else 8
     # chair.g is modelled at a realistic ~0.4 m; the planner's table/reach/scatter are built
     # for ~0.05 m parts, so scale the whole chair down (shape preserved) to fit -- else parts
@@ -675,12 +762,32 @@ class ChairAssembly(Assembly):
       # mate closure (dependencies_of feeds _mate_closure) and forbid building the module
       # detached. The join precedence lives ENTIRELY in connect_requires (cube-plates rule).
       post_off = {"obj_6": [-0.009, 0.152, -0.052], "obj_7": [-0.006, -0.148, -0.052]}
+      # posts join the backrest SIDEWAYS (the post-to-back offset is y-dominant: the posts
+      # flank the back). Their contact patch is COMPUTED: the closest point of the post's
+      # SIDE surface to the back plate at the assembled pose (off the central axis, at the
+      # overlap height -- 'touches == is close to'), via mate_contact_interface below.
       for p, off in post_off.items():
         self.part_shapes[p] = ("cylinder", [0.33 * s, 0.025 * s], q_post)
         self.scatter_orientations[p] = post_scatter
         self.assembly_relative_poses[p] = ["obj_5", np.array(off) * s]   # post -> backrest
-        self.mate_axes[p] = np.array([0.0, 0.0, -1.0])
+        self.mate_axes[p] = np.array([0.0, -1.0, 0.0]) if p == "obj_6" \
+            else np.array([0.0, 1.0, 0.0])               # press toward the back (sideways)
         self.assembly_dependencies[p] = ["obj_5"]
+      # for p in post_off:
+        # self.mate_interfaces[p] = self.mate_contact_interface(p)
+      self.mate_interfaces["obj_6"] = [0, -0.025*s, 0.33*s / 8]
+      self.mate_interfaces["obj_7"] = [0, 0.025*s, 0.33*s / 8]
+
+      # the MODULE JOIN (back -> seat) transmits its press through the POSTS' BOTTOM ends
+      # standing on the seat -- not through the backrest's own bottom (the back never
+      # touches the seat). Interface (in the BACK's frame, parts axis-aligned): midpoint of
+      # the two post bottoms = post offset + half_len along the post's downward long axis.
+      post_down = _quat_to_R(np.asarray(q_post, dtype=float))[:, 2]      # long axis
+      if post_down[2] > 0:                                               # orient downward
+        post_down = -post_down
+      bottoms = [np.array(off) * s + post_down * (0.33 * s / 2.0)
+                 for off in post_off.values()]
+      self.mate_interfaces["obj_5"] = np.mean(bottoms, axis=0)
 
 
 def make_assembly(kind, n_parts):
@@ -929,17 +1036,22 @@ def placement_quat(assembly, group, ref, face):
   # REST-POSE ANCHOR (change-2-lite, [[rest-pose-offaxis-change2]]): the world orientation of
   # the reference PART FRAME for placement id `face` -- rest poses are computed FROM THE
   # SHAPE, not from the bookkeeping part frame.
-  #   * SINGLETONS with a rotated shape: compose the INVERSE of the part's own shape rotation,
-  #     so `face` puts the SHAPE's face flush on the table (a reclined post rests on its cap;
-  #     the 90deg-rotated seat plate rests flat). Unrotated shapes: byte-identical.
-  #   * MULTI-part groups: the canonical face-down rotation of the axis-aligned structure
-  #     (members' shapes sit however the assembly puts them) -- unchanged.
+  #   * Compose the INVERSE of the REFERENCE part's own shape rotation, so `face` puts that
+  #     SHAPE's face flush on the table (a reclined post rests on its cap; the 90deg-rotated
+  #     seat plate rests flat). Unrotated reference shapes: byte-identical.
+  #   * GROUPS use the same rule via their reference part (change-2 GROUP extension,
+  #     2026-07-24): e.g. the chair's backrest module (ref = the reclined back plate) can
+  #     lie FLAT on the plate's face with the posts up; under the old canonical-only group
+  #     anchors the module had NO rest pose at all -- an unparkable hot potato that forced
+  #     hold-through-join plans and mass milestone backtracking. Stability is still judged
+  #     per pose by _rest_stable, so a bad reference choice only yields unstable (dropped)
+  #     candidates, never a wrong "stable" verdict.
   #   * face 5 (_IDENTITY_FACE) keeps its established semantics "as anchored/scattered"
   #     (_group_rest_pose preserves the anchor orientation there), so it is NOT composed --
   #     placement ids 0..4 are shape faces, 5 is the anchor pose.
   # Mesh shapes later swap the enumerator (stable-pose analysis), not this plumbing.
   q = _FACE_DOWN_QUATS[face]
-  if face == _IDENTITY_FACE or len(group) > 1:
+  if face == _IDENTITY_FACE:
     return q
   sq = _shape_quat(assembly.part_shape(ref))
   return q if sq is None else _quat_mul(q, _quat_conj(sq))
@@ -1232,6 +1344,30 @@ def part_grasp_surfaces(spec, rolls=None):
   return out
 
 
+def part_grasp_face_min_dims(spec, rolls=None):
+  # smallest extent of the FLAT face each grasp contacts (parallel to part_grasp_poses /
+  # part_grasp_surfaces; inf for curved surfaces -- the flat gate never fires there, the
+  # curved gate already handles them). Used for the VACUUM SEAL gate: a suction cup cannot
+  # seal on a face smaller than its own diameter (wrench.PARAMS['vacuum_seal_diameter']).
+  if rolls is None:
+    rolls = _ROLLS_PER_FACE
+  kind, params = spec[0], spec[1]
+  out = []
+  for normal in _CUBE_FACE_NORMALS:
+    if kind == "box":
+      ext = [params[0], params[1], params[2]]
+      i = int(np.argmax(np.abs(normal)))
+      dim = min(e for j, e in enumerate(ext) if j != i)    # the face's two in-plane extents
+    elif kind == "cylinder":
+      dim = 2.0 * params[1] if abs(normal[2]) > 0.5 else float("inf")  # cap disc diameter
+    else:                                                  # sphere: curved everywhere
+      dim = float("inf")
+    out.extend([dim] * rolls)
+  if _DENSE_GRASPS:
+    out = out * 3
+  return out
+
+
 def cube_grasp_pose(grasp_id, cube_size, offset=0.01):
   # grasp pose [x,y,z, qw,qx,qy,qz] in the grasped cube's OWN frame. grasp_id encodes
   # (face, roll): the face sets the approach (-normal); the roll spins the gripper about
@@ -1347,10 +1483,13 @@ def compute_cube_grasps(assembly, subassembly, offset=0.01,
     # the part's set). The DB pose is in the part frame; shift it into the subassembly
     # ref frame (parts are axis-aligned, so translation only).
     surfaces = part_grasp_surfaces(assembly.part_shape(obj))
+    face_dims = part_grasp_face_min_dims(assembly.part_shape(obj))
+    seal = wrench.PARAMS.get("vacuum_seal_diameter", 0.0)
     for grasp_id, local in enumerate(part_grasp_poses(assembly.part_shape(obj),
                                                       offset=offset)):
-      if vacuum and surfaces[grasp_id] == "curved":
-        continue
+      if vacuum and (surfaces[grasp_id] == "curved" or face_dims[grasp_id] < seal):
+        continue                                          # no seal on curvature or on a face
+                                                          # smaller than the cup (chair caps)
       grasp = np.concatenate([obj_in_ref + local[:3], local[3:]])
 
       if grasp_is_collision_free(grasp, obj):
@@ -1707,12 +1846,14 @@ def picks(state, assembly, robots, grasp_table=None, canonical=False):
     return
   if canonical:
     free = free[:1]
+  free = _canonical_free(free, grasp_table)               # --dominance: one twin per kind
   for group in state.subassemblies():
     if not _group_is_on_table(state, group) or _group_holders(state, group):
       continue
     key = _subasm_key(group)
     labeled = grasp_table[key] if grasp_table is not None else \
         compute_cube_grasps(assembly, key, return_labeled=True)
+    labeled = _useful_first(labeled)                      # --useful-grasps: mate-viable first
     for r in free:
       for gpart, grasp_id, _pose in labeled:              # grasp ANY part of the group
         if not _grasp_usable(grasp_table, key, gpart, grasp_id, r):
@@ -1849,8 +1990,11 @@ def assembles(state, assembly, robots, gripper_kind=None):
         # point slot cannot resist -> the part must be HELD while its fastener is hammered
         # in, even if it rests stably. (p == the fastener still counts: it fastens only
         # AFTER seating; the press happens before the weld.)
-        if not _staged_press_stable(state, assembly, onto, gripper_kind,
-                                    _insertion_load_variants(state, assembly, p, onto, d)):
+        if not _staged_press_stable(
+            state, assembly, onto, gripper_kind,
+            _insertion_load_variants(state, assembly, p, onto, d,
+                                     scale=_compliance_factor(state, assembly, target,
+                                                              gripper_kind))):
           continue
     if _group_is_on_table(state, target) and not _on_table_mateable_cached(
         assembly, p, _placement_face(state, target)):
@@ -1885,12 +2029,15 @@ def add_grasps(state, assembly, robots, grasp_table=None):
   # contact only; the kinematic `parent` is unchanged (the group stays rooted at its current
   # holder -- this is the whole point of parent(single)/supports(set)). A later release of the
   # original holder then re-roots the tree onto this grasp (see `releases`).
-  free = state.free_robots(robots)
+  free = _canonical_free(state.free_robots(robots), grasp_table)  # --dominance
   if not free:
     return
   for group in state.subassemblies():
     if not _group_holders(state, group):
-      continue                                            # only brace an already-held group
+      # --brace-resting: a TABLE-RESTING group may also be braced (steadied); without the
+      # flag, only an already-held group (the historical model).
+      if not (_BRACE_RESTING and _group_is_on_table(state, group)):
+        continue
     key = _subasm_key(group)
     labeled = grasp_table[key] if grasp_table is not None else \
         compute_cube_grasps(assembly, key, return_labeled=True)
@@ -1912,7 +2059,7 @@ def fused_handovers(state, assembly, robots, grasp_table=None):
   # so unlike the unfused add_grasp;release it introduces no higher-h two-holder intermediate
   # -- it is the heuristically neutral, air analogue of the place;pick regrasp. (Unfused
   # add_grasp stays for genuine bracing, where you keep both holders.)
-  free = state.free_robots(robots)
+  free = _canonical_free(state.free_robots(robots), grasp_table)  # --dominance
   if not free:
     return
   for group in state.subassemblies():
@@ -1925,6 +2072,7 @@ def fused_handovers(state, assembly, robots, grasp_table=None):
     key = _subasm_key(group)
     labeled = grasp_table[key] if grasp_table is not None else \
         compute_cube_grasps(assembly, key, return_labeled=True)
+    labeled = _useful_first(labeled)                      # --useful-grasps: mate-viable first
     taken = {(c[2], c[3]) for p in group for c in state.supports[p] if c[0] == "grasp"}
     for rB in free:
       for gpart, grasp_id, _pose in labeled:                # B grabs any free face...
@@ -2060,6 +2208,82 @@ _STAGED_MATES = False
 def set_staged_mates(on=True):
   global _STAGED_MATES
   _STAGED_MATES = bool(on)
+
+
+# BRACE RESTING (--brace-resting): allow add_grasp on a TABLE-RESTING group, not only an
+# already-held one. Physically routine (a hand steadying a resting assembly against a
+# press); without it, "resting + braced" exists ONLY as the leftover of a mate (the kept
+# inserter grasp) and is IRREVERSIBLE once released -- the artificial asymmetry that made
+# single milestone fills wrench-infeasible where windows (which never release) succeed,
+# and the abstract facts (which happily craft resting+braced states) systematically
+# optimistic. With the flag, the concrete model matches both physics and the abstraction.
+_BRACE_RESTING = False
+
+
+def set_brace_resting(on=True):
+  global _BRACE_RESTING
+  _BRACE_RESTING = bool(on)
+
+
+# USEFUL GRASPS (--useful-grasps, spec 6.2 reduced): _USEFUL_GRASPS = {part: frozenset of
+# mate-viable grasp ids} (collision-at-op x per-kind press; computed by
+# solver.compute_useful_grasps after the table build when the flag is on). Consumers:
+#   * picks()/fused_handovers() ORDER candidates U-first -- the transit gradient (grasps
+#     that can seat the mate are tried before ones that force a regrasp);
+#   * the milestone fill h prices a held non-U grasp at +1 (the forced handover/regrasp
+#     before the mate -- admissible).
+# ORDERING only (plus the admissible h term): nothing is removed, completeness untouched.
+_USEFUL_GRASPS = None
+_USEFUL_FLAG = False                                       # --useful-grasps requested; the
+                                                           # solvers populate after table build
+
+
+def set_useful_grasps_enabled(on=True):
+  global _USEFUL_FLAG
+  _USEFUL_FLAG = bool(on)
+
+
+def set_useful_grasps(mapping):
+  global _USEFUL_GRASPS
+  _USEFUL_GRASPS = mapping
+
+
+def _useful_first(labeled, part_of=None):
+  # stable U-first ordering of [(part, gid, pose), ...] rows; identity when the flag is off.
+  if _USEFUL_GRASPS is None:
+    return labeled
+  U = _USEFUL_GRASPS
+  return sorted(labeled, key=lambda t: 0 if t[1] in U.get(t[0], ()) else 1)
+
+
+# DOMINANCE (--dominance, spec 8.3 "same node modulo free robots"): SAME-KIND FREE-ARM
+# symmetry breaking -- when several currently-FREE arms of the same gripper kind could act,
+# only the LOWEST-INDEX one does. Any plan using a higher-index twin permutes to the
+# canonical one, so completeness holds EXACTLY when same-kind arms are interchangeable:
+# true for FLOATING EEs (identical geometry, no base); a REAL fixed-base arm at a different
+# table side is NOT a twin -- there the flag over-prunes (documented; the flag prints a
+# warning on real-arm scenes). Kills the x2-x3 idle-twin branching of the transit lattice.
+_DOMINANCE = False
+
+
+def set_dominance(on=True):
+  global _DOMINANCE
+  _DOMINANCE = bool(on)
+
+
+def _canonical_free(free, grasp_table):
+  # reduce the free-arm choice set to one representative per gripper KIND (lowest index).
+  # Uniform scenes (no robot_kinds): all arms are one kind -> single representative.
+  if not _DOMINANCE or len(free) <= 1:
+    return free
+  kinds = getattr(grasp_table, "robot_kinds", None) or {}
+  seen, out = set(), []
+  for r in free:                                          # free_robots is index-sorted
+    k = kinds.get(r, "_uniform")
+    if k not in seen:
+      seen.add(k)
+      out.append(r)
+  return out
 
 
 # ALLOW CURVED GRASPS (--allow-curved-grasps): let a VACUUM keep curved-surface grasps
@@ -2514,14 +2738,18 @@ def rest_faces(assembly, group):
 
 
 def _grasp_frame(assembly, part, part_pose, grasp_id):
-  # world frame of a grasp on a part: contact point (the grasped part's centre, matching the
-  # original isotropic model) plus the APPROACH axis (grasp local z) and the two LATERAL axes
-  # (local x/y) -- the axes feed the DIRECTIONAL grasp model (axial vs shear vs torque); the
-  # isotropic model ignores them.
+  # world frame of a grasp on a part: the CONTACT POINT (the grasp's actual location on the
+  # part -- the DB grasp pose position, NOT the part centre) plus the APPROACH axis (grasp
+  # local z) and the two LATERAL axes (local x/y). The axes feed the directional grasp model
+  # (axial vs shear vs torque); the point is the MOMENT ARM of the grasp's forces. Using the
+  # true location (not the centre) is what lets a grip NEAR the mate interface earn a short
+  # lever -- a mid-part pinch and an end grip are no longer collapsed to the same point (the
+  # chair post: a top-cap grip resists the sideways seating torque a mid-pin pinch cannot).
+  # Symmetric grippers keep symmetric CAPABILITY (the axes are unchanged); only the arm moves.
   gpose = _pose_compose(np.asarray(part_pose, dtype=float),
                         grasp_pose(assembly, part, grasp_id))
   R = _quat_to_R(np.asarray(gpose[3:], dtype=float))
-  return np.asarray(part_pose[:3], dtype=float), R[:, 2], R[:, 0], R[:, 1]
+  return np.asarray(gpose[:3], dtype=float), R[:, 2], R[:, 0], R[:, 1]
 
 
 # memoized equilibrium verdicts. The LP dominates the wrench-on search cost, but the result
@@ -2632,6 +2860,68 @@ def _group_stable(state, assembly, group, gripper_kind, applied=()):
   return res
 
 
+def state_contact_wrenches(state, assembly, gripper_kind, applied=(), poses=None):
+  """Per-contact equilibrium wrenches of a state, for VISUALIZATION (--show-wrenches).
+
+  For every subassembly with grounding contacts, rebuild the capability matrix like
+  _grounding_caps (uncached; per-contact column SPANS kept) and solve one balancing LP for
+  gravity plus any `applied` [(force_world, point_world, group_hint_part), ...] loads.
+  Returns [(point_world, force_3vec, torque_3vec, label), ...]: one entry per grasp contact,
+  one per table support point carrying force, plus each applied load itself (label 'press').
+  Infeasible groups contribute a single ('!' label) marker at the group centroid instead."""
+  out = []
+  kind_of = gripper_kind.get if isinstance(gripper_kind, dict) else (lambda _r: gripper_kind)
+  if poses is None:                                        # callers rendering REAL poses (the
+    poses = _state_part_poses(state, assembly, lift=0.35)  # IK replay) pass their own dict
+  else:
+    poses = dict(poses)
+  for group in state.subassemblies():
+    contacts = [(p, c) for p in sorted(group, key=_part_index)
+                for c in sorted(state.supports.get(p, ())) if c[0] == "grasp"]
+    on_table = any(("table",) in state.supports.get(p, ()) for p in group)
+    if not contacts and not on_table:
+      continue
+    members = sorted(group, key=_part_index)
+    pos = {p: np.asarray(poses[p][:3], dtype=float) for p in members}
+    centroid = np.mean([pos[p] for p in members], axis=0)
+    w_ext = wrench.gravity_wrench([(assembly.mass(p), pos[p] - centroid) for p in members])
+    g_applied = [(f, pt) for f, pt, hint in applied if hint in group]
+    for f, pt in g_applied:
+      w_ext = w_ext + wrench.point_force_wrench(f, np.asarray(pt, dtype=float) - centroid)
+    caps, spans = [], []                                   # spans: (kind, anchor_pt, label)
+    if on_table:
+      fp = _table_footprint(assembly, poses, members)
+      for x in fp:                                        # one unilateral column per point
+        caps.append(wrench.table_capability([np.asarray(x, dtype=float) - centroid]))
+        spans.append(("table", np.asarray(x, dtype=float), "table"))
+    for p, c in contacts:
+      gp, n, t1, t2 = _grasp_frame(assembly, c[2], poses[c[2]], c[3])
+      kk = kind_of(c[1]) if gripper_kind is not None else "two_finger"
+      caps.append(wrench.grasp_capability(gp - centroid, n, t1, t2, kk))
+      spans.append(("grasp", gp, f"{c[1]}:{c[2]}"))
+    G = np.hstack([cp[0] for cp in caps]) if caps else np.zeros((6, 0))
+    ub = np.concatenate([cp[1] for cp in caps]) if caps else np.zeros(0)
+    ok, x = wrench.equilibrium_solution(G, ub, w_ext)
+    if not ok:
+      out.append((centroid, np.zeros(3), np.zeros(3), "!infeasible"))
+      continue
+    col = 0
+    for (kind, pt, label), (Gi, ubi) in zip(spans, caps):
+      k = Gi.shape[1]
+      xi = x[col:col + k]
+      col += k
+      lin = Gi[:3, :]
+      is_couple = np.all(np.abs(lin) < 1e-12, axis=0)
+      force = lin @ xi                                     # net force at the contact point
+      torque = (Gi[3:, :][:, is_couple] @ xi[is_couple]) if is_couple.any() else np.zeros(3)
+      if np.linalg.norm(force) > 1e-6 or np.linalg.norm(torque) > 1e-6:
+        out.append((pt, force, torque, label))
+    for f, pt in g_applied:
+      out.append((np.asarray(pt, dtype=float), np.asarray(f, dtype=float),
+                  np.zeros(3), "press"))
+  return out
+
+
 _SURFACE_CACHE = {}
 
 
@@ -2674,7 +2964,7 @@ def _group_stable_affine(state, assembly, group, gripper_kind, f0, point, gens):
   return wrench.equilibrium_robust_affine(G, ub, w0, deltas, bounds=bounds)
 
 
-def _robust_stable(state, assembly, group, gripper_kind, f_world, point, mag):
+def _robust_stable(state, assembly, group, gripper_kind, f_world, point, mag, scale=1.0):
   # dispatch the robust insertion-stability check by wrench.PARAMS['robust_mode']:
   #   'corners' (default, EXACT): every uncertainty-box corner must be balanceable, the contacts
   #             free to rechoose their force split per realization (fully-adjustable robustness).
@@ -2682,10 +2972,10 @@ def _robust_stable(state, assembly, group, gripper_kind, f_world, point, mag):
   #             (an open-loop / fixed-compliance grasp) -- a single LP, stricter, still sound.
   # Identical to the plain nominal check when insertion_uncertainty is off (no generators).
   if wrench.PARAMS.get("robust_mode", "corners") == "affine" and wrench.PARAMS.get("insertion_uncertainty"):
-    f0, pt, gens = _insertion_uncertainty_gens(f_world, point, mag)
+    f0, pt, gens = _insertion_uncertainty_gens(f_world, point, mag, scale=scale)
     return _group_stable_affine(state, assembly, group, gripper_kind, f0, pt, gens)
   return _group_stable_loaded(state, assembly, group, gripper_kind,
-                              _insertion_uncertainty_variants(f_world, point, mag))
+                              _insertion_uncertainty_variants(f_world, point, mag, scale=scale))
 
 
 def _cross3(a, b):
@@ -2705,7 +2995,7 @@ def _transverse_basis(dvec):
   return t1, _cross3(d, t1)
 
 
-def _insertion_uncertainty_gens(f_world, point, mag):
+def _insertion_uncertainty_gens(f_world, point, mag, scale=1.0):
   # the seating force as an UNCERTAINTY BOX, returned as (nominal_force, nominal_point, gens)
   # where each gen is (apply-to, axis, half-width). Real seating is misaligned in two independent
   # ways: the press direction TILTS (angular) -> a transverse shear up to lateral*mag ("f"), and
@@ -2717,8 +3007,11 @@ def _insertion_uncertainty_gens(f_world, point, mag):
   if not unc:
     return f_world, point, []
   t1, t2 = _transverse_basis(f_world)
-  lat = float(unc.get("lateral", 0.0)) * mag              # transverse-force half-widths (N)
-  off = float(unc.get("offset", 0.0))                     # application-offset half-widths (m)
+  # `scale` inflates the box (GRASP COMPLIANCE, --grasp-compliance): a compliant holder --
+  # the vacuum cup -- DEFLECTS under the press, so the same commanded seating wanders more:
+  # effectively a larger misalignment box for the same noise level. Stiff holds scale 1.0.
+  lat = float(unc.get("lateral", 0.0)) * mag * scale      # transverse-force half-widths (N)
+  off = float(unc.get("offset", 0.0)) * scale             # application-offset half-widths (m)
   gens = []                                               # (apply-to, axis, half-width)
   if lat > 0.0:
     gens += [("f", t1, lat), ("f", t2, lat)]              # angular tilt -> transverse force
@@ -2727,12 +3020,12 @@ def _insertion_uncertainty_gens(f_world, point, mag):
   return f_world, point, gens
 
 
-def _insertion_uncertainty_variants(f_world, point, mag):
+def _insertion_uncertainty_variants(f_world, point, mag, scale=1.0):
   # the uncertainty box as its CORNERS (list of (force, point)). Because the set of balanceable
   # external wrenches is CONVEX, requiring every CORNER stable (_group_stable_loaded) is EXACT for
   # the box -- no sampling, no tunable count. (The box is a conservative OUTER polytope of the true
   # circular cone/disk, so it rejects marginally more, in the safe direction.) Off => [(nominal)].
-  f_world, point, gens = _insertion_uncertainty_gens(f_world, point, mag)
+  f_world, point, gens = _insertion_uncertainty_gens(f_world, point, mag, scale=scale)
   if not gens:
     return [(f_world, point)]
   out = []
@@ -2761,7 +3054,13 @@ def _insertion_load(state, assembly, part, onto, d=None):
   if d is None:
     d = assembly.mate_axis(part)
   f_world = wrench.insert_force(part) * (R @ d)             # force ON target, seating dir
-  point = np.asarray(poses[onto][:3], dtype=float) + R @ rel  # ~ part's seated position
+  # applied at the MATE INTERFACE (assembly.mate_interface: the explicit contact patch, or
+  # the part's face along the press axis by default) -- where the seam transmits the load.
+  # Along-axis default: nominal press is centre-equivalent (parallel offset, no moment) and
+  # only the noise's lateral components gain the lever. OFF-AXIS interface (chair post:
+  # contact at the TOP, press SIDEWAYS): the NOMINAL press itself becomes a real torque.
+  point = np.asarray(poses[onto][:3], dtype=float) + R @ (
+      rel + assembly.mate_interface(part, d))
   return f_world, point
 
 
@@ -2779,17 +3078,16 @@ def _inserter_load(state, assembly, part, onto, d=None):
   if d is None:
     d = assembly.mate_axis(part)
   f_world = wrench.insert_force(part) * (R @ (-d))          # reaction ON part: opposite press
-  half_d = _shape_half_extent_along(assembly.part_shape(part), d)
   point = np.asarray(poses[part][:3], dtype=float) \
-      + R @ (np.asarray(d, dtype=float) * half_d)           # at the pressing face (real lever)
+      + R @ assembly.mate_interface(part, d)                # at the mate interface (real lever)
   return f_world, point
 
 
-def _insertion_load_variants(state, assembly, part, onto, d=None):
+def _insertion_load_variants(state, assembly, part, onto, d=None, scale=1.0):
   # the target-side insertion reaction, as a list of worst-case realizations under the
   # insertion-uncertainty model (a singleton = the nominal load when the flag is off).
   f_world, point = _insertion_load(state, assembly, part, onto, d)
-  return _insertion_uncertainty_variants(f_world, point, wrench.insert_force(part))
+  return _insertion_uncertainty_variants(f_world, point, wrench.insert_force(part), scale=scale)
 
 
 def _inserter_load_variants(state, assembly, part, onto, d=None):
@@ -2798,16 +3096,39 @@ def _inserter_load_variants(state, assembly, part, onto, d=None):
   return _insertion_uncertainty_variants(f_world, point, wrench.insert_force(part))
 
 
+def _compliance_factor(state, assembly, group, gripper_kind):
+  # GRASP COMPLIANCE (--grasp-compliance): the multiplier a group's holding grasps put on
+  # the insertion-uncertainty box -- the WORST (most compliant) grasp in the load path
+  # decides (a chain deflects at its softest link). Table contact is stiff (1.0). Off
+  # (PARAMS None) or no gripper model => 1.0, byte-identical.
+  comp = wrench.PARAMS.get("grasp_compliance")
+  if not comp or gripper_kind is None:
+    return 1.0
+  kind_of = gripper_kind.get if isinstance(gripper_kind, dict) else (lambda _r: gripper_kind)
+  f = 1.0
+  for p in group:
+    for c in state.supports.get(p, ()):
+      if c[0] == "grasp":
+        f = max(f, float(comp.get(kind_of(c[1]), 1.0)))
+  return f
+
+
 def _insertion_stable(state, assembly, group, gripper_kind, part, onto, d=None):
   # `group` (the TARGET) withstands the robust insertion reaction of `part` seating onto it.
+  # A compliantly-held target wanders under the press -> its uncertainty box inflates.
   f_world, point = _insertion_load(state, assembly, part, onto, d)
-  return _robust_stable(state, assembly, group, gripper_kind, f_world, point, wrench.insert_force(part))
+  return _robust_stable(state, assembly, group, gripper_kind, f_world, point,
+                        wrench.insert_force(part),
+                        scale=_compliance_factor(state, assembly, group, gripper_kind))
 
 
 def _inserter_stable(state, assembly, group, gripper_kind, part, onto, d=None):
-  # the HELD `group` transmits its own weight plus the robust seating reaction through its grasp(s).
+  # the HELD `group` transmits its own weight plus the robust seating reaction through its
+  # grasp(s). A compliant inserter grasp cannot place the press accurately -> box inflates.
   f_world, point = _inserter_load(state, assembly, part, onto, d)
-  return _robust_stable(state, assembly, group, gripper_kind, f_world, point, wrench.insert_force(part))
+  return _robust_stable(state, assembly, group, gripper_kind, f_world, point,
+                        wrench.insert_force(part),
+                        scale=_compliance_factor(state, assembly, group, gripper_kind))
 
 
 # reference anchor poses for the wrench precompute: absolute position is irrelevant (the

@@ -2107,6 +2107,39 @@ def _labeled_geo_ok(checker, assembly, st, ideal_set, note=""):
   return checker._check(st, assembly, note=note)
 
 
+def _probe_grasp_kinds(st, kinds_of, all_kinds):
+  # for a crafted probe state, each grasp contact as (robot_id, allowed-kinds) -- the
+  # kind-usability mask of the grasp (kinds_of[(part,), part, gid]) or all present kinds.
+  out = []
+  for p in st.bodies():
+    for c in st.supports.get(p, ()):
+      if c[0] == "grasp":
+        mask = kinds_of.get(((c[2],), c[2], c[3])) if kinds_of is not None else None
+        out.append((c[1], tuple(sorted(mask)) if mask else all_kinds))
+  return out
+
+
+def _stable_any_kind(st, assembly, group, grasp_kinds, load_variants=None):
+  # MIXED-EE wrench fact: is the probe stable for SOME valid kind-assignment (each grasp a
+  # kind from its mask)? Optimistic over assignments -> admissible (never over-estimates
+  # cost); still False when NO kind can hold (e.g. a weak vacuum on a plate under a press),
+  # which is exactly the pruning the topological fallback lost. Grasp counts are tiny
+  # (hold+brace+inserter), so the product over masks (<=~16) is cheap; facts are cached.
+  import itertools
+  if any(len(ks) == 0 for _r, ks in grasp_kinds):
+    return False                                           # a grasp NO present kind can make
+  if not grasp_kinds:                                      # table-only: kind irrelevant
+    return (_group_stable_loaded(st, assembly, group, "two_finger", load_variants)
+            if load_variants else _group_stable(st, assembly, group, "two_finger"))
+  for combo in itertools.product(*(ks for _r, ks in grasp_kinds)):
+    gk = {r: combo[i] for i, (r, _ks) in enumerate(grasp_kinds)}
+    ok = (_group_stable_loaded(st, assembly, group, gk, load_variants)
+          if load_variants else _group_stable(st, assembly, group, gk))
+    if ok:
+      return True
+  return False
+
+
 def _kind_budget_ok(label_kinds, kind_counts, G, L):
   # MIXED-EE arm budget for the labeled abstractions: every held label needs an arm whose
   # kind is in the label's usability mask. With two kinds, Hall's condition reduces to
@@ -2187,10 +2220,14 @@ class LabeledDisassemblyHeuristic:
     self._bracing = bracing                                # model the add_grasp (co-grasp) edge
     self._clearance = clearance                            # see _table_aware_pick_fact
     self._gk = gripper_kind                                # non-None => WRENCH facts active
-    if isinstance(self._gk, dict):
-      # MIXED EEs v1: per-kind wrench facts are not modeled yet -- fall back to the
-      # TOPOLOGICAL facts (optimistic => admissible; forward gates stay exact).
-      self._gk = None
+    # MIXED EEs: gk is a {robot: kind} MAP. Wrench facts then evaluate over each grasp's
+    # kind MASK (exists-a-feasible-assignment; see _stable_any_kind) -- admissible, and it
+    # keeps the force/torque pruning the old topological fallback threw away.
+    self._mixed = isinstance(self._gk, dict) and _MIXED_WRENCH_H
+    if isinstance(self._gk, dict) and not _MIXED_WRENCH_H:
+      self._gk = None                                     # fast fallback: topological facts
+    self._kinds_of = getattr(grasp_table, "kinds_of", None)
+    self._all_kinds = tuple(sorted(set(getattr(grasp_table, "robot_kinds", {}).values())))
     objs = list(assembly.objects)
     base = assembly.base
     # STATES ARE SORTED TUPLES (ideal, G, face, L) -- tuples hash ~2x faster than
@@ -2260,6 +2297,8 @@ class LabeledDisassemblyHeuristic:
     # degenerates back to a plateau exactly on wrench-heavy configs (measured).
     flatposes = _flat_poses(assembly)
     self._wfacts = {}
+    self._ins_lv = {}
+    self._tgt_lv = {}
 
     def crafted(ideal_key, G, face):
       # a minimal real State for the LP: ideal parts mate-parented under the base; base on
@@ -2302,7 +2341,12 @@ class LabeledDisassemblyHeuristic:
       hit = self._wfacts.get(key)
       if hit is None:
         st = crafted(ideal_key, G, face)
-        hit = self._wfacts[key] = _group_stable(st, assembly, set(ideal_key), self._gk)
+        if self._mixed:
+          hit = self._wfacts[key] = _stable_any_kind(
+              st, assembly, set(ideal_key),
+              _probe_grasp_kinds(st, self._kinds_of, self._all_kinds))
+        else:
+          hit = self._wfacts[key] = _group_stable(st, assembly, set(ideal_key), self._gk)
       return hit
 
     def w_assemble_ok(ideal_s_key, G2, face, q, gq):
@@ -2315,15 +2359,37 @@ class LabeledDisassemblyHeuristic:
       hit = self._wfacts.get(key)
       if hit is None:
         onto = assembly.relative_pose(q)[0]
-        ok = w_hold_ok(ideal_s_key, G2, face)
+        # ARM BUDGET over the assemble's SIMULTANEOUS grasps (braces G2 + the inserter):
+        # single-kind labels must not exceed that kind's arm count -- e.g. two TF braces
+        # plus a TF inserter with only two TF arms is unrealizable however the LP balances
+        # (found via the chair stress config: the oracle kept proposing exactly these).
+        ok = (self._kind_counts is None
+              or _kind_budget_ok(self._label_kinds, self._kind_counts,
+                                 tuple(G2) + ((q, gq),), ()))
+        ok = ok and w_hold_ok(ideal_s_key, G2, face)
         if ok and wrench.PARAMS.get("check_inserter", True):
           st_q = held_single(q, gq)
-          ok = _group_stable_loaded(st_q, assembly, frozenset({q}), self._gk,
-                                    _inserter_load_variants(st_q, assembly, q, onto))
+          lv = self._ins_lv.get(q)                        # load independent of grasp/kind
+          if lv is None:
+            lv = self._ins_lv[q] = _inserter_load_variants(st_q, assembly, q, onto)
+          if self._mixed:
+            ok = _stable_any_kind(st_q, assembly, frozenset({q}),
+                                  _probe_grasp_kinds(st_q, self._kinds_of, self._all_kinds),
+                                  lv)
+          else:
+            ok = _group_stable_loaded(st_q, assembly, frozenset({q}), self._gk, lv)
         if ok:
           st_t = crafted(ideal_s_key, G2, face)
-          ok = _group_stable_loaded(st_t, assembly, set(ideal_s_key), self._gk,
-                                    _insertion_load_variants(st_t, assembly, q, onto))
+          lvt = self._tgt_lv.get((ideal_s_key, face, q))  # load independent of G2/gq
+          if lvt is None:
+            lvt = self._tgt_lv[(ideal_s_key, face, q)] = \
+                _insertion_load_variants(st_t, assembly, q, onto)
+          if self._mixed:
+            ok = _stable_any_kind(st_t, assembly, set(ideal_s_key),
+                                  _probe_grasp_kinds(st_t, self._kinds_of, self._all_kinds),
+                                  lvt)
+          else:
+            ok = _group_stable_loaded(st_t, assembly, set(ideal_s_key), self._gk, lvt)
         hit = self._wfacts[key] = ok
       return hit
 
@@ -2515,6 +2581,64 @@ class LabeledDisassemblyHeuristic:
 _SIG_COMPONENTS = ("press", "pickface", "contact", "solohold", "braceside")
 
 
+_MIXED_WRENCH_H = False                                    # --mixed-wrench-h: per-kind wrench
+                                                          # facts under mixed EEs (precise but
+                                                          # SLOW build); default False = the
+                                                          # fast topological fallback.
+
+
+_FILL_MAX_HOLDERS = 1                                      # milestone fill goal: the settling
+                                                          # component ends held by <= this many
+                                                          # arms. 1 = historical (a kept brace
+                                                          # must be released before the fill
+                                                          # completes); 2 lets a brace PERSIST
+                                                          # into the next fill.
+
+
+_FILL_TOUCH_ALL = False                                    # --fill-touch-all (debug): let a
+                                                          # fill act on ANY loose part, not
+                                                          # just ideal+{p} -- so it can move a
+                                                          # blocking scatter part aside. Big
+                                                          # search blow-up; a diagnosis knob.
+
+
+_FILL_CAPTURE_DIR = None                                   # debug: dump failing fills' ENTRY
+                                                          # states (pickle) for exact offline
+                                                          # replay -- set via env var
+                                                          # ASSEMBLY_FILL_CAPTURE=<dir>.
+import os as _os
+if _os.environ.get("ASSEMBLY_FILL_CAPTURE"):
+  _FILL_CAPTURE_DIR = _os.environ["ASSEMBLY_FILL_CAPTURE"]
+
+
+def _capture_fill_failure(s, q, ideal, tag):
+  if _FILL_CAPTURE_DIR is None:
+    return
+  try:
+    import pickle, os
+    os.makedirs(_FILL_CAPTURE_DIR, exist_ok=True)
+    n = len(os.listdir(_FILL_CAPTURE_DIR))
+    with open(os.path.join(_FILL_CAPTURE_DIR, f"fillfail_{n:03d}_{q}.pkl"), "wb") as f:
+      pickle.dump({"state": s, "q": q, "ideal": set(ideal), "tag": tag}, f)
+  except Exception as e:
+    print(f"[capture] failed: {e}")
+
+
+def set_fill_touch_all(on=True):
+  global _FILL_TOUCH_ALL
+  _FILL_TOUCH_ALL = bool(on)
+
+
+def set_fill_max_holders(n):
+  global _FILL_MAX_HOLDERS
+  _FILL_MAX_HOLDERS = int(n)
+
+
+def set_mixed_wrench_h(on=True):
+  global _MIXED_WRENCH_H
+  _MIXED_WRENCH_H = bool(on)
+
+
 def set_sig_components(components):
   """Ablation hook for the signature collapse (--sig-components): which components
   participate in the grasp-equivalence classes. Fewer components => coarser classes =>
@@ -2538,13 +2662,15 @@ def _sig_held_single_state(assembly, q, g):
                poses=dict(_flat_poses(assembly)))
 
 
-def _sig_press_ok(assembly, q, g, gk):
+def _sig_press_ok(assembly, q, g, gk, lv=None):
   # S1: can grasp g transmit the insertion press for q's OWN mate? (the per-state
-  # inserter gate of w_assemble_ok, evaluated once per (part, grasp))
+  # inserter gate of w_assemble_ok, evaluated once per (part, grasp)). `lv` lets the
+  # caller hoist the load variants (they depend only on q, not on g or the kind).
   onto = assembly.relative_pose(q)[0]
   st = _sig_held_single_state(assembly, q, g)
-  return _group_stable_loaded(st, assembly, frozenset({q}), gk,
-                              _inserter_load_variants(st, assembly, q, onto))
+  if lv is None:
+    lv = _inserter_load_variants(st, assembly, q, onto)
+  return _group_stable_loaded(st, assembly, frozenset({q}), gk, lv)
 
 
 def _sig_solo_hold_ok(assembly, q, g, gk):
@@ -2563,6 +2689,50 @@ def _sig_solo_hold_ok(assembly, q, g, gk):
   st = State(parent=parent, place={}, supports=supports,
              poses=dict(_flat_poses(assembly)))
   return _group_stable(st, assembly, set(assembly.objects), gk)
+
+
+def compute_useful_grasps(assembly, grasp_table, gripper_kind=None):
+  """SPEC 6.2 useful-grasp sets, reduced to what survives a free-handover domain: U[p] =
+  the grasps of p that can serve p's MATE ITSELF -- collision-free at the op (present in
+  the grasp table of p's mate-context subassembly) and press-transmitting for SOME kind in
+  their usability mask (per-kind wrench facts; wrench off => no press constraint).
+
+  The full regression closure (grasp x face reachability) COLLAPSES here: one handover
+  reaches any grasp, so distance-to-U is 0 / 1 / (inf only when U[p] is empty, which the
+  wrench facts already expose). What remains valuable -- and what the callers consume -- is
+  (a) ORDERING every grasp choice U-first (the transit gradient the flat local h lacks) and
+  (b) an ADMISSIBLE +1 in the fill h when the target part is held by a non-U grasp (the
+  forced regrasp/handover before its mate). Returns {part: frozenset(useful grasp ids)}."""
+  kinds_of = getattr(grasp_table, "kinds_of", None)
+  robot_kinds = getattr(grasp_table, "robot_kinds", None)
+  present = sorted(set(robot_kinds.values())) if robot_kinds else None
+  out = {}
+  for p in assembly.objects:
+    if assembly.relative_pose(p) is None:
+      continue                                            # base: no mate
+    ids = sorted({g for _q, g, _ in grasp_table.get((p,), ())})
+    if not ids:
+      continue
+    ctx = _subasm_key(_mate_closure(assembly, p) | {p})
+    ctx_rows = grasp_table.get(ctx)
+    at_op = {g for q, g, _ in ctx_rows if q == p} if ctx_rows is not None else set(ids)
+    if gripper_kind is None:
+      out[p] = frozenset(at_op)
+      continue
+    lv = None                                             # hoisted press load (per part)
+
+    def pressable(g):
+      nonlocal lv
+      if lv is None:
+        st0 = _sig_held_single_state(assembly, p, g)
+        lv = _inserter_load_variants(st0, assembly, p, assembly.relative_pose(p)[0])
+      ks = (kinds_of or {}).get(((p,), p, g)) if kinds_of else None
+      kk = sorted(ks) if ks else (present or [gripper_kind] if isinstance(gripper_kind, str)
+                                  else sorted(set(gripper_kind.values())))
+      return any(_sig_press_ok(assembly, p, g, k, lv=lv) for k in kk)
+
+    out[p] = frozenset(g for g in at_op if pressable(g))
+  return out
 
 
 def compute_grasp_signatures(assembly, grasp_table, gripper_kind=None, gripper_path=None,
@@ -2602,6 +2772,15 @@ def compute_grasp_signatures(assembly, grasp_table, gripper_kind=None, gripper_p
         axes.append(u)
   axes.sort()
   sigs = {}
+  _press_lv = {}                                           # per-part hoisted press loads
+
+  def press_lv(q):
+    lv = _press_lv.get(q)
+    if lv is None:
+      st0 = _sig_held_single_state(assembly, q, 0)
+      lv = _press_lv[q] = _inserter_load_variants(st0, assembly, q,
+                                                  assembly.relative_pose(q)[0])
+    return lv
   for q in assembly.objects:
     ids = sorted({g for _p, g, _ in grasp_table[(q,)]})
     faces = list(rest_faces(assembly, {q}))
@@ -2626,7 +2805,14 @@ def compute_grasp_signatures(assembly, grasp_table, gripper_kind=None, gripper_p
       if kmask is not None:
         sig.append(("gripper", tuple(sorted(kmask.get(((q,), q, g), ())))))
       if "press" in comps and gripper_kind is not None and q != assembly.base:
-        sig.append(("press", bool(_sig_press_ok(assembly, q, g, gripper_kind))))
+        # MIXED EEs (gripper_kind is a {robot:kind} map): evaluate at the grasp's own
+        # kind(s) from its mask, OR-ing -- the press-transmissible-by-SOME-usable-kind fact.
+        if isinstance(gripper_kind, dict):
+          ks = kmask.get(((q,), q, g), ()) if kmask else ()
+          val = any(_sig_press_ok(assembly, q, g, k, lv=press_lv(q)) for k in ks)
+        else:
+          val = _sig_press_ok(assembly, q, g, gripper_kind, lv=press_lv(q))
+        sig.append(("press", bool(val)))
       if "pickface" in comps:
         sig.append(("faces", tuple(
             (k, tuple(bool(_table_aware_pick_fact(assembly, (q,), f, q, g, pth,
@@ -2641,7 +2827,12 @@ def compute_grasp_signatures(assembly, grasp_table, gripper_kind=None, gripper_p
         sig.append(("contact", tuple(np.round(np.asarray(pose[:3], dtype=float), 3)),
                     tuple(np.round(close, 2))))
       if "solohold" in comps and gripper_kind is not None and assembly.can_hold(q):
-        sig.append(("hold", bool(_sig_solo_hold_ok(assembly, q, g, gripper_kind))))
+        if isinstance(gripper_kind, dict):                 # per-kind (see press, above)
+          ks = kmask.get(((q,), q, g), ()) if kmask else ()
+          val = any(_sig_solo_hold_ok(assembly, q, g, k) for k in ks)
+        else:
+          val = _sig_solo_hold_ok(assembly, q, g, gripper_kind)
+        sig.append(("hold", bool(val)))
       if "braceside" in comps:
         # brace force is transmitted through the PADS (closing axis, sign-symmetric),
         # not along the wrist approach.
@@ -2704,8 +2895,11 @@ class CollapsedLabeledHeuristic:
     self._bracing = bracing                                # model the add_grasp (co-grasp) edge
     self._clearance = clearance
     self._gk = gripper_kind
-    if isinstance(self._gk, dict):
-      self._gk = None                                      # mixed EEs v1: topological facts
+    self._mixed = isinstance(self._gk, dict) and _MIXED_WRENCH_H
+    if isinstance(self._gk, dict) and not _MIXED_WRENCH_H:
+      self._gk = None                                     # fast fallback: topological facts
+    self._kinds_of = getattr(grasp_table, "kinds_of", None)
+    self._all_kinds = tuple(sorted(set(getattr(grasp_table, "robot_kinds", {}).values())))
     self._collapse = bool(collapse_grasps)                 # see GraspCollapsedHeuristic
     objs = list(assembly.objects)
     base = assembly.base
@@ -2826,6 +3020,8 @@ class CollapsedLabeledHeuristic:
     # ---- WRENCH facts: identical to the fine class (G stays labeled, so these are exact).
     flatposes = _flat_poses(assembly)
     self._wfacts = {}
+    self._ins_lv = {}
+    self._tgt_lv = {}
 
     def crafted(ideal_key, G, face):
       parent, place, supports = {}, {}, {}
@@ -2863,9 +3059,13 @@ class CollapsedLabeledHeuristic:
       key = ("H", ideal_key, G, face)
       hit = self._wfacts.get(key)
       if hit is None:
+        def hold(st):
+          return (_stable_any_kind(st, assembly, set(ideal_key),
+                                   _probe_grasp_kinds(st, self._kinds_of, self._all_kinds))
+                  if self._mixed
+                  else _group_stable(st, assembly, set(ideal_key), self._gk))
         hit = self._wfacts[key] = any(
-            _group_stable(crafted(ideal_key, Gv, face), assembly, set(ideal_key), self._gk)
-            for Gv in gcombos(ideal_key, G))
+            hold(crafted(ideal_key, Gv, face)) for Gv in gcombos(ideal_key, G))
       return hit
 
     def w_assemble_ok(ideal_s_key, G2, face, q, gq):
@@ -2875,19 +3075,36 @@ class CollapsedLabeledHeuristic:
       hit = self._wfacts.get(key)
       if hit is None:
         onto = assembly.relative_pose(q)[0]
-        ok = w_hold_ok(ideal_s_key, G2, face)
+        ok = (self._kind_counts is None                   # arm budget incl. the inserter --
+              or _kind_budget_ok(self._label_kinds, self._kind_counts,
+                                 tuple(G2) + ((q, gq),), ()))  # see fine class
+        ok = ok and w_hold_ok(ideal_s_key, G2, face)
         if ok and wrench.PARAMS.get("check_inserter", True):
+          lv = self._ins_lv.get(q)                        # load independent of grasp/kind:
+          if lv is None:                                  # compute ONCE, reuse across every
+            st0 = held_single(q, self._svgroups.get(q, {}).get(gq, (gq,))[0])
+            lv = self._ins_lv[q] = _inserter_load_variants(st0, assembly, q, onto)
+
           def ins_ok(graw):
             st_q = held_single(q, graw)
-            return _group_stable_loaded(st_q, assembly, frozenset({q}), self._gk,
-                                        _inserter_load_variants(st_q, assembly, q, onto))
+            return (_stable_any_kind(st_q, assembly, frozenset({q}),
+                                     _probe_grasp_kinds(st_q, self._kinds_of, self._all_kinds), lv)
+                    if self._mixed
+                    else _group_stable_loaded(st_q, assembly, frozenset({q}), self._gk, lv))
           ok = any(ins_ok(graw)
                    for graw in self._svgroups.get(q, {}).get(gq, (gq,)))
         if ok:
+          lvt = self._tgt_lv.get((ideal_s_key, face, q))  # load independent of G2 combo
+          if lvt is None:
+            lvt = self._tgt_lv[(ideal_s_key, face, q)] = _insertion_load_variants(
+                crafted(ideal_s_key, (), face), assembly, q, onto)
+
           def tgt_ok(G2v):
             st_t = crafted(ideal_s_key, G2v, face)
-            return _group_stable_loaded(st_t, assembly, set(ideal_s_key), self._gk,
-                                        _insertion_load_variants(st_t, assembly, q, onto))
+            return (_stable_any_kind(st_t, assembly, set(ideal_s_key),
+                                     _probe_grasp_kinds(st_t, self._kinds_of, self._all_kinds), lvt)
+                    if self._mixed
+                    else _group_stable_loaded(st_t, assembly, set(ideal_s_key), self._gk, lvt))
           ok = any(tgt_ok(G2v) for G2v in gcombos(ideal_s_key, G2))
         hit = self._wfacts[key] = ok
       return hit
@@ -3132,15 +3349,14 @@ class SignatureCollapsedHeuristic(CollapsedLabeledHeuristic):
   incomplete signature only coarsens the relaxation -- admissibility is preserved."""
 
   def __init__(self, assembly, n_robots, grasp_table, **kwargs):
-    # MIXED EEs v1: the signature's WRENCH facts (press/solohold) craft probe states with a
-    # placeholder robot, which a {robot: kind} map cannot price -> evaluate them kind-less
-    # (skipped, like wrench-off). The GRIPPER MASK component still splits classes by kind,
-    # and the fine/collapsed guard handles the inherited facts the same way.
-    sig_gk = kwargs.get("gripper_kind")
-    if isinstance(sig_gk, dict):
-      sig_gk = None
+    # MIXED EEs: the signature's WRENCH components (press/solohold) evaluate at each grasp's
+    # KIND(S) from its mask (compute_grasp_signatures handles the {robot:kind} map) -- so
+    # classes split by per-kind press-transmissibility, and the collapsed abstraction's
+    # per-kind wrench facts (see CollapsedLabeledHeuristic) hang off those classes.
     classes = compute_grasp_signatures(
-        assembly, grasp_table, gripper_kind=sig_gk,
+        assembly, grasp_table,
+        gripper_kind=(None if (isinstance(kwargs.get("gripper_kind"), dict)
+                               and not _MIXED_WRENCH_H) else kwargs.get("gripper_kind")),
         gripper_path=kwargs.get("gripper_path"),
         clearance=kwargs.get("clearance", 0.02))
     if kwargs.get("verbose"):
@@ -3810,6 +4026,11 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
   if robots is None:
     robots = get_robots(C)
   gk = wrench_kind_arg(C, robots) if wrench else None      # scalar; {robot: kind} when MIXED
+  if _problem._USEFUL_FLAG:
+    _problem.set_useful_grasps(compute_useful_grasps(assembly, grasp_table, gk))
+    if verbose:
+      nU = {p: len(v) for p, v in (_problem._USEFUL_GRASPS or {}).items()}
+      print(f"[useful-grasps] mate-viable per part: {nU}")
 
   # abstraction heuristic: exact backward solve of a relaxed model. max() with the simple
   # counting heuristic keeps admissibility. Used only for FINITE weights: A*/wA* consume h
@@ -4370,6 +4591,58 @@ def _part_mated(state, p):
   return any(c[0] == "mate" for c in state.supports.get(p, ()))
 
 
+def _fill_fail_reason(q, ideal, assembly, gripper_kind):
+  """Diagnose a failed milestone fill: is the mate of `q` onto its parent GENUINELY
+  wrench-infeasible in this `ideal` context, or did the fill just not find it? Checks the
+  target group `ideal` resisting q's insertion press (a) resting on the table per face, and
+  (b) held by 1 or 2 arms. Returns a short string for the log."""
+  onto = assembly.relative_pose(q)[0] if assembly.relative_pose(q) else None
+  if onto is None or onto not in ideal:
+    return f"onto={onto} not in ideal"
+  # the probe held-states use synthetic robot ids -> a {robot:kind} MAP can't price them;
+  # evaluate the hold checks with a scalar USABLE kind (two-finger sorts last past vacuum).
+  hk = (sorted(set(gripper_kind.values()))[-1] if isinstance(gripper_kind, dict)
+        else gripper_kind)
+  poses = _flat_poses(assembly)
+
+  def rest_state(face):
+    parent, place, supports = {}, {}, {}
+    for r in assembly.objects:
+      if r in ideal:
+        if r == assembly.base:
+          parent[r] = ("table",); supports[r] = frozenset({("table",)}); place[r] = ("slot", 0, face)
+        else:
+          o = assembly.relative_pose(r)[0]
+          parent[r] = ("part", o); supports[r] = frozenset({("mate", o)})
+      else:
+        parent[r] = ("table",); supports[r] = frozenset({("table",)}); place[r] = ("slot", _part_index(r), _IDENTITY_FACE)
+    return State(parent=parent, place=place, supports=supports, poses=dict(poses))
+
+  faces = sorted(rest_faces(assembly, set(ideal)))
+  rest_ok = [f for f in faces
+             if _insertion_stable(rest_state(f), assembly, set(ideal), hk, q, onto)]
+
+  # held by N arms: base held + (N-1) braces (any distinct grasps on the group)
+  def held_state(n):
+    parent, supports = {}, {}
+    for r in assembly.objects:
+      if r in ideal:
+        if r == assembly.base:
+          parent[r] = ("gripper", "zz0"); supports[r] = frozenset()
+        else:
+          o = assembly.relative_pose(r)[0]; parent[r] = ("part", o); supports[r] = frozenset({("mate", o)})
+      else:
+        parent[r] = ("table",); supports[r] = frozenset({("table",)})
+    supports[assembly.base] = frozenset({("grasp", "zz0", assembly.base, 0)})
+    if n >= 2:
+      supports[assembly.base] = supports[assembly.base] | {("grasp", "zz1", assembly.base, 1)}
+    return State(parent=parent, place={}, supports=supports, poses=dict(poses))
+  held1 = _insertion_stable(held_state(1), assembly, set(ideal), hk, q, onto)
+  held2 = _insertion_stable(held_state(2), assembly, set(ideal), hk, q, onto)
+  return (f"target={sorted(ideal)} restfaces={faces} press-resisted: "
+          f"resting-on={rest_ok or 'NONE'}, held-by-1={held1}, held-by-2={held2}")
+
+
 def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot_ik,
                   weight, max_nodes, verbose, gripper_kind=None, handovers=True,
                   allow_place=True, bracing=False, grasp_cap=None, h_extra=None,
@@ -4409,7 +4682,7 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
     # p joined, nothing loose left in hand, and the settling component down to <=1 holder
     # (a clean rest point for the next step -- prevents inserter grasps / braces piling up).
     loose, holders = _loose_and_holders(s)
-    return _part_mated(s, p) and loose == 0 and holders <= 1
+    return _part_mated(s, p) and loose == 0 and holders <= _FILL_MAX_HOLDERS
 
   def h_fn(s):
     # LOCAL lower bound with a MONOTONE gradient along the intended fill (found via the
@@ -4422,10 +4695,18 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
       left = 0
     elif any(c[0] == "grasp" and c[2] == p for c in s.supports.get(p, ())):
       left = 1
+      # --useful-grasps: held by a grasp that CANNOT seat the mate -> one forced
+      # handover/regrasp before it (admissible +1; see spec 6.2 pricing).
+      U = _problem._USEFUL_GRASPS
+      if U is not None and p in U:
+        held_g = next(c[3] for c in s.supports.get(p, ())
+                      if c[0] == "grasp" and c[2] == p)
+        if held_g not in U[p]:
+          left = 2
     else:
       left = 2
     loose, holders = _loose_and_holders(s, exclude=p)
-    hv = left + loose + max(0, holders - 1)
+    hv = left + loose + max(0, holders - _FILL_MAX_HOLDERS)
     if h_extra is not None:
       # The labeled abstraction (FULL-assembly cost-to-go) keeps exactly two roles here:
       #   * h=inf PRUNES states the full assembly cannot be finished from (sound);
@@ -4453,8 +4734,15 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
     for a, ns in successors(s, assembly, robots, grasp_table=grasp_table,
                             gripper_kind=gripper_kind, handovers=handovers,
                             allow_place=allow_place, bracing=bracing):
-      if a[2] not in relevant:                            # a[2] is the part every action acts on
-        continue
+      if a[2] not in relevant and not _FILL_TOUCH_ALL:   # a[2] is the part each action acts on
+        # RELEASE of an INHERITED grasp is always legal: the previous fill may end holding
+        # the assembly by any part (<=1 holder persists), and the grasped part is then
+        # outside this fill's `relevant` -- without this exemption the inherited holder
+        # STRANDS an arm for the whole fill (module fills with 2 usable arms died on
+        # exactly this; found via captured-state replay, 2026-07-24). Releasing frees a
+        # resource and manipulates nothing.
+        if a[0] != "release":
+          continue
       if (grasp_cap is not None and a[0] in ("pick", "add_grasp", "handover")
           and a[3] >= grasp_cap):
         continue                                          # grasp-WIDENING: only ids < cap this pass
@@ -4642,8 +4930,8 @@ def _add_parts(start, ps, ideal, assembly, robots, checker, grasp_table, robot_i
     for a, ns in successors(s, assembly, robots, grasp_table=grasp_table,
                             gripper_kind=gripper_kind, handovers=handovers,
                             allow_place=allow_place, bracing=bracing):
-      if a[2] in relevant:
-        yield a, ns
+      if a[2] in relevant or a[0] == "release":           # inherited-grasp release always
+        yield a, ns                                       # legal (see _add_one_part)
 
   def edge_check_fn(prev, act, ns):
     if not cheap_feasible(act, prev, ns, assembly, checker):
@@ -4986,6 +5274,11 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
     robots = get_robots(C)
   checker, grasp_table = _search_context(C, assembly, robots)
   gk = wrench_kind_arg(C, robots) if wrench else None
+  if _problem._USEFUL_FLAG:
+    _problem.set_useful_grasps(compute_useful_grasps(assembly, grasp_table, gk))
+    if verbose:
+      nU = {p: len(v) for p, v in (_problem._USEFUL_GRASPS or {}).items()}
+      print(f"[useful-grasps] mate-viable per part: {nU}")
   if gk is not None:
     reset_wrench_cache()
   # the milestone oracle: GraspCollapsedHeuristic == CollapsedLabeledHeuristic when dense
@@ -5183,9 +5476,16 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
         break
       blacklist.add((ideal_key, q))
       repairs += 1
+      _capture_fill_failure(s, q, ideal, f"repair{repairs}")
       if verbose:
+        why = ""
+        if gk is not None:                                 # connect roots too: the JOIN is an
+          try:                                             # assemble of q onto its parent
+            why = "  | " + _fill_fail_reason(q, ideal, assembly, gk)
+          except Exception as _e:
+            why = f"  | (diag err: {_e})"
         print(f"[milestones] fill-in for {q} failed ({time.perf_counter() - tq:.1f}s) "
-              f"-> blacklisted ({repairs} repairs)")
+              f"-> blacklisted ({repairs} repairs){why}")
       if repairs > max_repairs:
         if verbose:
           print("[milestones] repair budget exhausted")
@@ -5361,8 +5661,8 @@ def _refill_window(start, ps, ideal, target, assembly, robots, checker, grasp_ta
     for a, ns in successors(s, assembly, robots, grasp_table=grasp_table,
                             gripper_kind=gripper_kind, handovers=handovers,
                             allow_place=allow_place, bracing=bracing):
-      if a[2] in relevant:
-        yield a, ns
+      if a[2] in relevant or a[0] == "release":           # inherited-grasp release always
+        yield a, ns                                       # legal (see _add_one_part)
 
   def cheap_only(prev, act, ns):
     return cheap_feasible(act, prev, ns, assembly, checker)
