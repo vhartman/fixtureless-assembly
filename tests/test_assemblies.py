@@ -610,6 +610,36 @@ def test_milestone_fill_releases_inherited_grasp():
   assert sub0 is not None and not any(a[0] == "release" and a[2] == "obj_2" for a in sub0)
 
 
+def test_check_initial_scene():
+  """The initial-scene validator (collision-free + every part graspable by >=1 robot). The
+  default scatter line is fully usable; a tight --grid-init block is collision-free but buries
+  the interior cubes so a SIDE-grasp two-finger reaches only the protruding one (NOT usable,
+  caught up front); the VACUUM top-pick reaches every cube in the same grid (usable). Purely an
+  INITIAL-STATE check -- the assembly/topology is never exercised."""
+  # default scatter line, two-finger: collision-free, all 7 graspable
+  A.set_seed(0); A.set_rolls_per_face(2)
+  asm = A.make_assembly("cross", 7)
+  C = make_four_robot_env(num_robots=4, floating_ee=True, vacuum=False)
+  A.add_disassembled_obj(C, asm)
+  ok, rep = A.check_initial_scene(C, asm, verbose=False)
+  assert ok and rep["collision_free"] and not rep["ungraspable"], rep
+
+  # tight 2-wide grid, two-finger: collision-free but the block is frozen (only the +1 cube)
+  asm2 = A.make_assembly("cross", 7)
+  C2 = make_four_robot_env(num_robots=4, floating_ee=True, vacuum=False)
+  A.add_disassembled_obj(C2, asm2, grid=2)
+  ok2, rep2 = A.check_initial_scene(C2, asm2, verbose=False)
+  assert rep2["collision_free"] and not ok2 and len(rep2["ungraspable"]) >= 5, rep2
+
+  # same tight grid, VACUUM: top-pick reaches every cube -> usable
+  A.set_rolls_per_face(1)
+  asm3 = A.make_assembly("cross", 7)
+  C3 = make_four_robot_env(num_robots=4, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C3, asm3, grid=2)
+  ok3, rep3 = A.check_initial_scene(C3, asm3, verbose=False)
+  assert ok3 and not rep3["ungraspable"], rep3
+
+
 def test_milestone_module_fill():
   """The MILESTONE planner on a MODULE assembly -- the solver family the stranded-arm fix lives
   in (the net had no milestone case before). cube-plates-8 builds the top plate {obj_4..7} as a

@@ -266,7 +266,7 @@ class Assembly:
 
 def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, max_tries=200,
                          spacing=1.0 / 7.0, per_row=8, random_init=None, float_height=0.015,
-                         min_sep=None):
+                         min_sep=None, grid=None, grid_gap=0.1):
   # scatter the assembly's parts on the table as loose cubes (test scene). Geometry
   # (cube_size / cube_radius) comes from the assembly, not a global. `spacing` = the x-pitch
   # of the scatter line (default = historical 1/7 m ~ 0.143); a knob for analysing how much
@@ -274,12 +274,22 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
   # rather than the planner. Parts beyond `per_row` WRAP into further rows (y += spacing per
   # row) -- a single line of >8 parts walks off the reachable table. Row 0 is byte-identical
   # to the historical line, so existing <=8-part scenes are unchanged.
+  #
+  # INITIAL-STATE LAYOUT MODES (mutually exclusive; the ASSEMBLY class is untouched -- this is
+  # purely where the parts START):
+  #   default          -- the scatter line above.
+  #   random_init      -- randomised square between the robots (seeded).
+  #   perturb_start_pose -- the line + a small collision-free jitter.
+  #   grid=<cols>      -- a TIGHT rectangular grid, `cols` wide, packed row-major and centred
+  #                       on the table, pitch = cube_size*(1+grid_gap). With a small gap the
+  #                       cubes sit shoulder-to-shoulder, so interior cubes are not directly
+  #                       graspable -- the planner must RELOCATE perimeter cubes to reach the
+  #                       ones the assembly needs. (cross-7, cols=2 -> a 2x3 block + 1.)
   cs = assembly.cube_size
 
   table_half = C.getFrame("table").getSize()[2] / 2.0
 
   for i, name in enumerate(assembly.objects):
-      row, col = divmod(i, per_row)
       # scatter orientation (how the part initially LIES, e.g. wheels flat) and a
       # SHAPE-AWARE height: table top + half extent at that orientation + `float_height`
       # (historical default 15mm; for the classic cube that is exactly the old fixed 0.07).
@@ -288,7 +298,16 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
       spec = assembly.part_shape(name)
       Rs = _quat_to_R(scatter_q) if scatter_q is not None else np.eye(3)
       z = table_half + _shape_half_z(spec, Rs) + float_height
-      pos = np.array([-0.5 + col * spacing, row * spacing, z])
+      if grid is not None:                                 # tight grid, centred on the table
+          cols = max(1, int(grid))
+          rows = -(-len(assembly.objects) // cols)         # ceil
+          r, c = divmod(i, cols)
+          pitch = cs * (1.0 + grid_gap)
+          pos = np.array([(c - (cols - 1) / 2.0) * pitch,
+                          (r - (rows - 1) / 2.0) * pitch, z])
+      else:
+          row, col = divmod(i, per_row)
+          pos = np.array([-0.5 + col * spacing, row * spacing, z])
 
       sq = _shape_quat(spec)
       obj = C.addFrame(name).setParent(C.getFrame("table"))
@@ -312,7 +331,9 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
       C.addFrame(f"{name}_marker", name).setShape(ry.ST.marker, [cs * 1.0])
 
       base_q = scatter_q if scatter_q is not None else np.array([1.0, 0.0, 0.0, 0.0])
-      if random_init:
+      if grid is not None:
+          pass                                             # tight grid: keep the nominal grid pose
+      elif random_init:
           # FULL randomization (seeded, hence reproducible): uniform x/y in the central
           # square [-random_init, +random_init]^2 between the robots + a random yaw,
           # rejection-sampled collision-free against everything already placed (parts,
@@ -360,6 +381,50 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
               obj.setRelativeQuaternion(list(base_q))
 
   return C
+
+
+def check_initial_scene(C, assembly, robots=None, robot_ik=None, verbose=True):
+  """Validate the INITIAL scene produced by add_disassembled_obj -- BEFORE committing a solve.
+  Two checks, both about the START state only (the assembly/topology is not exercised):
+
+    (1) COLLISION-FREE: no part penetrates another part, the table, or a robot.
+    (2) GRASPABLE: every part admits at least one cheap-feasible PICK by at least one robot
+        (i.e. some (robot, grasp) whose gripper reaches the part without collision). With
+        `robot_ik` given, the pick is additionally required to solve real-arm IK -- true
+        reachability, not just the floating-gripper proxy.
+
+  A part that no robot can pick (e.g. a cube buried in a tight --grid-init block) makes the
+  instance unsolvable no matter the planner, so this catches a broken layout up front. Returns
+  (ok, report) with report = {collision_free, graspable: {part: [robots]}, ungraspable: [...]}.
+  """
+  from solver import _search_context, feasible                     # local: solver imports us
+  if robots is None:
+    robots = get_robots(C)
+  checker, grasp_table = _search_context(C, assembly, robots)
+  s0 = get_initial_state(C, assembly)
+
+  collision_free = bool(C.getCollisionFree())
+  graspable = {p: [] for p in assembly.objects}
+  for a, ns in picks(s0, assembly, robots, grasp_table=grasp_table):
+    part, robot = a[2], a[1]
+    if robot in graspable[part]:                                    # this robot already qualifies
+      continue
+    # feasible = cheap floating-EE collision, plus real-arm IK reachability when robot_ik given.
+    if feasible(a, s0, ns, assembly, checker, robot_ik=robot_ik):
+      graspable[part].append(robot)
+
+  ungraspable = [p for p in assembly.objects if not graspable[p]]
+  ok = collision_free and not ungraspable
+  if verbose:
+    tag = "real-IK" if robot_ik is not None else "cheap"
+    print(f"[scene-check] collision-free: {collision_free} | graspable ({tag}) by >=1 robot: "
+          f"{len(assembly.objects) - len(ungraspable)}/{len(assembly.objects)} parts")
+    if ungraspable:
+      print(f"[scene-check] UNGRASPABLE parts (no robot can pick them here): {ungraspable}")
+    print(f"[scene-check] => scene {'OK' if ok else 'NOT USABLE'}")
+  return ok, {"collision_free": collision_free, "graspable": graspable,
+              "ungraspable": ungraspable}
+
 
 class CubeCrossAssembly(Assembly):
   """A central cube with one cube glued to each of its six faces (7 parts total).

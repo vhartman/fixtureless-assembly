@@ -4,10 +4,17 @@ import numpy as np
 
 from env import *
 from assembly import *
+from config import RunConfig
 
-def parse_args():
+def build_parser():
   parser = argparse.ArgumentParser(
       description="Spawn a multi-robot UR10 environment."
+  )
+  parser.add_argument(
+      "--config", metavar="FILE", default=None,
+      help="Load a RunConfig JSON file as the BASE configuration; any explicit command-line "
+           "flag overrides the file's value (CLI wins). Write one with config.RunConfig.save "
+           "or by hand. Without --config nothing changes (byte-identical default path).",
   )
   g_scene   = parser.add_argument_group("scene & problem", "assembly, parts, robots, grippers, initial layout, goal")
   g_solver  = parser.add_argument_group("solver / engine", "which search algorithm runs + suboptimality weight")
@@ -76,6 +83,24 @@ def parse_args():
       "--scatter-spacing", type=float, default=1.0 / 7.0, metavar="M",
       help="x-pitch of the scatter line in metres (default 1/7 ~ 0.143, the historical "
            "layout). For analysing how much search/IK cost is scene density.",
+  )
+  g_scene.add_argument(
+      "--grid-init", type=int, nargs="?", const=2, default=None, metavar="COLS",
+      help="Initial-state layout: pack the parts in a grid COLS wide (default 2 when given "
+           "bare), centred on the table, instead of the scatter line. (cross --parts 7 "
+           "--grid-init 2 -> a 2x3 block + 1.) The ASSEMBLY is unchanged; this only sets "
+           "where parts START. Difficulty is set by --grid-gap: a tight grid crowds the "
+           "arms so reaching an inner cube collides with its neighbours -> the planner must "
+           "RELOCATE cubes to clear access. Overrides the scatter line; --random-init / "
+           "--perturb-start-pose are ignored with it.",
+  )
+  g_scene.add_argument(
+      "--grid-gap", type=float, default=0.1, metavar="FRAC",
+      help="With --grid-init: inter-cube gap as a FRACTION of cube size (grid pitch = "
+           "cube_size*(1+FRAC), default 0.1). Small (~0.1) = shoulder-to-shoulder (a side-"
+           "grasp gripper can only reach protruding cubes; best with --vacuum top-pick). "
+           "Large (~1.0) = a cube-wide gap between parts (all reachable, little relocation). "
+           "The knob that trades off how much relocation the layout forces.",
   )
   g_viz.add_argument(
       "--no-view", dest="view", action="store_false",
@@ -149,6 +174,14 @@ def parse_args():
       "--weight", type=float, default=1.0,
       help="Weighted-A* factor f=g+w*h: 1=optimal, >1 faster & bounded-suboptimal, "
            "inf=greedy best-first. Use a large value (e.g. 5 or inf) for fast solutions.",
+  )
+  g_diag.add_argument(
+      "--check-init", action="store_true",
+      help="Validate the INITIAL scene before anything else: report whether it is collision-"
+           "free and whether every part is graspable by at least one robot (a part no arm can "
+           "pick -- e.g. a cube buried in a tight --grid-init block -- makes the instance "
+           "unsolvable). Uses the cheap floating-EE check, or real-arm IK with --real-ik. "
+           "Prints a report and continues (combine with --solve to check then solve).",
   )
   g_diag.add_argument(
       "--test-pick-ik", nargs="?", const="a1:obj_1:0", default=None,
@@ -832,7 +865,21 @@ def parse_args():
            "wrench settings, ...) to PATH as JSON, so it can be replayed later without "
            "re-searching via the standalone `python replay.py PATH` script.",
   )
-  return parser.parse_args()
+  return parser
+
+
+def parse_args(argv=None):
+  # Two-pass layering for --config: parse once to see if a config FILE was named; if so, load
+  # it as the parser's DEFAULTS and re-parse so unspecified flags take the file's value while
+  # any explicit command-line flag still wins (CLI > file > built-in default). Without --config
+  # this is exactly `build_parser().parse_args(argv)` -- one pass, byte-identical to before.
+  parser = build_parser()
+  args = parser.parse_args(argv)
+  if getattr(args, "config", None):
+    from config import RunConfig
+    parser.set_defaults(**RunConfig.from_file(args.config).to_dict())
+    args = parser.parse_args(argv)                          # file defaults + CLI overrides
+  return args
 
 
 # fields persisted by --save so replay.py can reconstruct the EXACT scene (see plan_io.py).
@@ -848,102 +895,199 @@ _SAVE_CONFIG_FIELDS = (
 )
 
 
-def save_plan(path, args, plan):
+def save_plan(path, cfg, plan):
   from plan_io import write_plan
-  config = {k: getattr(args, k) for k in _SAVE_CONFIG_FIELDS}
+  config = {k: getattr(cfg, k) for k in _SAVE_CONFIG_FIELDS}
   write_plan(path, config, plan)
   print(f"[save] wrote {len(plan)}-action plan + scene config to {path}")
 
-def main():
-  args = parse_args()
-  set_seed(args.seed)                           # reproducible numpy + rai (KOMO) RNG
+def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
+  # Select the search engine from the cfg flags and run it; returns the plan (or None).
+  # PURE dispatch: no global-state changes here (all set-up ran before this is called), so
+  # the engine choice reads as one flat if/elif instead of burying run() under it.
+  if cfg.ladder_lns is not None:
+    plan = solve_assembly_problem_ladder(
+        C, assembly, robots=robots, time_budget=cfg.ladder_lns, robot_ik=robot_ik,
+        weight=cfg.weight, wrench=cfg.wrench, handovers=cfg.handovers,
+        allow_place=cfg.allow_place, bracing=cfg.bracing,
+        geo_facts=cfg.geo_facts, sig_collapsed_h=cfg.sig_collapsed_h,
+        labeled_h=cfg.labeled_h, collapsed_h=cfg.collapsed_h,
+        grasp_collapsed_h=cfg.grasp_collapsed_h, lns=True, rwa_proof=False,
+        lns_object=not cfg.lns_segments)
+  elif cfg.ladder is not None:
+    plan = solve_assembly_problem_ladder(
+        C, assembly, robots=robots, time_budget=cfg.ladder, robot_ik=robot_ik,
+        weight=cfg.weight, wrench=cfg.wrench, handovers=cfg.handovers,
+        allow_place=cfg.allow_place, bracing=cfg.bracing,
+        geo_facts=cfg.geo_facts, sig_collapsed_h=cfg.sig_collapsed_h,
+        labeled_h=cfg.labeled_h, collapsed_h=cfg.collapsed_h,
+        grasp_collapsed_h=cfg.grasp_collapsed_h)
+  elif cfg.milestones_anytime is not None:
+    plan = solve_assembly_problem_milestones_anytime(
+        C, assembly, robots=robots, time_budget=cfg.milestones_anytime,
+        robot_ik=robot_ik, weight=cfg.weight, wrench=cfg.wrench,
+        handovers=cfg.handovers, allow_place=cfg.allow_place,
+        bracing=cfg.bracing, geo_facts=cfg.geo_facts,
+        sig_collapsed_h=cfg.sig_collapsed_h, labeled_h=cfg.labeled_h,
+        collapsed_h=cfg.collapsed_h, grasp_collapsed_h=cfg.grasp_collapsed_h,
+        fill_window=cfg.fill_window)
+  elif cfg.bounded or cfg.dfbnb:
+    plan = solve_assembly_problem_bounded(
+        C, assembly, robots=robots, robot_ik=robot_ik, weight=cfg.weight,
+        wrench=cfg.wrench, handovers=cfg.handovers, allow_place=cfg.allow_place,
+        bracing=cfg.bracing, labeled_h=cfg.labeled_h, collapsed_h=cfg.collapsed_h,
+        grasp_collapsed_h=cfg.grasp_collapsed_h or not (cfg.labeled_h or cfg.collapsed_h),
+        stats_every=cfg.search_stats, geo_facts=cfg.geo_facts,
+        sig_collapsed_h=cfg.sig_collapsed_h, beam_width=cfg.beam,
+        dfbnb=cfg.dfbnb, pea=cfg.pea, pathmax=cfg.pathmax,
+        corridor_h=cfg.corridor_h)
+  elif cfg.lazy:
+    plan = solve_assembly_problem_lazy(
+        C, assembly, robots=robots, weight=cfg.weight, robot_ik=robot_ik,
+        wrench=cfg.wrench, handovers=cfg.handovers, allow_place=cfg.allow_place,
+        labeled_h=cfg.labeled_h, collapsed_h=cfg.collapsed_h,
+        grasp_collapsed_h=cfg.grasp_collapsed_h,
+        wrench_aware_h=cfg.wrench_aware_h, bracing=cfg.bracing,
+        geo_facts=cfg.geo_facts, sig_collapsed_h=cfg.sig_collapsed_h)
+  elif cfg.milestones:
+    plan = solve_assembly_problem_milestones(
+        C, assembly, robots=robots, robot_ik=robot_ik, weight=cfg.weight,
+        wrench=cfg.wrench, handovers=cfg.handovers, allow_place=cfg.allow_place,
+        bracing=cfg.bracing, geo_facts=cfg.geo_facts,
+        sig_collapsed_h=cfg.sig_collapsed_h, fill_window=cfg.fill_window,
+        lazy_fills=cfg.lazy_fills)
+  elif cfg.optimistic and cfg.declutter:
+    plan = solve_assembly_problem_optimistic_declutter(
+        C, assembly, robots=robots, robot_ik=robot_ik, weight=cfg.weight,
+        wrench=cfg.wrench, handovers=cfg.handovers, allow_place=cfg.allow_place)
+  elif cfg.optimistic:
+    plan = solve_assembly_problem_optimistic(C, assembly, robots=robots,
+                                             robot_ik=robot_ik, weight=cfg.weight,
+                                             wrench=cfg.wrench, handovers=cfg.handovers,
+                                             allow_place=cfg.allow_place,
+                                             bracing=cfg.bracing,
+                                             grasp_collapsed_h=cfg.grasp_collapsed_h,
+                                             collapsed_h=cfg.collapsed_h,
+                                             labeled_h=cfg.labeled_h,
+                                             sig_collapsed_h=cfg.sig_collapsed_h)
+  elif cfg.anytime is not None:
+    plan, _cost, _opt = solve_assembly_problem_anytime(
+        C, assembly, robots=robots, time_budget=cfg.anytime, robot_ik=robot_ik,
+        wrench=cfg.wrench, handovers=cfg.handovers, allow_place=cfg.allow_place,
+        anonymous=cfg.anon_robots, labeled_h=cfg.labeled_h,
+        collapsed_h=cfg.collapsed_h, grasp_collapsed_h=cfg.grasp_collapsed_h,
+        wrench_aware_h=cfg.wrench_aware_h, bracing=cfg.bracing,
+        part_order_bias=cfg.part_order_bias,
+        sig_collapsed_h=cfg.sig_collapsed_h)
+  else:
+    plan = solve_assembly_problem(C, assembly, robots=robots, canonical=cfg.canonical,
+                                  weight=cfg.weight, robot_ik=robot_ik, wrench=cfg.wrench,
+                                  handovers=cfg.handovers, allow_place=cfg.allow_place,
+                                  anonymous=cfg.anon_robots, labeled_h=cfg.labeled_h,
+                                  collapsed_h=cfg.collapsed_h,
+                                  grasp_collapsed_h=cfg.grasp_collapsed_h,
+                                  wrench_aware_h=cfg.wrench_aware_h, bracing=cfg.bracing,
+                                  part_order_bias=cfg.part_order_bias,
+                                  stats_every=cfg.search_stats, por=cfg.por,
+                                  geo_facts=cfg.geo_facts,
+                                  sig_collapsed_h=cfg.sig_collapsed_h,
+                                  beam_width=cfg.beam, pea=cfg.pea,
+                                  iter_bound=cfg.iter_bound,
+                                  pathmax=cfg.pathmax)
+  return plan
+
+
+def run(cfg):
+  # cfg: RunConfig -- the single typed configuration object for the whole run. Every setting
+  # below reads a cfg field; the thin main() wrapper builds cfg from the parsed CLI args.
+  set_seed(cfg.seed)                           # reproducible numpy + rai (KOMO) RNG
   # MIXED END EFFECTORS (--grippers): per-robot vacuum/two_finger list; overrides --vacuum.
   gripper_list = None
-  if args.grippers:
-    ks = [k.strip() for k in args.grippers.split(",") if k.strip()]
+  if cfg.grippers:
+    ks = [k.strip() for k in cfg.grippers.split(",") if k.strip()]
     bad = [k for k in ks if k not in ("vacuum", "two_finger")]
     if bad:
       raise SystemExit(f"--grippers: unknown kind(s) {bad} (vacuum|two_finger)")
-    ks = (ks + [ks[-1]] * args.num_robots)[:args.num_robots]   # last entry repeats
+    ks = (ks + [ks[-1]] * cfg.num_robots)[:cfg.num_robots]   # last entry repeats
     gripper_list = [k == "vacuum" for k in ks]
     if len(set(ks)) > 1:
-      if args.anon_robots:
+      if cfg.anon_robots:
         raise SystemExit("--grippers (mixed) is incompatible with --anon-robots: "
                          "robot identity decides which gripper stands at a grasp.")
       print(f"[flag] --grippers ACTIVE (MIXED EEs): {', '.join(f'a{i+1}={k}' for i, k in enumerate(ks))}. "
             "Grasps are kind-mask filtered per robot; wrench prices each grasp with its "
             "holder's capability; labeled-h pick facts OR over kinds (admissible).")
     else:
-      args.vacuum = ks[0] == "vacuum"                      # uniform via --grippers = plain path
+      cfg.vacuum = ks[0] == "vacuum"                      # uniform via --grippers = plain path
 
   # grasp rolls are a property of the gripper: the vacuum is symmetric about its suction
   # axis (1 grasp per face); the two-finger has two in-plane orientations (90 deg apart).
   # --dense-grasps additionally enables the +-45deg WRIST-TILTED variants (same face pinch,
   # approach between the faces) -- see problem.set_dense_grasps. MIXED scenes take the
   # two-finger's 2 rolls whenever any two-finger arm exists (the vacuum ignores rolls).
-  any_two_finger = (gripper_list is not None and not all(gripper_list)) or not args.vacuum
+  any_two_finger = (gripper_list is not None and not all(gripper_list)) or not cfg.vacuum
   set_rolls_per_face(2 if any_two_finger else 1)
-  set_dense_grasps(args.dense_grasps and any_two_finger)
-  set_brace_for_assembly_only(args.brace_for_assembly_only)
-  set_extra_place_cells(args.place_cells)
-  set_prefer_center(args.prefer_center)
-  if args.place_cells:
-    print(f"[flag] --place-cells ACTIVE: {args.place_cells} extra translated placement "
+  set_dense_grasps(cfg.dense_grasps and any_two_finger)
+  set_brace_for_assembly_only(cfg.brace_for_assembly_only)
+  set_extra_place_cells(cfg.place_cells)
+  set_prefer_center(cfg.prefer_center)
+  if cfg.place_cells:
+    print(f"[flag] --place-cells ACTIVE: {cfg.place_cells} extra translated placement "
           f"anchors per (group, face)"
-          + (", CENTRE-FIRST ordering" if args.prefer_center else "") + ".")
-  if args.brace_for_assembly_only:
+          + (", CENTRE-FIRST ordering" if cfg.prefer_center else "") + ".")
+  if cfg.brace_for_assembly_only:
     print("[flag] --brace-for-assembly-only ACTIVE: a braced state (>=2 grippers on a group) "
           "may only assemble/release. Prunes brace branching; can miss plans that carry a "
           "brace across unrelated work (experimental).")
-  if args.lru_robots:
+  if cfg.lru_robots:
     from problem import set_lru_robots
     set_lru_robots(True)
     print("[flag] --lru-robots ACTIVE: successor robots ordered least-recently-used first "
           "(deterministic tie-break; spreads actions across arms).")
-  if args.brace_resting:
+  if cfg.brace_resting:
     from problem import set_brace_resting
     set_brace_resting(True)
     print("[flag] --brace-resting ACTIVE: resting assemblies may be braced (add_grasp), "
           "matching the abstraction's resting+braced states.")
-  if args.useful_grasps:
+  if cfg.useful_grasps:
     from problem import set_useful_grasps_enabled
     set_useful_grasps_enabled(True)
     print("[flag] --useful-grasps ACTIVE: mate-viable grasp sets ordered first + fill-h "
           "regrasp pricing (spec 6.2).")
-  if args.fill_touch_all:
+  if cfg.fill_touch_all:
     from solver import set_fill_touch_all
     set_fill_touch_all(True)
     print("[flag] --fill-touch-all: fills may move any loose part (debug; slow).")
-  if args.mixed_wrench_h:
+  if cfg.mixed_wrench_h:
     from solver import set_mixed_wrench_h
     set_mixed_wrench_h(True)
     print("[flag] --mixed-wrench-h ACTIVE: per-kind wrench heuristic (precise, slower build).")
-  if args.dominance:
+  if cfg.dominance:
     from problem import set_dominance
     set_dominance(True)
-    warn = "" if args.floating_ee else " WARNING: real fixed-base arms are not exact twins -- may prune plans."
+    warn = "" if cfg.floating_ee else " WARNING: real fixed-base arms are not exact twins -- may prune plans."
     print(f"[flag] --dominance ACTIVE: one free arm per gripper kind acts (idle-twin symmetry).{warn}")
-  if args.allow_curved_grasps:
+  if cfg.allow_curved_grasps:
     from problem import set_allow_curved_grasps
     set_allow_curved_grasps(True)
     print("[flag] --allow-curved-grasps ACTIVE: vacuum keeps curved-surface grasps (idealised "
           "suction on cylinders/spheres).")
-  if args.staged_mates:
+  if cfg.staged_mates:
     from problem import set_staged_mates
     set_staged_mates(True)
     print("[flag] --staged-mates ACTIVE: staged mates are SLOTS until their fastener lands "
           "(unheld unfastened part falls out unless the slot faces up); successor filter + "
           "labeled-h gate, admissible. Assemblies without staged_mates are unaffected.")
-  if args.inhand_reorient:
+  if cfg.inhand_reorient:
     from problem import set_inhand_reorient
     set_inhand_reorient(True)
     print("[flag] --inhand-reorient ACTIVE: held lone parts may rotate to any other grasp "
           "in hand (v1: full connectivity, unchanged grip capability, solo-held lone parts). "
           "Labeled/collapsed h model the inverse-reorient edge (cost 1) -> h stays admissible.")
   import wrench
-  wrench.PARAMS["grasp_model"] = args.grasp_model  # capability model (used when --wrench)
-  if args.vacuum_scale is not None:
-    vs = float(args.vacuum_scale)                          # scale EVERY vacuum force+torque cap
+  wrench.PARAMS["grasp_model"] = cfg.grasp_model  # capability model (used when --wrench)
+  if cfg.vacuum_scale is not None:
+    vs = float(cfg.vacuum_scale)                          # scale EVERY vacuum force+torque cap
     for _model in wrench.PARAMS["grasp"].values():         # all models; mu (a ratio) is left as-is
       vac = _model.get("vacuum")
       if vac:
@@ -952,297 +1096,218 @@ def main():
             vac[_k] = vac[_k] * vs
     print(f"[flag] --vacuum-scale ACTIVE: vacuum capability x{vs:g} (all forces + torques; "
           "two-finger and mu unchanged).")
-  if args.tf_close_torque is not None:
-    wrench.PARAMS["grasp"]["asymmetric"]["two_finger"]["T_close"] = float(args.tf_close_torque)
+  if cfg.tf_close_torque is not None:
+    wrench.PARAMS["grasp"]["asymmetric"]["two_finger"]["T_close"] = float(cfg.tf_close_torque)
     print(f"[flag] --tf-close-torque ACTIVE: two-finger closing-axis torque cap = "
-          f"{args.tf_close_torque:g} Nm (was 0.4). Models a pinch that rotates out of hand.")
-  if args.grasp_compliance is not None:
-    wrench.PARAMS["grasp_compliance"] = {"two_finger": 1.0, "vacuum": float(args.grasp_compliance)}
+          f"{cfg.tf_close_torque:g} Nm (was 0.4). Models a pinch that rotates out of hand.")
+  if cfg.grasp_compliance is not None:
+    wrench.PARAMS["grasp_compliance"] = {"two_finger": 1.0, "vacuum": float(cfg.grasp_compliance)}
     print(f"[flag] --grasp-compliance ACTIVE: vacuum-held load paths inflate the insertion-"
-          f"uncertainty box x{args.grasp_compliance:g} (two-finger 1.0). Effective with "
+          f"uncertainty box x{cfg.grasp_compliance:g} (two-finger 1.0). Effective with "
           "--wrench + --insertion-noise; picks/carries unaffected.")
-  wrench.PARAMS["check_inserter"] = args.inserter_check
-  wrench.PARAMS["insert_force"]["_default"] = args.insert_force
-  wrench.PARAMS["curved_grasp_torque_scale"] = args.curved_torque_scale
+  wrench.PARAMS["check_inserter"] = cfg.inserter_check
+  wrench.PARAMS["insert_force"]["_default"] = cfg.insert_force
+  wrench.PARAMS["curved_grasp_torque_scale"] = cfg.curved_torque_scale
   wrench.PARAMS["insertion_uncertainty"] = (
-      None if args.insertion_noise is None
-      else {"lateral": args.insertion_noise, "offset": args.insertion_offset})
-  wrench.PARAMS["robust_mode"] = args.robust_mode
-  wrench.PARAMS["ignore_gravity"] = args.ignore_gravity
-  if args.ignore_gravity:
+      None if cfg.insertion_noise is None
+      else {"lateral": cfg.insertion_noise, "offset": cfg.insertion_offset})
+  wrench.PARAMS["robust_mode"] = cfg.robust_mode
+  wrench.PARAMS["ignore_gravity"] = cfg.ignore_gravity
+  if cfg.ignore_gravity:
     print("[flag] --ignore-gravity ACTIVE: parts weightless in the wrench check "
           "(only insertion/applied loads must be resisted).")
-  set_goal(on_table=args.goal_on_table)
-  if args.goal_on_table:
+  set_goal(on_table=cfg.goal_on_table)
+  if cfg.goal_on_table:
     print("[flag] --goal-on-table ACTIVE: the finished assembly must rest on the table "
           "and be released (hands-off).")
 
   C = make_four_robot_env(
-      num_robots=args.num_robots,
-      floating_ee=args.floating_ee,
-      vacuum=gripper_list if gripper_list is not None else args.vacuum,
-      robot_types=args.robot_types or args.robot,   # --robot for all; --robot-types overrides
+      num_robots=cfg.num_robots,
+      floating_ee=cfg.floating_ee,
+      vacuum=gripper_list if gripper_list is not None else cfg.vacuum,
+      robot_types=cfg.robot_types or cfg.robot,   # --robot for all; --robot-types overrides
   )
 
-  assembly = make_assembly(args.assembly, args.parts)
+  assembly = make_assembly(cfg.assembly, cfg.parts)
 
-  if args.ladder_lns is not None:
-    print(f"[flag] --ladder-lns ACTIVE: budget {args.ladder_lns:g}s (k=1 -> LNS sweeps "
+  if cfg.ladder_lns is not None:
+    print(f"[flag] --ladder-lns ACTIVE: budget {cfg.ladder_lns:g}s (k=1 -> LNS sweeps "
           f"-> RWA*-under-bound proof).")
-  if args.ladder is not None:
-    print(f"[flag] --ladder ACTIVE: budget {args.ladder:g}s (k=1 -> k=2 -> w=1 proof "
+  if cfg.ladder is not None:
+    print(f"[flag] --ladder ACTIVE: budget {cfg.ladder:g}s (k=1 -> k=2 -> w=1 proof "
           f"rung, monotone incumbent bound).")
-  if args.milestones_anytime is not None:
-    print(f"[flag] --milestones-anytime ACTIVE: budget {args.milestones_anytime:g}s "
+  if cfg.milestones_anytime is not None:
+    print(f"[flag] --milestones-anytime ACTIVE: budget {cfg.milestones_anytime:g}s "
           f"(adaptive-width milestones -> bounded improvement -> PEA-greedy net).")
-  if args.corridor_h:
+  if cfg.corridor_h:
     print("[flag] --corridor-h ACTIVE: phase-2 heuristic built only up to the incumbent "
           "bound (misses prune); requires --bounded.")
-  if args.pathmax:
+  if cfg.pathmax:
     print("[flag] --pathmax ACTIVE: h consistency repair (h_child >= h_parent - cost); "
           "admissible, fewer f-bumps/frontier sweeps.")
-  if args.pea:
+  if cfg.pea:
     print("[flag] --pea ACTIVE: partial-expansion A* engine (banded open list; same "
           "guarantees, frontier memory / ~branching factor).")
-  if args.iter_bound:
+  if cfg.iter_bound:
     print("[flag] --iter-bound ACTIVE: iterative cost-bound deepening -- first plan found "
           "is proven optimal; --weight only orders exploration within passes.")
-  if args.beam is not None:
-    print(f"[flag] --beam ACTIVE: beam search, width {args.beam} (memory-bounded, no "
-          f"quality bound{'; incumbent fallback for --bounded' if args.bounded or args.dfbnb else ''}).")
-  if args.dfbnb:
+  if cfg.beam is not None:
+    print(f"[flag] --beam ACTIVE: beam search, width {cfg.beam} (memory-bounded, no "
+          f"quality bound{'; incumbent fallback for --bounded' if cfg.bounded or cfg.dfbnb else ''}).")
+  if cfg.dfbnb:
     print("[flag] --dfbnb ACTIVE: depth-first branch-and-bound certificate phase "
           "(implies --bounded).")
-  if args.sig_collapsed_h:
-    if args.sig_components:
-      set_sig_components([c.strip() for c in args.sig_components.split(",") if c.strip()])
+  if cfg.sig_collapsed_h:
+    if cfg.sig_components:
+      set_sig_components([c.strip() for c in cfg.sig_components.split(",") if c.strip()])
     print("[flag] --sig-collapsed-h ACTIVE: signature grasp-equivalence classes + labeled "
           "loose parts (components: "
-          + (args.sig_components or "press,pickface,contact,solohold,braceside") + ").")
-  if args.geo_facts:
+          + (cfg.sig_components or "press,pickface,contact,solohold,braceside") + ").")
+  if cfg.geo_facts:
     print("[flag] --geo-facts ACTIVE: labeled-abstraction backward relay gated on "
           "floating-gripper coexistence (gripper-vs-assembly/gripper/table); sound "
           "necessary condition, h stays admissible.")
-  if args.por:
+  if cfg.por:
     print("[flag] --por ACTIVE: partial-order reduction over independent successor actions "
           "(EXPERIMENTAL, unsound when part/arm geometries interact -- use --min-sep).")
-  C = add_disassembled_obj(C, assembly, perturb_start_pose=args.perturb_start_pose,
-                           spacing=args.scatter_spacing, random_init=args.random_init,
-                           float_height=args.part_float, min_sep=args.min_sep)
+  if cfg.grid_init is not None:
+    print(f"[flag] --grid-init {cfg.grid_init} ACTIVE: parts packed shoulder-to-shoulder in a "
+          f"{cfg.grid_init}-wide grid (relocation stress); scatter line / --random-init ignored.")
+  C = add_disassembled_obj(C, assembly, perturb_start_pose=cfg.perturb_start_pose,
+                           spacing=cfg.scatter_spacing, random_init=cfg.random_init,
+                           float_height=cfg.part_float, min_sep=cfg.min_sep,
+                           grid=cfg.grid_init, grid_gap=cfg.grid_gap)
+
+  if cfg.check_init:
+    chk_robots = get_robots(C)
+    chk_ik = RobotIK(C, chk_robots) if cfg.real_ik else None
+    check_initial_scene(C, assembly, robots=chk_robots, robot_ik=chk_ik)
 
 
-  if args.show_init:
+  if cfg.show_init:
     C.view(True, "initial state (close to continue)")
 
   # per-skill IK test popups run on THE ACTUAL CONFIGURED SCENE built above (robot type,
   # scatter/--random-init layout, assembly). Note the popups solve real-arm IK: with
   # --floating-ee the "arm" is the free-floating gripper itself.
-  if args.test_pick_ik is not None:
-    robot, part, grasp = args.test_pick_ik.split(":")
+  if cfg.test_pick_ik is not None:
+    robot, part, grasp = cfg.test_pick_ik.split(":")
     visualize_pick_ik(part=part, grasp_id=int(grasp), robot=robot, C=C, assembly=assembly)
     return
 
-  if args.test_assemble_ik is not None:
-    robot, part, grasp = args.test_assemble_ik.split(":")
+  if cfg.test_assemble_ik is not None:
+    robot, part, grasp = cfg.test_assemble_ik.split(":")
     visualize_assemble_ik(part=part, grasp_id=int(grasp), robot=robot, C=C,
                           assembly=assembly)
     return
 
-  if args.test_place_ik is not None:
-    fields = args.test_place_ik.split(":")
+  if cfg.test_place_ik is not None:
+    fields = cfg.test_place_ik.split(":")
     robot, part, grasp, n_asm = fields[:4]
     face = int(fields[4]) if len(fields) > 4 else 5
     visualize_place_ik(part=part, grasp_id=int(grasp), robot=robot,
                        n_assembled=int(n_asm), face=face, C=C, assembly=assembly)
     return
 
-  if args.test_assemble_held_ik is not None:
-    robot, part, grasp, target_robot, onto_grasp = args.test_assemble_held_ik.split(":")
+  if cfg.test_assemble_held_ik is not None:
+    robot, part, grasp, target_robot, onto_grasp = cfg.test_assemble_held_ik.split(":")
     visualize_assemble_ik(part=part, grasp_id=int(grasp), robot=robot,
                           target_robot=target_robot, onto_grasp=int(onto_grasp),
                           C=C, assembly=assembly)
     return
 
-  if args.disp_final:
+  if cfg.disp_final:
     display_final_assembly(C, assembly, [0, 0, 0.5])
 
-  if args.viz_grasps or args.viz_rest_poses:
+  if cfg.viz_grasps or cfg.viz_rest_poses:
     rec = None
-    if args.viser:
+    if cfg.viser:
       from viser_view import ViserRecorder
       rec = ViserRecorder()
-    if args.viz_grasps:
+    if cfg.viz_grasps:
       U = None
-      if args.wrench:
+      if cfg.wrench:
         from solver import _search_context     # local import ONLY of names not module-global
         _chk, _gt = _search_context(C, assembly, get_robots(C))  # -- shadowing wrench_kind_arg
         U = compute_useful_grasps(assembly, _gt, wrench_kind_arg(C, get_robots(C)))  # here made
         #                                                        # it function-local everywhere
-      visualize_grasps_viser(C, assembly, recorder=rec, view=args.view, useful=U)
-    if args.viz_rest_poses:
-      visualize_rest_poses_viser(C, assembly, recorder=rec, view=args.view)
+      visualize_grasps_viser(C, assembly, recorder=rec, view=cfg.view, useful=U)
+    if cfg.viz_rest_poses:
+      visualize_rest_poses_viser(C, assembly, recorder=rec, view=cfg.view)
     if rec is not None:
-      rec.serve(port=args.viser_port)
+      rec.serve(port=cfg.viser_port)
     return
 
-  if args.mate_sequence_viz:
+  if cfg.mate_sequence_viz:
     # schematic DAG mate-sequence: interface points + per-mate insertion wrench, NO search.
     rec = None
-    if args.viser:
+    if cfg.viser:
       from viser_view import ViserRecorder
       rec = ViserRecorder()
-    visualize_mate_sequence(C, assembly, recorder=rec, view=args.view)
+    visualize_mate_sequence(C, assembly, recorder=rec, view=cfg.view)
     if rec is not None:
-      rec.serve(port=args.viser_port)
+      rec.serve(port=cfg.viser_port)
     return
 
-  if args.show_successors:
+  if cfg.show_successors:
     visualize_successor_states(C, assembly)
     return
 
-  if args.solve:
+  if cfg.solve:
     robots = get_robots(C)
-    robot_ik = RobotIK(C, robots) if args.real_ik else None
-    if robot_ik is not None and args.full_ik:
+    robot_ik = RobotIK(C, robots) if cfg.real_ik else None
+    if robot_ik is not None and cfg.full_ik:
       robot_ik.single_arm_ik = False
       robot_ik.strip_inactive_collision = False
       robot_ik.reach_precheck = False
-    if robot_ik is not None and args.ik_seeding:
+    if robot_ik is not None and cfg.ik_seeding:
       robot_ik.ik_seeding = True
       robot_ik.collision_reject_depth = (
-          None if args.ik_collision_gate < 0 else args.ik_collision_gate)
-    if robot_ik is not None and args.witness_robot_collisions:
+          None if cfg.ik_collision_gate < 0 else cfg.ik_collision_gate)
+    if robot_ik is not None and cfg.witness_robot_collisions:
       # keep the OTHER robots' collision ON in the SEARCH's IK too (not just the post-opt pass):
       # the search's witnesses then avoid the idle arms from the start. (optimize_witnesses gets
       # robot_collisions too; with this already set, that toggle is a consistent no-op.)
       robot_ik.strip_inactive_collision = False
       print("[flag] --witness-robot-collisions ACTIVE: other robots' collision kept ON in IK "
             "(search + witness opt); idle arms are at HOME in the IK scene.")
-    if args.skill > 0.0:
+    if cfg.skill > 0.0:
       # shorthand: fill in every pre-skill split not set explicitly, then let the per-skill
       # blocks below apply/announce them (an explicit --pre-* keeps its own value).
       for _f in ("pre_insertion", "pre_pick", "pre_place", "pre_add_grasp"):
-        if getattr(args, _f) <= 0.0:
-          setattr(args, _f, args.skill)
-      print(f"[flag] --skill {args.skill:g} ACTIVE: enabling all pre-skill splits (pick, place, "
+        if getattr(cfg, _f) <= 0.0:
+          setattr(cfg, _f, cfg.skill)
+      print(f"[flag] --skill {cfg.skill:g} ACTIVE: enabling all pre-skill splits (pick, place, "
             "add_grasp, assemble) as skills.")
-    if robot_ik is not None and args.pre_insertion > 0.0:
-      robot_ik.pre_insertion_delta = args.pre_insertion
+    if robot_ik is not None and cfg.pre_insertion > 0.0:
+      robot_ik.pre_insertion_delta = cfg.pre_insertion
       print(f"[flag] --pre-insertion ACTIVE: MP export splits each assemble into a goto to the "
-            f"funnel mouth ({args.pre_insertion:g}m back along the mate axis) + the real mate at "
+            f"funnel mouth ({cfg.pre_insertion:g}m back along the mate axis) + the real mate at "
             "the seated witness. Search/plan/wrench unchanged.")
-    if robot_ik is not None and args.pre_pick > 0.0:
-      robot_ik.pre_pick_delta = args.pre_pick
+    if robot_ik is not None and cfg.pre_pick > 0.0:
+      robot_ik.pre_pick_delta = cfg.pre_pick
       print(f"[flag] --pre-pick ACTIVE: MP export splits each pick into a goto to the pre-grasp "
-            f"({args.pre_pick:g}m gripper retract) + the real grasp. Search/plan unchanged.")
-    if robot_ik is not None and args.pre_place > 0.0:
-      robot_ik.pre_place_delta = args.pre_place
+            f"({cfg.pre_pick:g}m gripper retract) + the real grasp. Search/plan unchanged.")
+    if robot_ik is not None and cfg.pre_place > 0.0:
+      robot_ik.pre_place_delta = cfg.pre_place
       print(f"[flag] --pre-place ACTIVE: MP export splits each place into a goto to the pre-place "
-            f"({args.pre_place:g}m lift) + the real set-down. Search/plan unchanged.")
-    if robot_ik is not None and args.pre_add_grasp > 0.0:
-      robot_ik.pre_add_grasp_delta = args.pre_add_grasp
+            f"({cfg.pre_place:g}m lift) + the real set-down. Search/plan unchanged.")
+    if robot_ik is not None and cfg.pre_add_grasp > 0.0:
+      robot_ik.pre_add_grasp_delta = cfg.pre_add_grasp
       print(f"[flag] --pre-add-grasp ACTIVE: MP export splits each add_grasp into a goto to the "
-            f"pre-grasp ({args.pre_add_grasp:g}m gripper retract) + the real brace reach. "
+            f"pre-grasp ({cfg.pre_add_grasp:g}m gripper retract) + the real brace reach. "
             "Search/plan unchanged.")
-    if args.view_cheap_checks:
+    if cfg.view_cheap_checks:
       set_cheap_check_debug(True)
     fail_rec = None
-    if args.log_ik_failures is not None and robot_ik is not None:
+    if cfg.log_ik_failures is not None and robot_ik is not None:
       from viser_view import ViserRecorder
       fail_rec = ViserRecorder()
       robot_ik.fail_recorder = fail_rec
-      robot_ik.fail_log_seconds = args.log_ik_failures
+      robot_ik.fail_log_seconds = cfg.log_ik_failures
       robot_ik.fail_log_stop = True                # abort the search when the window closes
     try:
-      if args.ladder_lns is not None:
-        plan = solve_assembly_problem_ladder(
-            C, assembly, robots=robots, time_budget=args.ladder_lns, robot_ik=robot_ik,
-            weight=args.weight, wrench=args.wrench, handovers=args.handovers,
-            allow_place=args.allow_place, bracing=args.bracing,
-            geo_facts=args.geo_facts, sig_collapsed_h=args.sig_collapsed_h,
-            labeled_h=args.labeled_h, collapsed_h=args.collapsed_h,
-            grasp_collapsed_h=args.grasp_collapsed_h, lns=True, rwa_proof=False,
-            lns_object=not args.lns_segments)
-      elif args.ladder is not None:
-        plan = solve_assembly_problem_ladder(
-            C, assembly, robots=robots, time_budget=args.ladder, robot_ik=robot_ik,
-            weight=args.weight, wrench=args.wrench, handovers=args.handovers,
-            allow_place=args.allow_place, bracing=args.bracing,
-            geo_facts=args.geo_facts, sig_collapsed_h=args.sig_collapsed_h,
-            labeled_h=args.labeled_h, collapsed_h=args.collapsed_h,
-            grasp_collapsed_h=args.grasp_collapsed_h)
-      elif args.milestones_anytime is not None:
-        plan = solve_assembly_problem_milestones_anytime(
-            C, assembly, robots=robots, time_budget=args.milestones_anytime,
-            robot_ik=robot_ik, weight=args.weight, wrench=args.wrench,
-            handovers=args.handovers, allow_place=args.allow_place,
-            bracing=args.bracing, geo_facts=args.geo_facts,
-            sig_collapsed_h=args.sig_collapsed_h, labeled_h=args.labeled_h,
-            collapsed_h=args.collapsed_h, grasp_collapsed_h=args.grasp_collapsed_h,
-            fill_window=args.fill_window)
-      elif args.bounded or args.dfbnb:
-        plan = solve_assembly_problem_bounded(
-            C, assembly, robots=robots, robot_ik=robot_ik, weight=args.weight,
-            wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
-            bracing=args.bracing, labeled_h=args.labeled_h, collapsed_h=args.collapsed_h,
-            grasp_collapsed_h=args.grasp_collapsed_h or not (args.labeled_h or args.collapsed_h),
-            stats_every=args.search_stats, geo_facts=args.geo_facts,
-            sig_collapsed_h=args.sig_collapsed_h, beam_width=args.beam,
-            dfbnb=args.dfbnb, pea=args.pea, pathmax=args.pathmax,
-            corridor_h=args.corridor_h)
-      elif args.lazy:
-        plan = solve_assembly_problem_lazy(
-            C, assembly, robots=robots, weight=args.weight, robot_ik=robot_ik,
-            wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
-            labeled_h=args.labeled_h, collapsed_h=args.collapsed_h,
-            grasp_collapsed_h=args.grasp_collapsed_h,
-            wrench_aware_h=args.wrench_aware_h, bracing=args.bracing,
-            geo_facts=args.geo_facts, sig_collapsed_h=args.sig_collapsed_h)
-      elif args.milestones:
-        plan = solve_assembly_problem_milestones(
-            C, assembly, robots=robots, robot_ik=robot_ik, weight=args.weight,
-            wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
-            bracing=args.bracing, geo_facts=args.geo_facts,
-            sig_collapsed_h=args.sig_collapsed_h, fill_window=args.fill_window,
-            lazy_fills=args.lazy_fills)
-      elif args.optimistic and args.declutter:
-        plan = solve_assembly_problem_optimistic_declutter(
-            C, assembly, robots=robots, robot_ik=robot_ik, weight=args.weight,
-            wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place)
-      elif args.optimistic:
-        plan = solve_assembly_problem_optimistic(C, assembly, robots=robots,
-                                                 robot_ik=robot_ik, weight=args.weight,
-                                                 wrench=args.wrench, handovers=args.handovers,
-                                                 allow_place=args.allow_place,
-                                                 bracing=args.bracing,
-                                                 grasp_collapsed_h=args.grasp_collapsed_h,
-                                                 collapsed_h=args.collapsed_h,
-                                                 labeled_h=args.labeled_h,
-                                                 sig_collapsed_h=args.sig_collapsed_h)
-      elif args.anytime is not None:
-        plan, _cost, _opt = solve_assembly_problem_anytime(
-            C, assembly, robots=robots, time_budget=args.anytime, robot_ik=robot_ik,
-            wrench=args.wrench, handovers=args.handovers, allow_place=args.allow_place,
-            anonymous=args.anon_robots, labeled_h=args.labeled_h,
-            collapsed_h=args.collapsed_h, grasp_collapsed_h=args.grasp_collapsed_h,
-            wrench_aware_h=args.wrench_aware_h, bracing=args.bracing,
-            part_order_bias=args.part_order_bias,
-            sig_collapsed_h=args.sig_collapsed_h)
-      else:
-        plan = solve_assembly_problem(C, assembly, robots=robots, canonical=args.canonical,
-                                      weight=args.weight, robot_ik=robot_ik, wrench=args.wrench,
-                                      handovers=args.handovers, allow_place=args.allow_place,
-                                      anonymous=args.anon_robots, labeled_h=args.labeled_h,
-                                      collapsed_h=args.collapsed_h,
-                                      grasp_collapsed_h=args.grasp_collapsed_h,
-                                      wrench_aware_h=args.wrench_aware_h, bracing=args.bracing,
-                                      part_order_bias=args.part_order_bias,
-                                      stats_every=args.search_stats, por=args.por,
-                                      geo_facts=args.geo_facts,
-                                      sig_collapsed_h=args.sig_collapsed_h,
-                                      beam_width=args.beam, pea=args.pea,
-                                      iter_bound=args.iter_bound,
-                                      pathmax=args.pathmax)
+      plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
     except IKFailureLogDone:
       print(f"[ik-failures] window/cap reached -- search stopped for debugging "
             f"({len(fail_rec.steps)} failures collected).")
@@ -1250,109 +1315,118 @@ def main():
     if fail_rec is not None and fail_rec.steps:
       print(f"[ik-failures] {len(fail_rec.steps)} failed binds recorded -- serving in "
             f"viser (Stop in the GUI to continue to the plan replay).")
-      fail_rec.serve(port=args.viser_port)
+      fail_rec.serve(port=cfg.viser_port)
     if plan is not None:
       print(f"plan ({len(plan)} actions):")
       for step in plan:
         print("  ", step)
-      if args.hoist_releases:
+      if cfg.hoist_releases:
         # BEFORE save/witnesses/utilization/motion-plan, so all downstream consumers see the
         # hoisted plan (witnesses are solved for the hoisted states).
         from solver import hoist_releases
         plan = hoist_releases(C, assembly, plan, robots,
-                              gripper_kind=wrench_kind_arg(C, robots) if args.wrench else None,
-                              handovers=args.handovers, allow_place=args.allow_place,
-                              bracing=args.bracing)
-      if args.save is not None:
-        save_plan(args.save, args, plan)
+                              gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
+                              handovers=cfg.handovers, allow_place=cfg.allow_place,
+                              bracing=cfg.bracing)
+      if cfg.save is not None:
+        save_plan(cfg.save, cfg, plan)
       opt_witnesses = None
-      if plan is not None and args.optimize_witnesses is not None:
+      if plan is not None and cfg.optimize_witnesses is not None:
         if robot_ik is None:
           print("[witopt] --optimize-witnesses needs --real-ik; skipping.")
         else:
           opt_witnesses, _rep = optimize_witnesses(
-              C, assembly, plan, robots, robot_ik, cost=args.optimize_witnesses,
-              gripper_kind=wrench_kind_arg(C, robots) if args.wrench else None,
-              handovers=args.handovers, allow_place=args.allow_place,
-              bracing=args.bracing, clear_weight=args.witness_clearance,
-              robot_collisions=args.witness_robot_collisions)
-      if plan is not None and args.utilization:
+              C, assembly, plan, robots, robot_ik, cost=cfg.optimize_witnesses,
+              gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
+              handovers=cfg.handovers, allow_place=cfg.allow_place,
+              bracing=cfg.bracing, clear_weight=cfg.witness_clearance,
+              robot_collisions=cfg.witness_robot_collisions)
+      if plan is not None and cfg.utilization:
         from solver import utilization_report
         utilization_report(C, assembly, plan, robots, witnesses=opt_witnesses,
-                           gripper_kind=wrench_kind_arg(C, robots) if args.wrench else None,
-                           handovers=args.handovers, allow_place=args.allow_place,
-                           bracing=args.bracing)
-      if plan is not None and args.motion_plan:
+                           gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
+                           handovers=cfg.handovers, allow_place=cfg.allow_place,
+                           bracing=cfg.bracing)
+      if plan is not None and cfg.motion_plan:
         if robot_ik is None:
           print("[motion-plan] needs --real-ik (for the IK witnesses); skipping.")
         else:
           import mp_export as MP
-          gk = wrench_kind_arg(C, robots) if args.wrench else None
+          gk = wrench_kind_arg(C, robots) if cfg.wrench else None
           # witnesses: the optimized set if --optimize-witnesses was given, else RAW (sweeps=0)
           mp_wit = opt_witnesses
           if mp_wit is None:
             mp_wit, _ = optimize_witnesses(
                 C, assembly, plan, robots, robot_ik, cost="ee", sweeps=0,
-                gripper_kind=gk, handovers=args.handovers, allow_place=args.allow_place,
-                bracing=args.bracing, verbose=False,
-                robot_collisions=args.witness_robot_collisions)
+                gripper_kind=gk, handovers=cfg.handovers, allow_place=cfg.allow_place,
+                bracing=cfg.bracing, verbose=False,
+                robot_collisions=cfg.witness_robot_collisions)
           prob = MP.make_problem(C, assembly, plan, mp_wit, robots, robot_ik, gk,
-                                 bracing=args.bracing, depgraph=not args.mp_sequence)
-          print(f"[motion-plan] {'SEQUENCE' if args.mp_sequence else 'DEPGRAPH'} problem, "
+                                 bracing=cfg.bracing, depgraph=not cfg.mp_sequence)
+          print(f"[motion-plan] {'SEQUENCE' if cfg.mp_sequence else 'DEPGRAPH'} problem, "
                 f"{len(prob.tasks)} tasks")
-          if args.mp_modes:
+          if cfg.mp_modes:
             import os as _os, sys as _sys
             MP._ensure_mrbench()
             _sys.path.insert(0, _os.path.join(_os.path.dirname(MP._MRBENCH_SRC), "scripts"))
             from show_problems import visualize_modes
-            print(f"[motion-plan] serving MODES on http://localhost:{args.viser_port}")
+            print(f"[motion-plan] serving MODES on http://localhost:{cfg.viser_port}")
             visualize_modes(prob, use_viser=True)
             return
           mp_path, _ = MP.run_birrt(
-              prob, runtime=args.mp_runtime, shortcut=not args.mp_no_shortcut,
-              shortcut_iters=args.mp_shortcut_iters, shortcut_resolution=args.mp_shortcut_res,
-              optimize=args.mp_optimize)
+              prob, runtime=cfg.mp_runtime, shortcut=not cfg.mp_no_shortcut,
+              shortcut_iters=cfg.mp_shortcut_iters, shortcut_resolution=cfg.mp_shortcut_res,
+              optimize=cfg.mp_optimize)
           if mp_path:
             print(f"[motion-plan] path {len(mp_path)} states, "
                   f"reaches terminal={prob.is_terminal_mode(mp_path[-1].mode)}")
-            if args.mp_viser:
+            if cfg.mp_viser:
               from multi_robot_multi_goal_planning.problems.util import interpolate_path
               disp = interpolate_path(mp_path, 0.05, kind="euclidean")
               print(f"[motion-plan] serving interpolated path ({len(disp)} states) on "
-                    f"http://localhost:{args.viser_port}"
-                    + (" (collision shapes only)" if args.mp_collision_view else ""))
-              prob.display_path_viser(disp, port=args.viser_port,
-                                      primitives_only=args.mp_collision_view)
+                    f"http://localhost:{cfg.viser_port}"
+                    + (" (collision shapes only)" if cfg.mp_collision_view else ""))
+              prob.display_path_viser(disp, port=cfg.viser_port,
+                                      primitives_only=cfg.mp_collision_view)
           else:
             print("[motion-plan] NO path found")
       # --motion-plan owns the display (via --mp-viser); don't ALSO fire the search-replay
-      # viz, which would open the BLOCKING rai viewer (args.view defaults True).
-      if (args.view or args.viser) and not args.motion_plan:
+      # viz, which would open the BLOCKING rai viewer (cfg.view defaults True).
+      if (cfg.view or cfg.viser) and not cfg.motion_plan:
         recorder = None
-        if args.viser:
+        if cfg.viser:
           from viser_view import ViserRecorder
           recorder = ViserRecorder()
         # wrench arrows are computed whenever the capability model is on; a viser GUI
         # checkbox ("Show wrenches") toggles their display per step.
-        wgk = wrench_kind_arg(C, robots) if args.wrench else None
-        if args.real_ik:
+        wgk = wrench_kind_arg(C, robots) if cfg.wrench else None
+        if cfg.real_ik:
           visualize_plan_ik(C, assembly, plan, robots=robots, robot_ik=robot_ik,
-                            recorder=recorder, bracing=args.bracing,
+                            recorder=recorder, bracing=cfg.bracing,
                             witnesses=opt_witnesses, wrench_gk=wgk)
         else:
-          visualize_plan(C, assembly, plan, recorder=recorder, bracing=args.bracing,
+          visualize_plan(C, assembly, plan, recorder=recorder, bracing=cfg.bracing,
                          wrench_gk=wgk)
         if recorder is not None:
-          recorder.serve(port=args.viser_port)
+          recorder.serve(port=cfg.viser_port)
     return
 
-  if args.viser:
+  if cfg.viser:
     from viser_view import ViserRecorder
     recorder = ViserRecorder()
     recorder.record(C, "scene")
-    recorder.serve(port=args.viser_port)
-  elif args.view:
+    recorder.serve(port=cfg.viser_port)
+  elif cfg.view:
     C.view(True)
+
+def main(argv=None, args=None):
+  # CLI / entry wrapper: build the typed RunConfig from parsed CLI args (or an override
+  # namespace a caller passed) and hand it to run(). Library callers may instead build a
+  # RunConfig directly and call run(cfg) -- no argparse, no namespace round-trip.
+  if args is None:
+    args = parse_args(argv)
+  return run(RunConfig.from_namespace(args))
+
 
 if __name__ == "__main__":
   main()
