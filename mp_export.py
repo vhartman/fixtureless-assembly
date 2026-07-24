@@ -326,6 +326,9 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
       self.manipulating_env = True
       self.tasks, seq, step_names = build_tasks(
           assembly, plan, witnesses, states, self.robots, self.robot_idx, robot_ik, home)
+      self.step_names = step_names                         # task names per plan action -- lets
+      self.plan_actions = [tuple(a) for a in plan]         # sim.py map completed tasks back to
+                                                           # plan actions (grasp/weld events)
       if depgraph:
         self.graph = _dependency_graph(plan, states, step_names, self.robots, robot_ik)
       else:
