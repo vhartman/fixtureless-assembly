@@ -1820,10 +1820,17 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
 
   states = [get_initial_state(C, assembly)]
   for a in plan:
-    states.append(next(ns for act, ns in successors(
+    ns = next((ns for act, ns in successors(
         states[-1], assembly, robots, grasp_table=grasp_table,
         gripper_kind=gripper_kind, handovers=handovers, allow_place=allow_place,
-        bracing=bracing) if act == a))
+        bracing=bracing) if act == a), None)
+    if ns is None:                                          # successor flags don't match the plan
+      raise ValueError(
+          f"optimize_witnesses: cannot reproduce action {tuple(a)} from the successor set -- "
+          f"the successor flags likely differ from the search that made the plan "
+          f"(bracing={bracing}, handovers={handovers}, allow_place={allow_place}). "
+          f"An add_grasp/handover in the plan needs bracing=True.")
+    states.append(ns)
 
   wit = [None] * len(plan)
   for i, a in enumerate(plan):                            # baseline = the search's witnesses

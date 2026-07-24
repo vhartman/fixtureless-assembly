@@ -72,7 +72,10 @@ fire() release events re-attach CONTINUING HOLDERS (hold-through groups; mirrors
 release fix). v1 discriminator re-verified after the weld-semantics change (ON 20/20;
 OFF fails physically, mode topple -> dropped-at-release).
 """
+import os
 import numpy as np
+
+import retiming                                              # portable path->trajectory retiming
 
 try:
   import mujoco
@@ -197,58 +200,114 @@ def _save_recording(path, scene, rec, report):
   print(f"[sim] recording ({len(rec['qpos'])} frames) -> {path}")
 
 
-def _arm_shape_frames(C, robots, meshes=False):
-  """Enumerate the robot SHAPE frames to mirror as kinematic bodies.
-  Returns [(frame_name, kind, size_or_hullverts, collide, exempt_while_holding), ...]."""
-  # DEFAULT (meshes=False): the arm's _coll* CAPSULES collide -- the same geometry the
-  # motion planner certified clearance for, so sim contact == planner contract. meshes=True
-  # exports the link visual meshes instead (scipy-prehulled): TRUE-ER geometry, but MuJoCo
-  # collides meshes as PER-LINK CONVEX HULLS -- itself a wrong approximation, and the
-  # capsules are NOT an outer bound of the meshes (measured: same path, capsule-sim 9/9,
-  # mesh-sim 51.8N forearm squeeze) -- so the mesh mode is PARKED until the planner-geometry
-  # question is settled (fatten capsules vs hull-collision planning; user 2026-07-24).
+# viewer geom GROUPS (toggled by number keys 0-5 in the MuJoCo viewer / replay window):
+GROUP_PART = 0                  # the assembly parts (always on)
+GROUP_ENV = 1                   # floor + table
+GROUP_COLL = 2                  # arm COLLISION capsules (the planner's model)
+GROUP_VISUAL = 3                # arm VISUAL link meshes + gripper primitives (nice look)
+
+_MESH_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sim_meshes")
+
+
+_ARM_COLORS = ["0.2 0.2 0.9 1", "0.9 0.2 0.2 1", "0.2 0.8 0.8 1", "0.9 0.7 0.1 1",
+               "0.6 0.2 0.8 1", "0.4 0.9 0.3 1"]           # per-robot tint for the capsules
+
+
+def _write_obj(name, V, T):
+  """Cache a mesh as an .obj (MuJoCo has no .ply decoder), return its abs path. Written once."""
+  os.makedirs(_MESH_CACHE_DIR, exist_ok=True)
+  path = os.path.join(_MESH_CACHE_DIR, name + ".obj")
+  if not os.path.exists(path):
+    with open(path, "w") as f:
+      f.write("".join(f"v {v[0]:.5f} {v[1]:.5f} {v[2]:.5f}\n" for v in V))
+      f.write("".join(f"f {int(t[0])+1} {int(t[1])+1} {int(t[2])+1}\n" for t in T))
+  return path
+
+
+def _link_meshes(C, frame):
+  """Split a link's visual mesh by VERTEX COLOR into single-color sub-meshes -- MuJoCo geoms
+  take one rgba and its .obj loader ignores per-vertex colors, so this is how the real UR look
+  (blue caps / grey body / dark joints) is preserved. Returns [(obj_path, rgba_str), ...], one
+  per distinct region color; falls back to a single light-grey mesh if colors are missing."""
+  V = np.asarray(C.getFrame(frame).getMeshPoints(), dtype=float)
+  T = np.asarray(C.getFrame(frame).getMeshTriangles()).astype(int)
+  if len(V) < 4 or len(T) == 0:
+    return []                                              # joint-origin helper meshes: skip
+  try:
+    cols = np.asarray(C.getFrame(frame).getMeshColors())[:, :3].astype(int)
+  except Exception:
+    cols = None
+  if cols is None or len(cols) != len(V):
+    return [(_write_obj(frame, V, T), "0.72 0.72 0.75 1")]
+  tri_col = cols[T[:, 0]]                                  # triangle color = its 1st vertex
   out = []
-  for r in robots:
-    for n in C.getFrameNames():
-      if n.startswith(r):
-        info = C.getFrame(n).info()
-        k = info.get("shape")
-        if k == "mesh":
-          if not meshes:
-            continue
-          try:
-            import scipy.spatial as _sp
-            V = np.asarray(C.getFrame(n).getMeshPoints(), dtype=float)
-            hull = V[np.unique(_sp.ConvexHull(V).vertices)]
-          except Exception:
-            continue                                       # degenerate mesh: skip this link
-          out.append((n, "mesh", hull, True, "wrist" in n))
-        elif k in ("capsule", "cylinder", "sphere", "box", "ssBox"):
-          if "_coll" in n:
-            if meshes:
-              continue                                     # mesh mode replaces the capsules
-            # rai contact=-2 (the WRIST cluster nearest the tool) is parent-chain exempt vs
-            # the ATTACHED part -- a held cube hangs 35mm from the tip, inside the 50mm
-            # wrist capsule (measured 37N/1.46Nm sustained battle when always-colliding).
-            # Exempted WHILE HOLDING (blanket toggle: fair mirror, see grasp()/release()).
-            out.append((n, k, list(np.asarray(info.get("size"), dtype=float)), True,
-                        info.get("contact") == -2))
-          else:
-            # gripper-local primitives (vacuum tip, gripper_fill) stay VISUAL-ONLY: rai
-            # exempts them against the HELD part; colliding the tip = permanent battle
-            # with the suctioned part (measured: sustained 37N on a carried group).
-            out.append((n, k, list(np.asarray(info.get("size"), dtype=float)), False, False))
+  for k, c in enumerate(np.unique(tri_col, axis=0)):
+    faces = T[np.all(tri_col == c, axis=1)]
+    used = np.unique(faces)
+    if len(used) < 4:
+      continue
+    remap = -np.ones(int(used.max()) + 1, dtype=int)
+    remap[used] = np.arange(len(used))
+    obj = _write_obj(f"{frame}__c{k}", V[used], remap[faces])
+    out.append((obj, f"{c[0]/255:.3f} {c[1]/255:.3f} {c[2]/255:.3f} 1"))
   return out
 
 
-def _arm_geom_xml(kind, size):
-  # rai capsule/cylinder size = [length, radius]; MJCF size = "radius half-length".
+def _arm_shape_frames(C, robots, visual=True):
+  """Kinematic-body specs for the robots, each mirrored as an FK-synced mocap body. Returns
+  [(body, fk_frame, geom, collide, exempt, group, rgba), ...] where
+      geom = ("capsule"|"cylinder"|"sphere"|"box", size_list) | ("mesh", obj_path).
+  `body` is the (unique) MuJoCo body name; `fk_frame` is the rai frame whose FK pose drives it
+  (a color-split link mesh yields several bodies sharing one fk_frame). COLLISION model =
+  rai's _coll* CAPSULES (group COLL) -- the exact geometry the planner certified; VISUAL link
+  meshes (group VISUAL, contype 0, real UR colors) are added when `visual`."""
+  out = []
+  for j, r in enumerate(robots):
+    tint = _ARM_COLORS[j % len(_ARM_COLORS)]
+    for n in C.getFrameNames():
+      if not n.startswith(r):
+        continue
+      info = C.getFrame(n).info()
+      k = info.get("shape")
+      if k == "mesh":
+        if visual:
+          try:
+            for si, (obj, rgba) in enumerate(_link_meshes(C, n)):
+              out.append((f"{n}__m{si}", n, ("mesh", obj), False, False, GROUP_VISUAL, rgba))
+          except Exception:
+            pass                                           # degenerate / no mesh: skip
+      elif k in ("capsule", "cylinder", "sphere", "box", "ssBox"):
+        sz = list(np.asarray(info.get("size"), dtype=float))
+        if "_coll" in n:
+          # rai contact=-2 (WRIST cluster nearest the tool) is parent-chain exempt vs the
+          # ATTACHED part (a held cube hangs 35mm from the tip, inside the wrist capsule).
+          out.append((n, n, (k, sz), True, info.get("contact") == -2, GROUP_COLL, tint))
+        else:
+          # gripper primitives (vacuum tip, gripper_fill): visual-only, never collide.
+          out.append((n, n, (k, sz), False, False, GROUP_VISUAL, tint))
+  return out
+
+
+def _default_geomgroups(viewer, has_mesh):
+  """Initial viewer group visibility. MuJoCo HIDES groups >=3 by default, so we set them
+  explicitly: when real link meshes exist, SHOW them (group VISUAL) and HIDE the collision
+  capsules (group COLL) so the robot reads cleanly. Toggle with number keys (COLL / VISUAL)."""
+  if viewer is None:
+    return
+  if has_mesh:
+    viewer.opt.geomgroup[GROUP_VISUAL] = 1                 # show the real link meshes
+    viewer.opt.geomgroup[GROUP_COLL] = 0                   # hide the collision capsules
+
+
+def _arm_geom_xml(geom):
+  """MJCF geom shape+size for a non-mesh arm geom. rai capsule/cylinder size = [length,
+  radius]; MJCF wants 'radius half-length'. (mesh geoms are emitted via an asset ref.)"""
+  kind, size = geom[0], geom[1]
   if kind in ("capsule", "cylinder"):
     return f'type="{kind}" size="{size[1]} {size[0]/2}"'
   if kind == "sphere":
     return f'type="sphere" size="{size[0]}"'
-  # box / ssBox: full extents -> half extents (rounding dropped, conservative)
-  return f'type="box" size="{size[0]/2} {size[1]/2} {size[2]/2}"'
+  return f'type="box" size="{size[0]/2} {size[1]/2} {size[2]/2}"'   # box / ssBox
 
 
 def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
@@ -286,43 +345,39 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
     gq = ' quat="1 0 0 0"' if sq is None else f' quat="{sq[0]} {sq[1]} {sq[2]} {sq[3]}"'
     mass = assembly.masses.get(p, 0.1)
     g = _geom_xml(spec, mu_table).replace(
-        "mass_placeholder", f'mass="{mass}" rgba="{palette[i % len(palette)]}"{gq}')
+        "mass_placeholder",
+        f'mass="{mass}" group="{GROUP_PART}" rgba="{palette[i % len(palette)]}"{gq}')
     parts_xml.append(
         f'<body name="{p}" pos="{pose[0]} {pose[1]} {pose[2]}" '
         f'quat="{q[0]} {q[1]} {q[2]} {q[3]}"><freejoint/>{g}</body>')
   ee_colors = ["0.2 0.2 0.9 1", "0.9 0.2 0.2 1", "0.2 0.8 0.8 1", "0.9 0.7 0.1 1",
                "0.6 0.2 0.8 1", "0.4 0.9 0.3 1"]
+  arm_mesh_assets = ""
   if arms is None:                                         # v1: one gripper puck per robot
     for j, r in enumerate(robots):
       parts_xml.append(
           f'<body name="ee_{r}" mocap="true" pos="0 0 1"><geom type="cylinder" '
-          f'size="0.02 0.02" mass="0.2" contype="0" conaffinity="0" '
+          f'size="0.02 0.02" mass="0.2" contype="0" conaffinity="0" group="{GROUP_VISUAL}" '
           f'rgba="{ee_colors[j % len(ee_colors)]}"/></body>')
     anchor = {r: f"ee_{r}" for r in robots}
-  arm_mesh_assets = ""
-  if arms is None:
-    pass
   else:                                                    # v2: FK-synced arm link bodies
     mesh_assets = []
-    for fname, kind, size, collide, _ex in arms:
-      pose = arm_poses[fname]
+    for body, fkf, geom_spec, collide, _ex, group, rgba in arms:
+      pose = arm_poses[fkf]
       q = pose[3:]
-      j = next(i for i, r in enumerate(robots) if fname.startswith(r))
       # contype 2 / conaffinity 1: arm links collide with PARTS and the table, never with
       # each other (self/arm-arm clearance was the MOTION PLANNER's job; re-checking it
       # here on mocap bodies would only produce huge phantom forces on interpenetration).
       con = 'contype="2" conaffinity="1"' if collide else 'contype="0" conaffinity="0"'
-      if kind == "mesh":                                   # true link geometry (hull verts)
-        vtx = " ".join(f"{v:.5f}" for v in np.asarray(size, dtype=float).ravel())
-        mesh_assets.append(f'<mesh name="m_{fname}" vertex="{vtx}"/>')
-        geom = f'type="mesh" mesh="m_{fname}"'
+      if geom_spec[0] == "mesh":                           # real link mesh (visual only)
+        mesh_assets.append(f'<mesh name="m_{body}" file="{geom_spec[1]}"/>')
+        geom = f'type="mesh" mesh="m_{body}"'
       else:
-        geom = _arm_geom_xml(kind, size)
+        geom = _arm_geom_xml(geom_spec)
       parts_xml.append(
-          f'<body name="arm_{fname}" mocap="true" pos="{pose[0]} {pose[1]} {pose[2]}" '
+          f'<body name="arm_{body}" mocap="true" pos="{pose[0]} {pose[1]} {pose[2]}" '
           f'quat="{q[0]} {q[1]} {q[2]} {q[3]}">'
-          f'<geom {geom} mass="1.0" {con} '
-          f'rgba="{ee_colors[j % len(ee_colors)]}"/></body>')
+          f'<geom {geom} mass="1.0" {con} group="{group}" rgba="{rgba}"/></body>')
     anchor = {r: f"arm_{ee_anchor[r]}" for r in robots}
     arm_mesh_assets = "".join(mesh_assets)
   for r in robots:
@@ -354,9 +409,11 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
   <visual><headlight ambient="0.35 0.35 0.35" diffuse="0.6 0.6 0.6"/></visual>
   <worldbody>
     <light pos="0.5 -0.5 2.5" dir="-0.2 0.2 -1" directional="true" castshadow="true"/>
-    <geom name="floor" type="plane" size="4 4 0.1" material="grid" pos="0 0 0"/>
+    <geom name="floor" type="plane" size="4 4 0.1" material="grid" pos="0 0 0"
+          group="{GROUP_ENV}"/>
     <geom name="table" type="box" size="{TABLE_HALF[0]} {TABLE_HALF[1]} {th}"
-          pos="0 0 {th}" rgba="0.55 0.42 0.28 1" friction="{mu_table} 0.005 0.0001"/>
+          pos="0 0 {th}" rgba="0.55 0.42 0.28 1" friction="{mu_table} 0.005 0.0001"
+          group="{GROUP_ENV}"/>
     {''.join(parts_xml)}
   </worldbody>
   <equality>{''.join(eq_xml)}</equality>
@@ -386,10 +443,10 @@ class SimScene:
     # per-robot geom ids of the rai contact=-2 wrist capsules (un-collided while holding)
     self._holdex = {r: [] for r in self.robots}
     if arms is not None:
-      for fname, _k, _s, collide, exempt in arms:
+      for body, fkf, _geom, collide, exempt, _grp, _rgba in arms:
         if collide and exempt:
-          r = next(rb for rb in self.robots if fname.startswith(rb))
-          bid = self._body_id(f"arm_{fname}")
+          r = next(rb for rb in self.robots if body.startswith(rb))
+          bid = self._body_id(f"arm_{body}")
           self._holdex[r].append(int(self.model.body_geomadr[bid]))
     self.gripper_kinds = gripper_kinds or {}
     self.active_grasps = {}                                # robot -> (eq_id, part, fcap, tcap)
@@ -397,7 +454,8 @@ class SimScene:
     if gui:
       from mujoco import viewer as _viewer                 # NOT `import mujoco.viewer`: that
       self.viewer = _viewer.launch_passive(self.model, self.data)  # would shadow the module-
-                                                           # global `mujoco` in this scope
+      _default_geomgroups(self.viewer,
+                          arms is not None and any(e[2][0] == "mesh" for e in arms))               # global `mujoco` in this scope
     mujoco.mj_forward(self.model, self.data)
 
   # -- naming helpers --------------------------------------------------------------------
@@ -438,9 +496,9 @@ class SimScene:
 
   def sync_arms(self, poses):
     """v2: set every arm link mocap body to its rai-FK world pose. poses = {frame: 7-pose}."""
-    for fname, _k, _s, _c, _e in self.arms:
-      mid = self.model.body_mocapid[self._body_id(f"arm_{fname}")]
-      pose = poses[fname]
+    for body, fkf, _geom, _c, _e, _grp, _rgba in self.arms:
+      mid = self.model.body_mocapid[self._body_id(f"arm_{body}")]
+      pose = poses[fkf]
       self.data.mocap_pos[mid] = pose[:3]
       self.data.mocap_quat[mid] = pose[3:]
 
@@ -807,7 +865,7 @@ JOINT_RATE = 1.0                # rad/s joint-space tracking speed along RAW pat
 
 
 def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kinds=None,
-                        record=None, verbose=True, gui=False, meshes=False):
+                        record=None, verbose=True, gui=False, visual=True):
   """Execute an mr_bench PATH (from mp_export.run_birrt) in MuJoCo with the REAL ARMS:
   every rai robot shape frame (the capsule collision model + gripper primitives) is mirrored
   as a kinematic body positioned by rai FK along the path -- the planner's own kinematics by
@@ -836,10 +894,11 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
   jnames = C_fk.getJointNames()
   ridx = {r: [i for i, jn in enumerate(jnames) if jn.startswith(r)] for r in robots}
 
-  arms = _arm_shape_frames(C_fk, robots, meshes=meshes)
+  arms = _arm_shape_frames(C_fk, robots, visual=visual)
   def fk_poses(qfull):
     C_fk.setJointState(qfull)
-    return {f: np.asarray(C_fk.getFrame(f).getPose(), dtype=float) for f, _k, _s, _c, _e in arms}
+    frames = {e[1] for e in arms}
+    return {f: np.asarray(C_fk.getFrame(f).getPose(), dtype=float) for f in frames}
 
   def full_q(state_q):
     flat = state_q.state() if hasattr(state_q, "state") else np.asarray(state_q)
@@ -854,7 +913,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
   # ee anchor frame for grasp welds: the tool cylinder if present, else the last shape frame
   ee_anchor = {}
   for r in robots:
-    cands = [f for f, _k, _s, _c, _e in arms if f.startswith(r)]
+    cands = [e[1] for e in arms if e[1].startswith(r) and e[2][0] != "mesh"]
     ee_anchor[r] = next((f for f in cands if "gripper_fill" in f), cands[-1])
 
   q0 = full_q(mp_path[0].q)
@@ -926,50 +985,30 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
 
   if verbose:
     print(f"[sim/mp] driving RAW path: {len(mp_path)} states, {len(problem.tasks)} tasks")
-  mode = mp_path[0].mode
   q_prev = full_q(mp_path[0].q)
   scene.sync_arms(fk_poses(q_prev))
 
   # --- split the raw path into PER-MODE STRETCHES (transition = duplicated goal config) ---
-  stretches = []                                           # (list of full-q waypoints, done tids)
-  cur = [q_prev]
-  for st in mp_path[1:] if len(mp_path) > 1 else []:
-    q = full_q(st.q)
-    if st.mode != mode:
-      done = [int(t) for t in np.atleast_1d(mode.task_ids)
-              if t not in np.atleast_1d(st.mode.task_ids)]
-      stretches.append((cur, sorted(set(done))))
-      cur = [cur[-1]]                                      # new stretch starts AT the goal config
-      mode = st.mode
-    cur.append(q)
-  stretches.append((cur, sorted(set(int(t) for t in np.atleast_1d(mode.task_ids)))))
+  # Decomposition + the trapezoidal profile now live in the portable `retiming` module
+  # (input = sequence/DAG + collision-free path, output = trajectory with v=0 at goals),
+  # so the same contract can move to the mr_bench side. `st.mode` is passed as the mode
+  # handle (compared with !=); full_q maps a path state's q to the full joint config.
+  stretches = retiming.split_stretches(                     # [(full-q waypoints, done tids)]
+      mp_path, q_of=lambda st: full_q(st.q),
+      mode_of=lambda st: st.mode,
+      taskids_of=lambda m: np.atleast_1d(m.task_ids))
 
   def drive_stretch(qs):
     # INTERIM ZERO-VELOCITY-AT-GOALS (kinodynamic MP is the real fix, out of scope for now):
     # the raw path has no dynamics, so constant-rate tracking blew THROUGH the task goals and
-    # the held part carried momentum into every grasp/mate/release event. Here each per-mode
-    # stretch gets an execution-side TRAPEZOIDAL profile -- ramp from ~0, cruise at
-    # JOINT_RATE, ramp back to ~0 over the last RAMP_DIST rad -- so arms arrive at every
-    # transition (where attaches fire) essentially at rest. Path GEOMETRY is untouched; this
-    # is exactly what a jerk-limited tracking controller would do on hardware.
-    segs = [float(np.linalg.norm(b - a)) for a, b in zip(qs, qs[1:])]
-    D = float(sum(segs))
-    if D < 1e-9:
-      return
-    csum = np.concatenate([[0.0], np.cumsum(segs)])
-
-    def config_at(s):
-      i = min(int(np.searchsorted(csum, s, side="right")) - 1, len(segs) - 1)
-      if segs[i] < 1e-12:
-        return qs[i + 1]
-      a = (s - csum[i]) / segs[i]
-      return (1 - a) * qs[i] + a * qs[i + 1]
-
-    s = 0.0
-    while s < D:
-      ramp = min(1.0, (min(s, D - s) + 1e-6) / RAMP_DIST) if RAMP_DIST > 0 else 1.0
-      s = min(D, s + JOINT_RATE * max(RAMP_MIN, ramp) * DT)
-      scene.sync_arms(fk_poses(config_at(s)))
+    # the held part carried momentum into every grasp/mate/release event. Each per-mode stretch
+    # gets an execution-side TRAPEZOIDAL profile -- ramp from ~0, cruise at JOINT_RATE, ramp
+    # back to ~0 over the last RAMP_DIST rad (retiming.retime_stretch) -- so arms arrive at
+    # every transition (where attaches fire) essentially at rest. Path GEOMETRY is untouched;
+    # this is exactly what a jerk-limited tracking controller would do on hardware.
+    for q in retiming.retime_stretch(qs, DT, joint_rate=JOINT_RATE,
+                                     ramp_dist=RAMP_DIST, ramp_min=RAMP_MIN):
+      scene.sync_arms(fk_poses(q))
       scene.step(1, report, ("path",))
 
   for qs, done in stretches:
@@ -1039,6 +1078,8 @@ def replay_recording(path, speed=1.0, loop=True):
     print("   ", r)
   print("[replay] controls: SPACE pause | arrows step | PgUp/PgDn jump | HOME/END | "
         "UP/DOWN speed | slider window (if Tk)")
+  print("[replay] geom groups (number keys): 0=parts 1=floor/table 2=arm-collision-capsules "
+        "3=arm-visual-meshes  (capsules start HIDDEN when meshes exist)")
   from mujoco import viewer as _viewer
   mpos = z["mpos"] if "mpos" in z.files else None          # mocap tracks (arms / EE pucks)
   mquat = z["mquat"] if "mquat" in z.files else None
@@ -1105,6 +1146,7 @@ def replay_recording(path, speed=1.0, loop=True):
 
   prev_shown = -1
   with _viewer.launch_passive(model, data, key_callback=key_cb) as v:
+    _default_geomgroups(v, model.nmesh > 0)               # meshes on, collision capsules off
     while v.is_running():
       i = int(st["i"])
       if i != prev_shown:
@@ -1201,11 +1243,15 @@ def _cli_run(a):
       rik.strip_inactive_collision = False
       rik.penetration_reject = float(cfg["strict_collisions"])
       rik.col_weight = 1e2
+    # successor flags MUST match the search that produced the plan, or the state re-derivation
+    # inside optimize_witnesses can't reproduce an action (e.g. car-mini's add_grasp needs
+    # bracing=True). bracing is saved; handovers/allow_place aren't (they default True).
+    brace = bool(cfg.get("bracing"))
     wit, _ = optimize_witnesses(C, asm, plan, robots, rik, cost="ee", sweeps=0,
-                                gripper_kind=gk,
+                                gripper_kind=gk, bracing=brace,
                                 robot_collisions=bool(cfg.get("witness_robot_collisions")),
                                 verbose=False)
-    prob = MP.make_problem(C, asm, plan, wit, robots, rik, gk, bracing=bool(cfg.get("bracing")),
+    prob = MP.make_problem(C, asm, plan, wit, robots, rik, gk, bracing=brace,
                            depgraph=False, collision_tolerance=a.mp_tolerance)
     if a.mp_path:                                          # load a saved BiRRT path -> no re-plan
       path = MP.load_path(a.mp_path)
@@ -1226,7 +1272,8 @@ def _cli_run(a):
       print("[sim] motion planner found no path.")
       return
     rep = execute_motion_plan(C, asm, plan, states, prob, path, gripper_kinds=gripper_kinds,
-                              record=a.record, gui=a.gui, meshes=a.meshes, verbose=a.verbose)
+                              record=a.record, gui=a.gui, visual=not a.no_arm_meshes,
+                              verbose=a.verbose)
   else:
     rep = SimExecutor(asm, gripper_kinds=gripper_kinds, gui=a.gui).execute(
         plan, states, record=a.record)
@@ -1258,9 +1305,9 @@ def _build_cli():
                       "--mp-path (the saved path already encodes it).")
   r.add_argument("--mp-runtime", type=float, default=60.0,
                  help="v2: BiRRT budget (s); ignored with --mp-path")
-  r.add_argument("--meshes", action="store_true",
-                 help="v2 EXPERIMENTAL/PARKED: collide hulled link meshes instead of the "
-                      "planner capsules (convex-hull approx is wrong -- see PIPELINE.md).")
+  r.add_argument("--no-arm-meshes", action="store_true",
+                 help="v2: skip the real link VISUAL meshes (default on) -- capsules only. "
+                      "Faster to build; the collision model is the capsules either way.")
   r.add_argument("--record", metavar="FILE", default=None, help="save a replayable .npz")
   r.add_argument("--gui", action="store_true", help="live MuJoCo viewer during execution")
   r.add_argument("--verbose", action="store_true")

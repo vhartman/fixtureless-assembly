@@ -726,7 +726,7 @@ class CarAssembly(Assembly):
       x, y = slots[i - 1]
       self.part_shapes[f"obj_{i}"] = wheel
       self.scatter_orientations[f"obj_{i}"] = q_flat
-      self.assembly_relative_poses[f"obj_{i}"] = ["obj_0", np.array([x, y, -0.3 * w])]
+      self.assembly_relative_poses[f"obj_{i}"] = ["obj_0", np.array([x * 1.1, y * 1.1, -0.3 * w])]
       self.mate_axes[f"obj_{i}"] = np.array([0.0, -np.sign(y), 0.0])  # axial, onto the axle
       self.no_hold.add(f"obj_{i}")                          # a wheel would rotate -> can't brace
     self.assembly_dependencies = {}
