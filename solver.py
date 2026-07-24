@@ -374,6 +374,27 @@ class RobotIK:
     # EVERY branch penetrates deeper than this gate, reject before any KOMO. 15mm keeps every
     # measured rescue while killing the deep-collision failure path.
     self.collision_reject_depth = 0.015
+    # --strict-collisions: POST-ACCEPT penetration gate on every KOMO witness. The collision
+    # objective is a SOFT ineq -- the NLP accepts mm-scale violations ("rescued grazes" up to
+    # ~10mm), which downstream consumers (MuJoCo execution, a 0-tolerance mr_bench export)
+    # then pay for. With penetration_reject set (metres), a feasible KOMO solution is ALSO
+    # required to have getCollisionsTotalPenetration() <= this on the skill scene; dirty
+    # solutions are treated as infeasible and the restart loop keeps searching for a clean
+    # basin. NOTE: the gate sees only what the skill scene contains -- combine with
+    # --witness-robot-collisions, else stripped idle arms stay invisible. None = off
+    # (byte-identical). col_weight: the accumulatedCollisions ineq weight (1e1 historical;
+    # strict mode raises it so the solver steers to clean configs instead of leaning on the
+    # slack and getting rejected).
+    self.penetration_reject = None
+    self.col_weight = 1e1
+    self.strict_rejects = 0                               # diagnostics: dirty witnesses vetoed
+    # DEBUG: set env PEN_VIEW_ACTION='pick a1 obj_1 0' to open a BLOCKING C.view(True) on the
+    # FIRST penetration check of that exact action (space-joined tuple) -- prints the colliding
+    # frame pairs and shows the skill scene at the checked witness. For inspecting whether a
+    # --strict-collisions witness rejection is real. Off unless the env var is set.
+    self._pen_view_action = os.environ.get("PEN_VIEW_ACTION")
+    self._pen_viewed = False
+    self._cur_action = None                               # set per _ik_* call (for the view)
     # HARD-reject depth (see _probe_branch_combos): only when EVERY exact branch penetrates
     # beyond this does the probe reject without a KOMO. Conservative on purpose (near the
     # measured unrescued MEDIAN 55mm): the old single 15mm gate falsely rejected feasible
@@ -658,7 +679,38 @@ class RobotIK:
                         [p["weight"] * p["rot_weight"]],
                         np.asarray(p["ee_quat"], dtype=float))
 
-  def _solve_ik(self, komo, restarts=12, seeds=None):
+  def _pen_ok(self, C, q):
+    # --strict-collisions gate: total penetration of the skill scene at witness q (the same
+    # contact flags the komo's collision objective saw -- target-part exclusions included).
+    if self.penetration_reject is None or C is None or q is None:
+      return True
+    saved = C.getJointState()
+    C.setJointState(np.asarray(q, dtype=float))
+    pen = float(C.getCollisionsTotalPenetration())
+    reject = pen > self.penetration_reject
+
+    if (self._pen_view_action is not None and not self._pen_viewed
+        and self._cur_action is not None
+        and " ".join(str(x) for x in self._cur_action) == self._pen_view_action):
+      # DEBUG (PEN_VIEW_ACTION): show the checked witness + its colliding pairs, BLOCKING.
+      # self._pen_viewed = True
+      pairs = sorted((c for c in C.getCollisions() if c[2] < 0), key=lambda c: c[2])
+      print(f"[pen-view] {tuple(self._cur_action)}: total penetration {pen*1000:.2f}mm "
+            f"({'REJECTED' if reject else 'accepted'}; gate {self.penetration_reject*1000:.2f}mm)")
+      for a, b, d in pairs[:15]:
+        print(f"   {a} ~ {b}: {d*1000:+.2f}mm")
+      if not pairs:
+        print("   (no penetrating pairs -- penetration is from another source / rounding)")
+      C.view(True, f"pen check {tuple(self._cur_action)}: {pen*1000:.1f}mm "
+                   f"{'REJECT' if reject else 'ok'} (close to continue)")
+
+    C.setJointState(saved)
+    if reject:
+      self.strict_rejects += 1
+      return False
+    return True
+
+  def _solve_ik(self, komo, restarts=12, seeds=None, C=None):
     # solve a skill KOMO, retrying from fresh inits until one converges. KOMO seeds its guess
     # with a little noise, so a borderline-reachable target flips feasible/infeasible run-to-
     # run; restarts make bind reliable -- a genuinely feasible action returns a witness (instead
@@ -670,7 +722,7 @@ class RobotIK:
     for seed in (seeds or []):
       komo.initWithConstant(np.asarray(seed, dtype=float))
       r = ry.NLP_Solver(komo.nlp(), verbose=0).solve().dict()
-      if r["feasible"]:
+      if r["feasible"] and self._pen_ok(C, komo.getPath()[-1]):
         self._last_res = r
         return True, komo.getPath()[-1]
     if seeds:
@@ -680,13 +732,13 @@ class RobotIK:
       # budget is for UNSEEDED solves where restarts must find the branches themselves.
       restarts = min(restarts, self.seed_restart_cap)
     r = ry.NLP_Solver(komo.nlp(), verbose=0).solve().dict()
-    if r["feasible"]:
+    if r["feasible"] and self._pen_ok(C, komo.getPath()[-1]):
       self._last_res = r
       return True, komo.getPath()[-1]
     for _ in range(restarts):
       komo.initRandom()
       r = ry.NLP_Solver(komo.nlp(), verbose=0).solve().dict()
-      if r["feasible"]:
+      if r["feasible"] and self._pen_ok(C, komo.getPath()[-1]):
         self._last_res = r
         return True, komo.getPath()[-1]
     self._last_res = r
@@ -940,6 +992,7 @@ class RobotIK:
     self.fail_recorder.record(C, label)
 
   def _ik_pick(self, action, s0, s1, assembly, seed, backoff=0.0, warm=None):
+    self._cur_action = action                             # for PEN_VIEW_ACTION debug
     # simple IK: ONE robot (the picker) reaches a fixed grasp pose on an on-table part.
     # Every other robot -- free or holding something else -- stays at home (an obstacle).
     #
@@ -992,7 +1045,7 @@ class RobotIK:
         # is physically bogus, and grasps that are actually unreachable wrongly pass. (the
         # target part is excluded above, since the gripper is supposed to touch it.)
         komo.addObjective(
-            [], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [1e1], [-0.0]
+            [], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [self.col_weight], [-0.0]
         )
       komo.addControlObjective([], 0, 1e-1)
       komo.addControlObjective([], 1, 1e-1)
@@ -1034,7 +1087,7 @@ class RobotIK:
       wseed = self._restrict_seed(warm, C, full_names) if full_names is not None \
           else np.asarray(warm, dtype=float)
       seeds = [wseed] + list(seeds or [])
-    feasible, witness = self._solve_ik(komo, seeds=seeds)
+    feasible, witness = self._solve_ik(komo, seeds=seeds, C=C)
     if self.single_arm_ik:
       witness = self._expand_witness(C, witness, full_names)  # restricted -> full joint vector
     if not feasible:
@@ -1047,6 +1100,7 @@ class RobotIK:
     return feasible, witness
 
   def _ik_add_grasp(self, action, s0, s1, assembly, seed, backoff=0.0, warm=None):
+    self._cur_action = action                             # for PEN_VIEW_ACTION debug
     # a SECOND robot reaches a grasp on an ALREADY-HELD subassembly (the handover / brace
     # primitive). Like a pick, but the target is held (posed by its current holder) rather
     # than resting on the table: scene_for attaches the group to its kinematic holder, that
@@ -1066,7 +1120,7 @@ class RobotIK:
     def build(collisions):
       komo = ry.KOMO(C, phases=1, slicesPerPhase=1, kOrder=1, enableCollisions=collisions)
       if collisions:
-        komo.addObjective([], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [1e1], [-0.0])
+        komo.addObjective([], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [self.col_weight], [-0.0])
       komo.addControlObjective([], 0, 1e-1)
       komo.addControlObjective([], 1, 1e-1)
       self._add_pull(komo, C, robot)                      # witness-opt pull (no-op in search)
@@ -1082,7 +1136,8 @@ class RobotIK:
 
     komo = build(True)
     feasible, witness = self._solve_ik(          # `warm` (full config) couples pre-add-grasp to
-        komo, seeds=([np.asarray(warm, dtype=float)] if warm is not None else None))  # the grasp
+        komo, seeds=([np.asarray(warm, dtype=float)] if warm is not None else None),  # the grasp
+        C=C)
     if not feasible:
       self._log_failure(action, C, komo)
 
@@ -1093,6 +1148,7 @@ class RobotIK:
     return feasible, witness
 
   def _ik_place(self, action, s0, s1, assembly, seed, backoff=0.0, warm=None):
+    self._cur_action = action                             # for PEN_VIEW_ACTION debug
     # ONE robot (the placer) sets its held subassembly onto the table, resting on the
     # placement FACE the action names. The target is the pose the DISCRETE model will
     # assume afterwards (scene_for/_pose_on_table's rest pose anchored at the lowest-index
@@ -1134,7 +1190,7 @@ class RobotIK:
         # resting on the table is intended contact (0 penetration satisfies the ineq); real
         # penetrations (through the table / into neighbours) still reject.
         komo.addObjective(
-            [], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [1e1], [-0.0]
+            [], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [self.col_weight], [-0.0]
         )
       komo.addControlObjective([], 0, 1e-1)
       komo.addControlObjective([], 1, 1e-1)
@@ -1203,7 +1259,7 @@ class RobotIK:
       wseed = self._restrict_seed(warm, C, full_names) if full_names is not None \
           else np.asarray(warm, dtype=float)
       seeds = [wseed] + list(seeds or [])
-    feasible, witness = self._solve_ik(komo, seeds=seeds)
+    feasible, witness = self._solve_ik(komo, seeds=seeds, C=C)
     if single:
       witness = self._expand_witness(C, witness, full_names)  # restricted -> full joint vector
     if not feasible:
@@ -1223,7 +1279,7 @@ class RobotIK:
     komo = ry.KOMO(C, phases=1, slicesPerPhase=1, kOrder=1, enableCollisions=collisions)
     if collisions:
       # no scene-penetration: keep the arm(s) from driving links through the table / cubes.
-      komo.addObjective([], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [1e1], [-0.0])
+      komo.addObjective([], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [self.col_weight], [-0.0])
     komo.addControlObjective([], 0, 1e-1)
     komo.addControlObjective([], 1, 1e-1)
     # cube-pose constraint (NOT an EE pose): pose(part) relative to pose(onto) == the mate.
@@ -1248,6 +1304,7 @@ class RobotIK:
     return komo
 
   def _ik_assemble(self, action, s0, s1, assembly, seed, bias_axes=None, backoff=0.0, warm=None):
+    self._cur_action = action                             # for PEN_VIEW_ACTION debug
     # solve for the added part's mate pose: the SEAM (`part`) must reach its mate pose
     # relative to the target subassembly. `part` may be a single cube OR the seam of a whole
     # held MODULE (a plate) -- in the latter case the module is rigid in the scene, so the
@@ -1352,7 +1409,8 @@ class RobotIK:
       self._add_grasp_maintenance(komo, s0, assembly)     # braces pinned at their grasps
       feasible, witness = self._solve_ik(              # `warm` (e.g. the mated witness for a
           komo, restarts=0,                            # pre-insertion goto) warm-starts the solve
-          seeds=([warm] if warm is not None else None))  # so it settles in the SAME IK basin
+          seeds=([warm] if warm is not None else None),  # so it settles in the SAME IK basin
+          C=C)
       if feasible:
         break
     if not feasible:                                      # fallback: unbiased random restarts
@@ -1360,7 +1418,7 @@ class RobotIK:
       self._add_pull(komo, C, robot)                    # witness-opt pull (no-op in search)
       self._add_grasp_maintenance(komo, s0, assembly)
       feasible, witness = self._solve_ik(
-          komo, restarts=6, seeds=([warm] if warm is not None else None))
+          komo, restarts=6, seeds=([warm] if warm is not None else None), C=C)
     if not feasible:
       self._log_failure(action, C, komo)
 

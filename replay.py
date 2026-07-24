@@ -61,9 +61,10 @@ def build_scene(cfg):
   set_rolls_per_face(2 if any_tf else 1)
   set_dense_grasps(bool(cfg.get("dense_grasps")) and any_tf)
   set_inhand_reorient(bool(cfg.get("inhand_reorient")))    # plan may contain reorient edges
-  from problem import set_staged_mates, set_allow_curved_grasps
+  from problem import set_staged_mates, set_allow_curved_grasps, set_plain_box
   set_staged_mates(bool(cfg.get("staged_mates")))          # staged-mate invariant, as searched
   set_allow_curved_grasps(bool(cfg.get("allow_curved_grasps")))  # grasp table must match the search
+  set_plain_box(bool(cfg.get("plain_box")))                # cube collision geometry must match
   from problem import set_dominance, set_useful_grasps_enabled
   set_dominance(bool(cfg.get("dominance")))                # successor set must match the search
   set_useful_grasps_enabled(bool(cfg.get("useful_grasps")))  # ordering must match the search
@@ -104,6 +105,11 @@ def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=T
     rik.pre_pick_delta = float(cfg.get("pre_pick") or 0.0)
     rik.pre_place_delta = float(cfg.get("pre_place") or 0.0)
     rik.pre_add_grasp_delta = float(cfg.get("pre_add_grasp") or 0.0)
+    if cfg.get("witness_robot_collisions"):                # replay IK sees the same scene
+      rik.strip_inactive_collision = False
+    if cfg.get("strict_collisions") is not None:           # same witness gate as the search
+      rik.penetration_reject = float(cfg["strict_collisions"])
+      rik.col_weight = 1e2
     visualize_plan_ik(C, assembly, plan, robots=robots, robot_ik=rik,
                       recorder=recorder, bracing=brace)
   else:

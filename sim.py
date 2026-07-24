@@ -62,6 +62,15 @@ semantics; welding at the ACHIEVED pose accumulated 9.7deg over 3 mates). Remain
 real finger-contact two-finger (breakaway-weld stand-in for now); v2 mr_bench joint
 trajectories; start-perturbation trials; --sim-validate flag in main.py.
 Recordings: sim_recordings/*.npz -- replay with `python3 sim.py replay <file> [speed]`.
+
+V2 STATUS (2026-07-24, later same day): execute_motion_plan VERIFIED end-to-end WITH the
+zero-tolerance chain -- --strict-collisions witnesses (0 penetration) -> make_problem
+collision_tolerance=1e-6 -> BiRRT -> arms-in-sim execution: cross-3/2R ur10 vacuum 9/9
+SUCCEEDED, 2.0mm/1.2deg final error (recording: sim_recordings/mp_cross3_strict.npz). The
+earlier 27.8N carry graze was the planner's tolerated 10mm penetration -- gone at 1e-6.
+fire() release events re-attach CONTINUING HOLDERS (hold-through groups; mirrors mp_export's
+release fix). v1 discriminator re-verified after the weld-semantics change (ON 20/20;
+OFF fails physically, mode topple -> dropped-at-release).
 """
 import numpy as np
 
@@ -101,6 +110,15 @@ BREAK_SUSTAIN = 0.02            # s : a grasp breaks only if overloaded CONTINUO
                                 # survivable by a real seal/pinch; loss of grip is a leak/slip
                                 # process, not a single-sample event. Static overloads (what
                                 # the LP prices) persist and still break.
+CAPTURE_RANGE = 0.05            # m   : a part-part mate datum-welds only within this of the
+                                # seat (the funnel mouth); a larger miss = the part never
+                                # arrived -> fail cleanly instead of snapping it in (explodes).
+RAMP_DIST = 0.2                 # rad : v2 trapezoid -- ramp to/from ~rest over this much joint
+                                # arc at each per-mode stretch boundary (task goals), so every
+                                # attach event happens quasi-statically. Interim stand-in for
+                                # kinodynamic MP: execution-side timing only, geometry untouched.
+RAMP_MIN = 0.04                 # frac: floor of the ramp (never exactly 0 -> guaranteed arrival)
+DWELL_T = 0.15                  # s   : hold at each transition before/after firing attaches
 SETTLE_T = 0.5                  # s   : settle after each action before judging
 TABLE_HALF = (1.2, 1.2, 0.05)   # matches the rai table footprint; z-offset checked on 1st run
 
@@ -179,32 +197,47 @@ def _save_recording(path, scene, rec, report):
   print(f"[sim] recording ({len(rec['qpos'])} frames) -> {path}")
 
 
-def _arm_shape_frames(C, robots):
-  """Enumerate the robot SHAPE frames to mirror as kinematic bodies: the capsule COLLISION
-  model (coll*) plus gripper primitives -- exactly the geometry mr_bench collision-checked,
-  so the sim replays what the motion planner guaranteed clearance for. Visual meshes are
-  skipped (heavy; the capsules read fine). Returns [(frame_name, kind, size), ...]."""
+def _arm_shape_frames(C, robots, meshes=False):
+  """Enumerate the robot SHAPE frames to mirror as kinematic bodies.
+  Returns [(frame_name, kind, size_or_hullverts, collide, exempt_while_holding), ...]."""
+  # DEFAULT (meshes=False): the arm's _coll* CAPSULES collide -- the same geometry the
+  # motion planner certified clearance for, so sim contact == planner contract. meshes=True
+  # exports the link visual meshes instead (scipy-prehulled): TRUE-ER geometry, but MuJoCo
+  # collides meshes as PER-LINK CONVEX HULLS -- itself a wrong approximation, and the
+  # capsules are NOT an outer bound of the meshes (measured: same path, capsule-sim 9/9,
+  # mesh-sim 51.8N forearm squeeze) -- so the mesh mode is PARKED until the planner-geometry
+  # question is settled (fatten capsules vs hull-collision planning; user 2026-07-24).
   out = []
   for r in robots:
     for n in C.getFrameNames():
       if n.startswith(r):
         info = C.getFrame(n).info()
         k = info.get("shape")
-        if k in ("capsule", "cylinder", "sphere", "box", "ssBox"):
-          # collide ONLY rai's arm collision capsules (the _coll* frames). Gripper-local
-          # geometry (vacuum tip, gripper_fill) is visual-only: rai exempts it against the
-          # HELD part (contact=None / parent-chain -1), and mirroring it as colliding put
-          # the tip sphere in a permanent contact-vs-weld battle with the suctioned part
-          # (measured: sustained 37N on a carried group).
-          collide = "_coll" in n
-          # rai contact=-2 (the WRIST cluster nearest the tool) is parent-chain exempt vs
-          # the ATTACHED part -- a held cube hangs 35mm from the tip, inside the 50mm wrist
-          # capsule, so mirroring these as always-colliding re-created the same battle
-          # (measured 37N/1.46Nm sustained). They are un-collided WHILE HOLDING (per-pair
-          # runtime exclusion doesn't exist in MuJoCo; vs OTHER parts the planner kept
-          # clearance, so the blanket toggle is a fair mirror).
-          exempt = info.get("contact") == -2
-          out.append((n, k, list(np.asarray(info.get("size"), dtype=float)), collide, exempt))
+        if k == "mesh":
+          if not meshes:
+            continue
+          try:
+            import scipy.spatial as _sp
+            V = np.asarray(C.getFrame(n).getMeshPoints(), dtype=float)
+            hull = V[np.unique(_sp.ConvexHull(V).vertices)]
+          except Exception:
+            continue                                       # degenerate mesh: skip this link
+          out.append((n, "mesh", hull, True, "wrist" in n))
+        elif k in ("capsule", "cylinder", "sphere", "box", "ssBox"):
+          if "_coll" in n:
+            if meshes:
+              continue                                     # mesh mode replaces the capsules
+            # rai contact=-2 (the WRIST cluster nearest the tool) is parent-chain exempt vs
+            # the ATTACHED part -- a held cube hangs 35mm from the tip, inside the 50mm
+            # wrist capsule (measured 37N/1.46Nm sustained battle when always-colliding).
+            # Exempted WHILE HOLDING (blanket toggle: fair mirror, see grasp()/release()).
+            out.append((n, k, list(np.asarray(info.get("size"), dtype=float)), True,
+                        info.get("contact") == -2))
+          else:
+            # gripper-local primitives (vacuum tip, gripper_fill) stay VISUAL-ONLY: rai
+            # exempts them against the HELD part; colliding the tip = permanent battle
+            # with the suctioned part (measured: sustained 37N on a carried group).
+            out.append((n, k, list(np.asarray(info.get("size"), dtype=float)), False, False))
   return out
 
 
@@ -266,7 +299,11 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
           f'size="0.02 0.02" mass="0.2" contype="0" conaffinity="0" '
           f'rgba="{ee_colors[j % len(ee_colors)]}"/></body>')
     anchor = {r: f"ee_{r}" for r in robots}
+  arm_mesh_assets = ""
+  if arms is None:
+    pass
   else:                                                    # v2: FK-synced arm link bodies
+    mesh_assets = []
     for fname, kind, size, collide, _ex in arms:
       pose = arm_poses[fname]
       q = pose[3:]
@@ -275,12 +312,19 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
       # each other (self/arm-arm clearance was the MOTION PLANNER's job; re-checking it
       # here on mocap bodies would only produce huge phantom forces on interpenetration).
       con = 'contype="2" conaffinity="1"' if collide else 'contype="0" conaffinity="0"'
+      if kind == "mesh":                                   # true link geometry (hull verts)
+        vtx = " ".join(f"{v:.5f}" for v in np.asarray(size, dtype=float).ravel())
+        mesh_assets.append(f'<mesh name="m_{fname}" vertex="{vtx}"/>')
+        geom = f'type="mesh" mesh="m_{fname}"'
+      else:
+        geom = _arm_geom_xml(kind, size)
       parts_xml.append(
           f'<body name="arm_{fname}" mocap="true" pos="{pose[0]} {pose[1]} {pose[2]}" '
           f'quat="{q[0]} {q[1]} {q[2]} {q[3]}">'
-          f'<geom {_arm_geom_xml(kind, size)} mass="1.0" {con} '
+          f'<geom {geom} mass="1.0" {con} '
           f'rgba="{ee_colors[j % len(ee_colors)]}"/></body>')
     anchor = {r: f"arm_{ee_anchor[r]}" for r in robots}
+    arm_mesh_assets = "".join(mesh_assets)
   for r in robots:
     # grasp welds: anchor body <-> each part (inactive; relpose set at grasp time).
     for p in assembly.objects:
@@ -305,6 +349,7 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
     <material name="grid" texture="grid" texrepeat="8 8" reflectance="0.1"/>
     <texture type="skybox" builtin="gradient" rgb1="0.5 0.7 0.9" rgb2="0.9 0.9 0.95"
              width="64" height="64"/>
+    {arm_mesh_assets}
   </asset>
   <visual><headlight ambient="0.35 0.35 0.35" diffuse="0.6 0.6 0.6"/></visual>
   <worldbody>
@@ -433,6 +478,39 @@ class SimScene:
     self.model.eq_data[eq][10] = 1.0                       # torquescale
     self.data.eq_active[eq] = 1
 
+  # -- frame-based attach (mirrors mr_bench set_to_mode) ---------------------------------
+  def _detach(self, child):
+    """Remove whatever weld currently parents `child` -- its gripper grasp OR its mate."""
+    for r, g in list(self.active_grasps.items()):
+      if g[1] == child:
+        self.release(r)                                    # deactivates + restores wrist coll
+    meq = self._eq_id(f"mate_{child}")
+    if meq >= 0 and self.data.eq_active[meq]:
+      self.data.eq_active[meq] = 0
+
+  def attach(self, parent_frame, child):
+    """Replay ONE mr_bench task attach (frames = [parent, child]) as a weld, EXACTLY as
+    set_to_mode does. This is the correct event model for a saved motion PATH: the path was
+    planned under these attaches, so the sim must mirror them or the arm drags the part.
+      parent == 'table'         -> child (its group) rests FREE (all its grippers let go).
+      parent == a gripper frame -> weld child to that arm (breakaway-capped grasp).
+      parent == a part          -> weld child to that part at the MANUAL datum (mate/snap-fit).
+    Re-rooting (release -> [table|other-gripper, obj]) and hold-through transfers fall out of
+    the frames automatically -- no action-kind inference, no continuing-holder patch."""
+    self._detach(child)
+    if parent_frame == "table":
+      return                                               # free body -> gravity + contact
+    if parent_frame in self.assembly.objects:              # part-part MATE at the datum
+      rel = self.assembly.relative_pose(child)
+      eq = self._eq_id(f"mate_{child}")
+      self.model.eq_data[eq][:3] = 0.0
+      self.model.eq_data[eq][3:6] = np.asarray(rel[1], dtype=float)
+      self.model.eq_data[eq][6:10] = [1.0, 0.0, 0.0, 0.0]
+      self.model.eq_data[eq][10] = 1.0
+      self.data.eq_active[eq] = 1
+    else:                                                  # gripper GRASP (frozen relpose)
+      self.grasp(parent_frame.split("_", 1)[0], child)
+
   # -- stepping with grasp breakaway -----------------------------------------------------
   def _weld_wrench(self, eq_id):
     """Constraint wrench currently exerted by an active weld: sum its efc rows.
@@ -527,6 +605,20 @@ class SimExecutor:
     return _pose_compose(self._expected_pose(state, part),
                          grasp_pose(self.assembly, part, gid))
 
+  def _reattach_holders(self, s_post, part):
+    """CONTINUING HOLDERS after a release: weld_mate removed the inserter's grasp weld, but if
+    the post-state still has another arm HOLDING this group (hold-through -- the milestone/
+    wrench plans lean on it heavily), that arm's grasp weld was also removed at its own
+    assemble and must be re-activated, else the group is orphaned and drops. Same fix as the
+    v2 executor's fire(); the arm's puck is parked at its grasp, so the frozen relpose is
+    correct. (Found by trace on a main-solved cross-5 plan: release a1/obj_0 with the airborne
+    {obj_0,obj_1,obj_2} held-through by a2/obj_2 -> obj_0 dropped.)"""
+    group = next((g for g in s_post.subassemblies() if part in g), frozenset())
+    for p in group:
+      for c in s_post.supports.get(p, ()):
+        if c[0] == "grasp" and c[1] not in self.scene.active_grasps:
+          self.scene.grasp(c[1], c[2])
+
   def execute(self, plan, states, record=None):
     """record=<path.npz>: dump a REPLAYABLE recording (model XML + qpos frames + per-robot
     grasp wrenches + action marks). View later with sim.replay_recording(path) or
@@ -577,8 +669,10 @@ class SimExecutor:
         gid = _held_grasp_id(s_pre, act[2])
         self._move(robot, self._ee_pose_for(s_post, act[2], gid), report, act)
         self.scene.release(robot)
+        self._reattach_holders(s_post, act[2])
       elif kind == "release":
         self.scene.release(robot)
+        self._reattach_holders(s_post, act[2])
       elif kind in ("handover", "add_grasp"):
         gid = act[3]
         self._move(robot, self._ee_pose_for(s_pre, act[2], gid), report, act)
@@ -713,14 +807,21 @@ JOINT_RATE = 1.0                # rad/s joint-space tracking speed along RAW pat
 
 
 def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kinds=None,
-                        record=None, verbose=True):
+                        record=None, verbose=True, gui=False, meshes=False):
   """Execute an mr_bench PATH (from mp_export.run_birrt) in MuJoCo with the REAL ARMS:
   every rai robot shape frame (the capsule collision model + gripper primitives) is mirrored
   as a kinematic body positioned by rai FK along the path -- the planner's own kinematics by
-  construction, so witness configs land exactly. Parts stay fully dynamic; grasp welds
-  (breakaway-capped) and mate welds fire at MODE TRANSITIONS, mapped back to plan actions via
-  the env's step_names (mp_export stashes them). SEQUENCE problems only for now (task order
-  == plan order); depgraph linearizations reorder events -- TODO.
+  construction, so witness configs land exactly. Parts stay fully dynamic.
+
+  RELINKING = FRAME-BASED ATTACH REPLAY (fixed 2026-07-25). At each MODE TRANSITION the
+  completed task's mr_bench frames [parent, child] are replayed as a weld -- EXACTLY what
+  set_to_mode does -- via scene.attach: parent 'table' => the part rests free; a gripper frame
+  => breakaway grasp; a part => datum mate (within CAPTURE_RANGE). This is required because the
+  path was PLANNED under those attaches: a `release` is a re-root to `table` or to the
+  CONTINUING HOLDER's gripper (not a detach at the releasing arm), so inferring welds from the
+  action KIND made the arm drag a part it had "released" (measured: release fired with the arm
+  1.3m away). Hold-through transfers and handovers fall out of the frames automatically.
+  SEQUENCE problems only for now; depgraph linearizations reorder events -- TODO.
 
   C: the rai config the problem was built from (used read-only; FK runs on a copy).
   plan/states: the discrete plan + its state trajectory (event semantics + judging).
@@ -735,7 +836,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
   jnames = C_fk.getJointNames()
   ridx = {r: [i for i, jn in enumerate(jnames) if jn.startswith(r)] for r in robots}
 
-  arms = _arm_shape_frames(C_fk, robots)
+  arms = _arm_shape_frames(C_fk, robots, meshes=meshes)
   def fk_poses(qfull):
     C_fk.setJointState(qfull)
     return {f: np.asarray(C_fk.getFrame(f).getPose(), dtype=float) for f, _k, _s, _c, _e in arms}
@@ -758,7 +859,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
 
   q0 = full_q(mp_path[0].q)
   scene = SimScene(assembly, states[0], robots, gripper_kinds=gripper_kinds,
-                   arms=arms, arm_poses=fk_poses(q0), ee_anchor=ee_anchor)
+                   arms=arms, arm_poses=fk_poses(q0), ee_anchor=ee_anchor, gui=gui)
   rec = None
   if record is not None:
     rec = scene.recorder = {"qpos": [], "mpos": [], "mquat": [], "forces": [], "marks": []}
@@ -770,63 +871,113 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     for k, nm in enumerate(nms):
       name_of[nm] = (i, k == len(nms) - 1)
 
+  import os as _os
+  _trace = bool(_os.environ.get("SIM_MP_TRACE"))
+
   def fire(task_id):
+    # REPLAY mr_bench's exact attach for this task (frames = [parent, child]); goto = no attach.
+    # This -- not action-kind inference -- is what a saved PATH requires: the path was planned
+    # under these attaches (release re-roots to table or to the continuing holder; hold-through
+    # transfers are just an attach to the other gripper), so mirroring the frames keeps the
+    # welds consistent with the motion and the arm never drags a part it "released".
     t = problem.tasks[task_id]
-    if t.name == "terminal" or t.name not in name_of:
-      return
-    i, final = name_of[t.name]
-    if not final:
-      return                                               # pre-insertion goto etc.
-    act = tuple(plan[i])
+    if t.name == "terminal" or not getattr(t, "frames", None):
+      return                                               # goto / terminal: nothing to relink
+    parent, child = t.frames[0], t.frames[1]
+    # seat check BEFORE the datum weld (part-part attach only) -- report a genuine miss.
+    seat_miss = None
+    if parent in assembly.objects:
+      got = _rel_pos(scene.part_pose(parent), scene.part_pose(child))
+      err = float(np.linalg.norm(got - np.asarray(assembly.relative_pose(child)[1])))
+      if err > SEAT_POS_TOL:
+        seat_miss = err
+    # only DATUM-WELD when the part is within CAPTURE range -- snapping a far part in would
+    # fire a huge constraint impulse (measured 4000N) and explode the scene. But the KINEMATIC
+    # side of the attach must ALWAYS be replayed: after this transition the path assumes the
+    # gripper is free (mr_bench re-parents the part), so the grasp weld must go even on a
+    # missed seat -- keeping it made the arm keep holding through the "assemble" and shove the
+    # target around (user-reported: 'not releasing when the assembly should happen').
+    if seat_miss is not None and seat_miss > CAPTURE_RANGE:
+      scene._detach(child)                                 # gripper lets go; no datum snap
+      # ALWAYS loud (user ask): a skipped datum weld must be unmistakable, not a trace line.
+      print(f"[sim] !!! {t.name}: {child} MISSED its seat on {parent} by "
+            f"{seat_miss*1000:.0f}mm (> {CAPTURE_RANGE*1000:.0f}mm capture range) -- mate NOT "
+            f"welded, gripper released; expect downstream failures.")
+    else:
+      scene.attach(parent, child)
+    # map to the plan action (for the taxonomy label + expected-state judge), if this task is
+    # the FINAL task of an action (pre-insertion gotos have no frames and never reach here).
+    lbl = name_of.get(t.name)
+    act = tuple(plan[lbl[0]]) if (lbl and lbl[1]) else ("attach", parent, child)
+    if _trace:
+      pp = scene.part_pose(child)[:3]
+      pj = scene.part_pose(parent)[:3] if parent in assembly.objects else (
+          np.asarray(C_fk.getFrame(ee_anchor.get(parent.split("_", 1)[0], "")).getPose()[:3])
+          if parent != "table" else None)
+      d = float(np.linalg.norm(pp - pj)) * 1000 if pj is not None else -1
+      print(f"  [fire] task{task_id} {t.name} attach[{parent}<-{child}] "
+            f"child-to-parent={d:.0f}mm seat_miss={seat_miss}")
     if rec is not None:
       rec["marks"].append((len(rec["qpos"]), repr(act)))
-    kind = act[0]
-    if kind in ("pick", "add_grasp"):
-      scene.grasp(act[1], act[2])
-    elif kind == "handover":
-      scene.grasp(act[1], act[2])
-      giver = _holder_of(states[i], act[2], exclude=act[1])
-      if giver:
-        scene.release(giver)
-    elif kind in ("release", "place"):
-      scene.release(act[1])
-    elif kind == "assemble":
-      rel = assembly.relative_pose(act[2])
-      got = _rel_pos(scene.part_pose(rel[0]), scene.part_pose(act[2]))
-      if float(np.linalg.norm(got - np.asarray(rel[1]))) <= SEAT_POS_TOL:
-        scene.weld_mate(act[2])
-      else:
-        report.results.append(ActionResult(act, False, "not_seated",
-                                           f"{float(np.linalg.norm(got - np.asarray(rel[1])))*1000:.1f}mm"))
-        return
-    # judge RESTING parts against the plan's expected next state (held groups are wherever
-    # the witnesses put them -- the symbolic layout does not price the arm's carry pose).
-    report.results.append(_judge_resting(scene, assembly, act, states[i + 1]))
+    if seat_miss is not None:
+      report.results.append(ActionResult(act, False, "not_seated", f"{seat_miss*1000:.1f}mm"))
+    elif lbl and lbl[1]:
+      report.results.append(_judge_resting(scene, assembly, act, states[lbl[0] + 1]))
 
   if verbose:
     print(f"[sim/mp] driving RAW path: {len(mp_path)} states, {len(problem.tasks)} tasks")
   mode = mp_path[0].mode
   q_prev = full_q(mp_path[0].q)
   scene.sync_arms(fk_poses(q_prev))
-  for st in mp_path:
-    q_next = full_q(st.q)
-    n = max(1, int(np.linalg.norm(q_next - q_prev) / (JOINT_RATE * DT)))
-    for k in range(n):                                     # smooth joint-space sub-lerp
-      a = (k + 1) / n
-      scene.sync_arms(fk_poses((1 - a) * q_prev + a * q_next))
-      scene.step(1, report, ("path",))
-    q_prev = q_next
-    if st.mode != mode:                                    # mode transition => task(s) done.
-      # Raw transitions are DUPLICATED goal configs (same q, old mode then new mode --
-      # FK-verified: tip exactly at the grasp standoff on both sides), so the arms are AT
-      # the witness when events fire.
-      done = [tid for tid in np.atleast_1d(mode.task_ids) if
-              tid not in np.atleast_1d(st.mode.task_ids)]
-      for tid in sorted(set(int(t) for t in done)):
-        fire(tid)
+
+  # --- split the raw path into PER-MODE STRETCHES (transition = duplicated goal config) ---
+  stretches = []                                           # (list of full-q waypoints, done tids)
+  cur = [q_prev]
+  for st in mp_path[1:] if len(mp_path) > 1 else []:
+    q = full_q(st.q)
+    if st.mode != mode:
+      done = [int(t) for t in np.atleast_1d(mode.task_ids)
+              if t not in np.atleast_1d(st.mode.task_ids)]
+      stretches.append((cur, sorted(set(done))))
+      cur = [cur[-1]]                                      # new stretch starts AT the goal config
       mode = st.mode
-  for tid in sorted(set(int(t) for t in np.atleast_1d(mode.task_ids))):
-    fire(tid)                                              # last mode's task (terminal goto)
+    cur.append(q)
+  stretches.append((cur, sorted(set(int(t) for t in np.atleast_1d(mode.task_ids)))))
+
+  def drive_stretch(qs):
+    # INTERIM ZERO-VELOCITY-AT-GOALS (kinodynamic MP is the real fix, out of scope for now):
+    # the raw path has no dynamics, so constant-rate tracking blew THROUGH the task goals and
+    # the held part carried momentum into every grasp/mate/release event. Here each per-mode
+    # stretch gets an execution-side TRAPEZOIDAL profile -- ramp from ~0, cruise at
+    # JOINT_RATE, ramp back to ~0 over the last RAMP_DIST rad -- so arms arrive at every
+    # transition (where attaches fire) essentially at rest. Path GEOMETRY is untouched; this
+    # is exactly what a jerk-limited tracking controller would do on hardware.
+    segs = [float(np.linalg.norm(b - a)) for a, b in zip(qs, qs[1:])]
+    D = float(sum(segs))
+    if D < 1e-9:
+      return
+    csum = np.concatenate([[0.0], np.cumsum(segs)])
+
+    def config_at(s):
+      i = min(int(np.searchsorted(csum, s, side="right")) - 1, len(segs) - 1)
+      if segs[i] < 1e-12:
+        return qs[i + 1]
+      a = (s - csum[i]) / segs[i]
+      return (1 - a) * qs[i] + a * qs[i + 1]
+
+    s = 0.0
+    while s < D:
+      ramp = min(1.0, (min(s, D - s) + 1e-6) / RAMP_DIST) if RAMP_DIST > 0 else 1.0
+      s = min(D, s + JOINT_RATE * max(RAMP_MIN, ramp) * DT)
+      scene.sync_arms(fk_poses(config_at(s)))
+      scene.step(1, report, ("path",))
+
+  for qs, done in stretches:
+    drive_stretch(qs)
+    scene.step(int(DWELL_T / DT), report, ("dwell",))      # settle: v ~= 0 before relinking
+    for tid in done:
+      fire(tid)
+    scene.step(int(DWELL_T / DT), report, ("dwell",))      # let the new attach take hold
   scene.step(int(SETTLE_T / DT), report, ("settle",))
 
   report.final_pose_err = {}
@@ -868,45 +1019,262 @@ def _judge_resting(scene, assembly, action, expect_state):
 # ---------------------------------------------------------------------------------------------
 def replay_recording(path, speed=1.0, loop=True):
   """Open the MuJoCo viewer on a recording made with execute(record=...): kinematic playback
-  of the stored qpos frames (no physics re-run -- exactly what happened, bit for bit). Prints
-  each action mark as playback crosses it. BLOCKS while the viewer is open (close it or
-  ctrl-C to stop). speed: 1.0 = real time; loop: restart at the end."""
+  of the stored qpos frames (no physics re-run -- exactly what happened, bit for bit). BLOCKS
+  while the viewer is open (close it or ctrl-C to stop).
+
+  SCRUBBING (viser-style): a Tk window with a draggable FRAME SLIDER + play/pause opens next
+  to the viewer (stdlib tkinter; skipped gracefully if unavailable). The slider label shows
+  time + the most recent plan action. Keyboard in the MuJoCo window works too:
+      SPACE play/pause | LEFT/RIGHT step 1 | PgUp/PgDn jump 5% | HOME/END | UP/DOWN speed x2
+  """
   import json, time
   z = np.load(path, allow_pickle=False)
   model = mujoco.MjModel.from_xml_string(str(z["xml"]))
   data = mujoco.MjData(model)
   marks = dict((int(f), a) for f, a in json.loads(str(z["marks"])))
   qpos = z["qpos"]
-  print(f"[replay] {path}: {len(qpos)} frames, {len(marks)} actions; results:")
+  T = len(qpos)
+  print(f"[replay] {path}: {T} frames, {len(marks)} actions; results:")
   for r in json.loads(str(z["results"])):
     print("   ", r)
+  print("[replay] controls: SPACE pause | arrows step | PgUp/PgDn jump | HOME/END | "
+        "UP/DOWN speed | slider window (if Tk)")
   from mujoco import viewer as _viewer
-  frame_dt = DT * RECORD_EVERY / speed
   mpos = z["mpos"] if "mpos" in z.files else None          # mocap tracks (arms / EE pucks)
   mquat = z["mquat"] if "mquat" in z.files else None
-  with _viewer.launch_passive(model, data) as v:
+  mark_keys = sorted(marks)
+
+  st = {"i": 0.0, "playing": True, "speed": float(speed), "scrub": False}
+
+  def key_cb(key):                                         # GLFW keycodes
+    if key == 32:                                          # SPACE
+      st["playing"] = not st["playing"]
+    elif key == 263:                                       # LEFT
+      st["playing"] = False; st["i"] = max(0.0, st["i"] - 1)
+    elif key == 262:                                       # RIGHT
+      st["playing"] = False; st["i"] = min(T - 1.0, st["i"] + 1)
+    elif key == 267:                                       # PGDN: back 5%
+      st["i"] = max(0.0, st["i"] - T * 0.05)
+    elif key == 266:                                       # PGUP: fwd 5%
+      st["i"] = min(T - 1.0, st["i"] + T * 0.05)
+    elif key == 268:                                       # HOME
+      st["i"] = 0.0
+    elif key == 269:                                       # END
+      st["playing"] = False; st["i"] = T - 1.0
+    elif key == 265:                                       # UP
+      st["speed"] = min(16.0, st["speed"] * 2)
+    elif key == 264:                                       # DOWN
+      st["speed"] = max(0.0625, st["speed"] / 2)
+
+  # optional Tk slider window (viser-style scrub bar)
+  root = scale = lbl = None
+  try:
+    import tkinter as tk
+    root = tk.Tk()
+    root.title(f"replay: {path.split('/')[-1]}")
+    root.geometry("640x110")
+    lbl = tk.Label(root, text="", anchor="w", font=("monospace", 9))
+    lbl.pack(fill="x", padx=8, pady=(6, 0))
+
+    def on_scale(val):
+      if st["scrub"]:                                      # user drag (not our .set feedback)
+        st["i"] = float(val)
+    scale = tk.Scale(root, from_=0, to=T - 1, orient="horizontal", showvalue=True,
+                     length=620, command=on_scale)
+    scale.pack(fill="x", padx=8)
+    scale.bind("<ButtonPress-1>", lambda e: st.update(scrub=True, playing=False))
+    scale.bind("<ButtonRelease-1>", lambda e: st.update(scrub=False))
+    row = tk.Frame(root); row.pack(pady=2)
+    tk.Button(row, text="play/pause", command=lambda: st.update(playing=not st["playing"])
+              ).pack(side="left", padx=4)
+    tk.Button(row, text="-", command=lambda: st.update(speed=max(0.0625, st["speed"] / 2))
+              ).pack(side="left")
+    tk.Button(row, text="+", command=lambda: st.update(speed=min(16.0, st["speed"] * 2))
+              ).pack(side="left")
+    for frac, txt in ((0.0, "|<"), (0.25, "25%"), (0.5, "50%"), (0.75, "75%")):
+      tk.Button(row, text=txt, command=lambda f=frac: st.update(i=f * (T - 1))
+                ).pack(side="left", padx=2)
+  except Exception as e:                                   # headless Tk / no display: keys only
+    print(f"[replay] no Tk slider ({e}); keyboard controls still active")
+    root = None
+
+  def last_mark(i):
+    import bisect
+    k = bisect.bisect_right(mark_keys, i) - 1
+    return marks[mark_keys[k]] if k >= 0 else "(start)"
+
+  prev_shown = -1
+  with _viewer.launch_passive(model, data, key_callback=key_cb) as v:
     while v.is_running():
-      for i in range(len(qpos)):
-        if not v.is_running():
-          return
-        if i in marks:
-          print(f"[replay] t={i*DT*RECORD_EVERY:6.2f}s  {marks[i]}")
+      i = int(st["i"])
+      if i != prev_shown:
         data.qpos[:] = qpos[i]
         if mpos is not None and len(mpos):
           data.mocap_pos[:] = mpos[i]
           data.mocap_quat[:] = mquat[i]
         mujoco.mj_forward(model, data)
-        v.sync()
-        time.sleep(frame_dt)
-      if not loop:
-        while v.is_running():
-          time.sleep(0.2)
+        prev_shown = i
+      v.sync()
+      if root is not None:
+        try:
+          if not st["scrub"]:
+            scale.set(i)
+          lbl.config(text=f"t={i*DT*RECORD_EVERY:7.2f}s  frame {i}/{T-1}  "
+                          f"speed x{st['speed']:g}  {'PLAYING' if st['playing'] else 'PAUSED'}"
+                          f"  |  {last_mark(i)}")
+          root.update()
+        except Exception:                                  # window closed -> keys only
+          root = None
+      if st["playing"] and not st["scrub"]:
+        st["i"] += st["speed"]                             # frames advance at speed x realtime
+        if st["i"] >= T:
+          st["i"] = 0.0 if loop else T - 1.0
+          if not loop:
+            st["playing"] = False
+      time.sleep(DT * RECORD_EVERY)
+  if root is not None:
+    try:
+      root.destroy()
+    except Exception:
+      pass
+
+
+# ---------------------------------------------------------------------------------------------
+# CLI: EXECUTE a saved plan in physics (`run`), or view a recording (`replay`).
+# We do NOT solve here -- run the SOLVER with main.py (`--save plan.json`); sim just consumes
+# that. The scene is rebuilt with replay.build_scene (the same reconstruction the rai replay
+# uses), so there is a single source of truth for the scene and zero solver duplication.
+# ---------------------------------------------------------------------------------------------
+def _gripper_kinds_from_cfg(cfg, robots):
+  ks = [k.strip() for k in (cfg.get("grippers") or "").split(",") if k.strip()]
+  if ks:                                                    # mixed EEs (--grippers CSV)
+    ks = (ks + [ks[-1]] * len(robots))[:len(robots)]
+    return {r: ks[i] for i, r in enumerate(robots)}
+  return {r: ("vacuum" if cfg.get("vacuum") else "two_finger") for r in robots}
+
+
+def _states_from_plan(cfg, C, asm, robots, plan):
+  """Re-derive the discrete state trajectory the same way tests/_replay_ok does -- the saved
+  JSON carries only actions, and the successor flags (gripper kind, bracing) must match the
+  search that produced it (both are in the saved config)."""
+  import assembly as A
+  gk = A.gripper_kind(C) if cfg.get("wrench") else None
+  brace = bool(cfg.get("bracing"))
+  _, gt = A._search_context(C, asm, robots)
+  states = [A.get_initial_state(C, asm)]
+  for act in plan:
+    states.append(next(ns for a, ns in A.successors(states[-1], asm, robots, gt,
+                                                     gripper_kind=gk, bracing=brace)
+                       if a == act))
+  return states
+
+
+def _cli_run(a):
+  import assembly as A
+  import replay as R
+  from plan_io import read_plan
+  cfg, plan = read_plan(a.path)
+  C, asm = R.build_scene(cfg)                               # exact reconstruction (shared)
+  robots = A.get_robots(C)
+  gripper_kinds = _gripper_kinds_from_cfg(cfg, robots)
+  states = _states_from_plan(cfg, C, asm, robots, plan)
+  print(f"[sim] {a.path}: {cfg['assembly']} ({cfg['parts']}p, {cfg['num_robots']}R), "
+        f"{len(plan)} actions; executing "
+        f"({'v2 real-arm motion plan' if a.v2 else 'v1 keyframe'}) ...")
+
+  if a.v2:
+    if cfg.get("floating_ee"):
+      print("[sim] --v2 needs a REAL-ARM plan: save from a run WITHOUT --floating-ee (and "
+            "with --real-ik). This plan is floating-EE.")
+      return
+    from solver import RobotIK, optimize_witnesses
+    import mp_export as MP
+    gk = A.gripper_kind(C) if cfg.get("wrench") else None
+    rik = RobotIK(C, robots)                                # geometric export only -- the
+    # VERBATIM from the saved config -- 0.0 means NO pre-insertion split. (A silent `or 0.05`
+    # default here rebuilt the problem WITH split tasks while the saved path used unsplit
+    # task ids -> every attach after the first assemble fired at the wrong task; user-hit.)
+    rik.pre_insertion_delta = float(cfg.get("pre_insertion") or 0.0)
+    if cfg.get("witness_robot_collisions"):
+      rik.strip_inactive_collision = False
+    if cfg.get("strict_collisions") is not None:
+      rik.strip_inactive_collision = False
+      rik.penetration_reject = float(cfg["strict_collisions"])
+      rik.col_weight = 1e2
+    wit, _ = optimize_witnesses(C, asm, plan, robots, rik, cost="ee", sweeps=0,
+                                gripper_kind=gk,
+                                robot_collisions=bool(cfg.get("witness_robot_collisions")),
+                                verbose=False)
+    prob = MP.make_problem(C, asm, plan, wit, robots, rik, gk, bracing=bool(cfg.get("bracing")),
+                           depgraph=False, collision_tolerance=a.mp_tolerance)
+    if a.mp_path:                                          # load a saved BiRRT path -> no re-plan
+      path = MP.load_path(a.mp_path)
+      print(f"[sim] loaded motion path ({len(path)} states) from {a.mp_path} -- skipping BiRRT")
+      # ALIGNMENT GUARD: the path's mode task-ids index MAIN's task list; the rebuilt problem
+      # must have the identical task structure or every attach fires at the wrong time.
+      max_tid = max(int(t) for st in path for t in np.atleast_1d(st.mode.task_ids))
+      if max_tid + 1 != len(prob.tasks):
+        print(f"[sim] !!! TASK-STRUCTURE MISMATCH: saved path references {max_tid + 1} tasks, "
+              f"rebuilt problem has {len(prob.tasks)}. The plan.json/mp.json pair does not "
+              f"match this rebuild (usually a pre-insertion/--skill difference: saved config "
+              f"has pre_insertion={cfg.get('pre_insertion')}). Aborting -- executing would "
+              f"relink at the wrong times.")
         return
+    else:
+      path, _ = MP.run_birrt(prob, runtime=a.mp_runtime, verbose=a.verbose)
+    if not path:
+      print("[sim] motion planner found no path.")
+      return
+    rep = execute_motion_plan(C, asm, plan, states, prob, path, gripper_kinds=gripper_kinds,
+                              record=a.record, gui=a.gui, meshes=a.meshes, verbose=a.verbose)
+  else:
+    rep = SimExecutor(asm, gripper_kinds=gripper_kinds, gui=a.gui).execute(
+        plan, states, record=a.record)
+  print(rep.summary())
+
+
+def _build_cli():
+  import argparse
+  p = argparse.ArgumentParser(
+      prog="sim.py",
+      description="MuJoCo validation harness. EXECUTE a saved plan in physics (`run`) or view "
+                  "a recording (`replay`). Solve with main.py --save; sim does not re-solve. "
+                  "Set PYTHONHASHSEED=0 for reproducible runs.")
+  sub = p.add_subparsers(dest="cmd", required=True)
+
+  r = sub.add_parser("run", help="execute a saved plan (main.py --save) in physics")
+  r.add_argument("path", help="plan JSON written by `main.py ... --save plan.json`")
+  r.add_argument("--v2", action="store_true",
+                 help="REAL-ARM motion-plan execution: rebuild witnesses + run mr_bench BiRRT "
+                      "for the SAVED discrete plan, then FK-synced arms follow the path in "
+                      "sim. Needs a plan saved from a --real-ik (non-floating) run. Default "
+                      "(v1) executes the plan with floating-gripper keyframes.")
+  r.add_argument("--mp-path", metavar="FILE", default=None,
+                 help="v2: load a saved BiRRT path (main --motion-plan --mp-save FILE) instead "
+                      "of re-planning. Must be from the SAME run as the plan JSON.")
+  r.add_argument("--mp-tolerance", type=float, default=0.01,
+                 help="v2: exported collision tolerance (1e-6 = zero-tol; the plan's witnesses "
+                      "must be clean -- save it from a --strict-collisions run). Ignored with "
+                      "--mp-path (the saved path already encodes it).")
+  r.add_argument("--mp-runtime", type=float, default=60.0,
+                 help="v2: BiRRT budget (s); ignored with --mp-path")
+  r.add_argument("--meshes", action="store_true",
+                 help="v2 EXPERIMENTAL/PARKED: collide hulled link meshes instead of the "
+                      "planner capsules (convex-hull approx is wrong -- see PIPELINE.md).")
+  r.add_argument("--record", metavar="FILE", default=None, help="save a replayable .npz")
+  r.add_argument("--gui", action="store_true", help="live MuJoCo viewer during execution")
+  r.add_argument("--verbose", action="store_true")
+
+  v = sub.add_parser("replay", help="view a recording (kinematic playback)")
+  v.add_argument("path")
+  v.add_argument("speed", nargs="?", type=float, default=1.0)
+  v.add_argument("--no-loop", action="store_true")
+  return p
 
 
 if __name__ == "__main__":
-  import sys
-  if len(sys.argv) >= 3 and sys.argv[1] == "replay":
-    replay_recording(sys.argv[2], speed=float(sys.argv[3]) if len(sys.argv) > 3 else 1.0)
+  args = _build_cli().parse_args()
+  if args.cmd == "run":
+    _cli_run(args)
   else:
-    print("usage: python3 sim.py replay <recording.npz> [speed]")
+    replay_recording(args.path, speed=args.speed, loop=not args.no_loop)

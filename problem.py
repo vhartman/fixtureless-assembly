@@ -1292,10 +1292,29 @@ def _shape_quat(spec):
   return np.asarray(spec[2], dtype=float) if len(spec) > 2 else None
 
 
+_PLAIN_BOX = False                                         # --plain-box: sharp ST.box instead of
+                                                          # the sphere-swept ssBox (drops the
+                                                          # corner_r inflation). A geometry
+                                                          # A/B test knob -- see set_plain_box.
+
+
+def set_plain_box(on=True):
+  """Use rai's sharp ST.box for cube parts instead of ssBox (which sphere-SWEEPS the box by
+  corner_r, inflating every face by r -> two 'flush' mated cubes overlap by 2r, and a gripper
+  grazing a face sees the inflated surface). Plain box = the nominal [sx,sy,sz] with no
+  inflation. Must be set BEFORE the scene/grasp-table is built (both solve and replay/export),
+  so it is saved in the plan config and reapplied on reconstruction."""
+  global _PLAIN_BOX
+  _PLAIN_BOX = bool(on)
+
+
 def _set_raw_shape(f, spec):
   kind, p = spec[0], spec[1]
   if kind == "box":
-    f.setShape(ry.ST.ssBox, list(p))                       # [sx, sy, sz, corner_r]
+    if _PLAIN_BOX:
+      f.setShape(ry.ST.box, list(p[:3]))                   # sharp box, no corner rounding
+    else:
+      f.setShape(ry.ST.ssBox, list(p))                     # [sx, sy, sz, corner_r]
   elif kind == "cylinder":
     f.setShape(ry.ST.cylinder, list(p))                    # [length, radius]
   elif kind == "sphere":

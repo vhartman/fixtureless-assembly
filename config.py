@@ -40,6 +40,7 @@ class RunConfig:
   robot: str = "ur10"
   robot_types: Optional[str] = None
   perturb_start_pose: bool = False
+  plain_box: bool = False
   part_float: float = 0.015
   random_init: Optional[float] = None
   scatter_spacing: float = 1.0 / 7.0
@@ -119,6 +120,7 @@ class RunConfig:
   ik_seeding: bool = True
   ik_collision_gate: float = 0.015
   full_ik: bool = False
+  strict_collisions: Optional[float] = None
 
   # -- witness optimization --
   optimize_witnesses: Optional[str] = None
@@ -140,6 +142,9 @@ class RunConfig:
   mp_no_shortcut: bool = False
   mp_shortcut_iters: int = 1000
   mp_shortcut_res: Optional[float] = None
+  mp_clearance: bool = False
+  mp_save: Optional[str] = None
+  mp_collision_tolerance: float = 0.01
   mp_viser: bool = False
   mp_collision_view: bool = False
   mp_modes: bool = False

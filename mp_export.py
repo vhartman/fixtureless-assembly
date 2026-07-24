@@ -296,7 +296,7 @@ def _dependency_graph(plan, states, step_names, robots, robot_ik):
 
 
 def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, bracing,
-                 depgraph=False):
+                 depgraph=False, collision_tolerance=0.01):
   """Build a live mr_bench problem from our solved plan. depgraph=False -> SequenceMixin (a
   fixed total order); depgraph=True -> DependencyGraphMixin (the partial order, so the planner
   may reorder independent actions). Same tasks/frames/witnesses either way."""
@@ -333,7 +333,11 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
         self.graph = _dependency_graph(plan, states, step_names, self.robots, robot_ik)
       else:
         self.sequence = self._make_sequence_from_names(seq)   # flat order (incl. terminal)
-      self.collision_tolerance = 0.01
+      # total allowed PENETRATION at validated configs (mr_bench semantics). 0.01 is the
+      # historical default; pass ~0 (with --strict-collisions witnesses) for a plan whose
+      # validated configs contain no tolerated penetration at all. Must be set BEFORE
+      # BaseModeLogic.__init__ (start-mode validation uses it).
+      self.collision_tolerance = collision_tolerance
       BaseModeLogic.__init__(self)
       self.prev_mode = self.start_mode
 
@@ -428,5 +432,119 @@ def save_problem(path_json, build_params, robots, tasks, sequence_names):
 
 
 def save_path(path_json, path):
+  """Persist a solved BiRRT PATH (main --motion-plan --mp-save). Each mr_bench State ->
+  {"q": joint vector, "mode": task_ids}. The discrete PLAN (main --save) must be saved from
+  the SAME run: load_path replays against a problem REBUILT from that plan (make_problem is
+  deterministic, so task ids / modes align)."""
   with open(path_json, "w") as f:
     json.dump([s.to_dict() for s in path] if path else [], f, indent=2)
+
+
+class _Mode:
+  """Lightweight stand-in for an mr_bench Mode: only .task_ids + equality are used downstream
+  (execute_motion_plan compares modes and reads task_ids). Avoids reconstructing real Mode
+  objects (which need the live problem's mode graph)."""
+  __slots__ = ("task_ids",)
+
+  def __init__(self, task_ids):
+    self.task_ids = list(task_ids)
+
+  def __eq__(self, o):
+    return isinstance(o, _Mode) and self.task_ids == o.task_ids
+
+  def __ne__(self, o):
+    return not self.__eq__(o)
+
+  def __hash__(self):
+    return hash(tuple(self.task_ids))
+
+
+class _PathState:
+  """Stand-in for an mr_bench path State: .q (plain joint array; sim's full_q handles the
+  no-.state() case) and .mode (a _Mode)."""
+  __slots__ = ("q", "mode")
+
+  def __init__(self, q, mode):
+    self.q = np.asarray(q, dtype=float)
+    self.mode = mode
+
+
+def load_path(path_json):
+  """Load a path saved by save_path into lightweight (_PathState) objects that sim's
+  execute_motion_plan consumes directly -- no mr_bench State/Mode reconstruction needed."""
+  with open(path_json) as f:
+    data = json.load(f)
+  return [_PathState(d["q"], _Mode(d["mode"])) for d in data]
+
+
+def report_problem_clearance(problem, plan=None, margin=0.02, verbose=True):
+  """Per-mode collision/clearance report at the exported TASK-GOAL keyframes -- the exact
+  configs (our witnesses) and the exact collision check (mr_bench's is_collision_free ->
+  getCollisionsTotalPenetration) that BiRRT validates. For each mode: which plan action it
+  belongs to, total penetration, and the closest/penetrating FRAME PAIRS within `margin` m.
+  This makes 'looks fine in viser but the planner rejects it' concrete: the offending pair
+  (arm-vs-part, part-vs-part rounding, arm-vs-arm) is named with its signed distance. Idle
+  (non-switching) robots sit at HOME here, exactly as mr_bench's mode validation poses them.
+  Returns [(mode_index, task_name, action, penetration, [(f1,f2,dist), ...]), ...]."""
+  env = problem
+  q_home = env.get_start_pos()
+  conf_type = type(q_home)
+  name_to_act = {}
+  step_names = getattr(env, "step_names", None)
+  if step_names is not None and plan is not None:
+    for i, nms in enumerate(step_names):
+      for nm in nms:
+        name_to_act[nm] = tuple(plan[i])
+
+  def goal_config(m, task):
+    goal = task.goal.sample(m)
+    q = []
+    for j, r in enumerate(env.robots):
+      if r in task.robots:
+        off = 0
+        for tr in task.robots:
+          if tr == r:
+            q.append(goal[off:off + env.robot_dims[tr]])
+            break
+          off += env.robot_dims[tr]
+      else:
+        q.append(q_home.robot_state(j))
+    return conf_type.from_list(q)
+
+  rows, m, k = [], env.start_mode, 0
+  while True:
+    combos = env.get_valid_next_task_combinations(m)
+    task = env.get_active_task(m, combos[0] if combos else None)
+    q = goal_config(m, task)
+    env.is_collision_free(q, m)                            # poses (mode + joints) as BiRRT does
+
+    def _held_by(fname):                                   # attach parent of a PART frame (else "")
+      if fname not in env.C.getFrameNames():
+        return ""
+      p = env.C.getFrame(fname).getParent()
+      return p.name if p is not None else ""
+
+    pen = float(env.C.getCollisionsTotalPenetration())
+    pairs = sorted(([c[0], c[1], float(c[2])] for c in env.C.getCollisions(margin)),
+                   key=lambda x: x[2])
+    rows.append((k, task.name, name_to_act.get(task.name), pen, pairs))
+    if verbose and (pen > 1e-6 or (pairs and pairs[0][2] < margin * 0.5)):
+      tag = f"  {name_to_act.get(task.name)}" if name_to_act.get(task.name) else ""
+      flag = "   <<< COLLIDES" if pen > 1e-6 else "   (near)"
+      print(f"  [{k:2d}] {task.name:34s}{tag}  pen={pen*1000:6.2f}mm{flag}")
+      for f1, f2, d in pairs[:6]:
+        h1 = f"  [{f1} on {_held_by(f1)}]" if f1.startswith("obj") else ""
+        h2 = f"  [{f2} on {_held_by(f2)}]" if f2.startswith("obj") else ""
+        print(f"        {f1:26s} ~ {f2:26s} {d*1000:+8.2f}mm{h1}{h2}")
+    if env.is_terminal_mode(m):
+      break
+    m = env.get_next_modes(q, m)[0]
+    k += 1
+
+  if verbose:
+    ncol = sum(1 for r in rows if r[3] > 1e-6)
+    print(f"[clearance] {ncol}/{len(rows)} task-goals collide (margin {margin*1000:.0f}mm, "
+          f"mr_bench check, idle arms at HOME). '[obj_X on a?_ur_vacuum]' = obj_X is ATTACHED "
+          f"to that gripper at this keyframe -- a part that should REST but is welded to an arm "
+          f"is a re-rooting bug, not a geometry clash.")
+  return rows

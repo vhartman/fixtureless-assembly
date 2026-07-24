@@ -95,6 +95,14 @@ def build_parser():
            "--perturb-start-pose are ignored with it.",
   )
   g_scene.add_argument(
+      "--plain-box", action="store_true",
+      help="Cube parts use rai's SHARP box (ST.box) instead of the default sphere-swept ssBox. "
+           "ssBox inflates every face by the corner radius r, so two flush-mated cubes overlap "
+           "by 2r and a gripper grazing a face meets the inflated surface -- a geometry A/B "
+           "test for spurious motion-planning collisions. Applied to solve, export, and replay "
+           "(saved in the plan config).",
+  )
+  g_scene.add_argument(
       "--grid-gap", type=float, default=0.1, metavar="FRAC",
       help="With --grid-init: inter-cube gap as a FRACTION of cube size (grid pitch = "
            "cube_size*(1+FRAC), default 0.1). Small (~0.1) = shoulder-to-shoulder (a side-"
@@ -756,6 +764,43 @@ def build_parser():
            "arms instead of passing through them -- important before motion planning, where "
            "mr_bench validates every arm. Note idle arms are at HOME in the witness scene.",
   )
+  g_ik.add_argument(
+      "--strict-collisions", type=float, nargs="?", const=1e-4, default=None, metavar="EPS",
+      help="With --real-ik: REJECT any KOMO witness whose skill scene has total penetration "
+           "> EPS metres (default 1e-4 when given bare) -- the collision objective is a SOFT "
+           "inequality, so the plain solve accepts mm-scale 'rescued grazes' (measured: wrist "
+           "capsule 4.9mm into the table at a pick witness) that a physics sim or a "
+           "0-tolerance motion-plan export then pays for. Dirty solutions count as infeasible "
+           "and the restart loop keeps searching for a clean basin; the collision weight is "
+           "also raised 1e1 -> 1e2 so the solver steers clean instead of leaning on the "
+           "slack. The gate only sees what the skill scene contains: combine with "
+           "--witness-robot-collisions to make stripped idle arms visible. Slower solves; "
+           "prints the number of vetoed witnesses at the end.",
+  )
+  g_mp.add_argument(
+      "--mp-clearance", action="store_true",
+      help="With --motion-plan: BEFORE running BiRRT, print a per-task-goal collision report "
+           "(mr_bench's own is_collision_free at each keyframe -- exactly what BiRRT checks): "
+           "which action, total penetration, and the offending frame pairs with signed "
+           "distance. Names the culprit (arm-arm graze / part-vs-table / part attached to a "
+           "gripper it should have released) so 'looks fine in viser but the planner rejects' "
+           "becomes concrete.",
+  )
+  g_mp.add_argument(
+      "--mp-save", metavar="FILE", default=None,
+      help="With --motion-plan: save the solved BiRRT PATH to FILE (JSON: per-state joint "
+           "vectors + mode task ids). Load it later WITHOUT re-planning via "
+           "`python3 sim.py run <plan.json> --v2 --mp-path FILE` -- pair it with --save "
+           "<plan.json> from the SAME run (the problem is rebuilt from that discrete plan).",
+  )
+  g_mp.add_argument(
+      "--mp-collision-tolerance", type=float, default=0.01, metavar="M",
+      help="With --motion-plan: the exported problem's collision tolerance in metres of "
+           "TOTAL allowed penetration at validated configs (mr_bench semantics; default "
+           "0.01 = historical). Lower it toward 0 (e.g. 1e-6) together with "
+           "--strict-collisions + --witness-robot-collisions so the plan the sim executes "
+           "contains no tolerated penetration at all.",
+  )
   g_mp.add_argument(
       "--motion-plan", action="store_true",
       help="After --solve, EXPORT the plan (+ witnesses) to the mr_bench motion planner "
@@ -891,7 +936,7 @@ _SAVE_CONFIG_FIELDS = (
     "pre_insertion", "pre_pick", "pre_place", "pre_add_grasp", "staged_mates",
     "allow_curved_grasps", "grippers", "grasp_compliance",
     "vacuum_scale", "tf_close_torque", "dominance", "useful_grasps", "brace_resting",
-    "mixed_wrench_h",
+    "mixed_wrench_h", "strict_collisions", "witness_robot_collisions", "plain_box",
 )
 
 
@@ -1028,6 +1073,11 @@ def run(cfg):
   any_two_finger = (gripper_list is not None and not all(gripper_list)) or not cfg.vacuum
   set_rolls_per_face(2 if any_two_finger else 1)
   set_dense_grasps(cfg.dense_grasps and any_two_finger)
+  if cfg.plain_box:
+    from problem import set_plain_box
+    set_plain_box(True)
+    print("[flag] --plain-box ACTIVE: cube parts use sharp ST.box (no ssBox corner-radius "
+          "inflation), for solve + export + replay.")
   set_brace_for_assembly_only(cfg.brace_for_assembly_only)
   set_extra_place_cells(cfg.place_cells)
   set_prefer_center(cfg.prefer_center)
@@ -1271,6 +1321,14 @@ def run(cfg):
       robot_ik.strip_inactive_collision = False
       print("[flag] --witness-robot-collisions ACTIVE: other robots' collision kept ON in IK "
             "(search + witness opt); idle arms are at HOME in the IK scene.")
+    if robot_ik is not None and cfg.strict_collisions is not None:
+      robot_ik.penetration_reject = float(cfg.strict_collisions)
+      robot_ik.col_weight = 1e2                          # steer clean, don't lean on the slack
+      print(f"[flag] --strict-collisions ACTIVE: KOMO witnesses rejected above "
+            f"{cfg.strict_collisions:g}m total penetration (collision weight 1e1 -> 1e2)."
+            + ("" if cfg.witness_robot_collisions else
+               " NOTE: idle arms are STRIPPED from skill scenes (add "
+               "--witness-robot-collisions to gate arm-arm penetration too)."))
     if cfg.skill > 0.0:
       # shorthand: fill in every pre-skill split not set explicitly, then let the per-skill
       # blocks below apply/announce them (an explicit --pre-* keeps its own value).
@@ -1312,6 +1370,9 @@ def run(cfg):
       print(f"[ik-failures] window/cap reached -- search stopped for debugging "
             f"({len(fail_rec.steps)} failures collected).")
       plan = None
+    if robot_ik is not None and cfg.strict_collisions is not None:
+      print(f"[strict-collisions] vetoed {robot_ik.strict_rejects} dirty KOMO witnesses "
+            f"(> {cfg.strict_collisions:g}m total penetration).")
     if fail_rec is not None and fail_rec.steps:
       print(f"[ik-failures] {len(fail_rec.steps)} failed binds recorded -- serving in "
             f"viser (Stop in the GUI to continue to the plan replay).")
@@ -1361,10 +1422,16 @@ def run(cfg):
                 gripper_kind=gk, handovers=cfg.handovers, allow_place=cfg.allow_place,
                 bracing=cfg.bracing, verbose=False,
                 robot_collisions=cfg.witness_robot_collisions)
+          if cfg.mp_collision_tolerance != 0.01:
+            print(f"[flag] --mp-collision-tolerance={cfg.mp_collision_tolerance:g}: exported "
+                  f"problem validates configs at this total-penetration budget.")
           prob = MP.make_problem(C, assembly, plan, mp_wit, robots, robot_ik, gk,
+                                 collision_tolerance=cfg.mp_collision_tolerance,
                                  bracing=cfg.bracing, depgraph=not cfg.mp_sequence)
           print(f"[motion-plan] {'SEQUENCE' if cfg.mp_sequence else 'DEPGRAPH'} problem, "
                 f"{len(prob.tasks)} tasks")
+          if cfg.mp_clearance:
+            MP.report_problem_clearance(prob, plan=plan)
           if cfg.mp_modes:
             import os as _os, sys as _sys
             MP._ensure_mrbench()
@@ -1380,6 +1447,10 @@ def run(cfg):
           if mp_path:
             print(f"[motion-plan] path {len(mp_path)} states, "
                   f"reaches terminal={prob.is_terminal_mode(mp_path[-1].mode)}")
+            if cfg.mp_save is not None:
+              MP.save_path(cfg.mp_save, mp_path)
+              print(f"[motion-plan] saved path -> {cfg.mp_save} (load in sim with "
+                    f"`sim.py run <plan.json> --v2 --mp-path {cfg.mp_save}`)")
             if cfg.mp_viser:
               from multi_robot_multi_goal_planning.problems.util import interpolate_path
               disp = interpolate_path(mp_path, 0.05, kind="euclidean")
