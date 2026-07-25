@@ -1135,3 +1135,117 @@ def _corridor_spread(prog, bar_s, act, fires, cor, dt, D, ramp_steps=100):
     if m:                                                    # keep monotone after clamping
       prog[m] = np.maximum(prog[m], prog[m - 1])
   return prog
+
+
+# =============================================================================================
+# C1 PATH SMOOTHING (the --spline variant of corridor retiming)
+#
+# The saved path is piecewise linear: C0. Every waypoint is a velocity DISCONTINUITY, which is
+# why a curvature-based wrench limit collapses there (a kink differentiates to near-infinite
+# p'') and why crossing arms had to be throttled at barriers. Fitting a C1 curve removes the
+# kinks outright, so smoothness stops being something the time-parameterization has to fake.
+#
+# CATMULL-ROM rather than a fitted B-spline, deliberately: it is C1 AND INTERPOLATES every
+# waypoint exactly. That matters here because the barrier waypoints ARE the task witnesses --
+# a mate must happen at the config the IK certified, so a spline that merely approximates the
+# waypoints would move the seat. Catmull-Rom changes the geometry only BETWEEN waypoints.
+#
+# The deviation still has to be certified: `spline_path` returns the densified path and the
+# caller checks it with the same oracle, shrinking `tension` (0 = straight back to the
+# original polyline) wherever a span fails -- so worst case degrades to the certified input.
+# =============================================================================================
+def catmull_rom(P, per_seg=8, tension=0.5, pin=None):
+  """Densify waypoints `P` into a C1 curve through ALL of them (Catmull-Rom).
+
+  `per_seg`: samples generated per original segment. `tension` 0.5 = uniform Catmull-Rom,
+  0 = the original polyline (no deviation). `pin`: optional set of waypoint indices whose
+  ADJACENT spans stay straight -- use it to keep an exact linear approach into/out of a
+  witness (an insertion must arrive along the mate axis, not on a curve).
+
+  Returns (Q, index_map) where Q is the densified path and index_map[i] is the index in Q of
+  original waypoint i, so barrier bookkeeping can be carried over unchanged."""
+  P = [np.asarray(p, float) for p in P]
+  n = len(P)
+  if n < 2:
+    return np.asarray(P, float), [0] if n else []
+  pin = set(pin or ())
+  Q, imap = [P[0]], [0]
+  for i in range(n - 1):
+    p0 = P[i - 1] if i > 0 else P[i]
+    p1, p2 = P[i], P[i + 1]
+    p3 = P[i + 2] if i + 2 < n else P[i + 1]
+    straight = (i in pin) or (i + 1 in pin) or tension <= 0.0
+    m1 = np.zeros_like(p1) if straight else tension * (p2 - p0)
+    m2 = np.zeros_like(p1) if straight else tension * (p3 - p1)
+    for k in range(1, per_seg + 1):
+      t = k / per_seg
+      if straight:
+        Q.append((1 - t) * p1 + t * p2)
+      else:                                                  # cubic Hermite = C1 at knots
+        t2, t3 = t * t, t * t * t
+        Q.append((2 * t3 - 3 * t2 + 1) * p1 + (t3 - 2 * t2 + t) * m1
+                 + (-2 * t3 + 3 * t2) * p2 + (t3 - t2) * m2)
+    imap.append(len(Q) - 1)
+  return np.asarray(Q, float), imap
+
+
+def path_deviation(Q, imap, P):
+  """Max distance (per joint-space norm) from the smoothed curve to the original polyline
+  segment it replaces -- the number that has to be justified to a collision checker."""
+  P = [np.asarray(p, float) for p in P]
+  worst = 0.0
+  for i in range(len(imap) - 1):
+    a, b = P[i], P[i + 1]
+    d = b - a
+    dd = float(d @ d)
+    for j in range(imap[i], imap[i + 1] + 1):
+      t = 0.0 if dd < 1e-12 else float(np.clip((Q[j] - a) @ d / dd, 0.0, 1.0))
+      worst = max(worst, float(np.linalg.norm(Q[j] - (a + t * d))))
+  return worst
+
+
+def spline_path(P, bar_idx, per_seg=8, tension=0.5, free_of=None, pin_barriers=True,
+                shrink=(0.5, 0.25, 0.0)):
+  """C1-smooth a path and CERTIFY the deviation, per span, shrinking where it fails.
+
+  `bar_idx`: waypoint indices that are barriers (task witnesses). With `pin_barriers` their
+  adjacent spans stay straight, so every event still happens exactly on its witness and the
+  approach/retreat direction is preserved.
+  `free_of(Q, j0, j1, i)`: called per smoothed span with the densified path, its index
+  range, and the ORIGINAL span index `i` (so the caller can pick the right mode / world
+  state); return True if that span is collision-free. None = accept unchecked (unsafe).
+
+  Each span is tried at `tension`, then at each value in `shrink` until it certifies; 0.0 is
+  the original straight segment, so the result is never worse than the input path. Returns
+  (Q, index_map, report)."""
+  P = [np.asarray(p, float) for p in P]
+  pin = set(bar_idx) if pin_barriers else set()
+  Q, imap = catmull_rom(P, per_seg=per_seg, tension=tension, pin=pin)
+  if free_of is None:
+    return Q, imap, {"checked": 0, "shrunk": 0, "straightened": 0,
+                     "deviation": path_deviation(Q, imap, P)}
+  checked = shrunk = straight = 0
+  for i in range(len(imap) - 1):
+    if i in pin or (i + 1) in pin:
+      continue                                               # pinned: already straight
+    checked += 1
+    if free_of(Q, imap[i], imap[i + 1], i):
+      continue
+    for t_try in shrink:                                     # pull back toward the polyline
+      Qi, _ = catmull_rom(P[max(i - 1, 0):i + 3], per_seg=per_seg,
+                          tension=t_try, pin={0, 1, 2, 3} if t_try <= 0 else ())
+      # rebuild just this span at the reduced tension
+      sub, _ = catmull_rom([P[i - 1] if i > 0 else P[i], P[i], P[i + 1],
+                            P[i + 2] if i + 2 < len(P) else P[i + 1]],
+                           per_seg=per_seg, tension=t_try)
+      lo, hi = imap[i], imap[i + 1]
+      span = sub[per_seg:2 * per_seg + 1] if i > 0 else sub[:per_seg + 1]
+      if len(span) == hi - lo + 1:
+        Q[lo:hi + 1] = span
+      if free_of(Q, lo, hi, i):
+        shrunk += 1
+        if t_try <= 0:
+          straight += 1
+        break
+  return Q, imap, {"checked": checked, "shrunk": shrunk, "straightened": straight,
+                   "deviation": path_deviation(Q, imap, P)}

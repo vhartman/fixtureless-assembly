@@ -929,7 +929,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         record=None, verbose=True, gui=False, visual=True, prioritized=False,
                         rate_boost=False, smooth=False,
                         corridor=False, corridor_ds=1.0, corridor_ds_lead=0.25,
-                        corridor_lead_max=4.0, force_limits=False, wrench_margin=1.0):
+                        corridor_lead_max=4.0, force_limits=False, wrench_margin=1.0, mass_scale=1.0,
+                        spline=False, spline_per_seg=8, spline_tension=0.5):
   """Execute an mr_bench PATH (from mp_export.run_birrt) in MuJoCo with the REAL ARMS:
   every rai robot shape frame (the capsule collision model + gripper primitives) is mirrored
   as a kinematic body positioned by rai FK along the path -- the planner's own kinematics by
@@ -1247,6 +1248,30 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       # "world" vs the table/resting parts. Collisions being pairwise is what makes this a
       # handful of 2-D scans instead of a search in n dimensions.
       _P, _bi = retiming._composite(stretches)
+      if spline:
+        # C1 SMOOTHING (--spline). The saved path is C0: every waypoint is a velocity
+        # discontinuity, which is what forces the crawl-through-corners behaviour and what
+        # makes a curvature-based wrench limit blow up. Catmull-Rom is C1 AND interpolates
+        # every waypoint, so the task WITNESSES stay exact -- only the geometry BETWEEN
+        # waypoints moves, and each smoothed span is certified with the planner's own check.
+        # Barrier-adjacent spans stay straight so approach/retreat directions are preserved.
+        _wp_stretch, _kk = [], 0
+        for _i in range(len(_P)):
+          while _kk + 1 < len(_bi) and _i > _bi[_kk]:
+            _kk += 1
+          _wp_stretch.append(min(_kk, len(stretch_mode) - 1))
+
+        def _sp_free(Q, j0, j1, i):
+          m = stretch_mode[_wp_stretch[min(i, len(_wp_stretch) - 1)]]
+          return all(bool(problem.is_collision_free(_conf(Q[j]), m))
+                     for j in range(j0, j1 + 1))
+        _Q, _imap, _rep = retiming.spline_path(_P, bar_idx=_bi, per_seg=spline_per_seg,
+                                               tension=spline_tension, free_of=_sp_free)
+        _P, _bi = _Q, [_imap[b] for b in _bi]
+        print(f"[sim/mp] --spline ACTIVE: C1 Catmull-Rom, {len(_P)} waypoints "
+              f"(was {len(_imap)}); {_rep['checked']} spans certified, {_rep['shrunk']} "
+              f"pulled back ({_rep['straightened']} fully straightened), max deviation "
+              f"{_rep['deviation']:.3f} rad. Witnesses exact; barrier approaches straight.")
       _sg, _D = retiming.arc_length(list(_P))
       _cs = np.concatenate([[0.0], np.cumsum(_sg)])
       _bar = [_cs[b] for b in _bi]
@@ -1377,28 +1402,21 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           problem.is_collision_free(_conf(_pose([_s] * len(robots))), stretch_mode[_k])
           _st = states[min(_stretch_plan[_k], len(states) - 1)]   # by ACTION, not by barrier
           for _r, _rn in enumerate(robots):
-            held = [q for grp in _st.subassemblies() for q in grp
-                    if any(c[0] == "grasp" and c[1] == _rn
-                           for c in _st.supports.get(q, ()))]
-            if not held:
-              continue
-            mm = np.array([assembly.masses.get(q, 0.1) for q in held], float)
-            pos = np.array([problem.C.getFrame(q).getPosition() for q in held], float)
-            com = (mm[:, None] * pos).sum(0) / mm.sum()
-            _p[_r, _g] = com
-            _m[_r, _g] = mm.sum()
-            try:
-              gp = np.asarray(problem.C.getFrame(ee_anchor[_rn]).getPosition(), float)
-              lev = float(np.linalg.norm(com - gp))
-            except Exception:
-              lev = 0.05
+            grasped = [q for q in assembly.objects
+                       if any(c[0] == "grasp" and c[1] == _rn
+                              for c in _st.supports.get(q, ()))]
+            if not grasped:
+              continue                                      # empty gripper: unconstrained
+            root = grasped[0]                                # the part the weld actually holds
+            grp = next((g for g in _st.subassemblies() if root in g), {root})
+            # one definition of the lever, owned by the assembly (Assembly.group_lever)
+            lev, gm, com = assembly.group_lever(
+                grp, root, lambda q: problem.C.getFrame(q).getPosition())
             if lev > LEVER_SANITY:
-              # A grasp lever is centimetres. Anything larger means this arm is not really
-              # holding that group here (stale support info) -- ignore rather than emit an
-              # absurd limit that would crawl the whole run.
               _bad_lever += 1
-              _m[_r, _g] = 0.0
               continue
+            _p[_r, _g] = com
+            _m[_r, _g] = gm
             _lev[_r, _g] = max(lev, 5e-3)
         # FINE geometric sampling: p'' on the 1-rad corridor grid smooths away all real
         # curvature and yields limits of 3-15 rad/s that never bind (measured). Curvature
@@ -1411,6 +1429,19 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           C_fk.setJointState(retiming.config_at(list(_P), _cs, _sg, min(_s, _D)))
           for _r, _rn in enumerate(robots):
             _pf[_r, _gi] = C_fk.getFrame(ee_anchor[_rn]).getPosition()
+        # The saved path is only C0: at a waypoint kink p' JUMPS, so a finite-differenced p''
+        # spikes to near-infinity and the curvature speed limit collapses to ~0.01 rad/s at
+        # isolated points (measured: worse motion than a blunt global slowdown). A kink is a
+        # velocity discontinuity, NOT curvature. Smoothing the geometry over the ramp length
+        # before differentiating models what a jerk-limited controller actually tracks -- and
+        # the --spline path removes the kinks outright.
+        _w = max(3, int(round(2.0 * RAMP_DIST / _dsf)))
+        _ker = np.ones(_w) / _w
+        for _r in range(len(robots)):
+          for _c in range(3):
+            _pf[_r, :, _c] = np.convolve(np.pad(_pf[_r, :, _c], (_w // 2, _w // 2),
+                                                mode="edge"), _ker, mode="same")[
+                _w // 2: _w // 2 + _pf.shape[1]]
         _vmax = np.full((len(robots), _G), 1e6)
         _amax = np.full((len(robots), _G), 1e6)
         _bind = {}
@@ -1750,6 +1781,14 @@ def _cli_run(a):
   cfg, plan = read_plan(a.path)
   C, asm = R.build_scene(cfg)                               # exact reconstruction (shared)
   robots = A.get_robots(C)
+  if getattr(a, "mass_scale", 1.0) != 1.0:
+    # scale the ASSEMBLY masses, so MuJoCo's bodies and the wrench estimate stay consistent
+    # (build_mjcf reads assembly.masses too). A one-sided estimate-only scale would be a lie.
+    for _p in list(asm.masses):
+      asm.masses[_p] = asm.masses[_p] * a.mass_scale
+    asm.DEFAULT_MASS = getattr(asm, "DEFAULT_MASS", 0.1) * a.mass_scale
+    print(f"[sim] --mass-scale {a.mass_scale:g}: part masses scaled (sim bodies AND the "
+          f"wrench estimate)")
   # debug knob: shrink arm collision geometry BEFORE witnesses/problem/sim so IK, the
   # collision oracle and the MuJoCo capsules stay mutually consistent. 1.0 = no-op.
   scale_arm_collision_shapes(C, robots, getattr(a, "coll_scale", 1.0))
@@ -1813,7 +1852,10 @@ def _cli_run(a):
                               corridor=a.corridor, corridor_ds=a.corridor_ds,
                               corridor_ds_lead=a.corridor_ds_lead,
                               corridor_lead_max=a.corridor_lead_max,
-                              force_limits=a.force_limits, wrench_margin=a.wrench_margin)
+                              force_limits=a.force_limits, wrench_margin=a.wrench_margin,
+                              mass_scale=a.mass_scale,
+                              spline=a.spline, spline_per_seg=a.spline_per_seg,
+                              spline_tension=a.spline_tension)
   else:
     rep = SimExecutor(asm, gripper_kinds=gripper_kinds, gui=a.gui).execute(
         plan, states, record=a.record)
@@ -1860,6 +1902,19 @@ def _build_cli():
                       "events (never at a barrier it merely crosses) and runs at its own joint "
                       "limit. A pair whose corridor is 0 must move together, which is how "
                       "handovers/co-grasps express themselves. Prints the corridor widths.")
+  r.add_argument("--spline", action="store_true",
+                 help="With --corridor: replace the C0 path by a C1 Catmull-Rom curve through "
+                      "the SAME waypoints, so there are no velocity discontinuities to crawl "
+                      "through and curvature is finite everywhere (which is what --force-limits "
+                      "needs). Task witnesses stay exact because Catmull-Rom interpolates every "
+                      "waypoint; only the geometry BETWEEN waypoints moves, and each smoothed "
+                      "span is certified with mr_bench's own check, pulled back toward the "
+                      "straight segment wherever it would collide (so never worse than input).")
+  r.add_argument("--spline-per-seg", type=int, default=8, metavar="N",
+                 help="--spline: samples generated per original segment (default 8).")
+  r.add_argument("--spline-tension", type=float, default=0.5, metavar="T",
+                 help="--spline: Catmull-Rom tension; 0.5 = uniform, 0 = the original "
+                      "polyline (default 0.5). Lower it for less deviation.")
   r.add_argument("--force-limits", action="store_true",
                  help="With --corridor: bound each arm's speed AND acceleration so the "
                       "INERTIAL wrench on its grasp stays inside the wrench.PARAMS caps. The "
@@ -1867,6 +1922,13 @@ def _build_cli():
                       "overload a grasp it certified; this slows ONLY the loaded arm, only "
                       "where it is loaded, instead of the blunt global --joint-rate. "
                       "Point-mass model (m*a, m*a*lever); arrivals shift later as needed.")
+  r.add_argument("--mass-scale", type=float, default=1.0, metavar="F",
+                 help="Scale every part mass (default 1.0), in BOTH the MuJoCo bodies and the "
+                      "wrench estimate, so they stay consistent. A test knob: the grasp caps in "
+                      "wrench.PARAMS are hand-set placeholders and the planner only checks a "
+                      "held group UPRIGHT, so a rotated carry can exceed the torque cap on "
+                      "gravity alone -- scale down to take that out of the picture while "
+                      "validating everything else.")
   r.add_argument("--wrench-margin", type=float, default=1.0, metavar="F",
                  help="Fraction of each grasp cap --force-limits may use (default 1.0 = the "
                       "full cap). Lower it (e.g. 0.7) for headroom against the unmodelled "

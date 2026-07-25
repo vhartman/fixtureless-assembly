@@ -115,6 +115,40 @@ class Assembly:
   def mass(self, part):
     return self.masses.get(part, self.DEFAULT_MASS)
 
+  def grasp_lever(self, part):
+    """Moment arm (m) of a grasp on `part`, in the WRENCH MODEL'S OWN convention.
+
+    The LP builds gravity as `gravity_wrench([(mass, zeros(3))])` and reduces moments ABOUT
+    THE PART'S CENTROID, so gravity contributes no torque there and the only lever in the
+    model is the centroid-to-CONTACT offset -- a surface half-extent. It is therefore always
+    SHORT. Centralised here (rather than re-derived per caller) because it is a property of
+    the assembly's geometry: sim.py's execution-side wrench limits and any future
+    inertial/LP term must agree on it. NB a gripper-frame-to-COM distance is NOT this
+    quantity -- using that gave 326mm levers whose weight moment alone blew the torque cap."""
+    spec = self.part_shapes.get(part)
+    if not spec:
+      return 0.05
+    kind, p = spec[0], np.asarray(spec[1], dtype=float)
+    if kind in ("box", "ssBox"):
+      return 0.5 * float(np.max(p[:3]))
+    if kind == "cylinder":
+      return 0.5 * float(max(p[0], 2.0 * p[1]))
+    if kind == "sphere":
+      return float(p[0])
+    return 0.05
+
+  def group_lever(self, parts, root, position_of):
+    """Moment arm for a whole held GROUP welded to the gripper through `root`:
+    how far the group's centroid sits off `root`, plus `root`'s own half-extent.
+    `position_of(part) -> xyz` supplies world positions (rai frame, sim body, ...) so this
+    stays free of any particular backend."""
+    parts = list(parts) or [root]
+    m = np.array([self.mass(q) for q in parts], dtype=float)
+    pos = np.array([np.asarray(position_of(q), dtype=float) for q in parts])
+    com = (m[:, None] * pos).sum(0) / max(float(m.sum()), 1e-9)
+    off = float(np.linalg.norm(com - np.asarray(position_of(root), dtype=float)))
+    return off + self.grasp_lever(root), float(m.sum()), com
+
   def can_hold(self, part):
     # may a grasp on `part` HOLD/BRACE a subassembly? False for no_hold parts (see __init__).
     return part not in self.no_hold
