@@ -1472,8 +1472,11 @@ def run(cfg):
             from solver import fuse_pre_skill_witnesses
             print("[flag] --fuse-pre-skill ACTIVE: each pre-* GOTO keyframe is re-solved with "
                   "every arm that does NOT move with the skill PINNED (hard eq) to the skill "
-                  "witness. A rejected split keeps today's keyframe; the task structure never "
-                  "changes.")
+                  "witness, then gated on actor dq <= 0.35 rad, idle-arm dq <= 0.02 rad, "
+                  "stationary body <= 2.0mm, funnel residual <= 1mm/1deg and penetration -- "
+                  "each of those 'or no worse than today's', plus a STRICT improvement in the "
+                  "approach-axis deviation. A rejected split keeps today's keyframe; the task "
+                  "structure never changes.")
             mp_pre, _prep = fuse_pre_skill_witnesses(
                 C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
                 handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing)

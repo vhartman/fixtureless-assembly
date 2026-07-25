@@ -345,6 +345,13 @@ def scale_arm_collision_shapes(C, robots, factor, verbose=True):
 
 
 GRAVITY = 9.81
+ARTICULATED_LINK_MASS = 50.0     # kg: --articulated links are driven kinematically, so this is
+ARTICULATED_LINK_INERTIA = 5.0   # not a real inertia -- it only has to dominate a held part
+                                 # (~0.5kg) so the weld reaction cannot move the arm.
+ARTICULATED_ARMATURE = 0.0       # MEASURED DEAD END: 1e6 was meant to make the chain
+                                 # unaccelerable, but it ill-conditions the mass matrix and made
+                                 # the first missed seat 66mm -> 20001mm. The arm is pinned by
+                                 # re-asserting qpos after each step instead (SimScene.step).
 LEVER_SANITY = 0.35   # m: a grasp lever beyond this means the support info is stale, not a long arm
 
 
@@ -530,7 +537,7 @@ def _arm_geom_xml(geom):
 
 
 def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
-               ee_anchor=None):
+               ee_anchor=None, articulated_C=None):
   """The whole validation world as one MJCF string:
   - table (static), parts (free bodies at state.poses, shape quat baked into the geom),
   - robots: EITHER one mocap-driven gripper puck per robot (v1 keyframe mode) OR, when
@@ -599,6 +606,24 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
           f'<geom {geom} mass="1.0" {con} group="{group}" rgba="{rgba}"/></body>')
     anchor = {r: f"arm_{ee_anchor[r]}" for r in robots}
     arm_mesh_assets = "".join(mesh_assets)
+  if articulated_C is not None:
+    # ARTICULATED (--articulated): one real kinematic chain per arm, generated from rai's own
+    # tree (arm_model), replacing the N disconnected mocap bodies above. Bodies keep the rai
+    # FRAME NAMES, so the grasp weld anchors to ee_anchor[r] directly with no prefix. Driven
+    # by SETTING qpos (SimScene.set_arm_q) -- still perfectly stiff, so the grasp weld stays
+    # the clean measuring device every wrench result so far was calibrated on.
+    import arm_model
+    body_xml, articulated_joints = arm_model.build_arms_mjcf(
+        articulated_C, robots, collide_fn=arm_model.collides_like_sim,
+        group=GROUP_COLL, contype="2", conaffinity="1",
+        # links must SWAMP the payload: the chain is integrated by mj_step even though we
+        # drive it kinematically, so a light link welded to a part lets the solver throw it.
+        link_mass=ARTICULATED_LINK_MASS, link_inertia=ARTICULATED_LINK_INERTIA,
+        armature=ARTICULATED_ARMATURE, limits=False)
+    parts_xml = [x for x in parts_xml if 'name="arm_' not in x]      # drop the mocap mirrors
+    parts_xml.append(body_xml)
+    anchor = {r: ee_anchor[r] for r in robots}
+    arm_mesh_assets = ""
   for r in robots:
     # grasp welds: anchor body <-> each part (inactive; relpose set at grasp time).
     for p in assembly.objects:
@@ -644,21 +669,24 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
 # ---------------------------------------------------------------------------------------------
 class SimScene:
   def __init__(self, assembly, state, robots, gripper_kinds=None, gui=False,
-               arms=None, arm_poses=None, ee_anchor=None):
+               arms=None, arm_poses=None, ee_anchor=None, articulated_C=None):
     if not HAVE_MUJOCO:
       raise RuntimeError("mujoco not installed (pip install mujoco)")
     self.assembly = assembly
     self.xml = build_mjcf(assembly, state, robots, arms=arms, arm_poses=arm_poses,
-                          ee_anchor=ee_anchor)
+                          ee_anchor=ee_anchor, articulated_C=articulated_C)
     self.model = mujoco.MjModel.from_xml_string(self.xml)
     self.data = mujoco.MjData(self.model)
     self.robots = list(robots)
     self.arms = arms                                       # v2: [(frame, kind, size)]
+    self.articulated = articulated_C is not None
     self.grasp_anchor = ({r: f"ee_{r}" for r in robots} if arms is None
-                         else {r: f"arm_{ee_anchor[r]}" for r in robots})
+                         else {r: (ee_anchor[r] if self.articulated else f"arm_{ee_anchor[r]}")
+                               for r in robots})
     self.recorder = None                                   # set by the executor (see record=)
     self._rec_count = 0
     self._over = {}                                        # robot -> consecutive overload steps
+    self._grasp_trace = int(os.environ.get("SIM_GRASP_TRACE", "0"))   # weld-slip diagnostic
     self.wrench_trace = None                               # SIM_WRENCH_TRACE hook, see
     self.trace_ctx = None                                  # _make_wrench_tracer (driver's
     self.step_i = 0                                        # sample index + the sim clock)
@@ -668,8 +696,26 @@ class SimScene:
       for body, fkf, _geom, collide, exempt, _grp, _rgba in arms:
         if collide and exempt:
           r = next(rb for rb in self.robots if body.startswith(rb))
-          bid = self._body_id(f"arm_{body}")
+          nm = body if self.articulated else f"arm_{body}"
+          try:
+            bid = self._body_id(nm)
+          except Exception:
+            continue                                       # visual-only frame: no body here
           self._holdex[r].append(int(self.model.body_geomadr[bid]))
+    # ARTICULATED: qpos index per rai joint name, so a rai joint vector maps onto MuJoCo's
+    # own ordering rather than by position (they coincide today; relying on that silently is
+    # exactly the class of bug fk_compare exists to catch).
+    # NB qpos and qvel are DIFFERENT address spaces -- a free joint occupies 7 qpos but only
+    # 6 qvel -- so a qpos address indexes qvel out of bounds once free-floating parts precede
+    # the arms (measured: IndexError at 48 with qvel size 48). Keep both.
+    self._qadr, self._vadr = {}, {}
+    if self.articulated:
+      for jn in articulated_C.getJointNames():
+        jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, jn)
+        if jid >= 0:
+          self._qadr[jn] = int(self.model.jnt_qposadr[jid])
+          self._vadr[jn] = int(self.model.jnt_dofadr[jid])
+      self._rai_joints = list(articulated_C.getJointNames())
     self.gripper_kinds = gripper_kinds or {}
     self.active_grasps = {}                                # robot -> (eq_id, part, fcap, tcap)
     self.viewer = None
@@ -692,6 +738,23 @@ class SimScene:
     return np.r_[self.data.xpos[b], self.data.xquat[b]]    # wxyz -- matches problem.py
 
   # -- weld managers ---------------------------------------------------------------------
+  def weld_violation(self, eq_id, body1, body2):
+    """How far body2 actually sits from where this weld says it should, in (mm, deg).
+
+    The direct measure of GRASP SLIP: `_activate_weld` freezes the relative pose into eq_data,
+    so any later disagreement is the constraint failing to hold the part. Zero for a mocap
+    anchor (it sits outside the constrained dynamics); non-zero for a jointed chain is exactly
+    the hypothesis under test."""
+    p1, q1 = self.data.xpos[body1], self.data.xquat[body1]
+    p2, q2 = self.data.xpos[body2], self.data.xquat[body2]
+    R1 = _quat_to_R(q1)
+    rel_p = R1.T @ (p2 - p1)
+    rel_q = _pose_compose(np.r_[0, 0, 0, _quat_conj(q1)], np.r_[0, 0, 0, q2])[3:]
+    tgt_p = np.asarray(self.model.eq_data[eq_id][3:6], dtype=float)
+    tgt_q = np.asarray(self.model.eq_data[eq_id][6:10], dtype=float)
+    return (float(np.linalg.norm(rel_p - tgt_p)) * 1000.0,
+            float(np.degrees(_quat_angle(rel_q, tgt_q))))
+
   def _activate_weld(self, eq_id, body1, body2):
     """Freeze the CURRENT relative pose of body2 in body1 into the weld's eq_data, then
     activate. TODO(verify): eq_data layout for mjEQ_WELD is [anchor(3), relpose(7), torquescale]
@@ -715,6 +778,29 @@ class SimScene:
     for gid in self._holdex.get(robot, ()):                # wrist cluster exempt while holding
       self.model.geom_contype[gid] = 0
       self.model.geom_conaffinity[gid] = 0
+
+  def set_arm_q(self, q, qdot=None):
+    """ARTICULATED set-pose: drive the chain by writing qpos directly (and zeroing qvel), the
+    kinematic stand-in for a controller. The arm is therefore perfectly stiff -- parts still
+    receive contact and weld forces, the arm ignores the reaction -- which is deliberate for
+    this stage: it keeps the grasp weld an exact measure of the payload's own m(a-g), the
+    property the corner/wrench calibrations depend on. Swapping in actuators later changes
+    only this method, not the model."""
+    q = np.asarray(q, dtype=float)
+    # qvel must be the COMMANDED joint velocity, not zero. A held part genuinely moves, so a
+    # gripper that claims zero velocity forces the weld to reconcile the two every step --
+    # which injects energy and diverges (measured: grasp force ramping 28 -> 311 -> 982 ->
+    # 15989 N). mocap bodies get away with it only because they sit outside the constrained
+    # dynamics entirely; a real chain does not.
+    self._cmd_q = (np.asarray(q, dtype=float),
+                   None if qdot is None else np.asarray(qdot, dtype=float))
+    v = None if qdot is None else np.asarray(qdot, dtype=float)
+    for i, jn in enumerate(self._rai_joints):
+      adr = self._qadr.get(jn)
+      if adr is not None:
+        self.data.qpos[adr] = q[i]
+        self.data.qvel[self._vadr[jn]] = 0.0 if v is None else v[i]
+    mujoco.mj_forward(self.model, self.data)
 
   def sync_arms(self, poses):
     """v2: set every arm link mocap body to its rai-FK world pose. poses = {frame: 7-pose}."""
@@ -809,6 +895,23 @@ class SimScene:
     sustain = max(1, int(BREAK_SUSTAIN / DT))
     for _ in range(n):
       mujoco.mj_step(self.model, self.data)
+      if self._grasp_trace and self.step_i % self._grasp_trace == 0:
+        for r, g in sorted(self.active_grasps.items()):
+          eq, part = g[0], g[1]
+          mm, deg = self.weld_violation(eq, self._body_id(self.grasp_anchor[r]),
+                                        self._body_id(part))
+          f, t = self._weld_wrench(eq)
+          print(f"[grasp] k={self.step_i:7d} {r}/{part:6s} slip {mm:8.3f}mm {deg:7.3f}deg "
+                f"|F|={f:8.2f} |T|={t:6.3f}  mode={'artic' if self.articulated else 'mocap'}")
+      if self.articulated and getattr(self, "_cmd_q", None) is not None:
+        # RE-ASSERT the commanded arm pose. mj_step has to integrate the chain (the PARTS
+        # need stepping and MuJoCo cannot step them selectively), so the weld accelerates the
+        # arm a little every step; left alone that error compounds and the grasp force runs
+        # away (measured 28 -> 351 -> 921 -> 15989 N). Rewriting qpos here bounds it to a
+        # single step, which is exactly the free lunch a mocap body gets by sitting outside
+        # the constrained dynamics. This is what makes the KINEMATIC arm behave; it goes away
+        # when actuators make the chain track for real.
+        self.set_arm_q(*self._cmd_q)
       self.step_i += 1
       for r, (eq, part, fcap, tcap) in list(self.active_grasps.items()):
         fmag, tmag = self._weld_wrench(eq)
@@ -1095,7 +1198,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         corridor=False, corridor_ds=1.0, corridor_ds_lead=0.25,
                         corridor_lead_max=4.0, force_limits=False, wrench_margin=1.0, mass_scale=1.0, inertia_factor=1.0,
                         corner_limits=True,
-                        spline=False, spline_per_seg=8, spline_tension=0.5):
+                        spline=False, spline_per_seg=8, spline_tension=0.5,
+                        articulated=False):
   """Execute an mr_bench PATH (from mp_export.run_birrt) in MuJoCo with the REAL ARMS:
   every rai robot shape frame (the capsule collision model + gripper primitives) is mirrored
   as a kinematic body positioned by rai FK along the path -- the planner's own kinematics by
@@ -1148,7 +1252,24 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
 
   q0 = full_q(mp_path[0].q)
   scene = SimScene(assembly, states[0], robots, gripper_kinds=gripper_kinds,
-                   arms=arms, arm_poses=fk_poses(q0), ee_anchor=ee_anchor, gui=gui)
+                   arms=arms, arm_poses=fk_poses(q0), ee_anchor=ee_anchor, gui=gui,
+                   articulated_C=(C_fk if articulated else None))
+  if articulated:
+    print(f"[sim/mp] --articulated ACTIVE: real kinematic chains generated from rai "
+          f"(arm_model), driven by SETTING qpos -- not {len(arms)} teleported mocap bodies. "
+          f"Still perfectly stiff; run fk_compare.py to re-check the model.")
+
+  _last_q = {}
+
+  def drive_q(q):
+    """One driver for both arm models, so the executor does not care which is in use."""
+    if articulated:
+      q = np.asarray(q, dtype=float)
+      prev = _last_q.get("q")
+      scene.set_arm_q(q, qdot=None if prev is None else (q - prev) / DT)
+      _last_q["q"] = q.copy()
+    else:
+      scene.sync_arms(fk_poses(q))
   rec = None
   if record is not None:
     rec = scene.recorder = {"qpos": [], "mpos": [], "mquat": [], "forces": [], "marks": []}
@@ -1216,7 +1337,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
   if verbose:
     print(f"[sim/mp] driving RAW path: {len(mp_path)} states, {len(problem.tasks)} tasks")
   q_prev = full_q(mp_path[0].q)
-  scene.sync_arms(fk_poses(q_prev))
+  drive_q(q_prev)
 
   # --- split the raw path into PER-MODE STRETCHES (transition = duplicated goal config) ---
   # Decomposition + the trapezoidal profile now live in the portable `retiming` module
@@ -1252,7 +1373,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     # this is exactly what a jerk-limited tracking controller would do on hardware.
     for q in retiming.retime_stretch(qs, DT, joint_rate=JOINT_RATE, ramp_dist=RAMP_DIST,
                                      ramp_min=RAMP_MIN, arm_dims=boost_dims):
-      scene.sync_arms(fk_poses(q))
+      drive_q(q)
       scene.step(1, report, ("path",))
 
   if prioritized or corridor:
@@ -1770,7 +1891,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
 
         scene.wrench_trace = _make_wrench_tracer(scene, predict=_wpred)
       for i in range(len(traj.q)):
-        scene.sync_arms(fk_poses(traj.q[i]))
+        drive_q(traj.q[i])
         scene.trace_ctx = i
         scene.step(1, report, (traj.phase[i],))
         if i in fire_at:
@@ -1827,7 +1948,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     for idx, ev in traj.fires:
       fire_at.setdefault(int(idx), []).extend(int(t) for t in ev)
     for i in range(len(traj.q)):
-      scene.sync_arms(fk_poses(traj.q[i]))
+      drive_q(traj.q[i])
       scene.step(1, report, (traj.phase[i],))
       if i in fire_at:
         for tid in fire_at[i]:
@@ -2123,7 +2244,8 @@ def _cli_run(a):
                               mass_scale=a.mass_scale, inertia_factor=a.inertia_factor,
                               corner_limits=a.corner_limits,
                               spline=a.spline, spline_per_seg=a.spline_per_seg,
-                              spline_tension=a.spline_tension)
+                              spline_tension=a.spline_tension,
+                              articulated=a.articulated)
   else:
     rep = SimExecutor(asm, gripper_kinds=gripper_kinds, gui=a.gui).execute(
         plan, states, record=a.record)
@@ -2174,6 +2296,15 @@ def _build_cli():
                       "events (never at a barrier it merely crosses) and runs at its own joint "
                       "limit. A pair whose corridor is 0 must move together, which is how "
                       "handovers/co-grasps express themselves. Prints the corridor widths.")
+  r.add_argument("--articulated", action="store_true",
+                 help="Drive REAL kinematic chains instead of teleported mocap bodies. Today "
+                      "each arm is N DISCONNECTED mocap bodies, every one snapped to its rai-FK "
+                      "world pose each step -- there are no joints between links at all. This "
+                      "generates the actual chain from rai's own tree (arm_model) and drives it "
+                      "by SETTING qpos: still perfectly stiff, so the grasp weld remains an "
+                      "exact measure of the payload's m(a-g) and every wrench/corner calibration "
+                      "stays interpretable. The step before actuators. Verify the model with "
+                      "`python fk_compare.py --robot <type>` (agreement is machine-precision).")
   r.add_argument("--spline", action="store_true",
                  help="With --corridor: replace the C0 path by a C1 Catmull-Rom curve through "
                       "the SAME waypoints, so there are no velocity discontinuities to crawl "

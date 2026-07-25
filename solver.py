@@ -746,10 +746,19 @@ class RobotIK:
     # inject the pre-skill joint PIN (no-op unless fuse_pre_skill_witnesses set _pin_joints).
     # Names absent from C are dropped, which is what makes this a no-op in a _restrict_to_arm
     # scene: there the other arms are already frozen, so there is nothing left to pin.
+    # NOTE the four RELAXED reach prechecks are skipped outright while a pin is set (see their
+    # call sites): that gate rejects on the LAST restart's residual against a threshold measured
+    # on UN-pinned solves, and a random restart cannot satisfy a hard joint pin -- measured, it
+    # threw away pinned solves that the full solve then found feasible.
     p = self._pin_joints
     if not p:
       return
     sel = [n for n in C.getJointNames() if n in p]
+    # Record what the pin actually bit on. An EMPTY sel means the scene had already frozen
+    # every joint we were asked to hold, so the solve that follows is the ordinary un-pinned
+    # one -- the caller must not present its outcome as a repair (measured: every `pick` takes
+    # this path, and 4 of 6 "accepted" splits were just solver noise on two draws of it).
+    self.pin_applied = len(sel)
     if not sel:
       return
     komo.addObjective([1, 1], ry.FS.qItself, sel, ry.OT.eq, [1e1],
@@ -1149,7 +1158,8 @@ class RobotIK:
       if reject:
         return False, None                                # every exact branch deeply colliding
       seeds = ranked or seeds                             # shallowest-collision branches first
-    elif self.reach_precheck and self._reach_precheck_reject(action, C, build(False)):
+    elif (self.reach_precheck and self._pin_joints is None
+          and self._reach_precheck_reject(action, C, build(False))):
       # includes the EMPTY-analytic-set case: an empty EXACT set does NOT prove the SOFT
       # solve fails -- the tolerant pose eq settles within tolerance of exactly-unreachable
       # poses (measured: the chair posts' thin-cylinder side pinch). Only the residual-gated
@@ -1204,7 +1214,8 @@ class RobotIK:
       self._add_grasp_maintenance(komo, s0, assembly)     # existing braces stay at their grasps
       return komo
 
-    if self.reach_precheck and self._reach_precheck_reject(action, C, build(False)):
+    if (self.reach_precheck and self._pin_joints is None
+        and self._reach_precheck_reject(action, C, build(False))):
       return False, None                                  # clear reach failure (relaxed solve)
 
     komo = build(True)
@@ -1324,7 +1335,8 @@ class RobotIK:
           return False, None
         arm_seeds[robot] = ranked or arm_seeds[robot]
       seeds = arm_seeds.get(robot, []) if single else []
-      if self.reach_precheck and self._reach_precheck_reject(action, C, build(False)):
+      if (self.reach_precheck and self._pin_joints is None
+          and self._reach_precheck_reject(action, C, build(False))):
         return False, None                                # clear reach failure (relaxed solve)
 
     komo = build(True)
@@ -1468,7 +1480,7 @@ class RobotIK:
         if reject:
           return False, None                              # every exact combo deeply colliding
 
-    if self.reach_precheck and not reachable_proven:
+    if self.reach_precheck and not reachable_proven and self._pin_joints is None:
       # relaxed (collision-free) reach: can the mate pose be reached AT ALL? A clear relaxed
       # failure rejects instantly -- skipping the whole bias sweep + restart fallback (the
       # most expensive failure path there is). Residual-gated like the other skills.
@@ -1539,6 +1551,12 @@ class RobotIK:
       self._opt_pull = {"mode": "joint", "robot": action[1],
                         "qmap": {n: float(warm[i]) for i, n in enumerate(names)},
                         "weight": self.pre_insertion_pull, "rot_weight": 1.0}
+    # A REQUESTED PIN THAT LANDS ON NOTHING IS NOT A REPAIR. _ik_pick/_ik_place restrict the
+    # KOMO scene to the acting arm (6 joints), so a 12-joint pin drops to zero names and the
+    # solve is the ordinary un-pinned one -- which the caller would then accept or reject on
+    # solver noise between two draws of the SAME problem, and report as a repair. _add_pin
+    # records whether it actually pinned anything so the caller can tell those apart.
+    self.pin_applied = None
     self._pin_joints = pin
     try:
       if kind == "pick":
@@ -2561,17 +2579,24 @@ def fuse_pre_skill_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
     after = robot_ik.pre_skill_witness(a, s0, s1, assembly, w, pin=pin)
     o, n = metrics(before), metrics(after)
     why = _pre_gate(o, n, pen_gate, max_dq, hold_dq, hold_mm, pos_tol, ang_tol)
+    if getattr(robot_ik, "pin_applied", None) == 0:
+      # The pin bit on NOTHING: _ik_pick/_ik_place restrict the scene to the acting arm, so
+      # the other arms were already frozen and this was just a second draw of the ordinary
+      # un-pinned solve. Accepting it would be reporting solver noise as a repair (measured:
+      # 4 of 6 "accepted" splits were exactly this). Keep today's keyframe.
+      why = why or "pin bit on no joint: the scene had already frozen every arm to hold"
     if kind == "assemble" and axis is None:
       why = why or "no mate axis: the funnel has zero length"   # report it, don't hide it
     if why is None:
       pre[i] = after
     rows.append((i, kind, why is None, why, o, n))
     if verbose:
-      fmt = lambda k, f, m: (f"{f % m[k]}" if m is not None else "n/a")
-      print(f"  {tag}: actor dq {fmt('dq', '%.3f', o)}->{fmt('dq', '%.3f', n)} rad"
-            f" | funnel dev {fmt('dev', '%.1f', o)}->{fmt('dev', '%.1f', n)}mm"
-            f" | idle arms {fmt('hold', '%.3f', o)}->{fmt('hold', '%.3f', n)} rad"
-            f" | static {fmt('stat_mm', '%.1f', o)}->{fmt('stat_mm', '%.1f', n)}mm"
+      pair = lambda k, f, u: ((f % o[k] if o else "n/a") + "->" +
+                              (f % n[k] if n else "n/a") + u)
+      print(f"  {tag}: actor dq {pair('dq', '%.3f', ' rad')}"
+            f" | funnel dev {pair('dev', '%.1f', ' mm')}"
+            f" | idle arms {pair('hold', '%.3f', ' rad')}"
+            f" | static {pair('stat_mm', '%.1f', ' mm')}"
             + (f"   REJECTED: {why} -- today's keyframe kept" if why else "   ACCEPTED"))
 
   acc = sum(1 for r in rows if r[2])
