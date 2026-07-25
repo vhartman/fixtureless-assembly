@@ -477,6 +477,42 @@ def load_path(path_json):
   return [_PathState(d["q"], _Mode(d["mode"])) for d in data]
 
 
+def mode_sequence(problem):
+  """Walk the SEQUENCE problem's mode chain (same walk as report_problem_clearance) and
+  return [mode_0, mode_1, ...]: mode_k is the attachment state IN FORCE while per-mode
+  stretch k of a saved path executes; the transition k -> k+1 fires stretch k's tasks.
+  This is what a desynced executor needs to collision-check arms at DIFFERENT path
+  parameters: attachments are a function of how many events have FIRED (time), not of
+  where any arm is, so world state at `fired=f` == mode_sequence(problem)[f]."""
+  env = problem
+  q_home = env.get_start_pos()
+  conf_type = type(q_home)
+
+  def goal_config(m, task):                                  # as report_problem_clearance
+    goal = task.goal.sample(m)
+    q = []
+    for j, r in enumerate(env.robots):
+      if r in task.robots:
+        off = 0
+        for tr in task.robots:
+          if tr == r:
+            q.append(goal[off:off + env.robot_dims[tr]])
+            break
+          off += env.robot_dims[tr]
+      else:
+        q.append(q_home.robot_state(j))
+    return conf_type.from_list(q)
+
+  chain, m = [], env.start_mode
+  while True:
+    chain.append(m)
+    if env.is_terminal_mode(m):
+      return chain
+    combos = env.get_valid_next_task_combinations(m)
+    task = env.get_active_task(m, combos[0] if combos else None)
+    m = env.get_next_modes(goal_config(m, task), m)[0]
+
+
 def report_problem_clearance(problem, plan=None, margin=0.02, verbose=True):
   """Per-mode collision/clearance report at the exported TASK-GOAL keyframes -- the exact
   configs (our witnesses) and the exact collision check (mr_bench's is_collision_free ->

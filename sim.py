@@ -73,6 +73,7 @@ release fix). v1 discriminator re-verified after the weld-semantics change (ON 2
 OFF fails physically, mode topple -> dropped-at-release).
 """
 import os
+import time as _time
 import numpy as np
 
 import retiming                                              # portable path->trajectory retiming
@@ -286,6 +287,66 @@ def _arm_shape_frames(C, robots, visual=True):
           # gripper primitives (vacuum tip, gripper_fill): visual-only, never collide.
           out.append((n, n, (k, sz), False, False, GROUP_VISUAL, tint))
   return out
+
+
+def scale_arm_collision_shapes(C, robots, factor, verbose=True):
+  """DEBUG AID: shrink every contact-enabled ARM collision primitive by `factor`
+  (1.0 = untouched, byte-identical). Covers not just the `_coll*` capsules but the gripper
+  primitives too (palm / fingers / gripper_fill DO collide in rai -- they show up as
+  colliding pairs in the oracle). Radius-only for capsule/cylinder/sphere (thinner arm,
+  unchanged reach/kinematics); all extents for boxes.
+
+  PARTS ARE NEVER SCALED -- mate seating and the assembly's own geometry depend on their
+  true size. Scaling changes what the planner/oracle considers free, so clearances no
+  longer match the certified path: for debugging desync/wedges, not for validation runs.
+  Applied to the rai config BEFORE witnesses/problem/sim, so IK, the collision oracle and
+  the MuJoCo capsules all see the same shrunken geometry. Returns #frames scaled."""
+  if factor is None or abs(float(factor) - 1.0) < 1e-12:
+    return 0
+  import robotic as ry
+  ST = {"capsule": ry.ST.capsule, "cylinder": ry.ST.cylinder, "sphere": ry.ST.sphere,
+        "box": ry.ST.box, "ssBox": ry.ST.ssBox}
+  factor = float(factor)
+  n = 0
+  for nm in C.getFrameNames():
+    if not any(nm.startswith(r) for r in robots):
+      continue
+    f = C.getFrame(nm)
+    info = f.info()
+    kind = info.get("shape")
+    if kind not in ST or not info.get("contact"):            # shapeless / visual-only: skip
+      continue
+    sz = list(np.asarray(info.get("size"), dtype=float))
+    if kind in ("capsule", "cylinder"):
+      sz[1] *= factor                                        # radius: thinner, same length
+    elif kind == "sphere":
+      sz[0] *= factor
+    elif kind == "ssBox":
+      sz = [v * factor for v in sz[:3]] + list(sz[3:])       # extents; keep corner radius
+    else:
+      sz = [v * factor for v in sz]
+    contact = info.get("contact")
+    f.setShape(ST[kind], sz)
+    f.setContact(int(contact))                               # setShape may clear the flag
+    n += 1
+  if verbose and n:
+    print(f"[sim] --coll-scale {factor:g}: shrank {n} arm collision primitives (parts "
+          f"untouched). DEBUG ONLY -- clearances no longer match the certified geometry.")
+  return n
+
+
+GRAVITY = 9.81
+LEVER_SANITY = 0.35   # m: a grasp lever beyond this means the support info is stale, not a long arm
+
+
+def _static_load(mass, lever):
+  """Static wrench a held group already imposes on its grasp: (|F|, |T|).
+
+  SWAPPABLE: this is the cheap weight-based estimate (m*g, and its torque about the grasp
+  through the lever arm). The principled replacement is the wrench LP's own per-action grasp
+  load (equilibrium_feasible), which also accounts for bracing and insertion reactions --
+  drop it in here and nothing else changes."""
+  return float(mass) * GRAVITY, float(mass) * GRAVITY * float(lever)
 
 
 def _default_geomgroups(viewer, has_mesh):
@@ -865,7 +926,10 @@ JOINT_RATE = 1.0                # rad/s joint-space tracking speed along RAW pat
 
 
 def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kinds=None,
-                        record=None, verbose=True, gui=False, visual=True):
+                        record=None, verbose=True, gui=False, visual=True, prioritized=False,
+                        rate_boost=False, smooth=False,
+                        corridor=False, corridor_ds=1.0, corridor_ds_lead=0.25,
+                        corridor_lead_max=4.0, force_limits=False, wrench_margin=1.0):
   """Execute an mr_bench PATH (from mp_export.run_birrt) in MuJoCo with the REAL ARMS:
   every rai robot shape frame (the capsule collision model + gripper primitives) is mirrored
   as a kinematic body positioned by rai FK along the path -- the planner's own kinematics by
@@ -998,6 +1062,20 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       mode_of=lambda st: st.mode,
       taskids_of=lambda m: np.atleast_1d(m.task_ids))
 
+  arm_dims = [np.asarray(ridx[r], int) for r in robots]
+  # --arm-rate: JOINT_RATE is nominally a PER-ARM joint speed, but it is applied to the
+  # COMPOSITE arc, so with k arms moving together each one only advances at |dq_arm|/|dq| of
+  # it (measured on car-mini: 0.61/0.51/0.41 -- arms at half their intended speed for a purely
+  # parametric reason). The boost restores the intended semantics. On the COMMON clock this
+  # is a time-only rescaling: identical configurations, so the planner's collision
+  # certificate carries over untouched and no extra checking is needed.
+  boost_dims = arm_dims if rate_boost else None
+  if rate_boost:
+    _b = retiming.arm_rate_boost(list(retiming._composite(stretches)[0]), arm_dims)
+    print(f"[sim/mp] --arm-rate ACTIVE: per-arm rate boost x{_b.mean():.2f} mean "
+          f"(max x{_b.max():.2f}, cap x{np.sqrt(len(robots)):.2f}) -- same path, "
+          f"time-rescaled only; watch for grasp_broke at the higher speeds.")
+
   def drive_stretch(qs):
     # INTERIM ZERO-VELOCITY-AT-GOALS (kinodynamic MP is the real fix, out of scope for now):
     # the raw path has no dynamics, so constant-rate tracking blew THROUGH the task goals and
@@ -1006,17 +1084,467 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     # back to ~0 over the last RAMP_DIST rad (retiming.retime_stretch) -- so arms arrive at
     # every transition (where attaches fire) essentially at rest. Path GEOMETRY is untouched;
     # this is exactly what a jerk-limited tracking controller would do on hardware.
-    for q in retiming.retime_stretch(qs, DT, joint_rate=JOINT_RATE,
-                                     ramp_dist=RAMP_DIST, ramp_min=RAMP_MIN):
+    for q in retiming.retime_stretch(qs, DT, joint_rate=JOINT_RATE, ramp_dist=RAMP_DIST,
+                                     ramp_min=RAMP_MIN, arm_dims=boost_dims):
       scene.sync_arms(fk_poses(q))
       scene.step(1, report, ("path",))
 
-  for qs, done in stretches:
-    drive_stretch(qs)
-    scene.step(int(DWELL_T / DT), report, ("dwell",))      # settle: v ~= 0 before relinking
-    for tid in done:
-      fire(tid)
-    scene.step(int(DWELL_T / DT), report, ("dwell",))      # let the new attach take hold
+  if prioritized or corridor:
+    # DESYNCED, EVENT-DRIVEN drive (retiming.plan_schedule): only the arm(s) ACTING at a
+    # barrier ramp to rest there; uninvolved arms cross without stopping. The acting arm is
+    # already at rest at each fire sample, so no pre-fire dwell is needed; we keep only the
+    # post-fire dwell (freezing briefly) to let the new weld take hold -- exactly the composite
+    # path's second dwell. Everything else (fire semantics, judging, settle, tail) is shared.
+    robot_index = {r: i for i, r in enumerate(robots)}
+    def holders_of(state, part):                             # arms grasping part's group
+      grp = next((g for g in state.subassemblies() if part in g), {part})
+      return {c[1] for p in grp for c in state.supports.get(p, ()) if c[0] == "grasp"}
+    def acting_for(done_ids):                                # arms that must be at rest here
+      # An event needs at rest not only the ACTING arm but every arm HOLDING a part it
+      # touches: a mate onto obj_0 needs obj_0's holder parked at its witness too, else the
+      # target drifts off and the seat is missed (car body held while wheels go on). The
+      # composite path has every arm at its witness config at each barrier, so pinning the
+      # holder here places it exactly on the mate pose.
+      arms_set = set()
+      for tid in done_ids:
+        t = problem.tasks[int(tid)]
+        lbl = name_of.get(t.name)
+        if lbl:
+          pre = states[lbl[0]]                               # state entering the action
+          for tok in plan[lbl[0]]:
+            if tok in robot_index:                           # the acting robot(s)
+              arms_set.add(robot_index[tok])
+            elif tok in assembly.objects:                    # holders of every touched part
+              for r in holders_of(pre, tok):
+                if r in robot_index:
+                  arms_set.add(robot_index[r])
+        for fr in (getattr(t, "frames", None) or []):        # fallback: gripper-frame owner
+          if isinstance(fr, str):
+            for r in robots:
+              if fr.startswith(r):
+                arms_set.add(robot_index[r])
+      return arms_set
+    acting = [acting_for(done) for _, done in stretches]
+    # COLLISION ORACLE: mr_bench's own is_collision_free (the check BiRRT certified the path
+    # with), queried at DESYNCED configs against the mode in force after `fired` events --
+    # attachments are a function of events fired, not arm positions, so mode_sequence[fired]
+    # is the exact world state. A crossing arm whose next step would collide (e.g. sweep a
+    # region where a part still sits, or another arm's lane) HOLDS until the world clears.
+    import mp_export as _MP
+    chain = _MP.mode_sequence(problem)
+    # ALIGNMENT BY MODE IDENTITY: the saved path's lightweight modes carry task_ids only, so
+    # match each per-stretch path mode to the rebuilt chain mode with the SAME active-task set
+    # (unique in a sequence problem -- progression is monotone). The path may collapse chain
+    # transitions that share a config (invisible goto completions), so counting fired tasks
+    # under-counts; the task_ids set is the unambiguous key. World state after `fired`
+    # barriers = the mode stretch `fired` executes under.
+    _ids = lambda m: frozenset(int(t) for t in np.atleast_1d(m.task_ids))
+    chain_by_ids = {_ids(m): m for m in chain}
+    path_mode_ids, pm = [], mp_path[0].mode
+    for st in mp_path:
+      if st.mode != pm or not path_mode_ids:
+        pm = st.mode
+        path_mode_ids.append(_ids(pm))
+    missing = [i for i in path_mode_ids if i not in chain_by_ids]
+    if len(path_mode_ids) != len(stretches) or missing:
+      raise RuntimeError(f"[sim/mp] mode alignment failed: {len(path_mode_ids)} path modes vs "
+                         f"{len(stretches)} stretches, {len(missing)} unmatched in the rebuilt "
+                         f"{len(chain)}-mode chain -- saved path and rebuilt problem disagree; "
+                         f"re-export with matching flags.")
+    stretch_mode = [chain_by_ids[i] for i in path_mode_ids]  # mode in force during stretch k
+    conf_type = type(problem.get_start_pos())
+    def _conf(fq):
+      return conf_type.from_list([np.asarray(fq)[ridx[r]] for r in robots])
+    def _pair_pens(qc, m):                                   # (planner ok?, {pair: depth>0})
+      ok = bool(problem.is_collision_free(qc, m))            # side effect: C <- (mode, q)
+      out = {}
+      for c in problem.C.getCollisions(0.0):
+        d = float(c[2])
+        if d < 0:
+          k = (c[0], c[1]) if c[0] < c[1] else (c[1], c[0])
+          out[k] = max(out.get(k, 0.0), -d)
+      return ok, out
+    # CALIBRATE per-pair thresholds from the CERTIFIED diagonal: the planner's 0.01 total-
+    # penetration tolerance is a witness allowance, not a license -- desynced arms may grind
+    # ~10mm into each other while is_collision_free still says yes (measured: exactly the
+    # earlier false deadlock). Block instead any candidate whose per-pair penetration exceeds
+    # what the saved path itself ever exhibits for that pair (+1mm sampling margin): arm-arm
+    # pairs never touch on the diagonal, so desync stops at FIRST contact, and the laggard's
+    # catch-up step (reducing overlap) stays legal -> tight formations reconverge on their own.
+    # DENSELY SAMPLED: BiRRT certifies the INTERPOLATED path, not just the saved waypoints --
+    # waypoint-only calibration blocked the fused diagonal itself mid-segment (measured: a
+    # fully fused 3-arm group froze at s=31.1 with no outside blocker).
+    # MODE-LOCAL allowances (key = (stretch, pair)): a pair's certified proximity in one
+    # mode neither licenses nor is judged by another -- global maxima let a blunt fallback
+    # to the planner's TOTAL-penetration bool block desynced configs whose per-pair pens
+    # were each certified somewhere (measured: cross8 froze at fired=32 on exactly that).
+    _CAL_DS = 0.02                                           # rad between calibration samples
+    allowed = {}
+    for k_st, (wps, _) in enumerate(stretches):
+      m_st = stretch_mode[k_st]
+      for wa, wb in zip(wps, wps[1:]):
+        wa, wb = np.asarray(wa, float), np.asarray(wb, float)
+        nseg = max(1, int(np.ceil(float(np.linalg.norm(wb - wa)) / _CAL_DS)))
+        for ti in range(nseg + 1):
+          fq = wa + (wb - wa) * (ti / nseg)
+          for pr, dep in _pair_pens(_conf(fq), m_st)[1].items():
+            key = (k_st, pr)
+            allowed[key] = max(allowed.get(key, 0.0), dep)
+    if allowed:
+      wp = max(allowed.items(), key=lambda kv: kv[1])
+      print(f"[sim/mp] diagonal calibration: {len(allowed)} (stretch, pair) allowance(s), "
+            f"worst {wp[0][1][0]}~{wp[0][1][1]} {wp[1]*1000:.1f}mm (stretch {wp[0][0]}) -- "
+            f"desync blocked beyond the certified per-mode penetration")
+    PEN_MARGIN = 1e-3                                        # waypoint-sampling slack (1mm)
+    _frame_arm = {}                                          # frame -> arm index (prefix match)
+    def _arm_of(fname):
+      if fname in _frame_arm:
+        return _frame_arm[fname]
+      a = next((robot_index[r] for r in robots if fname.startswith(r)), None)
+      if a is None:
+        base = fname.split("__", 1)[0]                       # obj_X__shape -> obj_X
+        if base in assembly.objects:
+          f = problem.C.getFrame(base)                       # blame the HOLDER (attach parent
+          while f is not None:                               # chain in the posed config)
+            a = next((robot_index[r] for r in robots if f.name.startswith(r)), None)
+            if a is not None:
+              break
+            f = f.getParent()
+          return a                                           # holder changes with mode: no cache
+      _frame_arm[fname] = a
+      return a
+    # pairs the certified path itself drives beyond ~2x the planner's tolerance are rai-
+    # DEACTIVATED links (obj rooted to the table at 975mm; a gripper-vs-held-target at 47mm
+    # during an insertion) -- an ACTIVE pair that deep would have failed is_collision_free,
+    # so the path could not have validated. mr_bench ignores them; policing them against
+    # steep-gradient mode-local allowances falsely froze fused groups (both measured). Only
+    # plausibly-ACTIVE pairs are policed, against their MODE-LOCAL certified allowance.
+    # (The planner's total-penetration bool is NOT used at desynced configs: certified
+    # per-pair pens from different modes can sum past its budget -- measured at fired=32.)
+    _PAIR_ACTIVE_MAX = max(0.02, 2.0 * float(getattr(problem, "collision_tolerance", 0.01)))
+    def collide(fq, fired):
+      k_idx = min(fired, len(stretch_mode) - 1)
+      _, pens = _pair_pens(_conf(fq), stretch_mode[k_idx])
+      who, viol = set(), []
+      for pr, dep in pens.items():
+        base = allowed.get((k_idx, pr), 0.0)
+        if base < _PAIR_ACTIVE_MAX and dep > base + PEN_MARGIN:
+          viol.append((pr, dep))
+          for f in pr:
+            a = _arm_of(f)
+            if a is not None:
+              who.add(a)
+      collide.last_pairs = viol                              # diagnostics for retiming traces
+      return who if viol else False                          # blocker arms (empty set = static)
+
+    if corridor:
+      # ============ CORRIDOR RETIMING (stages A/B/C -- see retiming.py) ============
+      # A: measure ONCE how far arms may drift apart before anything touches, as a function
+      # of arc position. B/C then plan inside that certified envelope with NO per-step
+      # collision checks at all: arms rest only at their OWN events, and each runs at its own
+      # joint limit. Probes pose arm i at s+d with everyone else on the certified diagonal at
+      # s (world state from s), and read the violation's ARMS -- pairwise vs another arm, or
+      # "world" vs the table/resting parts. Collisions being pairwise is what makes this a
+      # handful of 2-D scans instead of a search in n dimensions.
+      _P, _bi = retiming._composite(stretches)
+      _sg, _D = retiming.arc_length(list(_P))
+      _cs = np.concatenate([[0.0], np.cumsum(_sg)])
+      _bar = [_cs[b] for b in _bi]
+
+      def _pose(sv):                                         # composite config at per-arm arcs
+        fq = np.empty(_P.shape[1])
+        for r in range(len(robots)):
+          fq[arm_dims[r]] = retiming.config_at(list(_P), _cs, _sg,
+                                               min(max(sv[r], 0.0), _D))[arm_dims[r]]
+        return fq
+
+      def _fired_at(s):                                      # world state = barriers passed
+        return int(np.searchsorted(_bar, s + 1e-9, side="right"))
+
+      # POSITION-LOCAL baseline instead of the blanket "skip deep pairs" rule. A pair may
+      # legitimately be deep at ONE place on the path (a gripper inside the target it is
+      # inserting) -- skipping it everywhere made Stage A blind exactly where desync hurts
+      # most, and it certified a wide-open corridor on both scenes. Here the allowance is
+      # the penetration the CERTIFIED DIAGONAL shows for that pair AT THESE ARC POSITIONS.
+      _CG = 0.5                                              # rad per baseline bucket
+      _nb = int(_D / _CG) + 2
+      diag_pen = {}
+      for _i in range(len(_P) - 1):
+        _a, _b, _L = _P[_i], _P[_i + 1], _sg[_i]
+        _ns = max(1, int(np.ceil(_L / _CAL_DS)))
+        for _t in range(_ns + 1):
+          _s = _cs[_i] + _L * _t / _ns
+          _k = min(_fired_at(_s), len(stretch_mode) - 1)
+          for pr, dep in _pair_pens(_conf(_a + (_b - _a) * (_t / _ns)), stretch_mode[_k])[1].items():
+            arr = diag_pen.setdefault(pr, np.zeros(_nb))
+            _g = min(int(_s / _CG), _nb - 1)
+            arr[_g] = max(arr[_g], dep)
+
+      def _allow(pr, sa, sb):
+        arr = diag_pen.get(pr)
+        if arr is None:
+          return 0.0
+        ga = min(int(min(max(sa, 0.0), _D) / _CG), _nb - 1)
+        gb = min(int(min(max(sb, 0.0), _D) / _CG), _nb - 1)
+        return max(arr[ga], arr[gb])                         # deep here on the diagonal => ok
+
+      def _viol_arms(sv, s_ref):
+        """Violating (arm, arm) pairs and (arm, world) hits at this desynced combination."""
+        k = min(_fired_at(s_ref), len(stretch_mode) - 1)
+        _, pens = _pair_pens(_conf(_pose(sv)), stretch_mode[k])
+        pairs, world = set(), set()
+        for pr, dep in pens.items():
+          a, b = _arm_of(pr[0]), _arm_of(pr[1])
+          sa = sv[a] if a is not None else s_ref
+          sb = sv[b] if b is not None else s_ref
+          if dep <= _allow(pr, sa, sb) + PEN_MARGIN:
+            continue
+          if a is not None and b is not None and a != b:
+            pairs.add((min(a, b), max(a, b)))
+          elif a is not None or b is not None:
+            world.add(a if a is not None else b)
+        return pairs, world
+
+      def world_free(i, s, d):
+        sv = [s] * len(robots)
+        sv[i] = s + d
+        return i not in _viol_arms(sv, s)[1]
+
+      def pair_free(i, j, s, d):
+        sv = [s] * len(robots)
+        sv[i] = s + d
+        return (min(i, j), max(i, j)) not in _viol_arms(sv, s)[0]
+
+      # RIGID COUPLINGS the oracle can NEVER see: while two arms hold the SAME group (a
+      # handover overlap, a co-grasp/brace) they are kinematically locked -- desyncing them
+      # does not "collide", it tears the part out of a gripper (measured: 175.9N grasp break
+      # with a wide-open geometric corridor). Derive those spans from the plan's own support
+      # structure and force the corridor to 0 there.
+      # stretch index -> PLAN ACTION index. These are NOT the same: car-mini has 26 barriers
+      # for 17 actions (pre-insertion splits), so indexing `states` by barriers reads the
+      # wrong support structure -- it claimed arms held parts they do not, which produced
+      # 2-metre "lever arms" and absurd wrench limits (measured).
+      _stretch_plan = [next((name_of[problem.tasks[int(t)].name][0] for t in stretches[k][1]
+                             if problem.tasks[int(t)].name in name_of), None)
+                       for k in range(len(stretches))]
+      _last = 0
+      for k in range(len(_stretch_plan)):                     # a goto-only stretch inherits
+        if _stretch_plan[k] is None:
+          _stretch_plan[k] = _last
+        else:
+          _last = _stretch_plan[k]
+      _locked = []
+      for k in range(len(stretches)):
+        st_idx = _stretch_plan[k]
+        if st_idx is None:
+          continue
+        a0 = _bar[k - 1] if k else 0.0
+        for state in (states[st_idx], states[min(st_idx + 1, len(states) - 1)]):
+          for grp in state.subassemblies():
+            hold = sorted({robot_index[c[1]] for p in grp
+                           for c in state.supports.get(p, ()) if c[0] == "grasp"
+                           and c[1] in robot_index})
+            for x in range(len(hold)):
+              for y in range(x + 1, len(hold)):
+                _locked.append((hold[x], hold[y], a0, _bar[k]))
+      if _locked:
+        spans = {}
+        for i, j, a, b in _locked:
+          spans[(i, j)] = spans.get((i, j), 0.0) + (b - a)
+        print(f"[sim/mp] rigid couplings from the plan (same group held by 2 arms): " +
+              ", ".join(f"arm{i}-arm{j} over {v:.0f} rad" for (i, j), v in sorted(spans.items())))
+      _vmax = _amax = None
+      if force_limits:
+        # ---- WRENCH-LIMITED MOTION -------------------------------------------------------
+        # The wrench LP is QUASI-STATIC: it sizes a grasp for gravity, not for the inertial
+        # load of being swung around. So faster execution can overload a grasp the planner
+        # certified (measured: a3's grasp on the car body at 0.43Nm vs a 0.40 cap, which
+        # `--joint-rate 0.6` papered over by slowing EVERY arm). Here only the LOADED arm
+        # slows, and only where it is loaded.
+        #
+        # Along a fixed path the held group's Cartesian acceleration is
+        #     a = p'(s) * s_ddot  +  p''(s) * s_dot^2,
+        # so one wrench budget yields BOTH a speed limit (the curvature term) and an
+        # acceleration limit (the tangential term) at each arc position -- a mini-TOPP.
+        # Point-mass model: |F| = m|a|, |T| = m|a|*lever (no I*alpha term).
+        _G = len(cor_grid := np.arange(0.0, _D + corridor_ds, corridor_ds))
+        _p = np.zeros((len(robots), _G, 3))                  # held-group COM path
+        _lev = np.zeros((len(robots), _G))                    # |COM - gripper| lever arm
+        _m = np.zeros((len(robots), _G))                      # held mass
+        _bad_lever = 0
+        for _g, _s in enumerate(cor_grid):
+          _k = min(_fired_at(_s), len(stretch_mode) - 1)
+          problem.is_collision_free(_conf(_pose([_s] * len(robots))), stretch_mode[_k])
+          _st = states[min(_stretch_plan[_k], len(states) - 1)]   # by ACTION, not by barrier
+          for _r, _rn in enumerate(robots):
+            held = [q for grp in _st.subassemblies() for q in grp
+                    if any(c[0] == "grasp" and c[1] == _rn
+                           for c in _st.supports.get(q, ()))]
+            if not held:
+              continue
+            mm = np.array([assembly.masses.get(q, 0.1) for q in held], float)
+            pos = np.array([problem.C.getFrame(q).getPosition() for q in held], float)
+            com = (mm[:, None] * pos).sum(0) / mm.sum()
+            _p[_r, _g] = com
+            _m[_r, _g] = mm.sum()
+            try:
+              gp = np.asarray(problem.C.getFrame(ee_anchor[_rn]).getPosition(), float)
+              lev = float(np.linalg.norm(com - gp))
+            except Exception:
+              lev = 0.05
+            if lev > LEVER_SANITY:
+              # A grasp lever is centimetres. Anything larger means this arm is not really
+              # holding that group here (stale support info) -- ignore rather than emit an
+              # absurd limit that would crawl the whole run.
+              _bad_lever += 1
+              _m[_r, _g] = 0.0
+              continue
+            _lev[_r, _g] = max(lev, 5e-3)
+        # FINE geometric sampling: p'' on the 1-rad corridor grid smooths away all real
+        # curvature and yields limits of 3-15 rad/s that never bind (measured). Curvature
+        # needs a fine grid; this is pure FK (no oracle), so it is cheap. Limits are then
+        # reduced onto the coarse grid by MIN -- conservative within each cell.
+        _dsf = min(0.05, corridor_ds)
+        _sf = np.arange(0.0, _D + _dsf, _dsf)
+        _pf = np.zeros((len(robots), len(_sf), 3))
+        for _gi, _s in enumerate(_sf):
+          C_fk.setJointState(retiming.config_at(list(_P), _cs, _sg, min(_s, _D)))
+          for _r, _rn in enumerate(robots):
+            _pf[_r, _gi] = C_fk.getFrame(ee_anchor[_rn]).getPosition()
+        _vmax = np.full((len(robots), _G), 1e6)
+        _amax = np.full((len(robots), _G), 1e6)
+        _bind = {}
+        for _r, _rn in enumerate(robots):
+          fcap, tcap = _grasp_caps((gripper_kinds or {}).get(_rn, "two_finger"))
+          d1 = np.gradient(_pf[_r], _dsf, axis=0)             # d(grasp point)/ds [m/rad]
+          d2 = np.gradient(d1, _dsf, axis=0)                  # d2/ds2            [m/rad^2]
+          n1, n2 = np.linalg.norm(d1, axis=1), np.linalg.norm(d2, axis=1)
+          for _gi, _s in enumerate(_sf):
+            _g = min(int(_s / corridor_ds), _G - 1)
+            m, L = _m[_r, _g], _lev[_r, _g]
+            if m <= 0:
+              continue                                       # empty gripper: unconstrained
+            # remaining margin after the STATIC load (swap _static_load for the exact LP)
+            fs, ts = _static_load(m, L)
+            aF = max(wrench_margin * fcap - fs, 0.0) / m      # m/s^2 from the force cap
+            aT = max(wrench_margin * tcap - ts, 0.0) / (m * L)   # ... and the torque cap
+            a_allow = max(min(aF, aT), 1e-4)
+            if n2[_gi] > 1e-9:
+              _vmax[_r, _g] = min(_vmax[_r, _g], float(np.sqrt(a_allow / n2[_gi])))
+            if n1[_gi] > 1e-9:
+              _amax[_r, _g] = min(_amax[_r, _g], a_allow / n1[_gi])
+          _bind[_r] = int(np.sum(_vmax[_r] < JOINT_RATE))
+        _bind = {r: c for r, c in _bind.items() if c}
+        _vmax = retiming.brakeable(_vmax, _amax, corridor_ds)
+        if _bad_lever:
+          print(f"[sim/mp] --force-limits: ignored {_bad_lever} grid/arm samples whose lever "
+                f"exceeded {LEVER_SANITY*1000:.0f}mm (stale support info, not a real grasp)")
+        print(f"[sim/mp] --force-limits ACTIVE (margin {wrench_margin:g} of the grasp caps, "
+              f"point-mass): speed limit binds below cruise on " +
+              ", ".join(f"arm{r} {100.0 * c / _G:.0f}% of arc" for r, c in sorted(_bind.items()))
+              + (" -- nowhere" if not _bind else ""))
+        for _r in range(len(robots)):
+          _f = _vmax[_r][_vmax[_r] < 1e5]
+          if len(_f):
+            print(f"    arm{_r}: held mass up to {_m[_r].max():.2f}kg, lever up to "
+                  f"{_lev[_r].max() * 1000:.0f}mm, speed limit min {_f.min():.2f} rad/s "
+                  f"(cruise {JOINT_RATE:g})")
+      print(f"[sim/mp] --corridor STAGE A: certifying the desync envelope "
+            f"(D={_D:.0f} rad, {len(robots)} arms) ...")
+      t0 = _time.time()
+      cor = retiming.certify_corridor(len(robots), _D, world_free, pair_free,
+                                      ds_grid=corridor_ds, ds_lead=corridor_ds_lead,
+                                      lead_max=corridor_lead_max, locked=_locked,
+                                      progress=(print if verbose else None))
+      print(f"[sim/mp] STAGE A done in {_time.time() - t0:.0f}s")
+      print(retiming.corridor_width_report(cor))
+      traj = retiming.corridor_schedule(_P, arm_dims, _bar, acting, cor, DT,
+                                        joint_rate=JOINT_RATE, ramp_dist=RAMP_DIST,
+                                        ramp_min=RAMP_MIN, dwell=DWELL_T, spread=True,
+                                        vmax=_vmax, amax=_amax)
+      base = retiming.build_trajectory(stretches, DT, joint_rate=JOINT_RATE,
+                                       ramp_dist=RAMP_DIST, ramp_min=RAMP_MIN, dwell=DWELL_T)
+      print(f"[sim/mp] STAGES B+C: {len(traj.q)} samples vs {len(base.q)} lockstep "
+            f"({100 * (1 - len(traj.q) / max(len(base.q), 1)):+.1f}% makespan), "
+            f"{len(traj.fires)} fire points, ZERO collision checks during scheduling")
+      print(retiming.format_motion_report(
+          retiming.motion_report(base.q, DT, arm_dims, JOINT_RATE), "LOCKSTEP baseline"))
+      print(retiming.format_motion_report(
+          retiming.motion_report(traj.q, DT, arm_dims, JOINT_RATE), "CORRIDOR"))
+      fire_at = {}
+      for idx, ev in traj.fires:
+        for k in ev:                                         # fires carry stretch indices here
+          fire_at.setdefault(int(idx), []).extend(int(t) for t in stretches[int(k)][1])
+      for i in range(len(traj.q)):
+        scene.sync_arms(fk_poses(traj.q[i]))
+        scene.step(1, report, (traj.phase[i],))
+        if i in fire_at:
+          for tid in fire_at[i]:
+            fire(tid)
+      scene.step(int(SETTLE_T / DT), report, ("settle",))
+      report.final_pose_err = {}
+      for p in assembly.objects:
+        exp = np.asarray(_state_part_poses(states[-1], assembly, lift=CARRY_LIFT)[p], dtype=float)
+        report.final_pose_err[p] = (
+            float(np.linalg.norm(scene.part_pose(p)[:3] - exp[:3])),
+            _quat_angle(scene.part_pose(p)[3:], exp[3:]))
+      if rec is not None:
+        _save_recording(record, scene, rec, report)
+      return report
+
+    traj = retiming.plan_schedule(stretches, arm_dims, acting, DT, joint_rate=JOINT_RATE,
+                                  ramp_dist=RAMP_DIST, ramp_min=RAMP_MIN,
+                                  collide=collide, dwell=DWELL_T, rate_boost=rate_boost)
+    base = retiming.build_trajectory(stretches, DT, joint_rate=JOINT_RATE,   # lockstep, as data
+                                     ramp_dist=RAMP_DIST, ramp_min=RAMP_MIN, dwell=DWELL_T,
+                                     arm_dims=boost_dims)
+    print(f"[sim/mp] prioritized retiming ACTIVE: {len(traj.q)} samples vs {len(base.q)} "
+          f"lockstep ({100 * (1 - len(traj.q) / max(len(base.q), 1)):+.1f}% makespan), "
+          f"{len(traj.fires)} fire points, collision oracle: mr_bench is_collision_free "
+          f"(tol {getattr(problem, 'collision_tolerance', '?')})")
+    if smooth:
+      # SPREAD each arm's motion continuously between ITS OWN events instead of sprinting
+      # to the next barrier and parking there. Event indices (and therefore the whole firing
+      # schedule) are unchanged -- only the pacing between arrivals. Oracle-checked per
+      # interval, so it can never introduce a conflict the schedule did not already accept.
+      _P, _bi = retiming._composite(stretches)
+      _sg, _D = retiming.arc_length(list(_P))
+      _cs = np.concatenate([[0.0], np.cumsum(_sg)])
+      _bar = [_cs[b] for b in _bi]
+      _fire_at = sorted(int(i) for i, _ in traj.fires)
+      def _fired_of(i):
+        return int(np.searchsorted(_fire_at, i, side="right"))
+      before = retiming.motion_report(traj.q, DT, arm_dims, JOINT_RATE)
+      traj.q = retiming.spread_between_events(
+          traj, arm_dims, _bar, acting, DT, JOINT_RATE, ramp_dist=RAMP_DIST,
+          P=_P, csum=_cs, segs=_sg, collide=collide, fired_of=_fired_of)
+      print(f"[sim/mp] --smooth ACTIVE: rush-then-wait removed between each arm's own "
+            f"events (schedule/fire times unchanged, oracle-checked per interval)")
+      print(retiming.format_motion_report(before, "PRIORITIZED before --smooth"))
+    # MOTION QUALITY is the goal metric (smooth arms), not makespan -- print both profiles.
+    print(retiming.format_motion_report(
+        retiming.motion_report(base.q, DT, arm_dims, JOINT_RATE), "LOCKSTEP baseline"))
+    print(retiming.format_motion_report(
+        retiming.motion_report(traj.q, DT, arm_dims, JOINT_RATE), "PRIORITIZED"))
+    if verbose:
+      print(f"[sim/mp] acting sets {[sorted(a) for a in acting]}")
+    fire_at = {}
+    for idx, ev in traj.fires:
+      fire_at.setdefault(int(idx), []).extend(int(t) for t in ev)
+    for i in range(len(traj.q)):
+      scene.sync_arms(fk_poses(traj.q[i]))
+      scene.step(1, report, (traj.phase[i],))
+      if i in fire_at:
+        for tid in fire_at[i]:
+          fire(tid)                                          # acting arms rest through the
+                                                             # schedule's own post-fire dwell
+  else:
+    for qs, done in stretches:
+      drive_stretch(qs)
+      scene.step(int(DWELL_T / DT), report, ("dwell",))      # settle: v ~= 0 before relinking
+      for tid in done:
+        fire(tid)
+      scene.step(int(DWELL_T / DT), report, ("dwell",))      # let the new attach take hold
   scene.step(int(SETTLE_T / DT), report, ("settle",))
 
   report.final_pose_err = {}
@@ -1212,12 +1740,19 @@ def _states_from_plan(cfg, C, asm, robots, plan):
 
 
 def _cli_run(a):
+  global JOINT_RATE
+  if getattr(a, "joint_rate", None):
+    JOINT_RATE = float(a.joint_rate)                          # per-arm cruise speed override
+    print(f"[sim] --joint-rate {JOINT_RATE:g} rad/s (default 1.0)")
   import assembly as A
   import replay as R
   from plan_io import read_plan
   cfg, plan = read_plan(a.path)
   C, asm = R.build_scene(cfg)                               # exact reconstruction (shared)
   robots = A.get_robots(C)
+  # debug knob: shrink arm collision geometry BEFORE witnesses/problem/sim so IK, the
+  # collision oracle and the MuJoCo capsules stay mutually consistent. 1.0 = no-op.
+  scale_arm_collision_shapes(C, robots, getattr(a, "coll_scale", 1.0))
   gripper_kinds = _gripper_kinds_from_cfg(cfg, robots)
   states = _states_from_plan(cfg, C, asm, robots, plan)
   print(f"[sim] {a.path}: {cfg['assembly']} ({cfg['parts']}p, {cfg['num_robots']}R), "
@@ -1273,7 +1808,12 @@ def _cli_run(a):
       return
     rep = execute_motion_plan(C, asm, plan, states, prob, path, gripper_kinds=gripper_kinds,
                               record=a.record, gui=a.gui, visual=not a.no_arm_meshes,
-                              verbose=a.verbose)
+                              verbose=a.verbose, prioritized=a.prioritized,
+                              rate_boost=a.arm_rate, smooth=a.smooth,
+                              corridor=a.corridor, corridor_ds=a.corridor_ds,
+                              corridor_ds_lead=a.corridor_ds_lead,
+                              corridor_lead_max=a.corridor_lead_max,
+                              force_limits=a.force_limits, wrench_margin=a.wrench_margin)
   else:
     rep = SimExecutor(asm, gripper_kinds=gripper_kinds, gui=a.gui).execute(
         plan, states, record=a.record)
@@ -1308,8 +1848,71 @@ def _build_cli():
   r.add_argument("--no-arm-meshes", action="store_true",
                  help="v2: skip the real link VISUAL meshes (default on) -- capsules only. "
                       "Faster to build; the collision model is the capsules either way.")
+  r.add_argument("--joint-rate", type=float, default=None, metavar="RAD_S",
+                 help="Override the per-arm joint-space cruise speed (default JOINT_RATE=%g). "
+                      "Lower it when faster motion overloads a grasp (a heavy held part's "
+                      "inertial wrench is NOT in the quasi-static LP)." % JOINT_RATE)
+  r.add_argument("--corridor", action="store_true",
+                 help="CORRIDOR RETIMING (separate from --smooth/--prioritized). STAGE A first "
+                      "MEASURES how far arms may desync before anything touches -- a certified "
+                      "envelope, computed once with the same oracle -- then STAGES B+C plan "
+                      "inside it with ZERO collision checks: an arm rests only at ITS OWN "
+                      "events (never at a barrier it merely crosses) and runs at its own joint "
+                      "limit. A pair whose corridor is 0 must move together, which is how "
+                      "handovers/co-grasps express themselves. Prints the corridor widths.")
+  r.add_argument("--force-limits", action="store_true",
+                 help="With --corridor: bound each arm's speed AND acceleration so the "
+                      "INERTIAL wrench on its grasp stays inside the wrench.PARAMS caps. The "
+                      "planner's LP is quasi-static (gravity only), so fast execution can "
+                      "overload a grasp it certified; this slows ONLY the loaded arm, only "
+                      "where it is loaded, instead of the blunt global --joint-rate. "
+                      "Point-mass model (m*a, m*a*lever); arrivals shift later as needed.")
+  r.add_argument("--wrench-margin", type=float, default=1.0, metavar="F",
+                 help="Fraction of each grasp cap --force-limits may use (default 1.0 = the "
+                      "full cap). Lower it (e.g. 0.7) for headroom against the unmodelled "
+                      "angular term and tracking error.")
+  r.add_argument("--corridor-ds", type=float, default=1.0, metavar="RAD",
+                 help="--corridor stage A: arc spacing of the certification grid (default 1.0).")
+  r.add_argument("--corridor-ds-lead", type=float, default=0.25, metavar="RAD",
+                 help="--corridor stage A: lead step probed outward from the diagonal (0.25).")
+  r.add_argument("--corridor-lead-max", type=float, default=4.0, metavar="RAD",
+                 help="--corridor stage A: largest lead probed (default 4.0 rad).")
+  r.add_argument("--smooth", action="store_true",
+                 help="With --prioritized: spread each arm's motion CONTINUOUSLY between its "
+                      "own events instead of sprinting to the next barrier and parking there "
+                      "until the event fires. Fire times and the whole schedule are unchanged "
+                      "-- only the pacing between arrivals, so an arm decelerates just at its "
+                      "OWN events. Oracle-checked per interval; an interval that would conflict "
+                      "keeps its scheduled timing.")
+  r.add_argument("--arm-rate", action="store_true",
+                 help="Apply JOINT_RATE per ARM instead of to the composite arc. Today an arm "
+                      "moving alongside others advances at only |dq_arm|/|dq_composite| of the "
+                      "nominal speed (measured 0.41-0.61 on car-mini), so arms crawl for a "
+                      "purely parametric reason; this restores the intended semantics and never "
+                      "exceeds it (bounded by sqrt(#arms)). On the shared clock it rescales TIME "
+                      "only -- same configurations, so the planner's collision certificate still "
+                      "holds with no extra checking. Works with and without --prioritized.")
+  r.add_argument("--coll-scale", type=float, default=1.0, metavar="F",
+                 help="DEBUG: shrink every contact-enabled ARM collision primitive by F "
+                      "(capsule/cylinder radius, sphere radius, box extents; parts NEVER "
+                      "scaled). Try 0.95/0.9 to give desync room when the oracle wedges. "
+                      "Applied before witnesses/problem/sim so IK, the oracle and the MuJoCo "
+                      "capsules agree. Default 1.0 = untouched. Not for validation runs: "
+                      "clearances no longer match the planner's certified geometry.")
   r.add_argument("--record", metavar="FILE", default=None, help="save a replayable .npz")
   r.add_argument("--gui", action="store_true", help="live MuJoCo viewer during execution")
+  r.add_argument("--prioritized", action="store_true",
+                 help="EXPERIMENTAL v2 ASYNC retiming: arms desync so only the arm(s) acting at "
+                      "each event (incl. holders) ramp to rest; uninvolved arms cross mode "
+                      "barriers without stopping. Conflicts are found with mr_bench's own check "
+                      "at desynced configs and resolved by FUSING the pair over disjoint arc "
+                      "windows (CEGAR restarts). KNOWN GAP: the oracle SKIPS pairs the certified "
+                      "path itself drives deep (gripper-vs-held-target during insertion), so "
+                      "desync can drive those together unchecked -- measured on car-mini as a "
+                      "grasp break at 81.8N and two missed seats. cross8 passes 39/39. Gains "
+                      "little here anyway: ~2 of 3 arms must rest at each event, so most stops "
+                      "are physically required. RETIMING_TRACE=1 traces couplings. Default = "
+                      "lockstep. For smoother motion prefer --arm-rate, which is safe.")
   r.add_argument("--verbose", action="store_true")
 
   v = sub.add_parser("replay", help="view a recording (kinematic playback)")
