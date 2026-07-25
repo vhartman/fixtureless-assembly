@@ -2109,6 +2109,9 @@ def _cli_run(a):
     if not path:
       print("[sim] motion planner found no path.")
       return
+    if a.mp_cograsp:
+      print("[flag] --mp-cograsp ACTIVE: checking co-grasp rigidity along the loaded path.")
+      MP.report_cograsp_drift(C, prob, path, rik)
     rep = execute_motion_plan(C, asm, plan, states, prob, path, gripper_kinds=gripper_kinds,
                               record=a.record, gui=a.gui, visual=not a.no_arm_meshes,
                               verbose=a.verbose, prioritized=a.prioritized,
@@ -2152,6 +2155,10 @@ def _build_cli():
                       "--mp-path (the saved path already encodes it).")
   r.add_argument("--mp-runtime", type=float, default=60.0,
                  help="v2: BiRRT budget (s); ignored with --mp-path")
+  r.add_argument("--mp-cograsp", action="store_true",
+                 help="v2: before executing, report how far each pair of co-grasping tool "
+                      "centres drifts from its keyframe relative pose along the path. Lets a "
+                      "SAVED plan+path pair be audited without re-planning.")
   r.add_argument("--no-arm-meshes", action="store_true",
                  help="v2: skip the real link VISUAL meshes (default on) -- capsules only. "
                       "Faster to build; the collision model is the capsules either way.")

@@ -740,6 +740,20 @@ def build_parser():
            "each add_grasp into a GOTO to the pre-grasp (gripper retracted DELTA m along its "
            "-approach axis, default 0.05) + the real brace reach. Default off.",
   )
+  g_skills.add_argument(
+      "--fuse-pre-skill", action="store_true",
+      help="With --motion-plan and any --pre-* split: BEFORE the export, re-solve every pre-skill "
+           "funnel keyframe with each arm that is NOT supposed to move PINNED (hard eq) to the "
+           "skill witness, instead of letting the exporter solve it with only a weight-1.0 pull. "
+           "The skill constraints are RELATIVE, so today the optimiser pays for the backoff by "
+           "moving the cheaper body: measured on car-mini, the TARGET assembly slides 16.8-48.8mm "
+           "between the funnel mouth and the seat while the inserted part covers 6.1-35.8mm of "
+           "the nominal 50mm -- i.e. the exported funnel is not an approach, and inside a "
+           "--fuse-cograsp span it re-introduces exactly the holder drift fusion removed. The "
+           "skill keyframe is never re-solved (so fused pairs survive). ALL-OR-NOTHING per "
+           "split: any residual/penetration/no-improvement verdict keeps today's keyframe. The "
+           "exported task structure is identical either way.",
+  )
   g_output.add_argument(
       "--hoist-releases", action="store_true",
       help="POST-PASS after --solve (before witness optimization): bubble every `release` as "
@@ -764,6 +778,19 @@ def build_parser():
            "arms instead of passing through them -- important before motion planning, where "
            "mr_bench validates every arm. Note idle arms are at HOME in the witness scene.",
   )
+  g_witness.add_argument(
+      "--fuse-cograsp", action="store_true",
+      help="With --motion-plan: AFTER witness optimization and BEFORE the export, re-solve "
+           "each (add_grasp, assemble) witness PAIR as ONE 2-phase KOMO instead of two "
+           "independent single-keyframe IK solves. The two solves agree on the "
+           "object-relative gripper pose but land in different arm BRANCHES (measured "
+           "4-5 rad apart), and since a brace exports as a bare goto the co-grasp is then "
+           "unconstrained between keyframes -- the braced gripper swings metres away and "
+           "back while nominally welded to the object. A low-weight cross-phase cost on the "
+           "brace joint delta and the held object's pose delta collapses that. Per pair it "
+           "is ALL-OR-NOTHING: any failed/violated/not-improved solve keeps BOTH originals. "
+           "Pair with --mp-cograsp --mp-sequence to measure the effect.",
+  )
   g_ik.add_argument(
       "--strict-collisions", type=float, nargs="?", const=1e-4, default=None, metavar="EPS",
       help="With --real-ik: REJECT any KOMO witness whose skill scene has total penetration "
@@ -785,6 +812,14 @@ def build_parser():
            "distance. Names the culprit (arm-arm graze / part-vs-table / part attached to a "
            "gripper it should have released) so 'looks fine in viser but the planner rejects' "
            "becomes concrete.",
+  )
+  g_mp.add_argument(
+      "--mp-cograsp", action="store_true",
+      help="With --motion-plan: AFTER planning, FK the solved path and report how far each "
+           "pair of co-grasping tool centres drifts from its keyframe relative pose. A brace "
+           "exported as a bare goto is unconstrained BETWEEN keyframes, so two grippers welded "
+           "to one object can move independently; this measures it. SEQUENCE problems only -- "
+           "pair it with --mp-sequence or it prints 'skipping'.",
   )
   g_mp.add_argument(
       "--mp-save", metavar="FILE", default=None,
@@ -1422,12 +1457,33 @@ def run(cfg):
                 gripper_kind=gk, handovers=cfg.handovers, allow_place=cfg.allow_place,
                 bracing=cfg.bracing, verbose=False,
                 robot_collisions=cfg.witness_robot_collisions)
+          if cfg.fuse_cograsp:
+            from solver import fuse_cograsp_witnesses
+            print("[flag] --fuse-cograsp ACTIVE: re-solving each (add_grasp, assemble) "
+                  "witness pair as ONE 2-phase KOMO so the brace arm keeps its IK branch "
+                  "across both keyframes.")
+            mp_wit, _frep = fuse_cograsp_witnesses(
+                C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
+                handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing)
+          # AFTER fusing: this pass never re-solves a SKILL witness, so a fused pair survives
+          # untouched -- it only replaces the pre-* GOTO keyframes the exporter would solve.
+          mp_pre = None
+          if cfg.fuse_pre_skill:
+            from solver import fuse_pre_skill_witnesses
+            print("[flag] --fuse-pre-skill ACTIVE: each pre-* GOTO keyframe is re-solved with "
+                  "every arm that does NOT move with the skill PINNED (hard eq) to the skill "
+                  "witness. A rejected split keeps today's keyframe; the task structure never "
+                  "changes.")
+            mp_pre, _prep = fuse_pre_skill_witnesses(
+                C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
+                handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing)
           if cfg.mp_collision_tolerance != 0.01:
             print(f"[flag] --mp-collision-tolerance={cfg.mp_collision_tolerance:g}: exported "
                   f"problem validates configs at this total-penetration budget.")
           prob = MP.make_problem(C, assembly, plan, mp_wit, robots, robot_ik, gk,
                                  collision_tolerance=cfg.mp_collision_tolerance,
-                                 bracing=cfg.bracing, depgraph=not cfg.mp_sequence)
+                                 bracing=cfg.bracing, depgraph=not cfg.mp_sequence,
+                                 pre_witnesses=mp_pre)
           print(f"[motion-plan] {'SEQUENCE' if cfg.mp_sequence else 'DEPGRAPH'} problem, "
                 f"{len(prob.tasks)} tasks")
           if cfg.mp_clearance:
@@ -1447,6 +1503,9 @@ def run(cfg):
           if mp_path:
             print(f"[motion-plan] path {len(mp_path)} states, "
                   f"reaches terminal={prob.is_terminal_mode(mp_path[-1].mode)}")
+            if cfg.mp_cograsp:
+              print("[flag] --mp-cograsp ACTIVE: checking co-grasp rigidity along the path.")
+              MP.report_cograsp_drift(C, prob, mp_path, robot_ik)
             if cfg.mp_save is not None:
               MP.save_path(cfg.mp_save, mp_path)
               print(f"[motion-plan] saved path -> {cfg.mp_save} (load in sim with "

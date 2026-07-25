@@ -99,10 +99,14 @@ def _root_of(state, part, mate_parent):
 
 
 def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
-                home_state):
+                home_state, pre_witnesses=None):
   """Map the plan+witnesses to (tasks, sequence_names). robot_idx: {r: [joint indices]}
   in the problem config's joint order; witnesses[i] is the full-config keyframe for plan[i]
-  (None for non-IK actions -> skipped, no motion goal needed)."""
+  (None for non-IK actions -> skipped, no motion goal needed).
+
+  `pre_witnesses` (--fuse-pre-skill, {plan index: keyframe or None}) supplies the pre-* GOTO
+  keyframes ready-made, from solver.fuse_pre_skill_witnesses. None (the default) keeps the
+  historical behaviour: each split solves its own pre keyframe here, inside the export."""
   from multi_robot_multi_goal_planning.problems.planning_env import Task
   from multi_robot_multi_goal_planning.problems.core.goals import SingleGoal
 
@@ -149,8 +153,14 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
     # scene graph ends exactly like the un-split task; only the last DELTA is contact-rich (on the
     # mr_bench SKILLS branch the second task becomes the skill). goal_for mutates cur: T_pre then
     # the real witness, so downstream keyframes see the real skill config.
-    pre_wit = robot_ik.pre_skill_witness(a, states[i], states[i + 1], assembly, wit)
+    pre_wit = (pre_witnesses.get(i) if pre_witnesses is not None else
+               robot_ik.pre_skill_witness(a, states[i], states[i + 1], assembly, wit))
     pan = f"{i:02d}_pre_{kind}_{'_'.join(str(x) for x in a[1:])}"
+    if pre_wit is None and pre_witnesses is not None:
+      # the fallback is silent in the historical path; once the consistency pass owns these
+      # keyframes, say it -- a None here exports a pre GOTO whose goal EQUALS the skill goal.
+      print(f"  [pre] {i:02d} {kind}: NO pre keyframe -- the goto goal equals the skill goal "
+            f"(zero-length funnel)")
     pre_goal = goal_for(involved, pre_wit if pre_wit is not None else wit)   # cur := T_pre
     return [(pan, Task(pan, involved, pre_goal, type="goto")),
             (name, mk_skill(goal_for(involved, wit)))]                       # cur := real witness
@@ -296,7 +306,7 @@ def _dependency_graph(plan, states, step_names, robots, robot_ik):
 
 
 def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, bracing,
-                 depgraph=False, collision_tolerance=0.01):
+                 depgraph=False, collision_tolerance=0.01, pre_witnesses=None):
   """Build a live mr_bench problem from our solved plan. depgraph=False -> SequenceMixin (a
   fixed total order); depgraph=True -> DependencyGraphMixin (the partial order, so the planner
   may reorder independent actions). Same tasks/frames/witnesses either way."""
@@ -325,10 +335,14 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
       rai_env.__init__(self)                               # -> robot_idx, start_pos, limits
       self.manipulating_env = True
       self.tasks, seq, step_names = build_tasks(
-          assembly, plan, witnesses, states, self.robots, self.robot_idx, robot_ik, home)
+          assembly, plan, witnesses, states, self.robots, self.robot_idx, robot_ik, home,
+          pre_witnesses=pre_witnesses)
       self.step_names = step_names                         # task names per plan action -- lets
       self.plan_actions = [tuple(a) for a in plan]         # sim.py map completed tasks back to
                                                            # plan actions (grasp/weld events)
+      self.states = states                                 # discrete state trajectory -- the
+                                                           # only place report_cograsp_drift can
+                                                           # read WHO holds WHAT per mode
       if depgraph:
         self.graph = _dependency_graph(plan, states, step_names, self.robots, robot_ik)
       else:
@@ -583,4 +597,157 @@ def report_problem_clearance(problem, plan=None, margin=0.02, verbose=True):
           f"mr_bench check, idle arms at HOME). '[obj_X on a?_ur_vacuum]' = obj_X is ATTACHED "
           f"to that gripper at this keyframe -- a part that should REST but is welded to an arm "
           f"is a re-rooting bug, not a geometry clash.")
+  return rows
+
+
+def _pose_to_T(pose7):
+  """rai pose [x y z qw qx qy qz] -> 4x4 homogeneous. Local because the drift metric needs
+  matrix composition, and P._quat_mul/_pose_invert only speak the 7-vector convention."""
+  w, x, y, z = (float(v) for v in pose7[3:7])
+  M = np.eye(4)
+  M[:3, :3] = [[1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+               [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+               [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]]
+  M[:3, 3] = np.asarray(pose7[:3], dtype=float)
+  return M
+
+
+def _rel_deviation(T_ref, T):
+  # (mm, deg) of T relative to T_ref. The translation norm is read in T_ref's frame, so it is
+  # NOT symmetric under swapping the pair -- see the ANCHOR note in report_cograsp_drift.
+  d = np.linalg.inv(T_ref) @ T
+  ang = np.degrees(np.arccos(np.clip((np.trace(d[:3, :3]) - 1.0) / 2.0, -1.0, 1.0)))
+  return float(np.linalg.norm(d[:3, 3])) * 1000.0, float(ang)
+
+
+def report_cograsp_drift(C, problem, mp_path, robot_ik, tol_mm=1.0, tol_deg=1.0, verbose=True):
+  """CO-GRASP RIGIDITY along a solved motion path -- the companion diagnostic to
+  report_problem_clearance (that one checks the task-goal KEYFRAMES; this one checks what
+  happens BETWEEN them).
+
+  Two grippers on one group are a CLOSED kinematic loop, but the exporter never closes it:
+  add_grasp leaves as a bare type="goto" (see the TODO at the add_grasp branch of build_tasks)
+  and a continuing holder is pinned only by a joint goal, so between keyframes both tool
+  centres are welded to the SAME object yet free to move independently. This replays the
+  planned path through rai FK and measures, per co-grasp span and per gripper pair, how far
+  the pair's RELATIVE transform drifts from its value at the span's first path state -- a
+  perfect brace holds it at 0.
+
+  FRAMES: robot_ik.gripper_frame[r], the tool centre the grasp IK constrains. Both frames are
+  robot-mounted, so their relative pose is a pure function of q: the attach mode is irrelevant
+  and no re-parenting has to be replayed (unlike sim.execute_motion_plan).
+
+  SEQUENCE problems only -- the path-state -> discrete-state map walks mode_sequence's linear
+  mode chain (a depgraph linearization reorders task firings; same limitation as mode_sequence).
+
+  Returns [(i0, i1, group, holders, anchor, other, max_mm, k_mm, max_deg, k_deg), ...]."""
+  states = getattr(problem, "states", None)
+  if states is None or not hasattr(problem, "sequence"):
+    if verbose:
+      print("[cograsp] needs a SEQUENCE problem carrying .states (--mp-sequence); skipping.")
+    return []
+  if not mp_path:
+    return []
+  robots = list(problem.robots)
+
+  # private FK copy: only the ARM joints are written, the caller's C is untouched.
+  C_fk = ry.Config()
+  C_fk.addConfigurationCopy(C)
+  jnames = C_fk.getJointNames()
+  ridx = {r: [i for i, jn in enumerate(jnames) if jn.startswith(r)] for r in robots}
+  q_base = np.asarray(C_fk.getJointState()).copy()
+
+  def full_q(st):
+    flat = st.q.state() if hasattr(st.q, "state") else np.asarray(st.q)
+    q, o = q_base.copy(), 0
+    for r in robots:
+      n = len(ridx[r])
+      q[ridx[r]] = flat[o:o + n]
+      o += n
+    return q
+
+  # path state -> index into `states`. On a SEQUENCE problem the modes advance one task at a
+  # time, so a state carrying the k-th mode of mode_sequence() has k tasks FIRED; a plan
+  # ACTION is done once its LAST task fires (--pre-* splits one action into two tasks). A mode
+  # that no path state carries (two goals met by one config) is simply skipped -- it lasted
+  # zero path length, so nothing can drift inside it.
+  mkey = lambda m: tuple(np.atleast_1d(m.task_ids).tolist())
+  order = {mkey(m): k for k, m in enumerate(mode_sequence(problem))}
+  tid = {t.name: i for i, t in enumerate(problem.tasks)}
+  last = sorted(max(tid[nm] for nm in nms) for nms in problem.step_names if nms)
+  done = [int(np.searchsorted(last, order[mkey(st.mode)], side="left")) for st in mp_path]
+
+  def cograsps(state):
+    # holders -> group, for every subassembly held by 2+ grippers
+    out = {}
+    for g in state.subassemblies():
+      hs = tuple(sorted({c[1] for p in g for c in state.supports.get(p, ()) if c[0] == "grasp"}))
+      if len(hs) >= 2:
+        out[hs] = frozenset(g)
+    return out
+
+  # MAXIMAL spans: consecutive path states in which the SAME holder set co-holds the SAME
+  # group. The group may GROW (an assemble merges the mated part in) without ending the span --
+  # the grippers do not move at a mate, so the reference stays valid across it.
+  spans, open_ = [], {}                                    # holders -> [i0, group-so-far]
+  for k in range(len(mp_path)):
+    cg = cograsps(states[done[k]])
+    for hs in list(open_):
+      g = cg.get(hs)
+      if g is None or not (g & open_[hs][1]):
+        spans.append((open_[hs][0], k - 1, open_.pop(hs)[1], hs))
+      else:
+        open_[hs][1] = open_[hs][1] | g
+    for hs, g in cg.items():
+      open_.setdefault(hs, [k, g])
+  for hs, (i0, g) in open_.items():
+    spans.append((i0, len(mp_path) - 1, g, hs))
+  spans.sort()
+
+  # ANCHOR: the drift's translation norm is read in ONE gripper's frame, so it is not
+  # symmetric in the pair (the rotation angle is). Anchor on the INCUMBENT -- the arm whose
+  # UNINTERRUPTED grasp of this group started earliest -- so the number reads "how far the
+  # newcomer (the brace) wanders in the frame of the arm that owns the object".
+  def holds(state, r, grp):
+    return any(c[0] == "grasp" and c[1] == r for p in grp for c in state.supports.get(p, ()))
+
+  rows = []
+  for i0, i1, grp, hs in spans:
+    grp0 = cograsps(states[done[i0]])[hs]                  # the group as of the span START
+
+    def since(r):
+      j = done[i0]
+      while j > 0 and holds(states[j - 1], r, grp0):
+        j -= 1
+      return j
+
+    anchor = min(hs, key=lambda r: (since(r), r))
+    Ts = []
+    for k in range(i0, i1 + 1):
+      C_fk.setJointState(full_q(mp_path[k]))
+      Ts.append({r: _pose_to_T(C_fk.getFrame(robot_ik.gripper_frame[r]).getPose()) for r in hs})
+    for other in [r for r in hs if r != anchor]:
+      ref = np.linalg.inv(Ts[0][anchor]) @ Ts[0][other]
+      dev = [_rel_deviation(ref, np.linalg.inv(T[anchor]) @ T[other]) for T in Ts]
+      k_mm = int(np.argmax([v[0] for v in dev]))
+      k_deg = int(np.argmax([v[1] for v in dev]))
+      rows.append((i0, i1, grp, hs, anchor, other,
+                   dev[k_mm][0], i0 + k_mm, dev[k_deg][1], i0 + k_deg))
+
+  if verbose:
+    bad = [r for r in rows if r[6] > tol_mm or r[8] > tol_deg]
+    print(f"[cograsp] {len(spans)} co-grasp span(s) over {len(mp_path)} path states; "
+          f"{len(bad)}/{len(rows)} gripper pair(s) drift past {tol_mm:g}mm / {tol_deg:g}deg")
+    for i0, i1, grp, hs, anchor, other, mm, kmm, deg, kdeg in rows:
+      acts = sorted({done[k] for k in range(i0, i1 + 1)})
+      flag = "   <<< NOT RIGID" if (mm > tol_mm or deg > tol_deg) else ""
+      print(f"  path[{i0:3d}..{i1:3d}]  after actions {acts[0]}..{acts[-1]}  "
+            f"{{{','.join(sorted(grp))}}} held by {'+'.join(hs)}  "
+            f"{other} rel {anchor}: max {mm:8.1f}mm @path[{kmm}], "
+            f"{deg:6.1f}deg @path[{kdeg}]{flag}")
+    if bad:
+      print("[cograsp] a co-grasp is a CLOSED kinematic loop the export does not close "
+            "(add_grasp -> type=\"goto\"): these are two grippers welded to ONE object moving "
+            "independently. Deviation is measured from the span's FIRST path state and is 0 "
+            "there by construction.")
   return rows

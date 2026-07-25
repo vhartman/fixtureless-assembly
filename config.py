@@ -126,6 +126,7 @@ class RunConfig:
   optimize_witnesses: Optional[str] = None
   witness_clearance: float = 0.0
   witness_robot_collisions: bool = False
+  fuse_cograsp: bool = False
 
   # -- skills / pre-insertion splits --
   skill: float = 0.0
@@ -133,6 +134,7 @@ class RunConfig:
   pre_pick: float = 0.0
   pre_place: float = 0.0
   pre_add_grasp: float = 0.0
+  fuse_pre_skill: bool = False
 
   # -- motion-plan export (mr_bench) --
   motion_plan: bool = False
@@ -143,6 +145,7 @@ class RunConfig:
   mp_shortcut_iters: int = 1000
   mp_shortcut_res: Optional[float] = None
   mp_clearance: bool = False
+  mp_cograsp: bool = False
   mp_save: Optional[str] = None
   mp_collision_tolerance: float = 0.01
   mp_viser: bool = False

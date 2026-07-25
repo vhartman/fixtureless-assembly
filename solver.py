@@ -272,6 +272,37 @@ def set_cheap_check_debug(on=True):
   _CHEAP_DEBUG_VIEW = bool(on)
 
 
+# ---------------------------------------------------------------------------------------
+# PRE-* funnel-mouth algebra. One definition per skill family so the exporter's backoff and
+# the consistency pass's NOMINAL approach vector can never drift apart (they used to be four
+# inline expressions, only reachable through a rai solve). Pure numpy: unit-testable.
+# ---------------------------------------------------------------------------------------
+def _backoff_ee(ee_target, delta):
+  # pick / add_grasp: RETRACT the tool centre along -approach. The corrected EE +z points from
+  # the standoff INTO the part and `ee_target` is expressed in the PART frame, so this is a
+  # pure translation there.
+  out = np.asarray(ee_target, dtype=float).copy()
+  out[:3] = out[:3] - delta * (_quat_to_R(out[3:]) @ np.array([0.0, 0.0, 1.0]))
+  return out
+
+
+def _backoff_place(target, delta):
+  # place: LIFT the group off its rest pose, +z in WORLD (the target is an absolute pose).
+  out = np.asarray(target, dtype=float).copy()
+  out[2] = out[2] + delta
+  return out
+
+
+def _backoff_mate(rel_pos, axis, delta):
+  # assemble: back off along -mate_axis in `onto`'s frame (parts stay axis-aligned, so the
+  # base-frame mate axis is also the offset direction there). `axis` None = the part has no
+  # mate axis: the backoff is SKIPPED, i.e. the funnel has zero length. Historical behaviour,
+  # kept bit-identical -- fuse_pre_skill_witnesses is the one that reports it.
+  if axis is None:
+    return rel_pos
+  return rel_pos - delta * np.asarray(axis, dtype=float)
+
+
 class IKFailureLogDone(Exception):
   # raised by RobotIK._log_failure (only when fail_log_stop is set) once the failure-log
   # window or cap is reached: in debug mode the run's PURPOSE is the failure browser, so
@@ -410,6 +441,13 @@ class RobotIK:
     # (position + weighted orientation) -- costs, never constraints, so feasibility never
     # yields to smoothness.
     self._opt_pull = None
+    # PRE-SKILL PIN spec (post-pass only; None during search + export => byte-identical).
+    # {joint_name: value}: _add_pin turns it into ONE hard qItself eq at the skill weight, so the
+    # named joints are FROZEN for that solve. This is the term _opt_pull cannot be: a sos cost at
+    # weight 1e0 against eq weights of 1e1 never stops a free body from translating, an eq does.
+    # fuse_pre_skill_witnesses uses it to hold every arm that is NOT supposed to move during a
+    # pre-* approach, so the funnel offset is paid for by the ACTOR instead of by the world.
+    self._pin_joints = None
     self.fail_recorder = None                             # viser recorder for failed binds
     self.fail_log_cap = 300
     self.fail_log_seconds = 60.0                          # window from the FIRST failure
@@ -427,23 +465,48 @@ class RobotIK:
     grasp = grasp_pose(assembly, part, grasp_id)
     return np.concatenate([grasp[:3], _quat_mul(grasp[3:], self.q_correction[robot])])
 
-  def _add_grasp_maintenance(self, komo, state, assembly):
+  def _add_grasp_maintenance(self, komo, state, assembly, phase=1):
     # GRASP MAINTENANCE: every grasp that scene_for does NOT enforce kinematically (i.e.
     # every BRACE: a holder of a table-parented group, or a secondary holder of a held
     # group) becomes an explicit objective -- the gripper pinned at its grasp, the arm a
     # co-optimized DOF. Without this, brace arms sit at HOME in the IK scene (obstacles in
     # the wrong place) and a moved group slides out of its braces' grippers.
+    # `phase` exists only so fuse_cograsp_witnesses can ground the SAME objectives on the
+    # second keyframe of a 2-phase KOMO; every single-phase caller keeps the default.
+    for r, pt, tgt in self.maintenance_grasps(state, assembly):
+      if self._pin_joints and any(n.startswith(r + "_") for n in self._pin_joints):
+        # this arm is FROZEN by the pre-skill pin, and so is what it holds (only arms that do
+        # NOT move with the skill are ever pinned), so the grasp is already maintained. Keeping
+        # the eq would demand that a frozen pair drive a residual the witness itself only met to
+        # ~1e-4 to zero -- an unsatisfiable constraint that makes the WHOLE solve infeasible
+        # (measured: 2 of 4 assembles infeasible, and the other 2 thrown 1.5-1.8 rad off branch).
+        continue
+      komo.addObjective([phase, phase], ry.FS.positionRel, [self.gripper_frame[r], pt],
+                        ry.OT.eq, [1e1], tgt[:3])
+      komo.addObjective([phase, phase], ry.FS.quaternionRel, [self.gripper_frame[r], pt],
+                        ry.OT.eq, [1e1], tgt[3:])
+
+  def _add_grasp_objectives(self, komo, robot, gpart, ee_target, phase=1):
+    # the NEW gripper pinned at its grasp on `gpart` (the add_grasp/handover reach). Split
+    # out of _ik_add_grasp so fuse_cograsp_witnesses can ground it on either keyframe of a
+    # 2-phase KOMO; the single-phase caller keeps the default.
+    komo.addObjective([phase, phase], ry.FS.positionRel, [self.gripper_frame[robot], gpart],
+                      ry.OT.eq, [1e1], ee_target[:3])
+    komo.addObjective([phase, phase], ry.FS.quaternionRel, [self.gripper_frame[robot], gpart],
+                      ry.OT.eq, [1e1], ee_target[3:])
+
+  def maintenance_grasps(self, state, assembly):
+    # the (robot, part, ee_target) triples _add_grasp_maintenance pins. Split out so the
+    # fused-witness re-validation can score the SAME residuals the objectives constrain.
     grp_of = {p: g for g in state.subassemblies() for p in g}
+    out = []
     for r, (pt, gid) in self.holders(state).items():
       g = grp_of[pt]
       root = _group_root(state, g)
       if pt == root and state.parent.get(root) == ("gripper", r):
         continue                            # kinematic holder: enforced by the attach
-      tgt = self.ee_target(r, pt, gid, assembly)
-      komo.addObjective([1, 1], ry.FS.positionRel, [self.gripper_frame[r], pt],
-                        ry.OT.eq, [1e1], tgt[:3])
-      komo.addObjective([1, 1], ry.FS.quaternionRel, [self.gripper_frame[r], pt],
-                        ry.OT.eq, [1e1], tgt[3:])
+      out.append((r, pt, self.ee_target(r, pt, gid, assembly)))
+    return out
 
   def _disable_inactive_collision(self, C, active_robot):
     # drop the collision geometry of every robot EXCEPT `active_robot` (setContact(0) on their
@@ -678,6 +741,19 @@ class RobotIK:
       komo.addObjective([1, 1], ry.FS.quaternion, [ee], ry.OT.sos,
                         [p["weight"] * p["rot_weight"]],
                         np.asarray(p["ee_quat"], dtype=float))
+
+  def _add_pin(self, komo, C):
+    # inject the pre-skill joint PIN (no-op unless fuse_pre_skill_witnesses set _pin_joints).
+    # Names absent from C are dropped, which is what makes this a no-op in a _restrict_to_arm
+    # scene: there the other arms are already frozen, so there is nothing left to pin.
+    p = self._pin_joints
+    if not p:
+      return
+    sel = [n for n in C.getJointNames() if n in p]
+    if not sel:
+      return
+    komo.addObjective([1, 1], ry.FS.qItself, sel, ry.OT.eq, [1e1],
+                      [p[n] for n in sel])
 
   def _pen_ok(self, C, q):
     # --strict-collisions gate: total penetration of the skill scene at witness q (the same
@@ -1014,8 +1090,7 @@ class RobotIK:
     # The corrected EE +z points from the standoff INTO the part, so backing off is -z_EE, in
     # the PART frame (ee_target is EE-relative-to-part). Gives the pre-grasp funnel-mouth pose.
     if backoff > 0.0:
-      ee_target = ee_target.copy()
-      ee_target[:3] = ee_target[:3] - backoff * (_quat_to_R(ee_target[3:]) @ np.array([0.0, 0.0, 1.0]))
+      ee_target = _backoff_ee(ee_target, backoff)
 
     robot_ee_name = self.gripper_frame[robot]
     part_name = part
@@ -1050,6 +1125,7 @@ class RobotIK:
       komo.addControlObjective([], 0, 1e-1)
       komo.addControlObjective([], 1, 1e-1)
       self._add_pull(komo, C, robot)                      # witness-opt pull (no-op in search)
+      self._add_pin(komo, C)                              # pre-skill pin (no-op in search)
       # 6-DOF: gripper tool-center must sit at the (approach-corrected) grasp on the part:
       #   pose(ee) relative to pose(part) == ee_target.
       komo.addObjective(
@@ -1113,8 +1189,7 @@ class RobotIK:
     # PRE-ADD-GRASP backoff (--pre-add-grasp): RETRACT the tool-center along -approach (-z_EE),
     # exactly like pre-pick -- the pre-grasp funnel mouth for the brace/handover reach.
     if backoff > 0.0:
-      ee_target = ee_target.copy()
-      ee_target[:3] = ee_target[:3] - backoff * (_quat_to_R(ee_target[3:]) @ np.array([0.0, 0.0, 1.0]))
+      ee_target = _backoff_ee(ee_target, backoff)
     set_part_contact(C, gpart, 0)                        # the new gripper is meant to touch gpart
 
     def build(collisions):
@@ -1124,10 +1199,8 @@ class RobotIK:
       komo.addControlObjective([], 0, 1e-1)
       komo.addControlObjective([], 1, 1e-1)
       self._add_pull(komo, C, robot)                      # witness-opt pull (no-op in search)
-      komo.addObjective([1, 1], ry.FS.positionRel, [self.gripper_frame[robot], gpart],
-                        ry.OT.eq, [1e1], ee_target[:3])
-      komo.addObjective([1, 1], ry.FS.quaternionRel, [self.gripper_frame[robot], gpart],
-                        ry.OT.eq, [1e1], ee_target[3:])
+      self._add_pin(komo, C)                              # pre-skill pin (no-op in search)
+      self._add_grasp_objectives(komo, robot, gpart, ee_target)
       self._add_grasp_maintenance(komo, s0, assembly)     # existing braces stay at their grasps
       return komo
 
@@ -1167,8 +1240,7 @@ class RobotIK:
     # pose -> the object hovers above its landing spot (the pre-place funnel mouth), and the
     # place skill lowers the last DELTA.
     if backoff > 0.0:
-      target = target.copy()
-      target[2] = target[2] + backoff
+      target = _backoff_place(target, backoff)
 
     # SINGLE ACTIVE ARM: like pick, a place moves only the placer -- BUT only when the placer
     # is the group's SOLE holder. If another robot BRACES the group, that arm must co-move as
@@ -1195,6 +1267,7 @@ class RobotIK:
       komo.addControlObjective([], 0, 1e-1)
       komo.addControlObjective([], 1, 1e-1)
       self._add_pull(komo, C, robot)                      # witness-opt pull (no-op in search)
+      self._add_pin(komo, C)                              # pre-skill pin (no-op in search)
       # object-pose constraint (like assemble, not an EE pose): the group's reference part
       # must reach its canonical table pose, axis-aligned.
       komo.addObjective([1, 1], ry.FS.position, [ref], ry.OT.eq, [1e1], target[:3])
@@ -1282,15 +1355,23 @@ class RobotIK:
       komo.addObjective([], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [self.col_weight], [-0.0])
     komo.addControlObjective([], 0, 1e-1)
     komo.addControlObjective([], 1, 1e-1)
+    self._assemble_objectives(komo, part_name, onto, rel_pos, rel_quat, bias_axes)
+    return komo
+
+  def _assemble_objectives(self, komo, part_name, onto, rel_pos, rel_quat, bias_axes,
+                           phase=1):
+    # the mate constraint + its soft pose biases. Split out of _assemble_komo so
+    # fuse_cograsp_witnesses can ground it on the SECOND keyframe of a 2-phase KOMO; the
+    # single-phase caller keeps the default.
     # cube-pose constraint (NOT an EE pose): pose(part) relative to pose(onto) == the mate.
     #   positionRel([A, B]) / quaternionRel([A, B]) = pose of A expressed in B's frame.
-    komo.addObjective([1, 1], ry.FS.positionRel, [part_name, onto], ry.OT.eq, [1e1], rel_pos)
-    komo.addObjective([1, 1], ry.FS.quaternionRel, [part_name, onto], ry.OT.eq, [1e1], rel_quat)
+    komo.addObjective([phase, phase], ry.FS.positionRel, [part_name, onto], ry.OT.eq, [1e1], rel_pos)
+    komo.addObjective([phase, phase], ry.FS.quaternionRel, [part_name, onto], ry.OT.eq, [1e1], rel_quat)
     # slight position bias: pull the centre body toward the middle of the workspace. LOW
     # weight vs the mate eq -- only breaks the free-position DOF of a HELD assembly (inert on
     # the table). Keeps held assemblies centred instead of drifting to the reachable fringe.
     komo.addObjective(
-        [1, 1], ry.FS.position, [onto], ry.OT.sos, [_ASSEMBLE_POS_BIAS_W],
+        [phase, phase], ry.FS.position, [onto], ry.OT.sos, [_ASSEMBLE_POS_BIAS_W],
         list(_ASSEMBLE_POS_BIAS_TARGET),
     )
     # soft orientation bias on the centre body (`onto`): nudge its local +z / +x axes toward
@@ -1299,9 +1380,8 @@ class RobotIK:
     # Axis alignment is sign-free -- no quaternion double cover.
     if bias_axes is not None:
       z_dir, x_dir = bias_axes
-      komo.addObjective([1, 1], ry.FS.vectorZ, [onto], ry.OT.sos, [_ASSEMBLE_ORIENT_BIAS_W], list(z_dir))
-      komo.addObjective([1, 1], ry.FS.vectorX, [onto], ry.OT.sos, [_ASSEMBLE_ORIENT_BIAS_W], list(x_dir))
-    return komo
+      komo.addObjective([phase, phase], ry.FS.vectorZ, [onto], ry.OT.sos, [_ASSEMBLE_ORIENT_BIAS_W], list(z_dir))
+      komo.addObjective([phase, phase], ry.FS.vectorX, [onto], ry.OT.sos, [_ASSEMBLE_ORIENT_BIAS_W], list(x_dir))
 
   def _ik_assemble(self, action, s0, s1, assembly, seed, bias_axes=None, backoff=0.0, warm=None):
     self._cur_action = action                             # for PEN_VIEW_ACTION debug
@@ -1331,9 +1411,7 @@ class RobotIK:
     # -mate_axis). Parts stay axis-aligned (rel_quat=identity), so the base-frame mate_axis is
     # also the offset direction in `onto`'s frame -> a pure translation of rel_pos.
     if backoff > 0.0:
-      d = assembly.mate_axis(part)
-      if d is not None:
-        rel_pos = rel_pos - backoff * np.asarray(d, dtype=float)
+      rel_pos = _backoff_mate(rel_pos, assembly.mate_axis(part), backoff)
 
     # the mate seats the moving group flush against the target, so those contacts are intended
     # -- exclude the WHOLE moving group from collision (a single cube, or every cube of a
@@ -1406,6 +1484,7 @@ class RobotIK:
     for bias in biases:                                   # deterministic orientation sweep
       komo = self._assemble_komo(C, part_name, onto, rel_pos, rel_quat, bias)
       self._add_pull(komo, C, robot)                    # witness-opt pull (no-op in search)
+      self._add_pin(komo, C)                            # pre-skill pin (no-op in search)
       self._add_grasp_maintenance(komo, s0, assembly)     # braces pinned at their grasps
       feasible, witness = self._solve_ik(              # `warm` (e.g. the mated witness for a
           komo, restarts=0,                            # pre-insertion goto) warm-starts the solve
@@ -1416,6 +1495,7 @@ class RobotIK:
     if not feasible:                                      # fallback: unbiased random restarts
       komo = self._assemble_komo(C, part_name, onto, rel_pos, rel_quat, None)
       self._add_pull(komo, C, robot)                    # witness-opt pull (no-op in search)
+      self._add_pin(komo, C)                            # pre-skill pin (no-op in search)
       self._add_grasp_maintenance(komo, s0, assembly)
       feasible, witness = self._solve_ik(
           komo, restarts=6, seeds=([warm] if warm is not None else None), C=C)
@@ -1428,7 +1508,7 @@ class RobotIK:
 
     return feasible, witness
 
-  def pre_skill_witness(self, action, s0, s1, assembly, skill_witness=None):
+  def pre_skill_witness(self, action, s0, s1, assembly, skill_witness=None, pin=None):
     """EXPORT/REPLAY helper for --pre-pick/--pre-place/--pre-insertion: the PRE-skill GOTO
     keyframe -- the skill witness backed off along its approach axis (pick: -z_EE retract;
     place: +z lift; assemble: -mate_axis). Returns the full-config witness, or None (skill not
@@ -1439,7 +1519,13 @@ class RobotIK:
     given a full-config qItself pull toward it, so the goto config differs from the skill ONLY
     by the actor's delta backoff. Without this, the two independent solves can land in different
     IK basins (a whole wrist revolution measured for assemble) -> a long, possibly-colliding
-    'skill' motion between the two keyframes."""
+    'skill' motion between the two keyframes.
+
+    `pin` ({joint_name: value}, --fuse-pre-skill only) additionally FREEZES those joints by a
+    hard eq. The pull alone cannot enforce "only the actor moves": the skill constraints are
+    RELATIVE (positionRel(part, onto) for assemble, gripper-to-object for add_grasp), so a sos
+    cost at weight 1e0 lets the optimiser pay for the backoff by moving the cheaper body -- the
+    target assembly -- instead of the actor. None => byte-identical to the un-pinned solve."""
     kind = action[0]
     delta = {"pick": self.pre_pick_delta, "place": self.pre_place_delta,
              "add_grasp": self.pre_add_grasp_delta,
@@ -1453,6 +1539,7 @@ class RobotIK:
       self._opt_pull = {"mode": "joint", "robot": action[1],
                         "qmap": {n: float(warm[i]) for i, n in enumerate(names)},
                         "weight": self.pre_insertion_pull, "rot_weight": 1.0}
+    self._pin_joints = pin
     try:
       if kind == "pick":
         ok, w = self._ik_pick(action, s0, s1, assembly, None, backoff=delta, warm=warm)
@@ -1464,6 +1551,7 @@ class RobotIK:
         ok, w = self._ik_assemble(action, s0, s1, assembly, None, backoff=delta, warm=warm)
     finally:
       self._opt_pull = None
+      self._pin_joints = None
     return w if ok else None
 
 
@@ -1995,6 +2083,503 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
   robot_ik.strip_inactive_collision = _strip0
   return wit, {"before": before, "after": after, "improved": improved,
                "fallback": fallback}
+
+
+def _pose_deviation(pa, pb):
+  # (mm, deg) between two rai 7-poses. |dot| on the quaternions absorbs the double cover.
+  pa, pb = np.asarray(pa, dtype=float), np.asarray(pb, dtype=float)
+  dot = min(1.0, abs(float(np.dot(pa[3:], pb[3:]))))
+  return float(np.linalg.norm(pb[:3] - pa[:3])) * 1000.0, float(np.degrees(2.0 * np.arccos(dot)))
+
+
+def _quat_err_deg(v, target):
+  dot = min(1.0, abs(float(np.dot(np.asarray(v, dtype=float), np.asarray(target, dtype=float)))))
+  return float(np.degrees(2.0 * np.arccos(dot)))
+
+
+def _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
+                   bracing, grasp_table, who):
+  # states[i] = the discrete state plan[i] is applied IN (len = len(plan)+1), re-derived by
+  # replaying the plan through the SAME successor generator the search used. Shared by the
+  # witness post-passes, which all need the per-step state to rebuild IK scenes. `who` only
+  # names the caller in the error, which fires when the successor flags do not match the
+  # search that produced the plan.
+  states = [get_initial_state(C, assembly)]
+  for a in plan:
+    ns = next((ns for act, ns in successors(
+        states[-1], assembly, robots, grasp_table=grasp_table,
+        gripper_kind=gripper_kind, handovers=handovers, allow_place=allow_place,
+        bracing=bracing) if act == a), None)
+    if ns is None:                                          # successor flags don't match the plan
+      raise ValueError(
+          f"{who}: cannot reproduce action {tuple(a)} from the successor set "
+          f"-- the successor flags likely differ from the search that made the plan "
+          f"(bracing={bracing}, handovers={handovers}, allow_place={allow_place}). "
+          f"An add_grasp/handover in the plan needs bracing=True.")
+    states.append(ns)
+  return states
+
+
+def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
+                           gripper_kind=None, handovers=True, allow_place=True,
+                           bracing=False, grasp_table=None, weight=1e0,
+                           pos_tol=1e-3, ang_tol=1.0, verbose=True):
+  """CO-GRASP WITNESS FUSION -- a post-pass over a FIXED discrete plan, run AFTER
+  optimize_witnesses and BEFORE mp_export.
+
+  THE DEFECT. mp_export emits add_grasp as a bare type="goto", so a brace is enforced only
+  AT keyframes and is unconstrained between them. That would be harmless if the two
+  keyframes agreed, but they are two INDEPENDENT single-keyframe IK solves: the
+  object-relative gripper pose is identical at both by construction (same part, same grasp
+  id), yet the arm lands in a DIFFERENT IK branch, several radians apart. The exported
+  motion then swings the braced gripper across the workspace and back while it is nominally
+  welded to the object.
+
+  THE FIX. For each (add_grasp, assemble) pair the add_grasp enables, replace the two
+  independent solves with ONE KOMO over TWO keyframes -- phase 1 carries the add_grasp
+  keyframe's constraints, phase 2 the assemble keyframe's -- plus a low-weight cross-phase
+  COST (weight ~1e0 against the 1e1 eq, the _add_pull convention: cost never beats
+  feasibility) on the brace arm's joint delta and the held object's pose delta. When the
+  braced group is HELD its pose is a free variable, so the optimiser can simply not move it
+  and the brace config becomes identical at both frames. When the group RESTS on the table
+  its pose is pinned and only the brace-joint term can help -- the report says which case
+  applied per pair.
+
+  NO MODE SWITCH is needed: the brace exists at both keyframes as an OBJECTIVE (scene_for
+  attaches only the primary gripper-parented root), so both keyframes live in the SAME
+  kinematic configuration. That is verified per pair at runtime and the pair is skipped if
+  it ever stops being true.
+
+  ALL-OR-NOTHING per pair: a pair is accepted only if the joint solve converged, every
+  constraint residual and the penetration at BOTH keyframes are within tolerance (or no
+  worse than the witnesses being replaced), AND the brace joint delta actually shrank.
+  Otherwise BOTH original witnesses are kept -- a half-applied pair (the brace pinned at one
+  keyframe only) is strictly worse than either extreme.
+
+  Returns (witnesses, report). `witnesses` is a NEW list; the input is never mutated."""
+  import time
+  t0 = time.perf_counter()
+  if grasp_table is None:
+    _checker, grasp_table = _search_context(C, assembly, robots)
+  states = _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
+                          bracing, grasp_table, "fuse_cograsp_witnesses")
+
+  names = list(robot_ik.C.getJointNames())
+  # penetration budget: the --strict-collisions gate when one is configured, else a 0.1mm
+  # floor. Either way a fused keyframe may never be dirtier than the witness it replaces.
+  pen_gate = robot_ik.penetration_reject if robot_ik.penetration_reject is not None else 1e-4
+
+  def pairs():
+    # (add_grasp i, assemble j) where the assemble is the FIRST one the brace enables: it
+    # must mate onto the braced group while that brace is still in place, and the brace arm
+    # must not do anything else in between. handover routes through the same skill IK but has
+    # different semantics (the giver lets go), so it is deliberately out of scope.
+    for i, a in enumerate(plan):
+      if a[0] != "add_grasp":
+        continue
+      rb, gpart, gid = a[1], a[2], a[3]
+      for k in range(i + 1, len(plan)):
+        if plan[k][0] != "assemble":
+          if plan[k][1] == rb:
+            break                                           # the brace arm moves on first
+          continue
+        if robot_ik.holders(states[k]).get(rb) != (gpart, gid):
+          break                                             # brace no longer in place
+        tgrp = next((g for g in states[k].subassemblies() if plan[k][3] in g), ())
+        if gpart in tgrp:
+          yield i, k, rb, gpart, gid
+        break
+
+  out = list(witnesses)
+  rows = []
+  claimed = {}                                              # assemble index -> the add_grasp that took it
+  for i, j, rb, gpart, gid in pairs():
+    tag = f"[fuse] {i}->{j} brace {rb} on {gpart}"
+    if witnesses[i] is None or witnesses[j] is None:
+      rows.append((i, j, rb, False, "a witness is missing"))
+      if verbose:
+        print(f"  {tag}: SKIPPED (no witness to fuse)")
+      continue
+    if j in claimed:
+      # TWO braces before ONE assemble: pairs() maps each add_grasp to the first qualifying
+      # assemble, so both would write out[j] and the SECOND write would silently replace the
+      # assemble witness the first pair was fused against -- leaving that pair half-applied
+      # (its add_grasp keyframe optimised against a config that no longer exists) while
+      # printing ACCEPTED. Half-applied is strictly worse than untouched, so refuse. Fusing
+      # both jointly needs a 3-keyframe solve and is deliberately out of scope.
+      rows.append((i, j, rb, False, f"assemble {j} already fused with add_grasp {claimed[j]}"))
+      if verbose:
+        print(f"  {tag}: REJECTED (assemble {j} already fused with add_grasp "
+              f"{claimed[j]}; a 3-keyframe solve would be needed) -- BOTH originals kept")
+      continue
+    Ca = robot_ik.scene_for(states[i], assembly)
+    Cb = robot_ik.scene_for(states[j], assembly)
+    # SAME-MODE GUARD. The whole design rests on both keyframes living in one configuration;
+    # verify it rather than assume it, because a mismatch would silently solve phase 2 in the
+    # wrong scene.
+    parts = [p for p in states[j].bodies() if p in Ca.getFrameNames()]
+    same = (Ca.getFrameNames() == Cb.getFrameNames() and Ca.getJointNames() == Cb.getJointNames()
+            and all(_pose_deviation(Ca.getFrame(p).getPose(), Cb.getFrame(p).getPose())[0] < 1e-6
+                    for p in parts))
+    if not same:
+      rows.append((i, j, rb, False, "keyframes are not in the same kinematic mode"))
+      if verbose:
+        print(f"  {tag}: SKIPPED (the two keyframes are NOT one kinematic mode)")
+      continue
+
+    part, onto = plan[j][2], plan[j][3]
+    ee_t = robot_ik.ee_target(rb, gpart, gid, assembly)
+    rel_pos = np.asarray(assembly.relative_pose(part)[1], dtype=float)
+    rel_quat = np.array([1.0, 0.0, 0.0, 0.0])
+    moving = sorted(next((g for g in states[j].subassemblies() if part in g), (part,)))
+    grp = next((g for g in states[i + 1].subassemblies() if gpart in g), (gpart,))
+    root = _group_root(states[i + 1], grp)
+    held = states[i + 1].parent.get(root, (None,))[0] == "gripper"
+    bidx = [k for k, n in enumerate(names) if n.startswith(rb + "_")]
+
+    def build(bias):
+      komo = ry.KOMO(Ca, phases=2, slicesPerPhase=1, kOrder=1, enableCollisions=True)
+      # PER-SLICE collision exclusions. The two skills exclude DIFFERENT parts (add_grasp
+      # frees the part the new gripper is meant to touch, assemble frees the whole moving
+      # group whose seating is intended) and one KOMO has ONE contact configuration, so the
+      # union is unsound -- measured 42mm of penetration at a phase-1 keyframe in its own
+      # add_grasp scene. Slice frames are independent objects; set them before the
+      # collision objective is added.
+      komo.getFrame(part_shape_frame(Ca, gpart), 1.0).setContact(0)
+      for mp in moving:
+        komo.getFrame(part_shape_frame(Ca, mp), 2.0).setContact(0)
+      komo.addObjective([], ry.FS.accumulatedCollisions, [], ry.OT.ineq,
+                        [robot_ik.col_weight], [-0.0])
+      komo.addControlObjective([], 0, 1e-1)
+      komo.addControlObjective([], 1, 1e-1)
+      robot_ik._add_grasp_objectives(komo, rb, gpart, ee_t, phase=1)
+      robot_ik._add_grasp_maintenance(komo, states[i], assembly, phase=1)
+      robot_ik._assemble_objectives(komo, part, onto, rel_pos, rel_quat, bias, phase=2)
+      robot_ik._add_grasp_maintenance(komo, states[j], assembly, phase=2)
+      # CROSS-PHASE COST: the brace arm's joint delta plus the held object's pose delta. The
+      # object terms are inert when the group rests on the table (its pose is pinned there).
+      komo.addObjective([2, 2], ry.FS.qItself, [n for n in names if n.startswith(rb + "_")],
+                        ry.OT.sos, [weight], [], order=1)
+      komo.addObjective([2, 2], ry.FS.position, [gpart], ry.OT.sos, [weight], [], order=1)
+      komo.addObjective([2, 2], ry.FS.quaternion, [gpart], ry.OT.sos, [weight], [], order=1)
+      return komo
+
+    # STRUCTURED RESTARTS, as _ik_assemble: sweep the canonical orientation biases, each
+    # seeded from the ORIGINAL witnesses (the assemble one first -- it is the harder
+    # constraint and it won every measured pair), then unbiased random restarts. KOMO adds
+    # init noise and rai's RNG is not seeded by PYTHONHASHSEED, so a single-shot solve flips
+    # feasible/infeasible run to run; the sweep is what makes the pass reliable.
+    best, how = None, None
+    for bias in list(_ASSEMBLE_BIAS_ORIENTATIONS) + [None]:
+      komo = build(bias)
+      for sname, seed in (("assemble", witnesses[j]), ("add_grasp", witnesses[i])):
+        komo.initWithConstant(np.asarray(seed, dtype=float))
+        if ry.NLP_Solver(komo.nlp(), verbose=0).solve().dict()["feasible"]:
+          best, how = np.asarray(komo.getPath()).copy(), f"bias={bias} seed={sname}"
+          break
+      if best is not None:
+        break
+    if best is None:
+      komo = build(None)
+      for _ in range(6):
+        komo.initRandom()
+        if ry.NLP_Solver(komo.nlp(), verbose=0).solve().dict()["feasible"]:
+          best, how = np.asarray(komo.getPath()).copy(), "bias=None seed=random"
+          break
+
+    # RE-VALIDATION in the two ORIGINAL single-phase scenes (contact flags included), which
+    # is what catches an exclusion-set mismatch the fused KOMO could not see.
+    set_part_contact(Ca, gpart, 0)
+    for mp in moving:
+      set_part_contact(Cb, mp, 0)
+
+    def residuals(q1, q2):
+      # (max position error m, max orientation error deg, pen1 m, pen2 m) over EVERY eq
+      # constraint the two skill KOMOs impose, plus the total penetration of each scene.
+      pos, ang = 0.0, 0.0
+      Ca.setJointState(np.asarray(q1, dtype=float))
+      Cb.setJointState(np.asarray(q2, dtype=float))
+      checks = [(Ca, ry.FS.positionRel, [robot_ik.gripper_frame[rb], gpart], ee_t[:3], False),
+                (Ca, ry.FS.quaternionRel, [robot_ik.gripper_frame[rb], gpart], ee_t[3:], True),
+                (Cb, ry.FS.positionRel, [part, onto], rel_pos, False),
+                (Cb, ry.FS.quaternionRel, [part, onto], rel_quat, True)]
+      for Cx, st in ((Ca, states[i]), (Cb, states[j])):
+        for r, pt, tgt in robot_ik.maintenance_grasps(st, assembly):
+          checks.append((Cx, ry.FS.positionRel, [robot_ik.gripper_frame[r], pt], tgt[:3], False))
+          checks.append((Cx, ry.FS.quaternionRel, [robot_ik.gripper_frame[r], pt], tgt[3:], True))
+      for Cx, feat, frames, tgt, is_quat in checks:
+        v, _ = Cx.eval(feat, frames)
+        if is_quat:
+          ang = max(ang, _quat_err_deg(v, tgt))
+        else:
+          pos = max(pos, float(np.linalg.norm(np.asarray(v) - np.asarray(tgt))))
+      return (pos, ang, float(Ca.getCollisionsTotalPenetration()),
+              float(Cb.getCollisionsTotalPenetration()))
+
+    o_pos, o_ang, o_p1, o_p2 = residuals(witnesses[i], witnesses[j])
+    o_dq = float(np.linalg.norm(np.asarray(witnesses[j])[bidx] - np.asarray(witnesses[i])[bidx]))
+    Ca.setJointState(np.asarray(witnesses[i], dtype=float))
+    Cb.setJointState(np.asarray(witnesses[j], dtype=float))
+    o_mm, o_deg = _pose_deviation(Ca.getFrame(gpart).getPose(), Cb.getFrame(gpart).getPose())
+
+    why = None
+    if best is None:
+      why = "KOMO infeasible (all biases + restarts)"
+    else:
+      n_pos, n_ang, n_p1, n_p2 = residuals(best[0], best[1])
+      n_dq = float(np.linalg.norm(best[1][bidx] - best[0][bidx]))
+      Ca.setJointState(best[0])
+      Cb.setJointState(best[1])
+      n_mm, n_deg = _pose_deviation(Ca.getFrame(gpart).getPose(), Cb.getFrame(gpart).getPose())
+      if n_pos > max(pos_tol, o_pos):
+        why = f"position residual {n_pos*1000:.2f}mm > gate"
+      elif n_ang > max(ang_tol, o_ang):
+        why = f"orientation residual {n_ang:.2f}deg > gate"
+      elif n_p1 > max(pen_gate, o_p1) or n_p2 > max(pen_gate, o_p2):
+        why = (f"penetration {n_p1*1000:.2f}/{n_p2*1000:.2f}mm > gate "
+               f"{max(pen_gate, o_p1)*1000:.2f}/{max(pen_gate, o_p2)*1000:.2f}mm")
+      elif n_dq >= o_dq:
+        why = f"brace delta not improved ({o_dq:.3f} -> {n_dq:.3f} rad)"
+
+    case = "HELD" if held else "TABLE-RESTING"
+    if verbose:
+      print(f"  {tag} ({case} group): brace dq {o_dq:.3f}" +
+            (f" -> {n_dq:.3f} rad" if best is not None else " rad") +
+            f", object pose delta {o_mm:.1f}mm/{o_deg:.1f}deg" +
+            (f" -> {n_mm:.1f}mm/{n_deg:.1f}deg" if best is not None else "") +
+            (f"   REJECTED: {why} -- BOTH originals kept" if why else
+             f"   ACCEPTED [{how}]"))
+    if why is None:
+      out[i], out[j] = best[0].copy(), best[1].copy()
+      claimed[j] = i                                        # only on ACCEPT: a rejected pair
+                                                            # leaves out[j] untouched, so a
+                                                            # later add_grasp may still use it
+    rows.append((i, j, rb, why is None, why or how))
+
+  acc = sum(1 for r in rows if r[3])
+  if verbose:
+    print(f"[fuse] {acc}/{len(rows)} (add_grasp, assemble) pair(s) fused in "
+          f"{time.perf_counter() - t0:.1f}s; the rest keep BOTH original witnesses.")
+  return out, {"pairs": len(rows), "fused": acc, "rows": rows}
+
+
+def _pre_gate(o, n, pen_gate, max_dq, hold_dq, hold_mm, pos_tol, ang_tol):
+  """ALL-OR-NOTHING acceptance for ONE pre-skill keyframe. `n` = the pinned re-solve's metrics
+  (None = it did not converge), `o` = today's (None = today's solve failed outright, so there
+  is nothing to be worse than and only the absolute tolerances apply).
+
+  Every hard gate is "within the absolute tolerance OR no worse than the keyframe we are
+  replacing" -- the fuse convention, so the pass can never regress a metric. On top of that the
+  HEADLINE metric (approach-axis deviation: how far the moved body's pre->skill travel departs
+  from the nominal funnel vector) must STRICTLY improve, else there is nothing to buy and
+  today's keyframe is kept. Returns None to accept, or the reason to reject. Pure arithmetic."""
+  if n is None:
+    return "pinned solve infeasible"
+  lim = lambda k, t: t if o is None else max(t, o[k])
+  if n["pos"] > lim("pos", pos_tol):
+    return (f"funnel position residual {n['pos']*1000:.2f}mm > gate "
+            f"{lim('pos', pos_tol)*1000:.2f}mm")
+  if n["ang"] > lim("ang", ang_tol):
+    return f"funnel orientation residual {n['ang']:.2f}deg > gate {lim('ang', ang_tol):.2f}deg"
+  if n["pen"] > lim("pen", pen_gate):
+    return f"penetration {n['pen']*1000:.2f}mm > gate {lim('pen', pen_gate)*1000:.2f}mm"
+  if n["dq"] > lim("dq", max_dq):
+    return f"actor joint delta {n['dq']:.3f} rad > gate {lim('dq', max_dq):.3f} rad"
+  if n["hold"] > lim("hold", hold_dq):
+    return f"a non-moving arm shifted {n['hold']:.3f} rad > gate {lim('hold', hold_dq):.3f} rad"
+  if n["stat_mm"] > lim("stat_mm", hold_mm):
+    return f"a stationary body moved {n['stat_mm']:.1f}mm > gate {lim('stat_mm', hold_mm):.1f}mm"
+  if o is not None and n["dev"] >= o["dev"]:
+    return f"approach deviation not improved ({o['dev']:.1f} -> {n['dev']:.1f} mm)"
+  return None
+
+
+def fuse_pre_skill_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
+                             gripper_kind=None, handovers=True, allow_place=True,
+                             bracing=False, grasp_table=None, max_dq=0.35, hold_dq=0.02,
+                             hold_mm=2.0, pos_tol=1e-3, ang_tol=1.0, verbose=True):
+  """PRE-SKILL WITNESS CONSISTENCY -- a post-pass over a FIXED discrete plan, run AFTER
+  optimize_witnesses / fuse_cograsp_witnesses and BEFORE mp_export.
+
+  THE DEFECT. --pre-pick/--pre-place/--pre-add-grasp/--pre-insertion split a skill into a GOTO
+  to a funnel mouth plus the skill itself, and mp_export gets that first keyframe from
+  RobotIK.pre_skill_witness -- the skill's OWN single-keyframe KOMO with the target backed off,
+  warm-started from the skill witness plus a weight-1.0 qItself pull. Nothing in that solve says
+  "only the ACTOR may move". The skill constraints are RELATIVE (positionRel(part, onto) for
+  assemble, gripper-to-object for add_grasp), so the optimiser satisfies the backoff by moving
+  whichever body is cheaper -- and it moves the TARGET. Measured on car-mini-new: at every
+  assemble the target assembly obj_0 slides 16.8-48.8mm between the funnel mouth and the seat
+  while the inserted part covers only 6.1-35.8mm of the nominal 50mm. The exported funnel is
+  then not an approach at all, and inside a --fuse-cograsp span this third keyframe is exactly
+  the co-grasp drift fusion just removed (holder arms measured 0.085-0.200 rad off).
+
+  THE FIX. Re-solve each pre keyframe with every arm that is NOT supposed to move PINNED by a
+  hard qItself eq to the skill witness (RobotIK._add_pin). "Not supposed to move" = every robot
+  except the actor and the holders of the group the skill actually moves -- the co-holders must
+  ride along with it, so pinning them would be wrong (and infeasible). The pin is a CONSTRAINT,
+  not another cost: an eq at 1e1 stops the world from absorbing the offset, a sos at 1e0 (the
+  existing pull) never could.
+
+  The SKILL keyframe is never re-solved. That is what makes this compose for free with
+  --fuse-cograsp (a fused pair stays exactly as fused) and with --strict-collisions.
+
+  ALL-OR-NOTHING per split (see _pre_gate): reject -> today's keyframe is kept, with the reason
+  printed. The exported TASK STRUCTURE is identical either way -- the split always emits its two
+  tasks -- because sim.py --v2 rebuilds the task list from the saved config alone and any
+  per-action structural decision the exporter made would shift its task ids.
+
+  Returns (pre_witnesses, report). pre_witnesses maps a plan index to the keyframe mp_export
+  should use for that split (accepted or kept); mp_export.make_problem takes it as
+  `pre_witnesses=` and solves nothing itself."""
+  import time
+  t0 = time.perf_counter()
+  deltas = {"pick": robot_ik.pre_pick_delta, "place": robot_ik.pre_place_delta,
+            "add_grasp": robot_ik.pre_add_grasp_delta,
+            "assemble": robot_ik.pre_insertion_delta}
+  split = [i for i, a in enumerate(plan) if deltas.get(a[0], 0.0) > 0.0]
+  if not split:
+    if verbose:
+      print("[pre] no --pre-* split is active (--skill / --pre-pick / --pre-place / "
+            "--pre-add-grasp / --pre-insertion): nothing to make consistent.")
+    return {}, {"splits": 0, "consistent": 0, "rows": []}
+  if grasp_table is None:
+    _checker, grasp_table = _search_context(C, assembly, robots)
+  states = _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
+                          bracing, grasp_table, "fuse_pre_skill_witnesses")
+  names = list(robot_ik.C.getJointNames())
+  jidx = {r: [k for k, n in enumerate(names) if n.startswith(r + "_")] for r in robots}
+  # penetration budget: the --strict-collisions gate when one is configured, else a 0.1mm
+  # floor. Either way the repaired keyframe may never be dirtier than the one it replaces.
+  pen_gate = robot_ik.penetration_reject if robot_ik.penetration_reject is not None else 1e-4
+
+  pre, rows = {}, []
+  for i in split:
+    a = plan[i]
+    kind, actor, delta = a[0], a[1], deltas[a[0]]
+    s0, s1 = states[i], states[i + 1]
+    w = witnesses[i]
+    tag = f"[pre] {i:02d} {kind} {' '.join(str(x) for x in a[1:])}"
+    # BEFORE is today's export-time call, verbatim -- both the measurement baseline AND the
+    # fallback, so a rejected split exports exactly what it exports today.
+    before = robot_ik.pre_skill_witness(a, s0, s1, assembly, w)
+    pre[i] = before
+    if w is None:
+      rows.append((i, kind, False, "no skill witness", None, None))
+      if verbose:
+        print(f"  {tag}: SKIPPED (no skill witness to be consistent with)")
+      continue
+
+    # WHO MAY MOVE, and WHAT the approach is supposed to displace.
+    if kind == "assemble":
+      part, onto = a[2], a[3]
+      moving = set(next((g for g in s0.subassemblies() if part in g), (part,)))
+      axis = assembly.mate_axis(part)
+      body, ffr = part, [part, onto]                       # part travels +mate_axis in onto's frame
+      fpos, fquat = ry.FS.positionRel, ry.FS.quaternionRel
+    elif kind == "place":
+      root = a[2]
+      moving = set(next((g for g in s0.subassemblies() if root in g), (root,)))
+      axis = None
+      body = min(moving, key=_part_index)                  # group ref descends -delta in world z
+      ffr = [body]
+      fpos, fquat = ry.FS.position, ry.FS.quaternion
+    else:                                                  # pick / add_grasp: the GRIPPER
+      moving, axis = set(), None                           # approaches; NOTHING in the scene moves
+      body, ffr = robot_ik.gripper_frame[actor], [robot_ik.gripper_frame[actor], a[2]]
+      fpos, fquat = ry.FS.positionRel, ry.FS.quaternionRel
+    movers = {actor} | {r for r, (pt, _g) in robot_ik.holders(s0).items() if pt in moving}
+    pin = {names[k]: float(w[k]) for r in robots if r not in movers for k in jidx[r]}
+    if not pin:
+      rows.append((i, kind, False, "no arm to pin (every robot moves with the skill)", None, None))
+      if verbose:
+        print(f"  {tag}: SKIPPED (no arm to pin -- every robot co-moves)")
+      continue
+
+    # SCORING SCENE: the skill's own scene and the skill's own contact exclusions, so a
+    # penetration here is comparable with the one the skill IK itself gated on.
+    Cs = robot_ik.scene_for(s0, assembly)
+    if kind in ("pick", "add_grasp"):
+      set_part_contact(Cs, a[2], 0)                        # the gripper is meant to touch it
+    elif kind == "assemble":
+      for mp in moving:
+        set_part_contact(Cs, mp, 0)                        # the seating contact is intended
+    parts = [p for p in s0.bodies() if p in Cs.getFrameNames()]
+    stat = [p for p in parts if p not in moving]
+
+    def read(q):
+      Cs.setJointState(np.asarray(q, dtype=float))
+      fp, _ = Cs.eval(fpos, ffr)
+      fq, _ = Cs.eval(fquat, ffr)
+      grasps = [(Cs.eval(ry.FS.positionRel, [robot_ik.gripper_frame[r], pt])[0],
+                 Cs.eval(ry.FS.quaternionRel, [robot_ik.gripper_frame[r], pt])[0])
+                for r, pt, _t in robot_ik.maintenance_grasps(s0, assembly)]
+      return {"feat": (np.asarray(fp, dtype=float), np.asarray(fq, dtype=float)),
+              "body": np.asarray(Cs.getFrame(body).getPose(), dtype=float),
+              "parts": {p: np.asarray(Cs.getFrame(p).getPose(), dtype=float) for p in stat},
+              "grasps": grasps, "pen": float(Cs.getCollisionsTotalPenetration()),
+              "q": np.asarray(q, dtype=float)}
+
+    ref = read(w)                                          # the skill keyframe: the reference
+    # NOMINAL funnel vector: the world displacement the moved body SHOULD cover between the
+    # pre keyframe and the skill keyframe. Derived from the same _backoff_* algebra the
+    # exporter's solve used, so the two can never disagree.
+    if kind == "assemble":
+      onto_q = np.asarray(Cs.getFrame(onto).getPose(), dtype=float)[3:]   # Cs is still at `w`
+      nom = delta * (_quat_to_R(onto_q) @ np.asarray(axis, dtype=float)) \
+          if axis is not None else np.zeros(3)
+      want = _backoff_mate(ref["feat"][0], axis, delta)
+    elif kind == "place":
+      nom = np.array([0.0, 0.0, -delta])
+      want = _backoff_place(np.concatenate(ref["feat"]), delta)[:3]
+    else:
+      nom = delta * (_quat_to_R(ref["body"][3:]) @ np.array([0.0, 0.0, 1.0]))
+      want = _backoff_ee(np.concatenate(ref["feat"]), delta)[:3]
+
+    def metrics(q):
+      if q is None:
+        return None
+      m = read(q)
+      pos = float(np.linalg.norm(m["feat"][0] - want))
+      ang = _quat_err_deg(m["feat"][1], ref["feat"][1])
+      # every MAINTAINED grasp must sit at the SAME relative pose at both keyframes (scored
+      # against the skill keyframe, not against the absolute target, so a single-arm-IK scene's
+      # homed brace arms cancel instead of swamping the number).
+      for (gp, gq), (rp, rq) in zip(m["grasps"], ref["grasps"]):
+        pos = max(pos, float(np.linalg.norm(np.asarray(gp) - np.asarray(rp))))
+        ang = max(ang, _quat_err_deg(gq, rq))
+      smm, sdeg = 0.0, 0.0
+      for p in stat:
+        d_mm, d_deg = _pose_deviation(m["parts"][p], ref["parts"][p])
+        smm, sdeg = max(smm, d_mm), max(sdeg, d_deg)
+      return {"dq": float(np.linalg.norm(m["q"][jidx[actor]] - ref["q"][jidx[actor]])),
+              "hold": max([float(np.linalg.norm(m["q"][jidx[r]] - ref["q"][jidx[r]]))
+                           for r in robots if r not in movers] or [0.0]),
+              "stat_mm": smm, "stat_deg": sdeg,
+              "dev": float(np.linalg.norm((ref["body"][:3] - m["body"][:3]) - nom)) * 1000.0,
+              "pos": pos, "ang": ang, "pen": m["pen"]}
+
+    after = robot_ik.pre_skill_witness(a, s0, s1, assembly, w, pin=pin)
+    o, n = metrics(before), metrics(after)
+    why = _pre_gate(o, n, pen_gate, max_dq, hold_dq, hold_mm, pos_tol, ang_tol)
+    if kind == "assemble" and axis is None:
+      why = why or "no mate axis: the funnel has zero length"   # report it, don't hide it
+    if why is None:
+      pre[i] = after
+    rows.append((i, kind, why is None, why, o, n))
+    if verbose:
+      fmt = lambda k, f, m: (f"{f % m[k]}" if m is not None else "n/a")
+      print(f"  {tag}: actor dq {fmt('dq', '%.3f', o)}->{fmt('dq', '%.3f', n)} rad"
+            f" | funnel dev {fmt('dev', '%.1f', o)}->{fmt('dev', '%.1f', n)}mm"
+            f" | idle arms {fmt('hold', '%.3f', o)}->{fmt('hold', '%.3f', n)} rad"
+            f" | static {fmt('stat_mm', '%.1f', o)}->{fmt('stat_mm', '%.1f', n)}mm"
+            + (f"   REJECTED: {why} -- today's keyframe kept" if why else "   ACCEPTED"))
+
+  acc = sum(1 for r in rows if r[2])
+  if verbose:
+    print(f"[pre] {acc}/{len(rows)} pre-skill keyframe(s) made consistent in "
+          f"{time.perf_counter() - t0:.1f}s; the rest keep today's solve. The exported task "
+          f"structure is unchanged either way.")
+  return pre, {"splits": len(rows), "consistent": acc, "rows": rows}
 
 
 def utilization_report(C, assembly, plan, robots, witnesses=None, verbose=True,
