@@ -934,7 +934,8 @@ def brakeable(vmax, amax, ds):
 
 def corridor_schedule(P, arm_dims, bar_s, acting, cor, dt, joint_rate=DEFAULT_JOINT_RATE,
                       ramp_dist=DEFAULT_RAMP_DIST, ramp_min=DEFAULT_RAMP_MIN, dwell=0.0,
-                      settle=0.0, spread=True, max_steps=None, vmax=None, amax=None):
+                      settle=0.0, spread=True, max_steps=None, vmax=None, amax=None,
+                      limit_ds=None):
   """STAGES B+C: plan per-arm progress inside the certified corridor, then time it so a
   robot is always at its limit.
 
@@ -949,12 +950,16 @@ def corridor_schedule(P, arm_dims, bar_s, acting, cor, dt, joint_rate=DEFAULT_JO
   between an arm's own events (removing rush-then-wait) and re-clamped to the corridor, so
   arrival times are unchanged.
 
-  `vmax`/`amax` ((n, G) arrays over the corridor grid, arc units/s and /s^2) are extra
-  per-arm speed and acceleration limits -- e.g. wrench limits, so an arm carrying a heavy
-  group cannot accelerate hard enough to overload its own grasp. Only the arms that are
-  actually loaded slow down, and arrivals simply move later. The spread pass needs no
-  re-check against them: it redistributes the SAME arc over the SAME-or-longer time, so its
-  speeds and accelerations are bounded by the forward pass's, which already obeyed them."""
+  `vmax`/`amax` ((n, G) arrays, arc units/s and /s^2) are extra per-arm speed and
+  acceleration limits -- e.g. wrench limits, so an arm carrying a heavy group cannot
+  accelerate hard enough to overload its own grasp. Only the arms that are actually loaded
+  slow down, and arrivals simply move later. They are sampled on the corridor grid unless
+  `limit_ds` gives their own (finer) spacing: a wrench limit needs the resolution of the
+  geometry it came from, and a corner bound is a per-waypoint event that a 1-rad corridor
+  cell would smear over a whole radian of arc.
+
+  The spread pass does NOT respect them -- it can be locally 1.9x over the limit (measured);
+  see the KNOWN HOLE in _corridor_spread."""
   P = np.asarray(P, float)
   segs, D = arc_length(list(P))
   csum = np.concatenate([[0.0], np.cumsum(segs)]) if segs else np.array([0.0])
@@ -973,6 +978,14 @@ def corridor_schedule(P, arm_dims, bar_s, acting, cor, dt, joint_rate=DEFAULT_JO
   rest = []                                                  # own events only -- NOT every barrier
   for r in range(n):
     rest.append(sorted({0.0, D} | {bar_s[k] for k in range(K) if r in act[k]}))
+
+  def _lim_at(arr, s):                                       # index into vmax/amax at arc s
+    if limit_ds:                                             # own grid (see `limit_ds`)
+      return int(min(max(round(s / limit_ds), 0), np.shape(arr)[1] - 1))
+    return min(_cor_at(cor, s), np.shape(arr)[1] - 1)
+
+  def vlim(r, s):                                            # effective speed cap, with the
+    return max(float(vmax[r][_lim_at(vmax, s)]), ramp_min * joint_rate)   # never-stall floor
 
   def rate_of(r, s):                                         # arm r at ITS joint limit
     return joint_rate / share[r][_seg_index(csum, segs, s)]
@@ -1047,11 +1060,10 @@ def corridor_schedule(P, arm_dims, bar_s, acting, cor, dt, joint_rate=DEFAULT_JO
       lim = min(cap_event(r, fired), D)
       if s[r] < lim - eps:
         want = rate_of(r, s[r]) * ramp_of(r, s[r])            # stage C + own-event ramps
-        g = _cor_at(cor, s[r])
         if vmax is not None:                                  # e.g. wrench speed limit
-          want = min(want, max(float(vmax[r][g]), ramp_min * joint_rate))
+          want = min(want, vlim(r, s[r]))
         if amax is not None:                                  # accel-limited slew
-          am = max(float(amax[r][g]), 1e-9)
+          am = max(float(amax[r][_lim_at(amax, s[r])]), 1e-9)
           want = float(np.clip(want, vel[r] - am * dt, vel[r] + am * dt))
         vel[r] = want
         cand[r] = min(lim, s[r] + want * dt)
@@ -1106,7 +1118,18 @@ def _corridor_spread(prog, bar_s, act, fires, cor, dt, D, ramp_steps=100):
   barrier, every arm has a fixed arrival there, and pacing to it is what turns "rush, stop,
   wait" into one smooth slower motion. The arm still ramps to rest at its OWN events; at a
   barrier it merely crosses, both ends of the span are full-speed, so it flows through.
-  Timings of the anchors are untouched, so the firing schedule is unchanged."""
+  Timings of the anchors are untouched, so the firing schedule is unchanged.
+
+  KNOWN HOLE (measured, unfixed): this pass does NOT respect corridor_schedule's `vmax`. It
+  redistributes arc WITHIN an interval, so it can be locally faster than the forward pass was
+  at the same arc -- measured on car-mini at 1.9x the wrench speed limit, at the very corner
+  where the grasp then broke. Two repairs were tried and BOTH lost more than they gained,
+  because this pass is also what keeps loaded arms off velocity steps: falling back to the
+  forward profile on a violating interval restores its sprint-STOP-restart shape (cross8
+  22/49 actions vs 39/40); water-filling the interval against the cap respects the speed but
+  not the ACCELERATION, so it enters and leaves each capped corner in one step (car-mini
+  13/20 vs 17/17). Doing this properly means an accel-aware re-pacing (a small TOPP) here,
+  not a clamp."""
   prog = np.array(prog, float, copy=True)
   M, n = prog.shape
   for r in range(n):

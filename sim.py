@@ -114,6 +114,15 @@ BREAK_SUSTAIN = 0.02            # s : a grasp breaks only if overloaded CONTINUO
                                 # survivable by a real seal/pinch; loss of grip is a leak/slip
                                 # process, not a single-sample event. Static overloads (what
                                 # the LP prices) persist and still break.
+WELD_TIMECONST = 0.004          # s   : solref timeconst of the grasp/mate welds (stiff: with
+                                # MuJoCo's soft default the mocap-anchored weld SAGS mm-scale
+                                # under carry loads -- measured 7-8mm, enough to miss a seat).
+KINK_TAU = 2.0 * WELD_TIMECONST # s   : time the grasp interface takes to absorb a VELOCITY
+                                # STEP (a C0 path corner), i.e. peak |F| = m|dv|/KINK_TAU.
+                                # MEASURED on car-mini: a 1.24 m/s step on a 0.30kg group
+                                # peaked at 39.9N => 9.3ms, ~2 solref timeconsts. On hardware
+                                # the corner-rounding time of the tracking controller plays
+                                # this role; here it is the weld, which IS the interface.
 CAPTURE_RANGE = 0.05            # m   : a part-part mate datum-welds only within this of the
                                 # seat (the funnel mouth); a larger miss = the part never
                                 # arrived -> fail cleanly instead of snapping it in (explodes).
@@ -349,6 +358,155 @@ def _static_load(mass, lever):
   return float(mass) * GRAVITY, float(mass) * GRAVITY * float(lever)
 
 
+def _make_wrench_tracer(scene, predict=None, out=print):
+  """SIM_WRENCH_TRACE=1 -- why a grasp weld breaks (same style as SIM_MP_TRACE/RETIMING_TRACE).
+
+  For every ACTIVE grasp it lines up three wrenches at the SAME instant:
+    meas  what MuJoCo's weld constraint actually carries -- the value step() has already
+          read for its breakaway check, so tracing adds no efc work;
+    model what --force-limits predicts at this arc position (`predict(robot) -> dict`),
+          including whether the model believes the arm is holding anything at all there
+          (m == 0 means the limit is INACTIVE, not that the load is zero);
+    rb    the exact rigid-body wrench the held group's MEASURED motion requires, split into
+          the point-mass part |sum r_i x m_i(a_i-g)| the model keeps and the rotational part
+          |sum I_i alpha_i + w_i x I_i w_i| it omits.
+  plus `cmd`, the COMMANDED motion of the grasp anchor itself (finite-differenced from the
+  mocap poses sync_arms writes -- mocap bodies carry no MuJoCo velocity, so this is the only
+  way to see it). cmd is the ground truth the model is trying to predict: cmd >> model means
+  the executed path is not the path the limits were computed on (e.g. a C0 waypoint kink,
+  which is a VELOCITY step and therefore an unbounded acceleration); cmd small while rb is
+  large means the part is ringing on the weld rather than being driven.
+
+  Printed every SIM_WRENCH_EVERY steps (default 200 = 0.4s) AND every step once the measured
+  wrench passes SIM_WRENCH_FRAC of either cap (default 0.7), so a break is captured at full
+  500Hz without flooding the log. SIM_WRENCH_ARM=a3 restricts it to one robot."""
+  every = max(1, int(os.environ.get("SIM_WRENCH_EVERY", "200")))
+  frac = float(os.environ.get("SIM_WRENCH_FRAC", "0.7"))
+  only = os.environ.get("SIM_WRENCH_ARM")
+  g_vec = np.asarray(scene.model.opt.gravity, dtype=float)
+  bodies = {p: scene._body_id(p) for p in scene.assembly.objects}
+  vel = {p: (np.zeros(3), np.zeros(3)) for p in bodies}      # part -> (w, v), previous step
+  acc = {p: (np.zeros(3), np.zeros(3)) for p in bodies}      # part -> (alpha, a), this step
+  anchors = {r: scene._body_id(b) for r, b in scene.grasp_anchor.items()}
+  cmd_p = {r: None for r in anchors}                         # robot -> (pos, quat) prev step
+  cmd_v = {r: (np.zeros(3), np.zeros(3)) for r in anchors}   # robot -> (w, v) commanded
+  cmd_a = {r: (np.zeros(3), np.zeros(3)) for r in anchors}   # robot -> (alpha, a) commanded
+  cmd_turn = {r: 0.0 for r in anchors}                       # robot -> deg turned this step
+  last = [-1]
+
+  def sample():
+    """Cache every part's world velocity + finite-differenced acceleration, and the same for
+    the COMMANDED grasp-anchor poses. Per step, but ~one mj_objectVelocity call per part --
+    negligible next to mj_step."""
+    v6 = np.zeros(6)
+    for p, b in bodies.items():
+      mujoco.mj_objectVelocity(scene.model, scene.data, mujoco.mjtObj.mjOBJ_BODY, b, v6, 0)
+      w, v = v6[:3].copy(), v6[3:].copy()
+      acc[p] = ((w - vel[p][0]) / DT, (v - vel[p][1]) / DT)
+      vel[p] = (w, v)
+    q, dq, om = np.zeros(4), np.zeros(4), np.zeros(3)
+    for r, b in anchors.items():
+      pos = np.asarray(scene.data.xpos[b], dtype=float).copy()
+      mujoco.mju_mat2Quat(q, np.asarray(scene.data.xmat[b], dtype=float).ravel())
+      if cmd_p[r] is not None:
+        p0, q0 = cmd_p[r]
+        mujoco.mju_negQuat(dq, q0)
+        mujoco.mju_mulQuat(dq, q, dq)                        # q * conj(q0) = world-frame delta
+        mujoco.mju_quat2Vel(om, dq, DT)
+        v = (pos - p0) / DT
+        v0 = cmd_v[r][1]
+        cmd_a[r] = ((om - cmd_v[r][0]) / DT, (v - v0) / DT)
+        # TURN vs SPEED CHANGE: a C0 path corner turns the velocity without changing its
+        # magnitude; a scheduler velocity step (corridor/event clamp) does the opposite.
+        nn = float(np.linalg.norm(v) * np.linalg.norm(v0))
+        cmd_turn[r] = (np.degrees(np.arccos(np.clip(float(v @ v0) / nn, -1.0, 1.0)))
+                       if nn > 1e-12 else 0.0)
+        cmd_v[r] = (om.copy(), v)
+      cmd_p[r] = (pos, q.copy())
+
+  def group_of(part):
+    """The parts rigidly welded to `part` RIGHT NOW (active mate welds) -- what the grasp
+    actually carries, which is not the planner's symbolic group after a missed seat."""
+    adj = {}
+    for eq in range(scene.model.neq):
+      if not scene.data.eq_active[eq]:
+        continue
+      nm = mujoco.mj_id2name(scene.model, mujoco.mjtObj.mjOBJ_EQUALITY, eq)
+      if nm and nm.startswith("mate_"):
+        c = nm[len("mate_"):]
+        p = scene.assembly.relative_pose(c)[0]
+        adj.setdefault(c, set()).add(p)
+        adj.setdefault(p, set()).add(c)
+    seen, stack = {part}, [part]
+    while stack:
+      x = stack.pop()
+      for y in adj.get(x, ()):
+        if y in bodies and y not in seen:
+          seen.add(y)
+          stack.append(y)
+    return sorted(seen)
+
+  def rigid_body(parts, anchor):
+    """Newton-Euler wrench these bodies impose about `anchor` at their measured motion:
+    (mass, |F|, |T_total|, |T_pointmass|, |T_rot|, |a|, |w|, |alpha|)."""
+    F = np.zeros(3)
+    Tpm = np.zeros(3)
+    Trot = np.zeros(3)
+    m_tot = a_max = w_max = al_max = 0.0
+    for p in parts:
+      b = bodies[p]
+      m = float(scene.model.body_mass[b])
+      R = np.asarray(scene.data.ximat[b], dtype=float).reshape(3, 3)
+      I = R @ np.diag(np.asarray(scene.model.body_inertia[b], dtype=float)) @ R.T
+      w, _ = vel[p]
+      alpha, a = acc[p]
+      f = m * (a - g_vec)
+      r = np.asarray(scene.data.xipos[b], dtype=float) - anchor
+      F += f
+      Tpm += np.cross(r, f)
+      Trot += I @ alpha + np.cross(w, I @ w)
+      m_tot += m
+      a_max, w_max = max(a_max, float(np.linalg.norm(a))), max(w_max, float(np.linalg.norm(w)))
+      al_max = max(al_max, float(np.linalg.norm(alpha)))
+    return (m_tot, float(np.linalg.norm(F)), float(np.linalg.norm(Tpm + Trot)),
+            float(np.linalg.norm(Tpm)), float(np.linalg.norm(Trot)), a_max, w_max, al_max)
+
+  def trace(robot, part, fmag, tmag, fcap, tcap):
+    if scene.step_i != last[0]:                              # once per sim step, not per grasp
+      sample()
+      last[0] = scene.step_i
+    if only and robot != only:
+      return
+    hot = fmag > frac * fcap or tmag > frac * tcap
+    if not hot and scene.step_i % every:
+      return
+    grp = group_of(part)
+    # CO-HOLDERS: two grippers on one rigid group are kinematically locked -- desyncing them
+    # does not "collide", it TEARS the part out of a gripper (pure force, no torque). The
+    # corridor forces those pairs together only where the plan's supports show them, so a
+    # co-hold the trace sees but the plan does not is the difference that matters.
+    held = sorted(r for r, g in scene.active_grasps.items() if g[1] in grp)
+    anchor = np.asarray(scene.data.xpos[scene._body_id(scene.grasp_anchor[robot])], dtype=float)
+    m_rb, F_rb, T_rb, T_pm, T_rot, a_rb, w_rb, al_rb = rigid_body(grp, anchor)
+    pm = predict(robot) if predict is not None else None
+    ms = ("model none" if pm is None else
+          f"model m={pm['m']:.2f}kg L={pm['L']*1000:.0f}mm s={pm['s']:.2f} sdot={pm['v']:.3f} "
+          f"sddot={pm['acc']:+.2f} |a|={pm['a']:.2f} F={pm['F']:.1f} T={pm['T']:.3f} "
+          f"vmax={pm['vmax']:.2f} kink={pm['kink']:.2f} dbar={pm['dbar']:.2f}")
+    cw, cv = cmd_v[robot]
+    ca, cl = cmd_a[robot][0], cmd_a[robot][1]
+    out(f"[wrench] k={scene.step_i} t={scene.step_i * DT:.3f} {robot}/{part} "
+        f"meas F={fmag:.1f}/{fcap:g} T={tmag:.3f}/{tcap:g} | {ms} | "
+        f"rb m={m_rb:.2f}kg({len(grp)}p, held by {'+'.join(held)}) "
+        f"F={F_rb:.1f} T={T_rb:.3f} (pm {T_pm:.3f} + rot "
+        f"{T_rot:.3f}) |a|={a_rb:.2f} |w|={w_rb:.2f} |alpha|={al_rb:.1f} | "
+        f"cmd |v|={np.linalg.norm(cv):.3f} |a|={np.linalg.norm(cl):.2f} "
+        f"|w|={np.linalg.norm(cw):.3f} |alpha|={np.linalg.norm(ca):.1f} "
+        f"turn={cmd_turn[robot]:.1f}deg")
+
+  return trace
+
+
 def _default_geomgroups(viewer, has_mesh):
   """Initial viewer group visibility. MuJoCo HIDES groups >=3 by default, so we set them
   explicitly: when real link meshes exist, SHOW them (group VISUAL) and HIDE the collision
@@ -447,12 +605,12 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
       # stiff solref: the anchor is a mocap body, so a soft (default) weld SAGS mm-scale
       # under carry loads -- measured 7-8mm drift, enough to miss the seat tolerance.
       eq_xml.append(f'<weld name="grasp_{r}_{p}" body1="{anchor[r]}" body2="{p}" '
-                    f'active="false" solref="0.004 1"/>')
+                    f'active="false" solref="{WELD_TIMECONST} 1"/>')
   for p in assembly.objects:                               # mate welds along the manual's DAG
     rel = assembly.relative_pose(p)
     if rel is not None:
       eq_xml.append(f'<weld name="mate_{p}" body1="{rel[0]}" body2="{p}" active="false" '
-                    f'solref="0.004 1"/>')
+                    f'solref="{WELD_TIMECONST} 1"/>')
   # the table box reaches from the FLOOR (z=0) to table_top: collision-identical for the
   # parts (only the top face matters) but it looks like a table instead of a floating slab.
   th = table_top / 2.0
@@ -501,6 +659,9 @@ class SimScene:
     self.recorder = None                                   # set by the executor (see record=)
     self._rec_count = 0
     self._over = {}                                        # robot -> consecutive overload steps
+    self.wrench_trace = None                               # SIM_WRENCH_TRACE hook, see
+    self.trace_ctx = None                                  # _make_wrench_tracer (driver's
+    self.step_i = 0                                        # sample index + the sim clock)
     # per-robot geom ids of the rai contact=-2 wrist capsules (un-collided while holding)
     self._holdex = {r: [] for r in self.robots}
     if arms is not None:
@@ -648,8 +809,11 @@ class SimScene:
     sustain = max(1, int(BREAK_SUSTAIN / DT))
     for _ in range(n):
       mujoco.mj_step(self.model, self.data)
+      self.step_i += 1
       for r, (eq, part, fcap, tcap) in list(self.active_grasps.items()):
         fmag, tmag = self._weld_wrench(eq)
+        if self.wrench_trace is not None:                   # diagnostic: reuses THIS wrench
+          self.wrench_trace(r, part, fmag, tmag, fcap, tcap)
         if fmag > fcap or tmag > tcap:
           self._over[r] = self._over.get(r, 0) + 1
           if self._over[r] >= sustain:                     # sustained overload -> seal fails
@@ -929,7 +1093,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         record=None, verbose=True, gui=False, visual=True, prioritized=False,
                         rate_boost=False, smooth=False,
                         corridor=False, corridor_ds=1.0, corridor_ds_lead=0.25,
-                        corridor_lead_max=4.0, force_limits=False, wrench_margin=1.0, mass_scale=1.0,
+                        corridor_lead_max=4.0, force_limits=False, wrench_margin=1.0, mass_scale=1.0, inertia_factor=1.0,
+                        corner_limits=True,
                         spline=False, spline_per_seg=8, spline_tension=0.5):
   """Execute an mr_bench PATH (from mp_export.run_birrt) in MuJoCo with the REAL ARMS:
   every rai robot shape frame (the capsule collision model + gripper primitives) is mirrored
@@ -1420,15 +1585,61 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             _lev[_r, _g] = max(lev, 5e-3)
         # FINE geometric sampling: p'' on the 1-rad corridor grid smooths away all real
         # curvature and yields limits of 3-15 rad/s that never bind (measured). Curvature
-        # needs a fine grid; this is pure FK (no oracle), so it is cheap. Limits are then
-        # reduced onto the coarse grid by MIN -- conservative within each cell.
+        # needs a fine grid; this is pure FK (no oracle), so it is cheap. The LIMITS live on
+        # this fine grid too (corridor_schedule reads them with limit_ds): reducing them onto
+        # the 1-rad corridor grid by MIN let one sharp sample dictate a whole radian of arc,
+        # and it is far too coarse for the corner bound below, which is a per-waypoint event.
         _dsf = min(0.05, corridor_ds)
         _sf = np.arange(0.0, _D + _dsf, _dsf)
-        _pf = np.zeros((len(robots), len(_sf), 3))
+        _GF = len(_sf)
+        _pf = np.zeros((len(robots), _GF, 3))
         for _gi, _s in enumerate(_sf):
           C_fk.setJointState(retiming.config_at(list(_P), _cs, _sg, min(_s, _D)))
           for _r, _rn in enumerate(robots):
             _pf[_r, _gi] = C_fk.getFrame(ee_anchor[_rn]).getPosition()
+        # CORNERS (on by default; --no-corner-limits to ablate). What is EXECUTED is the
+        # piecewise-linear path through _P's waypoints, so at every waypoint the Cartesian
+        # tangent JUMPS -- and every mode
+        # barrier is such a waypoint (each stretch begins and ends at a task witness). Lockstep
+        # hides this by ramping EVERY arm to rest at every barrier; the corridor deliberately
+        # does not, so an arm that merely CROSSES a barrier turns its grasp point by up to
+        # 122 deg in ONE 2ms step (measured on car-mini at s=79.9, dbar=0.00: |dv|=1.24m/s at
+        # 0.81m/s cruise -> 621 m/s^2 for one step, 39.9N / 2.0Nm through the weld, and the
+        # 0.4Nm grasp broke). That is a VELOCITY STEP, not curvature: no p'' bound can see it
+        # (the smoothing above removes it by construction) and no constant safety factor covers
+        # it, since the implied acceleration grows as 1/dt. What IS bounded is the MOMENTUM
+        # step -- the interface must absorb m*|dv| within its response time -- so
+        # |dv| <= a_allow*KINK_TAU caps the arc speed AT the corner. On a C1 path the jump is
+        # ~0 and this never binds.
+        #
+        # This is the term the "conservatism" was standing in for, and it is the ONLY one that
+        # had to be added: with it, both scenes pass at inertia factor 1 -- no fudge at all
+        # (measured, --corridor --force-limits, factor 1; --no-corner-limits reproduces the
+        # left column):
+        #   car-mini-new  OFF 14/20 FAILED (a3 breaks on the s=79.9 corner)   ON 17/17 ok
+        #   cross8        OFF 39/40 (one 25.7N break, |T|=0.06Nm)             ON 39/39 ok
+        # and the corridor keeps its advantage over lockstep (+4.5% / +16.1% makespan), since
+        # only loaded arms slow and only within ~0.1 rad of a corner.
+        _jump = np.zeros((len(robots), _GF))                  # tangent jump [m/rad] at corners
+        if corner_limits:
+          _pw = np.zeros((len(robots), len(_P), 3))
+          for _i in range(len(_P)):
+            C_fk.setJointState(_P[_i])
+            for _r, _rn in enumerate(robots):
+              _pw[_r, _i] = C_fk.getFrame(ee_anchor[_rn]).getPosition()
+          _uniq = [0]                                         # waypoints at DISTINCT arc: a
+          for _i in range(1, len(_P)):                        # repeated config (mode markers)
+            if _cs[_i] - _cs[_uniq[-1]] > 1e-9:               # has no tangent of its own, and
+              _uniq.append(_i)                                # skipping it hid barrier corners
+          for _a, _b, _c in zip(_uniq, _uniq[1:], _uniq[2:]):
+            _gi = int(min(max(round(_cs[_b] / _dsf), 0), _GF - 1))
+            for _r in range(len(robots)):
+              _t0 = (_pw[_r, _b] - _pw[_r, _a]) / (_cs[_b] - _cs[_a])
+              _t1 = (_pw[_r, _c] - _pw[_r, _b]) / (_cs[_c] - _cs[_b])
+              _j = float(np.linalg.norm(_t1 - _t0))
+              for _gj in (_gi - 1, _gi):                      # the arm must ARRIVE slow: the
+                if _gj >= 0:                                  # corner sits mid-cell, half a
+                  _jump[_r, _gj] = max(_jump[_r, _gj], _j)    # cell < the braking distance
         # The saved path is only C0: at a waypoint kink p' JUMPS, so a finite-differenced p''
         # spikes to near-infinity and the curvature speed limit collapses to ~0.01 rad/s at
         # isolated points (measured: worse motion than a blunt global slowdown). A kink is a
@@ -1442,44 +1653,66 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             _pf[_r, :, _c] = np.convolve(np.pad(_pf[_r, :, _c], (_w // 2, _w // 2),
                                                 mode="edge"), _ker, mode="same")[
                 _w // 2: _w // 2 + _pf.shape[1]]
-        _vmax = np.full((len(robots), _G), 1e6)
-        _amax = np.full((len(robots), _G), 1e6)
-        _bind = {}
+        _vmax = np.full((len(robots), _GF), 1e6)
+        _amax = np.full((len(robots), _GF), 1e6)
+        _bind, _cbind = {}, {}
+        _d1 = {}                                              # kept for SIM_WRENCH_TRACE: the
+        _d2 = {}                                              # trace must use THESE derivatives
         for _r, _rn in enumerate(robots):
           fcap, tcap = _grasp_caps((gripper_kinds or {}).get(_rn, "two_finger"))
           d1 = np.gradient(_pf[_r], _dsf, axis=0)             # d(grasp point)/ds [m/rad]
           d2 = np.gradient(d1, _dsf, axis=0)                  # d2/ds2            [m/rad^2]
+          _d1[_r], _d2[_r] = d1, d2
           n1, n2 = np.linalg.norm(d1, axis=1), np.linalg.norm(d2, axis=1)
           for _gi, _s in enumerate(_sf):
-            _g = min(int(_s / corridor_ds), _G - 1)
+            # ROUND, not floor: corridor_schedule reads the coarse arrays with _cor_at, which
+            # snaps to the NEAREST grid point -- flooring here shifted every limit by up to
+            # half a cell, so the schedule applied the neighbouring radian's budget (measured
+            # on car-mini: executed 1.04 rad/s where the limit said 0.73).
+            _g = int(min(max(round(_s / corridor_ds), 0), _G - 1))
             m, L = _m[_r, _g], _lev[_r, _g]
             if m <= 0:
               continue                                       # empty gripper: unconstrained
             # remaining margin after the STATIC load (swap _static_load for the exact LP)
             fs, ts = _static_load(m, L)
-            aF = max(wrench_margin * fcap - fs, 0.0) / m      # m/s^2 from the force cap
-            aT = max(wrench_margin * tcap - ts, 0.0) / (m * L)   # ... and the torque cap
+            # Conservatism belongs on the INERTIAL prediction, not on the mass: scaling mass
+            # also inflates the STATIC term, which eats the whole budget and collapses the
+            # limit to ~0.01 rad/s (measured: passes, but 8-18x slower). Here the static load
+            # stays true and only the dynamic estimate is derated. Both scenes now pass at
+            # k=1: the residual model error (no I*alpha -- measured at 2.8% of the wrench at
+            # the break -- and the grasp-anchor path standing in for the COM path) is small
+            # next to the corner term above, which is what k>1 was really compensating for.
+            k = max(inertia_factor, 1e-9)
+            aF = max(wrench_margin * fcap - fs, 0.0) / (m * k)      # m/s^2 from the force cap
+            aT = max(wrench_margin * tcap - ts, 0.0) / (m * L * k)  # ... and the torque cap
             a_allow = max(min(aF, aT), 1e-4)
             if n2[_gi] > 1e-9:
-              _vmax[_r, _g] = min(_vmax[_r, _g], float(np.sqrt(a_allow / n2[_gi])))
+              _vmax[_r, _gi] = min(_vmax[_r, _gi], float(np.sqrt(a_allow / n2[_gi])))
             if n1[_gi] > 1e-9:
-              _amax[_r, _g] = min(_amax[_r, _g], a_allow / n1[_gi])
+              _amax[_r, _gi] = min(_amax[_r, _gi], a_allow / n1[_gi])
+            if _jump[_r, _gi] > 1e-9:                          # corner: bound the MOMENTUM step
+              _vmax[_r, _gi] = min(_vmax[_r, _gi],
+                                   a_allow * KINK_TAU / _jump[_r, _gi])
+              _cbind[_r] = _cbind.get(_r, 0) + int(_vmax[_r, _gi] < JOINT_RATE)
           _bind[_r] = int(np.sum(_vmax[_r] < JOINT_RATE))
         _bind = {r: c for r, c in _bind.items() if c}
-        _vmax = retiming.brakeable(_vmax, _amax, corridor_ds)
+        _vmax = retiming.brakeable(_vmax, _amax, _dsf)
         if _bad_lever:
           print(f"[sim/mp] --force-limits: ignored {_bad_lever} grid/arm samples whose lever "
                 f"exceeded {LEVER_SANITY*1000:.0f}mm (stale support info, not a real grasp)")
         print(f"[sim/mp] --force-limits ACTIVE (margin {wrench_margin:g} of the grasp caps, "
-              f"point-mass): speed limit binds below cruise on " +
-              ", ".join(f"arm{r} {100.0 * c / _G:.0f}% of arc" for r, c in sorted(_bind.items()))
-              + (" -- nowhere" if not _bind else ""))
+              f"point-mass{' + corner momentum steps' if corner_limits else ''}, inertia "
+              f"factor {inertia_factor:g}): speed limit binds below cruise on " +
+              ", ".join(f"arm{r} {100.0 * c / _GF:.0f}% of arc" for r, c in sorted(_bind.items()))
+              + (" -- nowhere" if not _bind else "")
+              + (f"; corners bind at {sum(_cbind.values())} waypoint(s)" if _cbind else ""))
         for _r in range(len(robots)):
           _f = _vmax[_r][_vmax[_r] < 1e5]
           if len(_f):
             print(f"    arm{_r}: held mass up to {_m[_r].max():.2f}kg, lever up to "
-                  f"{_lev[_r].max() * 1000:.0f}mm, speed limit min {_f.min():.2f} rad/s "
-                  f"(cruise {JOINT_RATE:g})")
+                  f"{_lev[_r].max() * 1000:.0f}mm, "
+                  + (f"worst corner {_jump[_r].max():.2f} m/rad, " if corner_limits else "")
+                  + f"speed limit min {_f.min():.2f} rad/s (cruise {JOINT_RATE:g})")
       print(f"[sim/mp] --corridor STAGE A: certifying the desync envelope "
             f"(D={_D:.0f} rad, {len(robots)} arms) ...")
       t0 = _time.time()
@@ -1492,7 +1725,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       traj = retiming.corridor_schedule(_P, arm_dims, _bar, acting, cor, DT,
                                         joint_rate=JOINT_RATE, ramp_dist=RAMP_DIST,
                                         ramp_min=RAMP_MIN, dwell=DWELL_T, spread=True,
-                                        vmax=_vmax, amax=_amax)
+                                        vmax=_vmax, amax=_amax,
+                                        limit_ds=(_dsf if force_limits else None))
       base = retiming.build_trajectory(stretches, DT, joint_rate=JOINT_RATE,
                                        ramp_dist=RAMP_DIST, ramp_min=RAMP_MIN, dwell=DWELL_T)
       print(f"[sim/mp] STAGES B+C: {len(traj.q)} samples vs {len(base.q)} lockstep "
@@ -1506,8 +1740,38 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       for idx, ev in traj.fires:
         for k in ev:                                         # fires carry stretch indices here
           fire_at.setdefault(int(idx), []).extend(int(t) for t in stretches[int(k)][1])
+      if _os.environ.get("SIM_WRENCH_TRACE"):
+        # The trace must read the model AS EXECUTED: same arc grid, same smoothed derivatives,
+        # same static term -- so it can only be built here, where those arrays exist.
+        _prog = getattr(traj, "progress", None)
+        _rix = {r: i for i, r in enumerate(robots)}
+
+        def _wpred(rn):
+          if _prog is None or not force_limits or scene.trace_ctx is None:
+            return None
+          i, k = int(scene.trace_ctx), _rix[rn]
+          if i >= len(_prog):
+            return None
+          s = float(_prog[i][k])
+          sm = float(_prog[i - 1][k]) if i > 0 else s
+          sp = float(_prog[i + 1][k]) if i + 1 < len(_prog) else s
+          v = (sp - sm) / (2.0 * DT)
+          sdd = (sp - 2.0 * s + sm) / (DT * DT)
+          g = int(min(max(round(s / corridor_ds), 0), _G - 1))
+          gi = int(min(max(round(s / _dsf), 0), len(_sf) - 1))
+          m, L = float(_m[k, g]), float(_lev[k, g])
+          av = _d1[k][gi] * sdd + _d2[k][gi] * v * v          # a = p'*s_ddot + p''*s_dot^2
+          a = float(np.linalg.norm(av))
+          fs, ts = _static_load(m, L)
+          return {"s": s, "v": v, "acc": sdd, "m": m, "L": L, "a": a,
+                  "F": fs + m * a, "T": ts + m * a * L, "vmax": float(_vmax[k][gi]),
+                  "kink": float(_jump[k][gi]),
+                  "dbar": min([abs(s - b) for b in _bar] or [-1.0])}
+
+        scene.wrench_trace = _make_wrench_tracer(scene, predict=_wpred)
       for i in range(len(traj.q)):
         scene.sync_arms(fk_poses(traj.q[i]))
+        scene.trace_ctx = i
         scene.step(1, report, (traj.phase[i],))
         if i in fire_at:
           for tid in fire_at[i]:
@@ -1853,7 +2117,8 @@ def _cli_run(a):
                               corridor_ds_lead=a.corridor_ds_lead,
                               corridor_lead_max=a.corridor_lead_max,
                               force_limits=a.force_limits, wrench_margin=a.wrench_margin,
-                              mass_scale=a.mass_scale,
+                              mass_scale=a.mass_scale, inertia_factor=a.inertia_factor,
+                              corner_limits=a.corner_limits,
                               spline=a.spline, spline_per_seg=a.spline_per_seg,
                               spline_tension=a.spline_tension)
   else:
@@ -1921,7 +2186,32 @@ def _build_cli():
                       "planner's LP is quasi-static (gravity only), so fast execution can "
                       "overload a grasp it certified; this slows ONLY the loaded arm, only "
                       "where it is loaded, instead of the blunt global --joint-rate. "
-                      "Point-mass model (m*a, m*a*lever); arrivals shift later as needed.")
+                      "Point-mass model (m*a, m*a*lever) along the path PLUS the momentum step "
+                      "at each C0 corner (see --no-corner-limits); arrivals shift later as "
+                      "needed. Both benchmark scenes pass with no safety factor.")
+  r.add_argument("--no-corner-limits", action="store_false", dest="corner_limits",
+                 help="ABLATION: drop the corner term from --force-limits, leaving the pure "
+                      "point-mass curvature/tangential bound. The corner term limits the arc "
+                      "speed at the C0 corners of the EXECUTED path (every mode barrier is "
+                      "one) so the velocity STEP a crossing arm takes there fits what its "
+                      "grasp can absorb in KINK_TAU -- and that step, not any missing "
+                      "conservatism, is what the curvature model cannot see: measured on "
+                      "car-mini the model predicted 2.93 m/s^2 at the breaking corner while "
+                      "the commanded motion did 621 m/s^2 for one 2ms step (a 122 deg turn at "
+                      "0.81 m/s), 39.9N/2.0Nm through a 25N/0.4Nm grasp. With the term, both "
+                      "scenes pass at --inertia-factor 1 (car-mini 17/17, cross8 39/39); "
+                      "without it they fail (14/20 and 39/40).")
+  r.add_argument("--inertia-factor", type=float, default=1.0, metavar="K",
+                 help="Safety factor on the PREDICTED INERTIAL wrench for --force-limits "
+                      "(default 1.0 = none needed). The point-mass estimate still omits the "
+                      "angular term and follows the grasp anchor rather than the true COM "
+                      "path, but those are small: the gap that once looked like '4x is not "
+                      "enough' was the CORNER momentum step, now modelled (see "
+                      "--no-corner-limits), and at factor 1 both scenes pass. Prefer this over "
+                      "--mass-scale if you do want margin: it leaves the STATIC load true, so "
+                      "the budget is not eaten before any motion (scaling mass cost 8-18x "
+                      "makespan). NB factor 4 with the corner term is very slow (cross8 went "
+                      "to -1.2% makespan vs lockstep and still failed) -- the two compound.")
   r.add_argument("--mass-scale", type=float, default=1.0, metavar="F",
                  help="Scale every part mass (default 1.0), in BOTH the MuJoCo bodies and the "
                       "wrench estimate, so they stay consistent. A test knob: the grasp caps in "
