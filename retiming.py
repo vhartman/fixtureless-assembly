@@ -935,7 +935,7 @@ def brakeable(vmax, amax, ds):
 def corridor_schedule(P, arm_dims, bar_s, acting, cor, dt, joint_rate=DEFAULT_JOINT_RATE,
                       ramp_dist=DEFAULT_RAMP_DIST, ramp_min=DEFAULT_RAMP_MIN, dwell=0.0,
                       settle=0.0, spread=True, max_steps=None, vmax=None, amax=None,
-                      limit_ds=None):
+                      limit_ds=None, rate_clamp=False):
   """STAGES B+C: plan per-arm progress inside the certified corridor, then time it so a
   robot is always at its limit.
 
@@ -1067,6 +1067,23 @@ def corridor_schedule(P, arm_dims, bar_s, acting, cor, dt, joint_rate=DEFAULT_JO
           want = float(np.clip(want, vel[r] - am * dt, vel[r] + am * dt))
         vel[r] = want
         cand[r] = min(lim, s[r] + want * dt)
+        if rate_clamp and cand[r] > s[r] + eps:
+          # RATE BUDGET vs REALISED MOTION. rate_of divides joint_rate by the arm's arc SHARE
+          # in the segment it is currently IN, but a step can LAND in a segment where that arm
+          # carries far more of the arc -- and then the joint speed actually executed exceeds
+          # the budget. MEASURED on cross-new: 1.98 rad/s commanded against joint_rate 1.0.
+          # Same off-by-one-cell class as the force-limit grid note in sim.py. A stiff arm
+          # absorbs the overshoot exactly; a compliant one turns it into grasp load. So bound
+          # the step by the motion it ACTUALLY produces rather than by the segment it started in.
+          d0 = np.asarray(config_at(list(P), csum, segs, s[r]), float)[arm_dims[r]]
+          budget = joint_rate * dt
+          for _ in range(4):                                 # geometric backoff, converges fast
+            d1 = np.asarray(config_at(list(P), csum, segs, cand[r]), float)[arm_dims[r]]
+            moved = float(np.abs(d1 - d0).max())
+            if moved <= budget * (1.0 + 1e-6) or cand[r] <= s[r] + eps:
+              break
+            cand[r] = s[r] + (cand[r] - s[r]) * max(budget / moved, 0.25)
+          vel[r] = (cand[r] - s[r]) / dt
     for _ in range(2):                                       # project (steps are tiny; converges)
       for r in range(n):
         cand[r] = min(cand[r], max(s[r], cap_corridor(r, cand)))

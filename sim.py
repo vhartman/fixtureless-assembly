@@ -348,6 +348,12 @@ GRAVITY = 9.81
 ARTICULATED_LINK_MASS = 50.0     # kg: --articulated links are driven kinematically, so this is
 ARTICULATED_LINK_INERTIA = 5.0   # not a real inertia -- it only has to dominate a held part
                                  # (~0.5kg) so the weld reaction cannot move the arm.
+ACTUATED_LINK_MASS = 4.0         # kg per link for --actuated. A first-order stand-in for real
+                                 # UR10 link masses (4.0/7.8/12.9/3.9/2.0/0.2): gravity torque
+                                 # must land inside rai's real effort limits (330/150/54 Nm),
+                                 # which the 50kg kinematic links would blow past. Per-link
+                                 # inertias are the obvious next refinement.
+ACTUATED_KP = 3000.0             # position-servo gain; kv defaults to 2*sqrt(kp) in arm_model
 ARTICULATED_ARMATURE = 0.0       # MEASURED DEAD END: 1e6 was meant to make the chain
                                  # unaccelerable, but it ill-conditions the mass matrix and made
                                  # the first missed seat 66mm -> 20001mm. The arm is pinned by
@@ -537,7 +543,7 @@ def _arm_geom_xml(geom):
 
 
 def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
-               ee_anchor=None, articulated_C=None):
+               ee_anchor=None, articulated_C=None, actuated=False):
   """The whole validation world as one MJCF string:
   - table (static), parts (free bodies at state.poses, shape quat baked into the geom),
   - robots: EITHER one mocap-driven gripper puck per robot (v1 keyframe mode) OR, when
@@ -618,12 +624,20 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
         group=GROUP_COLL, contype="2", conaffinity="1",
         # links must SWAMP the payload: the chain is integrated by mj_step even though we
         # drive it kinematically, so a light link welded to a part lets the solver throw it.
-        link_mass=ARTICULATED_LINK_MASS, link_inertia=ARTICULATED_LINK_INERTIA,
-        armature=ARTICULATED_ARMATURE, limits=False)
+        armature=ARTICULATED_ARMATURE, limits=bool(actuated),
+        link_mass=(ACTUATED_LINK_MASS if actuated else ARTICULATED_LINK_MASS),
+        link_inertia=((ACTUATED_LINK_MASS if actuated else ARTICULATED_LINK_MASS) / 10.0),
+        # only DOF-carrying bodies get real mass when actuated: rai has ~69 frames per arm, so
+        # massing all of them built a 276kg arm and the servos diverged (3.65 -> 0.020 rad).
+        static_mass=(1e-4 if actuated else None))
     parts_xml = [x for x in parts_xml if 'name="arm_' not in x]      # drop the mocap mirrors
     parts_xml.append(body_xml)
     anchor = {r: ee_anchor[r] for r in robots}
     arm_mesh_assets = ""
+  act_xml = ""
+  if articulated_C is not None and actuated:
+    a, _ = arm_model.actuator_mjcf(articulated_C, articulated_joints, kp=ACTUATED_KP)
+    act_xml = f"\n  <actuator>\n{a}\n  </actuator>"
   for r in robots:
     # grasp welds: anchor body <-> each part (inactive; relpose set at grasp time).
     for p in assembly.objects:
@@ -641,6 +655,12 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
   th = table_top / 2.0
   return f"""
 <mujoco model="assembly_validation">
+  <!-- MuJoCo's compiler defaults to angle="degree", so rai's joint ranges (radians) were being
+       read as degrees and shrunk 57x: shoulder_lift [-3.28, 0.283] became [-0.057, 0.005].
+       Every joint then sat ~2 rad outside its "limit" and MuJoCo answered with 23550 Nm, which
+       is what threw the actuated arm (32 rad/s) and what zeroed the grasp weld's force in the
+       kinematic mode. Body poses are quaternions, so only ranges were affected. -->
+  <compiler angle="radian"/>
   <option timestep="{DT}" integrator="implicitfast"/>
   <asset>
     <texture name="grid" type="2d" builtin="checker" rgb1="0.2 0.25 0.3"
@@ -660,7 +680,7 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
           group="{GROUP_ENV}"/>
     {''.join(parts_xml)}
   </worldbody>
-  <equality>{''.join(eq_xml)}</equality>
+  <equality>{''.join(eq_xml)}</equality>{act_xml}
 </mujoco>"""
 
 
@@ -669,17 +689,22 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
 # ---------------------------------------------------------------------------------------------
 class SimScene:
   def __init__(self, assembly, state, robots, gripper_kinds=None, gui=False,
-               arms=None, arm_poses=None, ee_anchor=None, articulated_C=None):
+               arms=None, arm_poses=None, ee_anchor=None, articulated_C=None,
+               actuated=False):
     if not HAVE_MUJOCO:
       raise RuntimeError("mujoco not installed (pip install mujoco)")
     self.assembly = assembly
     self.xml = build_mjcf(assembly, state, robots, arms=arms, arm_poses=arm_poses,
-                          ee_anchor=ee_anchor, articulated_C=articulated_C)
+                          ee_anchor=ee_anchor, articulated_C=articulated_C,
+                          actuated=actuated)
     self.model = mujoco.MjModel.from_xml_string(self.xml)
     self.data = mujoco.MjData(self.model)
     self.robots = list(robots)
     self.arms = arms                                       # v2: [(frame, kind, size)]
     self.articulated = articulated_C is not None
+    self.actuated = bool(actuated) and self.articulated
+    self._cmd_ref = None                                   # last commanded q (tracking metric)
+    self._cmd_qdot = None                                  # ... and its velocity feedforward
     self.grasp_anchor = ({r: f"ee_{r}" for r in robots} if arms is None
                          else {r: (ee_anchor[r] if self.articulated else f"arm_{ee_anchor[r]}")
                                for r in robots})
@@ -716,6 +741,11 @@ class SimScene:
           self._qadr[jn] = int(self.model.jnt_qposadr[jid])
           self._vadr[jn] = int(self.model.jnt_dofadr[jid])
       self._rai_joints = list(articulated_C.getJointNames())
+      self._ctrl_adr = {}
+      for jn in self._rai_joints:
+        aid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, jn)
+        if aid >= 0:
+          self._ctrl_adr[jn] = int(aid)
     self.gripper_kinds = gripper_kinds or {}
     self.active_grasps = {}                                # robot -> (eq_id, part, fcap, tcap)
     self.viewer = None
@@ -778,6 +808,57 @@ class SimScene:
     for gid in self._holdex.get(robot, ()):                # wrist cluster exempt while holding
       self.model.geom_contype[gid] = 0
       self.model.geom_conaffinity[gid] = 0
+
+  def tracking_error(self, q):
+    """max |q_actual - q_commanded| over the arm dofs, rad. With actuators the trajectory is a
+    REFERENCE, so this is the number that decides whether a mate still lands on its witness --
+    SEAT_POS_TOL is 10mm, so even ~0.01 rad at a 1m lever is already marginal."""
+    q = np.asarray(q, dtype=float)
+    e = 0.0
+    for i, jn in enumerate(self._rai_joints):
+      adr = self._qadr.get(jn)
+      if adr is not None:
+        e = max(e, abs(float(self.data.qpos[adr]) - float(q[i])))
+    return e
+
+  def command_arm_q(self, q, qdot=None):
+    """ACTUATED: hand the joint targets to the position servos and let MuJoCo track them.
+
+    The trajectory becomes a REFERENCE rather than a command -- the arm now has tracking
+    error, reacts to the payload, and is limited by rai's real effort limits. Gravity (and
+    Coriolis) are cancelled by feedforward so the PD only has to reject the payload and the
+    tracking error; that is what removes the need for an integral term, whose windup over a
+    long move is worse than the droop it would fix.
+
+    VELOCITY FEEDFORWARD via the SETPOINT. A `<position kp kv>` servo applies
+    kp*(ctrl - q) - kv*qdot, i.e. it damps ABSOLUTE velocity and so fights the commanded
+    motion, leaving a lag of kv/kp*qdot_ref (~0.03 rad at cruise -- 30mm at a 1m lever,
+    against a 10mm seat tolerance). Commanding ctrl = q_ref + kv/kp*qdot_ref turns that into
+    kp*(q_ref - q) + kv*(qdot_ref - qdot), the PD tracker we actually want. Doing it through
+    the SETPOINT rather than qfrc_applied keeps the torque subject to rai's `forcerange`.
+    kv/kp is read back from the compiled model so it cannot drift from the emitted XML."""
+    q = np.asarray(q, dtype=float)
+    self._cmd_ref = q
+    self._cmd_qdot = None if qdot is None else np.asarray(qdot, dtype=float)
+    for i, jn in enumerate(self._rai_joints):
+      adr = self._ctrl_adr.get(jn)
+      if adr is None:
+        continue
+      ff = 0.0
+      if self._cmd_qdot is not None:
+        kp = float(self.model.actuator_gainprm[adr, 0])
+        kv = -float(self.model.actuator_biasprm[adr, 2])
+        ff = (kv / kp) * self._cmd_qdot[i] if kp > 0 else 0.0
+      self.data.ctrl[adr] = q[i] + ff
+
+  def gravity_compensate(self):
+    """Cancel qfrc_bias (gravity + Coriolis) on the ARM dofs only -- parts keep real gravity,
+    Gravity/Coriolis is the only term applied OUTSIDE the actuator; note that qfrc_applied
+    bypasses `forcerange`, so nothing speed-dependent belongs here (measured: feeding the
+    velocity term in this way injected up to 93 Nm into a 54 Nm wrist and cost 3 seats).
+    The velocity feedforward goes through the setpoint instead -- see command_arm_q."""
+    for jn, v in self._vadr.items():
+      self.data.qfrc_applied[v] = self.data.qfrc_bias[v]
 
   def set_arm_q(self, q, qdot=None):
     """ARTICULATED set-pose: drive the chain by writing qpos directly (and zeroing qvel), the
@@ -901,8 +982,11 @@ class SimScene:
           mm, deg = self.weld_violation(eq, self._body_id(self.grasp_anchor[r]),
                                         self._body_id(part))
           f, t = self._weld_wrench(eq)
+          trk = ("" if not self.actuated or self._cmd_ref is None
+                 else f" trk={self.tracking_error(self._cmd_ref):7.4f}rad")
           print(f"[grasp] k={self.step_i:7d} {r}/{part:6s} slip {mm:8.3f}mm {deg:7.3f}deg "
-                f"|F|={f:8.2f} |T|={t:6.3f}  mode={'artic' if self.articulated else 'mocap'}")
+                f"|F|={f:8.2f} |T|={t:6.3f}  mode="
+                f"{'act' if self.actuated else ('artic' if self.articulated else 'mocap')}{trk}")
       if self.articulated and getattr(self, "_cmd_q", None) is not None:
         # RE-ASSERT the commanded arm pose. mj_step has to integrate the chain (the PARTS
         # need stepping and MuJoCo cannot step them selectively), so the weld accelerates the
@@ -1196,10 +1280,10 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         record=None, verbose=True, gui=False, visual=True, prioritized=False,
                         rate_boost=False, smooth=False,
                         corridor=False, corridor_ds=1.0, corridor_ds_lead=0.25,
-                        corridor_lead_max=4.0, force_limits=False, wrench_margin=1.0, mass_scale=1.0, inertia_factor=1.0,
+                        corridor_lead_max=4.0, rate_clamp=False, settle_tol=0.0, settle_max=1.0, couple_handovers=False, force_limits=False, wrench_margin=1.0, mass_scale=1.0, inertia_factor=1.0,
                         corner_limits=True,
                         spline=False, spline_per_seg=8, spline_tension=0.5,
-                        articulated=False):
+                        articulated=False, actuated=False):
   """Execute an mr_bench PATH (from mp_export.run_birrt) in MuJoCo with the REAL ARMS:
   every rai robot shape frame (the capsule collision model + gripper primitives) is mirrored
   as a kinematic body positioned by rai FK along the path -- the planner's own kinematics by
@@ -1253,17 +1337,54 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
   q0 = full_q(mp_path[0].q)
   scene = SimScene(assembly, states[0], robots, gripper_kinds=gripper_kinds,
                    arms=arms, arm_poses=fk_poses(q0), ee_anchor=ee_anchor, gui=gui,
-                   articulated_C=(C_fk if articulated else None))
+                   articulated_C=(C_fk if (articulated or actuated) else None),
+                   actuated=actuated)
+  articulated = articulated or actuated
   if articulated:
     print(f"[sim/mp] --articulated ACTIVE: real kinematic chains generated from rai "
           f"(arm_model), driven by SETTING qpos -- not {len(arms)} teleported mocap bodies. "
           f"Still perfectly stiff; run fk_compare.py to re-check the model.")
 
+  def settle_before_fire(q):
+    """ACTUATED: hold the reference until the arm has actually ARRIVED, then fire.
+
+    The schedule's dwell is a fixed DWELL_T, but a servo needs as long as it needs: measured on
+    cross-new, a stop settles in ~0.54s against DWELL_T=0.15s, so every attach fired while the
+    arm was still converging. _activate_weld anchors the grasp at the CURRENT gripper-to-part
+    pose, so that residual is frozen into how the part sits in the hand and every downstream
+    mate inherits it (measured pick-to-pick drift 0.05 -> 5 -> 40 -> 56mm before the damping
+    fix). Waiting on the MEASURED error costs only the time actually needed, unlike raising
+    DWELL_T for every transition whether it needs it or not. The stiff modes never need this
+    (their error is 0 by construction), so it is actuated-only."""
+    if not (actuated and settle_tol > 0.0):
+      return
+    for _ in range(int(settle_max / DT)):
+      if scene.tracking_error(q) <= settle_tol:
+        break
+      drive_q(q)                                             # qdot=0: hold, do not lead
+      scene.step(1, report, ("settle",))
+
   _last_q = {}
 
+  _armed = {}
+
   def drive_q(q):
-    """One driver for both arm models, so the executor does not care which is in use."""
-    if articulated:
+    """One driver for every arm model, so the executor does not care which is in use."""
+    if actuated:
+      if not _armed:
+        # SEED THE STATE. The model is generated at q=0 and an actuated arm is only ever given
+        # a ctrl TARGET, so without this it starts ~2 rad from the trajectory and spends the
+        # first actions swinging into place (measured: 1.7-2.9 rad tracking error, seats missed
+        # by up to 882mm). The kinematic modes never showed this because they write qpos.
+        scene.set_arm_q(q)
+        scene._cmd_q = None                                # servos own the arm from here on
+        _armed["yes"] = True
+      q = np.asarray(q, dtype=float)
+      prev = _last_q.get("q")
+      scene.command_arm_q(q, qdot=None if prev is None else (q - prev) / DT)
+      scene.gravity_compensate()
+      _last_q["q"] = q.copy()
+    elif articulated:
       q = np.asarray(q, dtype=float)
       prev = _last_q.get("q")
       scene.set_arm_q(q, qdot=None if prev is None else (q - prev) / DT)
@@ -1658,6 +1779,27 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             for x in range(len(hold)):
               for y in range(x + 1, len(hold)):
                 _locked.append((hold[x], hold[y], a0, _bar[k]))
+        if couple_handovers:
+          # A HANDOVER IS ATOMIC IN THE DISCRETE MODEL, so the state scan above cannot see it:
+          # the giver holds in states[i] and the receiver in states[i+1], never both. In
+          # EXECUTION both grippers are on the part across the transition, so the two arms are
+          # rigidly coupled through it exactly like a co-grasp, and without this the corridor may
+          # desync them by the full width while they co-hold. cross-new has 10 handovers and 0
+          # add_grasp, so the state scan finds ONE co-grasp in 36 actions (car-mini, with 4
+          # add_grasp, finds 12) and the corridor locks 0-5% of arc instead of 29-42%.
+          # Stiff arms hide this: they satisfy both welds by moving the PART and the qpos
+          # re-assert discards the reaction. It only bites once the arms are compliant.
+          _hact = tuple(plan[st_idx])
+          if _hact[0] == "handover":
+            _grp = next((g for g in states[st_idx].subassemblies() if _hact[2] in g),
+                        {_hact[2]})
+            _recv = robot_index.get(_hact[1])
+            _give = next((robot_index[c[1]] for p in _grp
+                          for c in states[st_idx].supports.get(p, ())
+                          if c[0] == "grasp" and c[1] in robot_index
+                          and robot_index[c[1]] != _recv), None)
+            if _recv is not None and _give is not None:
+              _locked.append((min(_recv, _give), max(_recv, _give), a0, _bar[k]))
       if _locked:
         spans = {}
         for i, j, a, b in _locked:
@@ -1843,11 +1985,16 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                                       progress=(print if verbose else None))
       print(f"[sim/mp] STAGE A done in {_time.time() - t0:.0f}s")
       print(retiming.corridor_width_report(cor))
+      if rate_clamp:
+        print("[flag] --corridor-rate-clamp ACTIVE: each corridor step is bounded by the joint "
+              "motion it actually produces (rate_of's share is taken from the segment the arm "
+              "STARTS in, so a step landing in a busier segment overshoots joint_rate).")
       traj = retiming.corridor_schedule(_P, arm_dims, _bar, acting, cor, DT,
                                         joint_rate=JOINT_RATE, ramp_dist=RAMP_DIST,
                                         ramp_min=RAMP_MIN, dwell=DWELL_T, spread=True,
                                         vmax=_vmax, amax=_amax,
-                                        limit_ds=(_dsf if force_limits else None))
+                                        limit_ds=(_dsf if force_limits else None),
+                                        rate_clamp=rate_clamp)
       base = retiming.build_trajectory(stretches, DT, joint_rate=JOINT_RATE,
                                        ramp_dist=RAMP_DIST, ramp_min=RAMP_MIN, dwell=DWELL_T)
       print(f"[sim/mp] STAGES B+C: {len(traj.q)} samples vs {len(base.q)} lockstep "
@@ -1895,6 +2042,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         scene.trace_ctx = i
         scene.step(1, report, (traj.phase[i],))
         if i in fire_at:
+          settle_before_fire(traj.q[i])
           for tid in fire_at[i]:
             fire(tid)
       scene.step(int(SETTLE_T / DT), report, ("settle",))
@@ -1951,6 +2099,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       drive_q(traj.q[i])
       scene.step(1, report, (traj.phase[i],))
       if i in fire_at:
+        settle_before_fire(traj.q[i])
         for tid in fire_at[i]:
           fire(tid)                                          # acting arms rest through the
                                                              # schedule's own post-fire dwell
@@ -2166,19 +2315,27 @@ def _cli_run(a):
   cfg, plan = read_plan(a.path)
   C, asm = R.build_scene(cfg)                               # exact reconstruction (shared)
   robots = A.get_robots(C)
+  # debug knob: shrink arm collision geometry BEFORE witnesses/problem/sim so IK, the
+  # collision oracle and the MuJoCo capsules stay mutually consistent. 1.0 = no-op.
+  scale_arm_collision_shapes(C, robots, getattr(a, "coll_scale", 1.0))
+  gripper_kinds = _gripper_kinds_from_cfg(cfg, robots)
+  # MASSES MUST STILL BE THE PLANNING MASSES HERE. _states_from_plan re-simulates the saved
+  # actions through the wrench-gated successor generator, so scaling first makes it judge a
+  # DIFFERENT action set than the search did and the saved action stops being reachable
+  # (measured on cross-new at --mass-scale 0.25: step 6 assemble a3 obj_2 obj_0 had ZERO
+  # assemble successors -> StopIteration). Lighter parts are not automatically safer: a fixed
+  # --insert-force presses against less self-weight, so the LP calls the mate unstable.
+  states = _states_from_plan(cfg, C, asm, robots, plan)
   if getattr(a, "mass_scale", 1.0) != 1.0:
     # scale the ASSEMBLY masses, so MuJoCo's bodies and the wrench estimate stay consistent
     # (build_mjcf reads assembly.masses too). A one-sided estimate-only scale would be a lie.
+    # AFTER the replay: the plan is fixed, and the point of the knob is to ask whether THAT
+    # plan survives different masses -- not to re-derive which plan the search would pick.
     for _p in list(asm.masses):
       asm.masses[_p] = asm.masses[_p] * a.mass_scale
     asm.DEFAULT_MASS = getattr(asm, "DEFAULT_MASS", 0.1) * a.mass_scale
     print(f"[sim] --mass-scale {a.mass_scale:g}: part masses scaled (sim bodies AND the "
           f"wrench estimate)")
-  # debug knob: shrink arm collision geometry BEFORE witnesses/problem/sim so IK, the
-  # collision oracle and the MuJoCo capsules stay mutually consistent. 1.0 = no-op.
-  scale_arm_collision_shapes(C, robots, getattr(a, "coll_scale", 1.0))
-  gripper_kinds = _gripper_kinds_from_cfg(cfg, robots)
-  states = _states_from_plan(cfg, C, asm, robots, plan)
   print(f"[sim] {a.path}: {cfg['assembly']} ({cfg['parts']}p, {cfg['num_robots']}R), "
         f"{len(plan)} actions; executing "
         f"({'v2 real-arm motion plan' if a.v2 else 'v1 keyframe'}) ...")
@@ -2240,12 +2397,15 @@ def _cli_run(a):
                               corridor=a.corridor, corridor_ds=a.corridor_ds,
                               corridor_ds_lead=a.corridor_ds_lead,
                               corridor_lead_max=a.corridor_lead_max,
+                              rate_clamp=a.corridor_rate_clamp,
+                              settle_tol=a.settle_tol, settle_max=a.settle_max,
+                              couple_handovers=a.couple_handovers,
                               force_limits=a.force_limits, wrench_margin=a.wrench_margin,
                               mass_scale=a.mass_scale, inertia_factor=a.inertia_factor,
                               corner_limits=a.corner_limits,
                               spline=a.spline, spline_per_seg=a.spline_per_seg,
                               spline_tension=a.spline_tension,
-                              articulated=a.articulated)
+                              articulated=a.articulated, actuated=a.actuated)
   else:
     rep = SimExecutor(asm, gripper_kinds=gripper_kinds, gui=a.gui).execute(
         plan, states, record=a.record)
@@ -2277,6 +2437,26 @@ def _build_cli():
                       "--mp-path (the saved path already encodes it).")
   r.add_argument("--mp-runtime", type=float, default=60.0,
                  help="v2: BiRRT budget (s); ignored with --mp-path")
+  r.add_argument("--couple-handovers", action="store_true",
+                 help="corridor: also lock giver+receiver over a handover's stretch. A handover "
+                      "is ATOMIC discretely (giver holds before, receiver after, never both), so "
+                      "the state-scan coupling misses it entirely -- yet both grippers are on "
+                      "the part in execution. OFF = byte-identical.")
+  r.add_argument("--settle-tol", type=float, default=0.0, metavar="RAD",
+                 help="--actuated: before each attach fires, hold the reference until the max "
+                      "joint tracking error is under RAD (0 = off, byte-identical). The "
+                      "schedule dwells a fixed DWELL_T, but a servo settles when it settles "
+                      "(measured 0.54s vs a 0.15s dwell), and the grasp weld freezes whatever "
+                      "residual exists at fire time into the hand.")
+  r.add_argument("--settle-max", type=float, default=1.0, metavar="SEC",
+                 help="--settle-tol: give up waiting after this long (default 1.0s).")
+  r.add_argument("--corridor-rate-clamp", action="store_true",
+                 help="corridor: bound each step by the joint motion it ACTUALLY produces. "
+                      "rate_of() budgets joint_rate using the arm's arc share in the segment it "
+                      "is IN, but a step can land in a segment where that arm carries more of "
+                      "the arc, so the executed joint speed overshoots (measured 1.98 rad/s at "
+                      "joint_rate 1.0). Stiff arms absorb it; --actuated turns it into grasp "
+                      "load. OFF = byte-identical.")
   r.add_argument("--mp-cograsp", action="store_true",
                  help="v2: before executing, report how far each pair of co-grasping tool "
                       "centres drifts from its keyframe relative pose along the path. Lets a "
@@ -2296,6 +2476,16 @@ def _build_cli():
                       "events (never at a barrier it merely crosses) and runs at its own joint "
                       "limit. A pair whose corridor is 0 must move together, which is how "
                       "handovers/co-grasps express themselves. Prints the corridor widths.")
+  r.add_argument("--actuated", action="store_true",
+                 help="DYNAMICS: drive the articulated arm with per-joint POSITION SERVOS "
+                      "(MuJoCo <position> = a PD, computed in-solver -- no Python control loop "
+                      "and no integral term to wind up) instead of writing qpos. forcerange "
+                      "comes from rai's OWN ctrl_limits, i.e. the real UR10 effort limits "
+                      "(330/150/54 Nm), so this is the first mode in which what the arm can "
+                      "PUSH is modelled rather than assumed. Gravity+Coriolis are cancelled by "
+                      "feedforward so the gains stay uncritical. Implies --articulated. The "
+                      "trajectory becomes a REFERENCE: expect tracking error, and re-derive "
+                      "the wrench/corner calibrations against it.")
   r.add_argument("--articulated", action="store_true",
                  help="Drive REAL kinematic chains instead of teleported mocap bodies. Today "
                       "each arm is N DISCONNECTED mocap bodies, every one snapped to its rai-FK "

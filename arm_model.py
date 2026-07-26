@@ -95,7 +95,7 @@ def collides_like_sim(name):
 
 def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, indent=4,
                    collide_fn=None, contype="2", conaffinity="1", link_mass=1e-3,
-                   link_inertia=1e-6, armature=0.0, limits=True):
+                   link_inertia=1e-6, armature=0.0, limits=True, static_mass=None):
   """MJCF <body> tree for one articulated arm, read out of rai at q=0.
 
   Returns (xml, joint_names) with joint_names in MuJoCo's own qpos order for this arm -- the
@@ -143,8 +143,16 @@ def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, inde
       out.append(f'{pad}  <joint name="{name}" type="hinge" '
                  f'axis="{axis[0]} {axis[1]} {axis[2]}"{lim}{arm}/>')
       jnames.append(name)
-    out.append(f'{pad}  <inertial pos="0 0 0" mass="{link_mass:g}" '
-               f'diaginertia="{link_inertia:g} {link_inertia:g} {link_inertia:g}"/>')
+    # MASS BELONGS ON THE MOVING LINKS, NOT ON EVERY FRAME. rai has ~69 frames per arm
+    # (joint origins, collision capsules, finger meshes); giving each one `link_mass` builds a
+    # ~276 kg arm with fictitious inertia. That is invisible while the arm is driven
+    # kinematically, and fatal once actuators have to move it -- measured 3.6-6.5 rad of
+    # tracking error that got WORSE with higher gain, i.e. divergence. Only DOF-carrying bodies
+    # get real mass; the rigidly-attached rest get a token one.
+    _m = link_mass if (j is not None or static_mass is None) else static_mass
+    _i = link_inertia if (j is not None or static_mass is None) else static_mass
+    out.append(f'{pad}  <inertial pos="0 0 0" mass="{_m:g}" '
+               f'diaginertia="{_i:g} {_i:g} {_i:g}"/>')
     info = f.info()
     kind = info.get("shape")
     if kind not in _NO_GEOM:
@@ -184,3 +192,57 @@ def standalone_model(C, prefixes, timestep=0.002, **kw):
   </worldbody>
 </mujoco>"""
   return xml, jnames
+
+
+# =============================================================================================
+# ACTUATION -- the step after kinematic set-pose.
+#
+# A MuJoCo `<position>` actuator IS a PD servo (kp on position error, kv on velocity), computed
+# inside the solver every step. That is simpler than a hand-written PID in Python AND better
+# behaved: no integral term to wind up over a long move, and the control law participates in
+# the same constraint solve as the welds instead of fighting it from outside.
+#
+# Gravity droop -- the usual reason to reach for an I term -- is handled properly by a
+# feedforward instead (see sim's gravity compensation): cancel qfrc_bias and the PD only has to
+# reject the payload and tracking error, which makes the gains far less critical.
+#
+# FORCE RANGE COMES FROM RAI, NOT FROM A GUESS. rai's `ctrl_limits` on each joint carries the
+# real UR10 numbers -- [vel_limit, ?, effort_limit] = 330/330/150/54/54/54 Nm and 2.16..3.2
+# rad/s. Emitting those as `forcerange` is the first time the sim models what the arm can
+# actually PUSH, which is the placeholder (`F_push`=100N) the wrench model has carried all
+# along.
+# =============================================================================================
+def joint_ctrl_limits(C, name):
+  """(velocity limit, effort limit) from rai's ctrl_limits, or (None, None)."""
+  cl = C.getFrame(name).info().get("ctrl_limits")
+  if cl is None:
+    return None, None
+  cl = np.asarray(cl, dtype=float).ravel()
+  vel = float(cl[0]) if cl.size >= 1 and cl[0] > 0 else None
+  eff = float(cl[2]) if cl.size >= 3 and cl[2] > 0 else None
+  return vel, eff
+
+
+def actuator_mjcf(C, joint_names, kp=3000.0, kv=None, indent=4, forcerange=True,
+                  dampratio=1.0):
+  """`<actuator>` block: one position servo per joint, with rai's own effort limits.
+
+  DAMPING IS PER-JOINT, VIA `dampratio`, NOT A SHARED kv. A single kv is critical damping for
+  ONE inertia only, and a UR10's joint inertia spans 42x (measured from MuJoCo's mass matrix:
+  wrist_3 0.40 -> shoulder_lift 16.97). With kv = 2*sqrt(kp) that put zeta at 0.24 on
+  shoulder_lift and 1.58 on wrist_3 -- the big joints rang after every stop (error still GREW
+  after the reference stopped, 8.7 -> 11.0 mrad, 3 sign flips, 0.79s to settle against a 0.15s
+  DWELL_T), so attaches fired mid-oscillation and the grasp weld froze the swing into the hand.
+  MuJoCo's `dampratio` sets kv = 2*zeta*sqrt(kp*M) from the actuator's OWN effective inertia, so
+  every joint lands on the ratio asked for and nothing needs retuning for a different arm.
+  Pass `kv` to force an explicit shared value instead (the old behaviour).
+  Returns (xml, actuator_names) with actuator names == joint names."""
+  pad = " " * indent
+  out, names = [], []
+  for jn in joint_names:
+    _vel, eff = joint_ctrl_limits(C, jn)
+    fr = f' forcerange="{-eff:.9g} {eff:.9g}"' if (forcerange and eff) else ""
+    damp = (f'dampratio="{dampratio:g}"' if kv is None else f'kv="{kv:g}"')
+    out.append(f'{pad}<position name="{jn}" joint="{jn}" kp="{kp:g}" {damp}{fr}/>')
+    names.append(jn)
+  return "\n".join(out), names
