@@ -121,10 +121,17 @@ class RunConfig:
   ik_collision_gate: float = 0.015
   full_ik: bool = False
   strict_collisions: Optional[float] = None
+  strict_mate_collisions: bool = False
+  ik_accuracy: Optional[float] = None
+  mate_accuracy: Optional[float] = None
+  mate_eq_weight: Optional[float] = None
 
   # -- witness optimization --
   optimize_witnesses: Optional[str] = None
   witness_clearance: float = 0.0
+  witness_branch_budget: int = 0
+  witness_branch_metric: str = "sign"
+  witness_reconfig_thresh: float = 1.5707963267948966
   witness_robot_collisions: bool = False
   fuse_cograsp: bool = False
 

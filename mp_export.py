@@ -109,7 +109,8 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
 
   `pre_witnesses` (--fuse-pre-skill, {plan index: keyframe or None}) supplies the pre-* GOTO
   keyframes ready-made, from solver.fuse_pre_skill_witnesses. None (the default) keeps the
-  historical behaviour: each split solves its own pre keyframe here, inside the export."""
+  historical behaviour: each split solves its own pre keyframe here, inside the export. A
+  missing SKILL witness, by contrast, is a hard error -- it cannot be substituted."""
   from multi_robot_multi_goal_planning.problems.planning_env import Task
   from multi_robot_multi_goal_planning.problems.core.goals import SingleGoal
 
@@ -162,6 +163,9 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
     # --fuse-pre-skill on silently degraded every split it rejected -- which is what made the
     # flag non-identity at zero accepts and blocked defaulting it. Only an EXPLICIT None now
     # means "this split has no funnel".
+    # PRE keyframes are the one thing the exporter may solve itself (a rejected --fuse-pre-skill
+    # split has to fall back to something, and a zero-length funnel is worse). The SKILL witness
+    # is a different matter -- see the hard failure below.
     pre_wit = (pre_witnesses.get(i, _SOLVE_IT) if pre_witnesses is not None else _SOLVE_IT)
     if pre_wit is _SOLVE_IT:
       pre_wit = robot_ik.pre_skill_witness(a, states[i], states[i + 1], assembly, wit)
@@ -176,9 +180,24 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
             (name, mk_skill(goal_for(involved, wit)))]                       # cur := real witness
 
   tasks, seq, step_names = [], [], []                             # step_names[i] = names of plan step i
+  _NEEDS_WITNESS = ("pick", "place", "stow", "assemble", "add_grasp", "handover")
   for i, a in enumerate(plan):
     kind, r = a[0], a[1]
     wit = witnesses[i]
+    if wit is None and kind in _NEEDS_WITNESS:
+      # `goal_for(rs, None)` deliberately leaves cur[] alone -- that is what lets a RELEASE
+      # capture the object at its held pose. But for a skill that must REACH somewhere it means
+      # the exported goal is the arm's PREVIOUS configuration, and mr_bench then attaches the
+      # part there: measured 22_assemble_a2_obj_4_obj_0 at 4.54mm penetration with no witness
+      # behind it at all. Loud by default (some scenes rely on the carried config for `place`),
+      # FATAL under --strict-mate-collisions, which is the flag that asks for exactly this rigor.
+      msg = (f"step {i} {tuple(a)[:4]} has NO witness -- the exported goal is the acting arm's "
+             f"PREVIOUS configuration and the part gets attached there. A tight "
+             f"--strict-collisions can veto every candidate; check the [strict-collisions] "
+             f"veto count.")
+      if getattr(robot_ik, "mate_pair_gate", False):
+        raise ValueError(f"mp_export: {msg}")
+      print(f"  [mp-export] WARNING: {msg}")
     emit = None                                                   # None => single task `t`; else [(name,Task)]
     name = f"{i:02d}_{kind}_{'_'.join(str(x) for x in a[1:])}"
     # ALL robots whose witness pose must be applied this keyframe: the actor PLUS the
@@ -570,7 +589,8 @@ def mode_sequence(problem):
     m = env.get_next_modes(goal_config(m, task), m)[0]
 
 
-def report_problem_clearance(problem, plan=None, margin=0.02, verbose=True):
+def report_problem_clearance(problem, plan=None, margin=0.02, verbose=True,
+                             ref_scene=None, problem_assembly=None):
   """Per-mode collision/clearance report at the exported TASK-GOAL keyframes -- the exact
   configs (our witnesses) and the exact collision check (mr_bench's is_collision_free ->
   getCollisionsTotalPenetration) that BiRRT validates. For each mode: which plan action it
@@ -604,6 +624,11 @@ def report_problem_clearance(problem, plan=None, margin=0.02, verbose=True):
         q.append(q_home.robot_state(j))
     return conf_type.from_list(q)
 
+  name_to_idx_ref = {}
+  if step_names is not None:
+    for i, nms in enumerate(step_names):
+      for nm in nms:
+        name_to_idx_ref[nm] = i
   rows, m, k = [], env.start_mode, 0
   while True:
     combos = env.get_valid_next_task_combinations(m)
@@ -611,16 +636,101 @@ def report_problem_clearance(problem, plan=None, margin=0.02, verbose=True):
     q = goal_config(m, task)
     env.is_collision_free(q, m)                            # poses (mode + joints) as BiRRT does
 
-    def _held_by(fname):                                   # attach parent of a PART frame (else "")
+    def _held_by(fname):                                   # FULL attach chain up to the root
+      # the immediate parent is not enough: 'obj_2 on obj_0' looks innocent, but if obj_0 is
+      # itself parented to a GRIPPER of a robot this task does not move, the mode check poses
+      # that arm at HOME and the whole assembly travels with it -- which reads as a mystery
+      # collision against the acting arm. Walk to the root so the culprit is visible.
       if fname not in env.C.getFrameNames():
         return ""
-      p = env.C.getFrame(fname).getParent()
-      return p.name if p is not None else ""
+      chain, f, seen = [], env.C.getFrame(fname), set()
+      while True:
+        p = f.getParent()
+        if p is None or p.name in seen:
+          break
+        seen.add(p.name)
+        chain.append(p.name)
+        f = p
+      return " <- ".join(chain)
 
     pen = float(env.C.getCollisionsTotalPenetration())
     pairs = sorted(([c[0], c[1], float(c[2])] for c in env.C.getCollisions(margin)),
                    key=lambda x: x[2])
     rows.append((k, task.name, name_to_act.get(task.name), pen, pairs))
+    if ref_scene is not None and pen > 1e-6 and name_to_idx_ref.get(task.name) is not None:
+      # SCENE DRIFT: the same joint configuration can be clean in OUR scene and penetrating
+      # here, because the two scenes derive the parts' poses differently -- ours seats a
+      # table-resting group at its canonical rest pose, this one ACCUMULATES the actual attach
+      # /mate operations from the start config. Print the parts that actually sit elsewhere;
+      # that difference is the whole discrepancy, and it is invisible from either side alone.
+      Cref = ref_scene(name_to_idx_ref[task.name])
+      if Cref is not None:
+        drift = []
+        for f1, f2, _d in pairs[:6]:
+          for fn in (f1, f2):
+            if not fn.startswith("obj") or fn in [x[0] for x in drift]:
+              continue
+            try:
+              a = np.asarray(env.C.getFrame(fn).getPosition(), dtype=float)
+              b = np.asarray(Cref.getFrame(fn).getPosition(), dtype=float)
+            except Exception:
+              continue
+            # RELATIVE to the part's own parent as well: a world delta cannot distinguish
+            # "this part is mated wrong" (relative pose differs -> baked-in mate residual) from
+            # "the mate is fine but the whole assembly sits elsewhere" (relative matches, world
+            # does not). Those have completely different fixes.
+            rel = float("nan")
+            try:
+              pa_ = env.C.getFrame(fn).getParent()
+              pb_ = Cref.getFrame(fn).getParent()
+              if pa_ is not None and pb_ is not None:
+                ra = np.asarray(env.C.getFrame(fn).getRelativePosition(), dtype=float)
+                rb = np.asarray(Cref.getFrame(fn).getRelativePosition(), dtype=float)
+                rel = float(np.linalg.norm(ra - rb)) * 1000.0
+            except Exception:
+              pass
+            drift.append((fn, (a - b) * 1000.0, float(np.linalg.norm(a - b)) * 1000.0, rel))
+        for fn, dv, dd, rel in drift:
+          # COMPONENTWISE on purpose: a spawn-height offset (--part-float) is purely VERTICAL,
+          # accumulated mate residual is mixed-axis. The magnitude alone cannot tell them apart.
+          # the parent must be named: a REL number computed against DIFFERENT parents in the
+          # two scenes compares nothing at all (measured 178mm of "drift" that way).
+          def _pn(Cx, f):
+            try:
+              q = Cx.getFrame(f).getParent()
+              return q.name if q is not None else "-"
+            except Exception:
+              return "?"
+          _pe, _po = _pn(env.C, fn), _pn(Cref, fn)
+          # WHICH SCENE IS WRONG? Compare each against the IDEAL mate geometry: the part's
+          # position relative to the assembly ROOT should equal assembly.position_in_base()
+          # (parts are axis-aligned, so orientation stays identity). Whichever scene deviates
+          # is the one to fix -- guessing that from a world delta alone is how I got this
+          # backwards twice.
+          try:
+            _root = None
+            for _cand in ("obj_0",):
+              if _cand in env.C.getFrameNames():
+                _root = _cand
+            if _root is not None and plan is not None:
+              _ideal = np.asarray(problem_assembly.position_in_base(fn), dtype=float) - \
+                       np.asarray(problem_assembly.position_in_base(_root), dtype=float)
+              for _tag, _Cx in (("exported", env.C), ("ours", Cref)):
+                # EXPRESS IN THE ROOT'S OWN FRAME. The ideal offset is a base-frame vector;
+                # the assembly is arbitrarily oriented in the world (always so when held), so
+                # comparing a world-frame delta to it is meaningless -- that mistake reported
+                # ~76-103mm of bogus error on BOTH scenes at once.
+                _R = np.asarray(_Cx.getFrame(_root).getRotationMatrix(), dtype=float)
+                _rp = _R.T @ (np.asarray(_Cx.getFrame(fn).getPosition(), dtype=float)
+                              - np.asarray(_Cx.getFrame(_root).getPosition(), dtype=float))
+                print(f"          vs IDEAL mate geometry [{_tag:8s}]: "
+                      f"{np.linalg.norm(_rp - _ideal)*1000:7.2f}mm off")
+          except Exception as _ee:
+            pass
+          _same = " (same parent)" if _pe == _po else f"  PARENTS DIFFER: exported '{_pe}' vs ours '{_po}'"
+          print(f"        [scene-drift] {fn}: world {dd:.2f}mm "
+                f"(dx={dv[0]:+.2f} dy={dv[1]:+.2f} dz={dv[2]:+.2f})  "
+                f"rel {rel:.2f}mm{_same}")
     if verbose and (pen > 1e-6 or (pairs and pairs[0][2] < margin * 0.5)):
       tag = f"  {name_to_act.get(task.name)}" if name_to_act.get(task.name) else ""
       flag = "   <<< COLLIDES" if pen > 1e-6 else "   (near)"

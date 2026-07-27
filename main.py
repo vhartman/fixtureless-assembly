@@ -605,13 +605,21 @@ def build_parser():
   )
   g_witness.add_argument(
       "--optimize-witnesses", nargs="?", const="joint", default=None,
-      choices=["joint", "ee", "dp-joint", "dp-ee"], metavar="MODE",
+      choices=["joint", "ee", "dp-joint", "dp-ee", "floor"], metavar="MODE",
       help="POST-optimize the plan's IK witnesses (discrete plan FIXED): re-solve each IK "
            "action pulled toward the ACTIVE arm's previous configuration, minimizing "
            "per-step movement in 'joint' space (default) or 'ee' space (position + "
            "weighted orientation). dp-joint/dp-ee: LADDER-DP -- harvest multiple feasible "
            "candidates per step (assemble orientation biases, fresh re-solves, the greedy "
            "pass) and pick the globally optimal combination by per-robot Viterbi "
+           "'floor': CLEARANCE-FLOOR ladder -- clearance becomes a per-step FLOOR (a hard "
+           "filter at alpha * the best clearance available at that step) and among the poses "
+           "that clear it the chain minimising IK BRANCH CROSSINGS wins. Unlike the weighted "
+           "dp-* modes the two objectives cannot trade; the floor is raised as high as is FREE "
+           "(costs no extra crossings) and the whole front is printed. Multi-arm steps "
+           "(handover/add_grasp/braced assemble) are JOINT nodes, clearance sees the other arms "
+           "at their carried configs rather than at home, and tool roll is treated as a "
+           "symmetry rather than a branch. "
            "(DP >= greedy >= original by construction). Feasibility-safe (search "
            "witnesses kept on any failure); idle arms stay home-pinned as in the search. "
            "Requires --real-ik.",
@@ -624,6 +632,63 @@ def build_parser():
            "SUM over arm-link pairs of min(gap, 0.4m) via C.eval(FS.distance) (sum not "
            "min: the gripper is pinned near the object; the cap ignores already-far "
            "pairs). Traded against movement by this weight. Best with the dp-* modes.",
+  )
+  g_witness.add_argument(
+      "--witness-branch-budget", type=int, default=0, metavar="N",
+      help="--optimize-witnesses floor: permit N extra IK BRANCH CROSSINGS in exchange for a "
+           "higher clearance floor. 0 (default) takes only the clearance that is FREE -- the "
+           "highest floor achieving the same crossing count as no floor at all.",
+  )
+  g_search.add_argument(
+      "--ik-accuracy", type=float, default=None, metavar="TOL",
+      help="NLP stopTolerance for every IK solve. rai's DEFAULT IS 0.01 -- 10mm -- so an "
+           "eq-constrained mate is declared solved while MILLIMETRES out (measured: every "
+           "cross-12 mate ~4.5mm short along its own insertion axis). mr_bench bakes that error "
+           "in at attach, so the exported assembly disagrees with the scene the witness was "
+           "solved in and the acting arm collides with an already-mated part. 1e-3 gave 0.012mm "
+           "residuals on car-mini (100x better) for ~3x solve time; TIGHTER IS WORSE (1e-5/1e-6 "
+           "regress -- the solver hits its eval caps before the augmented-Lagrangian schedule "
+           "finishes).",
+  )
+  g_search.add_argument(
+      "--mate-eq-weight", type=float, default=None, metavar="W",
+      help="Weight on the assemble's positionRel/quaternionRel EQUALITY constraints (default "
+           "1e1). rai's augmented-Lagrangian schedule trades the eq residual against the other "
+           "objectives, so at 1e1 the mate settles millimetres short and rai still reports "
+           "feasible. MEASURED car-mini: 1e2 gives 1.337mm -> 0.026mm AND is slightly faster; "
+           "1e3 is no better; 1e4 starts failing solves. Asking for accuracy up front beats "
+           "rejecting after the fact (--mate-accuracy cost ~90x search time).",
+  )
+  g_search.add_argument(
+      "--mate-accuracy", type=float, default=None, metavar="M",
+      help="ACCEPTANCE CRITERION for an assemble: reject a witness whose achieved "
+           "positionRel(part, onto) misses the mate by more than M and let the solver try "
+           "another bias/restart. rai calls an eq constraint 'feasible' while it is still "
+           "MILLIMETRES out and --ik-accuracy does NOT change that (measured: the same 4.5mm "
+           "mate at stopTolerance 1e-2 and 1e-3), so this is the only way to refuse an "
+           "under-seated mate. mr_bench bakes the miss in at attach, which is what makes the "
+           "exported assembly disagree with ours and the acting arm hit an already-mated part.",
+  )
+  g_search.add_argument(
+      "--strict-mate-collisions", action="store_true",
+      help="Gate assemble witnesses on collisions the moving part makes with everything OTHER "
+           "than its mate target. The IK must disable that group's contact to converge on a "
+           "flush mate, which also hides part-vs-arm and part-vs-part -- so the search accepts "
+           "witnesses the motion planner rejects at the same tolerance. Needs "
+           "--strict-collisions for the threshold.",
+  )
+  g_search.add_argument(
+      "--witness-branch-metric", choices=("sign", "motion"), default="sign",
+      help="--optimize-witnesses floor: how a BRANCH CROSSING is counted. 'sign' (default) "
+           "labels by (elbow, wrist_2) sign -- 4 of the arm's 8 analytic branches, blind to the "
+           "SHOULDER flip (measured: two same-label candidates 2.414 rad apart on pan). "
+           "'motion' instead counts joints that must travel > --witness-reconfig-thresh along "
+           "their shortest path, catching shoulder/elbow/wrist flips alike.",
+  )
+  g_search.add_argument(
+      "--witness-reconfig-thresh", type=float, default=float(np.pi / 2.0), metavar="RAD",
+      help="Per-joint travel above which --witness-branch-metric motion calls it a crossing "
+           "(default pi/2).",
   )
   g_search.add_argument(
       "--inhand-reorient", action="store_true",
@@ -985,6 +1050,16 @@ _SAVE_CONFIG_FIELDS = (
     "allow_curved_grasps", "grippers", "grasp_compliance",
     "vacuum_scale", "tf_close_torque", "dominance", "useful_grasps", "brace_resting",
     "mixed_wrench_h", "strict_collisions", "witness_robot_collisions", "plain_box",
+    # SUCCESSOR-AFFECTING and previously UNSAVED: a plan solved with any of these replays
+    # against a DIFFERENT successor set than the search that made it, and the first symptom is
+    # optimize_witnesses*/replay failing with "cannot reproduce action ... from the successor
+    # set". min_sep and place_cells change the place cells, the rest change the action space.
+    "strict_mate_collisions", "ik_accuracy", "mate_accuracy", "mate_eq_weight",
+    "min_sep", "place_cells", "prefer_center", "brace_for_assembly_only", "lru_robots",
+    "anon_robots", "declutter", "por",
+    # LAYOUT: these feed add_disassembled_obj, so without them the replay/sim rebuilds a
+    # DIFFERENT initial scatter than the plan was solved in (FRAGILITY 1.8).
+    "grid_init", "grid_gap",
 )
 
 
@@ -1384,6 +1459,27 @@ def run(cfg):
       robot_ik.strip_inactive_collision = False
       print("[flag] --witness-robot-collisions ACTIVE: other robots' collision kept ON in IK "
             "(search + witness opt); idle arms are at HOME in the IK scene.")
+    if robot_ik is not None and cfg.mate_eq_weight is not None:
+      robot_ik.mate_eq_weight = float(cfg.mate_eq_weight)
+      print(f"[flag] --mate-eq-weight {cfg.mate_eq_weight:g}: assemble mate eq constraints "
+            f"weighted up from the 1e1 default, so the solve SEATS the part instead of "
+            f"stopping millimetres short.")
+    if robot_ik is not None and cfg.mate_accuracy is not None:
+      robot_ik.mate_residual_reject = float(cfg.mate_accuracy)
+      print(f"[flag] --mate-accuracy {cfg.mate_accuracy:g}m: assemble witnesses REJECTED when "
+            f"the achieved mate misses by more than that (rai's own feasibility verdict does "
+            f"not enforce it).")
+    if robot_ik is not None and cfg.ik_accuracy is not None:
+      robot_ik.nlp_stop_tolerance = float(cfg.ik_accuracy)
+      print(f"[flag] --ik-accuracy {cfg.ik_accuracy:g}: NLP stopTolerance tightened from rai's "
+            f"default 0.01 (=10mm, which lets a mate settle millimetres short of its target).")
+    if robot_ik is not None and cfg.strict_mate_collisions:
+      robot_ik.mate_pair_gate = True
+      print("[flag] --strict-mate-collisions ACTIVE: at an assemble the moving group's contact "
+            "is disabled for the SOLVE (the mate is flush by construction) but the witness is "
+            "GATED on every pair except the intended moving<->target one. Without it the strict "
+            "gate is blind to part-vs-arm / part-vs-part at the mate -- which is where the "
+            "motion planner disagrees with the search at the SAME tolerance.")
     if robot_ik is not None and cfg.strict_collisions is not None:
       robot_ik.penetration_reject = float(cfg.strict_collisions)
       robot_ik.col_weight = 1e2                          # steer clean, don't lean on the slack
@@ -1457,6 +1553,9 @@ def run(cfg):
     if robot_ik is not None and cfg.strict_collisions is not None:
       print(f"[strict-collisions] vetoed {robot_ik.strict_rejects} dirty KOMO witnesses "
             f"(> {cfg.strict_collisions:g}m total penetration).")
+    if robot_ik is not None and cfg.mate_accuracy is not None:
+      print(f"[mate-accuracy] vetoed {robot_ik.mate_rejects} under-seated mates "
+            f"(> {cfg.mate_accuracy:g}m residual).")
     if fail_rec is not None and fail_rec.steps:
       print(f"[ik-failures] {len(fail_rec.steps)} failed binds recorded -- serving in "
             f"viser (Stop in the GUI to continue to the plan replay).")
@@ -1480,18 +1579,42 @@ def run(cfg):
         if robot_ik is None:
           print("[witopt] --optimize-witnesses needs --real-ik; skipping.")
         else:
-          opt_witnesses, _rep = optimize_witnesses(
-              C, assembly, plan, robots, robot_ik, cost=cfg.optimize_witnesses,
-              gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
-              handovers=cfg.handovers, allow_place=cfg.allow_place,
-              bracing=cfg.bracing, clear_weight=cfg.witness_clearance,
-              robot_collisions=cfg.witness_robot_collisions)
+          if cfg.optimize_witnesses == "floor":
+            from witness_floor import optimize_witnesses_floor
+            # floor mode CONSTRAINS clearance (a per-step normalised floor) rather than
+            # weighting it, so there is nothing for --witness-clearance to scale. Say so
+            # instead of accepting the flag and ignoring it.
+            if cfg.witness_clearance:
+              print(f"[witfloor] NOTE: --witness-clearance {cfg.witness_clearance} is IGNORED "
+                    "in floor mode (the floor is a constraint, not a weight); use "
+                    "--witness-branch-budget to buy a higher floor.")
+            opt_witnesses, _rep = optimize_witnesses_floor(
+                C, assembly, plan, robots, robot_ik,
+                gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
+                handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
+                branch_budget=cfg.witness_branch_budget,
+                branch_metric=cfg.witness_branch_metric,
+                reconfig_thresh=cfg.witness_reconfig_thresh)
+          else:
+            opt_witnesses, _rep = optimize_witnesses(
+                C, assembly, plan, robots, robot_ik, cost=cfg.optimize_witnesses,
+                gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
+                handovers=cfg.handovers, allow_place=cfg.allow_place,
+                bracing=cfg.bracing, clear_weight=cfg.witness_clearance,
+                robot_collisions=cfg.witness_robot_collisions)
       if plan is not None and cfg.utilization:
         from solver import utilization_report
         utilization_report(C, assembly, plan, robots, witnesses=opt_witnesses,
                            gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
                            handovers=cfg.handovers, allow_place=cfg.allow_place,
                            bracing=cfg.bracing)
+      if plan is not None and cfg.fuse_cograsp and not cfg.motion_plan:
+        # the fusion pass only ever ran inside the --motion-plan branch, so without it the
+        # flag is inert -- and the REPLAY then shows the unfused pair, whose brace arm sits in
+        # a different IK branch at add_grasp than at assemble. That looks like a broken pose.
+        print("[flag] --fuse-cograsp has NO EFFECT without --motion-plan: it rewrites the "
+              "MOTION-PLAN witnesses only. The replay/--viser shows the UNFUSED witnesses, "
+              "where a braced arm may change IK branch between add_grasp and assemble.")
       if plan is not None and cfg.motion_plan:
         if robot_ik is None:
           print("[motion-plan] needs --real-ik (for the IK witnesses); skipping.")
@@ -1514,6 +1637,26 @@ def run(cfg):
             mp_wit, _frep = fuse_cograsp_witnesses(
                 C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
                 handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing)
+          # LAST GATE: re-check the witnesses we are about to SHIP. Every earlier gate ran at
+          # SOLVE time, and the object that leaves here is not the object that was solved --
+          # optimize_witnesses* emits a splice and fuse_cograsp re-solves the pair again. A
+          # dirty mate keyframe must fail HERE, named, not surface as an unexplained motion-
+          # planner rejection three stages later.
+          if cfg.strict_mate_collisions and robot_ik.penetration_reject is not None:
+            from solver import validate_export_witnesses
+            mp_wit, _bad = validate_export_witnesses(
+                C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
+                handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing)
+            if _bad:
+              print(f"[export-gate] {len(_bad)} assemble witness(es) STILL penetrate after "
+                    f"falling back to the search's own witness -- the motion planner will "
+                    f"reject these keyframes:")
+              for _i, _act, _p, _ in _bad:
+                print(f"    step {_i} {_act[:4]}: {_p * 1000:.2f}mm "
+                      f"(gate {robot_ik.penetration_reject * 1000:.3f}mm)")
+            else:
+              print("[export-gate] every exported assemble keyframe is collision-free "
+                    "(only the intended mate contact exempt).")
           # AFTER fusing: this pass never re-solves a SKILL witness, so a fused pair survives
           # untouched -- it only replaces the pre-* GOTO keyframes the exporter would solve.
           mp_pre = None
@@ -1554,7 +1697,24 @@ def run(cfg):
           print(f"[motion-plan] {'SEQUENCE' if cfg.mp_sequence else 'DEPGRAPH'} problem, "
                 f"{len(prob.tasks)} tasks")
           if cfg.mp_clearance:
-            MP.report_problem_clearance(prob, plan=plan)
+            # pass OUR per-step scene so the report can name parts that sit elsewhere here
+            from solver import _replay_states as _rs, _search_context as _sc
+            try:
+              _ck2, _gt2 = _sc(C, assembly, robots)
+              _st = _rs(C, assembly, plan, robots, gk, cfg.handovers, cfg.allow_place,
+                        cfg.bracing, _gt2, "mp-clearance")
+
+              def _ref(i, _st=_st):
+                if mp_wit[i] is None:
+                  return None
+                Cx = robot_ik.scene_for(_st[i], assembly)
+                Cx.setJointState(np.asarray(mp_wit[i], dtype=float).ravel())
+                return Cx
+            except Exception as _e:
+              print(f"[clearance] scene-drift compare unavailable: {type(_e).__name__}")
+              _ref = None
+            MP.report_problem_clearance(prob, plan=plan, ref_scene=_ref,
+                                        problem_assembly=assembly)
           if cfg.mp_modes:
             import os as _os, sys as _sys
             MP._ensure_mrbench()

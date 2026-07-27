@@ -2914,6 +2914,14 @@ def reset_wrench_cache():
   _WRENCH_CACHE.clear()
 
 
+def reset_grasp_pose_cache():
+  """The grasp-pose cache is keyed on the SHAPE plus rolls/offset/dense -- NOT on every global
+  that shapes grasp generation (_ALLOW_CURVED_GRASPS and _PLAIN_BOX are absent). Two scenes in
+  one process therefore share entries computed under different settings, and the grasp table
+  silently stops matching the search that produced the plan."""
+  _GRASP_POSE_CACHE.clear()
+
+
 def _grounding_caps(state, assembly, group, gripper_kind):
   # Everything in the stability LP that does NOT depend on the applied load: the grounding
   # generator matrix (G [6xK], ub [K]) + its precomputed linprog `bounds` and rounded cache-

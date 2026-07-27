@@ -383,6 +383,25 @@ class RobotIK:
     self._reach_bounds = {}                               # robot -> sound max-reach (lazy)
     self.reach_rejects = 0                                # rejects by the reach-sphere bound
     self.analytic_rejects = 0                             # rejects by empty ssik solution sets
+    self.mate_eq_weight = None                            # None = 1e1 (rai default here)
+    self.mate_residual_reject = None                      # None = off; metres (--mate-accuracy)
+      # THE acceptance criterion for an assemble. rai's `feasible` verdict accepts an eq
+      # constraint that is still MILLIMETRES out, and tightening stopTolerance does NOT change
+      # what it ACCEPTS -- measured: bind returns the same 4.5mm mate at stopTolerance 1e-2 and
+      # 1e-3 alike. The only way to refuse an under-seated mate is to measure it and say no.
+    self.nlp_stop_tolerance = None                        # None = rai's default 1e-2 (=10mm!)
+      # rai's NLP_Solver stops at stopTolerance=0.01 by DEFAULT, so an eq-constrained mate is
+      # declared solved while still MILLIMETRES out -- measured ~4.5mm on every cross-12 mate,
+      # short along the part's own insertion axis. mr_bench then bakes that error in at attach
+      # and the exported assembly disagrees with ours. Set to tighten.
+    self.mate_pair_gate = False                           # --strict-mate-collisions (see _pen_ok)
+    self._mate_exempt = None                              # (moving parts, target parts) while solving a mate
+    self.harvest_branches = None                          # scratch list while harvesting
+    self.harvest_all_branches = True                      # keep EVERY feasible analytic
+      # branch as a ladder candidate, not just the first. `_solve_with_seeds` used to return on
+      # the first feasible seed, so a solo pick offered ~3 candidates all in ONE IK branch and
+      # the DP had nothing to choose between -- measured, the harvest took one pick from 1
+      # candidate/1 branch to 6/2. Set False to restore the first-feasible-only behaviour.
     self.seed_restart_cap = 2                             # random restarts left after seeds (see _solve_ik)
     self.braced_analytic = True                           # per-arm analytic for BRACED place/assemble
     # PRE-INSERTION funnel (--pre-insertion), EXPORT/REPLAY ONLY: metres to back off along the
@@ -418,7 +437,8 @@ class RobotIK:
     # slack and getting rejected).
     self.penetration_reject = None
     self.col_weight = 1e1
-    self.strict_rejects = 0                               # diagnostics: dirty witnesses vetoed
+    self.strict_rejects = 0
+    self.mate_rejects = 0                               # diagnostics: dirty witnesses vetoed
     # DEBUG: set env PEN_VIEW_ACTION='pick a1 obj_1 0' to open a BLOCKING C.view(True) on the
     # FIRST penetration check of that exact action (space-joined tuple) -- prints the colliding
     # frame pairs and shows the skill scene at the checked witness. For inspecting whether a
@@ -711,6 +731,18 @@ class RobotIK:
           cands.append(w)
     else:
       fn = {"pick": self._ik_pick, "place": self._ik_place}.get(kind, self._ik_add_grasp)
+      # HARVEST EVERY ANALYTIC BRANCH ONCE, then top up with restarts. Without it the
+      # fixed-target skills return the SAME first-feasible branch every call -- measured, a solo
+      # pick gave ~3 candidates clustered within 14cm, so a ladder had no real choice.
+      # OFF BY DEFAULT: this widens the pool the EXISTING dp-joint/dp-ee ladder consumes, and
+      # that path's behaviour is measured. witness_floor turns it on for its own ladder.
+      if self.harvest_all_branches:
+        self.harvest_branches = []
+        try:
+          fn(action, s0, s1, assembly, None)
+          cands.extend(self.harvest_branches)
+        finally:
+          self.harvest_branches = None
       for _ in range(resolves):
         ok, w = fn(action, s0, s1, assembly, None)
         if ok and w is not None:
@@ -764,6 +796,65 @@ class RobotIK:
     komo.addObjective([1, 1], ry.FS.qItself, sel, ry.OT.eq, [1e1],
                       [p[n] for n in sel])
 
+  def mate_penetration(self, C, moving, target):
+    """Total penetration of `moving` against everything EXCEPT its mate `target`.
+
+    The mate scene has the moving group's contact DISABLED -- required for the solve, since the
+    seating is flush and the intended contact would otherwise read as penetration -- but that
+    also hides part-vs-arm and part-vs-other-part, which the motion planner very much sees.
+    `getCollisionsTotalPenetration()` cannot express a per-PAIR exclusion (set_part_contact is
+    per-frame, all-or-nothing), so the group's contact is re-enabled just long enough to sum the
+    pairs by hand, and restored before returning.
+    """
+    for mp in moving:
+      set_part_contact(C, mp, 1)
+    try:
+      pen = 0.0
+      for c in C.getCollisions():
+        fa, fb, d = c[0], c[1], float(c[2])
+        if d >= 0.0:
+          continue
+        a_in = any(fa.startswith(m) for m in moving)
+        b_in = any(fb.startswith(m) for m in moving)
+        if a_in and b_in:
+          continue                                        # inside the moving group itself
+        if a_in != b_in:
+          other = fb if a_in else fa
+          if any(other.startswith(t) for t in target):
+            continue                                      # the INTENDED flush mate contact
+        # EVERYTHING ELSE COUNTS -- including pairs the moving group is not part of at all.
+        # An earlier version skipped those ("if a_in == b_in: continue"), which silently
+        # dropped the ACTOR'S ARM against a part of the TARGET assembly. Measured: the exported
+        # keyframe 18_assemble_a1_obj_4_obj_0 had obj_2 (already mated onto obj_0) 4.74mm
+        # inside a1_ur_palm, and this gate scored it 0.00mm. The only contact a mate may make
+        # is moving<->target; every other overlap is a real collision.
+        pen += -d
+      return pen
+    finally:
+      for mp in moving:
+        set_part_contact(C, mp, 0)
+
+  def mate_residual(self, C, q, part_name, onto, rel_pos):
+    """|achieved positionRel(part, onto) - target|, in metres. This is what mr_bench bakes in at
+    attach (C.attach keeps the WORLD pose at the mode switch), so an under-seated mate makes the
+    exported assembly disagree with the scene the witness was solved in -- and the acting arm
+    then collides with an already-mated part."""
+    saved = C.getJointState()
+    try:
+      C.setJointState(np.asarray(q, dtype=float))
+      v, _ = C.eval(ry.FS.positionRel, [part_name, onto])
+      return float(np.linalg.norm(np.asarray(v, dtype=float) - np.asarray(rel_pos, dtype=float)))
+    finally:
+      C.setJointState(saved)
+
+  def _nlp(self, komo):
+    """The ONE place an NLP_Solver is built, so `nlp_stop_tolerance` cannot be applied to some
+    solve paths and not others (there are three inside _solve_ik alone)."""
+    s = ry.NLP_Solver(komo.nlp(), verbose=0)
+    if self.nlp_stop_tolerance is not None:
+      s.setOptions(stopTolerance=float(self.nlp_stop_tolerance))
+    return s
+
   def _pen_ok(self, C, q):
     # --strict-collisions gate: total penetration of the skill scene at witness q (the same
     # contact flags the komo's collision objective saw -- target-part exclusions included).
@@ -771,7 +862,10 @@ class RobotIK:
       return True
     saved = C.getJointState()
     C.setJointState(np.asarray(q, dtype=float))
-    pen = float(C.getCollisionsTotalPenetration())
+    if self._mate_exempt is None:
+      pen = float(C.getCollisionsTotalPenetration())
+    else:
+      pen = self.mate_penetration(C, *self._mate_exempt)
     reject = pen > self.penetration_reject
 
     if (self._pen_view_action is not None and not self._pen_viewed
@@ -806,23 +900,33 @@ class RobotIK:
     # a nearby collision-free pose the discrete IK solutions don't cover), hence the fallback.
     for seed in (seeds or []):
       komo.initWithConstant(np.asarray(seed, dtype=float))
-      r = ry.NLP_Solver(komo.nlp(), verbose=0).solve().dict()
+      r = self._nlp(komo).solve().dict()
       if r["feasible"] and self._pen_ok(C, komo.getPath()[-1]):
         self._last_res = r
+        if self.harvest_branches is not None:
+          # CANDIDATE HARVEST: keep going. The analytic seed set ENUMERATES the arm's exact
+          # pose branches (up to 8), but returning the FIRST feasible one is what makes the
+          # witness-ladder's pool thin -- measured, solo picks yielded ~3 candidates all in one
+          # basin, so the DP had nothing to choose between. Collect them all and let the ladder
+          # pick; None (the default) restores the early return exactly.
+          self.harvest_branches.append(komo.getPath()[-1])
+          continue
         return True, komo.getPath()[-1]
+    if self.harvest_branches:
+      return True, self.harvest_branches[0]
     if seeds:
       # the analytic seed set ENUMERATES every exact pose branch (up to 8), so random restarts
       # can only re-derive branches already tried -- their residual value is exploring the eq
       # TOLERANCE slack (a nearby collision-free near-pose). A few tries cover that; the full
       # budget is for UNSEEDED solves where restarts must find the branches themselves.
       restarts = min(restarts, self.seed_restart_cap)
-    r = ry.NLP_Solver(komo.nlp(), verbose=0).solve().dict()
+    r = self._nlp(komo).solve().dict()
     if r["feasible"] and self._pen_ok(C, komo.getPath()[-1]):
       self._last_res = r
       return True, komo.getPath()[-1]
     for _ in range(restarts):
       komo.initRandom()
-      r = ry.NLP_Solver(komo.nlp(), verbose=0).solve().dict()
+      r = self._nlp(komo).solve().dict()
       if r["feasible"] and self._pen_ok(C, komo.getPath()[-1]):
         self._last_res = r
         return True, komo.getPath()[-1]
@@ -1176,6 +1280,13 @@ class RobotIK:
     feasible, witness = self._solve_ik(komo, seeds=seeds, C=C)
     if self.single_arm_ik:
       witness = self._expand_witness(C, witness, full_names)  # restricted -> full joint vector
+      # HARVESTED BRANCHES NEED THE SAME EXPANSION. _solve_with_seeds collects raw
+      # komo.getPath() rows, which under single_arm_ik are the RESTRICTED 6-vector -- handing
+      # those to a consumer that indexes by full joint name raised
+      # KeyError: 'a2_ur_shoulder_pan_joint' in optimize_witnesses' clearance().
+      if self.harvest_branches:
+        self.harvest_branches = [self._expand_witness(C, h, full_names)
+                                 for h in self.harvest_branches]
     if not feasible:
       self._log_failure(action, C, komo)
 
@@ -1347,6 +1458,11 @@ class RobotIK:
     feasible, witness = self._solve_ik(komo, seeds=seeds, C=C)
     if single:
       witness = self._expand_witness(C, witness, full_names)  # restricted -> full joint vector
+      # same expansion for the harvested branches (see the pick path) -- these are RESTRICTED
+      # 6-vectors straight out of komo.getPath() and every consumer indexes by full joint name.
+      if self.harvest_branches:
+        self.harvest_branches = [self._expand_witness(C, h, full_names)
+                                 for h in self.harvest_branches]
     if not feasible:
       self._log_failure(action, C, komo)
 
@@ -1377,8 +1493,13 @@ class RobotIK:
     # single-phase caller keeps the default.
     # cube-pose constraint (NOT an EE pose): pose(part) relative to pose(onto) == the mate.
     #   positionRel([A, B]) / quaternionRel([A, B]) = pose of A expressed in B's frame.
-    komo.addObjective([phase, phase], ry.FS.positionRel, [part_name, onto], ry.OT.eq, [1e1], rel_pos)
-    komo.addObjective([phase, phase], ry.FS.quaternionRel, [part_name, onto], ry.OT.eq, [1e1], rel_quat)
+    # MATE EQ WEIGHT. rai's augmented-Lagrangian schedule trades the eq residual against the
+    # other objectives; at the default 1e1 the mate settles MILLIMETRES out and rai still calls
+    # it feasible. Asking for accuracy up front is cheaper than rejecting and re-solving blindly
+    # (measured: --mate-accuracy 1e-3 vetoed 1315 mates and cost ~90x search time).
+    _mw = self.mate_eq_weight if self.mate_eq_weight is not None else 1e1
+    komo.addObjective([phase, phase], ry.FS.positionRel, [part_name, onto], ry.OT.eq, [_mw], rel_pos)
+    komo.addObjective([phase, phase], ry.FS.quaternionRel, [part_name, onto], ry.OT.eq, [_mw], rel_quat)
     # slight position bias: pull the centre body toward the middle of the workspace. LOW
     # weight vs the mate eq -- only breaks the free-position DOF of a HELD assembly (inert on
     # the table). Keeps held assemblies centred instead of drifting to the reachable fringe.
@@ -1433,6 +1554,16 @@ class RobotIK:
     moving = next((g for g in s0.subassemblies() if part in g), (part,))
     for mp in moving:
       set_part_contact(C, mp, 0)
+    # ...but tell the GATE what was excluded and why. Disabling the group's contact is needed
+    # for the SOLVE (the mate is flush against the target, so the intended contact would read as
+    # penetration and the IK would never converge) -- it is NOT a reason to stop checking the
+    # part against the REST of the world. Without this the strict gate is blind to part-vs-arm
+    # and part-vs-other-part at the mate, which is exactly where the motion planner then
+    # disagrees with us at the same tolerance (measured on cross-12: the inserted obj_3 through
+    # the bracing arm's palm by 5.2mm, obj_5 by 4.3mm, both silently accepted).
+    if self.mate_pair_gate:
+      target_grp = next((g for g in s0.subassemblies() if onto in g), (onto,))
+      self._mate_exempt = (frozenset(moving), frozenset(target_grp))
 
     # FIXED-target fast rejects: when the TARGET group rests on the table (no robot holds any
     # of its parts) the mate pose is fixed in the world, and the moving group rides RIGIDLY on
@@ -1502,6 +1633,11 @@ class RobotIK:
           komo, restarts=0,                            # pre-insertion goto) warm-starts the solve
           seeds=([warm] if warm is not None else None),  # so it settles in the SAME IK basin
           C=C)
+      if feasible and witness is not None and self.mate_residual_reject is not None:
+        _mr = self.mate_residual(C, witness, part_name, onto, rel_pos)
+        if _mr > self.mate_residual_reject:
+          self.mate_rejects += 1                       # under-seated: try the next bias/restart
+          feasible = False
       if feasible:
         break
     if not feasible:                                      # fallback: unbiased random restarts
@@ -1511,8 +1647,14 @@ class RobotIK:
       self._add_grasp_maintenance(komo, s0, assembly)
       feasible, witness = self._solve_ik(
           komo, restarts=6, seeds=([warm] if warm is not None else None), C=C)
+      if feasible and witness is not None and self.mate_residual_reject is not None:
+        if self.mate_residual(C, witness, part_name, onto, rel_pos) > self.mate_residual_reject:
+          self.mate_rejects += 1
+          feasible, witness = False, None
     if not feasible:
       self._log_failure(action, C, komo)
+
+    self._mate_exempt = None                              # scoped to this action's solves
 
     if self.debug_view:
         print("assemble feasible:", feasible)
@@ -1842,6 +1984,122 @@ class AbstractionHeuristic:
     return self.dist.get(self.abstract(state), 0.0)
 
 
+
+# =============================================================================================
+# WITNESS LADDER GEOMETRY -- what "the same pose" and "a different branch" actually mean.
+# =============================================================================================
+def gripper_roll_period(kind):
+  """How much tool roll (wrist_3) maps a grasp onto ITSELF.
+
+  A VACUUM cup is roll-symmetric: any wrist_3 gives the identical grasp, so roll is a FREE
+  parameter the ladder may choose. A TWO-FINGER gripper maps onto itself every pi (the jaws
+  swap). Treating roll as meaningful is why the exported goals showed a 4.712 rad jump on
+  joint 5 -- 3*pi/2 of tool roll that changes nothing physically and costs a wrist flip."""
+  return 0.0 if kind == "vacuum" else np.pi
+
+
+def canonical_roll(q, roll_idx, prev_q, period, lo=None, hi=None):
+  """Re-express `q` using the roll representative CLOSEST to `prev_q`, staying within limits.
+  period 0.0 => roll is free (vacuum): snap it straight onto prev. Returns a NEW array."""
+  out = np.array(q, dtype=float)
+  if roll_idx is None or prev_q is None:
+    return out
+  cur, tgt = float(out[roll_idx]), float(prev_q[roll_idx])
+  if period <= 0.0:                                        # fully free roll
+    best = tgt
+  else:
+    k = round((tgt - cur) / period)
+    best = cur + k * period
+  if lo is not None and hi is not None and not (lo <= best <= hi):
+    # walk back toward the valid range in whole periods (a free roll clamps instead)
+    if period <= 0.0:
+      best = min(max(best, lo), hi)
+    else:
+      while best > hi:
+        best -= period
+      while best < lo:
+        best += period
+      if not (lo <= best <= hi):
+        return out
+  out[roll_idx] = best
+  return out
+
+
+def ik_branch(q, elbow_idx, wrist_idx):
+  """A coarse IK-branch label: (elbow up/down, wrist flipped/not).
+
+  These are the two discrete choices a 6-DOF wrist-partitioned arm makes for the same tool
+  pose, and they are what a "branch crossing" IS -- as opposed to a long but continuous reach.
+  Tool ROLL is deliberately NOT part of the label (see gripper_roll_period): it is a symmetry,
+  not a branch."""
+  return (int(np.sign(q[elbow_idx]) or 1), int(np.sign(q[wrist_idx]) or 1))
+
+
+def involved_robots(action, s_before, s_after, rik):
+  """THE definition of "whose configuration does this action determine", shared by every
+  consumer. Previously each side had its own copy and they were free to drift:
+  `visualization._active_robots` (used by the replay AND by mp_export) computed it from the PRE
+  state, while `witness_floor._involved` used the POST state -- and a handover's giver holds the
+  group only before, the receiver only after, so the two could name different arms for the step
+  whose IK solves them TOGETHER.
+
+  Holders are unioned over BOTH states for that reason; pass `s_after=None` when only the pre
+  state is available (the replay's case) and the pre state alone is used.
+
+  A RELEASE returns [] -- `bind` produces no witness for one, so there are no DOFs to pose and
+  nothing to choose. That was the only measured disagreement between the two old versions
+  (28 releases across four plans); on all 91 witnessed actions they already agreed.
+
+  For an ASSEMBLE the holders of the MOVED part's group count as well as the target's. An arm
+  co-grasping the part being carried physically travels with it, so its configuration is
+  determined by this action; the old pre-state version looked only at the target group and
+  would have left such an arm behind. Measured byte-identical on every plan in the repo -- the
+  scenes brace the TARGET, not the moved part -- so this is latent correctness, not a change."""
+  kind = action[0]
+  if kind == "release":
+    return []
+  r = action[1]
+  out = [r]
+  if kind in ("pick", "inhand_reorient"):
+    return out                                            # these move no held group
+  parts = [action[2], action[3]] if kind == "assemble" else \
+          ([action[2]] if len(action) > 2 else [])
+  for st in (s_before, s_after):
+    if st is None:
+      continue
+    for p in parts:
+      grp = next((g for g in st.subassemblies() if p in g), None)
+      if grp is None:
+        continue
+      for h in rik._holders_of_group(st, grp):
+        if h not in out:
+          out.append(h)
+  return out
+
+
+def reconfig_crossings(qa, qb, roll_idx=None, thresh=np.pi / 2.0):
+  """A crossing count that MEASURES the reconfiguration instead of labelling it.
+
+  `ik_branch` partitions the solution set by (sign q_elbow, sign q_wrist_2), which is only 4 of
+  the arm's 8 analytic branches -- the SHOULDER choice is missing, and it is real: measured over
+  the harvested candidate pools on car-mini, two candidates the label calls IDENTICAL differ by
+  up to 2.414 rad on the pan joint with no 2*pi wrap to explain it. Joint 3 shows the same thing
+  (5.575 rad, 0.708 after removing whole turns) because wrist_1 is dragged along by a shoulder
+  flip; it is not an independent branch of its own, so adding it to the label would chase the
+  symptom.
+
+  Deriving the shoulder branch from q alone needs the wrist centre, i.e. FK -- and the label is
+  only ever COMPARED PAIRWISE, never stored, so the branch name is not actually needed. This
+  counts one crossing per joint that must travel more than `thresh` along its shortest path,
+  which catches shoulder, elbow and wrist flips alike. ROLL is excluded (a symmetry, already
+  canonicalised by `canonical_roll`); whole turns are removed first, so a 2*pi wrap is free."""
+  d = np.abs((np.asarray(qa, dtype=float) - np.asarray(qb, dtype=float) + np.pi)
+             % (2.0 * np.pi) - np.pi)
+  if roll_idx is not None and 0 <= roll_idx < d.size:
+    d[roll_idx] = 0.0
+  return int(np.count_nonzero(d > thresh))
+
+
 def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
                        pull_weight=1.0, ee_rot_weight=0.3, sweeps=2, verbose=True,
                        gripper_kind=None, handovers=True, allow_place=True, bracing=False,
@@ -2138,6 +2396,96 @@ def _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_pla
   return states
 
 
+def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
+                              gripper_kind=None, handovers=True, allow_place=True,
+                              bracing=False, grasp_table=None, tol=None, verbose=True):
+  """LAST GATE before mp_export: is the witness we are about to SHIP collision-free?
+
+  Every earlier gate checks a witness at the moment it is SOLVED. Nothing checked the one that
+  actually leaves the pipeline -- and it is rarely the same object: `optimize_witnesses*` emits
+  a SPLICE (bind's base with a candidate's joints written over it) and `fuse_cograsp_witnesses`
+  re-solves the pair again afterwards. Measured on cross-12: mate keyframes reached mp_export
+  with a part 4.7mm inside an arm while the search reported zero dirty witnesses.
+
+  For each assemble, measures the mate scene pair-wise (only the intended moving<->target
+  contact is exempt). If the shipped witness is dirty but the SEARCH's own witness is clean,
+  swaps it back. Whatever is still dirty is returned as a violation list so the caller can fail
+  loudly at the boundary instead of handing the motion planner a keyframe it will reject.
+  Returns (witnesses, [(step, action, penetration_m, swapped_bool), ...])."""
+  if tol is None:
+    tol = robot_ik.penetration_reject
+  if tol is None:
+    return witnesses, []
+  if grasp_table is None:
+    _checker, grasp_table = _search_context(C, assembly, robots)
+  states = _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
+                          bracing, grasp_table, "validate_export_witnesses")
+  out = list(witnesses)
+  bad = []
+  for i, a in enumerate(plan):
+    act = tuple(a)
+    if act[0] != "assemble" or out[i] is None:
+      continue
+    part, onto = act[2], act[3]
+    moving = frozenset(next((g for g in states[i].subassemblies() if part in g), (part,)))
+    target = frozenset(next((g for g in states[i].subassemblies() if onto in g), (onto,)))
+    Ci = robot_ik.scene_for(states[i], assembly)
+    for mp in moving:
+      set_part_contact(Ci, mp, 0)                         # same exclusion the solve used
+
+    def pen_of(q):
+      Ci.setJointState(np.asarray(q, dtype=float).ravel())
+      return robot_ik.mate_penetration(Ci, moving, target)
+
+    # MATE RESIDUAL: what the witness ACTUALLY achieves for positionRel(part, onto). This is
+    # the number mr_bench bakes in -- C.attach preserves the current WORLD pose at the mode
+    # switch, so the exported assembly inherits exactly this error and then disagrees with our
+    # scene (which re-seats at the ideal). Measured cross-12: a constant 3.08mm.
+    try:
+      Ci.setJointState(np.asarray(out[i], dtype=float).ravel())
+      _v, _ = Ci.eval(ry.FS.positionRel, [part, onto])
+      _ideal = np.asarray(assembly.relative_pose(part)[1], dtype=float)
+      _res = float(np.linalg.norm(np.asarray(_v, dtype=float) - _ideal)) * 1000.0
+      if _res > 0.2 and verbose:
+        # COMPONENTWISE in the target's frame: a pure +z offset is a spawn-height / shape-origin
+        # convention error; mixed axes are a wrong mate target. A constant offset in THIS frame
+        # shows up as mixed-axis WORLD deltas whenever the assembly is rotated -- which is what
+        # made the world-space view so misleading.
+        _dv = (np.asarray(_v, dtype=float) - _ideal) * 1000.0
+        # ALSO measure BIND's own witness: the shipped one is the FLOOR splice re-solved by
+        # fuse_cograsp, so if bind is exact and the shipped one is not, a LATER stage
+        # reintroduced the error and tightening the IK cannot help.
+        _bres = float("nan")
+        try:
+          _ok2, _w2 = robot_ik.bind(act, states[i], states[i + 1], assembly)
+          if _ok2 and _w2 is not None:
+            Ci.setJointState(np.asarray(_w2, dtype=float).ravel())
+            _v2, _ = Ci.eval(ry.FS.positionRel, [part, onto])
+            _bres = float(np.linalg.norm(np.asarray(_v2, dtype=float) - _ideal)) * 1000.0
+          Ci.setJointState(np.asarray(out[i], dtype=float).ravel())
+        except Exception:
+          pass
+        print(f"  [export-gate] step {i} {act[:4]}: MATE RESIDUAL shipped {_res:.2f}mm "
+              f"(dx={_dv[0]:+.2f} dy={_dv[1]:+.2f} dz={_dv[2]:+.2f}) vs BIND {_bres:.2f}mm")
+    except Exception:
+      pass
+    p = pen_of(out[i])
+    if p <= tol:
+      continue
+    swapped = False
+    ok, w0 = robot_ik.bind(act, states[i], states[i + 1], assembly)
+    if ok and w0 is not None and pen_of(w0) <= tol:
+      out[i] = np.asarray(w0, dtype=float).ravel().copy()  # the search's own clean witness
+      swapped, p = True, pen_of(out[i])
+    else:
+      bad.append((i, act, p, swapped))
+      continue
+    if verbose:
+      print(f"  [export-gate] step {i} {act[:4]}: shipped witness was dirty -- "
+            f"restored the search's own witness")
+  return out, bad
+
+
 def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
                            gripper_kind=None, handovers=True, allow_place=True,
                            bracing=False, grasp_table=None, weight=1e0,
@@ -2292,7 +2640,7 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
       komo = build(bias)
       for sname, seed in (("assemble", witnesses[j]), ("add_grasp", witnesses[i])):
         komo.initWithConstant(np.asarray(seed, dtype=float))
-        if ry.NLP_Solver(komo.nlp(), verbose=0).solve().dict()["feasible"]:
+        if robot_ik._nlp(komo).solve().dict()["feasible"]:
           best, how = np.asarray(komo.getPath()).copy(), f"bias={bias} seed={sname}"
           break
       if best is not None:
@@ -2301,7 +2649,7 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
       komo = build(None)
       for _ in range(6):
         komo.initRandom()
-        if ry.NLP_Solver(komo.nlp(), verbose=0).solve().dict()["feasible"]:
+        if robot_ik._nlp(komo).solve().dict()["feasible"]:
           best, how = np.asarray(komo.getPath()).copy(), "bias=None seed=random"
           break
 
@@ -2310,6 +2658,14 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
     set_part_contact(Ca, gpart, 0)
     for mp in moving:
       set_part_contact(Cb, mp, 0)
+    # ...but the assemble scene's penetration is then measured with the WHOLE moving group
+    # switched off, so a fused witness that drives the part through an ARM reads as 0mm and
+    # sails past the `n_p2 > max(pen_gate, o_p2)` gate below. That is how a mate collision
+    # survives even with --strict-mate-collisions: the flag gates `_ik_assemble`, and THIS pass
+    # produces the witnesses that actually reach mp_export. Under the flag, measure the mate
+    # scene pair-wise instead, exempting only the intended moving<->target contact.
+    target_grp = frozenset(next((g for g in states[j].subassemblies() if onto in g), (onto,)))
+    _mv = frozenset(moving)
 
     def residuals(q1, q2):
       # (max position error m, max orientation error deg, pen1 m, pen2 m) over EVERY eq
@@ -2331,8 +2687,9 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
           ang = max(ang, _quat_err_deg(v, tgt))
         else:
           pos = max(pos, float(np.linalg.norm(np.asarray(v) - np.asarray(tgt))))
-      return (pos, ang, float(Ca.getCollisionsTotalPenetration()),
-              float(Cb.getCollisionsTotalPenetration()))
+      p2 = (robot_ik.mate_penetration(Cb, _mv, target_grp) if robot_ik.mate_pair_gate
+            else float(Cb.getCollisionsTotalPenetration()))
+      return (pos, ang, float(Ca.getCollisionsTotalPenetration()), p2)
 
     o_pos, o_ang, o_p1, o_p2 = residuals(witnesses[i], witnesses[j])
     o_dq = float(np.linalg.norm(np.asarray(witnesses[j])[bidx] - np.asarray(witnesses[i])[bidx]))

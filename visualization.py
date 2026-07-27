@@ -580,28 +580,18 @@ def visualize_plan(C, assembly, plan, robots=None, gripper_path=None, recorder=N
 
 
 def _active_robots(action, s, rik):
-  # the robots whose WITNESS DOFs get applied to the live replay config: the actor, plus
-  # the holders (kinematic + braces) of the group the action MOVES. Braces of UNRELATED
-  # groups must NOT be witness-posed: their DOFs are solved relative to the stateless IK
-  # scene (which parks held groups at the holder's HOME pose), so transplanting them into
-  # the replay -- where that group sits elsewhere -- tears the grasp. Unrelated braces
-  # simply keep their pose (their group does not move during this action).
-  kind = action[0]
-  if kind in ("pick", "inhand_reorient"):
-    return [action[1]]                                    # picks/reorients move no held group
-  if kind in ("place", "stow"):                            # stow = a place aside (declutter)
-    r, root = action[1], action[2]
-    group = next((g for g in s.subassemblies() if root in g), frozenset())
-    return list(dict.fromkeys([r] + rik._holders_of_group(s, group)))
-  if kind == "assemble":
-    _, r, _part, onto = action
-    target = next((g for g in s.subassemblies() if onto in g), frozenset())
-    return list(dict.fromkeys([r] + rik._holders_of_group(s, target)))
-  if kind in ("add_grasp", "handover"):                   # new arm reaches; holders present it
-    r, gpart = action[1], action[2]
-    group = next((g for g in s.subassemblies() if gpart in g), frozenset())
-    return list(dict.fromkeys([r] + rik._holders_of_group(s, group)))
-  return []                                               # release: nobody moves
+  # the robots whose WITNESS DOFs get applied to the live replay config. Delegates to THE
+  # shared definition (solver.involved_robots) so this and the witness optimiser cannot drift
+  # apart -- they were separate copies keyed on different states, which is how a handover's
+  # giver could be named by one and not the other. Only the PRE state is available here, which
+  # is what `s_after=None` means. Verified byte-identical to the previous local copy over 326
+  # actions across 11 plans.
+  #
+  # Braces of UNRELATED groups are still excluded, by construction: only holders of the groups
+  # this action TOUCHES are returned. That exclusion matters -- an unrelated brace's DOFs are
+  # solved against the stateless IK scene, which parks held groups at the holder's HOME pose,
+  # so transplanting them into the replay (where that group sits elsewhere) tears the grasp.
+  return involved_robots(action, s, None, rik)
 
 
 def _carrier_frame_name(carrier, rik):
@@ -826,6 +816,22 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
       held, table = _held_and_table(nxt, g)
       if table and not held:
         _seat_rest(nxt, g)
+    # COLLISIONS AT THE KEYFRAME WE ARE ABOUT TO SHOW. The replay used to render silently, so a
+    # penetrating keyframe looked identical to a clean one and you had to spot it by eye. This is
+    # THE SAME check mr_bench runs (getCollisionsTotalPenetration) -- but on OUR scene, which is
+    # rebuilt from the discrete state with every mate re-seated at its IDEAL relative pose, while
+    # the exported scene ACCUMULATES the poses the witnesses actually achieved. That is the model
+    # mismatch: identical check, different worlds, so a keyframe can be clean here and colliding
+    # there. Reporting both ends is the only way to see which world is at fault.
+    _pen = float(Cv.getCollisionsTotalPenetration())
+    _cpairs = sorted(([c[0], c[1], float(c[2])] for c in Cv.getCollisions() if c[2] < 0),
+                     key=lambda x: x[2])
+    _ctag = ""
+    if _pen > 1e-6:
+      _ctag = f"  COLLIDES {_pen*1000:.2f}mm"
+      print(f"[{i}/{len(plan)}] COLLISION {_pen*1000:.2f}mm at this keyframe (our scene):")
+      for _f1, _f2, _d in _cpairs[:4]:
+        print(f"        {_f1:26s} ~ {_f2:26s} {_d*1000:+8.2f}mm")
     print(f"[{i}/{len(plan)}] {action} (feasible={_ok}) -> {nxt}")
     if recorder is not None:
       vecs = None
@@ -833,7 +839,8 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
         vecs = _wrench_vectors(nxt, assembly, wrench_gk,
                                applied=_press_applied(Cv, assembly, action),
                                poses=_cv_poses(Cv, assembly))
-      recorder.record(Cv, f"{i}: {action[0]} {' '.join(map(str, action[1:]))}", vectors=vecs,
+      recorder.record(Cv, f"{i}: {action[0]} {' '.join(map(str, action[1:]))}{_ctag}",
+                      vectors=vecs,
                       interfaces=_interface_vectors(Cv, assembly, nxt))
     elif view:
       Cv.view(True, f"{i}: {action[0]} {' '.join(map(str, action[1:]))}")

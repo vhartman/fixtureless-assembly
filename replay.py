@@ -20,8 +20,37 @@ from env import make_four_robot_env
 from plan_io import read_plan
 
 
+_WRENCH_PARAMS0 = None
+
+
+def _restore_in_place(dst, src):
+  """Deep-restore dst to src WITHOUT rebinding any dict: other modules hold references to
+  wrench.PARAMS and its sub-dicts, so replacing them would leave those readers on stale copies."""
+  import copy
+  for k in [k for k in dst if k not in src]:
+    del dst[k]
+  for k, v in src.items():
+    if isinstance(v, dict) and isinstance(dst.get(k), dict):
+      _restore_in_place(dst[k], v)
+    else:
+      dst[k] = copy.deepcopy(v)
+
+
 def apply_wrench_params(cfg):
+  import copy
   import wrench
+  # RESET TO THE PRISTINE DEFAULTS FIRST. This function mutates wrench.PARAMS IN PLACE and
+  # CUMULATIVELY, so back-to-back scenes in one process contaminated each other two ways:
+  # `tf_close_torque` is applied only when non-None, so a previous scene's value survived into
+  # one that wanted the default, and `vacuum_scale` MULTIPLIES the vacuum caps, so two scaled
+  # scenes scaled them twice. Wrench feasibility decides which grasps survive, which decides
+  # the successor set -- the symptom was a later scene failing to reproduce its own plan's
+  # actions. Measured: a cross8 sim run in-process made car-mini's plan unreproducible.
+  global _WRENCH_PARAMS0
+  if _WRENCH_PARAMS0 is None:
+    _WRENCH_PARAMS0 = copy.deepcopy(wrench.PARAMS)
+  else:
+    _restore_in_place(wrench.PARAMS, _WRENCH_PARAMS0)
   wrench.PARAMS["grasp_model"] = cfg["grasp_model"]
   wrench.PARAMS["check_inserter"] = cfg["inserter_check"]
   wrench.PARAMS["insert_force"]["_default"] = cfg["insert_force"]
@@ -70,15 +99,38 @@ def build_scene(cfg):
   set_useful_grasps_enabled(bool(cfg.get("useful_grasps")))  # ordering must match the search
   from problem import set_brace_resting
   set_brace_resting(bool(cfg.get("brace_resting")))         # action space must match the search
+  # RESET THE REST OF THE SUCCESSOR-AFFECTING GLOBALS TOO, unconditionally. These are module
+  # state in problem.py, so whatever ran in this process BEFORE us leaves them set -- a single
+  # in-process main() for another assembly was enough to change the grasp table here and make
+  # the plan's own actions unreproducible ("cannot reproduce action ... from the successor
+  # set"). Absent keys fall back to the parser defaults, which is what a plan saved before
+  # these were persisted was solved with.
+  from problem import (set_brace_for_assembly_only, set_extra_place_cells, set_prefer_center,
+                       set_anonymous_robots, set_lru_robots)
+  set_brace_for_assembly_only(bool(cfg.get("brace_for_assembly_only")))
+  set_extra_place_cells(int(cfg.get("place_cells") or 0))
+  set_prefer_center(bool(cfg.get("prefer_center")))
+  set_anonymous_robots(bool(cfg.get("anon_robots")))
+  set_lru_robots(bool(cfg.get("lru_robots")))
+  # and drop the cross-scene CACHES: they outlive a scene and are not keyed on every global
+  # that feeds them, so a previous scene's entries would be served to this one.
+  from problem import reset_wrench_cache, reset_grasp_pose_cache
+  reset_wrench_cache()
+  reset_grasp_pose_cache()
   apply_wrench_params(cfg)
   C = make_four_robot_env(num_robots=cfg["num_robots"], floating_ee=cfg["floating_ee"],
                           vacuum=gripper_list if gripper_list is not None else cfg["vacuum"],
                           robot_types=cfg.get("robot_types") or cfg.get("robot", "ur10"))
   assembly = make_assembly(cfg["assembly"], cfg["parts"])
+  # min_sep/grid/grid_gap MUST be passed too: they shape the initial scatter, so omitting them
+  # rebuilt a different layout than the plan was solved in (FRAGILITY 1.8). Absent keys keep the
+  # parser defaults, which is what a plan saved before they were persisted was solved with.
   C = add_disassembled_obj(C, assembly, perturb_start_pose=cfg["perturb_start_pose"],
                            spacing=cfg["scatter_spacing"],
                            random_init=cfg.get("random_init"),
-                           float_height=cfg.get("part_float", 0.015))
+                           float_height=cfg.get("part_float", 0.015),
+                           min_sep=cfg.get("min_sep"), grid=cfg.get("grid_init"),
+                           grid_gap=cfg.get("grid_gap", 0.1))
   return C, assembly
 
 
