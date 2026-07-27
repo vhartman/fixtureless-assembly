@@ -651,6 +651,16 @@ def build_parser():
            "finishes).",
   )
   g_search.add_argument(
+      "--grasp-translations", type=int, default=0, metavar="N",
+      help="Add N TRANSLATED variants per base grasp: the same pinch SLID along the directions "
+           "the gripper is open in (the tool's local x and z -- across the grasped face and "
+           "deeper/shallower). Sliding along the CLOSING axis would open the pinch, so it is "
+           "excluded. Travel is bounded by the part's half-extent minus the finger-pad half-"
+           "length (20mm, robotiq_tight.g) so the pad still overlaps the part; a part too small "
+           "to slide on keeps the centred grasp. Densifies the grasp set for re-orientations "
+           "the six face-centred grasps cannot reach. Appended AFTER the existing ids.",
+  )
+  g_search.add_argument(
       "--mate-eq-weight", type=float, default=None, metavar="W",
       help="Weight on the assemble's positionRel/quaternionRel EQUALITY constraints (default "
            "1e1). rai's augmented-Lagrangian schedule trades the eq residual against the other "
@@ -1055,6 +1065,7 @@ _SAVE_CONFIG_FIELDS = (
     # optimize_witnesses*/replay failing with "cannot reproduce action ... from the successor
     # set". min_sep and place_cells change the place cells, the rest change the action space.
     "strict_mate_collisions", "ik_accuracy", "mate_accuracy", "mate_eq_weight",
+    "grasp_translations",                                # grasp ids index the DB
     "min_sep", "place_cells", "prefer_center", "brace_for_assembly_only", "lru_robots",
     "anon_robots", "declutter", "por",
     # LAYOUT: these feed add_disassembled_obj, so without them the replay/sim rebuilds a
@@ -1201,6 +1212,11 @@ def run(cfg):
     set_plain_box(True)
     print("[flag] --plain-box ACTIVE: cube parts use sharp ST.box (no ssBox corner-radius "
           "inflation), for solve + export + replay.")
+  if cfg.grasp_translations:
+    from problem import set_grasp_translations
+    set_grasp_translations(cfg.grasp_translations)
+    print(f"[flag] --grasp-translations {cfg.grasp_translations}: each base grasp also offered "
+          f"SLID along the gripper's open directions (bounded so the pads stay on the part).")
   set_brace_for_assembly_only(cfg.brace_for_assembly_only)
   set_extra_place_cells(cfg.place_cells)
   set_prefer_center(cfg.prefer_center)

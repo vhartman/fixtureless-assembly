@@ -1216,6 +1216,45 @@ def set_rolls_per_face(n):
 _DENSE_GRASPS = False
 
 
+_GRASP_TRANSLATIONS = 0        # extra TRANSLATED variants per base grasp (0 = off)
+_GRASP_PAD_HALF = 0.011        # finger-pad HALF-WIDTH. robotiq_tight.g's pad is a capsule
+  # `size: [.04, .01]` = 40mm long, 10mm RADIUS -> ~22mm wide. The width is what limits sliding
+  # across the face; using the 40mm half-LENGTH instead (as this first did) halved the travel and
+  # made the variants nearly invisible on a 60mm cube.
+
+
+def set_grasp_translations(n, pad_half=None):
+  """Enable N extra grasps per base pose: the same pinch, SLID along the directions the gripper
+  is open in. Call once at startup, before any grasp precomputation (grasp ids index the DB).
+
+  The pads close along the tool's local y and contact the two faces perpendicular to it, so the
+  contact patch lives in the tool's x-z plane: sliding along local X (across the face) or local
+  Z (deeper/shallower) keeps the pads on the object, while sliding along Y would open the pinch.
+  The travel is bounded by the object's half-extent along that axis MINUS the pad half-length,
+  so the pad still overlaps the part; a bound of <=0 means the part is too small to slide on and
+  the variant collapses onto the centred grasp (harmless -- the grasp table filters duplicates).
+  """
+  global _GRASP_TRANSLATIONS, _GRASP_PAD_HALF
+  _GRASP_TRANSLATIONS = max(0, int(n))
+  if pad_half is not None:
+    _GRASP_PAD_HALF = float(pad_half)
+
+
+def _translation_pattern(n):
+  """(local axis, fraction of the safe travel) for each extra grasp, in a stable order:
+  +-half travel along X first (sliding across the face is the most useful for re-orienting),
+  then +-half along Z, then the full-travel pair of each. Deterministic so grasp ids are
+  reproducible run to run."""
+  base = [((1.0, 0.0, 0.0), +0.5), ((1.0, 0.0, 0.0), -0.5),
+          ((0.0, 0.0, 1.0), +0.5), ((0.0, 0.0, 1.0), -0.5),
+          ((1.0, 0.0, 0.0), +1.0), ((1.0, 0.0, 0.0), -1.0),
+          ((0.0, 0.0, 1.0), +1.0), ((0.0, 0.0, 1.0), -1.0)]
+  out = []
+  while len(out) < n:
+    out.extend(base)
+  return out[:n]
+
+
 def set_dense_grasps(flag):
   """Enable the +-45deg wrist-tilted grasp variants (two-finger). Call once at startup,
   before any grasp precomputation (grasp ids index the per-part DB)."""
@@ -1433,7 +1472,8 @@ def part_grasp_poses(spec, rolls=None, offset=0.01):
     rolls = _ROLLS_PER_FACE
   sq = _shape_quat(spec)
   key = ("DB", spec[0], tuple(spec[1]),
-         tuple(sq) if sq is not None else None, rolls, offset, _DENSE_GRASPS)
+         tuple(sq) if sq is not None else None, rolls, offset, _DENSE_GRASPS,
+         _GRASP_TRANSLATIONS, _GRASP_PAD_HALF)
   hit = _GRASP_POSE_CACHE.get(key)
   if hit is not None:
     return hit
@@ -1462,6 +1502,27 @@ def part_grasp_poses(spec, rolls=None, offset=0.01):
         tilted = np.concatenate([base[:3], _quat_mul(q_t, base[3:])])
         tilted.setflags(write=False)
         poses.append(tilted)
+  if _GRASP_TRANSLATIONS:
+    # TRANSLATED variants of every pose so far, appended base-order so existing grasp ids keep
+    # their meaning. Same orientation and same pinch; only the tool SLIDES in its open plane.
+    pat = _translation_pattern(_GRASP_TRANSLATIONS)
+    _src = list(poses)          # SNAPSHOT: translating the growing list compounds the slides
+    for axis, frac in pat:      # (12 -> 24 -> 48 poses, and diagonal double-translations)
+      for base in _src:
+        R = _quat_to_R(np.asarray(base[3:]))
+        d = R @ np.asarray(axis, dtype=float)              # the slide direction, in PART frame
+        # HOW FAR THE PAD MAY SLIDE. The pad must stay inside the contacted face, so the bound
+        # is the distance from the face centre to the boundary of the face INSET by the pad
+        # half-size, measured along d: min_i (h_i - pad) / |d_i|.
+        # NOT the box's support radius |d|.h -- that is the distance to the CORNER, which for a
+        # 45deg tilted grasp is 1.41x the axis-aligned value, so the diagonal variants slid 22mm
+        # while the perpendicular ones moved 10mm and looked untranslated next to them.
+        ad = np.abs(d)
+        lim = [(h[k] - _GRASP_PAD_HALF) / ad[k] for k in range(3) if ad[k] > 1e-9]
+        travel = max(0.0, min(lim)) if lim else 0.0
+        moved = np.concatenate([base[:3] + frac * travel * d, base[3:]])
+        moved.setflags(write=False)
+        poses.append(moved)
   hit = _GRASP_POSE_CACHE[key] = tuple(poses)
   return hit
 
@@ -1491,6 +1552,8 @@ def part_grasp_surfaces(spec, rolls=None):
     out.extend([surf] * rolls)
   if _DENSE_GRASPS:
     out = out * 3                                          # tilted variants pinch the SAME faces
+  if _GRASP_TRANSLATIONS:
+    out = out * (1 + _GRASP_TRANSLATIONS)                  # a slid grasp contacts the SAME face
   return out
 
 
@@ -1515,6 +1578,8 @@ def part_grasp_face_min_dims(spec, rolls=None):
     out.extend([dim] * rolls)
   if _DENSE_GRASPS:
     out = out * 3
+  if _GRASP_TRANSLATIONS:
+    out = out * (1 + _GRASP_TRANSLATIONS)                  # a slid grasp contacts the SAME face
   return out
 
 
@@ -3087,7 +3152,7 @@ def _grasp_surface(spec, grasp_id):
   # "flat" | "curved" surface a grasp contacts, memoized (part_grasp_surfaces depends only on
   # the shape KIND, the roll count, and dense mode). Only consulted when
   # curved_grasp_torque_scale is set.
-  key = (spec[0], _ROLLS_PER_FACE, _DENSE_GRASPS)
+  key = (spec[0], _ROLLS_PER_FACE, _DENSE_GRASPS, _GRASP_TRANSLATIONS)
   surfaces = _SURFACE_CACHE.get(key)
   if surfaces is None:
     surfaces = _SURFACE_CACHE[key] = part_grasp_surfaces(spec)

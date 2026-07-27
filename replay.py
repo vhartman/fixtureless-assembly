@@ -93,6 +93,9 @@ def build_scene(cfg):
   from problem import set_staged_mates, set_allow_curved_grasps, set_plain_box
   set_staged_mates(bool(cfg.get("staged_mates")))          # staged-mate invariant, as searched
   set_allow_curved_grasps(bool(cfg.get("allow_curved_grasps")))  # grasp table must match the search
+  from problem import set_grasp_translations
+  set_grasp_translations(int(cfg.get("grasp_translations") or 0))  # grasp IDS index this DB:
+  # a replay with a different count would read every saved grasp id against a different table.
   set_plain_box(bool(cfg.get("plain_box")))                # cube collision geometry must match
   from problem import set_dominance, set_useful_grasps_enabled
   set_dominance(bool(cfg.get("dominance")))                # successor set must match the search

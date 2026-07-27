@@ -542,8 +542,34 @@ def _arm_geom_xml(geom):
   return f'type="box" size="{size[0]/2} {size[1]/2} {size[2]/2}"'   # box / ssBox
 
 
+def joint_vmax(C):
+  """Per-joint velocity limits (rad/s) in the config's joint order, from rai. `info()["limits"]`
+  is [lo, hi, vel, ?, effort, ...]; a missing/zero entry becomes inf so that joint never binds.
+  UR10: 2.16 pan/lift, 3.15 elbow, 3.20 wrists -- against the nominal JOINT_RATE of 1.0."""
+  out = []
+  for n in C.getJointNames():
+    try:
+      lim = np.asarray(C.getFrame(n).info().get("limits", []), dtype=float).ravel()
+      out.append(float(lim[2]) if lim.size > 2 and lim[2] > 0 else np.inf)
+    except Exception:
+      out.append(np.inf)
+  return np.asarray(out, dtype=float)
+
+
+def planner_table_top(C):
+  """Top z of the table the SEARCH reasoned about, read from the rai scene rather than
+  hard-coded: frame z + half thickness. build_mjcf otherwise derives the top from the lowest
+  PART bottom, which sits part_float above this."""
+  try:
+    f = C.getFrame("table")
+    return float(np.asarray(f.getPosition(), dtype=float)[2]) + float(f.getSize()[2]) / 2.0
+  except Exception:
+    return None
+
+
 def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
-               ee_anchor=None, articulated_C=None, actuated=False):
+               ee_anchor=None, articulated_C=None, actuated=False, planner_table_top=None,
+               weld_timeconst=None):
   """The whole validation world as one MJCF string:
   - table (static), parts (free bodies at state.poses, shape quat baked into the geom),
   - robots: EITHER one mocap-driven gripper puck per robot (v1 keyframe mode) OR, when
@@ -564,6 +590,17 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
     spec = assembly.part_shape(p)
     tops.append(pose[2] - _shape_half_z(spec, _quat_to_R(pose[3:])))
   table_top = float(min(tops))
+  if planner_table_top is not None:
+    # --planner-table: use the table the SEARCH reasoned about, not one raised to meet the
+    # floated parts. The derivation above puts the top at the lowest part's BOTTOM, i.e.
+    # planner_top + part_float (15mm by default) -- so the arm meets the table 15mm early and
+    # presses against geometry the plan never saw (the enabling condition for the 81N break).
+    # Cost: the parts now START part_float above the table and settle onto it.
+    if abs(float(planner_table_top) - table_top) > 1e-9:
+      print(f"[flag] --planner-table: table top {table_top:.4f} -> {float(planner_table_top):.4f} "
+            f"({(table_top - float(planner_table_top))*1000:+.1f}mm); parts start that far above "
+            f"it and settle instead of resting.")
+    table_top = float(planner_table_top)
   parts_xml, eq_xml = [], []
   # deterministic per-part colors (tab10-ish) -- rai's colors are np.random.rand, not
   # reproducible here; a fixed palette keeps replays comparable across runs.
@@ -643,18 +680,25 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
   if articulated_C is not None and actuated:
     a, _ = arm_model.actuator_mjcf(articulated_C, articulated_joints, kp=ACTUATED_KP)
     act_xml = f"\n  <actuator>\n{a}\n  </actuator>"
+  # GRASP INTERFACE COMPLIANCE. The 4ms default is near-rigid, chosen because a MOCAP anchor
+  # sagged 7-8mm under carry loads. Under --actuated the anchor is the real link, and a rigid
+  # weld converts the tracking DIFFERENCE between two arms co-grasping one part into force
+  # through the part: measured 119.7N against a 25N cap on a3+a1 both holding obj_6, where the
+  # kinematic (--articulated) run places both arms exactly and sees none of it. A real pinch has
+  # finite stiffness; peak |F| = m|dv| / (2*timeconst), so softening trades sag for force.
+  _wtc = float(weld_timeconst) if weld_timeconst else WELD_TIMECONST
   for r in robots:
     # grasp welds: anchor body <-> each part (inactive; relpose set at grasp time).
     for p in assembly.objects:
       # stiff solref: the anchor is a mocap body, so a soft (default) weld SAGS mm-scale
       # under carry loads -- measured 7-8mm drift, enough to miss the seat tolerance.
       eq_xml.append(f'<weld name="grasp_{r}_{p}" body1="{anchor[r]}" body2="{p}" '
-                    f'active="false" solref="{WELD_TIMECONST} 1"/>')
+                    f'active="false" solref="{_wtc} 1"/>')
   for p in assembly.objects:                               # mate welds along the manual's DAG
     rel = assembly.relative_pose(p)
     if rel is not None:
       eq_xml.append(f'<weld name="mate_{p}" body1="{rel[0]}" body2="{p}" active="false" '
-                    f'solref="{WELD_TIMECONST} 1"/>')
+                    f'solref="{_wtc} 1"/>')
   # the table box reaches from the FLOOR (z=0) to table_top: collision-identical for the
   # parts (only the top face matters) but it looks like a table instead of a floating slab.
   th = table_top / 2.0
@@ -695,11 +739,12 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
 class SimScene:
   def __init__(self, assembly, state, robots, gripper_kinds=None, gui=False,
                arms=None, arm_poses=None, ee_anchor=None, articulated_C=None,
-               actuated=False):
+               actuated=False, planner_table_top=None, weld_timeconst=None):
     if not HAVE_MUJOCO:
       raise RuntimeError("mujoco not installed (pip install mujoco)")
     self.assembly = assembly
     self.xml = build_mjcf(assembly, state, robots, arms=arms, arm_poses=arm_poses,
+                          planner_table_top=planner_table_top, weld_timeconst=weld_timeconst,
                           ee_anchor=ee_anchor, articulated_C=articulated_C,
                           actuated=actuated)
     self.model = mujoco.MjModel.from_xml_string(self.xml)
@@ -1122,6 +1167,36 @@ class SimScene:
     return (worst, lbl, float(np.linalg.norm(F_p)),
             float(np.linalg.norm(T_gp)))
 
+  def _contact_context(self, r, part):
+    """WHAT ELSE IS TOUCHING at the moment a grasp breaks.
+
+    A grasp load is a REACTION: a large force with no torque is something pushing back on the
+    gripper, not the part being flung. Naming the contacts distinguishes "the arm pressed the
+    held part into the table" from "the part is restrained by another body" -- which the
+    magnitude alone cannot, and which sent this diagnosis down two wrong paths.
+    """
+    try:
+      import mujoco
+      names, tot = {}, {}
+      for i in range(int(self.data.ncon)):
+        c = self.data.contact[i]
+        b1 = self.model.body(self.model.geom_bodyid[c.geom1]).name
+        b2 = self.model.body(self.model.geom_bodyid[c.geom2]).name
+        if not (b1.startswith(r) or b2.startswith(r) or part in (b1, b2)):
+          continue
+        f = np.zeros(6)
+        mujoco.mj_contactForce(self.model, self.data, i, f)
+        k = tuple(sorted((b1, b2)))
+        tot[k] = tot.get(k, 0.0) + float(np.linalg.norm(f[:3]))
+        names[k] = f"{c.dist * 1000:+.2f}mm"
+      hot = sorted(tot.items(), key=lambda kv: -kv[1])[:3]
+      if not hot:
+        return "  [no contacts on the gripper or the part -- the load is NOT a reaction]"
+      return "  contacts: " + ", ".join(
+          f"{a}~{b} {v:.1f}N @{names[(a, b)]}" for (a, b), v in hot)
+    except Exception as e:
+      return f"  [contact probe failed: {type(e).__name__}]"
+
   def _weld_wrench(self, eq_id):
     """Constraint wrench currently exerted by an active weld: sum its efc rows.
     TODO(verify): efc bookkeeping -- rows with data.efc_type == mjCNSTR_EQUALITY and
@@ -1156,8 +1231,25 @@ class SimScene:
           mm, deg = self.weld_violation(eq, self._body_id(self.grasp_anchor[r]),
                                         self._body_id(part))
           f, t = self._weld_wrench(eq)
-          trk = ("" if not self.actuated or self._cmd_ref is None
-                 else f" trk={self.tracking_error(self._cmd_ref):7.4f}rad")
+          if self.actuated and self._cmd_ref is not None:
+            # ALSO the commanded speed: lag is VELOCITY-dependent and systematic (cancellable by
+            # feedforward), whereas a gravity/inertia error is not. Logging both makes the two
+            # separable instead of guessing from the deviation profile alone.
+            _qd = (0.0 if self._cmd_qdot is None
+                   else float(np.abs(np.asarray(self._cmd_qdot, dtype=float)).max()))
+            trk = (f" trk={self.tracking_error(self._cmd_ref):7.4f}rad"
+                   f" qdot={_qd:7.4f}rps")
+          elif self._mocap_ids is not None:
+            # ARTICULATED/MOCAP: the arm bodies are PLACED, so any gap between the commanded
+            # mocap pose and where the body actually is would be a solver artifact, not control
+            # lag. Reported in the same trace so the two modes are comparable -- "articulated is
+            # exact" should be measured, not assumed.
+            _bid = [self._body_id(f"arm_{b}") for b, *_ in self.arms]
+            _d = np.abs(np.asarray(self.data.xpos[_bid], dtype=float)
+                        - np.asarray(self.data.mocap_pos[self._mocap_ids], dtype=float))
+            trk = f" mocapdev={float(_d.max()) * 1000.0:7.4f}mm"
+          else:
+            trk = ""
           print(f"[grasp] k={self.step_i:7d} {r}/{part:6s} slip {mm:8.3f}mm {deg:7.3f}deg "
                 f"|F|={f:8.2f} |T|={t:6.3f}  mode="
                 f"{'act' if self.actuated else ('artic' if self.articulated else 'mocap')}{trk}")
@@ -1193,7 +1285,8 @@ class SimScene:
                   f"{r}/{part} |F|={fmag:.1f}N |T|={tmag:.2f}Nm"
                   + (f" -- worst bound {_lbl}" if _lbl else
                      f" (scalar caps {fcap:g}N/{tcap:g}Nm)")
-                  + f" sustained {BREAK_SUSTAIN*1000:.0f}ms"))
+                  + f" sustained {BREAK_SUSTAIN*1000:.0f}ms"
+                  + self._contact_context(r, part)))
         else:
           self._over[r] = 0
       if self.recorder is not None:
@@ -1469,7 +1562,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         verify_efc_cache=False, force_limits=False, wrench_margin=1.0, mass_scale=1.0, inertia_factor=1.0,
                         corner_limits=True,
                         spline=False, spline_per_seg=8, spline_tension=0.5,
-                        articulated=False, actuated=False):
+                        articulated=False, actuated=False, use_planner_table=False,
+                        corridor_margin=0.0, weld_timeconst=None, limit_rate=False):
   """Execute an mr_bench PATH (from mp_export.run_birrt) in MuJoCo with the REAL ARMS:
   every rai robot shape frame (the capsule collision model + gripper primitives) is mirrored
   as a kinematic body positioned by rai FK along the path -- the planner's own kinematics by
@@ -1529,7 +1623,9 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
   scene = SimScene(assembly, states[0], robots, gripper_kinds=gripper_kinds,
                    arms=arms, arm_poses=fk_poses(q0), ee_anchor=ee_anchor, gui=gui,
                    articulated_C=(C_fk if (articulated or actuated) else None),
-                   actuated=actuated)
+                   actuated=actuated,
+                   planner_table_top=(planner_table_top(C) if use_planner_table else None),
+                   weld_timeconst=weld_timeconst)
   scene.verify_efc_cache = bool(verify_efc_cache)
   scene.directional_caps = bool(directional_caps)
   articulated = articulated or actuated
@@ -1700,6 +1796,20 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
   # is a time-only rescaling: identical configurations, so the planner's collision
   # certificate carries over untouched and no extra checking is needed.
   boost_dims = arm_dims if rate_boost else None
+  if limit_rate:
+    # --limit-rate: saturate the BINDING JOINT against rai's real per-joint limit instead of the
+    # nominal 1.0 rad/s. Time-only rescaling on the common clock, so the certificate carries
+    # over; it does NOT bound grasp wrenches or tracking error, which is why --force-limits
+    # still applies its own per-segment vmax on top.
+    _vm = joint_vmax(C)
+    _lb = retiming.joint_limit_boost(list(retiming._composite(stretches)[0]), _vm,
+                                     joint_rate=JOINT_RATE)
+    _fin = _vm[np.isfinite(_vm)]
+    print(f"[sim/mp] --limit-rate ACTIVE: binding-joint boost x{_lb.mean():.2f} mean "
+          f"(min x{_lb.min():.2f}, max x{_lb.max():.2f}) against per-joint limits "
+          f"{_fin.min():.2f}-{_fin.max():.2f} rad/s vs JOINT_RATE {JOINT_RATE:g}. "
+          f"Same path, time-rescaled only -- expect a LARGER tracking envelope and watch for "
+          f"grasp_broke; --force-limits still caps each segment.")
   if rate_boost:
     _b = retiming.arm_rate_boost(list(retiming._composite(stretches)[0]), arm_dims)
     print(f"[sim/mp] --arm-rate ACTIVE: per-arm rate boost x{_b.mean():.2f} mean "
@@ -1786,13 +1896,21 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     def _conf(fq):
       return conf_type.from_list([np.asarray(fq)[ridx[r]] for r in robots])
     def _pair_pens(qc, m):                                   # (planner ok?, {pair: depth>0})
+      # `depth` is measured against the MARGIN, not against contact: depth = margin - gap, so a
+      # pair merely CLOSER than the margin already scores > 0 and a penetrating one scores
+      # margin + |penetration|. At margin=0 this is exactly the old "penetration only" measure
+      # (byte-identical), and because the per-pair allowances are CALIBRATED with the same
+      # function over the certified diagonal, the margin shifts both sides together: the rule
+      # stays "never come closer than the certified path itself did", now with `margin` of
+      # extra room wherever that path had room to give.
       ok = bool(problem.is_collision_free(qc, m))            # side effect: C <- (mode, q)
       out = {}
-      for c in problem.C.getCollisions(0.0):
+      for c in problem.C.getCollisions(corridor_margin):
         d = float(c[2])
-        if d < 0:
+        dep = corridor_margin - d
+        if dep > 0.0:
           k = (c[0], c[1]) if c[0] < c[1] else (c[1], c[0])
-          out[k] = max(out.get(k, 0.0), -d)
+          out[k] = max(out.get(k, 0.0), dep)
       return ok, out
     # CALIBRATE per-pair thresholds from the CERTIFIED diagonal: the planner's 0.01 total-
     # penetration tolerance is a witness allowance, not a license -- desynced arms may grind
@@ -2240,6 +2358,14 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           return any(f0 in g and f1 in g for g in st.subassemblies())
         if p0 or p1:                                         # arm vs part: is it ITS OWN part?
           part, arm_f = (f0, pr[1]) if p0 else (f1, pr[0])
+          # ...and is it the GRIPPER? Only the hand legitimately touches its payload. Exempting
+          # the WHOLE arm let a holder's own BASE link bury itself in the part it carries and
+          # still count as certified -- measured a1_ur_coll0 ~ obj_6 at 1.65mm / 39.7N, which
+          # broke a1's grasp while the corridor reported no violation (and which no
+          # --corridor-margin could catch, since the pair was filtered out before the margin
+          # was applied). A link that is not the hand has no business touching the payload.
+          if not any(t in arm_f for t in ("gripper", "palm", "finger", "robotiq", "vacuum")):
+            return False
           grp = next((g for g in st.subassemblies() if part in g), {part})
           for q in grp:
             for c in st.supports.get(q, ()):
@@ -2776,7 +2902,11 @@ def _cli_run(a):
                               corner_limits=a.corner_limits,
                               spline=a.spline, spline_per_seg=a.spline_per_seg,
                               spline_tension=a.spline_tension,
-                              articulated=a.articulated, actuated=a.actuated)
+                              articulated=a.articulated, actuated=a.actuated,
+                              use_planner_table=getattr(a, 'planner_table', False),
+                              corridor_margin=getattr(a, 'corridor_margin', 0.0),
+                              weld_timeconst=getattr(a, 'weld_timeconst', 0.0),
+                              limit_rate=getattr(a, 'limit_rate', False))
   else:
     rep = SimExecutor(asm, gripper_kinds=gripper_kinds, gui=a.gui).execute(
         plan, states, record=a.record)
@@ -2909,6 +3039,32 @@ def _build_cli():
   r.add_argument("--spline-tension", type=float, default=0.5, metavar="T",
                  help="--spline: Catmull-Rom tension; 0.5 = uniform, 0 = the original "
                       "polyline (default 0.5). Lower it for less deviation.")
+  r.add_argument("--weld-timeconst", type=float, default=0.0, metavar="S",
+                 help="solref timeconst of the grasp/mate welds (default 0.004 = near-rigid). "
+                      "Two arms co-grasping one part form a closed chain, so under --actuated "
+                      "their tracking DIFFERENCE becomes force through the part (measured "
+                      "119.7N vs a 25N cap). A real pinch is compliant: peak |F| = m|dv|/"
+                      "(2*timeconst), so a larger value absorbs the mismatch -- at the cost of "
+                      "the weld sagging under carry loads. 0 = keep the default.")
+  r.add_argument("--limit-rate", action="store_true",
+                 help="Time-rescale so the BINDING JOINT sits on its real velocity limit (rai "
+                      "reports them: UR10 2.16 rad/s pan/lift, 3.15 elbow, 3.20 wrists) instead "
+                      "of the nominal JOINT_RATE=1.0. Sibling of --arm-rate, which only "
+                      "normalises the busiest ARM to that nominal. Time-only rescaling: the "
+                      "configurations, and so the planner's certificate, are unchanged. Speed "
+                      "raises tracking error and grasp wrenches -- --force-limits still caps "
+                      "each segment.")
+  r.add_argument("--corridor-margin", type=float, default=0.0, metavar="M",
+                 help="Require M metres of CLEARANCE in the corridor, not just non-contact. The "
+                      "desync envelope is certified on penetration alone, so an object carried "
+                      "by a lagging arm may pass millimetres from another robot and still be "
+                      "legal. Measured against the certified diagonal, so it only asks for room "
+                      "the saved path itself had. 0 = today's behaviour.")
+  r.add_argument("--planner-table", action="store_true",
+                 help="Put the sim table where the SEARCH has it. build_mjcf otherwise sets the "
+                      "top to the LOWEST PART'S BOTTOM = planner_top + --part-float (15mm by "
+                      "default), so the arm meets the table 15mm early and presses on geometry "
+                      "the plan never saw. Parts then start that high and settle onto it.")
   r.add_argument("--force-limits", action="store_true",
                  help="With --corridor: bound each arm's speed AND acceleration so the "
                       "INERTIAL wrench on its grasp stays inside the wrench.PARAMS caps. The "

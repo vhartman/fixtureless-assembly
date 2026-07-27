@@ -91,6 +91,41 @@ def arm_rate_boost(qs, arm_dims, max_boost=None):
   return np.clip(boost, 1.0, cap)
 
 
+def joint_limit_boost(qs, vmax, joint_rate=DEFAULT_JOINT_RATE, max_boost=None):
+  """Per-segment rate multiplier that puts the BINDING JOINT exactly on its velocity limit.
+
+  `arm_rate_boost` normalises to a single nominal `joint_rate` on the composite arc; this uses
+  the robot's REAL per-joint limits (rai reports them: UR10 = 2.16 rad/s pan/lift, 3.15 elbow,
+  3.20 wrists, against a nominal 1.0). Along a segment a joint advances at
+  (|dq_j| / |dq|) * rate, so the rate that saturates exactly one joint is
+
+      rate = 1 / max_j( |dq_j| / (|dq| * vmax_j) )
+
+  and the multiplier returned is that over `joint_rate`. Exactly one joint ends up at its limit
+  and none exceed it, which is the "at least one robot at its velocity limit" semantics.
+
+  SAFE WITHOUT ANY COLLISION CHECK on a COMMON clock, for the same reason as arm_rate_boost: it
+  rescales TIME only, so the sequence of composite configurations -- and hence the planner's
+  certificate -- is unchanged. It does NOT bound the resulting grasp wrenches or the tracking
+  error, both of which grow with speed: compose with the --force-limits per-segment vmax and
+  re-measure the deviation envelope before trusting the faster schedule.
+
+  Returns an array aligned with the segments of `qs` (multiplier >= 0)."""
+  qs = [np.asarray(q, float) for q in qs]
+  d = np.diff(np.asarray(qs, float), axis=0)
+  tot = np.linalg.norm(d, axis=1)
+  v = np.asarray(vmax, dtype=float).ravel()
+  v = np.where(np.isfinite(v) & (v > 0), v, np.inf)          # unknown limit -> never binds
+  with np.errstate(divide="ignore", invalid="ignore"):
+    ratio = np.max(np.abs(d) / v[None, :], axis=1)           # per segment: max_j |dq_j|/vmax_j
+  boost = np.ones(len(d))
+  ok = (tot > 1e-12) & (ratio > 1e-12)
+  boost[ok] = (tot[ok] / ratio[ok]) / float(joint_rate)      # rate_seg / joint_rate
+  if max_boost is not None:
+    boost = np.minimum(boost, float(max_boost))
+  return np.maximum(boost, 0.0)
+
+
 def retime_stretch(qs, dt, joint_rate=DEFAULT_JOINT_RATE, ramp_dist=DEFAULT_RAMP_DIST,
                    ramp_min=DEFAULT_RAMP_MIN, accel=None, arm_dims=None):
   """Trapezoidal time-parameterization of ONE collision-free stretch of waypoints.

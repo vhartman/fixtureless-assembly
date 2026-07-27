@@ -125,6 +125,7 @@ class RunConfig:
   ik_accuracy: Optional[float] = None
   mate_accuracy: Optional[float] = None
   mate_eq_weight: Optional[float] = None
+  grasp_translations: int = 0
 
   # -- witness optimization --
   optimize_witnesses: Optional[str] = None
