@@ -98,6 +98,9 @@ def _root_of(state, part, mate_parent):
   return cur
 
 
+_SOLVE_IT = object()   # 'no keyframe supplied -- solve it here' (see build_tasks)
+
+
 def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
                 home_state, pre_witnesses=None):
   """Map the plan+witnesses to (tasks, sequence_names). robot_idx: {r: [joint indices]}
@@ -153,10 +156,17 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
     # scene graph ends exactly like the un-split task; only the last DELTA is contact-rich (on the
     # mr_bench SKILLS branch the second task becomes the skill). goal_for mutates cur: T_pre then
     # the real witness, so downstream keyframes see the real skill config.
-    pre_wit = (pre_witnesses.get(i) if pre_witnesses is not None else
-               robot_ik.pre_skill_witness(a, states[i], states[i + 1], assembly, wit))
+    # MISSING KEY vs EXPLICIT None. A consistency pass reports only the keyframes it
+    # ACCEPTED; a rejected split must fall back to the exporter's OWN solve, not to a
+    # zero-length funnel. Reading a missing key as None conflated the two, so turning
+    # --fuse-pre-skill on silently degraded every split it rejected -- which is what made the
+    # flag non-identity at zero accepts and blocked defaulting it. Only an EXPLICIT None now
+    # means "this split has no funnel".
+    pre_wit = (pre_witnesses.get(i, _SOLVE_IT) if pre_witnesses is not None else _SOLVE_IT)
+    if pre_wit is _SOLVE_IT:
+      pre_wit = robot_ik.pre_skill_witness(a, states[i], states[i + 1], assembly, wit)
     pan = f"{i:02d}_pre_{kind}_{'_'.join(str(x) for x in a[1:])}"
-    if pre_wit is None and pre_witnesses is not None:
+    if pre_wit is None and pre_witnesses is not None and i in pre_witnesses:
       # the fallback is silent in the historical path; once the consistency pass owns these
       # keyframes, say it -- a None here exports a pre GOTO whose goal EQUALS the skill goal.
       print(f"  [pre] {i:02d} {kind}: NO pre keyframe -- the goto goal equals the skill goal "
@@ -445,13 +455,40 @@ def save_problem(path_json, build_params, robots, tasks, sequence_names):
     json.dump(data, f, indent=2)
 
 
-def save_path(path_json, path):
+def task_signature(problem):
+  """Fingerprint of the EXPORTED TASK STRUCTURE a path was planned against.
+
+  A saved path indexes tasks by INTEGER id, so a plan/path pair whose task lists differ even
+  slightly relinks at the wrong moments -- and the existing guard only compares task COUNTS, so
+  a same-count-different-semantics pair passes silently (e.g. a --pre-* split that moved, or a
+  different `bracing`/`handovers` flag changing which arms a task involves). Hash what the ids
+  actually MEAN: name, type, involved robots, attach frames, in order."""
+  import hashlib
+  h = hashlib.sha256()
+  for t in problem.tasks:
+    h.update(("|".join([
+        str(getattr(t, "name", "")),
+        str(getattr(t, "type", "")),
+        ",".join(str(r) for r in (getattr(t, "robots", None) or [])),
+        ",".join(str(f) for f in (getattr(t, "frames", None) or [])),
+    ]) + "\n").encode())
+  return h.hexdigest()[:16]
+
+
+def save_path(path_json, path, problem=None):
   """Persist a solved BiRRT PATH (main --motion-plan --mp-save). Each mr_bench State ->
   {"q": joint vector, "mode": task_ids}. The discrete PLAN (main --save) must be saved from
   the SAME run: load_path replays against a problem REBUILT from that plan (make_problem is
-  deterministic, so task ids / modes align)."""
+  deterministic, so task ids / modes align).
+
+  FORMAT: a bare LIST historically; with `problem` it becomes
+  {"states": [...], "task_signature": ...} so a mismatched plan/path pair is DETECTED rather
+  than silently relinking at the wrong tasks. load_path reads both, so old files still work."""
+  states = [s.to_dict() for s in path] if path else []
+  blob = states if problem is None else {"states": states,
+                                        "task_signature": task_signature(problem)}
   with open(path_json, "w") as f:
-    json.dump([s.to_dict() for s in path] if path else [], f, indent=2)
+    json.dump(blob, f, indent=2)
 
 
 class _Mode:
@@ -488,7 +525,13 @@ def load_path(path_json):
   execute_motion_plan consumes directly -- no mr_bench State/Mode reconstruction needed."""
   with open(path_json) as f:
     data = json.load(f)
-  return [_PathState(d["q"], _Mode(d["mode"])) for d in data]
+  if isinstance(data, dict):                                 # new format: states + signature
+    states, sig = data.get("states", []), data.get("task_signature")
+  else:                                                      # historical bare list
+    states, sig = data, None
+  out = [_PathState(d["q"], _Mode(d["mode"])) for d in states]
+  load_path.last_signature = sig                             # checked by the caller, if present
+  return out
 
 
 def mode_sequence(problem):

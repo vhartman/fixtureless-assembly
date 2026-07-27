@@ -21,6 +21,7 @@ rai -> MJCF conventions relied on here, all verified in fk_compare.py rather tha
   * a rai joint frame's relative transform CONTAINS the current joint value, so the tree must
     be read at q = 0 to recover the fixed mounting offset (see `_zeroed`).
 """
+import os
 import numpy as np
 import robotic as ry
 
@@ -71,6 +72,60 @@ def joint_of(C, name):
   return jt, HINGE_AXES[jt], rng
 
 
+_MESH_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sim_meshes")
+
+
+_ARM_COLORS = ["0.2 0.2 0.9 1", "0.9 0.2 0.2 1", "0.2 0.8 0.8 1", "0.9 0.7 0.1 1",
+               "0.6 0.2 0.8 1", "0.4 0.9 0.3 1"]           # per-robot tint for the capsules
+
+
+def _write_obj(name, V, T):
+  """Cache a mesh as an .obj (MuJoCo has no .ply decoder), return its abs path. Written once."""
+  os.makedirs(_MESH_CACHE_DIR, exist_ok=True)
+  path = os.path.join(_MESH_CACHE_DIR, name + ".obj")
+  if not os.path.exists(path):
+    with open(path, "w") as f:
+      f.write("".join(f"v {v[0]:.5f} {v[1]:.5f} {v[2]:.5f}\n" for v in V))
+      f.write("".join(f"f {int(t[0])+1} {int(t[1])+1} {int(t[2])+1}\n" for t in T))
+  return path
+
+
+def link_meshes(C, frame):
+  """Split a link's visual mesh by VERTEX COLOR into single-color sub-meshes -- MuJoCo geoms
+  take one rgba and its .obj loader ignores per-vertex colors, so this is how the real UR look
+  (blue caps / grey body / dark joints) is preserved. Returns [(obj_path, rgba_str), ...], one
+  per distinct region color; falls back to a single light-grey mesh if colors are missing."""
+  try:
+    V = np.asarray(C.getFrame(frame).getMeshPoints(), dtype=float)
+    T = np.asarray(C.getFrame(frame).getMeshTriangles()).astype(int)
+  except Exception:
+    return []
+  # SHAPE-CHECK, not len(): a frame rai marks as `mesh` may carry no mesh at all (joint-origin
+  # helpers), and np.asarray of that is 0-d, where len() raises TypeError rather than returning
+  # 0. The articulated path walks EVERY mesh frame, so it meets those; sim's mocap path never
+  # did and the old len() guard looked sufficient for years.
+  if V.ndim != 2 or T.ndim != 2 or V.shape[0] < 4 or T.shape[0] == 0:
+    return []                                              # joint-origin helper meshes: skip
+  try:
+    cols = np.asarray(C.getFrame(frame).getMeshColors())[:, :3].astype(int)
+  except Exception:
+    cols = None
+  if cols is None or len(cols) != len(V):
+    return [(_write_obj(frame, V, T), "0.72 0.72 0.75 1")]
+  tri_col = cols[T[:, 0]]                                  # triangle color = its 1st vertex
+  out = []
+  for k, c in enumerate(np.unique(tri_col, axis=0)):
+    faces = T[np.all(tri_col == c, axis=1)]
+    used = np.unique(faces)
+    if len(used) < 4:
+      continue
+    remap = -np.ones(int(used.max()) + 1, dtype=int)
+    remap[used] = np.arange(len(used))
+    obj = _write_obj(f"{frame}__c{k}", V[used], remap[faces])
+    out.append((obj, f"{c[0]/255:.3f} {c[1]/255:.3f} {c[2]/255:.3f} 1"))
+  return out
+
+
 def _geom_xml(kind, size, rgba, group, contype, conaffinity="1"):
   """MJCF for one rai shape. rai capsule/cylinder size = [length, radius]; MJCF wants
   'radius half-length'. Mirrors sim._arm_geom_xml so the two models collide identically."""
@@ -95,7 +150,8 @@ def collides_like_sim(name):
 
 def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, indent=4,
                    collide_fn=None, contype="2", conaffinity="1", link_mass=1e-3,
-                   link_inertia=1e-6, armature=0.0, limits=True, static_mass=None):
+                   link_inertia=1e-6, armature=0.0, limits=True, static_mass=None,
+                   meshes=False, assets=None, mesh_group=1):
   """MJCF <body> tree for one articulated arm, read out of rai at q=0.
 
   Returns (xml, joint_names) with joint_names in MuJoCo's own qpos order for this arm -- the
@@ -161,6 +217,20 @@ def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, inde
                     contype if on else "0", conaffinity if on else "0")
       if g:
         out.append(f'{pad}  {g}')
+    elif kind == "mesh" and meshes:
+      # THE REAL LINK MESHES, read out of rai exactly like the tree itself -- so a ur5e config
+      # yields ur5e meshes with no porting, same guarantee as the FK. VISUAL ONLY
+      # (contype/conaffinity 0, own group): the certified collision model stays rai's _coll*
+      # capsules, so the physics is unchanged whether meshes are emitted or not. Split by VERTEX
+      # COLOR because a MuJoCo geom carries a single rgba and its .obj loader drops per-vertex
+      # colors -- that split is what keeps the real UR look (blue caps / grey body / dark
+      # joints) instead of one flat grey arm.
+      for _k, (_obj, _mrgba) in enumerate(link_meshes(Z, name)):
+        _mn = f"vm_{name}__{_k}"
+        if assets is not None:
+          assets.append(f'<mesh name="{_mn}" file="{_obj}"/>')
+        out.append(f'{pad}  <geom type="mesh" mesh="{_mn}" rgba="{_mrgba}" '
+                   f'group="{mesh_group}" contype="0" conaffinity="0"/>')
     for c in sorted(kids.get(name, [])):
       emit(c, depth + 1)
     out.append(f'{pad}</body>')
@@ -183,10 +253,14 @@ def standalone_model(C, prefixes, timestep=0.002, **kw):
   """A complete, self-contained MJCF holding only the arms -- what fk_compare loads. Kept
   separate from sim.py's full world so the kinematics can be checked without parts, table,
   welds or contacts confusing the picture."""
+  _assets = []
+  kw.setdefault("assets", _assets)
   body, jnames = build_arms_mjcf(C, prefixes, **kw)
+  asset = ("" if not kw["assets"] else
+           "\n  <asset>" + "".join(kw["assets"]) + "</asset>")
   xml = f"""<mujoco model="rai_arms">
   <compiler angle="radian"/>
-  <option timestep="{timestep}" gravity="0 0 0"/>
+  <option timestep="{timestep}" gravity="0 0 0"/>{asset}
   <worldbody>
 {body}
   </worldbody>

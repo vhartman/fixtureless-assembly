@@ -134,7 +134,8 @@ class RunConfig:
   pre_pick: float = 0.0
   pre_place: float = 0.0
   pre_add_grasp: float = 0.0
-  fuse_pre_skill: bool = False
+  fuse_pre_skill: Optional[bool] = None   # None = auto (ON when a pre-insertion/
+                                          # pre-add-grasp split is present)
 
   # -- motion-plan export (mr_bench) --
   motion_plan: bool = False
@@ -176,6 +177,7 @@ class RunConfig:
   # -- output & persistence --
   utilization: bool = False
   hoist_releases: bool = False
+  load_plan: Optional[str] = None
   save: Optional[str] = None
 
   # ---- conversions ----

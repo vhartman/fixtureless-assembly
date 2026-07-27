@@ -25,10 +25,14 @@ from problem import _quat_to_R
 
 
 # --------------------------------------------------------------------------- flag gate
-def test_fuse_pre_skill_defaults_off_and_the_flag_turns_it_on():
-  assert RunConfig().fuse_pre_skill is False
-  assert main.parse_args([]).fuse_pre_skill is False
+def test_fuse_pre_skill_is_tri_state_and_auto_enables_for_insertion_splits():
+  # None = AUTO. run() resolves it to ON when a --pre-insertion/--pre-add-grasp split exists,
+  # because that is the only place the pin can bite (pick/solo place restrict the scene to the
+  # acting arm already, so pin_applied == 0 and the pass rejects). Explicit flags still win.
+  assert RunConfig().fuse_pre_skill is None
+  assert main.parse_args([]).fuse_pre_skill is None
   assert main.parse_args(["--fuse-pre-skill"]).fuse_pre_skill is True
+  assert main.parse_args(["--no-fuse-pre-skill"]).fuse_pre_skill is False
 
 
 # --------------------------------------------------------------------------- backoff algebra

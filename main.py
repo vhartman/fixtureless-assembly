@@ -741,7 +741,7 @@ def build_parser():
            "-approach axis, default 0.05) + the real brace reach. Default off.",
   )
   g_skills.add_argument(
-      "--fuse-pre-skill", action="store_true",
+      "--fuse-pre-skill", action="store_true", default=None,
       help="With --motion-plan and any --pre-* split: BEFORE the export, re-solve every pre-skill "
            "funnel keyframe with each arm that is NOT supposed to move PINNED (hard eq) to the "
            "skill witness, instead of letting the exporter solve it with only a weight-1.0 pull. "
@@ -753,6 +753,11 @@ def build_parser():
            "skill keyframe is never re-solved (so fused pairs survive). ALL-OR-NOTHING per "
            "split: any residual/penetration/no-improvement verdict keeps today's keyframe. The "
            "exported task structure is identical either way.",
+  )
+  g_skills.add_argument(
+      "--no-fuse-pre-skill", dest="fuse_pre_skill", action="store_false", default=None,
+      help="Force the pre-skill pin OFF (it defaults ON when a --pre-insertion/--pre-add-grasp "
+           "split is present).",
   )
   g_output.add_argument(
       "--hoist-releases", action="store_true",
@@ -938,6 +943,14 @@ def build_parser():
   g_scene.add_argument(
       "--seed", type=int, default=0,
       help="RNG seed for numpy + rai (KOMO IK), for reproducible runs. Default: 0.",
+  )
+  g_output.add_argument(
+      "--load-plan", metavar="FILE", default=None,
+      help="Read the ACTIONS from a saved plan JSON and skip the search, then run the normal "
+           "post-passes and export on them (--optimize-witnesses, --fuse-cograsp, "
+           "--motion-plan). Use this to apply a witness pass to a plan you already trust: a "
+           "saved config does NOT carry the solver settings, so re-solving with --config gives "
+           "a DIFFERENT plan. Pair it with --config <the same file> so the scene matches.",
   )
   g_output.add_argument(
       "--save", metavar="PATH", default=None,
@@ -1338,7 +1351,22 @@ def run(cfg):
     visualize_successor_states(C, assembly)
     return
 
-  if cfg.solve:
+  # A RUN THAT SILENTLY IGNORES WHAT YOU ASKED FOR MUST SAY SO. Every flag below CONSUMES a
+  # plan, so without --solve or --load-plan it is dead: run() used to walk to the end and return
+  # None in 0.5s, indistinguishable from a crash or a very fast solve (cost me ~20min). Checking
+  # "did you ask for a plan consumer" rather than "did you ask for anything" keeps the legitimate
+  # viewer/diagnostic modes (and `view` defaults True, so the broad check was vacuous).
+  _NEEDS_PLAN = ("motion_plan", "save", "mp_save", "optimize_witnesses", "fuse_cograsp",
+                 "fuse_pre_skill", "utilization", "hoist_releases")
+  if not (cfg.solve or cfg.load_plan):
+    _asked = [f"--{a.replace('_', '-')}" for a in _NEEDS_PLAN if getattr(cfg, a, None)]
+    if _asked:
+      raise SystemExit(
+          f"main.py: {', '.join(_asked)} need a plan, but neither --solve nor --load-plan was "
+          f"given -- nothing would happen.\n"
+          f"  --solve            run the search\n"
+          f"  --load-plan FILE   re-run the post-passes/export on a saved plan (no search)")
+  if cfg.solve or cfg.load_plan:
     robots = get_robots(C)
     robot_ik = RobotIK(C, robots) if cfg.real_ik else None
     if robot_ik is not None and cfg.full_ik:
@@ -1399,12 +1427,33 @@ def run(cfg):
       robot_ik.fail_recorder = fail_rec
       robot_ik.fail_log_seconds = cfg.log_ik_failures
       robot_ik.fail_log_stop = True                # abort the search when the window closes
-    try:
-      plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
-    except IKFailureLogDone:
-      print(f"[ik-failures] window/cap reached -- search stopped for debugging "
-            f"({len(fail_rec.steps)} failures collected).")
-      plan = None
+    if cfg.load_plan:
+      # RE-RUN THE POST-PASSES ON A PLAN YOU ALREADY TRUST -- no search.
+      # A saved plan's `config` block does NOT persist the solver settings (no weight, no
+      # heuristic, no lazy, no anytime budget, no --min-sep), so `--config saved.json` does not
+      # reproduce the run that wrote it: MEASURED on car-mini, a re-solve with guessed flags gave
+      # a 29-action plan that executes 19-21/29 where the saved 25-action plan runs 17/17. That
+      # makes a fresh solve the wrong way to apply a WITNESS pass (--optimize-witnesses,
+      # --fuse-cograsp) or to re-export a --motion-plan path: it silently changes the plan the
+      # result is about. Loading the actions keeps the discrete plan fixed and re-runs only what
+      # was asked for. The scene still comes from --config/CLI, so it must MATCH the saved plan.
+      from plan_io import read_plan as _read_saved_plan
+      _saved_cfg, plan = _read_saved_plan(cfg.load_plan)
+      plan = [tuple(a) for a in plan]
+      print(f"[load-plan] {len(plan)} actions read from {cfg.load_plan}; search SKIPPED "
+            f"(post-passes and export run on the plan as saved).")
+      for _k in ("assembly", "parts", "num_robots", "seed"):
+        if _saved_cfg.get(_k) is not None and _saved_cfg.get(_k) != getattr(cfg, _k, None):
+          print(f"[load-plan] !!! scene MISMATCH on '{_k}': saved {_saved_cfg.get(_k)!r} vs "
+                f"current {getattr(cfg, _k, None)!r} -- witnesses will be solved in the WRONG "
+                f"scene. Pass --config {cfg.load_plan} (its config block) to match.")
+    else:
+      try:
+        plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
+      except IKFailureLogDone:
+        print(f"[ik-failures] window/cap reached -- search stopped for debugging "
+              f"({len(fail_rec.steps)} failures collected).")
+        plan = None
     if robot_ik is not None and cfg.strict_collisions is not None:
       print(f"[strict-collisions] vetoed {robot_ik.strict_rejects} dirty KOMO witnesses "
             f"(> {cfg.strict_collisions:g}m total penetration).")
@@ -1468,6 +1517,21 @@ def run(cfg):
           # AFTER fusing: this pass never re-solves a SKILL witness, so a fused pair survives
           # untouched -- it only replaces the pre-* GOTO keyframes the exporter would solve.
           mp_pre = None
+          # DEFAULT ON where the pin can actually bite. It cannot for `pick` or a solo
+          # `place` (_ik_pick/_ik_place already restrict the scene to the acting arm, so
+          # pin_applied == 0 and the pass rejects) -- that is 6/14 splits on car-mini and 16/22
+          # on cross8 of pure cost. It CAN bite for assemble/add_grasp, which is exactly where
+          # the defect is: without it the target assembly slides 16.8-48.8mm between the funnel
+          # mouth and the seat while the inserted part covers 6.1-35.8mm of a nominal 50mm.
+          # Now safe to default because a REJECTED split falls back to the exporter's own solve
+          # (mp_export._SOLVE_IT) instead of degrading to a zero-length funnel.
+          _pin_default = (cfg.pre_insertion or 0.0) > 0.0 or (cfg.pre_add_grasp or 0.0) > 0.0
+          if cfg.fuse_pre_skill is None:
+            cfg.fuse_pre_skill = _pin_default
+            if _pin_default:
+              print("[sim] --fuse-pre-skill defaulted ON (a --pre-insertion/--pre-add-grasp "
+                    "split is present, which is where the pin bites). Disable with "
+                    "--no-fuse-pre-skill.")
           if cfg.fuse_pre_skill:
             from solver import fuse_pre_skill_witnesses
             print("[flag] --fuse-pre-skill ACTIVE: each pre-* GOTO keyframe is re-solved with "
@@ -1510,7 +1574,7 @@ def run(cfg):
               print("[flag] --mp-cograsp ACTIVE: checking co-grasp rigidity along the path.")
               MP.report_cograsp_drift(C, prob, mp_path, robot_ik)
             if cfg.mp_save is not None:
-              MP.save_path(cfg.mp_save, mp_path)
+              MP.save_path(cfg.mp_save, mp_path, problem=prob)
               print(f"[motion-plan] saved path -> {cfg.mp_save} (load in sim with "
                     f"`sim.py run <plan.json> --v2 --mp-path {cfg.mp_save}`)")
             if cfg.mp_viser:

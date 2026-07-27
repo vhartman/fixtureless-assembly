@@ -75,6 +75,8 @@ OFF fails physically, mode topple -> dropped-at-release).
 import os
 import time as _time
 import numpy as np
+from math import sqrt as _sqrt
+import arm_model
 
 import retiming                                              # portable path->trajectory retiming
 
@@ -137,9 +139,13 @@ TABLE_HALF = (1.2, 1.2, 0.05)   # matches the rai table footprint; z-offset chec
 
 
 def _grasp_caps(kind):
-  """Force/torque breakaway caps for a grasp weld, from the PLANNER's wrench model -- the sim
-  shares the planner's parameters and may only disagree through physics. Conservative v1: one
-  scalar force cap (min over directions) + one torque cap; per-axis caps are a refinement."""
+  """SCALAR fallback: the tightest force/torque the planner's model allows in ANY direction.
+
+  Only used when the grasp id is unknown, so the grasp frame cannot be reconstructed. It is
+  CONSERVATIVE by construction (min over directions) and therefore safe, but it is also the
+  reason the sim used to reject loads the planner considers nearly free -- with the asymmetric
+  model this collapses F_push=100 and F_pull=25 to 25N in EVERY direction, so a compressive
+  insertion reaction reads as a 3x overload. See _grasp_polytope for the real test."""
   import wrench as W
   model = W.PARAMS["grasp"].get(W.PARAMS.get("grasp_model", "isotropic"),
                                 W.PARAMS["grasp"]["isotropic"])
@@ -147,6 +153,22 @@ def _grasp_caps(kind):
   fcap = min([v for k, v in g.items() if k.startswith("F_")] or [40.0])
   tcap = min([v for k, v in g.items() if k.startswith("T_")] or [1.0])
   return float(fcap), float(tcap)
+
+
+def _grasp_polytope(kind):
+  """(model_name, caps dict) -- the PLANNER's grasp capability, unreduced.
+
+  wrench.py builds a BOX in the grasp's own frame: an axial bound along the approach axis n
+  (asymmetric splits it into F_push when the part is pressed INTO the palm/cup and the much
+  weaker F_pull when it is pulled off), a per-axis lateral bound mu*F_axial from friction at the
+  preload, and separate couple bounds about n / the two lateral axes. Reproducing that box here
+  is what makes the sim's verdict the same statement as the planner's."""
+  import wrench as W
+  name = W.PARAMS.get("grasp_model", "isotropic")
+  fam = W.PARAMS["grasp"].get(name)
+  if fam is None or kind not in fam:
+    return None, None                                      # unknown -> caller uses the scalar
+  return name, dict(fam[kind])
 
 
 # ---------------------------------------------------------------------------------------------
@@ -173,14 +195,30 @@ class SimReport:
     return all(r.ok for r in self.results)
 
   def summary(self):
+    """LEAD WITH THE FIRST FAILURE, not the final pose error.
+
+    A final part error is almost always a CASCADE: one mate welds to a wrong datum, or one grasp
+    breaks, and everything after it inherits the displacement -- so the headline mm number
+    describes the wreckage, not the cause (measured: a 33.7mm first miss became a 1894mm final
+    error). What is actionable is WHICH step failed first and WHY, with the wrench that broke it
+    against the cap it was judged by. The final error is kept, demoted, as a rough severity hint."""
     n_ok = sum(r.ok for r in self.results)
+    bad = [r for r in self.results if not r.ok]
     lines = [f"[sim] {n_ok}/{len(self.results)} actions ok; plan "
              f"{'SUCCEEDED' if self.success else 'FAILED'}"]
-    lines += [f"  {r}" for r in self.results if not r.ok]
+    if bad:
+      first = bad[0]
+      idx = self.results.index(first)
+      lines.append(f"  FIRST FAILURE at result #{idx} -- everything after this may be a "
+                   f"consequence, not an independent fault:")
+      lines.append(f"      {first}")
+      if len(bad) > 1:
+        lines.append(f"  ... then {len(bad) - 1} more (likely downstream):")
+        lines += [f"      {r}" for r in bad[1:]]
     if self.final_pose_err:
       worst = max(self.final_pose_err.items(), key=lambda kv: kv[1][0])
-      lines.append(f"  worst final part error: {worst[0]} "
-                   f"pos {worst[1][0]*1000:.1f}mm ang {np.rad2deg(worst[1][1]):.1f}deg")
+      lines.append(f"  (final-state severity hint, NOT the cause: worst part {worst[0]} "
+                   f"pos {worst[1][0]*1000:.1f}mm ang {np.rad2deg(worst[1][1]):.1f}deg)")
     return "\n".join(lines)
 
 
@@ -216,51 +254,13 @@ GROUP_ENV = 1                   # floor + table
 GROUP_COLL = 2                  # arm COLLISION capsules (the planner's model)
 GROUP_VISUAL = 3                # arm VISUAL link meshes + gripper primitives (nice look)
 
-_MESH_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sim_meshes")
-
-
-_ARM_COLORS = ["0.2 0.2 0.9 1", "0.9 0.2 0.2 1", "0.2 0.8 0.8 1", "0.9 0.7 0.1 1",
-               "0.6 0.2 0.8 1", "0.4 0.9 0.3 1"]           # per-robot tint for the capsules
-
-
-def _write_obj(name, V, T):
-  """Cache a mesh as an .obj (MuJoCo has no .ply decoder), return its abs path. Written once."""
-  os.makedirs(_MESH_CACHE_DIR, exist_ok=True)
-  path = os.path.join(_MESH_CACHE_DIR, name + ".obj")
-  if not os.path.exists(path):
-    with open(path, "w") as f:
-      f.write("".join(f"v {v[0]:.5f} {v[1]:.5f} {v[2]:.5f}\n" for v in V))
-      f.write("".join(f"f {int(t[0])+1} {int(t[1])+1} {int(t[2])+1}\n" for t in T))
-  return path
-
-
-def _link_meshes(C, frame):
-  """Split a link's visual mesh by VERTEX COLOR into single-color sub-meshes -- MuJoCo geoms
-  take one rgba and its .obj loader ignores per-vertex colors, so this is how the real UR look
-  (blue caps / grey body / dark joints) is preserved. Returns [(obj_path, rgba_str), ...], one
-  per distinct region color; falls back to a single light-grey mesh if colors are missing."""
-  V = np.asarray(C.getFrame(frame).getMeshPoints(), dtype=float)
-  T = np.asarray(C.getFrame(frame).getMeshTriangles()).astype(int)
-  if len(V) < 4 or len(T) == 0:
-    return []                                              # joint-origin helper meshes: skip
-  try:
-    cols = np.asarray(C.getFrame(frame).getMeshColors())[:, :3].astype(int)
-  except Exception:
-    cols = None
-  if cols is None or len(cols) != len(V):
-    return [(_write_obj(frame, V, T), "0.72 0.72 0.75 1")]
-  tri_col = cols[T[:, 0]]                                  # triangle color = its 1st vertex
-  out = []
-  for k, c in enumerate(np.unique(tri_col, axis=0)):
-    faces = T[np.all(tri_col == c, axis=1)]
-    used = np.unique(faces)
-    if len(used) < 4:
-      continue
-    remap = -np.ones(int(used.max()) + 1, dtype=int)
-    remap[used] = np.arange(len(used))
-    obj = _write_obj(f"{frame}__c{k}", V[used], remap[faces])
-    out.append((obj, f"{c[0]/255:.3f} {c[1]/255:.3f} {c[2]/255:.3f} 1"))
-  return out
+# MESH EXTRACTION LIVES IN arm_model: it is "read geometry out of rai", the same job as the
+# frame tree, and the articulated model needs it too. Re-exported here under the old private
+# names so the mocap path reads unchanged.
+_MESH_CACHE_DIR = arm_model._MESH_CACHE_DIR
+_write_obj = arm_model._write_obj
+_link_meshes = arm_model.link_meshes
+_ARM_COLORS = arm_model._ARM_COLORS
 
 
 def _arm_shape_frames(C, robots, visual=True):
@@ -618,10 +618,15 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
     # FRAME NAMES, so the grasp weld anchors to ee_anchor[r] directly with no prefix. Driven
     # by SETTING qpos (SimScene.set_arm_q) -- still perfectly stiff, so the grasp weld stays
     # the clean measuring device every wrench result so far was calibrated on.
-    import arm_model
+    # VISUAL LINK MESHES follow whatever the mocap mirrors were built with (`arms` is already
+    # filtered by the headless rule), so --articulated shows the real UR10/UR5 exactly when the
+    # mocap path would. They are visual-only, so the physics is identical either way.
+    _arm_assets = []
+    _arm_meshes = any(e[2][0] == "mesh" for e in arms)
     body_xml, articulated_joints = arm_model.build_arms_mjcf(
         articulated_C, robots, collide_fn=arm_model.collides_like_sim,
         group=GROUP_COLL, contype="2", conaffinity="1",
+        meshes=_arm_meshes, assets=_arm_assets, mesh_group=GROUP_VISUAL,
         # links must SWAMP the payload: the chain is integrated by mj_step even though we
         # drive it kinematically, so a light link welded to a part lets the solver throw it.
         armature=ARTICULATED_ARMATURE, limits=bool(actuated),
@@ -633,7 +638,7 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
     parts_xml = [x for x in parts_xml if 'name="arm_' not in x]      # drop the mocap mirrors
     parts_xml.append(body_xml)
     anchor = {r: ee_anchor[r] for r in robots}
-    arm_mesh_assets = ""
+    arm_mesh_assets = "".join(_arm_assets)
   act_xml = ""
   if articulated_C is not None and actuated:
     a, _ = arm_model.actuator_mjcf(articulated_C, articulated_joints, kp=ACTUATED_KP)
@@ -705,6 +710,10 @@ class SimScene:
     self.actuated = bool(actuated) and self.articulated
     self._cmd_ref = None                                   # last commanded q (tracking metric)
     self._cmd_qdot = None                                  # ... and its velocity feedforward
+    self._phys = 0                                         # bumped by mj_step / mj_forward
+    self._eq_cache = (None, None, None)                    # (eq_active key, rows, ids)
+    self.verify_efc_cache = False                          # --verify-efc-cache
+    self._mocap_ids = self._mocap_fkf = None               # resolved on first sync_arms
     self.grasp_anchor = ({r: f"ee_{r}" for r in robots} if arms is None
                          else {r: (ee_anchor[r] if self.articulated else f"arm_{ee_anchor[r]}")
                                for r in robots})
@@ -733,7 +742,11 @@ class SimScene:
     # NB qpos and qvel are DIFFERENT address spaces -- a free joint occupies 7 qpos but only
     # 6 qvel -- so a qpos address indexes qvel out of bounds once free-floating parts precede
     # the arms (measured: IndexError at 48 with qvel size 48). Keep both.
-    self._qadr, self._vadr = {}, {}
+    self._qadr, self._vadr, self._ctrl_adr = {}, {}, {}
+    self._rai_joints = []
+    self._ctrl_i = self._ctrl_j = self._vadr_i = self._qadr_i = self._qadr_j = \
+        np.zeros(0, dtype=int)
+    self._ctrl_ff = np.zeros(0, dtype=float)
     if self.articulated:
       for jn in articulated_C.getJointNames():
         jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, jn)
@@ -746,8 +759,43 @@ class SimScene:
         aid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, jn)
         if aid >= 0:
           self._ctrl_adr[jn] = int(aid)
+    # PRECOMPUTED INDEX ARRAYS for the per-step hot paths (command_arm_q / gravity_compensate /
+    # tracking_error). The model is immutable after compile, so these never change; building
+    # them once turns three per-joint Python loops per step into single vectorised assignments.
+    # `_ctrl_j` maps into the COMMANDED q vector (rai joint order), `_ctrl_i` into data.ctrl.
+    _ci, _cj, _cff = [], [], []
+    for _i, _jn in enumerate(self._rai_joints):
+      _adr = self._ctrl_adr.get(_jn) if self.articulated else None
+      if _adr is None:
+        continue
+      _kp = float(self.model.actuator_gainprm[_adr, 0])
+      _kv = -float(self.model.actuator_biasprm[_adr, 2])
+      _ci.append(_adr)
+      _cj.append(_i)
+      _cff.append((_kv / _kp) if _kp > 0 else 0.0)
+    self._ctrl_i = np.asarray(_ci, dtype=int)
+    self._ctrl_j = np.asarray(_cj, dtype=int)
+    self._ctrl_ff = np.asarray(_cff, dtype=float)
+    self._vadr_i = np.asarray(sorted(self._vadr.values()), dtype=int)
+    _qi = [(self._qadr[_jn], _i) for _i, _jn in enumerate(self._rai_joints)
+           if _jn in self._qadr]
+    self._qadr_i = np.asarray([a for a, _ in _qi], dtype=int)
+    self._qadr_j = np.asarray([j for _, j in _qi], dtype=int)
     self.gripper_kinds = gripper_kinds or {}
     self.active_grasps = {}                                # robot -> (eq_id, part, fcap, tcap)
+    self._hold_info = {}                                   # robot -> grasp-frame info (directional caps)
+    self.expect_state = None                               # set by the executor: lets attach() recover a grasp id
+    # DIRECTIONAL CAPS default OFF. The test is faithful to the LP (force at the grasp point +
+    # residual pure couple, matching wrench._force_gen/_couple_gen), and it is MORE PERMISSIVE
+    # in force -- a compressive load gets F_push=100 instead of a blanket 25N. But it is
+    # STRICTER in torque, because the scalar path compared the couple about the PART ORIGIN
+    # while the LP's bound is on the residual couple at the GRASP: for a 34mm grasp offset at
+    # ~6N that is ~0.2Nm, the same order as T_close=0.4 itself. Enabling it regressed two
+    # measured-passing configs (car-mini actuated 17/17 -> T_close +0.4/0.4; cross-new
+    # articulated 36/36 -> 29/40). That is evidence the COUPLE CAPS are wrong (they are
+    # hand-set placeholders), not a reason to ship the regression. Turn on with
+    # --directional-caps to work on them.
+    self.directional_caps = False
     self.viewer = None
     if gui:
       from mujoco import viewer as _viewer                 # NOT `import mujoco.viewer`: that
@@ -755,6 +803,7 @@ class SimScene:
       _default_geomgroups(self.viewer,
                           arms is not None and any(e[2][0] == "mesh" for e in arms))               # global `mujoco` in this scope
     mujoco.mj_forward(self.model, self.data)
+    self._phys += 1
 
   # -- naming helpers --------------------------------------------------------------------
   def _eq_id(self, name):
@@ -800,11 +849,28 @@ class SimScene:
     self.model.eq_data[eq_id][10] = 1.0                    # torquescale
     self.data.eq_active[eq_id] = 1
 
-  def grasp(self, robot, part):
+  def grasp(self, robot, part, gid=None):
     eq = self._eq_id(f"grasp_{robot}_{part}")
     self._activate_weld(eq, self._body_id(self.grasp_anchor[robot]), self._body_id(part))
     kind = self.gripper_kinds.get(robot, "vacuum")
     self.active_grasps[robot] = (eq, part) + _grasp_caps(kind)
+    # DIRECTIONAL CAPS need the grasp FRAME, which is a property of the grasp id. Stored in a
+    # parallel dict so active_grasps keeps its 4-tuple shape for every existing consumer. With
+    # no gid we cannot build the frame and fall back to the conservative scalar.
+    self._hold_info.pop(robot, None)
+    if gid is None:
+      return
+    _model, _caps = _grasp_polytope(kind)
+    if _model is None:
+      return
+    import problem as _P
+    _g7 = np.asarray(_P.grasp_pose(self.assembly, part, gid), dtype=float)   # flat [pos, quat]
+    _gp, _gq = _g7[:3], _g7[3:]
+    _R = np.zeros(9)
+    mujoco.mju_quat2Mat(_R, _gq)
+    self._hold_info[robot] = {"eq": eq, "part": part, "gid": gid, "model": _model,
+                              "caps": _caps, "gp": _gp,
+                              "Rg": _R.reshape(3, 3)}
     for gid in self._holdex.get(robot, ()):                # wrist cluster exempt while holding
       self.model.geom_contype[gid] = 0
       self.model.geom_conaffinity[gid] = 0
@@ -814,12 +880,9 @@ class SimScene:
     REFERENCE, so this is the number that decides whether a mate still lands on its witness --
     SEAT_POS_TOL is 10mm, so even ~0.01 rad at a 1m lever is already marginal."""
     q = np.asarray(q, dtype=float)
-    e = 0.0
-    for i, jn in enumerate(self._rai_joints):
-      adr = self._qadr.get(jn)
-      if adr is not None:
-        e = max(e, abs(float(self.data.qpos[adr]) - float(q[i])))
-    return e
+    if self._qadr_i.size == 0:
+      return 0.0
+    return float(np.abs(self.data.qpos[self._qadr_i] - q[self._qadr_j]).max())
 
   def command_arm_q(self, q, qdot=None):
     """ACTUATED: hand the joint targets to the position servos and let MuJoCo track them.
@@ -840,16 +903,14 @@ class SimScene:
     q = np.asarray(q, dtype=float)
     self._cmd_ref = q
     self._cmd_qdot = None if qdot is None else np.asarray(qdot, dtype=float)
-    for i, jn in enumerate(self._rai_joints):
-      adr = self._ctrl_adr.get(jn)
-      if adr is None:
-        continue
-      ff = 0.0
-      if self._cmd_qdot is not None:
-        kp = float(self.model.actuator_gainprm[adr, 0])
-        kv = -float(self.model.actuator_biasprm[adr, 2])
-        ff = (kv / kp) * self._cmd_qdot[i] if kp > 0 else 0.0
-      self.data.ctrl[adr] = q[i] + ff
+    # VECTORISED over the arm dofs. The per-joint Python loop (with two model reads each) was
+    # 1.67s of a 13.7s car-mini run -- second only to mj_step. Same arithmetic, same order,
+    # so the setpoints are bit-identical; only the dispatch is gone. Index arrays and kv/kp
+    # are precomputed once in __init__ (the model is immutable after compile).
+    if self._cmd_qdot is None:
+      self.data.ctrl[self._ctrl_i] = q[self._ctrl_j]
+    else:
+      self.data.ctrl[self._ctrl_i] = q[self._ctrl_j] + self._ctrl_ff * self._cmd_qdot[self._ctrl_j]
 
   def gravity_compensate(self):
     """Cancel qfrc_bias (gravity + Coriolis) on the ARM dofs only -- parts keep real gravity,
@@ -857,8 +918,7 @@ class SimScene:
     bypasses `forcerange`, so nothing speed-dependent belongs here (measured: feeding the
     velocity term in this way injected up to 93 Nm into a 54 Nm wrist and cost 3 seats).
     The velocity feedforward goes through the setpoint instead -- see command_arm_q."""
-    for jn, v in self._vadr.items():
-      self.data.qfrc_applied[v] = self.data.qfrc_bias[v]
+    self.data.qfrc_applied[self._vadr_i] = self.data.qfrc_bias[self._vadr_i]
 
   def set_arm_q(self, q, qdot=None):
     """ARTICULATED set-pose: drive the chain by writing qpos directly (and zeroing qvel), the
@@ -882,14 +942,22 @@ class SimScene:
         self.data.qpos[adr] = q[i]
         self.data.qvel[self._vadr[jn]] = 0.0 if v is None else v[i]
     mujoco.mj_forward(self.model, self.data)
+    self._phys += 1
 
   def sync_arms(self, poses):
-    """v2: set every arm link mocap body to its rai-FK world pose. poses = {frame: 7-pose}."""
-    for body, fkf, _geom, _c, _e, _grp, _rgba in self.arms:
-      mid = self.model.body_mocapid[self._body_id(f"arm_{body}")]
-      pose = poses[fkf]
-      self.data.mocap_pos[mid] = pose[:3]
-      self.data.mocap_quat[mid] = pose[3:]
+    """v2: set every arm link mocap body to its rai-FK world pose. poses = {frame: 7-pose}.
+
+    The mocap ids are resolved ONCE and cached. Doing the f-string + mj_name2id per body per
+    step was the single largest cost in the DEFAULT path: 129 name lookups x 79k steps =
+    10.2M mj_name2id calls, and sync_arms alone was 63% of a 36.6s car-mini run. Nothing about
+    the mapping can change after the model is compiled."""
+    if self._mocap_ids is None:
+      self._mocap_ids = np.asarray(
+          [self.model.body_mocapid[self._body_id(f"arm_{b}")] for b, *_ in self.arms], dtype=int)
+      self._mocap_fkf = [e[1] for e in self.arms]
+    P = np.asarray([poses[f] for f in self._mocap_fkf], dtype=float)
+    self.data.mocap_pos[self._mocap_ids] = P[:, :3]
+    self.data.mocap_quat[self._mocap_ids] = P[:, 3:]
 
   def release(self, robot):
     g = self.active_grasps.pop(robot, None)
@@ -956,19 +1024,124 @@ class SimScene:
       self.model.eq_data[eq][10] = 1.0
       self.data.eq_active[eq] = 1
     else:                                                  # gripper GRASP (frozen relpose)
-      self.grasp(parent_frame.split("_", 1)[0], child)
+      # recover the GRASP ID so the breakaway can use the planner's directional caps: the
+      # frame-based replay only carries [parent, child], but the discrete state knows which
+      # grasp of `child` is held. Falls back to the conservative scalar if unavailable.
+      _gid = None
+      if self.expect_state is not None:
+        try:
+          _gid = _held_grasp_id(self.expect_state, child)
+        except ValueError:
+          _gid = None
+      self.grasp(parent_frame.split("_", 1)[0], child, gid=_gid)
 
   # -- stepping with grasp breakaway -----------------------------------------------------
+  def _eq_index(self):
+    """Row indices of the EQUALITY constraints, and their eq ids, for the CURRENT state.
+
+    Hoisted out of _weld_wrench, which used to scan the two full efc arrays per ACTIVE GRASP per
+    step (125k calls / 2.5s of a 13.7s car-mini run, the largest cost after mj_step itself).
+
+    CACHED ON eq_active, NOT on the step. MuJoCo lays the EQUALITY block at the head of efc and
+    gives every active weld exactly 6 rows in eq order, so which rows belong to which eq id is a
+    function of the ACTIVE SET ALONE -- contacts and limits are appended after it and cannot
+    shift it. So this only needs rebuilding when a grasp activates or releases (a handful of
+    times per run) rather than once per step. `--verify-efc-cache` re-derives it every step and
+    asserts equality, which is how the assumption above is checked rather than trusted."""
+    # KEY ON (eq_active, ne), NOT eq_active ALONE. step() breaks a grasp by writing
+    # eq_active[eq]=0 and then reads the NEXT grasp's wrench in the SAME loop iteration --
+    # before any mj_step/mj_forward has rebuilt efc. Keyed on the bytes alone that rebuilt the
+    # cache from STALE efc rows and stored it under the new key, so it was never corrected:
+    # measured IndexError (index 6 into a size-6 efc_force) on the next step with no contacts,
+    # and -- worse -- with contacts padding efc, no crash at all, just a permanently wrong
+    # reading (2.3x understated), which silently defeats every breakaway and force check.
+    # d.ne still holds the PRE-write row count at that moment and drops after the step, so it
+    # distinguishes the stale read; the bytes still catch an activate+release that keeps ne.
+    key = (self.data.eq_active.tobytes(), int(self.data.ne))
+    if self._eq_cache[0] != key:
+      idx = np.flatnonzero(self.data.efc_type == mujoco.mjtConstraint.mjCNSTR_EQUALITY)
+      self._eq_cache = (key, idx, self.data.efc_id[idx])
+    elif self.verify_efc_cache:
+      _i = np.flatnonzero(self.data.efc_type == mujoco.mjtConstraint.mjCNSTR_EQUALITY)
+      if not (np.array_equal(_i, self._eq_cache[1])
+              and np.array_equal(self.data.efc_id[_i], self._eq_cache[2])):
+        raise AssertionError(
+            f"[efc-cache] equality-row layout changed with the cache key unchanged at step "
+            f"{self.step_i}: "
+            f"cached rows {self._eq_cache[1]} vs live {_i}")
+    return self._eq_cache[1], self._eq_cache[2]
+
+  def _grasp_violation(self, h):
+    """Directional breakaway test in the GRASP's own frame -- the planner's box, not a scalar.
+
+    FRAMES (measured, not assumed -- see the ground-truth probes):
+      * efc_force[0:3] is a force in the WORLD frame; the wrench ON THE PART is its negative.
+      * eq_data[:3] is 0 here, so it acts at the PART BODY ORIGIN.
+      * efc_force[3:6] is a PURE COUPLE in the PART's frame, scaled by 2/torquescale.
+    Doing the algebra in the PART frame means no gripper-anchor offset table is needed and it is
+    valid in every drive mode (mocap / articulated / actuated), since R^T(Ra x Rb) = a x b.
+    The grasp frame's columns are [t1, t2, n] with n pointing FROM the gripper INTO the part, so
+    a POSITIVE axial component is the part pressed into the palm/cup (F_push) and a negative one
+    is pull-off (F_pull). Returns (worst_ratio, label, |F|, |T|); ratio > 1 means broken."""
+    rows = self._eq_index()[0][self._eq_index()[1] == h["eq"]]
+    if len(rows) < 6:
+      return 0.0, "", 0.0, 0.0
+    f = self.data.efc_force[rows]
+    ts = float(self.model.eq_data[h["eq"]][10])
+    bid = self._body_id(h["part"])
+    Rp = self.data.xmat[bid].reshape(3, 3)
+    F_p = Rp.T @ (-f[:3])                                  # world force -> part frame
+    T_p = (-0.5 * ts) * f[3:6]                             # couple about the part ORIGIN
+    T_gp = T_p - np.cross(h["gp"], F_p)                    # ... moved to the GRASP POINT
+    Fg, Tg = h["Rg"].T @ F_p, h["Rg"].T @ T_gp             # -> [t1, t2, n]
+    c, name = h["caps"], h["model"]
+    worst, lbl = 0.0, ""
+
+    def _hit(val, cap, tag):
+      nonlocal worst, lbl
+      if cap and cap > 0 and abs(val) / cap > worst:
+        worst, lbl = abs(val) / cap, f"{tag} {val:+.1f}/{cap:g}"
+
+    if name == "asymmetric":
+      _hit(Fg[2], c["F_push"] if Fg[2] > 0 else c["F_pull"],
+           "axial-push" if Fg[2] > 0 else "axial-PULL")
+      lat = c["mu"] * c["F_pull"]
+      _hit(Fg[0], lat, "lat1"); _hit(Fg[1], lat, "lat2")
+      _hit(Tg[2], c.get("T_axis"), "T_axis")
+      _hit(Tg[0], c.get("T_lat"), "T_lat")
+      _hit(Tg[1], c.get("T_close", c.get("T_lat")), "T_close")
+    elif name == "directional":
+      _hit(Fg[2], c["F_axial"], "axial")
+      lat = c["mu"] * c["F_axial"]
+      _hit(Fg[0], lat, "lat1"); _hit(Fg[1], lat, "lat2")
+      _hit(Tg[2], c.get("T_axis"), "T_axis")
+      _hit(Tg[0], c.get("T_lat"), "T_lat"); _hit(Tg[1], c.get("T_lat"), "T_lat")
+    else:                                                  # isotropic: magnitude bounds
+      _hit(float(np.linalg.norm(F_p)), c.get("F_max"), "F")
+      _hit(float(np.linalg.norm(T_gp)), c.get("T_max"), "T")
+    return (worst, lbl, float(np.linalg.norm(F_p)),
+            float(np.linalg.norm(T_gp)))
+
   def _weld_wrench(self, eq_id):
     """Constraint wrench currently exerted by an active weld: sum its efc rows.
     TODO(verify): efc bookkeeping -- rows with data.efc_type == mjCNSTR_EQUALITY and
     data.efc_id == eq_id; a weld contributes 6 rows (3 force + 3 torque)."""
-    rows = np.where((self.data.efc_type == mujoco.mjtConstraint.mjCNSTR_EQUALITY)
-                    & (self.data.efc_id == eq_id))[0]
-    f = self.data.efc_force[rows]
-    if len(f) < 6:
+    idx, ids = self._eq_index()
+    rows = idx[ids == eq_id]
+    if len(rows) < 6:
       return 0.0, 0.0
-    return float(np.linalg.norm(f[:3])), float(np.linalg.norm(f[3:6]))
+    f = self.data.efc_force[rows]
+    # THE TORQUE ROWS ARE NOT N.m. For mjEQ_WELD, efc_force[3:6] is a couple scaled by
+    # 2/torquescale, so comparing the raw rows to the planner's caps DOUBLED every torque --
+    # measured against ground truth (2kg at a 0.25m COM offset => true couple 4.9050 N.m,
+    # raw rows 9.8094, ratio 1.9999; 0.5*ts*raw = 4.9047). That made the sim reject grasps the
+    # planner considers fine: car-mini's only actuated-corridor failure was |T|=0.56 against a
+    # 0.4 cap, i.e. 0.28 N.m in reality. torquescale is read per-equality rather than assumed.
+    # explicit sqrt of the dot: np.linalg.norm on a 3-vector is dominated by its own dispatch
+    # (251k calls, 0.66s) and this is the innermost per-step measurement in the executor.
+    ts = 0.5 * float(self.model.eq_data[eq_id][10])
+    return (_sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]),
+            ts * _sqrt(f[3] * f[3] + f[4] * f[4] + f[5] * f[5]))
 
   def step(self, n=1, report=None, action=None):
     """Advance; after each step check every active grasp weld against its breakaway caps --
@@ -976,6 +1149,7 @@ class SimScene:
     sustain = max(1, int(BREAK_SUSTAIN / DT))
     for _ in range(n):
       mujoco.mj_step(self.model, self.data)
+      self._phys += 1
       if self._grasp_trace and self.step_i % self._grasp_trace == 0:
         for r, g in sorted(self.active_grasps.items()):
           eq, part = g[0], g[1]
@@ -1001,16 +1175,25 @@ class SimScene:
         fmag, tmag = self._weld_wrench(eq)
         if self.wrench_trace is not None:                   # diagnostic: reuses THIS wrench
           self.wrench_trace(r, part, fmag, tmag, fcap, tcap)
-        if fmag > fcap or tmag > tcap:
+        _h = self._hold_info.get(r) if self.directional_caps else None
+        if _h is not None:                                  # the planner's BOX, in the grasp frame
+          _ratio, _lbl, fmag, tmag = self._grasp_violation(_h)
+          _over = _ratio > 1.0
+        else:                                               # no grasp id -> conservative scalar
+          _lbl, _over = "", (fmag > fcap or tmag > tcap)
+        if _over:
           self._over[r] = self._over.get(r, 0) + 1
           if self._over[r] >= sustain:                     # sustained overload -> seal fails
             self.data.eq_active[eq] = 0
             del self.active_grasps[r]
+            self._hold_info.pop(r, None)
             if report is not None:
               report.results.append(ActionResult(
                   action or ("step",), False, "grasp_broke",
-                  f"{r}/{part} |F|={fmag:.1f}N(cap {fcap:g}) |T|={tmag:.2f}Nm(cap {tcap:g}) "
-                  f"sustained {BREAK_SUSTAIN*1000:.0f}ms"))
+                  f"{r}/{part} |F|={fmag:.1f}N |T|={tmag:.2f}Nm"
+                  + (f" -- worst bound {_lbl}" if _lbl else
+                     f" (scalar caps {fcap:g}N/{tcap:g}Nm)")
+                  + f" sustained {BREAK_SUSTAIN*1000:.0f}ms"))
         else:
           self._over[r] = 0
       if self.recorder is not None:
@@ -1087,7 +1270,7 @@ class SimExecutor:
     for p in group:
       for c in s_post.supports.get(p, ()):
         if c[0] == "grasp" and c[1] not in self.scene.active_grasps:
-          self.scene.grasp(c[1], c[2])
+          self.scene.grasp(c[1], c[2], gid=c[3])
 
   def execute(self, plan, states, record=None):
     """record=<path.npz>: dump a REPLAYABLE recording (model XML + qpos frames + per-robot
@@ -1110,7 +1293,7 @@ class SimExecutor:
       pre_n = len(report.results)                          # breakaways appended during steps
       if kind == "pick":
         self._move(robot, self._ee_pose_for(s_pre, act[2], act[3]), report, act)
-        self.scene.grasp(robot, act[2])
+        self.scene.grasp(robot, act[2], gid=act[3])
         # DEPART: straight up at the CURRENT orientation first, THEN move/reorient to the
         # carry pose. Slerping while still at table level dragged a rotated resting group's
         # corners through the table (measured 25.1N > 25N cap re-picking the face-3 stack).
@@ -1146,7 +1329,7 @@ class SimExecutor:
       elif kind in ("handover", "add_grasp"):
         gid = act[3]
         self._move(robot, self._ee_pose_for(s_pre, act[2], gid), report, act)
-        self.scene.grasp(robot, act[2])
+        self.scene.grasp(robot, act[2], gid=act[3])
         if kind == "handover":                             # giver = whoever held it before
           giver = _holder_of(s_pre, act[2], exclude=robot)
           if giver:
@@ -1280,7 +1463,10 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         record=None, verbose=True, gui=False, visual=True, prioritized=False,
                         rate_boost=False, smooth=False,
                         corridor=False, corridor_ds=1.0, corridor_ds_lead=0.25,
-                        corridor_lead_max=4.0, rate_clamp=False, settle_tol=0.0, settle_max=1.0, couple_handovers=False, force_limits=False, wrench_margin=1.0, mass_scale=1.0, inertia_factor=1.0,
+                        corridor_lead_max=4.0, corridor_verify=0, corridor_refine=0,
+                        rate_clamp=False, settle_tol=0.0, settle_max=1.0, couple_handovers=False,
+                        directional_caps=False,
+                        verify_efc_cache=False, force_limits=False, wrench_margin=1.0, mass_scale=1.0, inertia_factor=1.0,
                         corner_limits=True,
                         spline=False, spline_per_seg=8, spline_tension=0.5,
                         articulated=False, actuated=False):
@@ -1313,10 +1499,15 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
   ridx = {r: [i for i, jn in enumerate(jnames) if jn.startswith(r)] for r in robots}
 
   arms = _arm_shape_frames(C_fk, robots, visual=visual)
+  # Frame SET and frame OBJECTS hoisted out of fk_poses: it ran per step, rebuilding the set
+  # and re-resolving ~90 frames BY NAME every time. rai Frame handles stay valid for the life
+  # of the config, so the lookups are pure waste.
+  _fk_frames = sorted({e[1] for e in arms})
+  _fk_objs = [C_fk.getFrame(f) for f in _fk_frames]
+
   def fk_poses(qfull):
     C_fk.setJointState(qfull)
-    frames = {e[1] for e in arms}
-    return {f: np.asarray(C_fk.getFrame(f).getPose(), dtype=float) for f in frames}
+    return {f: np.asarray(o.getPose(), dtype=float) for f, o in zip(_fk_frames, _fk_objs)}
 
   def full_q(state_q):
     flat = state_q.state() if hasattr(state_q, "state") else np.asarray(state_q)
@@ -1339,6 +1530,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                    arms=arms, arm_poses=fk_poses(q0), ee_anchor=ee_anchor, gui=gui,
                    articulated_C=(C_fk if (articulated or actuated) else None),
                    actuated=actuated)
+  scene.verify_efc_cache = bool(verify_efc_cache)
+  scene.directional_caps = bool(directional_caps)
   articulated = articulated or actuated
   if articulated:
     print(f"[sim/mp] --articulated ACTIVE: real kinematic chains generated from rai "
@@ -1363,6 +1556,31 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         break
       drive_q(q)                                             # qdot=0: hold, do not lead
       scene.step(1, report, ("settle",))
+
+  # NO-FUNNEL WARNING. An assemble whose export is a single task drives the held part STRAIGHT to
+  # a pose that is already in contact, so it arrives LATERALLY and sweeps the target: measured on
+  # cross8, 0.213mm of penetration while the target was still at rest, then ~800 steps of shoving
+  # and a weld fired at 32mm lateral error (Z near-perfect) -> every downstream mate missed by
+  # 130-1900mm. --pre-insertion splits it into a goto to a funnel mouth along the mate axis plus
+  # the real mate, which is the difference between "approaches down the axis" and "swipes at it".
+  # Checked on the EXPORTED TASKS, not on cfg, so it also catches a saved path whose funnel was
+  # dropped or whose pre-witness solve failed.
+  _asm_idx = [i for i, a in enumerate(plan) if tuple(a)[0] == "assemble"]
+  _funnelled = set()
+  for _t in problem.tasks:
+    _nm = getattr(_t, "name", "") or ""
+    if "_pre_assemble" in _nm:
+      try:
+        _funnelled.add(int(_nm.split("_", 1)[0]))
+      except ValueError:
+        pass
+  _bare = [i for i in _asm_idx if i not in _funnelled]
+  if _bare:
+    print(f"[sim] !!! NO INSERTION FUNNEL on {len(_bare)}/{len(_asm_idx)} assemble(s) "
+          f"(plan steps {_bare[:8]}{'...' if len(_bare) > 8 else ''}): the part is driven "
+          f"straight to a seated pose that is already in contact, so it arrives laterally and "
+          f"can shove the target. Re-export with --pre-insertion (and --fuse-pre-skill) if a "
+          f"mate misses or the target slides.")
 
   _last_q = {}
 
@@ -1412,6 +1630,10 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     # transfers are just an attach to the other gripper), so mirroring the frames keeps the
     # welds consistent with the motion and the arm never drags a part it "released".
     t = problem.tasks[task_id]
+    # The discrete state this task lands in -- attach() reads it to recover a grasp id so the
+    # breakaway can use the planner's DIRECTIONAL caps instead of the conservative scalar.
+    _l = name_of.get(t.name)
+    scene.expect_state = states[min(_l[0] + 1, len(states) - 1)] if _l else None
     if t.name == "terminal" or not getattr(t, "frames", None):
       return                                               # goto / terminal: nothing to relink
     parent, child = t.frames[0], t.frames[1]
@@ -1603,7 +1825,18 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       print(f"[sim/mp] diagonal calibration: {len(allowed)} (stretch, pair) allowance(s), "
             f"worst {wp[0][1][0]}~{wp[0][1][1]} {wp[1]*1000:.1f}mm (stretch {wp[0][0]}) -- "
             f"desync blocked beyond the certified per-mode penetration")
-    PEN_MARGIN = 1e-3                                        # waypoint-sampling slack (1mm)
+    # ZERO. A desynced configuration may not be ANY deeper than the nominal path already is.
+    # This was 1mm of "waypoint-sampling slack" on the diagonal calibration, and slack here is
+    # not free: the certificate's currency is millimetres but the consequence is newtons. A part
+    # held by a vacuum gripper has a lateral bound of mu*F_pull = 0.15*25 = 3.75N, and ~1mm of
+    # penetration into it is a ~14N shove -- measured on cross-new, a3_ur_coll5 into obj_6 at
+    # -1.29mm, breaking a2's and a1's grasps on lat2 +14.0/3.75 and lat1 -14.2/3.75. Tracking
+    # (0.052 deg) and grasp slip (0.31mm) were negligible; the COMMANDED config already
+    # overlapped by 1.317mm, i.e. the corridor certified it.
+    # If this starts producing false violations, the fix is a FINER diagonal calibration
+    # (_CAL_DS) or a finer corridor grid -- not a fudge factor that buys makespan with a
+    # millimetre the grasp model cannot pay for.
+    PEN_MARGIN = 0.0
     _frame_arm = {}                                          # frame -> arm index (prefix match)
     def _arm_of(fname):
       if fname in _frame_arm:
@@ -1976,27 +2209,142 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                   f"{_lev[_r].max() * 1000:.0f}mm, "
                   + (f"worst corner {_jump[_r].max():.2f} m/rad, " if corner_limits else "")
                   + f"speed limit min {_f.min():.2f} rad/s (cruise {JOINT_RATE:g})")
-      print(f"[sim/mp] --corridor STAGE A: certifying the desync envelope "
-            f"(D={_D:.0f} rad, {len(robots)} arms) ...")
-      t0 = _time.time()
-      cor = retiming.certify_corridor(len(robots), _D, world_free, pair_free,
-                                      ds_grid=corridor_ds, ds_lead=corridor_ds_lead,
-                                      lead_max=corridor_lead_max, locked=_locked,
-                                      progress=(print if verbose else None))
-      print(f"[sim/mp] STAGE A done in {_time.time() - t0:.0f}s")
-      print(retiming.corridor_width_report(cor))
-      if rate_clamp:
-        print("[flag] --corridor-rate-clamp ACTIVE: each corridor step is bounded by the joint "
-              "motion it actually produces (rate_of's share is taken from the segment the arm "
-              "STARTS in, so a step landing in a busier segment overshoots joint_rate).")
-      traj = retiming.corridor_schedule(_P, arm_dims, _bar, acting, cor, DT,
-                                        joint_rate=JOINT_RATE, ramp_dist=RAMP_DIST,
-                                        ramp_min=RAMP_MIN, dwell=DWELL_T, spread=True,
-                                        vmax=_vmax, amax=_amax,
-                                        limit_ds=(_dsf if force_limits else None),
-                                        rate_clamp=rate_clamp)
+      # ---- STAGE A + VERIFY + REFINE ---------------------------------------------------
+      # STAGE A IS A SAMPLED CERTIFICATE, AND ITS SAMPLING IS COARSE NEXT TO WHAT IT MUST
+      # CATCH. At the 1 rad default, consecutive grid cells on cross-new are ~641mm of summed
+      # EE travel apart, while the failure mode is a ~1.3mm overlap lasting 10ms -- ~500x
+      # finer than the grid. MEASURED: the corridor certified a configuration in which
+      # a3_ur_coll5 penetrated obj_6 (held by a2) by 1.29mm, breaking two grasps on their
+      # LATERAL bound; tracking (0.052deg) and grasp slip (0.31mm) were negligible and the
+      # COMMANDED config already overlapped by 1.317mm. Zeroing PEN_MARGIN changed nothing --
+      # the certificate had simply never evaluated that instant.
+      # So: certify coarse, then VERIFY THE SCHEDULE THAT CAME OUT at fine resolution against
+      # the exact oracle, and REFINE where it fails. Verification is cheap next to
+      # certification -- it walks ONE 1-D trajectory instead of a 2-D envelope over all leads.
+      # MEASURED cost of refining cross-new: stage A 21s -> 36s -> 56s at ds 1.0/0.5/0.25,
+      # corridor width essentially unchanged (3.64 -> 3.66) and makespan unchanged (+21.4% ->
+      # +21.3%), and at 0.25 the collision-driven breaks disappear. Refinement is nearly free.
+      # WHO LEGITIMATELY TOUCHES WHOM. A gripper is IN CONTACT with the part it holds, and a
+      # mated part is IN CONTACT with its group -- reporting those as "collisions" makes the
+      # verifier cry wolf (measured: a1_gripper_fill~obj_0 at 7.21mm is a1 holding obj_0, and
+      # obj_0~obj_3__shape at 0.11mm on car-mini is a seated mate). Skip them by asking the
+      # DISCRETE STATE, which is exactly where "who holds what" is authoritative.
+      def _legit_pair(pr, fired):
+        k = min(fired, len(_stretch_plan) - 1)
+        st = states[min(_stretch_plan[k] + 1, len(states) - 1)] if _stretch_plan else None
+        if st is None:
+          return False
+        f0, f1 = pr[0].split("__", 1)[0], pr[1].split("__", 1)[0]
+        p0, p1 = f0 in assembly.objects, f1 in assembly.objects
+        if p0 and p1:                                        # two parts: mated => touching
+          return any(f0 in g and f1 in g for g in st.subassemblies())
+        if p0 or p1:                                         # arm vs part: is it ITS OWN part?
+          part, arm_f = (f0, pr[1]) if p0 else (f1, pr[0])
+          grp = next((g for g in st.subassemblies() if part in g), {part})
+          for q in grp:
+            for c in st.supports.get(q, ()):
+              if c[0] == "grasp" and arm_f.startswith(c[1]):
+                return True
+        return False
+
+      def _verify_schedule(_t, step):
+        """Exact per-sample check of the SCHEDULE. Returns [(sample, arcs, pairs, arms), ...]."""
+        if _t is None or not len(_t.q):
+          return []
+        # traj.fires is [(sample, [task_ids])]; all we need is HOW MANY events have fired by
+        # sample i, because that selects the attachment mode the oracle checks against.
+        fire_samples = sorted(int(_si) for _si, _ in (getattr(_t, "fires", []) or []))
+        prog = getattr(_t, "progress", None)
+        out = []
+        for i in range(0, len(_t.q), max(1, step)):
+          fired = int(np.searchsorted(fire_samples, i, side="right"))
+          if not collide(_t.q[i], fired):
+            continue
+          real = [(pr, dp) for pr, dp in getattr(collide, "last_pairs", [])
+                  if not _legit_pair(pr, fired)]
+          if not real:
+            continue                                         # only grasps/mates: not a violation
+          arms = {a for pr, _ in real for a in (_arm_of(pr[0]), _arm_of(pr[1]))
+                  if a is not None}
+          out.append((i, (list(prog[i]) if prog is not None else None), real, sorted(arms)))
+        return out
+
+      _ds = corridor_ds
+      _extra_locks, cor, traj = [], None, None
+      for _pass in range(max(0, corridor_refine) + 1):
+        print(f"[sim/mp] --corridor STAGE A: certifying the desync envelope "
+              f"(D={_D:.0f} rad, {len(robots)} arms, ds={_ds:g}"
+              + (f", +{len(_extra_locks)} counterexample lock(s)" if _extra_locks else "") + ") ...")
+        t0 = _time.time()
+        cor = retiming.certify_corridor(len(robots), _D, world_free, pair_free,
+                                        ds_grid=_ds, ds_lead=corridor_ds_lead,
+                                        lead_max=corridor_lead_max,
+                                        locked=_locked + _extra_locks,
+                                        progress=(print if verbose else None))
+        print(f"[sim/mp] STAGE A done in {_time.time() - t0:.0f}s")
+        print(retiming.corridor_width_report(cor))
+        if rate_clamp:
+          print("[flag] --corridor-rate-clamp ACTIVE: each corridor step is bounded by the "
+                "joint motion it actually produces (rate_of's share is taken from the segment "
+                "the arm STARTS in, so a step landing in a busier segment overshoots joint_rate).")
+        traj = retiming.corridor_schedule(_P, arm_dims, _bar, acting, cor, DT,
+                                          joint_rate=JOINT_RATE, ramp_dist=RAMP_DIST,
+                                          ramp_min=RAMP_MIN, dwell=DWELL_T, spread=True,
+                                          vmax=_vmax, amax=_amax,
+                                          limit_ds=(_dsf if force_limits else None),
+                                          rate_clamp=rate_clamp)
+        if corridor_verify <= 0:
+          break
+        t0 = _time.time()
+        _bad = _verify_schedule(traj, corridor_verify)
+        print(f"[sim/mp] VERIFY: {len(traj.q) // max(1, corridor_verify)} schedule samples "
+              f"checked exactly in {_time.time() - t0:.0f}s -> "
+              f"{len(_bad) if _bad else 'NO'} real violation(s)")
+        if not _bad:
+          print("[sim/mp] the executed schedule is certified collision-free at this resolution.")
+          break
+        for _i, _arcs, _prs, _arms in _bad[:4]:
+          print(f"[sim/mp] !!! schedule COLLIDES at sample {_i} (t={_i*DT:.2f}s), arms {_arms}: "
+                + ", ".join(f"{p[0]}~{p[1]} {d*1000:.2f}mm" for p, d in _prs[:3]))
+        if _pass >= corridor_refine:
+          print(f"[sim/mp] !!! refinement budget exhausted; EXECUTING ANYWAY -- expect the sim "
+                f"to report the consequence. Raise --corridor-refine.")
+          break
+        # LOCAL REFINEMENT: turn each counterexample into a LOCK on the offending arm pair over
+        # a window around where it happened, instead of re-gridding the whole path. Global
+        # halving does not converge -- it reschedules everything, so each pass yields a
+        # DIFFERENT trajectory with different violations (measured on cross-new: 3 -> 2 -> 1 ->
+        # 2 with a different pair each time). A lock removes exactly the desync freedom the
+        # counterexample used, at the SAME certification cost.
+        _win = max(2.0 * _ds, 1.0)
+        _added = 0
+        for _i, _arcs, _prs, _arms in _bad:
+          if _arcs is None or len(_arms) < 2:
+            continue                                         # arm-vs-world: locking cannot help
+          for _x in range(len(_arms)):
+            for _y in range(_x + 1, len(_arms)):
+              _a, _b = _arms[_x], _arms[_y]
+              _s0 = max(0.0, min(_arcs[_a], _arcs[_b]) - _win)
+              _s1 = min(_D, max(_arcs[_a], _arcs[_b]) + _win)
+              _extra_locks.append((min(_a, _b), max(_a, _b), _s0, _s1))
+              _added += 1
+        if _added:
+          print(f"[sim/mp] REFINING LOCALLY: locking {_added} arm pair(s) over +/-{_win:g} rad "
+                f"around the counterexample(s) (pass {_pass + 2}/{corridor_refine + 1})")
+        else:
+          _ds *= 0.5                                         # world violations: finer grid
+          print(f"[sim/mp] REFINING: no lockable arm pair; ds -> {_ds:g} "
+                f"(pass {_pass + 2}/{corridor_refine + 1})")
       base = retiming.build_trajectory(stretches, DT, joint_rate=JOINT_RATE,
                                        ramp_dist=RAMP_DIST, ramp_min=RAMP_MIN, dwell=DWELL_T)
+      _ff = getattr(traj, "force_floor", None) or {}
+      if _ff:
+        print("[sim/mp] !!! --force-limits: the wrench cap was BELOW the never-stall floor "
+              f"({RAMP_MIN * JOINT_RATE:g} rad/s) at " +
+              ", ".join(f"arm{r} {n} sample(s)" for r, n in sorted(_ff.items())) +
+              " -- those waypoints are traversed at the CAP now (previously the floor silently "
+              "won). Expect a longer schedule; a near-zero cap means the LP considers that "
+              "waypoint untraversable.")
       print(f"[sim/mp] STAGES B+C: {len(traj.q)} samples vs {len(base.q)} lockstep "
             f"({100 * (1 - len(traj.q) / max(len(base.q), 1)):+.1f}% makespan), "
             f"{len(traj.fires)} fire points, ZERO collision checks during scheduling")
@@ -2319,6 +2667,15 @@ def _cli_run(a):
   # collision oracle and the MuJoCo capsules stay mutually consistent. 1.0 = no-op.
   scale_arm_collision_shapes(C, robots, getattr(a, "coll_scale", 1.0))
   gripper_kinds = _gripper_kinds_from_cfg(cfg, robots)
+  # ARM VISUAL MESHES ARE FOR EYES ONLY: the collision model is the capsules either way, so on a
+  # headless run every mesh body is pure cost -- a rai getPose, a mocap write and a
+  # mj_kinematics slot per step. cross-new carries 60 mesh bodies against 30 real ones, and
+  # dropping them took a 2m15s run to 1m57s with a BIT-IDENTICAL result. Kept whenever anything
+  # actually looks at them (--gui or --record), and --no-arm-meshes still forces them off.
+  _want_meshes = (not a.no_arm_meshes) and bool(getattr(a, "gui", False) or a.record)
+  if not _want_meshes and not a.no_arm_meshes:
+    print("[sim] headless: skipping arm VISUAL meshes (capsules-only collision is unchanged). "
+          "Pass --gui/--record to keep them.")
   # MASSES MUST STILL BE THE PLANNING MASSES HERE. _states_from_plan re-simulates the saved
   # actions through the wrench-gated successor generator, so scaling first makes it judge a
   # DIFFERENT action set than the search did and the saved action stops being reachable
@@ -2374,6 +2731,16 @@ def _cli_run(a):
       print(f"[sim] loaded motion path ({len(path)} states) from {a.mp_path} -- skipping BiRRT")
       # ALIGNMENT GUARD: the path's mode task-ids index MAIN's task list; the rebuilt problem
       # must have the identical task structure or every attach fires at the wrong time.
+      _want = getattr(MP.load_path, "last_signature", None)
+      if _want is not None:
+        _have = MP.task_signature(prob)
+        if _have != _want:
+          print(f"[sim] !!! TASK-SIGNATURE MISMATCH: the path was planned against task structure "
+                f"{_want}, the rebuild produced {_have}. Same task COUNT can still mean different "
+                f"tasks (a moved --pre-* split, a different bracing/handovers flag), and the path "
+                f"indexes tasks by integer id -- so every attach would fire at the wrong moment. "
+                f"Aborting. Re-export the path from this plan, or use the plan the path came from.")
+          return
       max_tid = max(int(t) for st in path for t in np.atleast_1d(st.mode.task_ids))
       if max_tid + 1 != len(prob.tasks):
         print(f"[sim] !!! TASK-STRUCTURE MISMATCH: saved path references {max_tid + 1} tasks, "
@@ -2391,15 +2758,19 @@ def _cli_run(a):
       print("[flag] --mp-cograsp ACTIVE: checking co-grasp rigidity along the loaded path.")
       MP.report_cograsp_drift(C, prob, path, rik)
     rep = execute_motion_plan(C, asm, plan, states, prob, path, gripper_kinds=gripper_kinds,
-                              record=a.record, gui=a.gui, visual=not a.no_arm_meshes,
+                              record=a.record, gui=a.gui, visual=_want_meshes,
                               verbose=a.verbose, prioritized=a.prioritized,
                               rate_boost=a.arm_rate, smooth=a.smooth,
                               corridor=a.corridor, corridor_ds=a.corridor_ds,
                               corridor_ds_lead=a.corridor_ds_lead,
                               corridor_lead_max=a.corridor_lead_max,
+                              corridor_verify=a.corridor_verify,
+                              corridor_refine=a.corridor_refine,
                               rate_clamp=a.corridor_rate_clamp,
                               settle_tol=a.settle_tol, settle_max=a.settle_max,
+                              directional_caps=a.directional_caps,
                               couple_handovers=a.couple_handovers,
+                              verify_efc_cache=a.verify_efc_cache,
                               force_limits=a.force_limits, wrench_margin=a.wrench_margin,
                               mass_scale=a.mass_scale, inertia_factor=a.inertia_factor,
                               corner_limits=a.corner_limits,
@@ -2437,19 +2808,49 @@ def _build_cli():
                       "--mp-path (the saved path already encodes it).")
   r.add_argument("--mp-runtime", type=float, default=60.0,
                  help="v2: BiRRT budget (s); ignored with --mp-path")
+  r.add_argument("--verify-efc-cache", action="store_true",
+                 help="debug: re-derive the equality-row index EVERY step and assert it matches "
+                      "the eq_active-keyed cache. Checks the MuJoCo layout assumption that the "
+                      "equality block is a function of the active set alone. Slow; off by default.")
   r.add_argument("--couple-handovers", action="store_true",
                  help="corridor: also lock giver+receiver over a handover's stretch. A handover "
                       "is ATOMIC discretely (giver holds before, receiver after, never both), so "
                       "the state-scan coupling misses it entirely -- yet both grippers are on "
                       "the part in execution. OFF = byte-identical.")
-  r.add_argument("--settle-tol", type=float, default=0.0, metavar="RAD",
+  r.add_argument("--directional-caps", action="store_true",
+                 help="breakaway uses the planner's DIRECTIONAL grasp polytope (force at the "
+                      "grasp point + residual pure couple) instead of min-over-directions. More "
+                      "permissive in force (F_push vs a blanket F_pull), STRICTER in torque. "
+                      "OFF by default: it regresses configs that pass today, which indicts the "
+                      "hand-set couple caps rather than the test.")
+  r.add_argument("--settle-tol", type=float, default=1e-3, metavar="RAD",
                  help="--actuated: before each attach fires, hold the reference until the max "
+                      "joint tracking error is under RAD. DEFAULT 1e-3 (0 disables): settling "
+                      "takes ~0.54s against a 0.15s DWELL_T, so attaches used to fire mid-"
+                      "convergence and _activate_weld froze the residual into the hand -- "
+                      "measured pick-to-pick drift 0.05 -> 56mm, and enabling this removed EVERY "
+                      "not_seated failure on cross-new. No effect unless --actuated. "
                       "joint tracking error is under RAD (0 = off, byte-identical). The "
                       "schedule dwells a fixed DWELL_T, but a servo settles when it settles "
                       "(measured 0.54s vs a 0.15s dwell), and the grasp weld freezes whatever "
                       "residual exists at fire time into the hand.")
   r.add_argument("--settle-max", type=float, default=1.0, metavar="SEC",
                  help="--settle-tol: give up waiting after this long (default 1.0s).")
+  r.add_argument("--corridor-verify", type=int, default=50, metavar="EVERY",
+                 help="--corridor: after scheduling, re-check the RESULTING trajectory exactly "
+                      "every EVERY samples. DEFAULT 50 (0 = off) -- verification costs ~0s "
+                      "against 11-97s of certification, because it walks ONE 1-D trajectory "
+                      "instead of a 2-D envelope. "
+                      "every EVERY samples (0 = off). Stage A is a SAMPLED certificate -- at the "
+                      "1.0 default its grid cells are ~641mm of EE travel apart on cross-new "
+                      "while the failure mode is a 1.3mm overlap, so it can certify a "
+                      "configuration it never evaluated. Verification walks ONE 1-D trajectory, "
+                      "so it is cheap next to certification.")
+  r.add_argument("--corridor-refine", type=int, default=4, metavar="N",
+                 help="--corridor-verify: on a violation, halve --corridor-ds and re-certify, "
+                      "up to N times (0 = report only). MEASURED on cross-new: ds 1.0 -> 0.25 "
+                      "took stage A 21s -> 56s, left the corridor width and makespan unchanged "
+                      "(+21.4%% -> +21.3%%), and removed the collision-driven grasp breaks.")
   r.add_argument("--corridor-rate-clamp", action="store_true",
                  help="corridor: bound each step by the joint motion it ACTUALLY produces. "
                       "rate_of() budgets joint_rate using the arm's arc share in the segment it "

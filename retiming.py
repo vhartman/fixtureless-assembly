@@ -984,8 +984,24 @@ def corridor_schedule(P, arm_dims, bar_s, acting, cor, dt, joint_rate=DEFAULT_JO
       return int(min(max(round(s / limit_ds), 0), np.shape(arr)[1] - 1))
     return min(_cor_at(cor, s), np.shape(arr)[1] - 1)
 
-  def vlim(r, s):                                            # effective speed cap, with the
-    return max(float(vmax[r][_lim_at(vmax, s)]), ramp_min * joint_rate)   # never-stall floor
+  floor_hits = {}
+
+  def vlim(r, s):
+    """Effective speed cap. THE FORCE CAP WINS OVER THE NEVER-STALL FLOOR.
+
+    The floor (ramp_min * joint_rate = 0.04 rad/s by default) exists so an arm always arrives,
+    but it used to be applied with max(), which SILENTLY EXCEEDED a tighter force limit --
+    measured on car-mini, --force-limits asked for 0.02 rad/s on arm1 and 0.00 on arm2, both
+    below the floor, so the certified wrench bound was simply ignored. Honour the cap instead
+    and keep only an epsilon for termination; a cap that low is a real statement by the LP
+    ('this waypoint cannot be traversed safely at any useful speed') and is reported rather
+    than papered over."""
+    cap = float(vmax[r][_lim_at(vmax, s)])
+    fl = ramp_min * joint_rate
+    if cap >= fl:
+      return cap
+    floor_hits[r] = floor_hits.get(r, 0) + 1
+    return max(cap, 1e-4)                                    # epsilon: guarantee arrival only
 
   def rate_of(r, s):                                         # arm r at ITS joint limit
     return joint_rate / share[r][_seg_index(csum, segs, s)]
@@ -1123,8 +1139,11 @@ def corridor_schedule(P, arm_dims, bar_s, acting, cor, dt, joint_rate=DEFAULT_JO
     phase.append("settle")
   while len(phase) < len(q):
     phase.append("path")
-  return TimedTrajectory(dt=dt, q=np.asarray(q, float), phase=phase[:len(q)],
+  _t = TimedTrajectory(dt=dt, q=np.asarray(q, float), phase=phase[:len(q)],
                          fires=[(i, [k]) for i, k in fires], progress=prog)
+  # how often the wrench cap was tighter than the never-stall floor (see vlim)
+  _t.force_floor = dict(floor_hits)
+  return _t
 
 
 def _corridor_spread(prog, bar_s, act, fires, cor, dt, D, ramp_steps=100):
