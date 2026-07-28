@@ -2855,6 +2855,17 @@ def _cli_run(a):
     rik.pre_pick_delta = float(cfg.get("pre_pick") or 0.0)
     rik.pre_place_delta = float(cfg.get("pre_place") or 0.0)
     rik.pre_add_grasp_delta = float(cfg.get("pre_add_grasp") or 0.0)
+    # ...and the eq WEIGHTS, which decide how exactly a mate/place lands. Both were saved but
+    # never restored here, so the sim re-solved every witness at the default 1e1 and got
+    # different keyframes than the export it is supposed to be replaying.
+    if cfg.get("mate_eq_weight") is not None:
+      rik.mate_eq_weight = float(cfg["mate_eq_weight"])
+    if cfg.get("place_eq_weight") is not None:
+      rik.place_eq_weight = float(cfg["place_eq_weight"])
+    if cfg.get("mate_accuracy") is not None:
+      rik.mate_residual_reject = float(cfg["mate_accuracy"])
+    if cfg.get("ik_accuracy") is not None:
+      rik.nlp_stop_tolerance = float(cfg["ik_accuracy"])
     if cfg.get("witness_robot_collisions"):
       rik.strip_inactive_collision = False
     if cfg.get("strict_collisions") is not None:

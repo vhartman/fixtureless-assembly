@@ -1,4 +1,11 @@
 import argparse
+import os as _os
+
+# BEFORE rai loads: RAI_QUIET=1 drops rai's libccd/pairCollision spam at the fd (see rai_quiet).
+# Env var as well as a flag so it can be exported once instead of typed on every run.
+if _os.environ.get("RAI_QUIET", "").strip() not in ("", "0", "false", "no"):
+  import rai_quiet as _rq
+  _rq.install()
 
 import numpy as np
 
@@ -661,14 +668,6 @@ def build_parser():
            "the six face-centred grasps cannot reach. Appended AFTER the existing ids.",
   )
   g_search.add_argument(
-      "--place-eq-weight", type=float, default=None, metavar="W",
-      help="Equality weight on a PLACE's object-pose constraint (default 1e1), the twin of "
-           "--mate-eq-weight. A place sets the DATUM every later mate is measured against, so "
-           "its residual propagates: measured 3.91mm on a car-mini body place while every wheel "
-           "mated onto it at 0.01-0.23mm -- perfectly seated on a body in the wrong place. "
-           "Raising the NLP stopTolerance instead makes that place infeasible. Try 1e2.",
-  )
-  g_search.add_argument(
       "--tight-fingers", action="store_true",
       help="Shrink the finger COLLISION proxy from robotiq.g's capsule (40mm long, 20mm RADIUS "
            "= 80mm end to end) to robotiq_tight.g's (10mm radius), shifted 8mm outward so the "
@@ -677,6 +676,25 @@ def build_parser():
            "the tool centre, so it pokes out the far side of small parts and is what forces "
            "--part-float. Applied to the real scene, the cheap-EE scenes and the grasp "
            "precompute alike (they must agree). Changes which grasps survive the DB filter.",
+  )
+  g_search.add_argument(
+      "--place-eq-weight", type=float, default=None, metavar="W",
+      help="Weight on a PLACE's object-pose EQUALITY constraints (default 1e1) -- the twin of "
+           "--mate-eq-weight, which only reaches _ik_assemble. A place sets the DATUM every "
+           "later mate is measured against, so its residual propagates: MEASURED car-mini "
+           "(seed 11019) a body placed 3.91mm high while every wheel mated onto it at "
+           "0.01-0.23mm, i.e. perfectly seated on a body in the wrong place. NOTE it cannot "
+           "buy accuracy the geometry does not allow -- where the exact pose needs the arm "
+           "inside the table, a higher weight turns the compromise into a hard IK failure "
+           "(arguably the honest outcome; pair with a looser --strict-collisions).",
+  )
+  g_search.add_argument(
+      "--quiet-rai", action="store_true",
+      help="Drop rai's libccd/pairCollision WARNING spam ('called MPR penetration for non "
+           "intersecting meshes', 'but GJK says intersection'). rai prints those from C++ "
+           "straight to the file descriptor, so a Python redirect cannot see them -- this "
+           "splices a filter onto fd 1/2. Matches the SOURCE FILE, never the word WARNING, so "
+           "real diagnostics survive. Equivalent: export RAI_QUIET=1.",
   )
   g_search.add_argument(
       "--mate-eq-weight", type=float, default=None, metavar="W",
@@ -1102,7 +1120,9 @@ _SAVE_CONFIG_FIELDS = (
     # optimize_witnesses*/replay failing with "cannot reproduce action ... from the successor
     # set". min_sep and place_cells change the place cells, the rest change the action space.
     "strict_mate_collisions", "ik_accuracy", "mate_accuracy", "mate_eq_weight",
-    "place_eq_weight",
+    "place_eq_weight",                                   # a place is the DATUM later mates are
+    # measured against, so its residual is not local (measured: body 3.91mm high, wheels then
+    # mated onto it at 0.01-0.23mm -- perfectly seated on a body in the wrong place)
     "grasp_translations",                                # grasp ids index the DB
     "tight_fingers",                                     # changes what the grasp DB filters out
     "ik_seeding",                                        # off => witness IK fails on re-picks/
@@ -1271,6 +1291,11 @@ def run(cfg):
     set_grasp_translations(cfg.grasp_translations)
     print(f"[flag] --grasp-translations {cfg.grasp_translations}: each base grasp also offered "
           f"SLID along the gripper's open directions (bounded so the pads stay on the part).")
+  if cfg.quiet_rai:
+    import rai_quiet
+    rai_quiet.install()                                  # no-op if RAI_QUIET already installed it
+    print("[flag] --quiet-rai ACTIVE: rai's libccd/pairCollision spam is dropped at fd 1/2 "
+          "(matched on the C++ source file, never on 'WARNING', so real diagnostics survive).")
   if cfg.tight_fingers:
     from env import set_tight_fingers
     set_tight_fingers(True)
@@ -1536,16 +1561,16 @@ def run(cfg):
       robot_ik.strip_inactive_collision = False
       print("[flag] --witness-robot-collisions ACTIVE: other robots' collision kept ON in IK "
             "(search + witness opt); idle arms are at HOME in the IK scene.")
-    if robot_ik is not None and cfg.place_eq_weight is not None:
-      robot_ik.place_eq_weight = float(cfg.place_eq_weight)
-      print(f"[flag] --place-eq-weight {cfg.place_eq_weight:g}: PLACE object-pose eq constraints "
-            f"weighted {cfg.place_eq_weight:g} instead of 1e1 -- a place is the datum later "
-            f"mates are measured against, so its residual is not local.")
     if robot_ik is not None and cfg.mate_eq_weight is not None:
       robot_ik.mate_eq_weight = float(cfg.mate_eq_weight)
       print(f"[flag] --mate-eq-weight {cfg.mate_eq_weight:g}: assemble mate eq constraints "
             f"weighted up from the 1e1 default, so the solve SEATS the part instead of "
             f"stopping millimetres short.")
+    if robot_ik is not None and cfg.place_eq_weight is not None:
+      robot_ik.place_eq_weight = float(cfg.place_eq_weight)
+      print(f"[flag] --place-eq-weight {cfg.place_eq_weight:g}: PLACE object-pose eq "
+            f"constraints weighted up from the 1e1 default. A place is the DATUM later mates "
+            f"are measured against, so its residual is not local.")
     if robot_ik is not None and cfg.mate_accuracy is not None:
       robot_ik.mate_residual_reject = float(cfg.mate_accuracy)
       print(f"[flag] --mate-accuracy {cfg.mate_accuracy:g}m: assemble witnesses REJECTED when "

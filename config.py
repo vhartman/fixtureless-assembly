@@ -128,6 +128,7 @@ class RunConfig:
   place_eq_weight: Optional[float] = None
   grasp_translations: int = 0
   tight_fingers: bool = False
+  quiet_rai: bool = False
 
   # -- witness optimization --
   optimize_witnesses: Optional[str] = None
