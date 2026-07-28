@@ -125,7 +125,9 @@ class RunConfig:
   ik_accuracy: Optional[float] = None
   mate_accuracy: Optional[float] = None
   mate_eq_weight: Optional[float] = None
+  place_eq_weight: Optional[float] = None
   grasp_translations: int = 0
+  tight_fingers: bool = False
 
   # -- witness optimization --
   optimize_witnesses: Optional[str] = None
@@ -157,6 +159,8 @@ class RunConfig:
   mp_cograsp: bool = False
   mp_save: Optional[str] = None
   mp_collision_tolerance: float = 0.01
+  mp_robot_margin: float = 0.0
+  mp_margin_ramp: float = 0.0
   mp_viser: bool = False
   mp_collision_view: bool = False
   mp_modes: bool = False

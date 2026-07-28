@@ -1796,6 +1796,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
   # is a time-only rescaling: identical configurations, so the planner's collision
   # certificate carries over untouched and no extra checking is needed.
   boost_dims = arm_dims if rate_boost else None
+  boost_vmax = None
   if limit_rate:
     # --limit-rate: saturate the BINDING JOINT against rai's real per-joint limit instead of the
     # nominal 1.0 rad/s. Time-only rescaling on the common clock, so the certificate carries
@@ -1804,6 +1805,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     _vm = joint_vmax(C)
     _lb = retiming.joint_limit_boost(list(retiming._composite(stretches)[0]), _vm,
                                      joint_rate=JOINT_RATE)
+    boost_vmax = _vm                                       # <- APPLIED below, not just printed
     _fin = _vm[np.isfinite(_vm)]
     print(f"[sim/mp] --limit-rate ACTIVE: binding-joint boost x{_lb.mean():.2f} mean "
           f"(min x{_lb.min():.2f}, max x{_lb.max():.2f}) against per-joint limits "
@@ -1825,7 +1827,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     # every transition (where attaches fire) essentially at rest. Path GEOMETRY is untouched;
     # this is exactly what a jerk-limited tracking controller would do on hardware.
     for q in retiming.retime_stretch(qs, DT, joint_rate=JOINT_RATE, ramp_dist=RAMP_DIST,
-                                     ramp_min=RAMP_MIN, arm_dims=boost_dims):
+                                     ramp_min=RAMP_MIN, arm_dims=boost_dims,
+                                     vmax=boost_vmax):
       drive_q(q)
       scene.step(1, report, ("path",))
 
@@ -2832,10 +2835,26 @@ def _cli_run(a):
     import mp_export as MP
     gk = A.gripper_kind(C) if cfg.get("wrench") else None
     rik = RobotIK(C, robots)                                # geometric export only -- the
+    # RobotIK's own default is ik_seeding=False, but the CONFIG default is True and main.py
+    # turns it on before it exports; every other export path (mp_show_path, mp_debug_view,
+    # mp_show_modes, mp_viser_witness) sets it explicitly too. Leaving it off HERE made the
+    # witness IK fail for re-picks and reorienting places -- optimize_witnesses returned None
+    # and mp_export silently substituted the arm's PREVIOUS config, so the part was never
+    # carried anywhere (measured on car-mini: obj_0's two reorienting places became 0.07deg
+    # no-ops, the base stayed flat, and every wheel then missed its mate by ~70mm).
+    _seed = cfg.get("ik_seeding")
+    rik.ik_seeding = True if _seed is None else bool(_seed)
     # VERBATIM from the saved config -- 0.0 means NO pre-insertion split. (A silent `or 0.05`
     # default here rebuilt the problem WITH split tasks while the saved path used unsplit
     # task ids -> every attach after the first assemble fired at the wrong task; user-hit.)
     rik.pre_insertion_delta = float(cfg.get("pre_insertion") or 0.0)
+    # ...and the OTHER three splits, for the same reason: each one ADDS a task, so a rebuild
+    # that misses them produces a shorter task list than the saved --mp-path was planned
+    # against, and the path indexes tasks by integer id (the signature guard below catches it,
+    # but only if we even try). pre_insertion alone was restored here.
+    rik.pre_pick_delta = float(cfg.get("pre_pick") or 0.0)
+    rik.pre_place_delta = float(cfg.get("pre_place") or 0.0)
+    rik.pre_add_grasp_delta = float(cfg.get("pre_add_grasp") or 0.0)
     if cfg.get("witness_robot_collisions"):
       rik.strip_inactive_collision = False
     if cfg.get("strict_collisions") is not None:
@@ -2846,12 +2865,45 @@ def _cli_run(a):
     # inside optimize_witnesses can't reproduce an action (e.g. car-mini's add_grasp needs
     # bracing=True). bracing is saved; handovers/allow_place aren't (they default True).
     brace = bool(cfg.get("bracing"))
-    wit, _ = optimize_witnesses(C, asm, plan, robots, rik, cost="ee", sweeps=0,
-                                gripper_kind=gk, bracing=brace,
-                                robot_collisions=bool(cfg.get("witness_robot_collisions")),
-                                verbose=False)
+    _hand = cfg.get("handovers"); _hand = True if _hand is None else bool(_hand)
+    _aplace = cfg.get("allow_place"); _aplace = True if _aplace is None else bool(_aplace)
+    # WHICH witness optimizer ran at export time, reproduced here. build_tasks SKIPS a task
+    # whose witness is None, so a different optimizer -> a different None-pattern -> a task
+    # chain that no longer matches the saved --mp-path ("mode alignment failed: N unmatched").
+    _witopt = cfg.get("optimize_witnesses")
+    if _witopt == "floor":
+      from witness_floor import optimize_witnesses_floor
+      wit, _ = optimize_witnesses_floor(
+          C, asm, plan, robots, rik, gripper_kind=gk, handovers=_hand, allow_place=_aplace,
+          bracing=brace, branch_budget=cfg.get("witness_branch_budget"),
+          branch_metric=cfg.get("witness_branch_metric"),
+          reconfig_thresh=cfg.get("witness_reconfig_thresh"))
+    elif _witopt:
+      wit, _ = optimize_witnesses(C, asm, plan, robots, rik, cost=_witopt,
+                                  gripper_kind=gk, handovers=_hand, allow_place=_aplace,
+                                  bracing=brace, clear_weight=cfg.get("witness_clearance") or 0.0,
+                                  robot_collisions=bool(cfg.get("witness_robot_collisions")),
+                                  verbose=False)
+    else:
+      wit, _ = optimize_witnesses(C, asm, plan, robots, rik, cost="ee", sweeps=0,
+                                  gripper_kind=gk, bracing=brace, handovers=_hand,
+                                  allow_place=_aplace,
+                                  robot_collisions=bool(cfg.get("witness_robot_collisions")),
+                                  verbose=False)
+    # depgraph=False is DELIBERATE and must stay: execute_motion_plan consumes a SEQUENCE-style
+    # mode chain (one stretch per mode, in order). Rebuilding main's depgraph problem here to
+    # "match the export" instead broke alignment on the sim's OWN planned path (measured: 6/11/
+    # 15/14 unmatched modes across the pre-split configs, where sequence ran clean). Matching a
+    # saved --mp-path needs the chain PERSISTED with the path, not re-derived under a graph the
+    # executor cannot walk.
+    # ROBOT-ROBOT MARGIN, as the export applies it. A CARRIED part inherits its holder (frames
+    # are owned by kinematic root), so the margin covers part-vs-OTHER-ARM -- while a RESTING
+    # part is owned by nobody and keeps zero clearance to the table, which a place needs.
+    # sim's internal planning never passed this, so --mp-robot-margin was inert on this route.
     prob = MP.make_problem(C, asm, plan, wit, robots, rik, gk, bracing=brace,
-                           depgraph=False, collision_tolerance=a.mp_tolerance)
+                           depgraph=False, collision_tolerance=a.mp_tolerance,
+                           robot_robot_margin=float(cfg.get("mp_robot_margin") or 0.0),
+                           robot_margin_ramp=float(cfg.get("mp_margin_ramp") or 0.0))
     if a.mp_path:                                          # load a saved BiRRT path -> no re-plan
       path = MP.load_path(a.mp_path)
       print(f"[sim] loaded motion path ({len(path)} states) from {a.mp_path} -- skipping BiRRT")

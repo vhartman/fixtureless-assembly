@@ -113,6 +113,54 @@ GRIPPER_COLORS = [
 _GRIPPER_BODY_KEYS = ("vacuum", "finger", "palm", "gripper_fill", "gripper_center")
 
 
+_TIGHT_FINGERS = False         # shrink the finger COLLISION proxy (see tighten_fingers)
+
+# robotiq.g's finger proxy vs robotiq_tight.g's: the tight one halves the capsule RADIUS and
+# shifts the capsule laterally by the difference, so the gripping SURFACE stays put (measured:
+# inner surface 39.2mm -> 41.2mm from the tool axis) while the swept volume drops 4x.
+_FAT_FINGER_RADIUS = 0.02
+_TIGHT_FINGER_RADIUS = 0.01
+_TIGHT_FINGER_SHIFT = 0.008
+
+
+def set_tight_fingers(on):
+    """Select robotiq_tight.g's slim finger proxy over robotiq.g's fat one. Call BEFORE any
+    scene is built -- the geometry is baked into every C the run creates."""
+    global _TIGHT_FINGERS
+    _TIGHT_FINGERS = bool(on)
+
+
+def tighten_fingers(C, prefix=""):
+    """Shrink the two-finger COLLISION capsules in place to robotiq_tight.g's dimensions.
+
+    The visible robotiq pads carry contact:0 -- they are decoration. All grasping and all
+    collision run on finger1/finger2, capsules that robotiq.g sizes at [.04, .02]: 40mm long
+    with a 20mm RADIUS, so 80mm end to end against a real pad of 37.5mm. That proxy reaches
+    32.9mm past the tool centre, which is why the fingers poke out the far side of a small
+    part and why a part must float off the table to be graspable from the side. ur5_vamp
+    already includes the tight file; the ur10 line has it commented out.
+    """
+    n = 0
+    for name in C.getFrameNames():
+        if prefix and not name.startswith(prefix):
+            continue
+        if not (name.endswith("finger1") or name.endswith("finger2")):
+            continue
+        f = C.getFrame(name)
+        try:
+            size = list(f.getSize())
+        except Exception:
+            continue
+        if len(size) != 2 or abs(size[1] - _FAT_FINGER_RADIUS) > 1e-9:
+            continue                  # already slim, or not the robotiq.g capsule proxy
+        rel = list(f.getRelativePosition())
+        f.setShape(ry.ST.capsule, [float(size[0]), _TIGHT_FINGER_RADIUS])
+        f.setRelativePosition([rel[0], rel[1] - _TIGHT_FINGER_SHIFT, rel[2]])
+        f.setContact(-2)              # setShape drops the contact flag; restore the .g's value
+        n += 1
+    return n
+
+
 def color_gripper(C, prefix, color):
     """Tint the gripper bodies of the robot with frame prefix `prefix` (e.g. 'a1_')."""
     for name in C.getFrameNames():
@@ -121,6 +169,16 @@ def color_gripper(C, prefix, color):
                 C.getFrame(name).setColor(color)
             except Exception:
                 pass                      # shapeless frames (markers) may not take a color
+
+
+def maybe_tighten_fingers(C, prefix=""):
+    """tighten_fingers, gated on the flag. EVERY site that loads a gripper .g must call this:
+    the cheap-EE collision scenes and the grasp precompute build their own Configs, and a
+    finger proxy that differs between those and the real scene is exactly the model mismatch
+    that makes a witness read feasible in the search and collide in motion planning."""
+    if _TIGHT_FINGERS:
+        return tighten_fingers(C, prefix)
+    return 0
 
 
 def _robot_path(robot_type, floating_ee, vacuum):
@@ -179,6 +237,8 @@ def make_four_robot_env(
         ).setParent(C.getFrame("table")).setRelativePosition(
             place["pos"][i]
         ).setRelativeQuaternion(place["rot"][i]).setJoint(ry.JT.rigid)
+
+        maybe_tighten_fingers(C, prefix)
 
         # unique gripper colour per robot, so they are easy to tell apart in the viewer
         color_gripper(C, prefix, GRIPPER_COLORS[i % len(GRIPPER_COLORS)])

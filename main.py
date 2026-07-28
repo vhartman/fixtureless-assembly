@@ -661,6 +661,24 @@ def build_parser():
            "the six face-centred grasps cannot reach. Appended AFTER the existing ids.",
   )
   g_search.add_argument(
+      "--place-eq-weight", type=float, default=None, metavar="W",
+      help="Equality weight on a PLACE's object-pose constraint (default 1e1), the twin of "
+           "--mate-eq-weight. A place sets the DATUM every later mate is measured against, so "
+           "its residual propagates: measured 3.91mm on a car-mini body place while every wheel "
+           "mated onto it at 0.01-0.23mm -- perfectly seated on a body in the wrong place. "
+           "Raising the NLP stopTolerance instead makes that place infeasible. Try 1e2.",
+  )
+  g_search.add_argument(
+      "--tight-fingers", action="store_true",
+      help="Shrink the finger COLLISION proxy from robotiq.g's capsule (40mm long, 20mm RADIUS "
+           "= 80mm end to end) to robotiq_tight.g's (10mm radius), shifted 8mm outward so the "
+           "gripping surface stays put. The visible robotiq pads carry contact:0 -- this proxy "
+           "is what every grasp and collision check actually uses, and it reaches 32.9mm past "
+           "the tool centre, so it pokes out the far side of small parts and is what forces "
+           "--part-float. Applied to the real scene, the cheap-EE scenes and the grasp "
+           "precompute alike (they must agree). Changes which grasps survive the DB filter.",
+  )
+  g_search.add_argument(
       "--mate-eq-weight", type=float, default=None, metavar="W",
       help="Weight on the assemble's positionRel/quaternionRel EQUALITY constraints (default "
            "1e1). rai's augmented-Lagrangian schedule trades the eq residual against the other "
@@ -965,6 +983,25 @@ def build_parser():
            "(display_path_viser primitives_only). See exactly what the planner collides.",
   )
   g_mp.add_argument(
+      "--mp-robot-margin", type=float, default=0.0, metavar="M",
+      help="Plan with M metres of clearance between DIFFERENT ROBOTS (0 = off). The planner "
+           "certifies the COMMANDED path, but the executed one deviates by the controller's "
+           "tracking error, so a path validated at zero clearance collides when run (measured "
+           "on cross-new: p90 2.9mm, max 33.1mm at the EE). Classified by KINEMATIC ROOT, so a "
+           "carried part counts as its holder -- gripper-to-payload, part-to-table and mating "
+           "contacts keep the plain penetration budget because they are INTENDED.",
+  )
+  g_mp.add_argument(
+      "--mp-margin-ramp", type=float, default=0.0, metavar="M",
+      help="With --mp-robot-margin: relax the margin between the TASK'S OWN robots over the last "
+           "M metres of END-EFFECTOR travel to their goal (0 = drop it outright for that pair). "
+           "A handover needs its two arms close but not close to the third, so the margin is "
+           "dropped only for the participating pair, and only as they approach. Keyed on EE "
+           "DISTANCE, not path position: a sampling planner's predicate must be a pure function "
+           "of the state, so 'the last 10%% of the path' is not expressible -- distance-to-goal "
+           "is, and means the same thing.",
+  )
+  g_mp.add_argument(
       "--mp-modes", action="store_true",
       help="With --motion-plan: instead of planning, step through the exported problem's MODES "
            "(each posed at its task goal keyframe) in mr_bench's own viser viewer "
@@ -1065,7 +1102,24 @@ _SAVE_CONFIG_FIELDS = (
     # optimize_witnesses*/replay failing with "cannot reproduce action ... from the successor
     # set". min_sep and place_cells change the place cells, the rest change the action space.
     "strict_mate_collisions", "ik_accuracy", "mate_accuracy", "mate_eq_weight",
+    "place_eq_weight",
     "grasp_translations",                                # grasp ids index the DB
+    "tight_fingers",                                     # changes what the grasp DB filters out
+    "ik_seeding",                                        # off => witness IK fails on re-picks/
+    # reorienting places, and mp_export then exports the arm's PREVIOUS config as the goal
+    "pre_pick", "pre_place", "pre_add_grasp",            # each SPLITS an action into two tasks:
+    # unsaved, a replay/sim rebuild has fewer tasks than the --mp-path it loads, and the path
+    # indexes tasks by integer id. pre_insertion was already saved; these three were not.
+    "optimize_witnesses", "witness_branch_budget",       # WHICH witness optimizer ran: a
+    "witness_branch_metric", "witness_reconfig_thresh",  # different one yields a different
+    # None-pattern, and build_tasks SKIPS a task whose witness is None -- so the rebuilt mode
+    # chain stops matching the saved --mp-path ("mode alignment failed: N unmatched").
+    "hoist_releases",                                    # rewrites the PLAN (before --save, so
+    # the saved actions are already hoisted) -- recorded so a rebuild can tell what it is replaying
+    "witness_clearance", "handovers", "allow_place",
+    "mp_sequence",                                       # depgraph vs sequence = a different
+    # task GRAPH; the sim rebuilt SEQUENCE unconditionally while main defaults to depgraph
+    "mp_robot_margin", "mp_margin_ramp",                 # clearance the path was planned with
     "min_sep", "place_cells", "prefer_center", "brace_for_assembly_only", "lru_robots",
     "anon_robots", "declutter", "por",
     # LAYOUT: these feed add_disassembled_obj, so without them the replay/sim rebuilds a
@@ -1217,6 +1271,13 @@ def run(cfg):
     set_grasp_translations(cfg.grasp_translations)
     print(f"[flag] --grasp-translations {cfg.grasp_translations}: each base grasp also offered "
           f"SLID along the gripper's open directions (bounded so the pads stay on the part).")
+  if cfg.tight_fingers:
+    from env import set_tight_fingers
+    set_tight_fingers(True)
+    print("[flag] --tight-fingers ACTIVE: finger COLLISION capsules shrunk to "
+          "robotiq_tight.g's radius (20mm -> 10mm, shifted 8mm so the grip surface holds). "
+          "The fat proxy reaches 32.9mm past the tool centre -- it is what pokes out the far "
+          "side of small parts and what forces --part-float.")
   set_brace_for_assembly_only(cfg.brace_for_assembly_only)
   set_extra_place_cells(cfg.place_cells)
   set_prefer_center(cfg.prefer_center)
@@ -1475,6 +1536,11 @@ def run(cfg):
       robot_ik.strip_inactive_collision = False
       print("[flag] --witness-robot-collisions ACTIVE: other robots' collision kept ON in IK "
             "(search + witness opt); idle arms are at HOME in the IK scene.")
+    if robot_ik is not None and cfg.place_eq_weight is not None:
+      robot_ik.place_eq_weight = float(cfg.place_eq_weight)
+      print(f"[flag] --place-eq-weight {cfg.place_eq_weight:g}: PLACE object-pose eq constraints "
+            f"weighted {cfg.place_eq_weight:g} instead of 1e1 -- a place is the datum later "
+            f"mates are measured against, so its residual is not local.")
     if robot_ik is not None and cfg.mate_eq_weight is not None:
       robot_ik.mate_eq_weight = float(cfg.mate_eq_weight)
       print(f"[flag] --mate-eq-weight {cfg.mate_eq_weight:g}: assemble mate eq constraints "
@@ -1709,7 +1775,9 @@ def run(cfg):
           prob = MP.make_problem(C, assembly, plan, mp_wit, robots, robot_ik, gk,
                                  collision_tolerance=cfg.mp_collision_tolerance,
                                  bracing=cfg.bracing, depgraph=not cfg.mp_sequence,
-                                 pre_witnesses=mp_pre)
+                                 pre_witnesses=mp_pre,
+                                 robot_robot_margin=cfg.mp_robot_margin,
+                                 robot_margin_ramp=cfg.mp_margin_ramp)
           print(f"[motion-plan] {'SEQUENCE' if cfg.mp_sequence else 'DEPGRAPH'} problem, "
                 f"{len(prob.tasks)} tasks")
           if cfg.mp_clearance:

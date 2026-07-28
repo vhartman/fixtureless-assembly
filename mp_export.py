@@ -334,8 +334,129 @@ def _dependency_graph(plan, states, step_names, robots, robot_ik):
   return g
 
 
+def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0):
+  """MONKEY-PATCH a robot-robot clearance margin onto the exported problem (mr_bench unmodified).
+
+  TWO RELAXATIONS, so clearance is large where it can be and small only where it must be.
+
+  1. BY PARTICIPATION. A handover needs its two arms close; it does not need either of them close
+     to the third. The margin is therefore dropped only between robots that are BOTH in the
+     current mode's task -- everyone else keeps the full margin for the whole segment. The mode
+     already carries this (`task.robots`), so nothing has to be inferred.
+
+  2. BY EE DISTANCE TO THE GOAL, for that involved pair: required = margin * min(1, d_ee/ramp),
+     where d_ee is how far the arms' END EFFECTORS still are from their goal poses. Full margin
+     in transit, relaxing to zero exactly at the keyframe where contact is intended.
+
+     Keyed on EE distance rather than path position ON PURPOSE. "The last 10% of the path" is
+     history-dependent and a sampling planner has no such notion -- its predicate must be a pure
+     function of (q, mode) or edge checks and rewiring become inconsistent. Distance-to-goal is
+     that pure function and expresses the same intent, so the ramp works INSIDE planning rather
+     than as post-processing.
+
+  Frames are classified by KINEMATIC ROOT, so a carried part counts as its holder; recomputed per
+  call because attaches rewrite the parents. Goal EE poses are cached per mode (posing C to read
+  them, restoring the caller's state) since they cost FK.
+  """
+  import numpy as _np
+
+  def _owner(fname):
+    try:
+      f = env.C.getFrame(fname)
+    except Exception:
+      return None
+    seen = set()
+    while f is not None and f.name not in seen:
+      seen.add(f.name)
+      for r in robots:
+        if f.name.startswith(r):
+          return r
+      f = f.getParent()
+    return None
+
+  _goal_ee = {}
+
+  def _task_of(m):
+    try:
+      combos = env.get_valid_next_task_combinations(m)
+      return env.get_active_task(m, combos[0] if combos else None)
+    except Exception:
+      return None
+
+  def _goals(m):
+    """{robot: goal EE position} for the mode's task; cached, C restored."""
+    key = tuple(getattr(m, "task_ids", ()) or ()) if m is not None else ()
+    hit = _goal_ee.get(key)
+    if hit is not None:
+      return hit
+    out = {}
+    task = _task_of(m)
+    if task is not None:
+      try:
+        g = _np.asarray(task.goal.sample(m), dtype=float)
+        saved = _np.asarray(env.C.getJointState(), dtype=float)
+        qq, off = saved.copy(), 0
+        for tr in task.robots:
+          idx = _np.asarray(env.robot_idx[tr], dtype=int)
+          qq[idx] = g[off:off + idx.size]
+          off += idx.size
+        env.C.setJointState(qq)
+        for r in task.robots:
+          out[r] = _np.asarray(env.C.getFrame(gripper_frame[r]).getPosition(), dtype=float)
+        env.C.setJointState(saved)                        # never leave the caller's state moved
+      except Exception:
+        out = {}
+    _goal_ee[key] = out
+    return out
+
+  def _too_close(m):
+    task = _task_of(m)
+    involved = set(getattr(task, "robots", ()) or ())
+    goals = None
+    for c in env.C.getCollisions(margin):
+      d = float(c[2])
+      if d >= margin:
+        continue
+      ra, rb = _owner(c[0]), _owner(c[1])
+      if ra is None or rb is None or ra == rb:
+        continue
+      req = margin
+      if ra in involved and rb in involved:
+        req = 0.0
+        if ramp > 0.0:
+          if goals is None:
+            goals = _goals(m)
+          try:
+            d_ee = max(float(_np.linalg.norm(
+                _np.asarray(env.C.getFrame(gripper_frame[r]).getPosition(), dtype=float)
+                - goals[r])) for r in (ra, rb) if r in goals)
+            req = margin * min(1.0, d_ee / ramp)
+          except Exception:
+            req = 0.0
+      if d < req:
+        return True
+    return False
+
+  def _wrap(fn):
+    def patched(*a, **kw):
+      if not fn(*a, **kw):                               # poses C at (mode, q) as a side effect
+        return False
+      m = kw.get("m", a[1] if len(a) > 1 else None)
+      return not _too_close(m)
+    return patched
+
+  # BOTH full-scene predicates: BiRRT leans on the _np variant, so wrapping only
+  # is_collision_free would leave the margin unenforced on the hot path.
+  # is_collision_free_for_robot is deliberately NOT wrapped -- it judges a SUBSET of robots and
+  # explicitly discounts collisions with the others, so a cross-robot margin would invert it.
+  env.is_collision_free = _wrap(env.is_collision_free)
+  env.is_collision_free_np = _wrap(env.is_collision_free_np)
+  return env
+
+
 def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, bracing,
-                 depgraph=False, collision_tolerance=0.01, pre_witnesses=None):
+                 depgraph=False, collision_tolerance=0.01, pre_witnesses=None,
+                 robot_robot_margin=0.0, robot_margin_ramp=0.0):
   """Build a live mr_bench problem from our solved plan. depgraph=False -> SequenceMixin (a
   fixed total order); depgraph=True -> DependencyGraphMixin (the partial order, so the planner
   may reorder independent actions). Same tasks/frames/witnesses either way."""
@@ -384,7 +505,17 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
       BaseModeLogic.__init__(self)
       self.prev_mode = self.start_mode
 
-  return AssemblyEnv()
+  env = AssemblyEnv()
+  if robot_robot_margin and robot_robot_margin > 0.0:
+    print(f"[mp] --mp-robot-margin {robot_robot_margin:g}m: robot-robot clearance enforced by a "
+          f"wrapper around mr_bench's predicate (that module stays unmodified). Planning will be "
+          f"slower -- its early-out on 'nothing penetrates' no longer applies."
+          + (f" Relaxed to 0 between the TASK'S OWN robots, ramped over the last "
+             f"{robot_margin_ramp:g}m of EE travel to the goal." if robot_margin_ramp > 0
+             else " Dropped entirely between the TASK'S OWN robots (no ramp)."))
+    _install_robot_margin(env, float(robot_robot_margin), list(robots),
+                          robot_ik.gripper_frame, ramp=float(robot_margin_ramp))
+  return env
 
 
 # ---------------------------------------------------------------------------

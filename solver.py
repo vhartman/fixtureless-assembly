@@ -79,8 +79,10 @@ class CollisionChecker:
     # one free-floating gripper slot per robot (at most one active grasp per robot),
     # pre-loaded and parked far away so unused slots touch nothing.
     self.slots = [f"eeSLOT{i}_" for i in range(len(robots))]
+    from env import maybe_tighten_fingers        # cheap-EE proxy must match the real scene's
     for prefix, path in zip(self.slots, paths):
       template.addFile(path, namePrefix=prefix)
+      maybe_tighten_fingers(template, prefix)
     # per-slot tool transforms (grippers may differ under mixed EEs; identical when uniform)
     self._slot_tool = [_gripper_rest_transforms(template, prefix)[1:] for prefix in self.slots]
     self._slot_of = {r: i for i, r in enumerate(self.robots_order)}
@@ -384,6 +386,7 @@ class RobotIK:
     self.reach_rejects = 0                                # rejects by the reach-sphere bound
     self.analytic_rejects = 0                             # rejects by empty ssik solution sets
     self.mate_eq_weight = None                            # None = 1e1 (rai default here)
+    self.place_eq_weight = None                           # same, for _ik_place's object-pose eq
     self.mate_residual_reject = None                      # None = off; metres (--mate-accuracy)
       # THE acceptance criterion for an assemble. rai's `feasible` verdict accepts an eq
       # constraint that is still MILLIMETRES out, and tightening stopTolerance does NOT change
@@ -1392,8 +1395,15 @@ class RobotIK:
       self._add_pin(komo, C)                              # pre-skill pin (no-op in search)
       # object-pose constraint (like assemble, not an EE pose): the group's reference part
       # must reach its canonical table pose, axis-aligned.
-      komo.addObjective([1, 1], ry.FS.position, [ref], ry.OT.eq, [1e1], target[:3])
-      komo.addObjective([1, 1], ry.FS.quaternion, [ref], ry.OT.eq, [1e1], target[3:])
+      # --place-eq-weight, the PLACE twin of --mate-eq-weight. A place lands the datum every
+      # later mate is measured against, so its residual is not local: measured on car-mini
+      # (seed 11019, --grasp-translations 2) the body placed 3.91mm off while every wheel
+      # mated onto it at 0.01-0.23mm -- each assemble perfectly seated on a body in the wrong
+      # place. --mate-eq-weight only reaches _ik_assemble, and tightening the global NLP
+      # stopTolerance instead makes this place INFEASIBLE (measured: bind fails at 1e-4).
+      _pw = self.place_eq_weight if self.place_eq_weight is not None else 1e1
+      komo.addObjective([1, 1], ry.FS.position, [ref], ry.OT.eq, [_pw], target[:3])
+      komo.addObjective([1, 1], ry.FS.quaternion, [ref], ry.OT.eq, [_pw], target[3:])
       if not single:
         self._add_grasp_maintenance(komo, s0, assembly)   # braces ride along / stay pinned
       return komo

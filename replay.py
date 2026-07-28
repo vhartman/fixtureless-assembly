@@ -97,6 +97,10 @@ def build_scene(cfg):
   set_grasp_translations(int(cfg.get("grasp_translations") or 0))  # grasp IDS index this DB:
   # a replay with a different count would read every saved grasp id against a different table.
   set_plain_box(bool(cfg.get("plain_box")))                # cube collision geometry must match
+  from env import set_tight_fingers
+  set_tight_fingers(bool(cfg.get("tight_fingers")))        # GRIPPER collision geometry likewise
+  # -- set unconditionally (not under an `if`): a stale global from a previous scene in the same
+  # process would rebuild this one with the wrong finger proxy (FRAGILITY 1.10).
   from problem import set_dominance, set_useful_grasps_enabled
   set_dominance(bool(cfg.get("dominance")))                # successor set must match the search
   set_useful_grasps_enabled(bool(cfg.get("useful_grasps")))  # ordering must match the search

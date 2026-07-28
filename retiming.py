@@ -127,7 +127,7 @@ def joint_limit_boost(qs, vmax, joint_rate=DEFAULT_JOINT_RATE, max_boost=None):
 
 
 def retime_stretch(qs, dt, joint_rate=DEFAULT_JOINT_RATE, ramp_dist=DEFAULT_RAMP_DIST,
-                   ramp_min=DEFAULT_RAMP_MIN, accel=None, arm_dims=None):
+                   ramp_min=DEFAULT_RAMP_MIN, accel=None, arm_dims=None, vmax=None):
   """Trapezoidal time-parameterization of ONE collision-free stretch of waypoints.
 
   Yields configs sampled every `dt`, arc-length-following the waypoints: velocity
@@ -155,7 +155,15 @@ def retime_stretch(qs, dt, joint_rate=DEFAULT_JOINT_RATE, ramp_dist=DEFAULT_RAMP
     for s in _accel_profile(D, dt, joint_rate, accel):
       yield config_at(qs, csum, segs, s)
     return
-  boost = arm_rate_boost(qs, arm_dims) if arm_dims is not None else None
+  # `vmax` (--limit-rate) takes precedence over `arm_dims` (--arm-rate): both are per-segment
+  # rate multipliers on a common clock, but the per-JOINT one is strictly the better-founded
+  # -- it saturates a real limit instead of a nominal constant.
+  if vmax is not None:
+    boost = joint_limit_boost(qs, vmax, joint_rate=joint_rate)
+  elif arm_dims is not None:
+    boost = arm_rate_boost(qs, arm_dims)
+  else:
+    boost = None
   s = 0.0
   while s < D:
     ramp = min(1.0, (min(s, D - s) + 1e-6) / ramp_dist) if ramp_dist > 0 else 1.0

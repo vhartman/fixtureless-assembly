@@ -1100,6 +1100,8 @@ def place_floating_ee(C, target_pose, gripper_path=None, prefix="ee_"):
     gripper_path = os.path.join(os.path.dirname(__file__), DEFAULT_FLOATING_EE)
 
   C.addFile(gripper_path, namePrefix=prefix)
+  from env import maybe_tighten_fingers          # same proxy as the real scene, or they disagree
+  maybe_tighten_fingers(C, prefix)
   tool_center, base_rel_tool, q_correction = _gripper_rest_transforms(C, prefix)
   base_world = _ee_root_pose(target_pose, base_rel_tool, q_correction)
   root = C.getFrame(prefix + "ur_base")
@@ -1479,6 +1481,7 @@ def part_grasp_poses(spec, rolls=None, offset=0.01):
     return hit
   h = _shape_half_extents(spec)
   poses = []
+  pose_n = []                                              # face normal behind each pose
   for normal in _CUBE_FACE_NORMALS:                        # six axis directions (SHAPE frame)
     standoff = float(np.abs(normal) @ h) + offset
     for roll in range(rolls):
@@ -1490,6 +1493,7 @@ def part_grasp_poses(spec, rolls=None, offset=0.01):
         pose = np.concatenate([_quat_to_R(sq) @ pose[:3], _quat_mul(sq, pose[3:])])
       pose.setflags(write=False)
       poses.append(pose)
+      pose_n.append(np.asarray(normal, dtype=float))
   if _DENSE_GRASPS:
     # wrist-tilted variants (see set_dense_grasps): SAME tool position + pinch, pose rotated
     # +-45deg about the grasp's CLOSING axis (local y, in the part frame) through the tool
@@ -1502,13 +1506,16 @@ def part_grasp_poses(spec, rolls=None, offset=0.01):
         tilted = np.concatenate([base[:3], _quat_mul(q_t, base[3:])])
         tilted.setflags(write=False)
         poses.append(tilted)
+        pose_n.append(pose_n[len(poses) - 1 - len(_CUBE_FACE_NORMALS) * rolls]
+                      if len(pose_n) >= len(_CUBE_FACE_NORMALS) * rolls else np.zeros(3))
   if _GRASP_TRANSLATIONS:
     # TRANSLATED variants of every pose so far, appended base-order so existing grasp ids keep
     # their meaning. Same orientation and same pinch; only the tool SLIDES in its open plane.
     pat = _translation_pattern(_GRASP_TRANSLATIONS)
     _src = list(poses)          # SNAPSHOT: translating the growing list compounds the slides
-    for axis, frac in pat:      # (12 -> 24 -> 48 poses, and diagonal double-translations)
-      for base in _src:
+    _srcn = list(pose_n)        # (12 -> 24 -> 48 poses, and diagonal double-translations)
+    for axis, frac in pat:
+      for base, nrm in zip(_src, _srcn):
         R = _quat_to_R(np.asarray(base[3:]))
         d = R @ np.asarray(axis, dtype=float)              # the slide direction, in PART frame
         # HOW FAR THE PAD MAY SLIDE. The pad must stay inside the contacted face, so the bound
@@ -1520,6 +1527,28 @@ def part_grasp_poses(spec, rolls=None, offset=0.01):
         ad = np.abs(d)
         lim = [(h[k] - _GRASP_PAD_HALF) / ad[k] for k in range(3) if ad[k] > 1e-9]
         travel = max(0.0, min(lim)) if lim else 0.0
+        # A SLIDE ONLY STAYS ON THE SURFACE IF THE SURFACE IS FLAT ALONG IT.
+        #   box      -- every face is flat: both in-plane directions are fine.
+        #   cylinder -- a SIDE grasp sits on the barrel, which is flat only ALONG THE AXIS, so
+        #               only the axis-parallel slide is admissible (a tangential one would walk
+        #               the pads off the curve -- that wants a ROTATION about the axis, which is
+        #               a different variant). This axis slide is also the useful one: it takes
+        #               the cylinder higher up so the fingers clear the table. A CAP grasp is a
+        #               flat disc, so any in-plane direction is fine, bounded by the radius.
+        #   sphere   -- curved everywhere: no translation is admissible.
+        # An inadmissible direction yields travel 0, i.e. the variant collapses onto the centred
+        # grasp. Deliberate: it keeps the count uniform so grasp ids stay aligned with
+        # part_grasp_surfaces / part_grasp_face_min_dims.
+        kind = spec[0]
+        if kind == "sphere":
+          travel = 0.0
+        elif kind == "cylinder":
+          on_cap = abs(float(nrm[2])) > 0.5
+          if on_cap:
+            travel = max(0.0, min(float(h[0]), float(h[1])) - _GRASP_PAD_HALF)
+          else:
+            axis_par = abs(float(d[2]))                    # part-frame z IS the cylinder axis
+            travel = (max(0.0, float(h[2]) - _GRASP_PAD_HALF) if axis_par > 0.9 else 0.0)
         moved = np.concatenate([base[:3] + frac * travel * d, base[3:]])
         moved.setflags(write=False)
         poses.append(moved)
@@ -1663,6 +1692,8 @@ def compute_cube_grasps(assembly, subassembly, offset=0.01,
   # gripper .g for every face). A fresh copy per query, because rai caches the broadphase.
   base_scene = make_subassembly_scene(assembly, subassembly)
   base_scene.addFile(gripper_path, namePrefix="ee_")
+  from env import maybe_tighten_fingers          # the grasp DB must be filtered against the
+  maybe_tighten_fingers(base_scene, "ee_")       # SAME proxy the search and the sim collide with
   _, base_rel_tool, q_correction = _gripper_rest_transforms(base_scene, "ee_")
 
   def grasp_is_collision_free(grasp_pose, grasped_obj):
