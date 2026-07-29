@@ -3177,10 +3177,20 @@ def _states_from_plan(cfg, C, asm, robots, plan):
   brace = bool(cfg.get("bracing"))
   _, gt = A._search_context(C, asm, robots)
   states = [A.get_initial_state(C, asm)]
-  for act in plan:
-    states.append(next(ns for a, ns in A.successors(states[-1], asm, robots, gt,
-                                                     gripper_kind=gk, bracing=brace)
-                       if a == act))
+  for i, act in enumerate(plan):
+    ns = next((ns for a, ns in A.successors(states[-1], asm, robots, gt,
+                                            gripper_kind=gk, bracing=brace)
+               if a == act), None)
+    if ns is None:
+      # a bare StopIteration here cost a debugging session -- name the action and the cause
+      # class (FRAGILITY: successor-affecting setting differing from the search, usually an
+      # unsaved flag; ignore_gravity was exactly this).
+      raise SystemExit(
+          f"[sim] cannot reproduce action {i} {act!r} from the successor set -- a successor-"
+          f"affecting setting differs from the search that produced this plan (wrench caps, "
+          f"bracing, ignore_gravity, min_sep/place_cells, ...). If the plan predates a flag "
+          f"being SAVED, re-solve it; the saved config block is what the sim replays.")
+    states.append(ns)
   return states
 
 

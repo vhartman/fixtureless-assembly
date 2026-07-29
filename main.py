@@ -1160,6 +1160,9 @@ _SAVE_CONFIG_FIELDS = (
     "pre_insertion", "pre_pick", "pre_place", "pre_add_grasp", "staged_mates",
     "allow_curved_grasps", "grippers", "grasp_compliance",
     "vacuum_scale", "tf_close_torque", "dominance", "useful_grasps", "brace_resting",
+    "ignore_gravity",                                    # weightless stability: a plan searched
+    # weightless contains releases/lateral mates that are UNSTABLE under gravity, so a rebuild
+    # without it cannot reproduce the actions (user-hit: sim StopIteration on a cross-12 plan)
     "mixed_wrench_h", "strict_collisions", "witness_robot_collisions", "plain_box",
     # SUCCESSOR-AFFECTING and previously UNSAVED: a plan solved with any of these replays
     # against a DIFFERENT successor set than the search that made it, and the first symptom is

@@ -59,6 +59,9 @@ def apply_wrench_params(cfg):
       None if cfg["insertion_noise"] is None
       else {"lateral": cfg["insertion_noise"], "offset": cfg["insertion_offset"]})
   wrench.PARAMS["robust_mode"] = cfg.get("robust_mode", "corners")
+  # weightless stability -- without this a plan searched under --ignore-gravity is
+  # unreproducible here (its successor set differs). .get(): older files predate the key.
+  wrench.PARAMS["ignore_gravity"] = bool(cfg.get("ignore_gravity"))
   gc = cfg.get("grasp_compliance")
   wrench.PARAMS["grasp_compliance"] = (
       None if gc is None else {"two_finger": 1.0, "vacuum": float(gc)})
