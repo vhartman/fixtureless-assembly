@@ -334,8 +334,19 @@ def _dependency_graph(plan, states, step_names, robots, robot_ik):
   return g
 
 
-def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0):
+def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_margin=0.0):
   """MONKEY-PATCH a robot-robot clearance margin onto the exported problem (mr_bench unmodified).
+
+  `table_margin` adds the CARRIED-PART-vs-TABLE case (the transit graze: BiRRT+shortcut has no
+  reason to stay high at a 0.1mm collision tolerance, so the executed path's mm-level tracking
+  error drives the held part into the table and the contact force snaps the grasp -- measured
+  obj_0~world at 40-120N against a 25N cap, the FIRST failure in every config tried). A part
+  must touch the table at pick and set-down, so the margin is relaxed at BOTH ends of the
+  segment: required = table_margin * min(1, d_to_goal/ramp, d_from_prev_goal/ramp), where
+  prev-goal is the carrying arm's own previous task goal (its segment start). Both anchors are
+  properties of the mode, so the predicate stays a pure function of (q, mode). Applies ONLY to
+  bodies riding on an arm -- a RESTING part keeps zero table clearance (a place needs contact),
+  and the arm itself may still work arbitrarily close to the table.
 
   TWO RELAXATIONS, so clearance is large where it can be and small only where it must be.
 
@@ -376,6 +387,15 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0):
 
   _goal_ee = {}
 
+  # install time is right after make_problem, so C is at HOME -- the fallback start anchor
+  # for a robot whose mode has no earlier task of its own.
+  _home_ee = {}
+  try:
+    for _r in robots:
+      _home_ee[_r] = _np.asarray(env.C.getFrame(gripper_frame[_r]).getPosition(), dtype=float)
+  except Exception:
+    pass
+
   def _task_of(m):
     try:
       combos = env.get_valid_next_task_combinations(m)
@@ -409,15 +429,92 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0):
     _goal_ee[key] = out
     return out
 
+  _task_ee = {}                              # (robot, task_id) -> that robot's EE at the goal
+
+  def _ee_at_task(r, tid, m):
+    key = (r, tid)
+    if key in _task_ee:
+      return _task_ee[key]
+    out = None
+    try:
+      task = env.tasks[tid]
+      if r in (getattr(task, "robots", ()) or ()):
+        g = _np.asarray(task.goal.sample(m), dtype=float)
+        saved = _np.asarray(env.C.getJointState(), dtype=float)
+        qq, off = saved.copy(), 0
+        for tr in task.robots:
+          idx = _np.asarray(env.robot_idx[tr], dtype=int)
+          qq[idx] = g[off:off + idx.size]
+          off += idx.size
+        env.C.setJointState(qq)
+        out = _np.asarray(env.C.getFrame(gripper_frame[r]).getPosition(), dtype=float)
+        env.C.setJointState(saved)
+    except Exception:
+      out = None
+    _task_ee[key] = out
+    return out
+
+  def _prev_ee(r, m):
+    """r's EE at ITS OWN previous task goal -- where r's current segment started. env.tasks is
+    in plan order for both mixins, so the latest earlier task involving r is the predecessor."""
+    try:
+      k = int((getattr(m, "task_ids", ()) or ())[robots.index(r)])
+    except Exception:
+      return _home_ee.get(r)
+    for tid in range(k - 1, -1, -1):
+      try:
+        t = env.tasks[tid]
+      except Exception:
+        break
+      if r in (getattr(t, "robots", ()) or ()):
+        p = _ee_at_task(r, tid, m)
+        if p is not None:
+          return p
+    return _home_ee.get(r)
+
+  qmargin = max(margin, table_margin)
+
   def _too_close(m):
     task = _task_of(m)
     involved = set(getattr(task, "robots", ()) or ())
     goals = None
-    for c in env.C.getCollisions(margin):
-      d = float(c[2])
-      if d >= margin:
+    for c in env.C.getCollisions(qmargin):
+      fa, fb, d = c[0], c[1], float(c[2])
+      if d >= qmargin:
         continue
-      ra, rb = _owner(c[0]), _owner(c[1])
+      # CARRIED part vs the table: relaxed at both segment ends, full margin mid-transit.
+      if table_margin > 0.0 and "table" in (fa, fb):
+        other = fb if fa == "table" else fa
+        ro = _owner(other)
+        if ro is not None and not other.startswith(ro):  # a body RIDING on ro, not ro's arm
+          f = 1.0
+          if ramp > 0.0:
+            # BOTH anchors are ro's OWN tasks (task_ids is per robot). Reading the goal off
+            # _task_of(m) instead -- the next TRANSITION task, usually another robot's --
+            # left d_to_goal at infinity for the carrier, so the margin never relaxed at its
+            # set-down and every place-transition sample was invalid.
+            try:
+              ee = _np.asarray(env.C.getFrame(gripper_frame[ro]).getPosition(), dtype=float)
+              tid = int((getattr(m, "task_ids", ()) or ())[robots.index(ro)])
+              gp = _ee_at_task(ro, tid, m)
+              d_go = float(_np.linalg.norm(ee - gp)) if gp is not None else _np.inf
+              pv = _prev_ee(ro, m)
+              d_pv = float(_np.linalg.norm(ee - pv)) if pv is not None else _np.inf
+              f = min(1.0, min(d_go, d_pv) / ramp)
+            except Exception:
+              f = 0.0                          # fail OPEN -- the base predicate still applies
+          # The requirement interpolates from CONTACT-ALLOWED (-margin/2) at the segment ends
+          # to +margin mid-transit. A plain `d < margin*f` still vetoed at f == 0: a set-down
+          # goal has the part IN CONTACT (d <= 0, measured obj_0~table -0.4mm), and any veto
+          # of negative d there makes the place transition UNSATISFIABLE -- measured 0/4000
+          # valid samples, which is exactly BiRRT's 10k-attempts wall. Penetration at the
+          # ends stays the BASE predicate's job; the margin only shapes MID-TRANSIT clearance.
+          if d < table_margin * (1.5 * f - 0.5):
+            return True
+        continue                             # table pairs never enter the robot-robot branch
+      if margin <= 0.0 or d >= margin:
+        continue
+      ra, rb = _owner(fa), _owner(fb)
       if ra is None or rb is None or ra == rb:
         continue
       req = margin
@@ -456,7 +553,7 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0):
 
 def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, bracing,
                  depgraph=False, collision_tolerance=0.01, pre_witnesses=None,
-                 robot_robot_margin=0.0, robot_margin_ramp=0.0):
+                 robot_robot_margin=0.0, robot_margin_ramp=0.0, table_margin=0.0):
   """Build a live mr_bench problem from our solved plan. depgraph=False -> SequenceMixin (a
   fixed total order); depgraph=True -> DependencyGraphMixin (the partial order, so the planner
   may reorder independent actions). Same tasks/frames/witnesses either way."""
@@ -506,15 +603,26 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
       self.prev_mode = self.start_mode
 
   env = AssemblyEnv()
-  if robot_robot_margin and robot_robot_margin > 0.0:
-    print(f"[mp] --mp-robot-margin {robot_robot_margin:g}m: robot-robot clearance enforced by a "
-          f"wrapper around mr_bench's predicate (that module stays unmodified). Planning will be "
-          f"slower -- its early-out on 'nothing penetrates' no longer applies."
-          + (f" Relaxed to 0 between the TASK'S OWN robots, ramped over the last "
-             f"{robot_margin_ramp:g}m of EE travel to the goal." if robot_margin_ramp > 0
-             else " Dropped entirely between the TASK'S OWN robots (no ramp)."))
-    _install_robot_margin(env, float(robot_robot_margin), list(robots),
-                          robot_ik.gripper_frame, ramp=float(robot_margin_ramp))
+  if (robot_robot_margin and robot_robot_margin > 0.0) or (table_margin and table_margin > 0.0):
+    if robot_robot_margin and robot_robot_margin > 0.0:
+      print(f"[mp] --mp-robot-margin {robot_robot_margin:g}m: robot-robot clearance enforced by a "
+            f"wrapper around mr_bench's predicate (that module stays unmodified). Planning will be "
+            f"slower -- its early-out on 'nothing penetrates' no longer applies."
+            + (f" Relaxed to 0 between the TASK'S OWN robots, ramped over the last "
+               f"{robot_margin_ramp:g}m of EE travel to the goal." if robot_margin_ramp > 0
+               else " Dropped entirely between the TASK'S OWN robots (no ramp)."))
+    if table_margin and table_margin > 0.0:
+      print(f"[mp] --mp-table-margin {table_margin:g}m: CARRIED parts keep this clearance to the "
+            f"table mid-transit (the graze that snaps grasps), relaxed over {robot_margin_ramp:g}m "
+            f"of EE travel at BOTH segment ends so pick and set-down still touch. Resting parts "
+            f"and the arms themselves are unaffected.")
+      if not robot_margin_ramp or robot_margin_ramp <= 0.0:
+        print("[mp] WARNING: --mp-table-margin without --mp-margin-ramp demands the full margin "
+              "AT the pick keyframe too, where the part is only part_float above the table -- "
+              "the mode after every pick starts in violation and planning will wedge.")
+    _install_robot_margin(env, float(robot_robot_margin or 0.0), list(robots),
+                          robot_ik.gripper_frame, ramp=float(robot_margin_ramp),
+                          table_margin=float(table_margin or 0.0))
   return env
 
 
@@ -537,7 +645,7 @@ def run_motion_planner(problem, runtime=30.0, verbose=True):
 
 
 def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
-              shortcut_resolution=None, optimize=False, verbose=True):
+              shortcut_resolution=None, optimize=False, verbose=True, seed=None):
   """Run Bidirectional RRT* to the FIRST solution (optimize=False), then optionally apply
   robot/mode shortcutting as a post-process. Returns (path, info). No cost optimization --
   the tree stops as soon as a valid path is found; shortcutting only removes slack.
@@ -552,6 +660,17 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
   the wall-clock (measured: 46s -> 4.6s, identical cost). We default `shortcut_resolution` to
   the env's collision_resolution so shortcutting checks no finer than the planner did."""
   _ensure_mrbench()
+  if seed is not None:
+    # mr_bench draws from the GLOBAL numpy RNG throughout (sampling, tree ops, shortcut index
+    # picks) plus stdlib random.shuffle in shortcutting -- seeding both makes the whole
+    # BiRRT+shortcut draw REPRODUCIBLE. Unseeded, the same command yields paths whose failure
+    # CLASSES differ (one draw grazes the table at 57N, the next has no table contact at all),
+    # so every A/B on top was noise. None (the default) keeps the historical unseeded draw.
+    import random as _random
+    np.random.seed(int(seed))
+    _random.seed(int(seed))
+    print(f"[mp/birrt] RNG seeded: {int(seed)} (np.random + random) -- reproducible draw; "
+          f"runtime becomes a deterministic consultation budget, not wall seconds")
   from multi_robot_multi_goal_planning.planners.planner_birrtstar import BidirectionalRRTstar
   from multi_robot_multi_goal_planning.planners.rrtstar_base import BaseRRTConfig
   from multi_robot_multi_goal_planning.planners.shortcutting import robot_mode_shortcut
@@ -567,8 +686,26 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
   # config) blacklists the whole chain to the start -> assert "Tried to add initial mode to the
   # invalid modes". Off, BiRRT plans the modes directly and just routes/searches per mode.
   cfg.with_mode_validation = False
-  path, info = BidirectionalRRTstar(problem, config=cfg).plan(
-      ptc=RuntimeTerminationCondition(runtime), optimize=optimize)
+  # SEEDED runs also need a DETERMINISTIC clock: the tree search gates iterations on
+  # time.time() elapsed (planner_birrtstar ptc.should_terminate), so machine jitter shifts a
+  # phase boundary, the RNG stream offsets, and two identically-seeded draws diverge (measured:
+  # identical to state 15, different after). With a seed we swap time.time for a fake clock
+  # (+1ms per consultation) FOR THIS CALL ONLY: first-solution return still exits early, and
+  # the runtime budget becomes a deterministic consultation budget instead of wall seconds.
+  # perf_counter (pure accounting there) stays real. mr_bench itself is untouched.
+  import time as _time_mod
+  _real_time = _time_mod.time
+  if seed is not None:
+    _fake_t = [_real_time()]
+    def _fake_time():
+      _fake_t[0] += 1e-3
+      return _fake_t[0]
+    _time_mod.time = _fake_time
+  try:
+    path, info = BidirectionalRRTstar(problem, config=cfg).plan(
+        ptc=RuntimeTerminationCondition(runtime), optimize=optimize)
+  finally:
+    _time_mod.time = _real_time
   if verbose:
     tag = "optimized" if optimize else "first solution"
     print(f"[mp/birrt] {tag}: {'%d states' % len(path) if path else 'NO path'}")

@@ -219,7 +219,7 @@ class TimedTrajectory:
 
 def build_trajectory(stretches, dt, joint_rate=DEFAULT_JOINT_RATE, ramp_dist=DEFAULT_RAMP_DIST,
                      ramp_min=DEFAULT_RAMP_MIN, dwell=0.0, settle=0.0, accel=None,
-                     arm_dims=None):
+                     arm_dims=None, vmax=None):
   """Stitch per-mode stretches into one `TimedTrajectory` with v=0 (+ optional dwell)
   at every boundary where events fire, and a final settle hold.
 
@@ -232,7 +232,7 @@ def build_trajectory(stretches, dt, joint_rate=DEFAULT_JOINT_RATE, ramp_dist=DEF
   goal = None
   for qs, events in stretches:
     for c in retime_stretch(qs, dt, joint_rate, ramp_dist, ramp_min, accel=accel,
-                            arm_dims=arm_dims):
+                            arm_dims=arm_dims, vmax=vmax):
       q.append(c)
       phase.append("path")
     goal = np.asarray(qs[-1], float) if len(qs) else goal
@@ -1006,6 +1006,17 @@ def corridor_schedule(P, arm_dims, bar_s, acting, cor, dt, joint_rate=DEFAULT_JO
   P = np.asarray(P, float)
   segs, D = arc_length(list(P))
   csum = np.concatenate([[0.0], np.cumsum(segs)]) if segs else np.array([0.0])
+  _segs_arr = np.asarray(segs, float)
+
+  def _fcfg(x):
+    # config_at, minus the per-call `list(P)` materialisation (a 330-row list build per call,
+    # ~85k calls per schedule = ~75% of a whole sim run's wall time, profiled). Identical
+    # arithmetic on the same float64 rows, so the output is BIT-IDENTICAL (probe-verified).
+    i = min(int(np.searchsorted(csum, x, side="right")) - 1, len(_segs_arr) - 1)
+    if not len(_segs_arr) or _segs_arr[i] < 1e-12:
+      return P[i + 1]
+    a = (x - csum[i]) / _segs_arr[i]
+    return (1 - a) * P[i] + a * P[i + 1]
   n, K = len(arm_dims), len(bar_s)
   act = [set(int(a) for a in acting[k]) for k in range(K)]
   eps = 1e-6
@@ -1134,10 +1145,10 @@ def corridor_schedule(P, arm_dims, bar_s, acting, cor, dt, joint_rate=DEFAULT_JO
           # Same off-by-one-cell class as the force-limit grid note in sim.py. A stiff arm
           # absorbs the overshoot exactly; a compliant one turns it into grasp load. So bound
           # the step by the motion it ACTUALLY produces rather than by the segment it started in.
-          d0 = np.asarray(config_at(list(P), csum, segs, s[r]), float)[arm_dims[r]]
+          d0 = _fcfg(s[r])[arm_dims[r]]
           budget = joint_rate * dt
           for _ in range(4):                                 # geometric backoff, converges fast
-            d1 = np.asarray(config_at(list(P), csum, segs, cand[r]), float)[arm_dims[r]]
+            d1 = _fcfg(cand[r])[arm_dims[r]]
             moved = float(np.abs(d1 - d0).max())
             if moved <= budget * (1.0 + 1e-6) or cand[r] <= s[r] + eps:
               break
@@ -1149,7 +1160,7 @@ def corridor_schedule(P, arm_dims, bar_s, acting, cor, dt, joint_rate=DEFAULT_JO
     s = cand
     fq = np.empty(P.shape[1])
     for r in range(n):
-      fq[arm_dims[r]] = config_at(list(P), csum, segs, s[r])[arm_dims[r]]
+      fq[arm_dims[r]] = _fcfg(s[r])[arm_dims[r]]
     q.append(fq)
     prog.append(list(s))
     phase.append("path")
@@ -1175,7 +1186,7 @@ def corridor_schedule(P, arm_dims, bar_s, acting, cor, dt, joint_rate=DEFAULT_JO
     for m in range(len(prog)):
       fq = np.empty(P.shape[1])
       for r in range(n):
-        fq[arm_dims[r]] = config_at(list(P), csum, segs, prog[m, r])[arm_dims[r]]
+        fq[arm_dims[r]] = _fcfg(prog[m, r])[arm_dims[r]]
       q.append(fq)
   for _ in range(int(round(settle / dt)) if dt > 0 else 0):
     q.append(q[-1])
@@ -1187,6 +1198,183 @@ def corridor_schedule(P, arm_dims, bar_s, acting, cor, dt, joint_rate=DEFAULT_JO
   # how often the wrench cap was tighter than the never-stall floor (see vlim)
   _t.force_floor = dict(floor_hits)
   return _t
+
+
+class CorridorStepper:
+  """ONLINE Stage B/C: the SAME advance rule as `corridor_schedule`'s forward pass, exposed
+  one tick at a time so the EXECUTOR can drive it with runtime information.
+
+  Why online: the offline schedule must bake every slowdown in as worst-case pessimism (a
+  static near-table cap slowed whole low carries, and barrier coupling turned even per-arm
+  caps into global stalls). Here a slowdown exists only WHILE its trigger holds -- the caller
+  passes per-arm rate factors each tick (proximity pacing, force guard) and the corridor keeps
+  the timing certified: same conservative lookups as offline (`cap_corridor` against the
+  OTHERS' minimum, world lead from the laggard's cell, floor/round grid indexing -- never
+  interpolated), same no-pass-the-pending-barrier rule, same laggard-never-capped progress
+  guarantee. The coarse certificate is honoured, not out-run: any state this stepper visits
+  is inside the same certified set the offline scheduler used.
+
+  NOT inherited from offline: `_corridor_spread` (needs the future; its KNOWN HOLE of
+  exceeding wrench vmax 1.9x at corners is therefore also absent). Motion is the forward
+  profile: an early arm waits AT a barrier it acts on; with runtime-only slowdowns those
+  waits are the genuinely-required syncs, which is the point.
+
+  Interpolation is served from a PRECOMPUTED path cache: the offline pass paid ~2.4ms of
+  Python per 5ms sample (config_at per arm per tick, x4 more in the rate-clamp backoff) --
+  that was ~75% of a whole sim run's wall time. Vectorized lerp makes the per-tick cost
+  microseconds, which is what makes running this inside the control loop viable at all.
+  """
+
+  def __init__(self, P, arm_dims, bar_s, acting, cor, dt, joint_rate=DEFAULT_JOINT_RATE,
+               ramp_dist=DEFAULT_RAMP_DIST, ramp_min=DEFAULT_RAMP_MIN, dwell=0.0,
+               vmax=None, amax=None, limit_ds=None, rate_clamp=False):
+    self.P = np.asarray(P, float)
+    self.segs, self.D = arc_length(list(self.P))
+    self.csum = np.concatenate([[0.0], np.cumsum(self.segs)]) if self.segs else np.array([0.0])
+    self._segs_arr = np.asarray(self.segs, float)
+    self.arm_dims = [np.asarray(a, int) for a in arm_dims]
+    self.n, self.K = len(arm_dims), len(bar_s)
+    self.bar_s = list(bar_s)
+    self.act = [set(int(a) for a in acting[k]) for k in range(self.K)]
+    self.cor, self.dt = cor, float(dt)
+    self.joint_rate, self.ramp_dist, self.ramp_min = joint_rate, ramp_dist, ramp_min
+    self.vmax, self.amax, self.limit_ds, self.rate_clamp = vmax, amax, limit_ds, rate_clamp
+    self.n_dwell = int(round(dwell / dt)) if dt > 0 else 0
+    d = np.diff(self.P, axis=0)
+    tot = np.linalg.norm(d, axis=1)
+    self.share = np.ones((self.n, max(len(d), 1)))
+    for r in range(self.n):
+      sr = np.linalg.norm(d[:, self.arm_dims[r]], axis=1)
+      ok = tot > 1e-12
+      self.share[r][ok] = np.maximum(sr[ok] / tot[ok], 1e-3)
+    self.rest = [sorted({0.0, self.D} | {bar_s[k] for k in range(self.K) if r in self.act[k]})
+                 for r in range(self.n)]
+    self.s = [0.0] * self.n
+    self.vel = [0.0] * self.n
+    self.fired, self.steps, self.ready = 0, 0, None
+    self.hold = [-1] * self.n
+    self.floor_hits = {}
+    self.eps = 1e-6
+
+  # -- fast path interpolation (vectorised config_at) ------------------------------------
+  def _cfg(self, s):
+    i = int(np.searchsorted(self.csum, s, side="right")) - 1
+    i = min(max(i, 0), len(self._segs_arr) - 1) if len(self._segs_arr) else 0
+    if not len(self._segs_arr) or self._segs_arr[i] < 1e-12:
+      return self.P[min(i + 1, len(self.P) - 1)]
+    a = (s - self.csum[i]) / self._segs_arr[i]
+    return (1 - a) * self.P[i] + a * self.P[i + 1]
+
+  def q_now(self):
+    fq = np.empty(self.P.shape[1])
+    for r in range(self.n):
+      fq[self.arm_dims[r]] = self._cfg(self.s[r])[self.arm_dims[r]]
+    return fq
+
+  # -- the exact offline rules, one tick at a time ---------------------------------------
+  def _lim_at(self, arr, s):
+    if self.limit_ds:
+      return int(min(max(round(s / self.limit_ds), 0), np.shape(arr)[1] - 1))
+    return min(_cor_at(self.cor, s), np.shape(arr)[1] - 1)
+
+  def _vlim(self, r, s):
+    cap = float(self.vmax[r][self._lim_at(self.vmax, s)])
+    fl = self.ramp_min * self.joint_rate
+    if cap >= fl:
+      return cap
+    self.floor_hits[r] = self.floor_hits.get(r, 0) + 1
+    return max(cap, 1e-4)
+
+  def _ramp_of(self, r, s):
+    if self.ramp_dist <= 0:
+      return 1.0
+    pts = self.rest[r]
+    i = int(np.searchsorted(pts, s, side="right"))
+    prev = pts[i - 1] if i > 0 else 0.0
+    nxt = pts[i] if i < len(pts) else self.D
+    return max(self.ramp_min, min(1.0, (min(s - prev, nxt - s) + 1e-6) / self.ramp_dist))
+
+  def _cap_corridor(self, r, sv):
+    lim = self.D
+    others = [sv[j] for j in range(self.n) if j != r]
+    if not others:
+      return lim
+    for j in range(self.n):
+      if j == r:
+        continue
+      g = _cor_at(self.cor, min(sv[r], sv[j]))
+      A = self.cor["Lp"].get((min(r, j), max(r, j)))
+      if A is not None:
+        lim = min(lim, sv[j] + (A[g, 0] if r < j else A[g, 1]))
+    om = min(others)
+    return min(lim, om + self.cor["Lw"][r][_cor_at(self.cor, om)])
+
+  def tick(self, rate_factor=None):
+    """Advance one dt. `rate_factor`: per-arm multiplier from RUNTIME triggers (1.0 = free;
+    1/6 = proximity-paced; 0.0 = guard hold). Returns (q_ref, fire_ready) where fire_ready is
+    the barrier index whose event should fire NOW (caller settles/seats/fires, then MUST call
+    confirm_fire()), or None."""
+    self.steps += 1
+    n, D, dt, eps = self.n, self.D, self.dt, self.eps
+    cand = list(self.s)
+    for r in range(n):
+      if self.s[r] >= D - eps or self.steps <= self.hold[r]:
+        self.vel[r] = 0.0
+        continue
+      lim = min(self.bar_s[self.fired] if self.fired < self.K else D, D)
+      if self.s[r] < lim - eps:
+        base = (self.joint_rate / self.share[r][_seg_index(self.csum, self.segs, self.s[r])]
+                ) * self._ramp_of(r, self.s[r])
+        want = base
+        if self.vmax is not None:
+          want = min(want, self._vlim(r, self.s[r]))
+        if self.amax is not None:
+          am = max(float(self.amax[r][self._lim_at(self.amax, self.s[r])]), 1e-9)
+          want = float(np.clip(want, self.vel[r] - am * dt, self.vel[r] + am * dt))
+        if rate_factor is not None and rate_factor[r] < 1.0:
+          # RUNTIME SAFETY FACTORS ARE HARD CAPS, applied AFTER the accel clip. Routed through
+          # amax (as a plain rate multiplier) the wrench decel limit turned a proximity trigger
+          # into a gentle ramp-down -- the arm kept descending at speed through the whole
+          # near-zone and grazed at 65N (measured, first online run). The offline pacing was
+          # clean precisely because freezing the reference is INSTANT; match that: a factor
+          # bounds the final rate this very tick, factor 0 = hold now.
+          want = min(want, base * float(rate_factor[r]))
+        self.vel[r] = want
+        cand[r] = min(lim, self.s[r] + want * dt)
+        if self.rate_clamp and cand[r] > self.s[r] + eps:
+          d0 = self._cfg(self.s[r])[self.arm_dims[r]]
+          budget = self.joint_rate * dt
+          for _ in range(4):
+            d1 = self._cfg(cand[r])[self.arm_dims[r]]
+            moved = float(np.abs(d1 - d0).max())
+            if moved <= budget * (1.0 + 1e-6) or cand[r] <= self.s[r] + eps:
+              break
+            cand[r] = self.s[r] + (cand[r] - self.s[r]) * max(budget / moved, 0.25)
+          self.vel[r] = (cand[r] - self.s[r]) / dt
+    for _ in range(2):
+      for r in range(n):
+        cand[r] = min(cand[r], max(self.s[r], self._cap_corridor(r, cand)))
+    self.s = cand
+    fire_ready = None
+    if self.fired < self.K \
+        and all(self.s[r] >= self.bar_s[self.fired] - eps for r in self.act[self.fired]) \
+        and min(self.s) >= self.bar_s[self.fired] - eps:
+      if self.ready is None:
+        self.ready = self.steps
+      if self.steps - self.ready >= self.n_dwell:
+        fire_ready = self.fired
+    else:
+      self.ready = None
+    return self.q_now(), fire_ready
+
+  def confirm_fire(self):
+    for r in self.act[self.fired]:
+      self.hold[r] = self.steps + self.n_dwell
+    self.fired += 1
+    self.ready = None
+
+  def done(self):
+    return self.fired >= self.K and all(x >= self.D - self.eps for x in self.s)
 
 
 def _corridor_spread(prog, bar_s, act, fires, cor, dt, D, ramp_steps=100):

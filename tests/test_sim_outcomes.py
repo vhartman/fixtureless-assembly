@@ -60,10 +60,14 @@ CAR = ["run", "car-mini-new.json", "--v2", "--mp-path", "mp-car-mini-new.json"]
 
 @pytest.mark.skipif(not _have("car-mini-new.json", "mp-car-mini-new.json"),
                     reason="car-mini plan/path pair not present")
-def test_car_mini_actuated_smooth_executes_cleanly(capsys):
+def test_car_mini_actuated_executes_cleanly(capsys):
   """The compliant-arm reference case. Catches anything that breaks --actuated end to end:
-  the arm model, the servos, the velocity feedforward, the settle gate, the weld wrench."""
-  out = _run(capsys, CAR + ["--actuated", "--smooth"])
+  the arm model, the servos, the velocity feedforward, the settle gate, the weld wrench.
+  (--smooth is gone with the --prioritized branch: one preprocessing mode -> one executor.)"""
+  # pin the ORIGINAL configuration: actuated drive alone (2026-07-29 made the full
+  # corridor/servo stack the CLI default; this test isolates the plain actuated path).
+  out = _run(capsys, CAR + ["--actuated", "--no-corridor", "--no-skill-servo",
+                            "--no-force-limits"])
   n_ok, n_tot, first = _summary(out)
   assert first is None, f"expected a clean run, first failure was: {first}"
   assert n_ok == n_tot, f"{n_ok}/{n_tot}"
@@ -76,7 +80,11 @@ def test_car_mini_mocap_corridor_executes_cleanly_and_verifies(capsys):
   the legitimate-contact filter in place car-mini's schedule is genuinely collision-free, so a
   regression that reintroduces false positives (a gripper vs the part it HOLDS, a seated mate)
   shows up here rather than as mysterious refinement passes."""
-  out = _run(capsys, CAR + ["--corridor", "--force-limits", "--inertia-factor", "1"])
+  # pin the ORIGINAL configuration: mocap + bare corridor (no actuated/servo/spline/
+  # rate-clamp/cross-only, which are all CLI defaults since 2026-07-29).
+  out = _run(capsys, CAR + ["--corridor", "--force-limits", "--inertia-factor", "1",
+                            "--no-actuated", "--no-skill-servo", "--no-spline",
+                            "--no-corridor-rate-clamp", "--no-corridor-cross-only"])
   n_ok, n_tot, first = _summary(out)
   assert first is None, f"expected a clean run, first failure was: {first}"
   assert n_ok == n_tot, f"{n_ok}/{n_tot}"
@@ -93,7 +101,7 @@ def test_a_mismatched_plan_and_path_pair_is_refused(capsys, tmp_path):
   states = json.load(open(os.path.join(REPO, "mp-car-mini-new.json")))
   bad = tmp_path / "mp-bad.json"
   json.dump({"states": states, "task_signature": "deadbeefdeadbeef"}, open(bad, "w"))
-  out = _run(capsys, ["run", "car-mini-new.json", "--v2", "--mp-path", str(bad), "--smooth"])
+  out = _run(capsys, ["run", "car-mini-new.json", "--v2", "--mp-path", str(bad)])
   assert "TASK-SIGNATURE MISMATCH" in out
   assert "actions ok" not in out, "it executed anyway despite a mismatched pair"
 
@@ -105,7 +113,9 @@ def test_cross8_warns_that_its_assembles_have_no_funnel(capsys):
   to a pose already in contact and it arrives LATERALLY -- 0.213mm of penetration while the
   target was still at rest, then ~800 steps of shoving and a weld fired 32mm off. The warning
   is what turns an hour of probing into a line of output, so it must keep firing."""
-  out = _run(capsys, ["run", "cross8.json", "--v2", "--mp-path", "mp.json"])
+  out = _run(capsys, ["run", "cross8.json", "--v2", "--mp-path", "mp.json",
+                      "--no-corridor", "--no-actuated", "--no-skill-servo",
+                      "--no-force-limits"])
   assert "NO INSERTION FUNNEL" in out
   m = re.search(r"NO INSERTION FUNNEL on (\d+)/(\d+) assemble", out)
   assert m and m.group(1) == m.group(2), "expected EVERY cross8 assemble to be unfunnelled"

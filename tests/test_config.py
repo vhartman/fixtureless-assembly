@@ -8,8 +8,12 @@ from config import RunConfig
 
 
 def _parser_defaults():
+  import argparse
   p = main.build_parser()
-  return {a.dest: a.default for a in p._actions if a.dest not in ("help", "config")}
+  # SUPPRESS-default actions are auxiliary switches sharing a primary flag's dest
+  # (e.g. --no-strict-collisions); the primary action carries the real default.
+  return {a.dest: a.default for a in p._actions
+          if a.dest not in ("help", "config") and a.default is not argparse.SUPPRESS}
 
 
 def test_defaults_match_parser():

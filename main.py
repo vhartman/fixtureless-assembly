@@ -74,10 +74,12 @@ def build_parser():
       help="Randomly perturb the object start poses (kept collision free).",
   )
   g_scene.add_argument(
-      "--part-float", type=float, default=0.015, metavar="M",
-      help="z offset of the scattered parts above the table top (metres, default 0.015 -- "
-           "the historical float). Propagates through placement anchors, so every later "
-           "set-down keeps the same hover.",
+      "--part-float", type=float, default=0.002, metavar="M",
+      help="z offset of the scattered parts above the table top (metres, default 0.002 since "
+           "2026-07-29; 0.015 was the historical float). Propagates through placement anchors, "
+           "so every later set-down keeps the same hover. The sim RAISES its table by this "
+           "much to make parts start resting, so every mm here is planner-certified free "
+           "space that is solid table in the sim (FRAGILITY 2.6) -- keep it small.",
   )
   g_scene.add_argument(
       "--random-init", type=float, nargs="?", const=0.45, default=None, metavar="HALF",
@@ -226,9 +228,10 @@ def build_parser():
            "E.g. --test-place-ik a1:obj_1:0:1:0.",
   )
   g_ik.add_argument(
-      "--real-ik", action="store_true",
+      "--real-ik", action=argparse.BooleanOptionalAction, default=True,
       help="Run the search with real-robot IK in the feasibility loop (RobotIK), and "
-           "replay the plan with the actual arm poses instead of floating-EE stand-ins.",
+           "replay the plan with the actual arm poses instead of floating-EE stand-ins. "
+           "Default ON (2026-07-29 defaults change); --no-real-ik restores floating EEs.",
   )
   g_ik.add_argument(
       "--no-ik-seeding", action="store_false", dest="ik_seeding",
@@ -267,8 +270,8 @@ def build_parser():
            "fallback -- instead of the exact search. Much faster on the cases that blow up.",
   )
   g_solver.add_argument(
-      "--milestones", action="store_true",
-      help="MILESTONE planner: the labeled abstraction's backward (assembly-by-disassembly) "
+      "--milestones", action=argparse.BooleanOptionalAction, default=True,
+      help="Default ON (2026-07-29). MILESTONE planner: the labeled abstraction's backward (assembly-by-disassembly) "
            "solve picks the next part to add (wrench-informed ORDER, grasps assumed "
            "reachable); each milestone is filled in by a small per-part search "
            "(pick/handover/brace/mate/set-down); a failed fill-in blacklists that milestone "
@@ -343,19 +346,20 @@ def build_parser():
            "Removes the 'nothing else is in the way' assumption.",
   )
   g_phys.add_argument(
-      "--wrench", action="store_true",
+      "--wrench", action=argparse.BooleanOptionalAction, default=True,
       help="Turn on the static-equilibrium (stability) model: support-gate assemble/release "
            "with the insertion reaction, so sideways mates on a resting assembly need a hold "
-           "(mating becomes perpendicular unless braced). Default off (topological baseline).",
+           "(mating becomes perpendicular unless braced). Default ON (2026-07-29); "
+           "--no-wrench = topological baseline.",
   )
   g_phys.add_argument(
       "--grasp-model", choices=["isotropic", "directional", "asymmetric"],
-      default="isotropic",
+      default="asymmetric",
       help="Grasp wrench-capability model (with --wrench): isotropic = the original "
-           "direction-agnostic box (default); directional = weak-shear vacuum / weak-torque "
+           "direction-agnostic box; directional = weak-shear vacuum / weak-torque "
            "two-finger in the grasp frame; asymmetric = directional + push/pull asymmetry "
            "along the approach axis (pressing into the palm/cup is structural, pull-off is "
-           "the weak suction/friction path).",
+           "the weak suction/friction path; the default since 2026-07-29).",
   )
   g_phys.add_argument(
       "--vacuum-scale", type=float, default=None, metavar="FACTOR",
@@ -396,11 +400,12 @@ def build_parser():
            "facts, for comparison. Default: wrench-aware whenever --wrench is on.",
   )
   g_phys.add_argument(
-      "--bracing", action="store_true",
+      "--bracing", action=argparse.BooleanOptionalAction, default=True,
       help="Enable the add_grasp (co-grasp) primitive: a free robot adds a SECOND gripper to "
            "an already-held assembly and KEEPS it (unlike handover, which swaps). Needed for "
            "offset HORIZONTAL mates (e.g. car wheels), where one grasp cannot supply the "
-           "yaw-cancelling couple so two braces are required. Off by default (adds branching). "
+           "yaw-cancelling couple so two braces are required. Default ON since 2026-07-29 "
+           "(--no-bracing removes the branching). "
            "Exact search only (solve/anytime); the labeled-h abstraction models it when on.",
   )
   g_search.add_argument(
@@ -611,8 +616,8 @@ def build_parser():
            "counts). Extensible to a specific target pose later (set_goal(pose=...)).",
   )
   g_witness.add_argument(
-      "--optimize-witnesses", nargs="?", const="joint", default=None,
-      choices=["joint", "ee", "dp-joint", "dp-ee", "floor"], metavar="MODE",
+      "--optimize-witnesses", nargs="?", const="joint", default="floor",
+      choices=["joint", "ee", "dp-joint", "dp-ee", "floor", "off"], metavar="MODE",
       help="POST-optimize the plan's IK witnesses (discrete plan FIXED): re-solve each IK "
            "action pulled toward the ACTIVE arm's previous configuration, minimizing "
            "per-step movement in 'joint' space (default) or 'ee' space (position + "
@@ -629,7 +634,7 @@ def build_parser():
            "symmetry rather than a branch. "
            "(DP >= greedy >= original by construction). Feasibility-safe (search "
            "witnesses kept on any failure); idle arms stay home-pinned as in the search. "
-           "Requires --real-ik.",
+           "Requires --real-ik. Default 'floor' since 2026-07-29; pass 'off' to disable.",
   )
   g_witness.add_argument(
       "--witness-clearance", type=float, default=0.0, metavar="W",
@@ -641,10 +646,11 @@ def build_parser():
            "pairs). Traded against movement by this weight. Best with the dp-* modes.",
   )
   g_witness.add_argument(
-      "--witness-branch-budget", type=int, default=0, metavar="N",
+      "--witness-branch-budget", type=int, default=5, metavar="N",
       help="--optimize-witnesses floor: permit N extra IK BRANCH CROSSINGS in exchange for a "
-           "higher clearance floor. 0 (default) takes only the clearance that is FREE -- the "
-           "highest floor achieving the same crossing count as no floor at all.",
+           "higher clearance floor. 0 takes only the clearance that is FREE -- the "
+           "highest floor achieving the same crossing count as no floor at all. Default 5 "
+           "since 2026-07-29.",
   )
   g_search.add_argument(
       "--ik-accuracy", type=float, default=None, metavar="TOL",
@@ -668,8 +674,8 @@ def build_parser():
            "the six face-centred grasps cannot reach. Appended AFTER the existing ids.",
   )
   g_search.add_argument(
-      "--tight-fingers", action="store_true",
-      help="Shrink the finger COLLISION proxy from robotiq.g's capsule (40mm long, 20mm RADIUS "
+      "--tight-fingers", action=argparse.BooleanOptionalAction, default=True,
+      help="Default ON (2026-07-29). Shrink the finger COLLISION proxy from robotiq.g's capsule (40mm long, 20mm RADIUS "
            "= 80mm end to end) to robotiq_tight.g's (10mm radius), shifted 8mm outward so the "
            "gripping surface stays put. The visible robotiq pads carry contact:0 -- this proxy "
            "is what every grasp and collision check actually uses, and it reaches 32.9mm past "
@@ -697,9 +703,9 @@ def build_parser():
            "real diagnostics survive. Equivalent: export RAI_QUIET=1.",
   )
   g_search.add_argument(
-      "--mate-eq-weight", type=float, default=None, metavar="W",
+      "--mate-eq-weight", type=float, default=100.0, metavar="W",
       help="Weight on the assemble's positionRel/quaternionRel EQUALITY constraints (default "
-           "1e1). rai's augmented-Lagrangian schedule trades the eq residual against the other "
+           "1e2 since 2026-07-29; rai's own is 1e1). rai's augmented-Lagrangian schedule trades the eq residual against the other "
            "objectives, so at 1e1 the mate settles millimetres short and rai still reports "
            "feasible. MEASURED car-mini: 1e2 gives 1.337mm -> 0.026mm AND is slightly faster; "
            "1e3 is no better; 1e4 starts failing solves. Asking for accuracy up front beats "
@@ -824,14 +830,16 @@ def build_parser():
            "Default off.",
   )
   g_skills.add_argument(
-      "--pre-insertion", type=float, nargs="?", const=0.05, default=0.0, metavar="DELTA",
+      "--pre-insertion", type=float, nargs="?", const=0.05, default=0.05, metavar="DELTA",
       help="PRE-INSERTION funnel (EXPORT/REPLAY only; the SEARCH is unchanged): split every "
            "`assemble` into a GOTO to the funnel-mouth pose T_pre (the mate witness backed off "
            "DELTA metres along the mate axis, default 0.05) followed by the REAL mate at the "
            "seated witness. The motion planner then connects the free-space approach to T_pre "
            "and only the short T_pre->seated seating motion is contact-rich -- on the mr_bench "
            "SKILLS branch that second task becomes the insertion skill. The mate pose, wrench "
-           "gate, and plan are all untouched. Default off (0 = single un-split assemble).",
+           "gate, and plan are all untouched. Default 0.05 since 2026-07-29 (FRAGILITY 2.2: "
+           "without it the held part arrives laterally, already in contact); "
+           "0 = single un-split assemble.",
   )
   g_skills.add_argument(
       "--pre-pick", type=float, nargs="?", const=0.05, default=0.0, metavar="DELTA",
@@ -871,8 +879,8 @@ def build_parser():
            "split is present).",
   )
   g_output.add_argument(
-      "--hoist-releases", action="store_true",
-      help="POST-PASS after --solve (before witness optimization): bubble every `release` as "
+      "--hoist-releases", action=argparse.BooleanOptionalAction, default=True,
+      help="Default ON (2026-07-29). POST-PASS after --solve (before witness optimization): bubble every `release` as "
            "EARLY in the plan as legal -- applicable per the real successor generator (wrench "
            "stability: a needed hold cannot release early), cheap-geometry-checked, and only "
            "where the swapped pair provably commutes (identical state after). Frees arms "
@@ -888,15 +896,15 @@ def build_parser():
            "ran, else 1/action. Report only; no behavior change.",
   )
   g_witness.add_argument(
-      "--witness-robot-collisions", action="store_true",
-      help="During --optimize-witnesses, keep the OTHER robots' collision geometry ON (the "
+      "--witness-robot-collisions", action=argparse.BooleanOptionalAction, default=True,
+      help="Default ON (2026-07-29). During --optimize-witnesses, keep the OTHER robots' collision geometry ON (the "
            "search strips it on solo steps for speed). Re-solved witnesses then AVOID the idle "
            "arms instead of passing through them -- important before motion planning, where "
            "mr_bench validates every arm. Note idle arms are at HOME in the witness scene.",
   )
   g_witness.add_argument(
-      "--fuse-cograsp", action="store_true",
-      help="With --motion-plan: AFTER witness optimization and BEFORE the export, re-solve "
+      "--fuse-cograsp", action=argparse.BooleanOptionalAction, default=True,
+      help="Default ON (2026-07-29). With --motion-plan: AFTER witness optimization and BEFORE the export, re-solve "
            "each (add_grasp, assemble) witness PAIR as ONE 2-phase KOMO instead of two "
            "independent single-keyframe IK solves. The two solves agree on the "
            "object-relative gripper pose but land in different arm BRANCHES (measured "
@@ -908,9 +916,10 @@ def build_parser():
            "Pair with --mp-cograsp --mp-sequence to measure the effect.",
   )
   g_ik.add_argument(
-      "--strict-collisions", type=float, nargs="?", const=1e-4, default=None, metavar="EPS",
+      "--strict-collisions", type=float, nargs="?", const=1e-4, default=1e-6, metavar="EPS",
       help="With --real-ik: REJECT any KOMO witness whose skill scene has total penetration "
-           "> EPS metres (default 1e-4 when given bare) -- the collision objective is a SOFT "
+           "> EPS metres (default 1e-6 since 2026-07-29; 1e-4 when given bare; "
+           "--no-strict-collisions disables the gate) -- the collision objective is a SOFT "
            "inequality, so the plain solve accepts mm-scale 'rescued grazes' (measured: wrist "
            "capsule 4.9mm into the table at a pick witness) that a physics sim or a "
            "0-tolerance motion-plan export then pays for. Dirty solutions count as infeasible "
@@ -919,6 +928,11 @@ def build_parser():
            "slack. The gate only sees what the skill scene contains: combine with "
            "--witness-robot-collisions to make stripped idle arms visible. Slower solves; "
            "prints the number of vetoed witnesses at the end.",
+  )
+  g_ik.add_argument(
+      "--no-strict-collisions", dest="strict_collisions", action="store_const", const=None,
+      default=argparse.SUPPRESS,
+      help="Disable the strict witness-penetration gate (restores the pre-2026-07-29 default).",
   )
   g_mp.add_argument(
       "--mp-clearance", action="store_true",
@@ -945,12 +959,12 @@ def build_parser():
            "<plan.json> from the SAME run (the problem is rebuilt from that discrete plan).",
   )
   g_mp.add_argument(
-      "--mp-collision-tolerance", type=float, default=0.01, metavar="M",
+      "--mp-collision-tolerance", type=float, default=1e-4, metavar="M",
       help="With --motion-plan: the exported problem's collision tolerance in metres of "
            "TOTAL allowed penetration at validated configs (mr_bench semantics; default "
-           "0.01 = historical). Lower it toward 0 (e.g. 1e-6) together with "
-           "--strict-collisions + --witness-robot-collisions so the plan the sim executes "
-           "contains no tolerated penetration at all.",
+           "1e-4 since 2026-07-29, 0.01 was the historical value). Works with the "
+           "--strict-collisions default so the plan the sim executes "
+           "contains no tolerated penetration beyond noise.",
   )
   g_mp.add_argument(
       "--motion-plan", action="store_true",
@@ -962,19 +976,22 @@ def build_parser():
            "search witnesses are used. See the --mp-* flags for planner options.",
   )
   g_mp.add_argument(
-      "--mp-sequence", action="store_true",
-      help="With --motion-plan: export a FIXED-SEQUENCE problem (total order) instead of the "
-           "default DEPENDENCY GRAPH (partial order, planner may reorder independent actions).",
+      "--mp-sequence", action=argparse.BooleanOptionalAction, default=True,
+      help="With --motion-plan: export a FIXED-SEQUENCE problem (total order) instead of a "
+           "DEPENDENCY GRAPH (partial order, planner may reorder independent actions). "
+           "Default ON since 2026-07-29 (the sim executor pipeline assumes a sequence); "
+           "--no-mp-sequence restores the depgraph export.",
   )
   g_mp.add_argument(
-      "--mp-optimize", action="store_true",
-      help="With --motion-plan: RRT* COST optimization until --mp-runtime (default: stop at "
-           "the first solution). Improves path cost; uses the tree-extension shim.",
+      "--mp-optimize", action=argparse.BooleanOptionalAction, default=True,
+      help="With --motion-plan: RRT* COST optimization until --mp-runtime. Default ON since "
+           "2026-07-29; --no-mp-optimize stops at the first solution. Improves path cost; "
+           "uses the tree-extension shim.",
   )
   g_mp.add_argument(
-      "--mp-runtime", type=float, default=60.0, metavar="SEC",
-      help="With --motion-plan: BiRRT search budget in seconds (default: 60). Bounds ONLY the "
-           "tree search, NOT shortcutting.",
+      "--mp-runtime", type=float, default=30.0, metavar="SEC",
+      help="With --motion-plan: BiRRT search budget in seconds (default 30 since 2026-07-29). "
+           "Bounds ONLY the tree search, NOT shortcutting.",
   )
   g_mp.add_argument(
       "--mp-no-shortcut", action="store_true",
@@ -1001,8 +1018,9 @@ def build_parser():
            "(display_path_viser primitives_only). See exactly what the planner collides.",
   )
   g_mp.add_argument(
-      "--mp-robot-margin", type=float, default=0.0, metavar="M",
-      help="Plan with M metres of clearance between DIFFERENT ROBOTS (0 = off). The planner "
+      "--mp-robot-margin", type=float, default=0.1, metavar="M",
+      help="Plan with M metres of clearance between DIFFERENT ROBOTS (0 = off; default 0.1 "
+           "since 2026-07-29). The planner "
            "certifies the COMMANDED path, but the executed one deviates by the controller's "
            "tracking error, so a path validated at zero clearance collides when run (measured "
            "on cross-new: p90 2.9mm, max 33.1mm at the EE). Classified by KINEMATIC ROOT, so a "
@@ -1010,14 +1028,34 @@ def build_parser():
            "contacts keep the plain penetration budget because they are INTENDED.",
   )
   g_mp.add_argument(
-      "--mp-margin-ramp", type=float, default=0.0, metavar="M",
+      "--mp-margin-ramp", type=float, default=0.1, metavar="M",
       help="With --mp-robot-margin: relax the margin between the TASK'S OWN robots over the last "
-           "M metres of END-EFFECTOR travel to their goal (0 = drop it outright for that pair). "
+           "M metres of END-EFFECTOR travel to their goal (0 = drop it outright for that pair; "
+           "default 0.1 since 2026-07-29). "
            "A handover needs its two arms close but not close to the third, so the margin is "
            "dropped only for the participating pair, and only as they approach. Keyed on EE "
            "DISTANCE, not path position: a sampling planner's predicate must be a pure function "
            "of the state, so 'the last 10%% of the path' is not expressible -- distance-to-goal "
            "is, and means the same thing.",
+  )
+  g_mp.add_argument(
+      "--mp-seed", type=int, default=None, metavar="N",
+      help="Seed BiRRT + shortcutting (mr_bench draws from the GLOBAL numpy/stdlib RNGs). "
+           "Unseeded, the same command yields paths whose failure CLASSES differ run to run "
+           "(measured: one draw grazes the table at 57N, the next has no table contact), so "
+           "any A/B without this is noise. Default None = historical unseeded behaviour. "
+           "Saved with the plan; sim.py reuses it unless overridden.",
+  )
+  g_mp.add_argument(
+      "--mp-table-margin", type=float, default=0.0, metavar="M",
+      help="Clearance a CARRIED part must keep to the table mid-transit (metres). The transit "
+           "graze is the top sim killer: BiRRT+shortcut skims the table at a 0.1mm collision "
+           "tolerance, mm-level tracking error then drives the held part INTO it and the "
+           "contact snaps the grasp (measured obj_0~world 40-120N vs a 25N cap, the FIRST "
+           "failure in every config tried). Relaxed over --mp-margin-ramp metres of EE travel "
+           "at BOTH segment ends -- pick and set-down still touch. Resting parts and the arms "
+           "themselves keep zero table margin. Use WITH --mp-margin-ramp (else the mode after "
+           "every pick starts in violation).",
   )
   g_mp.add_argument(
       "--mp-modes", action="store_true",
@@ -1027,17 +1065,19 @@ def build_parser():
            "spotting per-mode collisions. Blocks. Port = --viser-port.",
   )
   g_search.add_argument(
-      "--sig-collapsed-h", action="store_true",
-      help="SIGNATURE grasp collapse + LABELED loose parts: grasp labels are equivalence "
+      "--sig-collapsed-h", action=argparse.BooleanOptionalAction, default=True,
+      help="Default ON (2026-07-29). SIGNATURE grasp collapse + LABELED loose parts: grasp labels are equivalence "
            "classes under the fact signature (press capability, pick-face vector, contact "
            "patch, solo-hold, brace-side), and loose parts keep their class label -- the "
            "fine labeled-h's plateau-killing pick/press discrimination at collapsed-h "
            "scale. Facts OR over class members (relaxation -> admissible).",
   )
   g_search.add_argument(
-      "--sig-components", type=str, default=None, metavar="CSV",
+      "--sig-components", type=str, default="press", metavar="CSV",
       help="Ablation for --sig-collapsed-h: comma-separated subset of signature "
-           "components (press,pickface,contact,solohold,braceside). Default: all.",
+           "components (press,pickface,contact,solohold,braceside). Default 'press' since "
+           "2026-07-29 (the load-bearing component; full signatures blow up at scale -- "
+           "pass 'all' for every component).",
   )
   g_search.add_argument(
       "--geo-facts", action="store_true",
@@ -1081,6 +1121,12 @@ def build_parser():
            "--motion-plan). Use this to apply a witness pass to a plan you already trust: a "
            "saved config does NOT carry the solver settings, so re-solving with --config gives "
            "a DIFFERENT plan. Pair it with --config <the same file> so the scene matches.",
+  )
+  g_output.add_argument(
+      "--refresh-witnesses", action="store_true",
+      help="With --load-plan: IGNORE the witnesses persisted in the plan file and re-run the "
+           "witness pass. Default: reuse them whenever every witness-shaping setting matches "
+           "the saved config (making the motion-plan stage a pure function of the file).",
   )
   g_output.add_argument(
       "--save", metavar="PATH", default=None,
@@ -1140,6 +1186,8 @@ _SAVE_CONFIG_FIELDS = (
     "mp_sequence",                                       # depgraph vs sequence = a different
     # task GRAPH; the sim rebuilt SEQUENCE unconditionally while main defaults to depgraph
     "mp_robot_margin", "mp_margin_ramp",                 # clearance the path was planned with
+    "mp_table_margin",                                   # carried-part-vs-table transit clearance
+    "mp_seed",                                           # reproducible BiRRT draw (None = unseeded)
     "min_sep", "place_cells", "prefer_center", "brace_for_assembly_only", "lru_robots",
     "anon_robots", "declutter", "por",
     # LAYOUT: these feed add_disassembled_obj, so without them the replay/sim rebuilds a
@@ -1148,11 +1196,32 @@ _SAVE_CONFIG_FIELDS = (
 )
 
 
-def save_plan(path, cfg, plan):
+def save_plan(path, cfg, plan, witnesses=None):
   from plan_io import write_plan
   config = {k: getattr(cfg, k) for k in _SAVE_CONFIG_FIELDS}
-  write_plan(path, config, plan)
-  print(f"[save] wrote {len(plan)}-action plan + scene config to {path}")
+  write_plan(path, config, plan, witnesses=witnesses)
+  print(f"[save] wrote {len(plan)}-action plan + scene config"
+        + (" + witnesses" if witnesses is not None else "") + f" to {path}")
+
+
+# Witness REUSE guard: a persisted witness block is only valid if every setting that shaped
+# it still holds. All of these are in _SAVE_CONFIG_FIELDS, so files that carry witnesses also
+# carry the values; a key absent from an (older) saved config is treated as a mismatch.
+_WITNESS_FIELDS = (
+    "optimize_witnesses", "witness_branch_budget", "witness_branch_metric",
+    "witness_reconfig_thresh", "witness_clearance", "witness_robot_collisions",
+    "strict_collisions", "mate_eq_weight", "place_eq_weight", "mate_accuracy",
+    "ik_accuracy", "ik_seeding", "seed", "bracing", "handovers", "allow_place",
+    "tight_fingers", "part_float", "hoist_releases")
+
+
+def _witnesses_reusable(saved_cfg, cfg):
+  bad = [k for k in _WITNESS_FIELDS
+         if k not in saved_cfg or saved_cfg[k] != getattr(cfg, k, None)]
+  if bad:
+    print("[witness-reuse] settings differ from the saved witnesses on: "
+          + ", ".join(bad) + " -- re-solving instead of reusing.")
+  return not bad
 
 def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
   # Select the search engine from the cfg flags and run it; returns the plan (or None).
@@ -1202,13 +1271,6 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         grasp_collapsed_h=cfg.grasp_collapsed_h,
         wrench_aware_h=cfg.wrench_aware_h, bracing=cfg.bracing,
         geo_facts=cfg.geo_facts, sig_collapsed_h=cfg.sig_collapsed_h)
-  elif cfg.milestones:
-    plan = solve_assembly_problem_milestones(
-        C, assembly, robots=robots, robot_ik=robot_ik, weight=cfg.weight,
-        wrench=cfg.wrench, handovers=cfg.handovers, allow_place=cfg.allow_place,
-        bracing=cfg.bracing, geo_facts=cfg.geo_facts,
-        sig_collapsed_h=cfg.sig_collapsed_h, fill_window=cfg.fill_window,
-        lazy_fills=cfg.lazy_fills)
   elif cfg.optimistic and cfg.declutter:
     plan = solve_assembly_problem_optimistic_declutter(
         C, assembly, robots=robots, robot_ik=robot_ik, weight=cfg.weight,
@@ -1232,6 +1294,16 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         wrench_aware_h=cfg.wrench_aware_h, bracing=cfg.bracing,
         part_order_bias=cfg.part_order_bias,
         sig_collapsed_h=cfg.sig_collapsed_h)
+  elif cfg.milestones:
+    # milestones is the DEFAULT solver (2026-07-29), so it sits LAST among the named ones:
+    # any explicitly-requested solver above (--optimistic, --anytime, --lazy, ...) must win
+    # over a default. --no-milestones falls through to the exact search below.
+    plan = solve_assembly_problem_milestones(
+        C, assembly, robots=robots, robot_ik=robot_ik, weight=cfg.weight,
+        wrench=cfg.wrench, handovers=cfg.handovers, allow_place=cfg.allow_place,
+        bracing=cfg.bracing, geo_facts=cfg.geo_facts,
+        sig_collapsed_h=cfg.sig_collapsed_h, fill_window=cfg.fill_window,
+        lazy_fills=cfg.lazy_fills)
   else:
     plan = solve_assembly_problem(C, assembly, robots=robots, canonical=cfg.canonical,
                                   weight=cfg.weight, robot_ik=robot_ik, wrench=cfg.wrench,
@@ -1253,6 +1325,8 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
 def run(cfg):
   # cfg: RunConfig -- the single typed configuration object for the whole run. Every setting
   # below reads a cfg field; the thin main() wrapper builds cfg from the parsed CLI args.
+  if cfg.optimize_witnesses == "off":          # 'floor' is the default; 'off' is the escape
+    cfg.optimize_witnesses = None
   set_seed(cfg.seed)                           # reproducible numpy + rai (KOMO) RNG
   # MIXED END EFFECTORS (--grippers): per-robot vacuum/two_finger list; overrides --vacuum.
   gripper_list = None
@@ -1433,11 +1507,12 @@ def run(cfg):
     print("[flag] --dfbnb ACTIVE: depth-first branch-and-bound certificate phase "
           "(implies --bounded).")
   if cfg.sig_collapsed_h:
-    if cfg.sig_components:
+    if cfg.sig_components and cfg.sig_components != "all":
       set_sig_components([c.strip() for c in cfg.sig_components.split(",") if c.strip()])
     print("[flag] --sig-collapsed-h ACTIVE: signature grasp-equivalence classes + labeled "
           "loose parts (components: "
-          + (cfg.sig_components or "press,pickface,contact,solohold,braceside") + ").")
+          + (cfg.sig_components if cfg.sig_components and cfg.sig_components != "all"
+             else "press,pickface,contact,solohold,braceside") + ").")
   if cfg.geo_facts:
     print("[flag] --geo-facts ACTIVE: labeled-abstraction backward relay gated on "
           "floating-gripper coexistence (gripper-vs-assembly/gripper/table); sound "
@@ -1533,8 +1608,10 @@ def run(cfg):
   # None in 0.5s, indistinguishable from a crash or a very fast solve (cost me ~20min). Checking
   # "did you ask for a plan consumer" rather than "did you ask for anything" keeps the legitimate
   # viewer/diagnostic modes (and `view` defaults True, so the broad check was vacuous).
-  _NEEDS_PLAN = ("motion_plan", "save", "mp_save", "optimize_witnesses", "fuse_cograsp",
-                 "fuse_pre_skill", "utilization", "hoist_releases")
+  # (optimize_witnesses/fuse_cograsp/hoist_releases/fuse_pre_skill left this list on
+  # 2026-07-29: they are DEFAULTS now, so "present without a plan" is no longer a request
+  # being silently dropped -- only explicitly-asked-for outputs still warrant the error.)
+  _NEEDS_PLAN = ("motion_plan", "save", "mp_save", "utilization")
   if not (cfg.solve or cfg.load_plan):
     _asked = [f"--{a.replace('_', '-')}" for a in _NEEDS_PLAN if getattr(cfg, a, None)]
     if _asked:
@@ -1686,7 +1763,19 @@ def run(cfg):
         if robot_ik is None:
           print("[witopt] --optimize-witnesses needs --real-ik; skipping.")
         else:
-          if cfg.optimize_witnesses == "floor":
+          # WITNESS PERSISTENCE: a loaded plan file may carry the optimized keyframes, making
+          # this stage a pure function of the file -- no witfloor re-solve, no possibility of
+          # witness drift between stages. Reused only when every witness-shaping setting
+          # matches the saved config; --refresh-witnesses forces the re-solve.
+          if cfg.load_plan and not cfg.refresh_witnesses and _witnesses_reusable(_saved_cfg, cfg):
+            from plan_io import read_witnesses
+            opt_witnesses = read_witnesses(cfg.load_plan,
+                                           list(robot_ik.C.getJointNames()), len(plan))
+            if opt_witnesses is not None:
+              print(f"[witness-reuse] {sum(w is not None for w in opt_witnesses)} persisted "
+                    f"witnesses loaded from {cfg.load_plan}; witness optimization SKIPPED "
+                    "(--refresh-witnesses to re-solve).")
+          if opt_witnesses is None and cfg.optimize_witnesses == "floor":
             from witness_floor import optimize_witnesses_floor
             # floor mode CONSTRAINS clearance (a per-step normalised floor) rather than
             # weighting it, so there is nothing for --witness-clearance to scale. Say so
@@ -1702,23 +1791,34 @@ def run(cfg):
                 branch_budget=cfg.witness_branch_budget,
                 branch_metric=cfg.witness_branch_metric,
                 reconfig_thresh=cfg.witness_reconfig_thresh)
-          else:
+          elif opt_witnesses is None:
             opt_witnesses, _rep = optimize_witnesses(
                 C, assembly, plan, robots, robot_ik, cost=cfg.optimize_witnesses,
                 gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
                 handovers=cfg.handovers, allow_place=cfg.allow_place,
                 bracing=cfg.bracing, clear_weight=cfg.witness_clearance,
                 robot_collisions=cfg.witness_robot_collisions)
+      if cfg.save is not None and plan is not None and opt_witnesses is not None:
+        # RE-save with the optimized witnesses attached (the first save above is deliberately
+        # EARLY so a witness-pass crash cannot lose the plan). With this block downstream
+        # stages (main --load-plan --motion-plan, sim.py run) reuse the exact keyframes
+        # instead of re-solving them.
+        from plan_io import witness_block
+        save_plan(cfg.save, cfg, plan,
+                  witnesses=witness_block(list(robot_ik.C.getJointNames()), opt_witnesses))
       if plan is not None and cfg.utilization:
         from solver import utilization_report
         utilization_report(C, assembly, plan, robots, witnesses=opt_witnesses,
                            gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
                            handovers=cfg.handovers, allow_place=cfg.allow_place,
                            bracing=cfg.bracing)
-      if plan is not None and cfg.fuse_cograsp and not cfg.motion_plan:
+      if (plan is not None and cfg.fuse_cograsp and not cfg.motion_plan
+          and any(a and a[0] == "add_grasp" for a in plan)):
         # the fusion pass only ever ran inside the --motion-plan branch, so without it the
         # flag is inert -- and the REPLAY then shows the unfused pair, whose brace arm sits in
         # a different IK branch at add_grasp than at assemble. That looks like a broken pose.
+        # (fuse_cograsp defaults ON since 2026-07-29, so only warn when the plan actually
+        # CONTAINS a cograsp -- otherwise the note is perpetual noise on plain solves.)
         print("[flag] --fuse-cograsp has NO EFFECT without --motion-plan: it rewrites the "
               "MOTION-PLAN witnesses only. The replay/--viser shows the UNFUSED witnesses, "
               "where a braced arm may change IK branch between add_grasp and assemble.")
@@ -1802,7 +1902,8 @@ def run(cfg):
                                  bracing=cfg.bracing, depgraph=not cfg.mp_sequence,
                                  pre_witnesses=mp_pre,
                                  robot_robot_margin=cfg.mp_robot_margin,
-                                 robot_margin_ramp=cfg.mp_margin_ramp)
+                                 robot_margin_ramp=cfg.mp_margin_ramp,
+                                 table_margin=cfg.mp_table_margin)
           print(f"[motion-plan] {'SEQUENCE' if cfg.mp_sequence else 'DEPGRAPH'} problem, "
                 f"{len(prob.tasks)} tasks")
           if cfg.mp_clearance:
@@ -1835,7 +1936,7 @@ def run(cfg):
           mp_path, _ = MP.run_birrt(
               prob, runtime=cfg.mp_runtime, shortcut=not cfg.mp_no_shortcut,
               shortcut_iters=cfg.mp_shortcut_iters, shortcut_resolution=cfg.mp_shortcut_res,
-              optimize=cfg.mp_optimize)
+              optimize=cfg.mp_optimize, seed=cfg.mp_seed)
           if mp_path:
             print(f"[motion-plan] path {len(mp_path)} states, "
                   f"reaches terminal={prob.is_terminal_mode(mp_path[-1].mode)}")

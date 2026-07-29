@@ -212,10 +212,11 @@ def test_translation_is_read_in_the_anchor_frame_but_the_angle_is_not():
 
 
 # --------------------------------------------------------------------------- fusion gate
-def test_fuse_cograsp_defaults_off_and_the_flag_turns_it_on():
-  assert RunConfig().fuse_cograsp is False
-  assert main.parse_args([]).fuse_cograsp is False
-  assert main.parse_args(["--fuse-cograsp"]).fuse_cograsp is True
+def test_fuse_cograsp_defaults_on_and_the_flag_turns_it_off():
+  # default flipped ON 2026-07-29 (part of the settled-method defaults change)
+  assert RunConfig().fuse_cograsp is True
+  assert main.parse_args([]).fuse_cograsp is True
+  assert main.parse_args(["--no-fuse-cograsp"]).fuse_cograsp is False
   assert RunConfig().mp_cograsp is False
   assert main.parse_args([]).mp_cograsp is False
 

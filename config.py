@@ -41,7 +41,7 @@ class RunConfig:
   robot_types: Optional[str] = None
   perturb_start_pose: bool = False
   plain_box: bool = False
-  part_float: float = 0.015
+  part_float: float = 0.002
   random_init: Optional[float] = None
   scatter_spacing: float = 1.0 / 7.0
   grid_init: Optional[int] = None
@@ -54,7 +54,7 @@ class RunConfig:
   # -- solver / engine --
   solve: bool = False
   optimistic: bool = False
-  milestones: bool = False
+  milestones: bool = True
   lazy: bool = False
   anytime: Optional[float] = None
   milestones_anytime: Optional[float] = None
@@ -72,8 +72,8 @@ class RunConfig:
   labeled_h: bool = False
   collapsed_h: bool = False
   grasp_collapsed_h: bool = False
-  sig_collapsed_h: bool = False
-  sig_components: Optional[str] = None
+  sig_collapsed_h: bool = True
+  sig_components: Optional[str] = "press"
   corridor_h: bool = False
   wrench_aware_h: bool = True
   geo_facts: bool = False
@@ -95,8 +95,8 @@ class RunConfig:
   declutter: bool = False
 
   # -- physics / wrench model --
-  wrench: bool = False
-  grasp_model: str = "isotropic"
+  wrench: bool = True
+  grasp_model: str = "asymmetric"
   vacuum_scale: Optional[float] = None
   tf_close_torque: Optional[float] = None
   curved_torque_scale: Optional[float] = None
@@ -107,7 +107,7 @@ class RunConfig:
   ignore_gravity: bool = False
   robust_mode: str = "corners"
   inserter_check: bool = True
-  bracing: bool = False
+  bracing: bool = True
   brace_resting: bool = False
   brace_for_assembly_only: bool = False
   staged_mates: bool = False
@@ -116,32 +116,32 @@ class RunConfig:
   dense_grasps: bool = False
 
   # -- IK & feasibility --
-  real_ik: bool = False
+  real_ik: bool = True
   ik_seeding: bool = True
   ik_collision_gate: float = 0.015
   full_ik: bool = False
-  strict_collisions: Optional[float] = None
+  strict_collisions: Optional[float] = 1e-6
   strict_mate_collisions: bool = False
   ik_accuracy: Optional[float] = None
   mate_accuracy: Optional[float] = None
-  mate_eq_weight: Optional[float] = None
+  mate_eq_weight: Optional[float] = 100.0
   place_eq_weight: Optional[float] = None
   grasp_translations: int = 0
-  tight_fingers: bool = False
+  tight_fingers: bool = True
   quiet_rai: bool = False
 
   # -- witness optimization --
-  optimize_witnesses: Optional[str] = None
+  optimize_witnesses: Optional[str] = "floor"
   witness_clearance: float = 0.0
-  witness_branch_budget: int = 0
+  witness_branch_budget: int = 5
   witness_branch_metric: str = "sign"
   witness_reconfig_thresh: float = 1.5707963267948966
-  witness_robot_collisions: bool = False
-  fuse_cograsp: bool = False
+  witness_robot_collisions: bool = True
+  fuse_cograsp: bool = True
 
   # -- skills / pre-insertion splits --
   skill: float = 0.0
-  pre_insertion: float = 0.0
+  pre_insertion: float = 0.05
   pre_pick: float = 0.0
   pre_place: float = 0.0
   pre_add_grasp: float = 0.0
@@ -150,18 +150,20 @@ class RunConfig:
 
   # -- motion-plan export (mr_bench) --
   motion_plan: bool = False
-  mp_sequence: bool = False
-  mp_optimize: bool = False
-  mp_runtime: float = 60.0
+  mp_sequence: bool = True
+  mp_optimize: bool = True
+  mp_runtime: float = 30.0
   mp_no_shortcut: bool = False
   mp_shortcut_iters: int = 1000
   mp_shortcut_res: Optional[float] = None
   mp_clearance: bool = False
   mp_cograsp: bool = False
   mp_save: Optional[str] = None
-  mp_collision_tolerance: float = 0.01
-  mp_robot_margin: float = 0.0
-  mp_margin_ramp: float = 0.0
+  mp_collision_tolerance: float = 1e-4
+  mp_robot_margin: float = 0.1
+  mp_margin_ramp: float = 0.1
+  mp_table_margin: float = 0.0
+  mp_seed: Optional[int] = None
   mp_viser: bool = False
   mp_collision_view: bool = False
   mp_modes: bool = False
@@ -189,8 +191,9 @@ class RunConfig:
 
   # -- output & persistence --
   utilization: bool = False
-  hoist_releases: bool = False
+  hoist_releases: bool = True
   load_plan: Optional[str] = None
+  refresh_witnesses: bool = False
   save: Optional[str] = None
 
   # ---- conversions ----
@@ -229,4 +232,10 @@ class RunConfig:
   @classmethod
   def from_file(cls, path):
     with open(path) as f:
-      return cls.from_dict(json.load(f))
+      d = json.load(f)
+    # A saved PLAN file (plan_io: {"config": {...}, "plan": [...]}) carries its config as a
+    # nested block. Accept it directly so `--config plan.json --load-plan plan.json` (the
+    # documented re-export idiom) works without hand-extracting the block.
+    if isinstance(d.get("config"), dict) and "plan" in d:
+      d = d["config"]
+    return cls.from_dict(d)
