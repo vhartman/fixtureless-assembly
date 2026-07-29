@@ -125,8 +125,12 @@ class RunConfig:
   ik_accuracy: Optional[float] = None
   mate_accuracy: Optional[float] = None
   mate_eq_weight: Optional[float] = 100.0
-  place_eq_weight: Optional[float] = None
+  place_eq_weight: Optional[float] = 100.0
   grasp_translations: int = 0
+  grasp_sampler: bool = False
+  grasp_sampler_keep: int = 12
+  grasp_sampler_candidates: int = 200
+  grasp_sampler_seed: int = 0
   tight_fingers: bool = True
   quiet_rai: bool = False
 

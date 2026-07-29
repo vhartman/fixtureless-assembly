@@ -1264,6 +1264,205 @@ def set_dense_grasps(flag):
   _DENSE_GRASPS = bool(flag)
 
 
+# ---------------------------------------------------------------------------------------
+# SAMPLED grasps (--grasp-sampler): the mesh-based second code path. Instead of the fixed
+# face-centred enumeration, tessellate the part shape into an actual MESH (trimesh) and
+# SAMPLE candidate grasps off its surface -- a suction-style block (surface point + inward
+# normal, canonical roll) plus an antipodal pinch block (opposing surface-point pairs within
+# the finger aperture) -- then DOWNSAMPLE to a search-sized set by farthest-point selection.
+# The precursor to a real learned/mesh grasp generator: swap _sample_candidates for the
+# generator, keep everything else. grasp_id stays a positional index into the per-shape
+# list, and part_grasp_poses / part_grasp_surfaces / part_grasp_face_min_dims all delegate
+# to ONE jointly-computed, memoized (poses, surfaces, min_dims) triple so the three
+# parallel views can never shear. OFF (default) = byte-identical to the enumerator.
+_SAMPLED_GRASPS = None         # None = off; else {"seed": int, "candidates": int, "keep": int}
+_SAMPLED_VIEWS_CACHE = {}
+_MAX_GRASP_WIDTH = 0.078       # two-finger max pinch width. The fixed-open robotiq pads
+  # measure ~82mm inner gap (robotiq_tight.g capsules); 78mm keeps a seating margin. The EE
+  # collision filter stays the final arbiter -- this only prunes hopeless candidates early.
+
+
+def set_sampled_grasps(mode):
+  """Enable/disable the sampled-grasp path. `mode` = None (off) or a dict with keys
+  seed / candidates / keep. Call once at startup, BEFORE any grasp precomputation, like
+  set_rolls_per_face -- grasp ids index the per-shape candidate list, so flipping this
+  mid-run rebinds every saved grasp id."""
+  global _SAMPLED_GRASPS
+  _SAMPLED_GRASPS = None if mode is None else {
+      "seed": int(mode.get("seed", 0)),
+      "candidates": max(8, int(mode.get("candidates", 200))),
+      "keep": max(2, int(mode.get("keep", 12)))}
+  _SAMPLED_VIEWS_CACHE.clear()
+
+
+def _spec_mesh(spec):
+  # tessellate a shape spec into a trimesh (SHAPE frame; the caller composes the spec's
+  # own rotation). ssBox corner rounding is ignored: the flat faces are where grasps live,
+  # and the EE collision filter runs against the true rai geometry anyway.
+  import trimesh
+  kind, p = spec[0], spec[1]
+  if kind == "box":
+    return trimesh.creation.box(extents=[float(p[0]), float(p[1]), float(p[2])])
+  if kind == "cylinder":
+    return trimesh.creation.cylinder(radius=float(p[1]), height=float(p[0]), sections=48)
+  if kind == "sphere":
+    return trimesh.creation.icosphere(subdivisions=3, radius=float(p[0]))
+  raise ValueError(f"--grasp-sampler: unknown shape kind {kind!r}")
+
+
+def _surface_class_and_min_dim(spec, n):
+  # (surface label, flat-patch min extent) at a surface point with outward normal `n`
+  # (SHAPE frame). Analytic for the primitives; a mesh version estimates the patch instead.
+  kind, p = spec[0], spec[1]
+  if kind == "box":
+    i = int(np.argmax(np.abs(n)))
+    ext = [float(p[0]), float(p[1]), float(p[2])]
+    return "flat", min(e for j, e in enumerate(ext) if j != i)
+  if kind == "cylinder":
+    if abs(float(n[2])) > 0.99:                            # cap disc
+      return "flat", 2.0 * float(p[1])
+    return "curved", 0.0
+  return "curved", 0.0                                     # sphere
+
+
+def _ray_exit(spec, p, d):
+  """(exit point, outward normal there) of the ray p + t*d, t > 0, leaving the shape
+  (SHAPE frame; p inside or on the surface). Analytic for the primitives -- the mesh is
+  only the SAMPLING surface, so the opposite-point query needs no ray-tracing backend;
+  a real mesh swaps this helper for a mesh ray cast."""
+  kind, prm = spec[0], spec[1]
+  d = np.asarray(d, dtype=float); p = np.asarray(p, dtype=float)
+  if kind == "box":
+    h = _shape_half_extents(spec)
+    ts = [(((h[i] if d[i] > 0 else -h[i]) - p[i]) / d[i], i) for i in range(3)
+          if abs(d[i]) > 1e-12]
+    t, i = min((t, i) for t, i in ts if t > -1e-12) if ts else (0.0, 2)
+    n = np.zeros(3); n[i] = 1.0 if d[i] > 0 else -1.0
+    return p + t * d, n
+  if kind == "cylinder":
+    hz, r = float(prm[0]) / 2.0, float(prm[1])
+    cands = []
+    if abs(d[2]) > 1e-12:                                  # caps
+      t = ((hz if d[2] > 0 else -hz) - p[2]) / d[2]
+      if t > -1e-12:
+        cands.append((t, np.array([0.0, 0.0, 1.0 if d[2] > 0 else -1.0]), True))
+    a = d[0] * d[0] + d[1] * d[1]
+    if a > 1e-12:                                          # barrel
+      b = p[0] * d[0] + p[1] * d[1]
+      c = p[0] * p[0] + p[1] * p[1] - r * r
+      disc = b * b - a * c
+      if disc >= 0.0:
+        t = (-b + np.sqrt(disc)) / a
+        if t > -1e-12:
+          e = p + t * d
+          nr = np.array([e[0], e[1], 0.0])
+          cands.append((t, nr / max(np.linalg.norm(nr), 1e-12), False))
+    valid = [(t, n) for t, n, inside in cands
+             if (inside and np.hypot(*(p + t * d)[:2]) <= r + 1e-9)
+             or (not inside and abs((p + t * d)[2]) <= hz + 1e-9)]
+    if not valid:
+      return p, np.array([0.0, 0.0, 1.0])
+    t, n = min(valid, key=lambda tn: tn[0])
+    return p + t * d, n
+  # sphere
+  r = float(prm[0])
+  b = float(p @ d); c = float(p @ p) - r * r
+  disc = b * b - float(d @ d) * c
+  t = (-b + np.sqrt(max(disc, 0.0))) / float(d @ d)
+  e = p + t * d
+  return e, e / max(np.linalg.norm(e), 1e-12)
+
+
+def _fps_downsample(feats, keep):
+  # farthest-point selection over feature vectors, seeded at candidate 0 (the raw order is
+  # deterministic), ties broken by INDEX so the result is a total order -- no float-equality
+  # dependence across platforms.
+  n = len(feats)
+  if n <= keep:
+    return list(range(n))
+  F = np.asarray(feats, dtype=float)
+  chosen = [0]
+  d = np.linalg.norm(F - F[0], axis=1)
+  for _ in range(keep - 1):
+    i = int(np.argmax(np.round(d, 12)))                    # argmax takes the FIRST max: index tiebreak
+    chosen.append(i)
+    d = np.minimum(d, np.linalg.norm(F - F[i], axis=1))
+  return sorted(chosen)
+
+
+def _sampled_grasp_views(spec, offset):
+  """The joint (poses, surfaces, min_dims) triple for the sampled path -- ONE memoized
+  computation so the three parallel per-gid views cannot drift apart. Poses follow the
+  enumerator's frame conventions exactly: local z = approach INTO the part (the asymmetric
+  wrench model's press/pull sign hangs on it), local y = finger closing axis, position =
+  tool centre standing `offset` off the approach-side surface (the wrench moment arm)."""
+  import zlib
+  cfgv = _SAMPLED_GRASPS
+  sq = _shape_quat(spec)
+  key = (spec[0], tuple(spec[1]), tuple(sq) if sq is not None else None,
+         float(offset), cfgv["seed"], cfgv["candidates"], cfgv["keep"])
+  hit = _SAMPLED_VIEWS_CACHE.get(key)
+  if hit is not None:
+    return hit
+  import trimesh
+  mesh = _spec_mesh(spec)
+  # PRIVATE RNG, seeded from (sampler seed, canonical spec key): byte-identical across
+  # processes and entry points -- the global np.random stream is drained path-dependently
+  # by scatter layout and must never feed the id-bearing pipeline.
+  rng_seed = zlib.crc32(repr(key).encode())
+  pts, fidx = trimesh.sample.sample_surface(mesh, cfgv["candidates"], seed=int(rng_seed))
+  normals = mesh.face_normals[np.asarray(fidx, int)]
+
+  suction, antip = [], []                                  # (pose, surf, min_dim, feature)
+  for k in range(len(pts)):
+    p, n = np.asarray(pts[k], float), np.asarray(normals[k], float)
+    nn = np.linalg.norm(n)
+    if nn < 1e-9:
+      continue
+    n = n / nn
+    surf, mind = _surface_class_and_min_dim(spec, n)
+    # ---- suction-style candidate: approach along -n, canonical roll ----
+    q = _grasp_quat_for_normal(n)
+    pose = np.concatenate([p + offset * n, q])
+    suction.append((pose, surf, mind, np.concatenate([p, 0.02 * n])))
+    # ---- antipodal candidate: the opposing surface point within the aperture ----
+    p2, n2 = _ray_exit(spec, p - 1e-9 * n, -n)
+    width = float(np.linalg.norm(p2 - p))
+    if width > 1e-4 and width <= _MAX_GRASP_WIDTH and float(n2 @ (-n)) > 0.95:
+      y = (p2 - p) / width                                 # closing axis: pad-to-pad
+      ref = (np.array([0.0, 0.0, 1.0]) if abs(float(y[2])) < 0.9
+             else np.array([1.0, 0.0, 0.0]))
+      z = np.cross(y, ref); z /= np.linalg.norm(z)         # approach, perpendicular to the pinch
+      x = np.cross(y, z)
+      mid = 0.5 * (p + p2)
+      _, _t_exit = None, _ray_exit(spec, mid, -z)          # stand off the approach-side surface
+      t = float(np.linalg.norm(_t_exit[0] - mid))
+      pose = np.concatenate([mid - z * (t + offset), _mat_to_quat(np.column_stack([x, y, z]))])
+      # label = the contacted surface class; min_dim 0.0 keeps the vacuum seal gate shut
+      # for pinch candidates (the suction block is the vacuum's own candidate family).
+      antip.append((pose, surf, 0.0, np.concatenate([mid, 0.02 * y, 0.02 * z])))
+
+  keep = cfgv["keep"]
+  k_suc = (keep + 1) // 2
+  rows = []
+  for block, k_want in ((suction, k_suc), (antip, keep - k_suc)):
+    if not block or k_want <= 0:
+      continue
+    idx = _fps_downsample([b[3] for b in block], k_want)
+    rows.extend(block[i] for i in idx)
+  if not rows:
+    raise ValueError(f"--grasp-sampler: no feasible candidates for shape {spec!r}")
+  poses, surfs, mins = [], [], []
+  for pose, surf, mind, _f in rows:
+    if sq is not None:                                     # rotate into the PART frame
+      pose = np.concatenate([_quat_to_R(sq) @ pose[:3], _quat_mul(sq, pose[3:])])
+    pose = np.asarray(pose, dtype=float)
+    pose.setflags(write=False)
+    poses.append(pose); surfs.append(surf); mins.append(float(mind))
+  hit = _SAMPLED_VIEWS_CACHE[key] = (tuple(poses), tuple(surfs), tuple(mins))
+  return hit
+
+
 # EXTRA PLACE CELLS (experimental, OFF by default): classic `place` always lands a group at
 # its reference part's ORIGINAL scatter anchor -- parts at the scatter extremes then get set
 # down at the table edge where half the arms cannot reach them. With N > 0, places() ALSO
@@ -1470,6 +1669,8 @@ def part_grasp_poses(spec, rolls=None, offset=0.01):
   on the caps and the side grasps on the curved surface (vacuum allowed there, same force
   -- per current model decision); spheres get the same six directions at radius standoff.
   Rotated/off-center grasp variants are a later, purely additive extension."""
+  if _SAMPLED_GRASPS is not None:                          # --grasp-sampler second path
+    return _sampled_grasp_views(spec, offset)[0]
   if rolls is None:
     rolls = _ROLLS_PER_FACE
   sq = _shape_quat(spec)
@@ -1567,6 +1768,8 @@ def part_grasp_surfaces(spec, rolls=None):
   # "curved". Box faces are flat; a cylinder's +-z caps are flat, its side is curved; a
   # sphere is curved everywhere. Used to restrict the VACUUM to flat surfaces (a suction
   # cup cannot seal on strong curvature) -- the two-finger keeps curved grasps.
+  if _SAMPLED_GRASPS is not None:                          # --grasp-sampler second path
+    return list(_sampled_grasp_views(spec, 0.01)[1])
   if rolls is None:
     rolls = _ROLLS_PER_FACE
   kind = spec[0]
@@ -1591,6 +1794,8 @@ def part_grasp_face_min_dims(spec, rolls=None):
   # part_grasp_surfaces; inf for curved surfaces -- the flat gate never fires there, the
   # curved gate already handles them). Used for the VACUUM SEAL gate: a suction cup cannot
   # seal on a face smaller than its own diameter (wrench.PARAMS['vacuum_seal_diameter']).
+  if _SAMPLED_GRASPS is not None:                          # --grasp-sampler second path
+    return list(_sampled_grasp_views(spec, 0.01)[2])
   if rolls is None:
     rolls = _ROLLS_PER_FACE
   kind, params = spec[0], spec[1]
@@ -3016,6 +3221,7 @@ def reset_grasp_pose_cache():
   one process therefore share entries computed under different settings, and the grasp table
   silently stops matching the search that produced the plan."""
   _GRASP_POSE_CACHE.clear()
+  _SAMPLED_VIEWS_CACHE.clear()                             # --grasp-sampler: same hazard class
 
 
 def _grounding_caps(state, assembly, group, gripper_kind):

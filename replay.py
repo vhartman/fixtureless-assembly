@@ -99,6 +99,11 @@ def build_scene(cfg):
   from problem import set_grasp_translations
   set_grasp_translations(int(cfg.get("grasp_translations") or 0))  # grasp IDS index this DB:
   # a replay with a different count would read every saved grasp id against a different table.
+  from problem import set_sampled_grasps
+  set_sampled_grasps({"seed": int(cfg.get("grasp_sampler_seed") or 0),
+                      "candidates": int(cfg.get("grasp_sampler_candidates") or 200),
+                      "keep": int(cfg.get("grasp_sampler_keep") or 12)}
+                     if cfg.get("grasp_sampler") else None)  # sampled ids: same hazard class
   set_plain_box(bool(cfg.get("plain_box")))                # cube collision geometry must match
   from env import set_tight_fingers
   set_tight_fingers(bool(cfg.get("tight_fingers")))        # GRIPPER collision geometry likewise

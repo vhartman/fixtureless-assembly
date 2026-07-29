@@ -250,6 +250,33 @@ def build_parser():
            "--vacuum (rotationally symmetric).",
   )
   g_ik.add_argument(
+      "--grasp-sampler", action=argparse.BooleanOptionalAction, default=False,
+      help="SECOND grasp-DB code path (default off = byte-identical): tessellate each part "
+           "shape into a MESH (trimesh) and SAMPLE candidate grasps off its surface -- a "
+           "suction block (surface point + inward normal, canonical roll) and an antipodal "
+           "pinch block (opposing surface pairs within the finger aperture) -- then "
+           "farthest-point DOWNSAMPLE to --grasp-sampler-keep per shape. The precursor to a "
+           "proper mesh grasp generator: everything downstream (EE collision filter, wrench "
+           "pricing, IK, sim, export) consumes the sampled DB unchanged via grasp ids. "
+           "Incompatible with --dense-grasps/--grasp-translations. Deterministic: a private "
+           "RNG seeded from (--grasp-sampler-seed, shape), never the global stream.",
+  )
+  g_ik.add_argument(
+      "--grasp-sampler-keep", type=int, default=12, metavar="N",
+      help="--grasp-sampler: grasps kept per part shape after downsampling (default 12 -- "
+           "matches the enumerator's 6 faces x 2 rolls search load). Split ~half suction-"
+           "style, ~half antipodal.",
+  )
+  g_ik.add_argument(
+      "--grasp-sampler-candidates", type=int, default=200, metavar="M",
+      help="--grasp-sampler: raw surface samples per shape before downsampling (default 200).",
+  )
+  g_ik.add_argument(
+      "--grasp-sampler-seed", type=int, default=0, metavar="S",
+      help="--grasp-sampler: sampler RNG seed (saved with the plan; grasp ids only replay "
+           "under the same seed/counts).",
+  )
+  g_ik.add_argument(
       "--ik-collision-gate", type=float, default=0.015, metavar="M",
       help="With --ik-seeding: penetration depth (metres) beyond which an exact analytic branch "
            "counts as DEEPLY colliding; a bind is rejected pre-KOMO only if EVERY branch combo "
@@ -684,15 +711,18 @@ def build_parser():
            "precompute alike (they must agree). Changes which grasps survive the DB filter.",
   )
   g_search.add_argument(
-      "--place-eq-weight", type=float, default=None, metavar="W",
-      help="Weight on a PLACE's object-pose EQUALITY constraints (default 1e1) -- the twin of "
+      "--place-eq-weight", type=float, default=100.0, metavar="W",
+      help="Weight on a PLACE's object-pose EQUALITY constraints (default 1e2 since "
+           "2026-07-29; rai's own default is 1e1) -- the twin of "
            "--mate-eq-weight, which only reaches _ik_assemble. A place sets the DATUM every "
            "later mate is measured against, so its residual propagates: MEASURED car-mini "
            "(seed 11019) a body placed 3.91mm high while every wheel mated onto it at "
            "0.01-0.23mm, i.e. perfectly seated on a body in the wrong place. NOTE it cannot "
            "buy accuracy the geometry does not allow -- where the exact pose needs the arm "
            "inside the table, a higher weight turns the compromise into a hard IK failure "
-           "(arguably the honest outcome; pair with a looser --strict-collisions).",
+           "(arguably the honest outcome; pair with a looser --strict-collisions). Made the "
+           "default after FRAGILITY 2.10: a 2.43mm-low place datum sank a mated part below "
+           "the table for every later mode and walled BiRRT's transition sampler.",
   )
   g_search.add_argument(
       "--quiet-rai", action="store_true",
@@ -1173,6 +1203,8 @@ _SAVE_CONFIG_FIELDS = (
     # measured against, so its residual is not local (measured: body 3.91mm high, wheels then
     # mated onto it at 0.01-0.23mm -- perfectly seated on a body in the wrong place)
     "grasp_translations",                                # grasp ids index the DB
+    "grasp_sampler", "grasp_sampler_keep",               # --grasp-sampler: sampled ids only
+    "grasp_sampler_candidates", "grasp_sampler_seed",    # replay under identical settings
     "tight_fingers",                                     # changes what the grasp DB filters out
     "ik_seeding",                                        # off => witness IK fails on re-picks/
     # reorienting places, and mp_export then exports the arm's PREVIOUS config as the goal
@@ -1215,7 +1247,8 @@ _WITNESS_FIELDS = (
     "witness_reconfig_thresh", "witness_clearance", "witness_robot_collisions",
     "strict_collisions", "mate_eq_weight", "place_eq_weight", "mate_accuracy",
     "ik_accuracy", "ik_seeding", "seed", "bracing", "handovers", "allow_place",
-    "tight_fingers", "part_float", "hoist_releases")
+    "tight_fingers", "part_float", "hoist_releases",
+    "grasp_sampler", "grasp_sampler_keep", "grasp_sampler_candidates", "grasp_sampler_seed")
 
 
 def _witnesses_reusable(saved_cfg, cfg):
@@ -1358,6 +1391,24 @@ def run(cfg):
   any_two_finger = (gripper_list is not None and not all(gripper_list)) or not cfg.vacuum
   set_rolls_per_face(2 if any_two_finger else 1)
   set_dense_grasps(cfg.dense_grasps and any_two_finger)
+  from problem import set_sampled_grasps
+  if cfg.grasp_sampler:
+    if cfg.dense_grasps or cfg.grasp_translations:
+      # dense/translations are FACE-ENUMERATOR variant families and several id-arithmetic
+      # sites assume their block layout (g % nb collapses, nb-capped fill phases) -- with
+      # sampled ids those silently corrupt the grasp identity space.
+      raise SystemExit("--grasp-sampler is incompatible with --dense-grasps / "
+                       "--grasp-translations (face-enumerator variant families).")
+    set_sampled_grasps({"seed": cfg.grasp_sampler_seed,
+                        "candidates": cfg.grasp_sampler_candidates,
+                        "keep": cfg.grasp_sampler_keep})
+    print(f"[flag] --grasp-sampler ACTIVE: mesh-sampled grasp DB (trimesh surface sampling; "
+          f"{cfg.grasp_sampler_candidates} candidates -> {cfg.grasp_sampler_keep} kept per "
+          f"shape via farthest-point downsampling; suction + antipodal blocks; seed "
+          f"{cfg.grasp_sampler_seed}). Grasp ids index the SAMPLED list -- plans/witnesses "
+          f"only replay under the same sampler settings (saved with the plan).")
+  else:
+    set_sampled_grasps(None)
   if cfg.plain_box:
     from problem import set_plain_box
     set_plain_box(True)

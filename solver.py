@@ -4979,11 +4979,14 @@ def _search_context(C, assembly, robots):
     merged = {}
     for k in distinct:
       for p, g, pose in per_kind[k].get(key, ()):
-        if k == "vacuum" and rolls > 1 and not dense and g % rolls != 0:
+        if (k == "vacuum" and rolls > 1 and not dense and g % rolls != 0
+            and _problem._SAMPLED_GRASPS is None):
           continue  # the pen is roll-symmetric: rolls of one face are IK-identical
                     # duplicates for the vacuum -- and vacuum binds are the expensive
                     # ones (no analytic reject) -> keep roll 0 only in ITS mask. The
                     # two-finger keeps every roll (its pads genuinely differ per roll).
+                    # (--grasp-sampler ids are NOT (face, roll)-structured: the modulus
+                    # would silently drop half the sampled vacuum candidates -- skip.)
         merged.setdefault((p, g), (p, g, pose))
         table.kinds_of.setdefault((key, p, g), set())
         table.kinds_of[(key, p, g)].add(k)
