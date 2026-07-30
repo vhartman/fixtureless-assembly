@@ -1471,6 +1471,53 @@ def _sampled_grasp_views(spec, offset):
 # slot tag ("slot", ("cell", k), face) -- poses are NOT part of the state key -- and carry
 # the landing anchor in the state's pose payload (the same mechanism declutter stowing uses).
 # Infeasible cells (occupied / colliding) are rejected by the cheap layer like any placement.
+# --ban-actions (SEARCH-scoped): action patterns the successor generator must not yield.
+# The bandit outer loop's DISCRETE escalation: when motion planning stalls on a hold whose
+# acquisition locked an unconnectable homotopy (chair-8: the handover receiving grasp), ban
+# that acquisition and re-solve -- the search then picks a different grasp/pairing. Patterns
+# are (kind, robot, part, arg) with None as wildcard per field. Reset per scene by
+# replay.build_scene; NEVER applied to replay walks (a saved plan cannot contain a banned
+# action anyway -- the search that produced it avoided them).
+_BANNED_ACTIONS = ()
+
+
+def set_banned_actions(patterns):
+  """patterns: 'kind:robot:part:arg' strings ('*' = wildcard per field), optionally with a
+  STATE CONTEXT suffix '@partA+partB+...': the ban then applies only when a subassembly
+  involving one of the action's parts CONTAINS all the listed parts. This makes a ban
+  exactly as strong as the measured counterexample -- the same action on a SMALLER
+  subassembly (e.g. the seat before its legs are attached) stays legal, so the search can
+  restructure the ORDER instead of losing the action outright."""
+  global _BANNED_ACTIONS
+  out = []
+  for pat in patterns or ():
+    pat = str(pat)
+    ctx = None
+    if "@" in pat:
+      pat, ctx_s = pat.split("@", 1)
+      ctx = frozenset(x for x in ctx_s.split("+") if x)
+    f = [None if x in ("*", "") else x for x in pat.split(":")]
+    out.append((tuple(f + [None] * (4 - len(f))), ctx))
+  _BANNED_ACTIONS = tuple(out)
+
+
+def _action_banned(a, state=None):
+  if not _BANNED_ACTIONS:
+    return False
+  for pat, ctx in _BANNED_ACTIONS:
+    if not all(p is None or str(a[k]) == p for k, p in enumerate(pat) if k < len(a)):
+      continue
+    if ctx is None:
+      return True
+    if state is None:
+      continue                                             # contextual ban needs the state
+    parts = [x for x in a[2:] if isinstance(x, str)]
+    for g in state.subassemblies():
+      if any(p in g for p in parts) and ctx <= set(g):
+        return True
+  return False
+
+
 _EXTRA_PLACE_CELLS = 0
 _PLACE_CELL_XY = ((0.0, 0.0), (0.0, 0.35), (0.0, -0.35), (0.3, 0.0), (-0.3, 0.0),
                   (0.3, 0.35), (-0.3, -0.35), (-0.3, 0.35), (0.3, -0.35))
@@ -2876,6 +2923,8 @@ def successors(state, assembly, robots, grasp_table=None, canonical=False,
 
   def _filtered():
     it = _gen()
+    if _BANNED_ACTIONS:
+      it = (x for x in it if not _action_banned(x[0], state))
     if _BRACE_FOR_ASSEMBLY_ONLY and _has_brace(state):
       # a brace is present -> only consume it (assemble) or drop it (release); see the flag doc.
       it = (x for x in it if x[0][0] in ("assemble", "release"))

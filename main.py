@@ -673,6 +673,25 @@ def build_parser():
            "pairs). Traded against movement by this weight. Best with the dp-* modes.",
   )
   g_witness.add_argument(
+      "--witness-draw", type=int, default=None, metavar="K",
+      help="DIVERSITY draw for the witness ladder (bandit outer loop): seed K thins the "
+           "witfloor candidate ladder with a private RNG before the DP, so different draws "
+           "ship locally-good but globally DIFFERENT witness chains (covers grasp-side/"
+           "homotopy families that cost-ranking alone never picks). None = deterministic "
+           "ladder (byte-identical).",
+  )
+  g_witness.add_argument(
+      "--witness-margin", type=float, default=None, metavar="M",
+      help="ROBUST KEYFRAMES: reject any witness whose posed scene has a NON-INTENDED pair "
+           "closer than M metres -- (non-hand arm link) vs (part), and (arm) vs (other arm). "
+           "Intended contacts stay legal (hand-vs-payload, part-part mates, table). Applied "
+           "to the WITNESS passes only (witfloor/optimize/fuse/pre-skill re-solves; the "
+           "search is untouched). Keyframes that are legal by a hair (measured: -1.35mm "
+           "forearm inside the arm's own cargo on chair-8) sample fine but can never be "
+           "CONNECTED by the motion planner; a margin makes the exported anchors plannable. "
+           "Try 0.005.",
+  )
+  g_witness.add_argument(
       "--witness-branch-budget", type=int, default=5, metavar="N",
       help="--optimize-witnesses floor: permit N extra IK BRANCH CROSSINGS in exchange for a "
            "higher clearance floor. 0 takes only the clearance that is FREE -- the "
@@ -1018,6 +1037,21 @@ def build_parser():
            "2026-07-29; --no-mp-optimize stops at the first solution. Improves path cost; "
            "uses the tree-extension shim.",
   )
+  g_search.add_argument(
+      "--ban-actions", type=str, default=None, metavar="CSV",
+      help="SEARCH-scoped action bans: comma-separated 'kind:robot:part:arg' patterns "
+           "('*' wildcards a field), e.g. 'handover:a1:obj_0:*'. The successor generator "
+           "never yields matching actions -- the bandit outer loop's discrete escalation "
+           "when a hold's acquisition locks an unconnectable homotopy. Never applied to "
+           "replays (saved plans cannot contain banned actions).",
+  )
+  g_mp.add_argument(
+      "--mp-stall-timeout", type=float, default=None, metavar="SEC",
+      help="With --motion-plan: stop BiRRT early once the MODE FRONTIER has not grown for "
+           "SEC seconds (a structured stuck signal for outer loops -- the per-mode attempt "
+           "budget). run_birrt reports frontier depth + deepest task_ids either way. "
+           "None = run the full --mp-runtime.",
+  )
   g_mp.add_argument(
       "--mp-runtime", type=float, default=30.0, metavar="SEC",
       help="With --motion-plan: BiRRT search budget in seconds (default 30 since 2026-07-29). "
@@ -1211,6 +1245,11 @@ _SAVE_CONFIG_FIELDS = (
     "pre_pick", "pre_place", "pre_add_grasp",            # each SPLITS an action into two tasks:
     # unsaved, a replay/sim rebuild has fewer tasks than the --mp-path it loads, and the path
     # indexes tasks by integer id. pre_insertion was already saved; these three were not.
+    "witness_margin", "witness_draw",                    # robust-keyframe gate + ladder
+    # draw: both change which witnesses ship, so replays/reuse must match
+    "ban_actions",                                       # shapes the PLAN (provenance +
+    # hoist/witness walks must see the same successor filter the search used)
+    # which witnesses ship, so replays/reuse must match
     "optimize_witnesses", "witness_branch_budget",       # WHICH witness optimizer ran: a
     "witness_branch_metric", "witness_reconfig_thresh",  # different one yields a different
     # None-pattern, and build_tasks SKIPS a task whose witness is None -- so the rebuilt mode
@@ -1247,7 +1286,7 @@ _WITNESS_FIELDS = (
     "witness_reconfig_thresh", "witness_clearance", "witness_robot_collisions",
     "strict_collisions", "mate_eq_weight", "place_eq_weight", "mate_accuracy",
     "ik_accuracy", "ik_seeding", "seed", "bracing", "handovers", "allow_place",
-    "tight_fingers", "part_float", "hoist_releases",
+    "tight_fingers", "part_float", "hoist_releases", "witness_margin", "witness_draw",
     "grasp_sampler", "grasp_sampler_keep", "grasp_sampler_candidates", "grasp_sampler_seed")
 
 
@@ -1516,6 +1555,12 @@ def run(cfg):
       else {"lateral": cfg.insertion_noise, "offset": cfg.insertion_offset})
   wrench.PARAMS["robust_mode"] = cfg.robust_mode
   wrench.PARAMS["ignore_gravity"] = cfg.ignore_gravity
+  from problem import set_banned_actions
+  set_banned_actions([x.strip() for x in cfg.ban_actions.split(",") if x.strip()]
+                     if cfg.ban_actions else ())
+  if cfg.ban_actions:
+    print(f"[flag] --ban-actions ACTIVE: {cfg.ban_actions} (successor generator filters "
+          f"matching actions; search only)")
   if cfg.ignore_gravity:
     print("[flag] --ignore-gravity ACTIVE: parts weightless in the wrench check "
           "(only insertion/applied loads must be resisted).")
@@ -1812,6 +1857,14 @@ def run(cfg):
                               bracing=cfg.bracing)
       if cfg.save is not None:
         save_plan(cfg.save, cfg, plan)
+      if cfg.witness_margin is not None and robot_ik is not None:
+        # ROBUST-KEYFRAME gate for everything from here on (witfloor, fuse, pre-skill, raw
+        # export solves). Deliberately NOT set during the search: plans stay identical; only
+        # the shipped keyframes change.
+        robot_ik.clearance_reject = float(cfg.witness_margin)
+        print(f"[flag] --witness-margin {cfg.witness_margin*1000:.0f}mm ACTIVE: witnesses "
+              f"rejected unless every non-intended pair (non-hand arm vs part, arm vs other "
+              f"arm) clears the margin; restarts hunt for fat-neighbourhood keyframes.")
       opt_witnesses = None
       if plan is not None and cfg.optimize_witnesses is not None:
         if robot_ik is None:
@@ -1844,7 +1897,8 @@ def run(cfg):
                 handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
                 branch_budget=cfg.witness_branch_budget,
                 branch_metric=cfg.witness_branch_metric,
-                reconfig_thresh=cfg.witness_reconfig_thresh)
+                reconfig_thresh=cfg.witness_reconfig_thresh,
+                draw_seed=cfg.witness_draw)
           elif opt_witnesses is None:
             opt_witnesses, _rep = optimize_witnesses(
                 C, assembly, plan, robots, robot_ik, cost=cfg.optimize_witnesses,
@@ -1990,7 +2044,16 @@ def run(cfg):
           mp_path, _ = MP.run_birrt(
               prob, runtime=cfg.mp_runtime, shortcut=not cfg.mp_no_shortcut,
               shortcut_iters=cfg.mp_shortcut_iters, shortcut_resolution=cfg.mp_shortcut_res,
-              optimize=cfg.mp_optimize, seed=cfg.mp_seed)
+              optimize=cfg.mp_optimize, seed=cfg.mp_seed,
+              stall_timeout=cfg.mp_stall_timeout)
+          if not mp_path and cfg.mp_stall_timeout is not None:
+            # STRUCTURED stuck report for outer loops: name the frontier tasks (their names
+            # embed the plan step), so a bandit can compute ban candidates without parsing
+            # any debug output.
+            _mpinfo = _  # run_birrt's info dict
+            _tids = (_mpinfo or {}).get("frontier_task_ids") or []
+            _names = [prob.tasks[t].name for t in _tids if 0 <= t < len(prob.tasks)]
+            print(f"[motion-plan] STALLED frontier task_ids {_tids} names {_names}")
           if mp_path:
             print(f"[motion-plan] path {len(mp_path)} states, "
                   f"reaches terminal={prob.is_terminal_mode(mp_path[-1].mode)}")

@@ -22,6 +22,7 @@ ACTION -> TASK map (confirmed with the user 2026-07-20):
 """
 import sys
 import json
+import os as _os
 
 import numpy as np
 
@@ -530,7 +531,38 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
             req = margin * min(1.0, d_ee / ramp)
           except Exception:
             req = 0.0
-      if d < req:
+      elif ramp > 0.0 and (ra in involved) != (rb in involved):
+        # ONE-SIDED relaxation (2026-07-30): an involved arm NEAR ITS GOAL is executing its
+        # task posture, and that fixed posture can sit inside the margin of an UNINVOLVED
+        # arm's BASE links -- which no sample of the free arm can change (measured: chair-8
+        # task 28_assemble_a1_obj_7_obj_5, a1's pinned wrist 7.7mm from a2's base link at
+        # HOME -> every transition sample invalid -> "Failed to sample after 10000
+        # attempts"). Ramp the pair's requirement on the INVOLVED arm's own distance to its
+        # goal: full margin while it transits, relaxed to the base predicate exactly where
+        # the task pins it -- the same contact-allowed-at-anchors philosophy as the
+        # involved-pair and table ramps. Fail OPEN like the branch above: a missing goal
+        # must not veto a state the base predicate accepts.
+        rinv = ra if ra in involved else rb
+        if goals is None:
+          goals = _goals(m)
+        try:
+          d_ee = float(_np.linalg.norm(
+              _np.asarray(env.C.getFrame(gripper_frame[rinv]).getPosition(), dtype=float)
+              - goals[rinv]))
+          req = margin * min(1.0, d_ee / ramp)
+        except Exception:
+          req = 0.0
+      # CLAMP AT CONTACT (2026-07-30): a fully-relaxed pair (req 0) must not be vetoed for a
+      # sub-tolerance witness graze -- `d < req` with d = -0.1mm and req = 0 still fired,
+      # so every transition whose goal formation TOUCHES (a seated mate, a co-grasp) was
+      # unsatisfiable under the margin no matter the relaxation (chair-8's second wall).
+      # Penetration is the BASE predicate's job (same rule the table branch documents);
+      # clamping d at 0 keeps every positive requirement guarding real proximity while
+      # handing at-or-below-contact states back to the tolerance.
+      if max(d, 0.0) < req:
+        if _os.environ.get("MP_MARGIN_DEBUG"):
+          print(f"[margin-debug] VETO {fa} ~ {fb} d={d*1000:.1f}mm req={req*1000:.1f}mm "
+                f"owners=({ra},{rb}) involved={sorted(involved)}")
         return True
     return False
 
@@ -645,7 +677,8 @@ def run_motion_planner(problem, runtime=30.0, verbose=True):
 
 
 def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
-              shortcut_resolution=None, optimize=False, verbose=True, seed=None):
+              shortcut_resolution=None, optimize=False, verbose=True, seed=None,
+              stall_timeout=None):
   """Run Bidirectional RRT* to the FIRST solution (optimize=False), then optionally apply
   robot/mode shortcutting as a post-process. Returns (path, info). No cost optimization --
   the tree stops as soon as a valid path is found; shortcutting only removes slack.
@@ -675,7 +708,7 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
   from multi_robot_multi_goal_planning.planners.rrtstar_base import BaseRRTConfig
   from multi_robot_multi_goal_planning.planners.shortcutting import robot_mode_shortcut
   from multi_robot_multi_goal_planning.planners.termination_conditions import (
-      RuntimeTerminationCondition)
+      RuntimeTerminationCondition, PlannerTerminationCondition)
   cfg = BaseRRTConfig()
   # internal (tree_extension) shortcutting is only meaningful while optimizing; our EXPLICIT
   # robot_mode_shortcut below is separate. optimize=True keeps improving cost until `runtime`.
@@ -701,11 +734,45 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
       _fake_t[0] += 1e-3
       return _fake_t[0]
     _time_mod.time = _fake_time
+  planner = BidirectionalRRTstar(problem, config=cfg)
+  # PER-MODE PROGRESS BUDGET (stall_timeout, seconds): a wall shows up as the MODE FRONTIER
+  # not growing while the tree burns transition attempts -- the "Failed to sample" stdout is
+  # a debug print, not an interface, so scripts must not parse it. This ptc closes over the
+  # planner and stops the pull once the frontier has been flat for `stall_timeout` seconds;
+  # the caller reads the STRUCTURED outcome from info["frontier_*"] / info["stalled"].
+  class _FrontierStallPTC(PlannerTerminationCondition):
+    def __init__(self, pl, max_s, stall_s):
+      self.pl, self.max_s, self.stall_s = pl, float(max_s), float(stall_s)
+      self.best, self.t_best, self.stalled = -1, 0.0, False
+    def __repr__(self):
+      return f"max runtime {self.max_s}s, frontier stall {self.stall_s}s"
+    def should_terminate(self, current_iterations=None, current_time=None):
+      if current_time is None:
+        return False
+      n = len(getattr(self.pl, "modes", ()) or ())
+      if n > self.best:
+        self.best, self.t_best = n, current_time
+      elif current_time - self.t_best > self.stall_s:
+        self.stalled = True
+        return True
+      return current_time > self.max_s
+  ptc = (RuntimeTerminationCondition(runtime) if stall_timeout is None
+         else _FrontierStallPTC(planner, runtime, stall_timeout))
   try:
-    path, info = BidirectionalRRTstar(problem, config=cfg).plan(
-        ptc=RuntimeTerminationCondition(runtime), optimize=optimize)
+    path, info = planner.plan(ptc=ptc, optimize=optimize)
   finally:
     _time_mod.time = _real_time
+  info = dict(info or {})
+  _modes = list(getattr(planner, "modes", ()) or ())
+  info["frontier_modes"] = len(_modes)
+  info["frontier_task_ids"] = (
+      [int(t) for t in np.atleast_1d(_modes[-1].task_ids)] if _modes else None)
+  info["stalled"] = bool(getattr(ptc, "stalled", False))
+  if verbose or stall_timeout is not None:
+    print(f"[mp/birrt] frontier: {info['frontier_modes']} modes, deepest task_ids "
+          f"{info['frontier_task_ids']}"
+          + (f" -- STALLED (no frontier growth for {stall_timeout:g}s)"
+             if info["stalled"] else ""))
   if verbose:
     tag = "optimized" if optimize else "first solution"
     print(f"[mp/birrt] {tag}: {'%d states' % len(path) if path else 'NO path'}")

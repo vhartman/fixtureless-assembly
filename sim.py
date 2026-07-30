@@ -3173,7 +3173,10 @@ def _states_from_plan(cfg, C, asm, robots, plan):
   JSON carries only actions, and the successor flags (gripper kind, bracing) must match the
   search that produced it (both are in the saved config)."""
   import assembly as A
-  gk = A.gripper_kind(C) if cfg.get("wrench") else None
+  # MIXED-EE aware: gripper_kind(C) says "vacuum" whenever ANY vacuum frame exists, which
+  # prices every arm's grasps with vacuum caps on a mixed scene -- the successor set then
+  # cannot reproduce two-finger actions (user-hit on the chair: "cannot reproduce action 2").
+  gk = A.wrench_kind_arg(C, robots) if cfg.get("wrench") else None
   brace = bool(cfg.get("bracing"))
   _, gt = A._search_context(C, asm, robots)
   states = [A.get_initial_state(C, asm)]
@@ -3246,7 +3249,7 @@ def _cli_run(a):
       return
     from solver import RobotIK, optimize_witnesses
     import mp_export as MP
-    gk = A.gripper_kind(C) if cfg.get("wrench") else None
+    gk = A.wrench_kind_arg(C, robots) if cfg.get("wrench") else None   # mixed-EE aware
     rik = RobotIK(C, robots)                                # geometric export only -- the
     # RobotIK's own default is ik_seeding=False, but the CONFIG default is True and main.py
     # turns it on before it exports; every other export path (mp_show_path, mp_debug_view,
@@ -3279,6 +3282,8 @@ def _cli_run(a):
       rik.mate_residual_reject = float(cfg["mate_accuracy"])
     if cfg.get("ik_accuracy") is not None:
       rik.nlp_stop_tolerance = float(cfg["ik_accuracy"])
+    if cfg.get("witness_margin") is not None:
+      rik.clearance_reject = float(cfg["witness_margin"])   # robust-keyframe gate, as exported
     if cfg.get("witness_robot_collisions"):
       rik.strip_inactive_collision = False
     if cfg.get("strict_collisions") is not None:
@@ -3315,7 +3320,8 @@ def _cli_run(a):
           C, asm, plan, robots, rik, gripper_kind=gk, handovers=_hand, allow_place=_aplace,
           bracing=brace, branch_budget=cfg.get("witness_branch_budget"),
           branch_metric=cfg.get("witness_branch_metric"),
-          reconfig_thresh=cfg.get("witness_reconfig_thresh"))
+          reconfig_thresh=cfg.get("witness_reconfig_thresh"),
+          draw_seed=cfg.get("witness_draw"))
     elif _witopt:
       wit, _ = optimize_witnesses(C, asm, plan, robots, rik, cost=_witopt,
                                   gripper_kind=gk, handovers=_hand, allow_place=_aplace,

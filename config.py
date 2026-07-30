@@ -137,6 +137,9 @@ class RunConfig:
   # -- witness optimization --
   optimize_witnesses: Optional[str] = "floor"
   witness_clearance: float = 0.0
+  witness_draw: Optional[int] = None
+  ban_actions: Optional[str] = None
+  witness_margin: Optional[float] = None
   witness_branch_budget: int = 5
   witness_branch_metric: str = "sign"
   witness_reconfig_thresh: float = 1.5707963267948966
@@ -157,6 +160,7 @@ class RunConfig:
   mp_sequence: bool = True
   mp_optimize: bool = True
   mp_runtime: float = 30.0
+  mp_stall_timeout: Optional[float] = None
   mp_no_shortcut: bool = False
   mp_shortcut_iters: int = 1000
   mp_shortcut_res: Optional[float] = None

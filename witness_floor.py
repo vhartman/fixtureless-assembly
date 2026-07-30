@@ -62,7 +62,8 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
                              handovers=True, allow_place=True, bracing=False,
                              grasp_table=None, clear_margin=0.4, alpha=None,
                              branch_weight=10.0, branch_budget=0, alpha_lo=0.0,
-                             branch_metric="sign", reconfig_thresh=np.pi / 2.0, verbose=True):
+                             branch_metric="sign", reconfig_thresh=np.pi / 2.0, verbose=True,
+                             draw_seed=None):
   """Returns (witnesses, report). `alpha` fixes the floor; None => BISECT for the highest
   feasible one. The floor is per-step NORMALISED (`eps_i = alpha * best_clearance_at_step_i`)
   because a global floor would be dictated by the tightest step -- an insertion has the gripper
@@ -187,6 +188,20 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
         norm.append(dict(zip(arm_joints[act[1]], [float(x) for x in w])))
     if norm:
       cand[i] = norm
+  # --witness-draw (draw_seed != None): DIVERSITY over re-draws for the bandit outer loop.
+  # The ladder is near-deterministic, so every re-run ships the same chain -- including a
+  # chain whose hold homotopy is infeasible to CONNECT (chair-8: the grasp approaches the
+  # legs from the wrong side; per-keyframe checks cannot see it). Each draw THINS the ladder
+  # with a private seeded RNG (drop each non-first candidate with p=0.4, always keep >= 1),
+  # and the DP then optimizes within what survives: locally-good but globally different
+  # chains, with full coverage of the candidate alphabet in the limit of draws.
+  if draw_seed is not None:
+    import zlib
+    _rng = np.random.default_rng(zlib.crc32(f"witdraw|{int(draw_seed)}".encode()))
+    for i in list(cand):
+      pool = list(cand[i])
+      _rng.shuffle(pool)                                     # so the DP favourite can drop too
+      cand[i] = [pool[0]] + [c for c in pool[1:] if _rng.random() > 0.4]
   steps = sorted(cand)
   if not steps:
     robot_ik.strip_inactive_collision = _strip0

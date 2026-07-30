@@ -442,6 +442,16 @@ class RobotIK:
     self.col_weight = 1e1
     self.strict_rejects = 0
     self.mate_rejects = 0                               # diagnostics: dirty witnesses vetoed
+    # --witness-margin (metres, None = off): ROBUST-KEYFRAME gate. A witness is rejected
+    # unless every NON-INTENDED pair clears this margin: (non-hand arm link) vs (part) and
+    # (arm link) vs (other arm's link). Intended contacts stay legal: the HAND touching its
+    # payload, part-part mates, anything with the table. Motivation (chair-8): keyframes
+    # legal-by-a-hair (-1.35mm forearm inside the arm's OWN carried leg, within the
+    # penetration tolerance) have measure-near-zero connectable neighbourhoods -- the motion
+    # planner samples them but can never CONNECT them. Robust keyframes make the exported
+    # anchors fat enough to plan to. Scoped by main to the WITNESS passes (search untouched).
+    self.clearance_reject = None
+    self.margin_rejects = 0
     # DEBUG: set env PEN_VIEW_ACTION='pick a1 obj_1 0' to open a BLOCKING C.view(True) on the
     # FIRST penetration check of that exact action (space-joined tuple) -- prints the colliding
     # frame pairs and shows the skill scene at the checked witness. For inspecting whether a
@@ -892,6 +902,49 @@ class RobotIK:
       return False
     return True
 
+  _HAND_TOKENS = ("gripper", "palm", "finger", "robotiq", "vacuum")
+
+  def _clearance_ok(self, C, q):
+    """--witness-margin gate (see clearance_reject above): posed at witness q, veto if any
+    non-intended pair sits closer than the margin. Pair classes checked: non-hand arm link
+    vs part (catches the forearm-inside-own-cargo class), and arm link vs OTHER arm's link
+    (only arms posed in this scene -- idle arms at HOME are out of scope here; the export
+    validates the chained scene). Table pairs, part-part pairs and the hand-vs-anything are
+    intended-contact territory and stay exempt."""
+    M = self.clearance_reject
+    if M is None or C is None or q is None:
+      return True
+    saved = C.getJointState()
+    C.setJointState(np.asarray(q, dtype=float))
+    def _arm_of(f):
+      for r in self.robots:
+        if f.startswith(r):
+          return r
+      return None
+    def _is_hand(f):
+      return any(t in f for t in self._HAND_TOKENS)
+    def _is_part(f):
+      return f.startswith("obj_")
+    bad = None
+    for c in C.getCollisions(M):
+      fa, fb, d = c[0], c[1], float(c[2])
+      if d >= M:
+        continue
+      ra, rb = _arm_of(fa), _arm_of(fb)
+      arm_a = ra is not None and not _is_hand(fa)
+      arm_b = rb is not None and not _is_hand(fb)
+      # non-hand arm link vs part; or two DIFFERENT arms' links (hands included there:
+      # two hands should not be within the margin of each other either)
+      if (arm_a and _is_part(fb)) or (arm_b and _is_part(fa)) \
+         or (ra is not None and rb is not None and ra != rb):
+        bad = (fa, fb, d)
+        break
+    C.setJointState(saved)
+    if bad is not None:
+      self.margin_rejects += 1
+      return False
+    return True
+
   def _solve_ik(self, komo, restarts=12, seeds=None, C=None):
     # solve a skill KOMO, retrying from fresh inits until one converges. KOMO seeds its guess
     # with a little noise, so a borderline-reachable target flips feasible/infeasible run-to-
@@ -904,7 +957,7 @@ class RobotIK:
     for seed in (seeds or []):
       komo.initWithConstant(np.asarray(seed, dtype=float))
       r = self._nlp(komo).solve().dict()
-      if r["feasible"] and self._pen_ok(C, komo.getPath()[-1]):
+      if r["feasible"] and self._pen_ok(C, komo.getPath()[-1]) and self._clearance_ok(C, komo.getPath()[-1]):
         self._last_res = r
         if self.harvest_branches is not None:
           # CANDIDATE HARVEST: keep going. The analytic seed set ENUMERATES the arm's exact
@@ -924,13 +977,13 @@ class RobotIK:
       # budget is for UNSEEDED solves where restarts must find the branches themselves.
       restarts = min(restarts, self.seed_restart_cap)
     r = self._nlp(komo).solve().dict()
-    if r["feasible"] and self._pen_ok(C, komo.getPath()[-1]):
+    if r["feasible"] and self._pen_ok(C, komo.getPath()[-1]) and self._clearance_ok(C, komo.getPath()[-1]):
       self._last_res = r
       return True, komo.getPath()[-1]
     for _ in range(restarts):
       komo.initRandom()
       r = self._nlp(komo).solve().dict()
-      if r["feasible"] and self._pen_ok(C, komo.getPath()[-1]):
+      if r["feasible"] and self._pen_ok(C, komo.getPath()[-1]) and self._clearance_ok(C, komo.getPath()[-1]):
         self._last_res = r
         return True, komo.getPath()[-1]
     self._last_res = r
