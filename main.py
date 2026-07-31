@@ -2011,7 +2011,8 @@ def run(cfg):
                                  pre_witnesses=mp_pre,
                                  robot_robot_margin=cfg.mp_robot_margin,
                                  robot_margin_ramp=cfg.mp_margin_ramp,
-                                 table_margin=cfg.mp_table_margin)
+                                 table_margin=cfg.mp_table_margin,
+              table_float=cfg.part_float if cfg.mp_table_margin else 0.0)
           print(f"[motion-plan] {'SEQUENCE' if cfg.mp_sequence else 'DEPGRAPH'} problem, "
                 f"{len(prob.tasks)} tasks")
           if cfg.mp_clearance:

@@ -1118,6 +1118,51 @@ class SimScene:
       F += fw if b2 == bid else -fw
     return F
 
+  def branch_contact_force(self, robot):
+    """Net world-frame contact force ON `robot`'s WHOLE branch -- arm links + gripper +
+    held cargo -- from the environment. The --compliant-follow admittance trigger:
+    net_contact_force(part) only sees a HELD part, so a press on the bare gripper (a pick
+    approach before the weld exists) or on an arm LINK never yields. Same sign convention
+    and the same welded-partner exclusion as net_contact_force (intra-assembly contact is
+    not the environment pressing); intra-branch contacts cancel and are skipped."""
+    if not hasattr(self, "_branch_bodies"):
+      self._branch_bodies = {}
+      for r in self.grasp_anchor:
+        pre = f"{r}_"
+        self._branch_bodies[r] = frozenset(
+            b for b in range(int(self.model.nbody))
+            if (mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, b) or ""
+                ).startswith(pre))
+    branch = set(self._branch_bodies.get(robot, ()))
+    g = self.active_grasps.get(robot)
+    welded = set()
+    if g is not None:
+      cid = self._body_id(g[1])
+      branch.add(cid)
+      for e in range(int(self.model.neq)):
+        if not self.data.eq_active[e] or self.model.eq_type[e] != mujoco.mjtEq.mjEQ_WELD:
+          continue
+        b1, b2 = int(self.model.eq_obj1id[e]), int(self.model.eq_obj2id[e])
+        if b1 == cid:
+          welded.add(b2)
+        elif b2 == cid:
+          welded.add(b1)
+    F = np.zeros(3)
+    for i in range(int(self.data.ncon)):
+      c = self.data.contact[i]
+      b1 = int(self.model.geom_bodyid[c.geom1])
+      b2 = int(self.model.geom_bodyid[c.geom2])
+      in1, in2 = b1 in branch, b2 in branch
+      if in1 == in2:                                       # intra-branch or foreign: skip
+        continue
+      if (b1 if in2 else b2) in welded:
+        continue
+      f6 = np.zeros(6)
+      mujoco.mj_contactForce(self.model, self.data, i, f6)
+      fw = np.asarray(c.frame, dtype=float).reshape(3, 3).T @ f6[:3]
+      F += fw if in2 else -fw
+    return F
+
   # -- stepping with grasp breakaway -----------------------------------------------------
   def _eq_index(self):
     """Row indices of the EQUALITY constraints, and their eq ids, for the CURRENT state.
@@ -1611,10 +1656,29 @@ class _SkillServo:
   """
 
   def __init__(self, scene, dt, force=6.0, yield_gain=0.004, max_dev=0.010,
-               decay_tau=0.3, kp=4.0, vmax=0.05, tol=0.002):
+               decay_tau=0.3, kp=4.0, vmax=0.05, tol=0.002, torque_guard=None,
+               compliant=False, compliant_force=3.0):
     self.scene = scene
     self.dt = float(dt)
     self.f0 = float(force)
+    # --servo-torque-guard FRAC: engage the guarded hold + yield when a held part's GRASP
+    # TORQUE exceeds FRAC of its cap, independent of contact force. The force-only trigger
+    # (f0) is blind to long-lever cargo: the chair seat reaches its 0.8Nm cap at ~8N of
+    # table drag (lever ~0.1m), so by the 6N force trigger the torque already sits at ~74%
+    # of the cap and the 20ms breakage window beats the plant-bandwidth yield. Watching the
+    # SAME weld wrench the breakage monitor judges gives the servo the full ramp to react.
+    self.torque_guard = None if torque_guard is None else float(torque_guard)
+    self.torque_holds = 0                                  # diagnostic: torque-triggered ticks
+    # --compliant-follow: WHOLE-BRANCH admittance (arm links + gripper + cargo) with its own
+    # LOWER deadband -- compliant following as the default tracking law, not a held-cargo-only
+    # feature. The guard/funnel triggers (f0) keep their meaning: the reference starts
+    # deviating at c_f0 before the clock even pauses at f0.
+    self.compliant = bool(compliant)
+    self.c_f0 = float(compliant_force)
+    self.place_ok = False                                  # --servo-place-seat (set by caller)
+    self.place_log = []                                    # (task, xy_err0, F_end, touched)
+    self.pick_ok = False                                   # --servo-pick (set by caller)
+    self.pick_log = []                                     # (task, F_at_fire, F_end, lift s)
     self.kf = float(yield_gain)                            # m/(N*s) of yield per N of excess
     self.max_dev = float(max_dev)
     self.decay = self.dt / float(decay_tau)
@@ -1633,12 +1697,21 @@ class _SkillServo:
       self.qidx.setdefault(r, []).append(i)
 
   def _jac(self, robot, part):
-    """3 x n positional Jacobian of the held part w.r.t. the carrying arm's joints. Taking it
-    at the PART (not the gripper) folds the grasp lever arm in for free."""
+    """3 x n positional Jacobian of `part`'s position w.r.t. the carrying arm's joints.
+
+    NOT mj_jacBody(part): a part is a FREEJOINT body attached to the gripper only by an
+    equality weld, so its body Jacobian has ALL-ZERO columns at the arm dofs -- lstsq then
+    returns dq=0 and every task-space servo built on it silently commands nothing (verified
+    with a minimal MuJoCo model; explains why yields never moved an actuated arm and pacing
+    was the load-bearing layer). The cargo rides rigidly on the ANCHOR body, so the correct
+    map is the point-Jacobian of the part's current position treated as attached to the
+    anchor -- same lever-arm folding, real arm columns. For part == the anchor itself (bare
+    arm) this degenerates to the anchor's own point Jacobian."""
     jacp = np.zeros((3, self.scene.model.nv))
     jacr = np.zeros((3, self.scene.model.nv))
-    mujoco.mj_jacBody(self.scene.model, self.scene.data, jacp, jacr,
-                      self.scene._body_id(part))
+    point = np.asarray(self.scene.data.xpos[self.scene._body_id(part)], dtype=float)
+    mujoco.mj_jac(self.scene.model, self.scene.data, jacp, jacr, point,
+                  self.scene._body_id(self.scene.grasp_anchor[robot]))
     return jacp[:, self.dofs[robot]]
 
   def update(self):
@@ -1647,18 +1720,70 @@ class _SkillServo:
     the per-arm yield offsets."""
     self._hot = 0.0
     self._hot_by = {}
+    if self.compliant:
+      self._update_compliant()
+      return
     for r, g in self.scene.active_grasps.items():
       part = g[1]
       F = self.scene.net_contact_force(part)
       mag = float(np.sqrt(F @ F))
-      self._hot_by[r] = mag
-      if mag > self._hot:
-        self._hot = mag
+      hot = mag
+      excess = mag - self.f0
+      if self.torque_guard is not None:
+        # torque-aware trigger (see __init__): same weld wrench the breakage monitor reads.
+        _, tmag = self.scene._weld_wrench(g[0])
+        tfrac = tmag / max(self.torque_guard * float(g[3]), 1e-9)
+        if tfrac > 1.0:
+          hot = max(hot, self.f0 + 1e-3)                   # engages guard + funnel like a press
+          # drive the yield by the NORMALISED torque excess (mapped through f0 so the gain
+          # keeps its m/(N*s) meaning); direction stays the net contact push -- at a lever
+          # press, backing off along the push shortens the drag the same way.
+          excess = max(excess, (tfrac - 1.0) * self.f0)
+          self.torque_holds += 1
+      self._hot_by[r] = hot
+      if hot > self._hot:
+        self._hot = hot
       o = self.off.get(r)
       if o is None:
         o = np.zeros(3)
-      if mag > self.f0:
-        o = o + (self.kf * (mag - self.f0) * self.dt) * (F / mag)
+      if excess > 0.0 and mag > 1e-9:
+        o = o + (self.kf * excess * self.dt) * (F / mag)
+        n = float(np.sqrt(o @ o))
+        if n > self.max_dev:
+          o = o * (self.max_dev / n)
+        if n > self.peak.get(r, 0.0):
+          self.peak[r] = n
+      else:
+        o = o * (1.0 - self.decay)
+      self.off[r] = o
+
+  def _update_compliant(self):
+    """--compliant-follow: ONE admittance loop over EVERY arm, driven by the whole-branch
+    contact force -- a press on a bare gripper (pick approach, pre-weld) or an arm link
+    yields exactly like a cargo press. Yield deadband c_f0 < f0, so the reference deviates
+    before the guard/funnel (which keep reading the same magnitudes via _hot) engage."""
+    for r in self.dofs:
+      g = self.scene.active_grasps.get(r)
+      F = self.scene.branch_contact_force(r)
+      mag = float(np.sqrt(F @ F))
+      hot = mag
+      excess = mag - self.c_f0
+      if self.torque_guard is not None and g is not None:
+        # identical torque-aware trigger to the plain path (long-lever cargo, see __init__)
+        _, tmag = self.scene._weld_wrench(g[0])
+        tfrac = tmag / max(self.torque_guard * float(g[3]), 1e-9)
+        if tfrac > 1.0:
+          hot = max(hot, self.f0 + 1e-3)
+          excess = max(excess, (tfrac - 1.0) * self.f0)
+          self.torque_holds += 1
+      self._hot_by[r] = hot
+      if hot > self._hot:
+        self._hot = hot
+      o = self.off.get(r)
+      if o is None:
+        o = np.zeros(3)
+      if excess > 0.0 and mag > 1e-9:
+        o = o + (self.kf * excess * self.dt) * (F / mag)
         n = float(np.sqrt(o @ o))
         if n > self.max_dev:
           o = o * (self.max_dev / n)
@@ -1690,7 +1815,13 @@ class _SkillServo:
       return None
     g = self.scene.active_grasps.get(robot)
     if g is None:
-      return None
+      # BARE-GRIPPER clearance (--compliant-follow / --servo-pick): the funnel was
+      # cargo-gated, so the one descent that needed it most -- an empty gripper's pick
+      # approach -- ran unpaced (measured: 13mm in 96ms into the grasp keyframe, 48N press
+      # sustained on the fresh weld). Same bottom-projection, over the EE subtree's geoms.
+      if not (self.compliant or self.pick_ok):
+        return None
+      return self._bare_ee_clearance(robot)
     part = g[1]
     gids = self._part_geoms.get(part)
     if gids is None:
@@ -1704,6 +1835,74 @@ class _SkillServo:
       if lo is None or c < lo:
         lo = c
     return lo
+
+  def _held_bodies(self):
+    """Body ids that currently ride an arm: every grasped cargo plus everything transitively
+    welded to it. A MATE weld alone does NOT mean held -- a mated subassembly resting on the
+    table is exactly what a re-pick descends onto, and treating it as held made the approach
+    funnel blind to the tallest obstacle in the scene."""
+    m, d = self.scene.model, self.scene.data
+    frontier = [self.scene._body_id(g[1]) for g in self.scene.active_grasps.values()]
+    held = set(frontier)
+    while frontier:
+      b = frontier.pop()
+      for e in range(int(m.neq)):
+        if not d.eq_active[e] or m.eq_type[e] != mujoco.mjtEq.mjEQ_WELD:
+          continue
+        b1, b2 = int(m.eq_obj1id[e]), int(m.eq_obj2id[e])
+        other = b2 if b1 == b else (b1 if b2 == b else None)
+        if other is not None and other not in held:
+          held.add(other)
+          frontier.append(other)
+    return held
+
+  def _bare_ee_clearance(self, robot):
+    """Min clearance (m) of an EMPTY gripper above the table or any LOOSE part beneath it,
+    so the funnel paces a pick approach onto what it is actually descending toward -- a part
+    top sits ~12mm above the table, and table-only clearance would let the EE arrive at
+    part height still doing 20mm/s."""
+    m, d = self.scene.model, self.scene.data
+    if not hasattr(self, "_ee_geoms"):
+      self._ee_geoms = {}
+    gids = self._ee_geoms.get(robot)
+    if gids is None:
+      sub = {self.scene._body_id(self.scene.grasp_anchor[robot])}
+      grew = True                                          # anchor body + its descendants
+      while grew:
+        grew = False
+        for b in range(int(m.nbody)):
+          if b not in sub and int(m.body_parentid[b]) in sub:
+            sub.add(b)
+            grew = True
+      gids = [gi for gi in range(m.ngeom) if int(m.geom_bodyid[gi]) in sub]
+      self._ee_geoms[robot] = gids
+    if not gids:
+      return None
+    bot, xy = None, None
+    for gi in gids:
+      R = d.geom_xmat[gi].reshape(3, 3)
+      zb = float(d.geom_xpos[gi][2] - np.abs(R[2]) @ m.geom_size[gi])
+      if bot is None or zb < bot:
+        bot, xy = zb, np.asarray(d.geom_xpos[gi][:2])
+    c = bot - self._ttop
+    held = self._held_bodies()
+    for p in self.scene.assembly.objects:
+      if self.scene._body_id(p) in held:
+        continue                                           # rides an arm: not an obstacle
+      pg = self._part_geoms.get(p)
+      if pg is None:
+        bid = self.scene._body_id(p)
+        pg = [gi for gi in range(m.ngeom) if int(m.geom_bodyid[gi]) == bid]
+        self._part_geoms[p] = pg
+      for gi in pg:
+        dx = d.geom_xpos[gi][:2] - xy
+        if float(dx @ dx) > (float(np.max(m.geom_size[gi])) + 0.03) ** 2:
+          continue
+        R = d.geom_xmat[gi].reshape(3, 3)
+        cp = bot - float(d.geom_xpos[gi][2] + np.abs(R[2]) @ m.geom_size[gi])
+        if -0.005 < cp < c:                                # beside/below a part != above it
+          c = cp
+    return c
 
   def rate_factors(self, robot_names, near=0.012, pace=6):
     # NB: unlike the retired static schedule caps, a factor here lasts exactly as long as its
@@ -1751,12 +1950,97 @@ class _SkillServo:
         continue
       g = self.scene.active_grasps.get(r)
       if g is None:
-        continue
-      dq = np.linalg.lstsq(self._jac(r, g[1]), o, rcond=None)[0]
+        if not self.compliant:
+          continue
+        body = self.scene.grasp_anchor[r]                  # bare arm: yield at the EE
+      else:
+        body = g[1]
+      dq = np.linalg.lstsq(self._jac(r, body), o, rcond=None)[0]
       if out is None:
         out = np.asarray(q, dtype=float).copy()
       out[self.qidx[r]] += np.clip(dq, -0.05, 0.05)
     return q if out is None else out
+
+  def place_seat(self, q_ref, part, target_pose, name, drive, tick, budget):
+    """--servo-place-seat: force-terminated PLACE. A place's terminal objective is a CONTACT
+    STATE -- the part resting on the real support -- not a coordinate: the joint reference's
+    z was authored against the PLANNER's table, which sits part_float BELOW the executed one,
+    so tracking it grinds the part into the surface (measured on the chair seat: 0.22mm/s
+    descent ratcheting the grasp torque to its cap). Here the part is servoed in TASK SPACE:
+    XY toward the rest anchor, z descending at a bounded rate, TERMINATED by sustained
+    contact -- the executed world, not the model, decides where the set-down ends."""
+    holder = next((r for r, g in self.scene.active_grasps.items() if g[1] == part), None)
+    if holder is None:
+      return
+    tgt = np.asarray(target_pose[:3], dtype=float)
+    q_ref = np.asarray(q_ref, dtype=float).copy()
+    e0 = touched = 0
+    fmag = 0.0
+    for k in range(int(budget / self.dt)):
+      cur = np.asarray(self.scene.part_pose(part)[:3], dtype=float)
+      if k == 0:
+        e0 = float(np.hypot(*(tgt[:2] - cur[:2])))
+      F = self.scene.net_contact_force(part)
+      fmag = float(np.sqrt(F @ F))
+      if fmag > 4.0 * self.f0:
+        break                                              # bulldoze guard, as in seat()
+      touched = touched + 1 if fmag > 0.5 * self.f0 else 0
+      if touched * self.dt >= 0.03:
+        break                                              # 30ms of sustained support: seated
+      e = np.zeros(3)
+      e[:2] = np.clip(self.kp * (tgt[:2] - cur[:2]), -self.vmax, self.vmax)
+      e[2] = -0.015                                        # bounded descent toward touch (m/s)
+      dq = np.linalg.lstsq(self._jac(holder, part), e * self.dt, rcond=None)[0]
+      q_ref[self.qidx[holder]] += np.clip(dq, -0.02, 0.02)
+      drive(q_ref)
+      tick()
+    self.place_log.append((name, e0, fmag, touched * self.dt >= 0.03))
+
+  def pick_lift(self, q_ref, robot, part, name, drive, tick, budget):
+    """--servo-pick: force-terminated LIFT-OFF owning the fresh-weld window. A pick's grasp
+    keyframe is a CONTACT terminal: it is authored ~1mm into the part, plant lag bottoms out
+    PAST it right after the fire, and the press lands exactly inside the 20ms breakage
+    sustain that judges the brand-new weld (measured on chair-8 obj_3: 48N, identical with
+    reference-side compliance active -- the onset outruns the plant). So do not track
+    through it: rise in task space at a bounded rate until the cargo is contact-free
+    (sustained), then hand back to the schedule."""
+    q = np.asarray(q_ref, dtype=float).copy()
+    # START FROM THE PLANT, NOT THE SCHEDULE. The fire-sample reference sits at the authored
+    # grasp depth (~1mm into the part), and the funnel-paced plant can still be several mm
+    # ABOVE it at fire time -- re-commanding that baseline plus a slow rise still NET-DESCENDS
+    # the arm into the press (measured: 8.4mm plunge, 48N, weld broke inside the lift's first
+    # ticks while its own force check read "free").
+    jn = self.scene._rai_joints
+    for j in self.qidx[robot]:
+      q[j] = float(self.scene.data.qpos[self.scene._qadr[jn[j]]])
+    F0 = float(np.linalg.norm(self.scene.net_contact_force(part)))
+    free = ticks = 0
+    for _ in range(int(budget / self.dt)):
+      F = self.scene.net_contact_force(part)
+      if float(F @ F) < 1.0:                               # < 1N: cargo is free...
+        free += 1
+        c = self._cargo_clearance(robot)
+        # ...but free NOW is not enough: the schedule resumes at the pressing keyframe, so
+        # terminate only with real CLEARANCE in hand (or when the scene has no table datum).
+        if free * self.dt >= 0.03 and (c is None or c >= 0.004):
+          break
+      else:
+        free = 0
+      dq = np.linalg.lstsq(self._jac(robot, part),
+                           np.array([0.0, 0.0, 0.8 * self.vmax]) * self.dt, rcond=None)[0]
+      q[self.qidx[robot]] += np.clip(dq, -0.01, 0.01)
+      drive(q)
+      tick()
+      ticks += 1
+    # PARK the achieved lift in the admittance offset: adjust() keeps applying it to the
+    # resumed schedule (which dwells AT the pressing keyframe post-fire) and it decays away
+    # over decay_tau as the retreat takes over -- otherwise tracking pulls straight back
+    # into the press the lift just relieved.
+    o = np.array([0.0, 0.0, min(ticks * 0.8 * self.vmax * self.dt, self.max_dev)])
+    if o[2] > self.off.get(robot, np.zeros(3))[2]:
+      self.off[robot] = o
+    self.pick_log.append((name, F0, float(np.linalg.norm(
+        self.scene.net_contact_force(part))), ticks * self.dt))
 
   def seat(self, q_ref, parent, child, name, drive, tick, budget):
     """Servo `child` to its ideal datum on `parent` before the mate weld fires. Position only
@@ -1804,7 +2088,9 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         articulated=False, actuated=False, use_planner_table=False,
                         corridor_margin=0.0, weld_timeconst=None, limit_rate=False,
                         skill_servo=False, servo_force=6.0, servo_max_dev=0.010,
-                        servo_tol=0.002):
+                        servo_tol=0.002, servo_torque_guard=None,
+                        servo_place_seat=False, compliant_follow=False,
+                        compliant_force=3.0, servo_pick=False):
   """Execute an mr_bench PATH (from mp_export.run_birrt) in MuJoCo with the REAL ARMS:
   every rai robot shape frame (the capsule collision model + gripper primitives) is mirrored
   as a kinematic body positioned by rai FK along the path -- the planner's own kinematics by
@@ -1875,7 +2161,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           f"(arm_model), driven by SETTING qpos -- not {len(arms)} teleported mocap bodies. "
           f"Still perfectly stiff; run fk_compare.py to re-check the model.")
 
-  def settle_before_fire(q):
+  def settle_before_fire(q, touch_robots=()):
     """ACTUATED: hold the reference until the arm has actually ARRIVED, then fire.
 
     The schedule's dwell is a fixed DWELL_T, but a servo needs as long as it needs: measured on
@@ -1891,6 +2177,13 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     for _ in range(int(settle_max / DT)):
       if scene.tracking_error(q) <= settle_tol:
         break
+      if touch_robots and any(
+          float(np.linalg.norm(scene.branch_contact_force(r))) > 1.0 for r in touch_robots):
+        # --servo-pick: the picking arm has TOUCHED its part. The remaining tracking error
+        # IS the authored grasp interference (~1mm into the part) -- settling it closed is
+        # what drove the 48-52N press the fresh weld then inherited and broke under. Fire
+        # at touch instead; pick_lift owns the rest of the window.
+        break
       drive_q(q)                                             # qdot=0: hold, do not lead
       scene.step(1, report, ("settle",))
 
@@ -1901,10 +2194,60 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       return
     t = problem.tasks[tid]
     fr = getattr(t, "frames", None)
-    if not fr or fr[0] not in assembly.objects:
+    if not fr:
+      return
+    if fr[0] == "table" and len(fr) > 1 and fr[1] in assembly.objects and servo.place_ok:
+      # --servo-place-seat: a PLACE fires by CONTACT, not by coordinate (see place_seat).
+      _l = name_of.get(t.name)
+      if _l is not None:
+        exp = _state_part_poses(states[min(_l[0] + 1, len(states) - 1)], assembly,
+                                lift=CARRY_LIFT)[fr[1]]
+        servo.place_seat(q_ref, fr[1], np.asarray(exp, dtype=float), t.name, drive_q,
+                         lambda: scene.step(1, report, ("servo",)), settle_max)
+      return
+    if fr[0] not in assembly.objects:
       return                                               # grasps/releases: no datum to seat
     servo.seat(q_ref, fr[0], fr[1], t.name, drive_q,
                lambda: scene.step(1, report, ("servo",)), settle_max)
+
+  def _touch_robots(tids):
+    """--servo-pick: the arms whose fire at this barrier is a PICK -- their settle must
+    terminate on TOUCH, not on tracking convergence into the authored grasp interference."""
+    if servo is None or not servo.pick_ok:
+      return ()
+    out = []
+    for tid in tids:
+      if _pick_task(tid) is not None:
+        out.extend(problem.tasks[tid].robots)
+    return tuple(out)
+
+  def _pick_task(tid):
+    """The part a PICK task acquires, or None. Keys on the PLAN ACTION kind, not on
+    Task.type: mp_export gives inhand_reorient `type="pick"` too (it re-attaches to the same
+    gripper), and running a lift-off on an already-held, in-air part is a spurious 1s stall."""
+    t = problem.tasks[tid]
+    lbl = name_of.get(t.name)
+    if lbl is None or plan[lbl[0]][0] != "pick":
+      return None
+    fr = getattr(t, "frames", None)
+    if not fr or len(fr) < 2 or fr[1] not in assembly.objects:
+      return None
+    return fr[1]
+
+  def lift_after_fire(tid, q_ref):
+    """--servo-pick: own the fresh-weld window AFTER a pick fires -- rise until the new
+    cargo is contact-free instead of tracking through the pressing grasp keyframe (see
+    _SkillServo.pick_lift). Handovers/places keep their own terminals."""
+    if servo is None or not servo.pick_ok:
+      return
+    part = _pick_task(tid)
+    if part is None:
+      return
+    holder = next((r for r, g in scene.active_grasps.items() if g[1] == part), None)
+    if holder is None:
+      return
+    servo.pick_lift(q_ref, holder, part, problem.tasks[tid].name, drive_q,
+                    lambda: scene.step(1, report, ("servo",)), settle_max)
 
   def servo_summary():
     # called from EVERY executor tail -- the corridor branch returns early, and the first
@@ -1921,6 +2264,15 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             f"(no held-part contact above {servo.f0:g}N).")
     for nm, e0, e1 in servo.seat_log:
       print(f"[sim/mp] --skill-servo seat {nm}: {e0*1000:.1f}mm -> {e1*1000:.1f}mm")
+    for nm, e0, fN, ok in servo.place_log:
+      print(f"[sim/mp] --servo-place-seat {nm}: xy_err {e0*1000:.1f}mm, "
+            f"end |F| {fN:.1f}N, {'TOUCHED' if ok else 'no touch (guard/budget)'}")
+    for nm, f0_, fN, secs in servo.pick_log:
+      print(f"[sim/mp] --servo-pick {nm}: fire |F| {f0_:.1f}N -> {fN:.1f}N "
+            f"after {secs*1000:.0f}ms lift")
+    if servo.torque_holds:
+      print(f"[sim/mp] --servo-torque-guard: {servo.torque_holds} tick(s) engaged by the "
+            f"TORQUE trigger (force alone was below {servo.f0:g}N)")
 
   # NO-FUNNEL WARNING. An assemble whose export is a single task drives the held part STRAIGHT to
   # a pose that is already in contact, so it arrives LATERALLY and sweeps the target: measured on
@@ -1985,7 +2337,29 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       print("[sim/mp] --skill-servo needs --actuated (stiff modes have no tracking error to "
             "yield with); IGNORED.")
     else:
-      servo = _SkillServo(scene, DT, force=servo_force, max_dev=servo_max_dev, tol=servo_tol)
+      servo = _SkillServo(scene, DT, force=servo_force, max_dev=servo_max_dev, tol=servo_tol,
+                          torque_guard=servo_torque_guard, compliant=compliant_follow,
+                          compliant_force=compliant_force)
+      servo.place_ok = bool(servo_place_seat)
+      servo.pick_ok = bool(servo_pick)
+      if servo_pick:
+        print("[sim/mp] --servo-pick ACTIVE: picks own their fresh-weld window -- the bare-"
+              "gripper approach is funnel-paced (EE clearance to the table AND loose parts), "
+              "and after each pick fire the arm RISES until the cargo is contact-free "
+              "instead of tracking through the pressing grasp keyframe.")
+      if compliant_follow:
+        print(f"[sim/mp] --compliant-follow ACTIVE: whole-branch admittance -- arm links, "
+              f"bare gripper AND cargo forces all yield the reference above "
+              f"{compliant_force:g}N, everywhere along the path (guard/funnel keep engaging "
+              f"at {servo_force:g}N as before).")
+      if servo_place_seat:
+        print("[sim/mp] --servo-place-seat ACTIVE: places terminate by CONTACT (task-space "
+              "XY-to-anchor + bounded descent until sustained touch) instead of tracking the "
+              "joint reference's z, which is authored against the planner's lower table.")
+      if servo_torque_guard is not None:
+        print(f"[sim/mp] --servo-torque-guard {servo_torque_guard:g}: guarded hold + yield "
+              f"also engage at {servo_torque_guard:.0%} of a grasp's TORQUE cap -- the "
+              f"force-only trigger is blind to long-lever cargo (seat: cap reached at ~8N).")
       print(f"[sim/mp] --skill-servo ACTIVE: held-part admittance (yield above "
             f"{servo_force:g}N, bounded {servo_max_dev*1000:g}mm, force-triggered so intended "
             f"contacts still happen) + terminal seat servo to the mate datum before each "
@@ -2069,6 +2443,21 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       mp_path, q_of=lambda st: full_q(st.q),
       mode_of=lambda st: st.mode,
       taskids_of=lambda m: np.atleast_1d(m.task_ids))
+  # FIRE-COVERAGE GUARD: every task's completion must land in some stretch's done set -- a
+  # task in none of them simply never fires, and its attach/release side effects are skipped
+  # SILENTLY (the dropped-holder-release failure class: the arm keeps its weld and drags the
+  # assembly). repair_mode_chain heals the known cause upstream at the load/plan sites, so
+  # anything still missing here is real path corruption: stop, do not execute.
+  _fired_ids = set()
+  for _w, _tids in stretches:
+    _fired_ids.update(int(t) for t in _tids)
+  _unfired = sorted(set(range(len(problem.tasks))) - _fired_ids)
+  if _unfired:
+    raise RuntimeError(
+        f"[sim/mp] fire-coverage: task id(s) {_unfired} "
+        f"({', '.join(problem.tasks[t].name for t in _unfired)}) complete at NO stretch "
+        f"boundary -- their attach events would never fire. The path is missing their modes "
+        f"and repair could not restore them; re-export the path for this plan.")
 
   arm_dims = [np.asarray(ridx[r], int) for r in robots]
   # --arm-rate: JOINT_RATE is nominally a PER-ARM joint speed, but it is applied to the
@@ -2931,10 +3320,11 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       drive_q(qc)
       scene.step(1, report, ("path",))
       if fire_k is not None:
-        settle_before_fire(qc0)
+        settle_before_fire(qc0, _touch_robots(online_fire_tids[fire_k]))
         for tid in online_fire_tids[fire_k]:
           seat_before_fire(tid, qc0)
           fire(tid)
+          lift_after_fire(tid, qc0)
         online_stepper.confirm_fire()
     print(f"[sim/mp] --corridor-online: {_n_tick} ticks executed "
           f"({online_stepper.fired}/{online_stepper.K} events), no precomputed schedule; "
@@ -2949,7 +3339,41 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     # untouched, recording bit-identical to baseline). The uncertified --prioritized branch
     # is REMOVED. The GLOBAL pacing/guard below is the offline modes' blunt instrument; the
     # per-arm version lives in the --corridor-online stepper above.
-    for i in range(len(traj.q)):
+    _fire_samples = sorted(fire_at)
+
+    def _pending_place(i):
+      """If the NEXT fire is a lone PLACE of a currently-PRESSED cargo, return
+      (fire sample, tid, part, expected rest pose); else None."""
+      if servo is None or not servo.place_ok:
+        return None
+      j = next((sm for sm in _fire_samples if sm >= i), None)
+      if j is None or len(fire_at[j]) != 1:                 # bundled foreign fires: no jump --
+        return None                                        # other arms are mid-path at i
+      tid = fire_at[j][0]
+      t = problem.tasks[tid]
+      fr = getattr(t, "frames", None)
+      if not fr or fr[0] != "table" or len(fr) < 2 or fr[1] not in assembly.objects:
+        return None
+      holder = next((r for r, g in scene.active_grasps.items() if g[1] == fr[1]), None)
+      if holder is None or getattr(servo, "_hot_by", {}).get(holder, 0.0) <= servo.f0:
+        return None
+      _l = name_of.get(t.name)
+      if _l is None:
+        return None
+      # NO JUMP OVER OTHER ARMS' MOTION. Skipping to the fire sample teleports the reference
+      # of every arm that was mid-carry across [i, j]: drive_q derives qdot from the
+      # reference delta, so a one-tick velocity spike hits arms that have nothing to do with
+      # this place. Only jump when the span is the holder's alone.
+      _hold_dims = set(int(x) for x in arm_dims[robots.index(holder)])
+      _others = [k for k in range(traj.q[i].shape[0]) if k not in _hold_dims]
+      if _others and float(np.max(np.abs(traj.q[j][_others] - traj.q[i][_others]))) > 1e-3:
+        return None
+      exp = _state_part_poses(states[min(_l[0] + 1, len(states) - 1)], assembly,
+                              lift=CARRY_LIFT)[fr[1]]
+      return j, tid, fr[1], np.asarray(exp, dtype=float)
+
+    i, _NQ = 0, len(traj.q)
+    while i < _NQ:
       qc = traj.q[i]
       if servo is not None:
         servo.update()
@@ -2980,15 +3404,30 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           servo.update()
           qc = servo.adjust(traj.q[i])
           held += 1
+        if held >= int(1.0 / DT) and servo.pressing():
+          # GUARD EXHAUSTED, STILL PRESSED. If what the schedule is grinding toward is a
+          # PLACE of the pressed cargo, stop consuming the joint reference (its z is
+          # authored against the planner's lower table) and let the skill finish by
+          # CONTACT: task-space servo to the rest anchor, touch-terminate, fire the
+          # place, resume after its sample. --servo-place-seat only; else old behaviour.
+          _pp = _pending_place(i)
+          if _pp is not None:
+            _j, _tid, _part, _exp = _pp
+            servo.place_seat(qc, _part, _exp, problem.tasks[_tid].name, drive_q,
+                             lambda: scene.step(1, report, ("servo",)), settle_max)
+            fire(_tid)                                     # capture the TOUCHED pose
+            i = _j + 1
+            continue
       drive_q(qc)
       scene.trace_ctx = i
       scene.step(1, report, (traj.phase[i],))
       if i in fire_at:
-        settle_before_fire(traj.q[i])
+        settle_before_fire(traj.q[i], _touch_robots(fire_at[i]))
         for tid in fire_at[i]:
           seat_before_fire(tid, traj.q[i])
           fire(tid)                                          # acting arms rest through the
-                                                             # schedule's own post-fire dwell
+          lift_after_fire(tid, traj.q[i])                    # schedule's own post-fire dwell
+      i += 1
   scene.step(int(SETTLE_T / DT), report, ("settle",))
   servo_summary()
 
@@ -3348,7 +3787,9 @@ def _cli_run(a):
                            depgraph=False, collision_tolerance=a.mp_tolerance,
                            robot_robot_margin=float(cfg.get("mp_robot_margin") or 0.0),
                            robot_margin_ramp=float(cfg.get("mp_margin_ramp") or 0.0),
-                           table_margin=float(cfg.get("mp_table_margin") or 0.0))
+                           table_margin=float(cfg.get("mp_table_margin") or 0.0),
+                           table_float=(float(cfg.get("part_float") or 0.0)
+                                        if cfg.get("mp_table_margin") else 0.0))
     if a.mp_path:                                          # load a saved BiRRT path -> no re-plan
       path = MP.load_path(a.mp_path)
       print(f"[sim] loaded motion path ({len(path)} states) from {a.mp_path} -- skipping BiRRT")
@@ -3372,6 +3813,14 @@ def _cli_run(a):
               f"has pre_insertion={cfg.get('pre_insertion')}). Aborting -- executing would "
               f"relink at the wrong times.")
         return
+      # HEAL DROPPED ZERO-MOTION MODES: shortcutting can erase a zero-motion task's whole
+      # mode stretch from a saved path (see MP.repair_mode_chain), and the fire extraction
+      # derives events from mode transitions -- on chair-8 the holder-release never fired and
+      # the arm dragged the chair to its next pick. Dirty files on disk heal here on load.
+      path, _ = MP.repair_mode_chain(
+          path, MP.mode_sequence(prob),
+          lambda ref, m: MP._PathState(ref.q,
+                                       MP._Mode([int(t) for t in np.atleast_1d(m.task_ids)])))
     else:
       # seed precedence: sim CLI > the seed the plan was SOLVED/exported with > unseeded.
       _mseed = a.mp_seed if a.mp_seed is not None else cfg.get("mp_seed")
@@ -3395,7 +3844,12 @@ def _cli_run(a):
                               corridor_cross_only=a.corridor_cross_only,
                               corridor_online=a.corridor_online,
                               skill_servo=a.skill_servo, servo_force=a.servo_force,
+                              compliant_follow=a.compliant_follow,
+                              compliant_force=a.compliant_force,
+                              servo_pick=a.servo_pick,
                               servo_max_dev=a.servo_max_dev, servo_tol=a.servo_tol,
+                              servo_torque_guard=a.servo_torque_guard,
+                              servo_place_seat=a.servo_place_seat,
                               rate_clamp=a.corridor_rate_clamp,
                               settle_tol=a.settle_tol, settle_max=a.settle_max,
                               directional_caps=a.directional_caps,
@@ -3482,6 +3936,21 @@ def _build_cli():
                       "residual exists at fire time into the hand.")
   r.add_argument("--settle-max", type=float, default=1.0, metavar="SEC",
                  help="--settle-tol: give up waiting after this long (default 1.0s).")
+  r.add_argument("--servo-pick", action=argparse.BooleanOptionalAction, default=False,
+                 help="with --skill-servo: picks OWN their terminal -- the empty gripper's "
+                      "approach is funnel-paced by EE clearance (to the table and to loose "
+                      "parts), and after the fire the arm rises until the fresh cargo is "
+                      "contact-free instead of tracking through the pressing grasp keyframe "
+                      "(the measured 48N/20ms fresh-weld break class).")
+  r.add_argument("--compliant-follow", action=argparse.BooleanOptionalAction, default=False,
+                 help="with --skill-servo: WHOLE-BRANCH admittance during all path following "
+                      "-- contact force on arm links and the bare gripper (a pick approach "
+                      "before any weld exists) yields the reference exactly like a cargo "
+                      "press, with its own lower deadband --compliant-force. Compliant "
+                      "following as the default tracking law instead of held-cargo-only.")
+  r.add_argument("--compliant-force", type=float, default=3.0, metavar="N",
+                 help="--compliant-follow yield deadband (N); the guard/funnel keep engaging "
+                      "at --servo-force")
   r.add_argument("--skill-servo", action=argparse.BooleanOptionalAction, default=True,
                  help="--actuated: compliant skills -- the execution half of the funnel. "
                       "(a) held-part ADMITTANCE: above --servo-force the arm's reference "
@@ -3498,6 +3967,20 @@ def _build_cli():
   r.add_argument("--servo-max-dev", type=float, default=0.010, metavar="M",
                  help="--skill-servo: task-space yield bound (default 10mm -- the tube the "
                       "reference may leave the certified path by).")
+  r.add_argument("--servo-place-seat", action=argparse.BooleanOptionalAction, default=False,
+                 help="--skill-servo: PLACES terminate by CONTACT -- task-space servo of the "
+                      "held part (XY to the rest anchor, bounded descent) until sustained "
+                      "touch, instead of tracking a joint reference whose z was authored "
+                      "against the PLANNER's table (part_float below the real one; the "
+                      "datum-band grind that ratchets long-lever grasps to their torque "
+                      "cap). Fires the place at the touched pose. Default off.")
+  r.add_argument("--servo-torque-guard", type=float, default=None, metavar="FRAC",
+                 help="--skill-servo: ALSO engage the guarded hold + yield when a held part's "
+                      "grasp TORQUE exceeds FRAC of its cap (e.g. 0.6). The force-only 6N "
+                      "trigger is blind to long-lever cargo: the chair seat hits its 0.8Nm cap "
+                      "at ~8N of table drag, past the 20ms breakage window before the yield "
+                      "can react. Watches the same weld wrench the breakage monitor judges. "
+                      "Default off (byte-identical).")
   r.add_argument("--servo-tol", type=float, default=0.002, metavar="M",
                  help="--skill-servo: seat-servo convergence tolerance (default 2mm).")
   r.add_argument("--corridor-online", action="store_true",

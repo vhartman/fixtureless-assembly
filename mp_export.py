@@ -335,7 +335,8 @@ def _dependency_graph(plan, states, step_names, robots, robot_ik):
   return g
 
 
-def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_margin=0.0):
+def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_margin=0.0,
+                          table_float=0.0):
   """MONKEY-PATCH a robot-robot clearance margin onto the exported problem (mr_bench unmodified).
 
   `table_margin` adds the CARRIED-PART-vs-TABLE case (the transit graze: BiRRT+shortcut has no
@@ -510,7 +511,17 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
           # of negative d there makes the place transition UNSATISFIABLE -- measured 0/4000
           # valid samples, which is exactly BiRRT's 10k-attempts wall. Penetration at the
           # ends stays the BASE predicate's job; the margin only shapes MID-TRANSIT clearance.
-          if d < table_margin * (1.5 * f - 0.5):
+          # DATUM FIX (2026-07-30, FRAGILITY 2.6 option A): the SIM raises its table by
+          # part_float, so planner distance d overstates the REAL clearance by exactly that
+          # much. Compare against the real table (d_eff), and enforce a hard never-below-
+          # real-contact floor even inside the ramp: a carried part commanded below the
+          # sim's surface is always a press the base predicate cannot see (its table is
+          # lower). Ends stay contact-allowed at d_eff ~ 0 (pick/set-down rest ON the real
+          # table); measured without this: 185N table press snapping the seat grasp.
+          d_eff = d - table_float
+          if d_eff < -0.001:
+            return True
+          if max(d_eff, 0.0) < table_margin * (1.5 * f - 0.5):
             return True
         continue                             # table pairs never enter the robot-robot branch
       if margin <= 0.0 or d >= margin:
@@ -585,7 +596,8 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
 
 def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, bracing,
                  depgraph=False, collision_tolerance=0.01, pre_witnesses=None,
-                 robot_robot_margin=0.0, robot_margin_ramp=0.0, table_margin=0.0):
+                 robot_robot_margin=0.0, robot_margin_ramp=0.0, table_margin=0.0,
+                 table_float=0.0):
   """Build a live mr_bench problem from our solved plan. depgraph=False -> SequenceMixin (a
   fixed total order); depgraph=True -> DependencyGraphMixin (the partial order, so the planner
   may reorder independent actions). Same tasks/frames/witnesses either way."""
@@ -654,7 +666,8 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
               "the mode after every pick starts in violation and planning will wedge.")
     _install_robot_margin(env, float(robot_robot_margin or 0.0), list(robots),
                           robot_ik.gripper_frame, ramp=float(robot_margin_ramp),
-                          table_margin=float(table_margin or 0.0))
+                          table_margin=float(table_margin or 0.0),
+                          table_float=float(table_float or 0.0))
   return env
 
 
@@ -789,6 +802,12 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
     if verbose:
       after = path_cost(path, problem.batch_config_cost)
       print(f"[mp/birrt] shortcut: {len(path)} states, cost {before:.3f} -> {after:.3f}")
+  if path:
+    from multi_robot_multi_goal_planning.problems.planning_env import State as _State
+    path, n_repaired = repair_mode_chain(path, mode_sequence(problem),
+                                         lambda ref, m: _State(ref.q, m))
+    if n_repaired:
+      info["mode_repair"] = n_repaired
   return path, info
 
 
@@ -922,6 +941,49 @@ def mode_sequence(problem):
     combos = env.get_valid_next_task_combinations(m)
     task = env.get_active_task(m, combos[0] if combos else None)
     m = env.get_next_modes(goal_config(m, task), m)[0]
+
+
+def repair_mode_chain(path, chain, make_state, verbose=True):
+  """Re-insert task modes that shortcutting DROPPED from a path. mr_bench's
+  remove_interpolated_nodes deletes the middle of three states whenever the outer two configs
+  coincide WITHOUT checking the middle state's mode (the A.mode != C.mode guard sits on the
+  collinear branch only), and a ZERO-MOTION task -- a release/goto whose goal pins every
+  involved arm where it already is -- has its whole mode stretch at ONE config, so once
+  shortcutting straightens the uninvolved arms through it the entire stretch is erased.
+  The geometry stays valid; only the mode ANNOTATION loses an entry -- and every consumer
+  that derives EVENTS from mode transitions (the sim's fire extraction) then silently skips
+  that task's side effects (measured on chair-8: the holder-release never fired and the arm
+  dragged the whole chair to its next pick; 10 of 15 saved paths on disk were missing ids).
+
+  `chain` = mode_sequence(problem), the symbolically-expected mode order. Wherever adjacent
+  path states jump PAST chain entries, the missing modes are re-inserted at the boundary
+  config -- correct by construction: a mode can only collapse when it is zero-motion, so its
+  one true config IS the boundary config. make_state(ref_state, chain_mode) builds an
+  inserted state of the caller's path-state type. Clean paths come back unchanged.
+  Returns (path, number of inserted states)."""
+  ids = lambda m: frozenset(int(t) for t in np.atleast_1d(m.task_ids))
+  where = {ids(m): k for k, m in enumerate(chain)}
+  out, prev_k, inserted = [], None, []
+  for st in path:
+    k = where.get(ids(st.mode))
+    if k is None:
+      # a mode outside the problem's chain: this is not our path/problem pair -- leave it
+      # alone and let the task-signature guards at the call sites do the complaining.
+      if verbose:
+        print(f"[mp/repair] path mode {sorted(ids(st.mode))} not in the problem's mode "
+              f"chain; leaving the path unrepaired")
+      return list(path), 0
+    if prev_k is not None:
+      for j in range(prev_k + 1, k):
+        out.append(make_state(out[-1], chain[j]))
+        inserted.append(sorted(ids(chain[j]) - ids(chain[j - 1])))
+    out.append(st)
+    prev_k = k
+  if inserted and verbose:
+    print(f"[mp/repair] re-inserted {len(inserted)} dropped zero-motion mode(s); newly "
+          f"active task ids per inserted mode: {inserted} -- without this their attach/"
+          f"release events would never fire")
+  return out, len(inserted)
 
 
 def report_problem_clearance(problem, plan=None, margin=0.02, verbose=True,
