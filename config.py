@@ -124,6 +124,8 @@ class RunConfig:
   strict_mate_collisions: bool = False
   ik_accuracy: Optional[float] = None
   mate_accuracy: Optional[float] = None
+  grasp_accuracy: Optional[float] = None
+  grasp_eq_weight: Optional[float] = None
   mate_eq_weight: Optional[float] = 100.0
   place_eq_weight: Optional[float] = 100.0
   grasp_translations: int = 0
@@ -131,6 +133,9 @@ class RunConfig:
   grasp_sampler_keep: int = 12
   grasp_sampler_candidates: int = 200
   grasp_sampler_seed: int = 0
+  grasp_sampler_margin: float = 0.008
+  grasp_sampler_pad_support: float = 0.75
+  stable_rest_poses: bool = False
   tight_fingers: bool = True
   quiet_rai: bool = False
 
@@ -138,6 +143,8 @@ class RunConfig:
   optimize_witnesses: Optional[str] = "floor"
   witness_clearance: float = 0.0
   witness_draw: Optional[int] = None
+  witness_sets: int = 0
+  witness_set_spread: float = 0.05
   ban_actions: Optional[str] = None
   witness_margin: Optional[float] = None
   witness_branch_budget: int = 5

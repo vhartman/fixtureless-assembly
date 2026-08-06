@@ -128,6 +128,8 @@ class Assembly:
     spec = self.part_shapes.get(part)
     if not spec:
       return 0.05
+    if spec[0] in ("mesh", "compound"):
+      return float(np.max(_shape_half_extents(spec)))     # same convention: max half-extent
     kind, p = spec[0], np.asarray(spec[1], dtype=float)
     if kind in ("box", "ssBox"):
       return 0.5 * float(np.max(p[:3]))
@@ -181,6 +183,14 @@ class Assembly:
       sq = _shape_quat(spec)
       Rs = np.eye(3) if sq is None else _quat_to_R(np.asarray(sq, dtype=float))
       pts = []
+      if kind == "compound":                               # union of the children's samples
+        return np.vstack([surface_points(sub) + off
+                          for sub, off in _compound_children(spec)])
+      if kind == "mesh":
+        m = _load_mesh(params)["mesh"]                     # deterministic samples: vertices
+        vs = np.vstack([np.asarray(m.vertices, dtype=float),   # + face centroids
+                        np.asarray(m.triangles_center, dtype=float)])
+        return vs @ Rs.T
       if kind == "cylinder":
         L, r = float(params[0]), float(params[1])
         for z in np.linspace(-L / 2.0, L / 2.0, n_axial):
@@ -203,7 +213,14 @@ class Assembly:
       kind, params = spec[0], spec[1]
       sq = _shape_quat(spec)
       Rs = np.eye(3) if sq is None else _quat_to_R(np.asarray(sq, dtype=float))
+      if kind == "compound":                               # nearest of the children
+        return np.min([dist_to_shape(pts_local - off, sub)
+                       for sub, off in _compound_children(spec)], axis=0)
       q = pts_local @ Rs                                   # into the shape's own frame
+      if kind == "mesh":
+        import trimesh
+        sd = trimesh.proximity.signed_distance(_load_mesh(params)["mesh"], q)
+        return np.maximum(0.0, -np.asarray(sd, dtype=float))   # interior counts as touching
       if kind == "cylinder":
         L, r = float(params[0]), float(params[1])
         dr = np.maximum(np.linalg.norm(q[:, :2], axis=1) - r, 0.0)
@@ -343,9 +360,20 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
           row, col = divmod(i, per_row)
           pos = np.array([-0.5 + col * spacing, row * spacing, z])
 
-      sq = _shape_quat(spec)
+      sq = _shape_quat(spec) if spec[0] != "compound" else None
       obj = C.addFrame(name).setParent(C.getFrame("table"))
-      if sq is None:                                       # shape on the part frame itself
+      _extra_shape_fs = []
+      if spec[0] == "compound":                            # one rigid child per sub-shape
+        for k, (sub, off) in enumerate(_compound_children(spec)):
+          shp = _set_raw_shape(C.addFrame(f"{name}__shape{k}", name), sub)
+          ssq = _shape_quat(sub)
+          if ssq is not None:
+            shp.setRelativeQuaternion(list(ssq))
+          shp.setRelativePosition([float(off[0]), float(off[1]), float(off[2])])
+          shp.setContact(1)
+          _extra_shape_fs.append(shp)
+        shape_f = _extra_shape_fs.pop(0)
+      elif sq is None:                                     # shape on the part frame itself
         _set_raw_shape(obj, spec).setContact(1)
         shape_f = obj
       else:                                                # rotated shape -> rigid child
@@ -356,7 +384,10 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
       if scatter_q is not None:
         obj.setRelativeQuaternion(list(scatter_q))
       shape_f.setMass(0.1)                                 # rai wants the mass on the shape
-      shape_f.setColor(np.random.rand(3))
+      _col = np.random.rand(3)                             # ONE draw, as before: the global
+      shape_f.setColor(_col)                               # np.random stream is id-bearing
+      for _s in _extra_shape_fs:                           # downstream (scatter layout)
+        _s.setColor(_col)
 
       # ORIENTATION MARKER: a rai axis-triad marker per cube, so rotations of the
       # uniformly-colored cubes are visible. A child frame -> follows the part wherever
@@ -766,6 +797,72 @@ class CarAssembly(Assembly):
     self.assembly_dependencies = {}
 
 
+class MeshDemoAssembly(Assembly):
+  """The MESH smoke assembly: cube base + a real triangle-mesh part (a chamfered cube,
+  part_meshes/chamfered_box.stl) lowered onto it + a cube cap on top. Exists to exercise
+  the ("mesh", {...}) shape kind end to end: rai convex-hull collision, sampled grasps
+  (--grasp-sampler REQUIRED for mesh parts), hull support points in the wrench LP, and the
+  MuJoCo mesh-asset geom. All mates are top-down stacks (default axes from the offsets)."""
+
+  def __init__(self, n_parts=3, width=0.05, cube_radius=0.005):
+    self.n_parts = min(int(n_parts), 3)
+    self.width = width
+    self.cube_size = width
+    self.cube_radius = cube_radius
+    super().__init__()
+
+  def define(self):
+    w, r = self.width, self.cube_radius
+    self.objects = [f"obj_{i}" for i in range(self.n_parts)]
+    self.base = "obj_0"
+    self.part_shapes["obj_0"] = ("box", [w, w, w, r])
+    if self.n_parts > 1:
+      self.part_shapes["obj_1"] = ("mesh", {"file": "part_meshes/chamfered_box.stl"})
+    if self.n_parts > 2:
+      self.part_shapes["obj_2"] = ("box", [w, w, w, r])
+    self.assembly_relative_poses = {
+        f"obj_{i}": [f"obj_{i - 1}", np.array([0.0, 0.0, w])]
+        for i in range(1, self.n_parts)}
+    self.assembly_dependencies = {}
+
+
+class CompoundDemoAssembly(Assembly):
+  """The COMPOUND smoke assembly: cube base + a compound part (a plinth box carrying a
+  cylinder boss -- ONE rigid part made of TWO primitives) + a cube cap resting on the boss.
+  Exists to exercise the ("compound", [...]) shape kind end to end: multiple __shape{i}
+  children in every rai scene, sampled grasps over the union surface (--grasp-sampler
+  REQUIRED), per-child support points and rest height, and the multi-geom MuJoCo body.
+  The compound is authored symmetric about the part origin (box spans z in [-0.03, 0],
+  boss in [0, 0.03]), so the symmetric half-extent cover is exact."""
+
+  def __init__(self, n_parts=3, width=0.05, cube_radius=0.005):
+    self.n_parts = min(int(n_parts), 3)
+    self.width = width
+    self.cube_size = width
+    self.cube_radius = cube_radius
+    super().__init__()
+
+  def define(self):
+    w, r = self.width, self.cube_radius
+    self.objects = [f"obj_{i}" for i in range(self.n_parts)]
+    self.base = "obj_0"
+    self.part_shapes["obj_0"] = ("box", [w, w, w, r])
+    if self.n_parts > 1:
+      self.part_shapes["obj_1"] = ("compound", [
+          {"shape": ("box", [w, w, 0.03, r]), "pos": [0.0, 0.0, -0.015]},
+          # boss cap 3.6cm: a centered vacuum cup (~2cm) seals with margin, and the box-top
+          # annulus is too narrow for the sampler to park a cup on (it would overhang the
+          # boss wall, which the tight vacuum band in the DB filter rejects).
+          {"shape": ("cylinder", [0.03, 0.018]), "pos": [0.0, 0.0, 0.015]},
+      ])
+    if self.n_parts > 2:
+      self.part_shapes["obj_2"] = ("box", [w, w, w, r])
+    self.assembly_relative_poses = {
+        f"obj_{i}": [f"obj_{i - 1}", np.array([0.0, 0.0, 0.055])]
+        for i in range(1, self.n_parts)}
+    self.assembly_dependencies = {}
+
+
 class SlotPinAssembly(Assembly):
   """STAGED-MATE test assembly (A11): base + a CANTILEVER bar slotted into its side + a PIN
   that fastens the bar. The bar's mate is staged (a slot until the pin lands): unheld and
@@ -939,6 +1036,8 @@ def make_assembly(kind, n_parts):
            # grasp-DB's curved-surface entries, which the two-finger keeps (vacuum drops).
            "car-mini": (lambda n_parts: CarAssembly(n_parts=n_parts, width=0.03), 5),
            "slot-pin": (SlotPinAssembly, 3),
+           "mesh-demo": (MeshDemoAssembly, 3),
+           "compound-demo": (CompoundDemoAssembly, 3),
            "chair": (ChairAssembly, 8)}
   cls, max_n = kinds[kind]
   return cls(n_parts=min(n_parts, max_n))
@@ -1165,6 +1264,135 @@ def _quat_conj(q):
   return np.array([q[0], -q[1], -q[2], -q[3]])
 
 
+_STABLE_REST_POSES = False   # --stable-rest-poses: see placement_table
+
+
+def set_stable_rest_poses(on=True):
+  """Fill the placement table from the shape's TRUE stable poses instead of the six
+  axis-aligned face-down rotations. Call BEFORE any scene or table is built (like
+  set_plain_box / set_sampled_grasps): placement ids index the table, so flipping this
+  mid-run rebinds every saved placement."""
+  global _STABLE_REST_POSES
+  _STABLE_REST_POSES = bool(on)
+
+
+def _placement_id(quat):
+  """The GLOBAL placement id of a rotation: the same rotation always gets the same id, in
+  every group and in every run.
+
+  This is what makes a placement id survive its group CHANGING, and the reason is physical
+  rather than bookkeeping: when a part is mated onto a resting group, the group's ORIENTATION
+  does not change -- only the set of orientations it could rest in does. An id that indexed a
+  per-group list would silently mean a different rotation after the group grew (measured on
+  car-mini: id 8, assigned when the group was one shape, resolved against a two-part group
+  that had eight ids). Deriving the id FROM the rotation removes the question.
+
+  Ids 0..15 stay free for the legacy face table and for the reserved 'as anchored' id, so
+  the two modes never collide.
+  """
+  import zlib
+  q = np.asarray(quat, dtype=float)
+  if q[0] < 0.0:
+    q = -q                                                 # q and -q are the same rotation
+  q = np.round(q, 6) + 0.0                                 # kill -0.0
+  if abs(q[0] - 1.0) < 1e-9 and float(np.abs(q[1:]).max()) < 1e-9:
+    return _IDENTITY_FACE                                  # the reserved 'as anchored' id
+  return int(zlib.crc32(q.tobytes()) & 0x00FFFFFF) + 16
+
+
+def placement_table(assembly, group, ref):
+  """{placement id -> rotation of the reference PART FRAME}, for one subassembly.
+
+  THE ONE PLACE that decides what a placement id means. Two ways to fill it, and the point
+  of the partial migration is that they are the same kind of object -- a face direction IS
+  just a placement pose:
+
+    legacy (default)         the six axis-aligned face-down rotations, with the reference
+                             shape's own rotation composed out. Ids 0..5 exactly as before,
+                             so saved plans and witnesses keep their meaning.
+    --stable-rest-poses      the TRUE stable rest orientations of the shape (one part) or of
+                             the ASSEMBLED GROUP (several parts), computed from the convex
+                             hull and the mass-weighted centre of mass. Ids come from
+                             `_placement_id`, so they are global and survive group growth.
+
+  ID 5 IS RESERVED IN BOTH MODES for the "as anchored / as scattered" placement, which keeps
+  the part's own anchor orientation instead of imposing a rotation (`_group_rest_pose` and
+  `_group_rest_lift` special-case it, and it is the default of several helpers).
+
+  Every table is also recorded in a per-assembly REGISTRY, so a rotation stays resolvable
+  from any group -- see placement_quat.
+  """
+  cache = getattr(assembly, "_placement_table_cache", None)
+  if cache is None:
+    cache = assembly._placement_table_cache = {}
+  reg = getattr(assembly, "_placement_registry", None)
+  if reg is None:
+    reg = assembly._placement_registry = {}
+  key = (_subasm_key(group), ref, _STABLE_REST_POSES)
+  hit = cache.get(key)
+  if hit is not None:
+    return hit
+  ident = np.array([1.0, 0.0, 0.0, 0.0])
+  if not _STABLE_REST_POSES:
+    table = {f: _legacy_placement_quat(assembly, ref, f)
+             for f in range(len(_FACE_DOWN_QUATS))}
+  else:
+    grp = tuple(group)
+    poses = (group_stable_rest_poses(assembly, grp, ref) if len(grp) > 1
+             else stable_rest_poses(assembly.part_shape(ref)))
+    table = {}
+    for q, _prob in _thin_rest_poses(poses, grp):
+      table[_placement_id(q)] = np.asarray(q, dtype=float)
+    table[_IDENTITY_FACE] = ident
+  cache[key] = table
+  reg.update(table)                                        # ids are global; keep them all
+  return table
+
+
+_STABLE_REST_MAX = 12        # placements kept per group under --stable-rest-poses
+_STABLE_REST_PER_TIER = 6    # ... and per equal-probability tier (see _thin_rest_poses).
+                             # 6 so a CUBE keeps all six of its faces: its rests are one
+                             # equal-probability tier, and dropping any of them would make
+                             # the flag lose placements the legacy table had.
+
+
+def _thin_rest_poses(poses, group=()):
+  """Keep the placement table small WITHOUT losing a qualitatively different rest.
+
+  A rotationally symmetric shape has a CONTINUUM of rests, and the enumerator returns it as
+  many poses of equal probability: a 30cm leg comes back with 24 barrel rolls, which would
+  become 24 placement ids and multiply the search's branching factor for no new behaviour.
+  Measured before this: chair legs 25 ids each, the assembled cross 25.
+
+  Thinning by probability ALONE would be wrong -- it drops exactly the rare-but-essential
+  rests (a leg standing on its cap is an unlikely drop and a necessary placement). So the
+  poses are grouped into equal-probability TIERS, which is what a symmetry looks like from
+  here, and each tier keeps at most `_STABLE_REST_PER_TIER` members. A leg then keeps a few
+  barrel rolls AND both caps; a cube (6 equal, one tier) keeps all six.
+  """
+  tiers = {}
+  for q, prob in poses:                                   # already sorted, high prob first
+    tiers.setdefault(round(float(prob), 4), []).append((q, prob))
+  out = []
+  for _k, members in tiers.items():
+    out.extend(members[:_STABLE_REST_PER_TIER])
+  out = out[:_STABLE_REST_MAX]
+  if len(out) < len(poses):
+    print(f"[rest-poses] {tuple(group)!r}: {len(poses)} stable rests thinned to {len(out)} "
+          f"({len(tiers)} probability tier(s)) -- a rotationally symmetric shape returns a "
+          f"CONTINUUM of rests, and each tier keeps at most {_STABLE_REST_PER_TIER}.")
+  return out
+
+
+def _legacy_placement_quat(assembly, ref, face):
+  # the pre-change-2 rule, kept verbatim as one of the two ways to fill the table.
+  q = _FACE_DOWN_QUATS[face]
+  if face == _IDENTITY_FACE:
+    return q
+  sq = _shape_quat(assembly.part_shape(ref))
+  return q if sq is None else _quat_mul(q, _quat_conj(sq))
+
+
 def placement_quat(assembly, group, ref, face):
   # REST-POSE ANCHOR (change-2-lite, [[rest-pose-offaxis-change2]]): the world orientation of
   # the reference PART FRAME for placement id `face` -- rest poses are computed FROM THE
@@ -1182,12 +1410,24 @@ def placement_quat(assembly, group, ref, face):
   #   * face 5 (_IDENTITY_FACE) keeps its established semantics "as anchored/scattered"
   #     (_group_rest_pose preserves the anchor orientation there), so it is NOT composed --
   #     placement ids 0..4 are shape faces, 5 is the anchor pose.
-  # Mesh shapes later swap the enumerator (stable-pose analysis), not this plumbing.
-  q = _FACE_DOWN_QUATS[face]
-  if face == _IDENTITY_FACE:
-    return q
-  sq = _shape_quat(assembly.part_shape(ref))
-  return q if sq is None else _quat_mul(q, _quat_conj(sq))
+  # The enumerator now lives in placement_table, which fills this from either the six faces
+  # (default) or the shape's true stable poses (--stable-rest-poses). This function stays
+  # the single lookup point, so every consumer works in both modes unchanged.
+  table = placement_table(assembly, group, ref)
+  q = table.get(face)
+  if q is None:
+    # NOT in THIS group's table. That is normal and it is not an error: a placement id names
+    # a ROTATION, and a group keeps the rotation it was placed at when parts are mated onto
+    # it, even though the set of rotations it could newly rest in has changed. So fall back
+    # to the per-assembly registry, which holds every rotation any table has ever named.
+    q = getattr(assembly, "_placement_registry", {}).get(face)
+  if q is None:
+    # genuinely unknown -- e.g. the labeled heuristic asking a geometric fact about a group
+    # it has not built a table for. Callers treat this as "no information"; see
+    # _on_table_mateable_cached, which must then NOT prune.
+    raise KeyError(f"placement id {face} is unknown for {tuple(group)!r} "
+                   f"(ref {ref!r}, ids {sorted(table)})")
+  return q
 
 
 # grasps per cube face. 1 = a single (vacuum-like) grasp; 2 = the two in-plane
@@ -1277,6 +1517,7 @@ def set_dense_grasps(flag):
 # parallel views can never shear. OFF (default) = byte-identical to the enumerator.
 _SAMPLED_GRASPS = None         # None = off; else {"seed": int, "candidates": int, "keep": int}
 _SAMPLED_VIEWS_CACHE = {}
+_SAMPLED_META_CACHE = {}          # same key: per-candidate gate diagnostics (not the DB)
 _MAX_GRASP_WIDTH = 0.078       # two-finger max pinch width. The fixed-open robotiq pads
   # measure ~82mm inner gap (robotiq_tight.g capsules); 78mm keeps a seating margin. The EE
   # collision filter stays the final arbiter -- this only prunes hopeless candidates early.
@@ -1291,8 +1532,179 @@ def set_sampled_grasps(mode):
   _SAMPLED_GRASPS = None if mode is None else {
       "seed": int(mode.get("seed", 0)),
       "candidates": max(8, int(mode.get("candidates", 200))),
-      "keep": max(2, int(mode.get("keep", 12)))}
+      "keep": max(2, int(mode.get("keep", 12))),
+      "margin": float(mode.get("margin", 0.008)),
+      "pad_support": float(mode.get("pad_support", 0.75))}
   _SAMPLED_VIEWS_CACHE.clear()
+  _SAMPLED_META_CACHE.clear()
+
+
+_FEATURE_EDGE_DEG = 30.0     # a CREASE, not a tessellation step -- see _mesh_feature_edges
+
+
+def _mesh_feature_edges(mesh, tol_deg=_FEATURE_EDGE_DEG):
+  """(N,2,3) segment endpoints of the mesh's FEATURE edges -- the real geometric edges a
+  contact must stay clear of: every edge whose dihedral angle exceeds `tol_deg`, plus the
+  border edges of an open mesh. Cached on the mesh.
+
+  THE THRESHOLD IS NOT THE FLATNESS ONE. _mesh_patch_class asks "is this region planar?"
+  and 5 deg is right for that. Here the question is "is this a CREASE, or just how finely
+  a smooth surface was tessellated?" -- and a tessellation step can be far larger than 5
+  deg: our 48-section cylinder steps 7.5 deg, so a 5 deg rule marked every barrel edge a
+  feature and read 0.97mm (the chord half-width) of clearance ANYWHERE on the barrel,
+  which silently made the margin gate a no-op on every curved surface. 30 deg separates
+  the two populations by a wide band: real creases are 90 deg (cube edges, cylinder cap
+  rims) or ~55 deg (a chamfer), tessellation steps are single digits."""
+  seg = mesh.metadata.get("_feature_edges")
+  if seg is None:
+    E = np.asarray(mesh.face_adjacency_edges, dtype=int)
+    ang = np.asarray(mesh.face_adjacency_angles, dtype=float)
+    keep = E[ang > np.radians(tol_deg)] if len(E) else np.zeros((0, 2), dtype=int)
+    border = np.asarray(getattr(mesh, "edges_boundary", np.zeros((0, 2))), dtype=int)
+    idx = np.vstack([keep, border]) if len(border) else keep
+    V = np.asarray(mesh.vertices, dtype=float)
+    seg = (V[idx[:, 0]], V[idx[:, 1]]) if len(idx) else (np.zeros((0, 3)), np.zeros((0, 3)))
+    mesh.metadata["_feature_edges"] = seg
+  return seg
+
+
+# Contact PATCH of each end effector, as half extents in the contact plane. These mirror the
+# collision proxies the rest of the pipeline uses, so "the pad is supported" here means the
+# same surface the sim and the DB filter collide with.
+#   two-finger: robotiq_tight.g's finger capsule is 0.04 long with a 0.01 radius, so the pad
+#               is ~20mm across the closing direction and ~40mm along the approach.
+#   vacuum:     a disc of wrench.PARAMS['vacuum_seal_diameter'] (0.025 by default).
+_PAD_HALF_ACROSS = 0.010
+_PAD_HALF_ALONG = 0.020
+
+
+def _pad_samples_rect(half_u, half_v, nu=3, nv=5):
+  # deterministic grid over the pad rectangle (grasp ids must be reproducible)
+  us = np.linspace(-half_u, half_u, nu)
+  vs = np.linspace(-half_v, half_v, nv)
+  return np.array([[u, v] for u in us for v in vs], dtype=float)
+
+
+def _pad_samples_disc(radius, rings=2, per_ring=8):
+  pts = [[0.0, 0.0]]
+  for i in range(1, rings + 1):
+    r = radius * i / rings
+    for k in range(per_ring):
+      a = 2.0 * np.pi * k / per_ring
+      pts.append([r * np.cos(a), r * np.sin(a)])
+  return np.array(pts, dtype=float)
+
+
+def _pad_support(mesh, p, n, u, v, offsets, lift=0.002, depth=0.003):
+  """Fraction of the CONTACT PATCH that is backed by material.
+
+  Edge clearance keeps the contact POINT away from a crease. This answers the other half of
+  the question -- how much of the PAD actually lies on the part -- which is what decides
+  whether a pinch holds or pivots and whether a cup can seal. A pad whose centre clears every
+  edge can still hang half over a step or off the end of a short face.
+
+  Each patch sample is lifted `lift` off the surface and cast back along -n; it counts as
+  supported when it meets material within `lift + depth`. The depth bound is what makes the
+  measure local: without it, a sample hanging over an edge still hits the far side of the
+  part far below and would count as supported.
+  """
+  O = (np.asarray(p, dtype=float)[None, :]
+       + offsets[:, 0:1] * np.asarray(u, dtype=float)[None, :]
+       + offsets[:, 1:2] * np.asarray(v, dtype=float)[None, :]
+       + float(lift) * np.asarray(n, dtype=float)[None, :])
+  D = np.repeat(-np.asarray(n, dtype=float)[None, :], len(O), axis=0)
+  loc, idx_ray, _tri = mesh.ray.intersects_location(O, D, multiple_hits=False)
+  if len(loc) == 0:
+    return 0.0
+  d = np.linalg.norm(np.asarray(loc, dtype=float) - O[np.asarray(idx_ray, dtype=int)], axis=1)
+  ok = np.zeros(len(O), dtype=bool)
+  ok[np.asarray(idx_ray, dtype=int)[d <= lift + depth]] = True
+  return float(ok.mean())
+
+
+def _pad_end_drop(mesh, p, n, along, half_len, miss=1.0):
+  """How far the two ENDS of the pad fall away from the contact plane, in metres.
+
+  A CONTINUOUS measure, unlike counting supported samples: near the best roll the hit count
+  saturates (every probe point still hits), so it cannot tell 22.5 degrees off-axis from
+  on-axis -- measured. The drop keeps falling all the way to the optimum, so it can be
+  refined. An end that misses the part entirely scores `miss`, which dominates any real drop.
+  """
+  ends = np.array([p + half_len * along, p - half_len * along], dtype=float)
+  O = ends + 0.02 * np.asarray(n, dtype=float)[None, :]     # start well clear of the surface
+  D = np.repeat(-np.asarray(n, dtype=float)[None, :], 2, axis=0)
+  loc, idx, _t = mesh.ray.intersects_location(O, D, multiple_hits=False)
+  drop = np.full(2, float(miss))
+  if len(loc):
+    idx = np.asarray(idx, dtype=int)
+    d = np.linalg.norm(np.asarray(loc, dtype=float) - O[idx], axis=1) - 0.02
+    drop[idx] = np.abs(d)
+  return float(drop.max())
+
+
+def _best_pad_axes(mesh, p, p2, y, u0, v0, n_roll=8):
+  """Choose the pinch's ROLL about the closing axis so the pads lie ALONG the part.
+
+  The closing axis of an antipodal grasp is fixed by its two contact points, but the roll
+  about it is free -- and the sampler used to fix it with an arbitrary reference vector.
+  That is why a pinch on a 30mm barrel scored 0.20 pad support: the pad is 40mm long, and an
+  arbitrary roll wraps that length AROUND the cylinder instead of laying it along the axis.
+  The roll is the difference between a pad touching on a line and a pad lying flat.
+
+  The objective is the worst END DROP over the two pads (see _pad_end_drop) -- minimised by
+  a coarse sweep plus one refinement pass. Returns (across, along) unit axes in the plane the
+  closing axis is normal to; `along` is the pad's long axis and the grasp's approach.
+  Deterministic: a fixed angle grid, ties broken by the smaller angle.
+  """
+  half = _PAD_HALF_ALONG
+
+  def _cost(a):
+    across = np.cos(a) * u0 + np.sin(a) * v0
+    along = -np.sin(a) * u0 + np.cos(a) * v0
+    return (max(_pad_end_drop(mesh, p, -y, along, half),
+                _pad_end_drop(mesh, p2, y, along, half)), across, along)
+
+  step = np.pi / float(n_roll)                             # a pad is 180deg symmetric
+  best_a, best = 0.0, float("inf")
+  for i in range(int(n_roll)):
+    c, _x, _z = _cost(i * step)
+    if c < best - 1e-12:
+      best, best_a = c, i * step
+  for k in (-0.5, -0.25, 0.25, 0.5):                       # refine around the winner
+    a = best_a + k * step
+    c, _x, _z = _cost(a)
+    if c < best - 1e-12:
+      best, best_a = c, a
+  _c, across, along = _cost(best_a)
+  return across, along
+
+
+def _plane_axes(n):
+  """Two unit axes spanning the plane with normal `n` (deterministic choice)."""
+  n = np.asarray(n, dtype=float)
+  ref = np.array([0.0, 0.0, 1.0]) if abs(float(n[2])) < 0.9 else np.array([1.0, 0.0, 0.0])
+  u = np.cross(n, ref)
+  u /= max(np.linalg.norm(u), 1e-12)
+  return u, np.cross(n, u)
+
+
+def _edge_clearance(mesh, pts):
+  """Distance from each point to the nearest FEATURE edge (see _mesh_feature_edges), in
+  metres. This is what keeps a sampled contact off the corners: a pad or a suction cup
+  parked on an edge has half its area over nothing, and the analytic patch reasoning
+  (surface class, seal diameter) silently assumes the contact sits INSIDE its face.
+  inf when the shape has no feature edges at all (e.g. a sphere)."""
+  A, B = _mesh_feature_edges(mesh)
+  P = np.atleast_2d(np.asarray(pts, dtype=float))
+  if len(A) == 0:
+    return np.full(len(P), np.inf)
+  AB = B - A                                               # (E,3)
+  L2 = np.einsum("ij,ij->i", AB, AB)
+  L2 = np.where(L2 > 1e-18, L2, 1.0)
+  t = np.einsum("pej,ej->pe", P[:, None, :] - A[None, :, :], AB) / L2   # (P,E) foot param
+  t = np.clip(t, 0.0, 1.0)
+  closest = A[None, :, :] + t[:, :, None] * AB[None, :, :]
+  return np.linalg.norm(P[:, None, :] - closest, axis=2).min(axis=1)
 
 
 def _spec_mesh(spec):
@@ -1307,7 +1719,46 @@ def _spec_mesh(spec):
     return trimesh.creation.cylinder(radius=float(p[1]), height=float(p[0]), sections=48)
   if kind == "sphere":
     return trimesh.creation.icosphere(subdivisions=3, radius=float(p[0]))
+  if kind == "mesh":
+    return _load_mesh(p)["mesh"]                           # the REAL surface, not the hull
+  if kind == "compound":
+    return _compound_mesh(spec)                            # children transformed + concatenated
   raise ValueError(f"--grasp-sampler: unknown shape kind {kind!r}")
+
+
+def _mesh_patch_class(mesh, f0, tol_deg=5.0):
+  """(surface label, flat-patch min extent) at face `f0` of a real mesh -- the mesh
+  counterpart of _surface_class_and_min_dim. Flood-fills the coplanar patch around f0
+  (adjacent faces within `tol_deg` dihedral), then measures the patch's smallest in-plane
+  extent; that is the number the vacuum seal gate compares against its cup diameter. A
+  patch thinner than 1 mm counts as curved (no seal, torque de-rated like any curved
+  grasp). The adjacency map is cached on the mesh's metadata (one mesh, many samples)."""
+  nbr = mesh.metadata.get("_patch_nbr")
+  if nbr is None:
+    nbr = {}
+    for (a, b), t in zip(np.asarray(mesh.face_adjacency, dtype=int),
+                         np.asarray(mesh.face_adjacency_angles, dtype=float)):
+      if t <= np.radians(tol_deg):
+        nbr.setdefault(int(a), []).append(int(b))
+        nbr.setdefault(int(b), []).append(int(a))
+    mesh.metadata["_patch_nbr"] = nbr
+  seen, stack = {int(f0)}, [int(f0)]
+  while stack:
+    x = stack.pop()
+    for y in nbr.get(x, ()):
+      if y not in seen:
+        seen.add(y)
+        stack.append(y)
+  faces = np.fromiter(seen, dtype=int)
+  vs = mesh.vertices[np.unique(np.asarray(mesh.faces, dtype=int)[faces].ravel())]
+  n = np.asarray(mesh.face_normals[int(f0)], dtype=float)
+  ref = np.array([0.0, 0.0, 1.0]) if abs(float(n[2])) < 0.9 else np.array([1.0, 0.0, 0.0])
+  u = np.cross(n, ref); u /= max(np.linalg.norm(u), 1e-12)
+  v = np.cross(n, u)
+  proj = np.column_stack([vs @ u, vs @ v])
+  ext = proj.max(0) - proj.min(0)
+  mind = float(min(ext))
+  return ("flat", mind) if mind > 1e-3 else ("curved", 0.0)
 
 
 def _surface_class_and_min_dim(spec, n):
@@ -1322,6 +1773,8 @@ def _surface_class_and_min_dim(spec, n):
     if abs(float(n[2])) > 0.99:                            # cap disc
       return "flat", 2.0 * float(p[1])
     return "curved", 0.0
+  if kind in ("mesh", "compound"):
+    raise ValueError("mesh/compound surfaces are classified per-face via _mesh_patch_class")
   return "curved", 0.0                                     # sphere
 
 
@@ -1364,6 +1817,18 @@ def _ray_exit(spec, p, d):
       return p, np.array([0.0, 0.0, 1.0])
     t, n = min(valid, key=lambda tn: tn[0])
     return p + t * d, n
+  if kind in ("mesh", "compound"):
+    m = _load_mesh(prm)["mesh"] if kind == "mesh" else _compound_mesh(spec)
+    loc, _ri, tri = m.ray.intersects_location([p], [d], multiple_hits=True)   # the mesh ray
+                                                           # cast the docstring promised
+    if len(loc):
+      ts = (np.asarray(loc, dtype=float) - p) @ d / float(d @ d)
+      ok = np.flatnonzero(ts > 1e-12)
+      if len(ok):
+        i = int(ok[np.argmin(ts[ok])])                     # first wall along d, like the
+        return (np.asarray(loc[i], dtype=float),           # primitives' smallest positive t
+                np.asarray(m.face_normals[int(tri[i])], dtype=float))
+    return p, -d / max(np.linalg.norm(d), 1e-12)           # no exit: degenerate, caller gates
   # sphere
   r = float(prm[0])
   b = float(p @ d); c = float(p @ p) - r * r
@@ -1398,9 +1863,9 @@ def _sampled_grasp_views(spec, offset):
   tool centre standing `offset` off the approach-side surface (the wrench moment arm)."""
   import zlib
   cfgv = _SAMPLED_GRASPS
-  sq = _shape_quat(spec)
-  key = (spec[0], tuple(spec[1]), tuple(sq) if sq is not None else None,
-         float(offset), cfgv["seed"], cfgv["candidates"], cfgv["keep"])
+  sq = _shape_quat(spec) if spec[0] != "compound" else None
+  key = (_spec_key(spec), float(offset), cfgv["seed"], cfgv["candidates"], cfgv["keep"],
+         float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)))
   hit = _SAMPLED_VIEWS_CACHE.get(key)
   if hit is not None:
     return hit
@@ -1413,26 +1878,48 @@ def _sampled_grasp_views(spec, offset):
   pts, fidx = trimesh.sample.sample_surface(mesh, cfgv["candidates"], seed=int(rng_seed))
   normals = mesh.face_normals[np.asarray(fidx, int)]
 
-  suction, antip = [], []                                  # (pose, surf, min_dim, feature)
+  # EDGE CLEARANCE of every sampled point, up front (vectorised): the margin gate below
+  # keeps contacts INSIDE their face instead of hanging over a corner.
+  clr = _edge_clearance(mesh, np.asarray(pts, dtype=float))
+  margin = float(cfgv.get("margin", 0.0))
+  min_support = float(cfgv.get("pad_support", 0.0))
+  _cup = _pad_samples_disc(0.5 * float(wrench.PARAMS.get("vacuum_seal_diameter", 0.025)))
+  _rect = _pad_samples_rect(_PAD_HALF_ACROSS, _PAD_HALF_ALONG)
+
+  suction, antip = [], []              # (pose, surf, min_dim, feature, clr, support, family)
   for k in range(len(pts)):
     p, n = np.asarray(pts[k], float), np.asarray(normals[k], float)
     nn = np.linalg.norm(n)
     if nn < 1e-9:
       continue
     n = n / nn
-    surf, mind = _surface_class_and_min_dim(spec, n)
+    if spec[0] in ("mesh", "compound"):
+      surf, mind = _mesh_patch_class(mesh, int(fidx[k]))
+    else:
+      surf, mind = _surface_class_and_min_dim(spec, n)
     # ---- suction-style candidate: approach along -n, canonical roll ----
     q = _grasp_quat_for_normal(n)
     pose = np.concatenate([p + offset * n, q])
-    suction.append((pose, surf, mind, np.concatenate([p, 0.02 * n])))
+    _u, _v = _plane_axes(n)                                # the cup sits in the contact plane
+    _sup = (_pad_support(mesh, p, n, _u, _v, _cup) if min_support > 0.0 else 1.0)
+    suction.append((pose, surf, mind, np.concatenate([p, 0.02 * n]), float(clr[k]), _sup,
+                    "suction"))
     # ---- antipodal candidate: the opposing surface point within the aperture ----
     p2, n2 = _ray_exit(spec, p - 1e-9 * n, -n)
     width = float(np.linalg.norm(p2 - p))
     if width > 1e-4 and width <= _MAX_GRASP_WIDTH and float(n2 @ (-n)) > 0.95:
       y = (p2 - p) / width                                 # closing axis: pad-to-pad
-      ref = (np.array([0.0, 0.0, 1.0]) if abs(float(y[2])) < 0.9
-             else np.array([1.0, 0.0, 0.0]))
-      z = np.cross(y, ref); z /= np.linalg.norm(z)         # approach, perpendicular to the pinch
+      _u0, _v0 = _plane_axes(y)                            # the free roll lives in this plane
+      if min_support > 0.0:
+        _, z = _best_pad_axes(mesh, p, p2, y, _u0, _v0)    # lay the pads ALONG the part
+      else:
+        ref = (np.array([0.0, 0.0, 1.0]) if abs(float(y[2])) < 0.9
+               else np.array([1.0, 0.0, 0.0]))
+        z = np.cross(y, ref); z /= np.linalg.norm(z)       # legacy: an arbitrary roll
+      # x FROM y AND z, always: the frame must stay RIGHT-handed. Taking the roll search's
+      # own two axes as (x, z) makes the triple LEFT-handed -- _mat_to_quat then returns a
+      # reflected frame, so the recovered approach and closing axes are not the ones that
+      # were chosen. The existing convention tests caught exactly that.
       x = np.cross(y, z)
       mid = 0.5 * (p + p2)
       _, _t_exit = None, _ray_exit(spec, mid, -z)          # stand off the approach-side surface
@@ -1440,7 +1927,13 @@ def _sampled_grasp_views(spec, offset):
       pose = np.concatenate([mid - z * (t + offset), _mat_to_quat(np.column_stack([x, y, z]))])
       # label = the contacted surface class; min_dim 0.0 keeps the vacuum seal gate shut
       # for pinch candidates (the suction block is the vacuum's own candidate family).
-      antip.append((pose, surf, 0.0, np.concatenate([mid, 0.02 * y, 0.02 * z])))
+      # BOTH pads must clear the edges -- a pinch is only as good as its worse contact.
+      # each PAD lies in the plane the closing axis y is normal to, and it is long along
+      # the approach z -- so the rectangle's axes are (x across, z along).
+      _sup = (min(_pad_support(mesh, p, -y, x, z, _rect),
+                  _pad_support(mesh, p2, y, x, z, _rect)) if min_support > 0.0 else 1.0)
+      antip.append((pose, surf, 0.0, np.concatenate([mid, 0.02 * y, 0.02 * z]),
+                    min(float(clr[k]), float(_edge_clearance(mesh, p2)[0])), _sup, "pinch"))
 
   keep = cfgv["keep"]
   k_suc = (keep + 1) // 2
@@ -1448,19 +1941,51 @@ def _sampled_grasp_views(spec, offset):
   for block, k_want in ((suction, k_suc), (antip, keep - k_suc)):
     if not block or k_want <= 0:
       continue
+    if margin > 0.0 or min_support > 0.0:
+      good = [b for b in block if b[4] >= margin and b[5] >= min_support]
+      if len(good) < k_want:
+        # the shape cannot honour the gates (a small face, a thin part, a short pad). Fall
+        # back to the k_want BEST candidates -- most pad support first, then most interior --
+        # rather than dropping the block or silently accepting corner grasps. Deterministic.
+        block = sorted(block, key=lambda b: (-b[5], -b[4], tuple(np.round(b[0], 9))))[:k_want]
+      else:
+        block = good
     idx = _fps_downsample([b[3] for b in block], k_want)
     rows.extend(block[i] for i in idx)
   if not rows:
     raise ValueError(f"--grasp-sampler: no feasible candidates for shape {spec!r}")
-  poses, surfs, mins = [], [], []
-  for pose, surf, mind, _f in rows:
+  poses, surfs, mins, meta = [], [], [], []
+  for pose, surf, mind, _f, _clr, _sup, _fam in rows:
     if sq is not None:                                     # rotate into the PART frame
       pose = np.concatenate([_quat_to_R(sq) @ pose[:3], _quat_mul(sq, pose[3:])])
     pose = np.asarray(pose, dtype=float)
     pose.setflags(write=False)
     poses.append(pose); surfs.append(surf); mins.append(float(mind))
+    # what the two contact gates measured for THIS candidate, kept for diagnostics and for
+    # the tests: re-deriving it outside is not possible for a pinch (the pad contact points
+    # are not recoverable from the pose alone), and a wrong re-derivation reads as a
+    # regression that is not there.
+    meta.append({"edge_clearance": float(_clr), "pad_support": float(_sup),
+                 "family": _fam})
+  # the returned view stays a 3-TUPLE: several call sites unpack it positionally, and the
+  # diagnostics are not part of the grasp DB. They ride in a parallel cache on the same key.
+  _SAMPLED_META_CACHE[key] = tuple(meta)
   hit = _SAMPLED_VIEWS_CACHE[key] = (tuple(poses), tuple(surfs), tuple(mins))
   return hit
+
+
+def sampled_grasp_meta(spec, offset=0.01):
+  """Per-candidate diagnostics of the sampled DB, parallel to part_grasp_poses: edge
+  clearance, pad support, and the family a candidate came from. Empty when the sampler is
+  off. It exists because a pinch's PAD contact points cannot be recovered from the grasp
+  pose alone, so neither a caller nor a test can re-derive what the gates measured."""
+  if _SAMPLED_GRASPS is None:
+    return ()
+  _sampled_grasp_views(spec, offset)                       # fills both caches
+  cfgv = _SAMPLED_GRASPS
+  key = (_spec_key(spec), float(offset), cfgv["seed"], cfgv["candidates"], cfgv["keep"],
+         float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)))
+  return _SAMPLED_META_CACHE.get(key, ())
 
 
 # EXTRA PLACE CELLS (experimental, OFF by default): classic `place` always lands a group at
@@ -1613,6 +2138,109 @@ def _shape_quat(spec):
   return np.asarray(spec[2], dtype=float) if len(spec) > 2 else None
 
 
+# --- mesh shape kind: ("mesh", {"file": path, "scale": s}[, quat]) --------------------------
+# The file is any trimesh-loadable mesh (.stl/.obj/.ply), path relative to this repo (or
+# absolute). v1 CONTRACT: the part COLLIDES AS ITS CONVEX HULL (rai setConvexMesh and the
+# MuJoCo geom both get the hull) -- a non-convex part needs a decomposition into several
+# parts/shape children first. The mesh is re-CENTERED on its AABB centre at load so the
+# symmetric half-extent helpers (rest heights, standoffs, levers) stay exact; author mate
+# poses against that centre. Grasps for mesh parts REQUIRE --grasp-sampler: the 6-face
+# enumerator's ids are cube-face semantics and would silently mis-model a free-form part.
+_MESH_CACHE = {}
+
+
+def _mesh_key(prm):
+  path = prm["file"]
+  if not os.path.isabs(path):
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
+  return (os.path.normpath(path), float(prm.get("scale", 1.0)))
+
+
+# --- compound shape kind: ("compound", [{"shape": spec, "pos": [x,y,z]}, ...]) -------------
+# ONE rigid part built from SEVERAL sub-shapes (primitives or meshes; no nesting). Each child
+# is an ordinary (kind, params[, quat]) spec plus an offset in the part frame. Realized the
+# rai way: the part frame stays shapeless and rigid children `<part>__shape0..N-1` carry the
+# shapes (the same pattern rotated single shapes already use -- address them via
+# part_shape_frames / set_part_contact). Author the compound roughly CENTERED on the part
+# origin: the half-extent helpers return a symmetric cover (exact per-child for rest
+# heights). Grasps REQUIRE --grasp-sampler (same reason as mesh: the 6-face enumerator's ids
+# are cube-face semantics); the sampler tessellates the union, and candidates buried between
+# children are dropped by the DB filter's self-penetration gate.
+
+
+def _compound_children(spec):
+  """[(child_spec, offset)] of a compound spec. Children are (kind, params[, quat]) tuples
+  -- any non-compound kind; nesting is refused (flatten by hand, it is the same shape)."""
+  out = []
+  for ch in spec[1]:
+    sub = tuple(ch["shape"])
+    if sub[0] == "compound":
+      raise ValueError("no nested compounds -- flatten the children into one list")
+    out.append((sub, np.asarray(ch.get("pos", (0.0, 0.0, 0.0)), dtype=float)))
+  return out
+
+
+def _spec_key(spec):
+  """Canonical hashable identity of a shape spec, for memo keys. Meshes key on their
+  (path, scale) -- NOT the kind string, two meshes are two surfaces; compounds key on the
+  child keys plus offsets."""
+  kind = spec[0]
+  if kind == "compound":
+    return (kind, tuple((_spec_key(sub), tuple(map(float, pos)))
+                        for sub, pos in _compound_children(spec)))
+  sq = _shape_quat(spec)
+  qk = tuple(np.asarray(sq, dtype=float)) if sq is not None else None
+  if kind == "mesh":
+    return (kind, _mesh_key(spec[1]), qk)
+  return (kind, tuple(spec[1]), qk)
+
+
+_COMPOUND_MESH_CACHE = {}
+
+
+def _compound_mesh(spec):
+  """Tessellation of a compound part (child meshes transformed + concatenated), memoized.
+  The sampler samples and raycasts THIS union. Vertices are not merged across children, so
+  coplanar-patch flood fills stay within one child's surface -- conservative, never wrong."""
+  key = _spec_key(spec)
+  hit = _COMPOUND_MESH_CACHE.get(key)
+  if hit is None:
+    import trimesh
+    parts = []
+    for sub, pos in _compound_children(spec):
+      m = _spec_mesh(sub).copy()
+      sq = _shape_quat(sub)
+      T = np.eye(4)
+      if sq is not None:
+        T[:3, :3] = _quat_to_R(sq)
+      T[:3, 3] = pos
+      m.apply_transform(T)
+      parts.append(m)
+    hit = _COMPOUND_MESH_CACHE[key] = trimesh.util.concatenate(parts)
+  return hit
+
+
+def _load_mesh(prm):
+  """Memoized mesh load for a ("mesh", {...}) spec's params. Returns
+  {"mesh": centered+scaled trimesh, "hull": convex-hull vertices (N,3), "half": AABB half
+  extents} -- one object per (path, scale), shared by every consumer."""
+  key = _mesh_key(prm)
+  hit = _MESH_CACHE.get(key)
+  if hit is None:
+    import trimesh
+    m = trimesh.load(key[0], force="mesh")
+    if key[1] != 1.0:
+      m.apply_scale(key[1])
+    lo, hi = np.asarray(m.bounds, dtype=float)
+    m.apply_translation(-(lo + hi) / 2.0)
+    hull = m.convex_hull
+    hit = _MESH_CACHE[key] = {
+        "mesh": m, "hull": np.asarray(hull.vertices, dtype=float), "hull_mesh": hull,
+        "half": (np.asarray(m.bounds[1], dtype=float)
+                 - np.asarray(m.bounds[0], dtype=float)) / 2.0}
+  return hit
+
+
 _PLAIN_BOX = False                                         # --plain-box: sharp ST.box instead of
                                                           # the sphere-swept ssBox (drops the
                                                           # corner_r inflation). A geometry
@@ -1640,6 +2268,11 @@ def _set_raw_shape(f, spec):
     f.setShape(ry.ST.cylinder, list(p))                    # [length, radius]
   elif kind == "sphere":
     f.setShape(ry.ST.sphere, list(p))                      # [radius]
+  elif kind == "mesh":
+    f.setConvexMesh(_load_mesh(p)["hull"])                 # v1 contract: collide as the hull
+  elif kind == "compound":
+    raise ValueError("compound is several shapes -- realize via add_part_frame "
+                     "(one __shape{i} child per sub-shape), never on a single frame")
   else:
     raise ValueError(f"unknown shape kind {kind!r}")
   return f
@@ -1652,8 +2285,17 @@ def _set_frame_shape(f, spec):
 
 
 def add_part_frame(C, name, spec, contact=1):
-  q = _shape_quat(spec)
   f = C.addFrame(name)
+  if spec[0] == "compound":                                # one rigid child per sub-shape
+    for i, (sub, pos) in enumerate(_compound_children(spec)):
+      shp = C.addFrame(f"{name}__shape{i}", name)
+      _set_raw_shape(shp, sub).setContact(contact)
+      sq = _shape_quat(sub)
+      if sq is not None:
+        shp.setRelativeQuaternion(list(sq))
+      shp.setRelativePosition([float(pos[0]), float(pos[1]), float(pos[2])])
+    return f
+  q = _shape_quat(spec)
   if q is None:
     return _set_raw_shape(f, spec).setContact(contact)
   shp = C.addFrame(f"{name}__shape", name)                 # rigid child carries the shape
@@ -1662,16 +2304,30 @@ def add_part_frame(C, name, spec, contact=1):
   return f
 
 
-def part_shape_frame(C, name):
-  # the frame that CARRIES a part's collision shape: the `__shape` child for rotated
-  # specs, the part frame itself otherwise.
+def part_shape_frames(C, name):
+  # ALL frames carrying `name`'s collision shape: the `__shape` child (rotated single
+  # shape), the `__shape{i}` children (compound), or the part frame itself.
+  names = C.getFrameNames()
   child = f"{name}__shape"
-  return child if child in C.getFrameNames() else name
+  if child in names:
+    return [child]
+  out, i = [], 0
+  while f"{name}__shape{i}" in names:
+    out.append(f"{name}__shape{i}")
+    i += 1
+  return out or [name]
+
+
+def part_shape_frame(C, name):
+  # the FIRST frame that carries a part's collision shape (complete for single-shape
+  # parts). Anything that must cover a compound's every sub-shape uses part_shape_frames.
+  return part_shape_frames(C, name)[0]
 
 
 def set_part_contact(C, name, v):
-  # contact toggle that works for both plain parts and rotated-shape parts.
-  C.getFrame(part_shape_frame(C, name)).setContact(v)
+  # contact toggle that works for plain, rotated-shape, and compound parts (all children).
+  for f in part_shape_frames(C, name):
+    C.getFrame(f).setContact(v)
 
 
 def _shape_half_extents(spec):
@@ -1684,12 +2340,29 @@ def _shape_half_extents(spec):
     return np.array([p[1], p[1], p[0] / 2.0], dtype=float)
   if kind == "sphere":
     return np.array([p[0], p[0], p[0]], dtype=float)
+  if kind == "mesh":
+    return np.asarray(_load_mesh(p)["half"], dtype=float).copy()
+  if kind == "compound":
+    # symmetric COVER of the children (|offset| + rotated child half, per axis). Exact for
+    # compounds authored symmetric about the part origin; an over-approximation otherwise.
+    h = np.zeros(3)
+    for sub, pos in _compound_children(spec):
+      hs = _shape_half_extents(sub)
+      sq = _shape_quat(sub)
+      if sq is not None:
+        hs = np.abs(_quat_to_R(sq)) @ hs
+      h = np.maximum(h, np.abs(pos) + hs)
+    return h
   raise ValueError(f"unknown shape kind {kind!r}")
 
 
 def _shape_half_extent_along(spec, d_part):
   # half extent of the shape along direction `d_part` given in the PART frame (accounts
   # for the spec's shape rotation). Exact for axis-aligned directions.
+  if spec[0] == "compound":
+    d = np.asarray(d_part, dtype=float)
+    return max(abs(float(d @ pos)) + _shape_half_extent_along(sub, d)
+               for sub, pos in _compound_children(spec))
   q = _shape_quat(spec)
   d = d_part if q is None else _quat_to_R(q).T @ np.asarray(d_part, dtype=float)
   return float(np.abs(d) @ _shape_half_extents(spec))
@@ -1699,6 +2372,11 @@ def _shape_half_z(spec, R):
   # half extent along WORLD z when the PART frame is rotated by R (the shape's own
   # rotation inside the part frame is composed in). Exact for our axis-aligned placement
   # rotations; a safe over-approximation for general R.
+  if spec[0] == "compound":
+    # per child: how far its centre drops below the part origin, plus its own half-z.
+    # EXACT per-child bound, so an asymmetric compound still rests at the right height.
+    return max(float(-(R @ pos)[2]) + _shape_half_z(sub, R)
+               for sub, pos in _compound_children(spec))
   if spec[0] == "sphere":
     return _shape_half_extents(spec)[2]
   q = _shape_quat(spec)
@@ -1718,6 +2396,9 @@ def part_grasp_poses(spec, rolls=None, offset=0.01):
   Rotated/off-center grasp variants are a later, purely additive extension."""
   if _SAMPLED_GRASPS is not None:                          # --grasp-sampler second path
     return _sampled_grasp_views(spec, offset)[0]
+  if spec[0] in ("mesh", "compound"):
+    raise ValueError("mesh/compound parts need --grasp-sampler: the 6-face enumerator's "
+                     "grasp ids are cube-face semantics and would silently mis-model them")
   if rolls is None:
     rolls = _ROLLS_PER_FACE
   sq = _shape_quat(spec)
@@ -1817,6 +2498,8 @@ def part_grasp_surfaces(spec, rolls=None):
   # cup cannot seal on strong curvature) -- the two-finger keeps curved grasps.
   if _SAMPLED_GRASPS is not None:                          # --grasp-sampler second path
     return list(_sampled_grasp_views(spec, 0.01)[1])
+  if spec[0] in ("mesh", "compound"):
+    raise ValueError("mesh/compound parts need --grasp-sampler (see part_grasp_poses)")
   if rolls is None:
     rolls = _ROLLS_PER_FACE
   kind = spec[0]
@@ -1843,6 +2526,8 @@ def part_grasp_face_min_dims(spec, rolls=None):
   # seal on a face smaller than its own diameter (wrench.PARAMS['vacuum_seal_diameter']).
   if _SAMPLED_GRASPS is not None:                          # --grasp-sampler second path
     return list(_sampled_grasp_views(spec, 0.01)[2])
+  if spec[0] in ("mesh", "compound"):
+    raise ValueError("mesh/compound parts need --grasp-sampler (see part_grasp_poses)")
   if rolls is None:
     rolls = _ROLLS_PER_FACE
   kind, params = spec[0], spec[1]
@@ -1955,15 +2640,38 @@ def compute_cube_grasps(assembly, subassembly, offset=0.01,
     # themselves (flush-seated parts touch at d=-0.0) and are irrelevant to whether the
     # gripper fits -- a binary getCollisionFree() here wrongly killed EVERY grasp on any
     # flush-mated subassembly (found via the car: wheel caps seat flush on the body).
+    #
+    # SAMPLED DBs additionally gate the GRASPED part itself: an off-center sampled grasp on
+    # a FLAT face routinely parks an OPEN finger capsule ON the surface (measured 5-10mm on
+    # cubes and the chamfered mesh; face-center enumerator grasps are clean by construction,
+    # <=0.5mm capsule graze). Such a candidate survives every assembly-side gate (the
+    # witness gate exempts the acting grasp pair) and then hard-kills motion planning:
+    # mr_bench exempts nothing, so the pick mode's transition never samples. 1mm separates
+    # the fat-capsule grazing band from a finger through the surface. Enumerator path
+    # unchanged (byte-identical DBs for every existing scene).
     C_col = ry.Config()
     C_col.addConfigurationCopy(base_scene)
     base_world = _ee_root_pose(grasp_pose, base_rel_tool, q_correction)
     root = C_col.getFrame("ee_ur_base")
     root.setPosition(base_world[:3])
     root.setQuaternion(base_world[3:])
-    set_part_contact(C_col, grasped_obj, 0)
-    return not any((a.startswith("ee_") or b.startswith("ee_")) and d < -1e-9
-                   for a, b, d in C_col.getCollisions())
+    if _SAMPLED_GRASPS is None:
+      set_part_contact(C_col, grasped_obj, 0)
+      return not any((a.startswith("ee_") or b.startswith("ee_")) and d < -1e-9
+                     for a, b, d in C_col.getCollisions())
+    _own = lambda n: n == grasped_obj or n.startswith(grasped_obj + "__shape")
+    # the OWN-part band absorbs the two-finger's fat capsule proxy (clean face-center
+    # grasps graze <=0.5mm). A VACUUM has no proxy -- its cup either stands clean at the
+    # 1cm offset (~0) or overhangs an adjacent feature (measured 0.26mm: the cup lip on a
+    # compound's boss wall, which motion planning then rejects at 1e-4) -- tight band.
+    _own_tol = 1e-4 if "vacuum" in os.path.basename(gripper_path) else 1e-3
+    for a, b, d in C_col.getCollisions():
+      if not (a.startswith("ee_") or b.startswith("ee_")):
+        continue
+      own = _own(a) or _own(b)
+      if d < (-_own_tol if own else -1e-9):
+        return False
+    return True
 
   # a VACUUM cannot seal on curved surfaces -> restrict it to flat-surface grasps (grasp
   # ids stay positions in the FULL per-shape DB, so id-based lookups are unaffected -- the
@@ -2517,7 +3225,16 @@ def _on_table_mateable_cached(assembly, part, face=_IDENTITY_FACE):
     cache = assembly._otm_cache = {}
   key = (part, face)
   if key not in cache:
-    cache[key] = _on_table_mateable(assembly, part, face=face)
+    try:
+      cache[key] = _on_table_mateable(assembly, part, face=face)
+    except KeyError:
+      # --stable-rest-poses: placement ids are PER GROUP, and this fact is asked with an id
+      # taken from a DIFFERENT group's table (the heuristic reasons about an abstract group
+      # and then queries the mate closure). Under the legacy table every group shared the
+      # same six ids, so the question always made sense; now it sometimes does not.
+      # "Unknown" must resolve to True: this fact only ever PRUNES candidates, so answering
+      # True keeps the search complete, while answering False could remove a real plan.
+      cache[key] = True
   return cache[key]
 
 
@@ -2797,6 +3514,9 @@ def set_allow_curved_grasps(on=True):
 
 
 def _slot_holds_alone(assembly, part, face):
+  # NOTE (--stable-rest-poses): `face` must index THIS part's own placement table. A foreign
+  # id raises from placement_quat rather than silently scoring a wrong rotation; the caller
+  # decides what to do, and both callers treat it as "no information".
   # LP fact, memoized per (part, face): can the SLOT capability alone balance `part`'s gravity
   # when the assembly rests on placement face `face` (identity face = held/upright)? Gravity
   # acts at the part's centroid (zero torque about it), so the slot's point forces at the seat
@@ -2811,11 +3531,14 @@ def _slot_holds_alone(assembly, part, face):
       cache[key] = True                                    # no mate axis: nothing to check
     else:
       R = _quat_to_R(np.asarray(placement_quat(assembly, (part,), part, face), dtype=float))
-      kind, params = assembly.part_shape(part)
+      shp = assembly.part_shape(part)
+      kind, params = shp[0], shp[1]
       if kind == "box":
         half = float(np.dot(np.abs(d), np.asarray(params[:3], dtype=float))) / 2.0
       elif kind == "cylinder":
         half = abs(d[2]) * params[0] / 2.0 + (1 - abs(d[2])) * params[1]
+      elif kind in ("mesh", "compound"):
+        half = _shape_half_extent_along(shp, d)            # AABB extent along the press
       else:                                                # sphere
         half = params[0]
       seat = R @ (half * np.asarray(d, dtype=float))       # seat face center, centroid-relative
@@ -3147,6 +3870,13 @@ def _part_support_points_world(pose, spec):
             for sz in (-1.0, 1.0) for a in np.arange(8) * (np.pi / 4.0)]
   if kind == "sphere":
     return [c + np.array([0.0, 0.0, sz * p[0]]) for sz in (-1.0, 1.0)]
+  if kind == "mesh":
+    return [c + R @ v for v in _load_mesh(p)["hull"]]     # hull vertices = candidate contacts
+  if kind == "compound":                                   # union over the children, each at
+    pts = []                                               # its own offset (child quat handled
+    for sub, off in _compound_children(spec):              # by the recursive call)
+      pts += _part_support_points_world(np.concatenate([c + R @ off, pose[3:]]), sub)
+    return pts
   raise ValueError(f"unknown shape kind {kind!r}")
 
 
@@ -3221,8 +3951,11 @@ def rest_faces(assembly, group):
   # precompute_stable_faces and both labeled heuristics look placements up here, so the search
   # and the abstraction stay consistent (same faces => admissibility preserved). Cached on the
   # assembly, keyed by subassembly, like the grasp table.
-  #   change-1 era: entries are still the 6 canonical face rotations, only stability-filtered;
-  #   turning them into arbitrary per-group quats is change 2 [[rest-pose-offaxis-change2]].
+  #   The candidate ids come from placement_table, so this is the same filter in both modes:
+  #   six canonical faces by default, arbitrary per-group stable quats under
+  #   --stable-rest-poses. The stability test is kept in BOTH modes -- computed poses are
+  #   stable for the shape by construction, but this re-checks the ASSEMBLED GROUP at its
+  #   scatter anchor, which is a different question.
   cache = getattr(assembly, "_rest_faces_cache", None)
   if cache is None:
     cache = assembly._rest_faces_cache = {}
@@ -3232,9 +3965,155 @@ def rest_faces(assembly, group):
     grp = set(group)
     ref = reference_part(grp)
     anchor_q = assembly.scatter_orientations.get(ref, np.array([1.0, 0.0, 0.0, 0.0]))
-    hit = cache[key] = tuple(f for f in range(len(_FACE_DOWN_QUATS))
+    hit = cache[key] = tuple(f for f in sorted(placement_table(assembly, grp, ref))
                              if _rest_stable(assembly, grp, ref, f, anchor_q))
   return hit
+
+
+# ---------------------------------------------------------------------------------------------
+# TRUE stable rest orientations (the enumerator half of change 2)
+#
+# What the search uses TODAY is `rest_faces`: the six axis-aligned face-down rotations of
+# _FACE_DOWN_QUATS, filtered by _rest_stable's support-polygon test. That is exact for a box
+# and a reasonable approximation for a cylinder, and it is WRONG for anything else -- a
+# chamfered part can rest on a chamfer, an L-bracket rests on two faces at once, and a mesh
+# part usually has no axis-aligned resting face at all.
+#
+# The functions below compute the real thing from the geometry. They are DELIBERATELY not
+# wired into the search yet: a placement id is today an index into a 6-element table and it
+# lives inside State.place, so replacing the enumerator REBINDS EVERY SAVED PLAN AND WITNESS
+# (the same compatibility class as rebinding grasp ids). See the module note in
+# `stable_rest_poses` for the full list of what integration still needs.
+# ---------------------------------------------------------------------------------------------
+def _part_frame_mesh(spec):
+  """The shape's mesh expressed in the PART frame (the spec's own shape rotation applied)."""
+  m = (_compound_mesh(spec) if spec[0] == "compound" else _spec_mesh(spec)).copy()
+  q = _shape_quat(spec)
+  if q is not None and spec[0] != "compound":              # compounds bake theirs per child
+    T = np.eye(4)
+    T[:3, :3] = _quat_to_R(q)
+    m.apply_transform(T)
+  return m
+
+
+def _mat_to_quat_wxyz(R):
+  q = np.zeros(4)
+  M = np.eye(4)
+  M[:3, :3] = np.asarray(R, dtype=float)
+  import trimesh
+  return np.asarray(trimesh.transformations.quaternion_from_matrix(M), dtype=float)
+
+
+def stable_rest_poses(spec, mass_center=None, *, min_prob=0.02, max_poses=24, sigma=0.0):
+  """TRUE stable resting orientations of one part shape, as [(quat, probability), ...].
+
+  `quat` is [w,x,y,z] and rotates the PART FRAME into a pose in which the part rests on a
+  horizontal table. The probability is trimesh's estimate of how likely that rest is when the
+  part is dropped -- the solid angle over which the centre of mass falls inside the
+  supporting facet -- so it also ranks the poses, which the current 6-face table cannot do.
+
+  The criterion is the same one `_rest_stable` applies today (the projected centre of mass
+  must lie inside the support polygon), but over the shape's OWN convex hull facets instead
+  of over six assumed axis-aligned faces.
+
+  DEGENERATE SHAPES. A rotationally symmetric part has a CONTINUUM of rests, not a set: a
+  sphere rests in every orientation, a cylinder rolls on its barrel. trimesh answers with
+  many near-equal-probability poses; `max_poses` caps that, and `min_prob` drops the noise.
+  A caller that must distinguish "a set of rests" from "a continuum" should look at whether
+  the returned probabilities are all equal and numerous -- see `rest_pose_report`.
+
+  WHAT INTEGRATION STILL NEEDS (this function is only the enumerator):
+    1. placement ids become opaque per-shape ids, not indices into _FACE_DOWN_QUATS. They sit
+       in State.place, so every saved plan and witness rebinds -- plan a migration or a
+       version tag.
+    2. `placement_quat` composes the reference part's shape rotation; with real rest poses the
+       pose IS the answer and that composition disappears.
+    3. GROUPS need their own poses, not their reference part's -- use `group_stable_rest_poses`.
+    4. rest heights (`_group_rest_height`, `_shape_half_z`) come free from the pose: the
+       transform puts the supporting facet on z=0.
+    5. the labeled heuristics assume a canonical rest face exists for every part; a part with
+       NO stable pose (a sphere) must keep an explicit answer, or h goes to infinity and the
+       milestone fills die (that failure is on record).
+    6. scatter orientations should be drawn from these poses too, so a part starts in a rest
+       the planner knows about.
+  """
+  import trimesh
+  mesh = _part_frame_mesh(spec)
+  com = None if mass_center is None else np.asarray(mass_center, dtype=float)
+  T, P = trimesh.poses.compute_stable_poses(mesh, center_mass=com, sigma=float(sigma),
+                                            n_samples=1, threshold=float(min_prob))
+  out = []
+  for i in range(len(T)):
+    out.append((_mat_to_quat_wxyz(np.asarray(T[i])[:3, :3]), float(P[i])))
+    if len(out) >= int(max_poses):
+      break
+  return out
+
+
+def group_stable_rest_poses(assembly, group, ref=None, **kw):
+  """Stable rest orientations of a whole SUBASSEMBLY, in its reference part's frame.
+
+  A group is not its root part: a car body with wheels on rests on the WHEELS, and the chair
+  backrest module rests flat on its plate. This builds the union mesh of the group at its
+  assembled relative poses and uses the MASS-WEIGHTED centre of mass (parts carry different
+  masses, so the volume centroid trimesh would assume is the wrong pivot), then defers to
+  `stable_rest_poses`.
+  """
+  import trimesh
+  parts = list(group)
+  ref = ref or reference_part(set(parts))
+  meshes, coms, masses = [], [], []
+  for p in parts:
+    m = _part_frame_mesh(assembly.part_shape(p))
+    off = np.asarray(assembly.position_in_base(p), dtype=float) \
+        - np.asarray(assembly.position_in_base(ref), dtype=float)
+    T = np.eye(4)
+    T[:3, 3] = off
+    m.apply_transform(T)
+    meshes.append(m)
+    coms.append(np.asarray(m.center_mass, dtype=float))
+    masses.append(float(assembly.mass(p)))
+  union = trimesh.util.concatenate(meshes)
+  w = np.asarray(masses, dtype=float)
+  com = (np.asarray(coms) * w[:, None]).sum(axis=0) / max(float(w.sum()), 1e-12)
+  return _stable_poses_of_mesh(union, com, **kw)
+
+
+def _stable_poses_of_mesh(mesh, com, *, min_prob=0.02, max_poses=24, sigma=0.0):
+  import trimesh
+  T, P = trimesh.poses.compute_stable_poses(mesh, center_mass=np.asarray(com, dtype=float),
+                                            sigma=float(sigma), n_samples=1,
+                                            threshold=float(min_prob))
+  return [(_mat_to_quat_wxyz(np.asarray(T[i])[:3, :3]), float(P[i]))
+          for i in range(min(len(T), int(max_poses)))]
+
+
+def rest_pose_report(spec, mass_center=None, **kw):
+  """Summary of `stable_rest_poses`, with the two cases the discrete placement model cannot
+  express called out:
+
+    `continuum`  MANY rests of equal probability. That is the signature of a tessellated
+                 CURVED support -- a 30cm leg returns a dozen equal rests, which are one
+                 physical rest (lying on its barrel) sampled at a dozen roll angles. Six
+                 equal rests are NOT a continuum: that is a cube, and they are genuinely
+                 distinct placements.
+    `neutral`    NO discrete rest at all (a sphere). Physically it rests in EVERY
+                 orientation; the current heuristics assume a canonical rest face exists and
+                 send h to infinity when it does not, so this case needs an explicit answer.
+
+  NOTE ON PROBABILITY. trimesh ranks rests by how likely they are when the part is DROPPED.
+  That is not the same question as which rests are USEFUL: a long leg standing on its cap is
+  a rare drop outcome but a perfectly good (and often necessary) placement. So a planner must
+  keep every rest above a stability threshold and must not take the top-k by probability.
+  """
+  poses = stable_rest_poses(spec, mass_center, **kw)
+  probs = np.array([p for _q, p in poses], dtype=float)
+  equal = bool(len(probs) >= 2 and float(probs.std()) < 1e-3)
+  return {"n": len(poses), "probs": probs.round(4).tolist(),
+          "equal_probs": equal,
+          "continuum": bool(equal and len(probs) >= 8),
+          "neutral": len(poses) == 0,
+          "top_quat": (poses[0][0].round(6).tolist() if poses else None)}
 
 
 def _grasp_frame(assembly, part, part_pose, grasp_id):
@@ -3271,6 +4150,7 @@ def reset_grasp_pose_cache():
   silently stops matching the search that produced the plan."""
   _GRASP_POSE_CACHE.clear()
   _SAMPLED_VIEWS_CACHE.clear()                             # --grasp-sampler: same hazard class
+  _SAMPLED_META_CACHE.clear()
 
 
 def _grounding_caps(state, assembly, group, gripper_kind):
@@ -3438,7 +4318,9 @@ def _grasp_surface(spec, grasp_id):
   # "flat" | "curved" surface a grasp contacts, memoized (part_grasp_surfaces depends only on
   # the shape KIND, the roll count, and dense mode). Only consulted when
   # curved_grasp_torque_scale is set.
-  key = (spec[0], _ROLLS_PER_FACE, _DENSE_GRASPS, _GRASP_TRANSLATIONS)
+  # keyed on the canonical spec identity: mesh/compound parts must not alias on the kind
+  # string -- two different meshes/compounds are two different surfaces.
+  key = (_spec_key(spec), _ROLLS_PER_FACE, _DENSE_GRASPS, _GRASP_TRANSLATIONS)
   surfaces = _SURFACE_CACHE.get(key)
   if surfaces is None:
     surfaces = _SURFACE_CACHE[key] = part_grasp_surfaces(spec)

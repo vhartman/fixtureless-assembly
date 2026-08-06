@@ -133,14 +133,15 @@ def display_final_assembly(C, assembly, base_pose):
     # (e.g. legs laid flat) does not leak into the assembled view.
     C_final.getFrame(obj).setRelativeQuaternion([1.0, 0.0, 0.0, 0.0])
 
-    # keep the object's color, just lower its opacity (shape may live on a __shape child).
+    # keep the object's color, just lower its opacity (shape may live on __shape children).
     # THIN shapes (cylinders/spheres) get a higher alpha: at 0.3 a thin leg has so little
     # material along any view ray that it nearly vanishes next to a 0.3 box.
-    sf = C_final.getFrame(part_shape_frame(C_final, obj))
-    mesh_colors = np.asarray(sf.getMeshColors(), dtype=float)
-    rgb = (mesh_colors.reshape(-1, mesh_colors.shape[-1])[0][:3]) / 255.0
-    a = 0.7 if assembly.part_shape(obj)[0] in ("cylinder", "sphere") else 0.3
-    sf.setColor([rgb[0], rgb[1], rgb[2], a])
+    for _sfn in part_shape_frames(C_final, obj):
+      sf = C_final.getFrame(_sfn)
+      mesh_colors = np.asarray(sf.getMeshColors(), dtype=float)
+      rgb = (mesh_colors.reshape(-1, mesh_colors.shape[-1])[0][:3]) / 255.0
+      a = 0.7 if assembly.part_shape(obj)[0] in ("cylinder", "sphere") else 0.3
+      sf.setColor([rgb[0], rgb[1], rgb[2], a])
 
   C_final.getFrame(assembly.base).setPosition(base_pose)
   C_final.getFrame(assembly.base).setQuaternion([1.0, 0.0, 0.0, 0.0])
@@ -165,13 +166,14 @@ def show_subassemblies(C, assembly, subassemblies, base_pose):
         C_final.getFrame(obj).setRelativePosition(parent[1])
         C_final.getFrame(obj).setRelativeQuaternion([1.0, 0.0, 0.0, 0.0])  # see display_final_assembly
 
-      # keep the object's color, just lower its opacity (shape may live on a __shape child;
+      # keep the object's color, just lower its opacity (shape may live on __shape children;
       # thin cylinders/spheres get a higher alpha -- see display_final_assembly)
-      sf = C_final.getFrame(part_shape_frame(C_final, obj))
-      mesh_colors = np.asarray(sf.getMeshColors(), dtype=float)
-      rgb = (mesh_colors.reshape(-1, mesh_colors.shape[-1])[0][:3]) / 255.0
-      a = 0.7 if assembly.part_shape(obj)[0] in ("cylinder", "sphere") else 0.3
-      sf.setColor([rgb[0], rgb[1], rgb[2], a])
+      for _sfn in part_shape_frames(C_final, obj):
+        sf = C_final.getFrame(_sfn)
+        mesh_colors = np.asarray(sf.getMeshColors(), dtype=float)
+        rgb = (mesh_colors.reshape(-1, mesh_colors.shape[-1])[0][:3]) / 255.0
+        a = 0.7 if assembly.part_shape(obj)[0] in ("cylinder", "sphere") else 0.3
+        sf.setColor([rgb[0], rgb[1], rgb[2], a])
 
     C_final.getFrame(assembly.base).setPosition(base_pose)
 

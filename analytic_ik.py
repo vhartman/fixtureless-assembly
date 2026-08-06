@@ -64,6 +64,10 @@ _CAL = {
         "load": lambda: _artifact("ur10_ik"),
     },
 }
+# ur10_limited is a ur10 with a tighter shoulder-lift/elbow workspace. The KINEMATICS are
+# identical, so the analytic solver is the same; the caller applies the joint limits to the
+# returned branches (seed_configs returns all branches, limit filtering happens downstream).
+_CAL["ur10_limited"] = _CAL["ur10"]
 for _c in _CAL.values():
   _c["Binv"] = np.linalg.inv(_c["B"])
   _c["solver"] = None                                        # lazily loaded ssik module

@@ -103,7 +103,7 @@ _SOLVE_IT = object()   # 'no keyframe supplied -- solve it here' (see build_task
 
 
 def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
-                home_state, pre_witnesses=None):
+                home_state, pre_witnesses=None, witness_sets=None):
   """Map the plan+witnesses to (tasks, sequence_names). robot_idx: {r: [joint indices]}
   in the problem config's joint order; witnesses[i] is the full-config keyframe for plan[i]
   (None for non-IK actions -> skipped, no motion goal needed).
@@ -111,26 +111,65 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
   `pre_witnesses` (--fuse-pre-skill, {plan index: keyframe or None}) supplies the pre-* GOTO
   keyframes ready-made, from solver.fuse_pre_skill_witnesses. None (the default) keeps the
   historical behaviour: each split solves its own pre keyframe here, inside the export. A
-  missing SKILL witness, by contrast, is a hard error -- it cannot be substituted."""
+  missing SKILL witness, by contrast, is a hard error -- it cannot be substituted.
+
+  `witness_sets` (--witness-sets, {plan index: [full vectors, member 0 == witnesses[i]]}):
+  the covered task's goal becomes an mr_bench GoalSet over the members. Every member shares
+  the grasp AND the grasped parts' world poses with the canonical witness, so every attach --
+  which mr_bench fires at the ACHIEVED configuration -- is member-invariant, and all members
+  hash to the SAME mode (no mode-graph growth). A later no-witness task (release,
+  inhand_reorient) that pins arms last moved by a set-bearing task MIRRORS the set: member m
+  pins each arm at ITS OWN member-m sub-vector (aligned whole-witness slices, never mixed),
+  so the diversity survives past the release instead of collapsing back to member 0. Steps
+  the export SPLITS (pre-* funnels) never receive sets here -- the caller excludes them."""
   from multi_robot_multi_goal_planning.problems.planning_env import Task
-  from multi_robot_multi_goal_planning.problems.core.goals import SingleGoal
+  from multi_robot_multi_goal_planning.problems.core.goals import SingleGoal, GoalSet
 
   # cur[r] = robot r's CURRENT joint sub-vector (start: home). A witness updates the
   # ACTIVE arm(s); a no-witness / release action leaves the arm where it was -- so its goal
   # keeps it AT ITS GRASP, which is what makes a release's re-parent capture the object at
   # its true (held) pose rather than at home.
   cur = {r: np.asarray(home_state)[robot_idx[r]].copy() for r in robots}
+  # cur_alt[r] = (source plan index, [per-member sub-vectors]) when r was last moved by a
+  # set-bearing task; reset whenever a set-less task moves r. Consumed by the mirroring below.
+  cur_alt = {r: None for r in robots}
 
   # mate tree exactly as mr_bench builds it: each assemble(r, part, onto) -> attach(onto, part)
   mate_parent = {a[2]: a[3] for a in plan if a[0] == "assemble"}
 
-  def goal_for(rs, wit):
+  def goal_for(rs, wit, alts=None):
     parts = []
     for r in rs:
       if wit is not None:
         cur[r] = np.asarray(wit)[robot_idx[r]]             # active arm -> witness config
+        cur_alt[r] = None
       parts.append(cur[r])
     return SingleGoal(np.concatenate(parts))
+
+  def goal_for_set(rs, members, src_index):
+    """GoalSet over aligned member slices; canonical member 0 feeds cur (so set-less
+    downstream consumers see exactly the single-witness behaviour)."""
+    goals = []
+    for m, w in enumerate(members):
+      goals.append(np.concatenate([np.asarray(w)[robot_idx[r]] for r in rs]))
+    for r in rs:
+      cur[r] = np.asarray(members[0])[robot_idx[r]]
+      cur_alt[r] = (src_index, [np.asarray(w)[robot_idx[r]].copy() for w in members])
+    return GoalSet(goals)
+
+  def mirrored_pin(rs):
+    """Goal for a no-witness task pinning `rs`: a GoalSet mirroring the members when every
+    set-bearing arm shares ONE source task (aligned slices), else the canonical SingleGoal."""
+    srcs = {cur_alt[r][0] for r in rs if cur_alt[r] is not None}
+    if len(srcs) == 1:
+      n = len(next(cur_alt[r] for r in rs if cur_alt[r] is not None)[1])
+      goals = [np.concatenate([(cur_alt[r][1][m] if cur_alt[r] is not None else cur[r])
+                               for r in rs]) for m in range(n)]
+      return GoalSet(goals)
+    if len(srcs) > 1:
+      print("[witsets] pin over arms from DIFFERENT set sources "
+            f"({sorted(srcs)}): falling back to the canonical pin.")
+    return SingleGoal(np.concatenate([cur[r] for r in rs]))
 
   def _support_frame(state, root):
     # the frame the released/placed assembly root should attach to. Scan the root's WHOLE
@@ -207,20 +246,36 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
     # held part (obj_0) snapped to that arm's home pose and every downstream mate misaligned.
     # `goal_for` poses each in task-robot order at its witness config, pinning the holder.
     involved = _active_robots(a, states[i], robot_ik) or [r]
+    # --witness-sets: members for THIS step, validated against the shipped canonical witness.
+    # Steps the export splits keep their single witness (the funnel pairing needs one member).
+    smembers = None
+    if witness_sets and i in witness_sets and wit is not None:
+      _ms = witness_sets[i]
+      if len(_ms) >= 2 and np.allclose(np.asarray(_ms[0]), np.asarray(wit), atol=1e-9):
+        smembers = _ms
+      elif len(_ms) >= 2:
+        print(f"[witsets] step {i} {kind}: member 0 no longer matches the canonical witness "
+              f"(rewritten by a later pass) -- set dropped.")
     if kind == "pick":
       # --pre-pick splits into a goto to the retracted pre-grasp + the real pick (grasp+attach).
       frames = [robot_ik.gripper_frame[r], _root_of(states[i], a[2], mate_parent)]
       mk = lambda g: Task(name, involved, g, type="pick", frames=frames)
       emit = split_skill(a, i, wit, involved, name, kind, mk) if pre_pick else None
       if emit is None:
-        t = mk(goal_for(involved, wit))
+        t = mk(goal_for_set(involved, smembers, i) if smembers
+               else goal_for(involved, wit))
+      elif smembers:
+        print(f"[witsets] step {i} pick is pre-split: set dropped (single witness kept).")
     elif kind == "place":
       # --pre-place splits into a goto to the lifted pre-place + the real place (set-down+attach).
       frames = ["table", _root_of(states[i], a[2], mate_parent)]
       mk = lambda g: Task(name, involved, g, type="place", frames=frames)
       emit = split_skill(a, i, wit, involved, name, kind, mk) if pre_place else None
       if emit is None:
-        t = mk(goal_for(involved, wit))
+        t = mk(goal_for_set(involved, smembers, i) if smembers
+               else goal_for(involved, wit))
+      elif smembers:
+        print(f"[witsets] step {i} place is pre-split: set dropped (single witness kept).")
     elif kind == "assemble":
       # --pre-insertion splits into a goto to the funnel mouth + the real mate (seats at `wit`).
       frames = [a[3], a[2]]
@@ -237,7 +292,8 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       # v1: lone parts only, so the attach child is the part itself.
       _g = A.grasp_pose(assembly, a[2], a[3])
       _ee = np.concatenate([_g[:3], P._quat_mul(_g[3:], robot_ik.q_correction[r])])
-      t = Task(name, [r], goal_for([r], None), type="pick",
+      t = Task(name, [r],
+               mirrored_pin([r]) if witness_sets else goal_for([r], None), type="pick",
                frames=[robot_ik.gripper_frame[r], a[2]],
                side_effect="make_appear", side_effect_data=P._pose_invert(_ee))
     elif kind == "release":
@@ -259,8 +315,9 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       root = _root_of(states[i + 1], a[2], mate_parent)
       grp = next((g for g in states[i + 1].subassemblies() if root in g), {root})
       rel_robots = list(dict.fromkeys([r] + robot_ik._holders_of_group(states[i + 1], grp)))
-      t = Task(name, rel_robots, goal_for(rel_robots, None), type="place",
-               frames=[_support_frame(states[i + 1], root), root])
+      t = Task(name, rel_robots,
+               mirrored_pin(rel_robots) if witness_sets else goal_for(rel_robots, None),
+               type="place", frames=[_support_frame(states[i + 1], root), root])
     elif kind == "add_grasp":
       # TODO(mp): a brace should be a RELATIVE-POSE CONSTRAINT gripper<->object, not a goto
       # keyframe (other mr_bench branch). goto = motion to the brace pose for now.
@@ -268,12 +325,17 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       mk = lambda g: Task(name, involved, g, type="goto")
       emit = split_skill(a, i, wit, involved, name, kind, mk) if pre_add_grasp else None
       if emit is None:
-        t = mk(goal_for(involved, wit))
+        t = mk(goal_for_set(involved, smembers, i) if smembers
+               else goal_for(involved, wit))
+      elif smembers:
+        print(f"[witsets] step {i} add_grasp is pre-split: set dropped.")
     elif kind == "handover":
       rB = r
       rA = _holder_of(states[i], a[2])
       task_robots = [rA, rB] if rA is not None and rA != rB else [rB]
-      t = Task(name, task_robots, goal_for(task_robots, wit), type="handover",
+      t = Task(name, task_robots,
+               goal_for_set(task_robots, smembers, i) if smembers
+               else goal_for(task_robots, wit), type="handover",
                frames=[robot_ik.gripper_frame[rB], _root_of(states[i], a[2], mate_parent)])
     else:
       step_names.append([])                                   # non-exported: keep index alignment
@@ -415,7 +477,7 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
     task = _task_of(m)
     if task is not None:
       try:
-        g = _np.asarray(task.goal.sample(m), dtype=float)
+        g = _np.asarray(_goal_q(task.goal, m), dtype=float)
         saved = _np.asarray(env.C.getJointState(), dtype=float)
         qq, off = saved.copy(), 0
         for tr in task.robots:
@@ -441,7 +503,7 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
     try:
       task = env.tasks[tid]
       if r in (getattr(task, "robots", ()) or ()):
-        g = _np.asarray(task.goal.sample(m), dtype=float)
+        g = _np.asarray(_goal_q(task.goal, m), dtype=float)
         saved = _np.asarray(env.C.getJointState(), dtype=float)
         qq, off = saved.copy(), 0
         for tr in task.robots:
@@ -597,7 +659,7 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
 def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, bracing,
                  depgraph=False, collision_tolerance=0.01, pre_witnesses=None,
                  robot_robot_margin=0.0, robot_margin_ramp=0.0, table_margin=0.0,
-                 table_float=0.0):
+                 table_float=0.0, witness_sets=None):
   """Build a live mr_bench problem from our solved plan. depgraph=False -> SequenceMixin (a
   fixed total order); depgraph=True -> DependencyGraphMixin (the partial order, so the planner
   may reorder independent actions). Same tasks/frames/witnesses either way."""
@@ -625,9 +687,14 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
       # old workarounds -- finger re-parent, ssBox baking, sys.modules stub -- are removed.)
       rai_env.__init__(self)                               # -> robot_idx, start_pos, limits
       self.manipulating_env = True
+      if witness_sets:
+        enable_goalset_cycling()
+        _n = sum(1 for v in witness_sets.values() if len(v) >= 2)
+        print(f"[witsets] make_problem: {_n} task(s) carry witness GoalSets "
+              f"(K up to {max(len(v) for v in witness_sets.values())}).")
       self.tasks, seq, step_names = build_tasks(
           assembly, plan, witnesses, states, self.robots, self.robot_idx, robot_ik, home,
-          pre_witnesses=pre_witnesses)
+          pre_witnesses=pre_witnesses, witness_sets=witness_sets)
       self.step_names = step_names                         # task names per plan action -- lets
       self.plan_actions = [tuple(a) for a in plan]         # sim.py map completed tasks back to
                                                            # plan actions (grasp/weld events)
@@ -797,7 +864,12 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
     if verbose:
       print(f"[mp/birrt] shortcutting (up to {shortcut_iters} iters, resolution {res}, "
             "not time-bounded)...")
-    path, sc_info = robot_mode_shortcut(problem, path, max_iter=shortcut_iters, resolution=res)
+    # PASS THE ENV'S OWN TOLERANCE. robot_mode_shortcut's default is tolerance=0.01 = 1cm of
+    # ALLOWED PENETRATION, which silently overrode the strict 1e-4/1e-6 tolerance the path was
+    # planned at -- the one loose stage in the zero-collision-tolerance chain. Cost impact is
+    # nil (measured: finals within seed noise at 1e-4); acceptance is just honest now.
+    path, sc_info = robot_mode_shortcut(problem, path, max_iter=shortcut_iters, resolution=res,
+                                        tolerance=getattr(problem, "collision_tolerance", 0.01))
     info["shortcut"] = sc_info
     if verbose:
       after = path_cost(path, problem.batch_config_cost)
@@ -907,6 +979,35 @@ def load_path(path_json):
   return out
 
 
+
+def enable_goalset_cycling():
+  """MONKEYPATCH (mr_bench untouched on disk): GoalSet.sample CYCLES its members instead of
+  drawing one uniformly at random. Reverse-tree transition seeding samples the goal a handful
+  of times per task; uniform-with-replacement leaves a member with NO reverse root ~23% of the
+  time at K=4, and an unseeded member is dead weight. Cycling covers every member first, then
+  wraps -- and consumes no np.random draws, so --mp-seed streams are unchanged."""
+  from multi_robot_multi_goal_planning.problems.core import goals as _goals
+  if getattr(_goals.GoalSet, "_witsets_cycling", False):
+    return
+  def _sample(self, mode):
+    k = getattr(self, "_witsets_next", 0)
+    self._witsets_next = k + 1
+    return self.goals[k % len(self.goals)]
+  _goals.GoalSet.sample = _sample
+  _goals.GoalSet._witsets_cycling = True
+  print("[witsets] GoalSet.sample now CYCLES members (runtime monkeypatch, "
+        "reverse-root coverage; mr_bench on disk untouched).")
+
+
+def _goal_q(goal, mode):
+  """Deterministic goal draw for chain/report walks: a GoalSet's CANONICAL member 0 (member 0
+  is the shipped single witness by construction), so mode_sequence and the clearance report
+  stay reproducible instead of consuming RNG on a random member."""
+  gs = getattr(goal, "goals", None)
+  if gs is not None and len(gs):
+    return gs[0]
+  return goal.sample(mode)
+
 def mode_sequence(problem):
   """Walk the SEQUENCE problem's mode chain (same walk as report_problem_clearance) and
   return [mode_0, mode_1, ...]: mode_k is the attachment state IN FORCE while per-mode
@@ -919,7 +1020,7 @@ def mode_sequence(problem):
   conf_type = type(q_home)
 
   def goal_config(m, task):                                  # as report_problem_clearance
-    goal = task.goal.sample(m)
+    goal = _goal_q(task.goal, m)
     q = []
     for j, r in enumerate(env.robots):
       if r in task.robots:
@@ -1007,7 +1108,7 @@ def report_problem_clearance(problem, plan=None, margin=0.02, verbose=True,
         name_to_act[nm] = tuple(plan[i])
 
   def goal_config(m, task):
-    goal = task.goal.sample(m)
+    goal = _goal_q(task.goal, m)
     q = []
     for j, r in enumerate(env.robots):
       if r in task.robots:

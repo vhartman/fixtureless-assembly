@@ -171,6 +171,15 @@ def _grasp_polytope(kind):
   return name, dict(fam[kind])
 
 
+def _mate_caps_from_args(a):
+  """CLI -> SimScene.mate_caps. None unless at least one cap is given (feature OFF = the
+  historical infinite-strength rigid weld, byte-identical); a missing partner cap is inf."""
+  if a.mate_force_cap is None and a.mate_torque_cap is None:
+    return None
+  return (float(a.mate_force_cap) if a.mate_force_cap is not None else float("inf"),
+          float(a.mate_torque_cap) if a.mate_torque_cap is not None else float("inf"))
+
+
 # ---------------------------------------------------------------------------------------------
 # report / failure taxonomy
 # ---------------------------------------------------------------------------------------------
@@ -185,7 +194,7 @@ class ActionResult:
 
 class SimReport:
   """Per-action results + final assembly error. failure in
-  {dropped, slid, toppled, grasp_broke, not_seated}."""
+  {dropped, slid, toppled, grasp_broke, mate_broke, not_seated}."""
   def __init__(self):
     self.results = []
     self.final_pose_err = None                             # {part: (pos_err_m, ang_err_rad)}
@@ -225,9 +234,74 @@ class SimReport:
 # ---------------------------------------------------------------------------------------------
 # MJCF construction: assembly spec + a State's poses -> model XML
 # ---------------------------------------------------------------------------------------------
+_PART_MESH_ASSETS = {}                                     # (path, scale) -> (name, obj path)
+
+
+def _part_mesh_asset(prm):
+  """MuJoCo <mesh> asset for a ("mesh", {...}) part spec: the part's CONVEX HULL written to
+  the sim_meshes/ cache as .obj (MuJoCo has no .stl/.ply loader we rely on, and it needs a
+  convex geom anyway -- same v1 contract as the rai side). Deterministic name per
+  (path, scale), memoized; the file is written once."""
+  import problem as P
+  key = P._mesh_key(prm)
+  hit = _PART_MESH_ASSETS.get(key)
+  if hit is None:
+    import zlib
+    name = f"part_{zlib.crc32(repr(key).encode()) & 0xffffffff:08x}"
+    os.makedirs(_MESH_CACHE_DIR, exist_ok=True)            # defined below (arm_model's cache)
+    path = os.path.join(_MESH_CACHE_DIR, name + ".obj")
+    if not os.path.exists(path):
+      hm = P._load_mesh(prm)["hull_mesh"]
+      with open(path, "w") as f:
+        for v in hm.vertices:
+          f.write(f"v {v[0]} {v[1]} {v[2]}\n")
+        for a, b, c in hm.faces:
+          f.write(f"f {a + 1} {b + 1} {c + 1}\n")
+    hit = _PART_MESH_ASSETS[key] = (name, path)
+  return hit
+
+
+def _spec_volume(spec):
+  # volume of ONE sub-shape (ssBox corner rounding ignored; mesh = its convex hull) --
+  # used to split a compound part's mass across its geoms so the inertia is roughly right.
+  kind, p = spec[0], spec[1]
+  if kind == "box":
+    return float(p[0] * p[1] * p[2])
+  if kind == "cylinder":
+    return float(np.pi * p[1] * p[1] * p[0])
+  if kind == "sphere":
+    return float(4.0 / 3.0 * np.pi * p[0] ** 3)
+  if kind == "mesh":
+    import problem as P
+    return float(P._load_mesh(p)["hull_mesh"].volume)
+  raise ValueError(f"unknown shape kind {kind!r}")
+
+
+def _compound_geoms_xml(spec, mu, mass, group, rgba):
+  """FINISHED <geom> strings for a compound part: one geom per sub-shape, each at its own
+  pos/quat inside the body, mass split by sub-shape volume (no mass_placeholder -- the
+  caller's single-geom replace would stamp the FULL mass onto every child)."""
+  import problem as P
+  chs = P._compound_children(spec)
+  vols = np.array([_spec_volume(s) for s, _ in chs], dtype=float)
+  vols = vols / max(float(vols.sum()), 1e-12)
+  out = []
+  for (sub, pos), w in zip(chs, vols):
+    sq = sub[2] if len(sub) > 2 else None
+    gq = ' quat="1 0 0 0"' if sq is None else f' quat="{sq[0]} {sq[1]} {sq[2]} {sq[3]}"'
+    gp = f' pos="{pos[0]} {pos[1]} {pos[2]}"'
+    out.append(_geom_xml(sub, mu).replace(
+        "mass_placeholder", f'mass="{mass * w}" group="{group}" rgba="{rgba}"{gq}{gp}'))
+  return "".join(out)
+
+
 def _geom_xml(spec, mu):
-  kind, p = spec[0], list(spec[1])
+  kind, p = spec[0], list(spec[1]) if not isinstance(spec[1], dict) else spec[1]
   fr = f'friction="{mu} 0.005 0.0001"'
+  if kind == "mesh":
+    return f'<geom type="mesh" mesh="{_part_mesh_asset(p)[0]}" {fr} mass_placeholder/>'
+  if kind == "compound":
+    raise ValueError("compound parts are emitted via _compound_geoms_xml (several geoms)")
   if kind == "box":
     return f'<geom type="box" size="{p[0]/2} {p[1]/2} {p[2]/2}" {fr} mass_placeholder/>'
   if kind == "cylinder":
@@ -602,6 +676,21 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
             f"it and settle instead of resting.")
     table_top = float(planner_table_top)
   parts_xml, eq_xml = [], []
+  # <mesh> assets for MESH-shaped parts and mesh CHILDREN of compound parts (deduped by
+  # asset name; _geom_xml references them)
+  def _mesh_specs():
+    import problem as _P
+    for p in assembly.objects:
+      spec = assembly.part_shape(p)
+      if spec[0] == "mesh":
+        yield spec[1]
+      elif spec[0] == "compound":
+        for sub, _off in _P._compound_children(spec):
+          if sub[0] == "mesh":
+            yield sub[1]
+  part_mesh_assets = "".join(dict.fromkeys(
+      f'<mesh name="{_part_mesh_asset(prm)[0]}" file="{_part_mesh_asset(prm)[1]}"/>'
+      for prm in _mesh_specs()))
   # deterministic per-part colors (tab10-ish) -- rai's colors are np.random.rand, not
   # reproducible here; a fixed palette keeps replays comparable across runs.
   palette = ["0.84 0.15 0.16 1", "0.12 0.47 0.71 1", "0.17 0.63 0.17 1", "1.0 0.5 0.05 1",
@@ -613,9 +702,13 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
     sq = spec[2] if len(spec) > 2 else None
     gq = ' quat="1 0 0 0"' if sq is None else f' quat="{sq[0]} {sq[1]} {sq[2]} {sq[3]}"'
     mass = assembly.masses.get(p, 0.1)
-    g = _geom_xml(spec, mu_table).replace(
-        "mass_placeholder",
-        f'mass="{mass}" group="{GROUP_PART}" rgba="{palette[i % len(palette)]}"{gq}')
+    if spec[0] == "compound":                              # several geoms, mass by volume
+      g = _compound_geoms_xml(spec, mu_table, mass, GROUP_PART,
+                              palette[i % len(palette)])
+    else:
+      g = _geom_xml(spec, mu_table).replace(
+          "mass_placeholder",
+          f'mass="{mass}" group="{GROUP_PART}" rgba="{palette[i % len(palette)]}"{gq}')
     parts_xml.append(
         f'<body name="{p}" pos="{pose[0]} {pose[1]} {pose[2]}" '
         f'quat="{q[0]} {q[1]} {q[2]} {q[3]}"><freejoint/>{g}</body>')
@@ -717,7 +810,7 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
     <material name="grid" texture="grid" texrepeat="8 8" reflectance="0.1"/>
     <texture type="skybox" builtin="gradient" rgb1="0.5 0.7 0.9" rgb2="0.9 0.9 0.95"
              width="64" height="64"/>
-    {arm_mesh_assets}
+    {part_mesh_assets}{arm_mesh_assets}
   </asset>
   <visual><headlight ambient="0.35 0.35 0.35" diffuse="0.6 0.6 0.6"/></visual>
   <worldbody>
@@ -829,6 +922,20 @@ class SimScene:
     self.gripper_kinds = gripper_kinds or {}
     self.active_grasps = {}                                # robot -> (eq_id, part, fcap, tcap)
     self._hold_info = {}                                   # robot -> grasp-frame info (directional caps)
+    # FINITE MATE STRENGTH (--mate-force-cap/--mate-torque-cap): mate welds get the same
+    # breakaway treatment as grasp welds. None = infinite strength = the historical model
+    # (monitoring fully off, byte-identical). The map is built once from the pre-declared
+    # mate_<part> equalities; parent comes from the weld's own body1, not the assembly DAG.
+    self.mate_caps = None                                  # (F N, T Nm) scalar caps, or None
+    self._mate_over = {}                                   # part -> consecutive overload steps
+    self._mate_max = {}                                    # part -> (max |F|, max |T|) observed
+    self._mate_eqs = {}                                    # part -> (eq id, parent body name)
+    for _eq in range(self.model.neq):
+      _nm = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_EQUALITY, _eq)
+      if _nm and _nm.startswith("mate_"):
+        _par = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY,
+                                 int(self.model.eq_obj1id[_eq]))
+        self._mate_eqs[_nm[len("mate_"):]] = (_eq, _par)
     self.expect_state = None                               # set by the executor: lets attach() recover a grasp id
     # DIRECTIONAL CAPS default OFF. The test is faithful to the LP (force at the grasp point +
     # residual pure couple, matching wrench._force_gen/_couple_gen), and it is MORE PERMISSIVE
@@ -1372,6 +1479,33 @@ class SimScene:
                   + self._contact_context(r, part)))
         else:
           self._over[r] = 0
+      if self.mate_caps is not None:
+        # FINITE MATE STRENGTH: the same sustained-overload breakaway as grasps, applied to
+        # every ACTIVE mate weld. A broken mate deactivates -- the child separates and the
+        # judge sees the cascade (toppled/not_seated) with mate_broke as the first failure.
+        # This is what makes "hold the car by one wheel" fail EMERGENTLY: the wheel-body weld
+        # carries the whole group's weight, exceeds its cap, and lets go.
+        _mf, _mt = self.mate_caps
+        for _p, (_eq, _par) in self._mate_eqs.items():
+          if not self.data.eq_active[_eq]:
+            self._mate_over.pop(_p, None)
+            continue
+          _fm, _tm = self._weld_wrench(_eq)
+          _mx = self._mate_max.get(_p, (0.0, 0.0))
+          self._mate_max[_p] = (max(_mx[0], _fm), max(_mx[1], _tm))
+          if _fm > _mf or _tm > _mt:
+            self._mate_over[_p] = self._mate_over.get(_p, 0) + 1
+            if self._mate_over[_p] >= sustain:              # sustained overload -> joint fails
+              self.data.eq_active[_eq] = 0
+              self._mate_over.pop(_p, None)
+              if report is not None:
+                report.results.append(ActionResult(
+                    action or ("step",), False, "mate_broke",
+                    f"{_p}~{_par} |F|={_fm:.1f}N |T|={_tm:.2f}Nm "
+                    f"(mate caps {_mf:g}N/{_mt:g}Nm) "
+                    f"sustained {BREAK_SUSTAIN*1000:.0f}ms"))
+          else:
+            self._mate_over[_p] = 0
       if self.recorder is not None:
         self._rec_count += 1
         if self._rec_count % RECORD_EVERY == 0:
@@ -2081,7 +2215,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         corridor_lead_max=4.0, corridor_verify=0, corridor_refine=0,
                         corridor_cross_only=False, corridor_online=False,
                         rate_clamp=False, settle_tol=0.0, settle_max=1.0, couple_handovers=False,
-                        directional_caps=False,
+                        directional_caps=False, mate_caps=None,
                         verify_efc_cache=False, force_limits=False, wrench_margin=1.0, mass_scale=1.0, inertia_factor=1.0,
                         corner_limits=True,
                         spline=False, spline_per_seg=8, spline_tension=0.5,
@@ -2155,6 +2289,12 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                    weld_timeconst=weld_timeconst)
   scene.verify_efc_cache = bool(verify_efc_cache)
   scene.directional_caps = bool(directional_caps)
+  scene.mate_caps = mate_caps
+  if mate_caps is not None:
+    print(f"[sim/mp] --mate-*-cap ACTIVE: finite mate strength {mate_caps[0]:g}N/"
+          f"{mate_caps[1]:g}Nm -- an overloaded mate weld BREAKS (mate_broke) after "
+          f"{BREAK_SUSTAIN*1000:.0f}ms, same breakaway rule as grasps. Per-mate load "
+          f"maxima print at the end of the run.")
   articulated = articulated or actuated
   if articulated:
     print(f"[sim/mp] --articulated ACTIVE: real kinematic chains generated from rai "
@@ -2834,13 +2974,23 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         # so one wrench budget yields BOTH a speed limit (the curvature term) and an
         # acceleration limit (the tangential term) at each arc position -- a mini-TOPP.
         # Point-mass model: |F| = m|a|, |T| = m|a|*lever (no I*alpha term).
-        _G = len(cor_grid := np.arange(0.0, _D + corridor_ds, corridor_ds))
-        _p = np.zeros((len(robots), _G, 3))                  # held-group COM path
-        _lev = np.zeros((len(robots), _G))                    # |COM - gripper| lever arm
-        _m = np.zeros((len(robots), _G))                      # held mass
+        # SAMPLE PER STRETCH, NOT PER ARC GRID POINT. The held group is a property of the
+        # symbolic state, which is constant within a stretch and changes only at barriers --
+        # so an arc grid samples the wrong thing at the wrong resolution. Measured on
+        # car-mini: the states where an arm holds the WHOLE subassembly are the release /
+        # co-grasp stretches, and four of them have exactly ZERO arc after mode repair, so a
+        # 1-rad grid could never see them -- the un-optimized path reported "0.20kg max" and
+        # ran its force limits off a payload 2.5x too light, while the optimized path (same
+        # plan!) happened to put arc into those stretches, saw the true 0.50kg, and deadlocked.
+        # One sample per stretch is also CHEAPER (one oracle call per stretch, not per radian).
+        _K = len(stretches)
+        _p = np.zeros((len(robots), _K, 3))                  # held-group COM, per stretch
+        _lev = np.zeros((len(robots), _K))                    # |COM - gripper| lever arm
+        _m = np.zeros((len(robots), _K))                      # held mass (SHARE of it, below)
         _bad_lever = 0
-        for _g, _s in enumerate(cor_grid):
-          _k = min(_fired_at(_s), len(stretch_mode) - 1)
+        for _k in range(_K):
+          _a0 = _bar[_k - 1] if _k else 0.0
+          _s = 0.5 * (_a0 + _bar[_k])                        # mid-stretch config
           problem.is_collision_free(_conf(_pose([_s] * len(robots))), stretch_mode[_k])
           _st = states[min(_stretch_plan[_k], len(states) - 1)]   # by ACTION, not by barrier
           for _r, _rn in enumerate(robots):
@@ -2857,9 +3007,28 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             if lev > LEVER_SANITY:
               _bad_lever += 1
               continue
-            _p[_r, _g] = com
-            _m[_r, _g] = gm
-            _lev[_r, _g] = max(lev, 5e-3)
+            # CO-HOLDERS SHARE THE LOAD. group_lever returns the WHOLE group's mass, and
+            # charging that in full to every arm holding it contradicts the planner's own
+            # certificate: _grounding_caps feeds ALL of a group's grasps (plus the table)
+            # into ONE equilibrium LP, which shares the load by construction. Charging each
+            # wrist the full mass made the executor refuse a hold the search proved stable
+            # (car-mini: 0.5kg x 91mm = 0.446Nm against a 0.40Nm cap -> zero speed -> the
+            # schedule deadlocked). Even split is the INTERIM; the principled successor is
+            # wrench.equilibrium_solution's per-contact multipliers, exactly as _static_load's
+            # docstring specifies -- geometry, not arithmetic, decides the true split.
+            _nhold = sum(1 for _o in robots
+                         if any(c[0] == "grasp" and c[1] == _o
+                                for q in grp for c in _st.supports.get(q, ())))
+            _share = gm / max(_nhold, 1)
+            _p[_r, _k] = com
+            _m[_r, _k] = _share
+            _lev[_r, _k] = max(lev, 5e-3)
+            if _os.environ.get("SIM_FORCE_TRACE"):
+              print(f"[force-trace] stretch={_k:3d} arc=[{_a0:.2f},{_bar[_k]:.2f}] "
+                    f"plan={_stretch_plan[_k]} "
+                    f"({tuple(plan[_stretch_plan[_k]]) if _stretch_plan[_k] is not None else '-'}) "
+                    f"arm{_r} root={root} grp={sorted(grp)} m={gm:.3f}/{_nhold}={_share:.3f} "
+                    f"lev={lev*1000:.0f}mm")
         # FINE geometric sampling: p'' on the 1-rad corridor grid smooths away all real
         # curvature and yields limits of 3-15 rad/s that never bind (measured). Curvature
         # needs a fine grid; this is pure FK (no oracle), so it is cheap. The LIMITS live on
@@ -2932,7 +3101,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                 _w // 2: _w // 2 + _pf.shape[1]]
         _vmax = np.full((len(robots), _GF), 1e6)
         _amax = np.full((len(robots), _GF), 1e6)
-        _bind, _cbind = {}, {}
+        _bind, _cbind, _infeasible = {}, {}, {}
         _d1 = {}                                              # kept for SIM_WRENCH_TRACE: the
         _d2 = {}                                              # trace must use THESE derivatives
         for _r, _rn in enumerate(robots):
@@ -2946,8 +3115,12 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             # snaps to the NEAREST grid point -- flooring here shifted every limit by up to
             # half a cell, so the schedule applied the neighbouring radian's budget (measured
             # on car-mini: executed 1.04 rad/s where the limit said 0.73).
-            _g = int(min(max(round(_s / corridor_ds), 0), _G - 1))
-            m, L = _m[_r, _g], _lev[_r, _g]
+            # BY STRETCH: the held group is constant within a stretch and changes only at
+            # barriers, so resolving the fine sample to its stretch is exact -- the old
+            # round(_s / corridor_ds) also bled a payload up to half a corridor cell PAST the
+            # barrier where the arm had already let go.
+            _kk = min(_fired_at(_s), _K - 1)
+            m, L = _m[_r, _kk], _lev[_r, _kk]
             if m <= 0:
               continue                                       # empty gripper: unconstrained
             # remaining margin after the STATIC load (swap _static_load for the exact LP)
@@ -2960,6 +3133,15 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             # the break -- and the grasp-anchor path standing in for the COM path) is small
             # next to the corner term above, which is what k>1 was really compensating for.
             k = max(inertia_factor, 1e-9)
+            # STATIC LOAD ALONE OVER THE CAP = an INFEASIBLE HOLD, not a slow one. Without
+            # this report the only symptom is retiming's "exceeded max_steps" much later: the
+            # numerator clamps to 0, a_allow floors at 1e-4, and the arm is told it may
+            # accelerate its payload at 0.1mm/s^2 -- a speed limit of ~0 that deadlocks the
+            # schedule with no hint of why. Name the arm, the load and the cap instead.
+            if (wrench_margin * tcap - ts <= 0.0 or wrench_margin * fcap - fs <= 0.0):
+              _key = (_r, round(m, 3), round(L, 3))
+              if _key not in _infeasible:
+                _infeasible[_key] = (_s, ts, tcap, fs, fcap)
             aF = max(wrench_margin * fcap - fs, 0.0) / (m * k)      # m/s^2 from the force cap
             aT = max(wrench_margin * tcap - ts, 0.0) / (m * L * k)  # ... and the torque cap
             a_allow = max(min(aF, aT), 1e-4)
@@ -2979,6 +3161,15 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         # The slowdown is a RUNTIME phenomenon and now lives in the ONLINE stepper's per-arm
         # rate factors, applied only while their trigger actually holds.)
         _vmax = retiming.brakeable(_vmax, _amax, _dsf)
+        for (_r, _mm, _LL), (_s, _ts, _tc, _fs, _fc) in sorted(_infeasible.items()):
+          print(f"[sim/mp] !!! --force-limits: arm{_r}'s STATIC hold already exceeds its "
+                f"grasp cap at s={_s:.1f} rad ({_mm:.2f}kg at {_LL*1000:.0f}mm lever: "
+                f"{_ts:.2f}Nm vs {wrench_margin * _tc:.2f}Nm cap"
+                + (f", {_fs:.1f}N vs {wrench_margin * _fc:.1f}N" if _fs > wrench_margin * _fc
+                   else "") + "). NO speed makes this hold feasible -- the schedule will "
+                f"crawl or stall there. The planner's wrench LP shares a group's load across "
+                f"ALL its grasps and the table; this check sizes ONE grasp, so they can "
+                f"disagree. Check the plan's grasp choice, or --wrench-margin.")
         if _bad_lever:
           print(f"[sim/mp] --force-limits: ignored {_bad_lever} grid/arm samples whose lever "
                 f"exceeded {LEVER_SANITY*1000:.0f}mm (stale support info, not a real grasp)")
@@ -2991,8 +3182,11 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         for _r in range(len(robots)):
           _f = _vmax[_r][_vmax[_r] < 1e5]
           if len(_f):
-            print(f"    arm{_r}: held mass up to {_m[_r].max():.2f}kg, lever up to "
-                  f"{_lev[_r].max() * 1000:.0f}mm, "
+            # the WORST-LOADED stretch reported as a pair, not two independent maxima (which
+            # advertised a mass and a lever that need never co-occur)
+            _w = int(np.argmax(_m[_r] * _lev[_r]))
+            print(f"    arm{_r}: worst load {_m[_r][_w]:.2f}kg at {_lev[_r][_w] * 1000:.0f}mm "
+                  f"lever (share of the group; stretch {_w}), "
                   + (f"worst corner {_jump[_r].max():.2f} m/rad, " if corner_limits else "")
                   + f"speed limit min {_f.min():.2f} rad/s (cruise {JOINT_RATE:g})")
       # ---- STAGE A + VERIFY + REFINE ---------------------------------------------------
@@ -3216,9 +3410,9 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           sp = float(_prog[i + 1][k]) if i + 1 < len(_prog) else s
           v = (sp - sm) / (2.0 * DT)
           sdd = (sp - 2.0 * s + sm) / (DT * DT)
-          g = int(min(max(round(s / corridor_ds), 0), _G - 1))
           gi = int(min(max(round(s / _dsf), 0), len(_sf) - 1))
-          m, L = float(_m[k, g]), float(_lev[k, g])
+          _kk = min(_fired_at(s), _m.shape[1] - 1)           # per-STRETCH, as the limits are
+          m, L = float(_m[k, _kk]), float(_lev[k, _kk])
           av = _d1[k][gi] * sdd + _d2[k][gi] * v * v          # a = p'*s_ddot + p''*s_dot^2
           a = float(np.linalg.norm(av))
           fs, ts = _static_load(m, L)
@@ -3437,6 +3631,12 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     report.final_pose_err[p] = (
         float(np.linalg.norm(scene.part_pose(p)[:3] - exp[:3])),
         _quat_angle(scene.part_pose(p)[3:], exp[3:]))
+  if scene.mate_caps is not None and scene._mate_max:
+    # per-mate load maxima -- this is the calibration readout: caps must sit ABOVE every
+    # value seen in a normal run and BELOW the load of an abusive hold (car by one wheel).
+    _mm = ", ".join(f"{p}~{scene._mate_eqs[p][1]} {f:.1f}N/{t:.2f}Nm"
+                    for p, (f, t) in sorted(scene._mate_max.items()))
+    print(f"[sim/mate] per-mate max weld load over the run: {_mm}")
   if rec is not None:
     _save_recording(record, scene, rec, report)
   return report
@@ -3719,6 +3919,10 @@ def _cli_run(a):
       rik.place_eq_weight = float(cfg["place_eq_weight"])
     if cfg.get("mate_accuracy") is not None:
       rik.mate_residual_reject = float(cfg["mate_accuracy"])
+    if cfg.get("grasp_accuracy") is not None:
+      rik.grasp_pose_reject = float(cfg["grasp_accuracy"])
+    if cfg.get("grasp_eq_weight") is not None:
+      rik.grasp_eq_weight = float(cfg["grasp_eq_weight"])
     if cfg.get("ik_accuracy") is not None:
       rik.nlp_stop_tolerance = float(cfg["ik_accuracy"])
     if cfg.get("witness_margin") is not None:
@@ -3853,6 +4057,7 @@ def _cli_run(a):
                               rate_clamp=a.corridor_rate_clamp,
                               settle_tol=a.settle_tol, settle_max=a.settle_max,
                               directional_caps=a.directional_caps,
+                              mate_caps=_mate_caps_from_args(a),
                               couple_handovers=a.couple_handovers,
                               verify_efc_cache=a.verify_efc_cache,
                               force_limits=a.force_limits, wrench_margin=a.wrench_margin,
@@ -3917,6 +4122,16 @@ def _build_cli():
                       "is ATOMIC discretely (giver holds before, receiver after, never both), so "
                       "the state-scan coupling misses it entirely -- yet both grippers are on "
                       "the part in execution. OFF = byte-identical.")
+  r.add_argument("--mate-force-cap", type=float, default=None, metavar="N",
+                 help="FINITE MATE STRENGTH: max force a mate weld transmits before it breaks "
+                      "(mate_broke, same sustained-overload rule as grasps). Default None = "
+                      "infinite = the historical rigid-weld model, byte-identical. Giving "
+                      "either mate cap enables monitoring; the other defaults to infinity. "
+                      "This is what makes 'hold the car by one wheel' fail emergently: the "
+                      "wheel-body weld carries the whole group and lets go.")
+  r.add_argument("--mate-torque-cap", type=float, default=None, metavar="NM",
+                 help="FINITE MATE STRENGTH: max torque a mate weld transmits before it "
+                      "breaks. See --mate-force-cap.")
   r.add_argument("--directional-caps", action="store_true",
                  help="breakaway uses the planner's DIRECTIONAL grasp polytope (force at the "
                       "grasp point + residual pure couple) instead of min-over-directions. More "

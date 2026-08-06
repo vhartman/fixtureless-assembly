@@ -104,9 +104,18 @@ def build_scene(cfg):
   from problem import set_sampled_grasps
   set_sampled_grasps({"seed": int(cfg.get("grasp_sampler_seed") or 0),
                       "candidates": int(cfg.get("grasp_sampler_candidates") or 200),
-                      "keep": int(cfg.get("grasp_sampler_keep") or 12)}
+                      "keep": int(cfg.get("grasp_sampler_keep") or 12),
+                      # LEGACY-FAITHFUL: a plan saved BEFORE the edge margin existed carries
+                      # no key and was built with NO margin -- reconstructing it at today's
+                      # DEFAULT would rebind every saved grasp id. Missing => 0.0, not 0.008.
+                      "margin": float(cfg.get("grasp_sampler_margin") or 0.0),
+                      "pad_support": float(cfg.get("grasp_sampler_pad_support") or 0.0)}
                      if cfg.get("grasp_sampler") else None)  # sampled ids: same hazard class
   set_plain_box(bool(cfg.get("plain_box")))                # cube collision geometry must match
+  from problem import set_stable_rest_poses
+  # PLACEMENT ids index the per-group table, so a replay must fill it the same way the
+  # search did. Missing key => False, which is what every plan saved before the flag used.
+  set_stable_rest_poses(bool(cfg.get("stable_rest_poses")))
   from env import set_tight_fingers
   set_tight_fingers(bool(cfg.get("tight_fingers")))        # GRIPPER collision geometry likewise
   # -- set unconditionally (not under an `if`): a stale global from a previous scene in the same

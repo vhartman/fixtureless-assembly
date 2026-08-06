@@ -442,6 +442,13 @@ class RobotIK:
     self.col_weight = 1e1
     self.strict_rejects = 0
     self.mate_rejects = 0                               # diagnostics: dirty witnesses vetoed
+    self.grasp_pose_reject = None                       # None = off; metres (--grasp-accuracy)
+    self.grasp_rejects = 0                              # diagnostics: off-pose grasps vetoed
+    self.grasp_eq_weight = None                         # None = 1e1: NEW-grasp tool-pose pin
+                                                        # weight (--grasp-eq-weight; the
+                                                        # maintenance pins keep 1e1 -- raising
+                                                        # a FROZEN pair's weight makes solves
+                                                        # infeasible, see _add_pin's comment)
     # --witness-margin (metres, None = off): ROBUST-KEYFRAME gate. A witness is rejected
     # unless every NON-INTENDED pair clears this margin: (non-hand arm link) vs (part) and
     # (arm link) vs (other arm's link). Intended contacts stay legal: the HAND touching its
@@ -523,10 +530,11 @@ class RobotIK:
     # the NEW gripper pinned at its grasp on `gpart` (the add_grasp/handover reach). Split
     # out of _ik_add_grasp so fuse_cograsp_witnesses can ground it on either keyframe of a
     # 2-phase KOMO; the single-phase caller keeps the default.
+    _gw = [self.grasp_eq_weight if self.grasp_eq_weight is not None else 1e1]
     komo.addObjective([phase, phase], ry.FS.positionRel, [self.gripper_frame[robot], gpart],
-                      ry.OT.eq, [1e1], ee_target[:3])
+                      ry.OT.eq, _gw, ee_target[:3])
     komo.addObjective([phase, phase], ry.FS.quaternionRel, [self.gripper_frame[robot], gpart],
-                      ry.OT.eq, [1e1], ee_target[3:])
+                      ry.OT.eq, _gw, ee_target[3:])
 
   def maintenance_grasps(self, state, assembly):
     # the (robot, part, ee_target) triples _add_grasp_maintenance pins. Split out so the
@@ -768,6 +776,132 @@ class RobotIK:
         uniq.append(w)
     return uniq[:limit]
 
+  def branch_witnesses(self, action, s0, s1, assembly, base_witness, movers, *,
+                       max_seeds=12, time_budget=6.0, min_dist=0.05):
+    """ACTIVE IK-branch enumeration for --witness-sets: same-tool-pose alternatives for a
+    step whose canonical witness is `base_witness` (a FULL joint vector over self.C's joints
+    -- in practice bind's own witness, the base every emitted set member is built on).
+
+    WHY THIS EXISTS. candidate_witnesses harvests whatever the skill solves happen to find,
+    and that pool is STARVED of branch diversity: without ssik the analytic enumerator
+    returns nothing, KOMO restarts land in the canonical basin, so picks offer 1-2 near-
+    identical candidates (measured on cross: every step's pool within 0.05 rad of the
+    canonical). Branches must be AIMED AT: for each acting arm, construct branch_seeds from
+    its canonical config and re-solve THAT ARM ALONE for its canonical tool pose.
+
+    CONDITIONED ENUMERATION -- what is frozen. The scene is scene_for(s0) posed at the FULL
+    base witness, so every other arm and every part sits exactly where the canonical witness
+    puts them; the varied arm is restricted to its own subtree (everything else is a frozen
+    obstacle). Its tool pose is pinned to the canonical gripper WORLD pose, so:
+      * a HOLDING arm's payload (attached to its gripper) lands at the canonical pose -- the
+        object never moves, which is what makes sets safe for handovers;
+      * a REACHING arm keeps the canonical grasp relation.
+    The base MUST be the emitted canonical MEMBER (wit[i]), not bind's witness: at a handover
+    the DP may legitimately choose a candidate that holds the object elsewhere than bind did
+    (measured on cross steps 19/33: 717mm apart -- bind's own emitted config was penetrating
+    and the least-bad full-scene candidate won), and members enumerated against bind's poses
+    would then disagree with member 0 about where the "frozen" object is.
+    The orientation is pinned via TWO WORLD AXES (vectorX + vectorZ), not a quaternion eq: a
+    pi-flipped or 2*pi-wound branch reaches the same pose with the NEGATED quaternion, and a
+    quaternion eq would score that exact solution as residual 2 and drive the solve back to
+    the canonical basin.
+
+    Acceptance mirrors _solve_ik: NLP feasible + _pen_ok + _clearance_ok, then a novelty
+    check (>= min_dist from every kept config -- a seed that converged back to a known basin
+    is not a find). branch_seeds' `exact` whole-turn shifts skip the solve: a full turn of
+    one revolute joint moves no body, so they are pose- and collision-identical by identity.
+
+    Returns (alts, funnel): alts = [{joint_name: value}] in the same per-candidate shape
+    witness_floor's pool uses, so the existing gates + greedy selection apply unchanged.
+    Each map covers EVERY mover arm's joints -- the varied arm at its new branch, the other
+    movers at their base-witness values -- because the emission overwrites a candidate's
+    joints onto BIND's witness: a map naming only the varied arm would let a multi-arm
+    step's partner fall back to bind's (possibly different) config and break the very
+    consistency the set promises. funnel = counters {seeds, solved, gated, exact, kept}.
+    Called ONLY from the witness-sets block (witness_sets >= 2): flag off => never runs."""
+    import time as _time
+    t0 = _time.perf_counter()
+    fun = {"seeds": 0, "solved": 0, "gated": 0, "exact": 0, "kept": 0}
+    alts = []
+    base_witness = np.asarray(base_witness, dtype=float).ravel()
+    C0 = self.scene_for(s0, assembly)
+    if base_witness.size != len(C0.getJointNames()):
+      return alts, fun
+    C0.setJointState(base_witness)
+    # intended-contact exemptions, as the skill scenes set them: every gripper in the
+    # canonical witness is AT its grasp (fingers around the part), so each grasped part's
+    # contact must be off or the collision ineq carries a constant violation no candidate
+    # can fix. Union over both states (a pick's part is grasped only in s1).
+    for st in (s0, s1):
+      if st is None:
+        continue
+      for _r, (pt, _g) in self.holders(st).items():
+        set_part_contact(C0, pt, 0)
+    names0 = C0.getJointNames()
+    # every mover arm's base-witness values ride along in each returned map (see docstring)
+    mover_map = {n: float(base_witness[k]) for k, n in enumerate(names0)
+                 if any(n.startswith(rr + "_") for rr in movers)}
+    for r in sorted(movers):
+      if self.robot_arm.get(r) is None:
+        continue                                       # floating EE: no arm, no branches
+      if _time.perf_counter() - t0 > time_budget or fun["seeds"] >= max_seeds:
+        break
+      Cr = ry.Config()
+      Cr.addConfigurationCopy(C0)                      # contact flags + posed state ride along
+      full_names = Cr.getJointNames()
+      Cr.selectJointsBySubtree(Cr.getFrame(self.robot_base[r]))
+      rnames = Cr.getJointNames()
+      if len(rnames) != 6:
+        continue                                       # not a plain 6R chain: out of scope
+      q0 = self._restrict_seed(base_witness, Cr, full_names)
+      lo, hi = (np.asarray(v, dtype=float) for v in Cr.getJointLimits())
+      gf = Cr.getFrame(self.gripper_frame[r])
+      p_t = np.asarray(gf.getPosition(), dtype=float)
+      R_t = np.asarray(gf.getRotationMatrix(), dtype=float)
+      exact, seeds = branch_seeds(q0, lo, hi, max_seeds=max_seeds)
+      kept_here = [q0]
+      for q in exact:                                  # pose/collision-identical by identity
+        fun["exact"] += 1
+        if min(float(np.linalg.norm(q - k)) for k in kept_here) < min_dist:
+          continue
+        m = dict(mover_map)
+        m.update({n: float(v) for n, v in zip(rnames, q)})
+        alts.append(m)
+        kept_here.append(q)
+        fun["kept"] += 1
+      if not seeds:
+        continue
+      komo = ry.KOMO(Cr, phases=1, slicesPerPhase=1, kOrder=1, enableCollisions=True)
+      komo.addObjective([], ry.FS.accumulatedCollisions, [], ry.OT.ineq,
+                        [self.col_weight], [-0.0])
+      komo.addControlObjective([], 0, 1e-1)
+      komo.addControlObjective([], 1, 1e-1)
+      ee = self.gripper_frame[r]
+      komo.addObjective([1, 1], ry.FS.position, [ee], ry.OT.eq, [1e1], p_t)
+      komo.addObjective([1, 1], ry.FS.vectorX, [ee], ry.OT.eq, [1e1], R_t[:, 0])
+      komo.addObjective([1, 1], ry.FS.vectorZ, [ee], ry.OT.eq, [1e1], R_t[:, 2])
+      for q in seeds:
+        if _time.perf_counter() - t0 > time_budget or fun["seeds"] >= max_seeds:
+          break
+        fun["seeds"] += 1
+        komo.initWithConstant(q)
+        res = self._nlp(komo).solve().dict()
+        if not res["feasible"]:
+          continue
+        fun["solved"] += 1
+        qs = np.asarray(komo.getPath()[-1], dtype=float).ravel()
+        if not (self._pen_ok(Cr, qs) and self._clearance_ok(Cr, qs)):
+          fun["gated"] += 1
+          continue
+        if min(float(np.linalg.norm(qs - k)) for k in kept_here) < min_dist:
+          continue                                     # converged back to a known basin
+        m = dict(mover_map)
+        m.update({n: float(v) for n, v in zip(rnames, qs)})
+        alts.append(m)
+        kept_here.append(qs)
+        fun["kept"] += 1
+    return alts, fun
+
   def _add_pull(self, komo, C, robot):
     # inject the witness-optimization pull (no-op unless optimize_witnesses set _opt_pull
     # for THIS robot). Weights ~1e0 vs constraint weights 1e1: cost never beats feasibility.
@@ -846,6 +980,27 @@ class RobotIK:
     finally:
       for mp in moving:
         set_part_contact(C, mp, 0)
+
+  def grasp_pose_residual(self, C, q, robot, part, ee_target):
+    """|achieved positionRel(gripper, part) - the pinned grasp-DB target|, metres.
+
+    mr_bench's attach and the sim's grasp weld FREEZE the ACHIEVED relation at the pick
+    transition, while every LATER witness is solved with the part at the DB relation
+    (scene_for reconstructs held parts from the grasp id). So any slack rai's feasible
+    verdict tolerates here becomes a RIGID part-in-hand error downstream -- measured ~5mm
+    along the approach on sampled grasps (the table's collision cost pushes the hand out),
+    which surfaced as a 1mm seat penetration mr_bench cannot exempt (two held parts: the
+    two picks' residuals DIFFER, and the difference lands in the mate). Face-center
+    enumerator grasps land on the DB pose, which is why this stayed invisible. Same
+    contract as mate_residual."""
+    saved = C.getJointState()
+    try:
+      C.setJointState(np.asarray(q, dtype=float))
+      v, _ = C.eval(ry.FS.positionRel, [self.gripper_frame[robot], part])
+      return float(np.linalg.norm(np.asarray(v, dtype=float)
+                                  - np.asarray(ee_target[:3], dtype=float)))
+    finally:
+      C.setJointState(saved)
 
   def mate_residual(self, C, q, part_name, onto, rel_pos):
     """|achieved positionRel(part, onto) - target|, in metres. This is what mr_bench bakes in at
@@ -1297,11 +1452,12 @@ class RobotIK:
       self._add_pin(komo, C)                              # pre-skill pin (no-op in search)
       # 6-DOF: gripper tool-center must sit at the (approach-corrected) grasp on the part:
       #   pose(ee) relative to pose(part) == ee_target.
+      _gw = [self.grasp_eq_weight if self.grasp_eq_weight is not None else 1e1]
       komo.addObjective(
-          [1, 1], ry.FS.positionRel, [robot_ee_name, part_name], ry.OT.eq, [1e1], ee_target[:3]
+          [1, 1], ry.FS.positionRel, [robot_ee_name, part_name], ry.OT.eq, _gw, ee_target[:3]
       )
       komo.addObjective(
-          [1, 1], ry.FS.quaternionRel, [robot_ee_name, part_name], ry.OT.eq, [1e1], ee_target[3:]
+          [1, 1], ry.FS.quaternionRel, [robot_ee_name, part_name], ry.OT.eq, _gw, ee_target[3:]
       )
       if not self.single_arm_ik:
         self._add_grasp_maintenance(komo, s0, assembly)   # braces are DOFs only in full mode
@@ -1334,7 +1490,8 @@ class RobotIK:
           else np.asarray(warm, dtype=float)
       seeds = [wseed] + list(seeds or [])
     feasible, witness = self._solve_ik(komo, seeds=seeds, C=C)
-    if self.single_arm_ik:
+    _w_raw = witness                                       # C-dimensioned (restricted under
+    if self.single_arm_ik:                                 # single_arm_ik) -- for the gate
       witness = self._expand_witness(C, witness, full_names)  # restricted -> full joint vector
       # HARVESTED BRANCHES NEED THE SAME EXPANSION. _solve_with_seeds collects raw
       # komo.getPath() rows, which under single_arm_ik are the RESTRICTED 6-vector -- handing
@@ -1343,6 +1500,12 @@ class RobotIK:
       if self.harvest_branches:
         self.harvest_branches = [self._expand_witness(C, h, full_names)
                                  for h in self.harvest_branches]
+    if feasible and _w_raw is not None and self.grasp_pose_reject is not None \
+        and backoff <= 0.0:                               # gate the REAL grasp, not the funnel
+      if self.grasp_pose_residual(C, _w_raw, robot, part, ee_target) \
+          > self.grasp_pose_reject:
+        self.grasp_rejects += 1                           # off the DB pose: candidate dies,
+        feasible, witness = False, None                   # bind tries the next grasp id
     if not feasible:
       self._log_failure(action, C, komo)
 
@@ -1389,6 +1552,12 @@ class RobotIK:
     feasible, witness = self._solve_ik(          # `warm` (full config) couples pre-add-grasp to
         komo, seeds=([np.asarray(warm, dtype=float)] if warm is not None else None),  # the grasp
         C=C)
+    if feasible and witness is not None and self.grasp_pose_reject is not None \
+        and backoff <= 0.0:                               # same freeze as picks: the handover/
+      if self.grasp_pose_residual(C, witness, robot, gpart, ee_target) \
+          > self.grasp_pose_reject:                       # brace attach keeps the ACHIEVED pose
+        self.grasp_rejects += 1
+        feasible, witness = False, None
     if not feasible:
       self._log_failure(action, C, komo)
 
@@ -2163,6 +2332,107 @@ def reconfig_crossings(qa, qb, roll_idx=None, thresh=np.pi / 2.0):
   return int(np.count_nonzero(d > thresh))
 
 
+def wrap_to_limits(x, lo, hi, ref):
+  """The representative x + 2*pi*k inside [lo, hi] NEAREST to `ref`, or None when no whole-turn
+  shift fits. This is what makes branch-seed construction limit-aware: a pi-offset always has an
+  in-limits representative when the joint's range is >= 2*pi (the UR10 model's +-3.28 rad just
+  qualifies), but the ur10 shoulder-lift range is only [-3.28, 0.28] and there a target either
+  fits directly or the transform must be DROPPED, not clamped -- a clamped seed is not near any
+  branch and only wastes a solve. Deterministic tie-break: the smaller value wins."""
+  two_pi = 2.0 * np.pi
+  k0 = round((float(ref) - float(x)) / two_pi)
+  best = None
+  for k in (k0 - 1, k0, k0 + 1):
+    v = float(x) + two_pi * k
+    if lo - 1e-9 <= v <= hi + 1e-9:
+      if best is None or abs(v - ref) < abs(best - ref) - 1e-12:
+        best = v
+  return best
+
+
+def branch_seeds(q, lo, hi, max_seeds=12):
+  """Diverse 6-joint SEEDS aiming at the OTHER IK branches of a UR-style arm for the SAME tool
+  pose, built from the one solved branch `q` (UR chain order: pan, lift, elbow, wrist_1,
+  wrist_2, wrist_3). This is the ACTIVE generator behind --witness-sets: the candidate harvest
+  is starved because KOMO restarts land in one basin and the analytic enumerator (ssik) may be
+  unavailable, so the branches must be AIMED AT explicitly.
+
+  Returns (exact, seeds):
+    exact -- whole-turn (+-2*pi) shifts of a SINGLE joint, limit-checked. A full turn of one
+             revolute joint moves NO downstream body, so these are bit-identical in pose and
+             collision and need no solve; they are distinct C-space points the motion planner
+             can exploit (a wound-up wrist goal avoids a full unwind). Empty on arms whose
+             range is < 4*pi around q (the ur10's +-3.28 rad admits them only in corners).
+    seeds -- approximate branch-flip WARM STARTS for a collision-aware IK re-solve: wrist flip
+             (q3+pi, -q4, q5+pi), elbow flip (q1+q2, -q2, q3+q2 -- exact when upper arm ==
+             forearm; the UR10's 0.612/0.572 split makes it a close guess), base flip (q0+pi
+             with the lift/elbow/wrist chain mirrored), and their compositions -- the full
+             8-branch family. Each is only a basin GUESS: the caller's solve + gates decide,
+             and a seed that converges back to a known basin is discarded there.
+  Every joint target is wrapped by wrap_to_limits (nearest in-limit representative);
+  a transform with any unrepresentable joint is dropped. Deterministic."""
+  q = np.asarray(q, dtype=float).ravel()
+  lo = np.asarray(lo, dtype=float).ravel()
+  hi = np.asarray(hi, dtype=float).ravel()
+  if q.size != 6 or lo.size != 6 or hi.size != 6:
+    return [], []
+  pi = np.pi
+  exact = []
+  for j in (5, 3, 4):                                  # wrist joints: the spread metric's axes
+    for s in (1.0, -1.0):
+      v = q[j] + s * 2.0 * pi
+      if lo[j] - 1e-9 <= v <= hi[j] + 1e-9:
+        e = q.copy()
+        e[j] = v
+        exact.append(e)
+
+  def t_wrist(v):
+    o = v.copy()
+    o[3] = v[3] + pi
+    o[4] = -v[4]
+    o[5] = v[5] + pi
+    return o
+
+  def t_elbow(v):
+    o = v.copy()
+    o[1] = v[1] + v[2]
+    o[2] = -v[2]
+    o[3] = v[3] + v[2]
+    return o
+
+  def t_base(v):
+    o = v.copy()
+    o[0] = v[0] + pi
+    o[1] = -pi - v[1]                                  # mirror of the lift plane; -pi-x and
+    o[2] = -v[2]                                       # pi-x are the same value mod 2*pi, so
+    o[3] = -pi - v[3]                                  # the wrap picks whichever fits
+    o[4] = -v[4]
+    return o
+
+  seeds = []
+  for chain in ((t_wrist,), (t_elbow,), (t_elbow, t_wrist), (t_base,),
+                (t_base, t_wrist), (t_base, t_elbow), (t_base, t_elbow, t_wrist)):
+    v = q.copy()
+    for t in chain:
+      v = t(v)
+    w = np.empty(6)
+    ok = True
+    for j in range(6):
+      r = wrap_to_limits(v[j], lo[j], hi[j], q[j])
+      if r is None:
+        ok = False
+        break
+      w[j] = r
+    if not ok:
+      continue
+    if np.linalg.norm(w - q) < 1e-6:
+      continue                                         # degenerate (e.g. q2=0 elbow flip)
+    if any(np.linalg.norm(w - s) < 1e-6 for s in seeds):
+      continue                                         # two chains collapsed to one target
+    seeds.append(w)
+  return exact, seeds[:max(0, int(max_seeds))]
+
+
 def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
                        pull_weight=1.0, ee_rot_weight=0.3, sweeps=2, verbose=True,
                        gripper_kind=None, handovers=True, allow_place=True, bracing=False,
@@ -2674,9 +2944,11 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
       # union is unsound -- measured 42mm of penetration at a phase-1 keyframe in its own
       # add_grasp scene. Slice frames are independent objects; set them before the
       # collision objective is added.
-      komo.getFrame(part_shape_frame(Ca, gpart), 1.0).setContact(0)
+      for _sf in part_shape_frames(Ca, gpart):             # every child of a compound part
+        komo.getFrame(_sf, 1.0).setContact(0)
       for mp in moving:
-        komo.getFrame(part_shape_frame(Ca, mp), 2.0).setContact(0)
+        for _sf in part_shape_frames(Ca, mp):
+          komo.getFrame(_sf, 2.0).setContact(0)
       komo.addObjective([], ry.FS.accumulatedCollisions, [], ry.OT.ineq,
                         [robot_ik.col_weight], [-0.0])
       komo.addControlObjective([], 0, 1e-1)

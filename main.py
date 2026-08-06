@@ -104,6 +104,18 @@ def build_parser():
            "--perturb-start-pose are ignored with it.",
   )
   g_scene.add_argument(
+      "--stable-rest-poses", action=argparse.BooleanOptionalAction, default=False,
+      help="Fill the per-group PLACEMENT TABLE from the shape's true stable rest "
+           "orientations instead of the six axis-aligned face-down rotations. The two are "
+           "the same kind of object -- a face direction IS a placement pose -- so this is a "
+           "drop-in swap of the enumerator: id 5 still means 'as anchored', and every "
+           "consumer (places, rest heights, the labeled heuristics, the wrench gates) is "
+           "unchanged. A part then rests the way its geometry actually allows: a chamfered "
+           "or mesh part on real facets, a group on the facets of the ASSEMBLED hull with "
+           "the mass-weighted centre of mass. PLACEMENT ids rebind, so a plan saved with "
+           "the flag does not replay without it (saved in the plan config). Default off.",
+  )
+  g_scene.add_argument(
       "--plain-box", action="store_true",
       help="Cube parts use rai's SHARP box (ST.box) instead of the default sphere-swept ssBox. "
            "ssBox inflates every face by the corner radius r, so two flush-mated cubes overlap "
@@ -165,7 +177,8 @@ def build_parser():
   g_scene.add_argument(
       "--assembly",
       choices=["cross", "cube", "arch", "arch-seq", "cube-plates", "cube-plates-2x2x3",
-               "cuboid-tower", "car", "car-mini", "slot-pin", "chair"],
+               "cuboid-tower", "car", "car-mini", "slot-pin", "mesh-demo", "compound-demo",
+               "chair"],
       default="cross",
       help="Assembly to build: cross (cube cross, 7), cube (2x2x2 grid, 8), "
            "arch (two pillars + lintel, 7 -- known-flawed star model), "
@@ -270,6 +283,27 @@ def build_parser():
   g_ik.add_argument(
       "--grasp-sampler-candidates", type=int, default=200, metavar="M",
       help="--grasp-sampler: raw surface samples per shape before downsampling (default 200).",
+  )
+  g_ik.add_argument(
+      "--grasp-sampler-pad-support", type=float, default=0.75, metavar="F",
+      help="--grasp-sampler: least fraction of the CONTACT PATCH that must lie on the part. "
+           "The patch mirrors the collision proxies: the two-finger pad (20x40mm, robotiq_"
+           "tight.g's capsule) at BOTH pads of a pinch, and the vacuum cup (the seal "
+           "diameter) for a suction candidate. --grasp-sampler-margin keeps the contact "
+           "POINT off a crease; this keeps the pad AREA on the part, which is what decides "
+           "whether a pinch holds or pivots and whether a cup can seal. A shape too small "
+           "for the patch (a thin leg) keeps its best-supported candidates instead. "
+           "Default 0.75; 0 disables. Saved with the plan -- it rebinds grasp ids.",
+  )
+  g_ik.add_argument(
+      "--grasp-sampler-margin", type=float, default=0.008, metavar="M",
+      help="--grasp-sampler: minimum clearance from a sampled contact to the nearest "
+           "FEATURE EDGE of the shape (dihedral > 5 deg: a box's 12 edges, a cylinder's cap "
+           "rims, a chamfer's borders -- never the tessellation's internal edges). Keeps "
+           "pads and suction cups INSIDE their face instead of hanging over a corner, which "
+           "is also what the analytic patch reasoning (surface class, seal diameter) "
+           "assumes. A shape too small to honour it keeps its most-interior candidates "
+           "instead. Default 0.008; 0 disables. Saved with the plan -- it rebinds grasp ids.",
   )
   g_ik.add_argument(
       "--grasp-sampler-seed", type=int, default=0, metavar="S",
@@ -673,6 +707,19 @@ def build_parser():
            "pairs). Traded against movement by this weight. Best with the dp-* modes.",
   )
   g_witness.add_argument(
+      "--witness-sets", type=int, default=0, metavar="K",
+      help="WITNESS SETS: export up to K same-grasp IK-branch alternatives per task (member 0 "
+           "= the canonical witness) as mr_bench GoalSets, so the motion planner gets several "
+           "diverse keyframes per transition instead of one. Alternatives come from the "
+           "witfloor candidate pool, pass the same gates as the canonical witness, keep every "
+           "grasped part at the canonical world pose (handover/add_grasp diversity = arm "
+           "branches only), and are selected greedy-max-min on wrist-joint spread. 0/1 = OFF "
+           "(byte-identical). Requires --optimize-witnesses floor.")
+  g_witness.add_argument(
+      "--witness-set-spread", type=float, default=0.05, metavar="RAD",
+      help="--witness-sets: minimum wrist-joint distance between accepted members (rad); "
+           "selection stops below it.")
+  g_witness.add_argument(
       "--witness-draw", type=int, default=None, metavar="K",
       help="DIVERSITY draw for the witness ladder (bandit outer loop): seed K thins the "
            "witfloor candidate ladder with a private RNG before the DP, so different draws "
@@ -769,6 +816,23 @@ def build_parser():
            "mate at stopTolerance 1e-2 and 1e-3), so this is the only way to refuse an "
            "under-seated mate. mr_bench bakes the miss in at attach, which is what makes the "
            "exported assembly disagree with ours and the acting arm hit an already-mated part.",
+  )
+  g_search.add_argument(
+      "--grasp-eq-weight", type=float, default=None, metavar="W",
+      help="Weight of the NEW-grasp tool-pose eq in pick/add_grasp IK (rai default 1e1). "
+           "Raise to 100 (like --mate-eq-weight) so the solve LANDS ON the grasp-DB pose "
+           "instead of stopping millimetres off when collision costs push back -- the "
+           "attach freezes the achieved relation, see --grasp-accuracy.",
+  )
+  g_search.add_argument(
+      "--grasp-accuracy", type=float, default=None, metavar="M",
+      help="ACCEPTANCE CRITERION for a pick/add_grasp: reject a witness whose achieved "
+           "tool-in-part pose misses the grasp-DB pose by more than M and let bind try the "
+           "next candidate. mr_bench's attach and the sim's weld FREEZE the ACHIEVED "
+           "relation while later witnesses assume the DB relation, so slack here becomes a "
+           "rigid part-in-hand error (measured ~5mm on sampled grasps; with a HELD mate "
+           "base the two picks' residuals differ and the difference lands in the seat, "
+           "which mr_bench cannot exempt).",
   )
   g_search.add_argument(
       "--strict-mate-collisions", action="store_true",
@@ -1228,17 +1292,21 @@ _SAVE_CONFIG_FIELDS = (
     # weightless contains releases/lateral mates that are UNSTABLE under gravity, so a rebuild
     # without it cannot reproduce the actions (user-hit: sim StopIteration on a cross-12 plan)
     "mixed_wrench_h", "strict_collisions", "witness_robot_collisions", "plain_box",
+    "stable_rest_poses",                                 # placement ids index the per-group
+    # placement table, so this changes the ACTION SPACE, not only the geometry
     # SUCCESSOR-AFFECTING and previously UNSAVED: a plan solved with any of these replays
     # against a DIFFERENT successor set than the search that made it, and the first symptom is
     # optimize_witnesses*/replay failing with "cannot reproduce action ... from the successor
     # set". min_sep and place_cells change the place cells, the rest change the action space.
-    "strict_mate_collisions", "ik_accuracy", "mate_accuracy", "mate_eq_weight",
+    "strict_mate_collisions", "ik_accuracy", "mate_accuracy", "grasp_accuracy",
+    "mate_eq_weight", "grasp_eq_weight",
     "place_eq_weight",                                   # a place is the DATUM later mates are
     # measured against, so its residual is not local (measured: body 3.91mm high, wheels then
     # mated onto it at 0.01-0.23mm -- perfectly seated on a body in the wrong place)
     "grasp_translations",                                # grasp ids index the DB
     "grasp_sampler", "grasp_sampler_keep",               # --grasp-sampler: sampled ids only
     "grasp_sampler_candidates", "grasp_sampler_seed",    # replay under identical settings
+    "grasp_sampler_margin", "grasp_sampler_pad_support",
     "tight_fingers",                                     # changes what the grasp DB filters out
     "ik_seeding",                                        # off => witness IK fails on re-picks/
     # reorienting places, and mp_export then exports the arm's PREVIOUS config as the goal
@@ -1246,6 +1314,7 @@ _SAVE_CONFIG_FIELDS = (
     # unsaved, a replay/sim rebuild has fewer tasks than the --mp-path it loads, and the path
     # indexes tasks by integer id. pre_insertion was already saved; these three were not.
     "witness_margin", "witness_draw",                    # robust-keyframe gate + ladder
+    "witness_sets", "witness_set_spread",                # multi-witness goal sets
     # draw: both change which witnesses ship, so replays/reuse must match
     "ban_actions",                                       # shapes the PLAN (provenance +
     # hoist/witness walks must see the same successor filter the search used)
@@ -1285,14 +1354,25 @@ _WITNESS_FIELDS = (
     "optimize_witnesses", "witness_branch_budget", "witness_branch_metric",
     "witness_reconfig_thresh", "witness_clearance", "witness_robot_collisions",
     "strict_collisions", "mate_eq_weight", "place_eq_weight", "mate_accuracy",
+    "grasp_accuracy", "grasp_eq_weight",
     "ik_accuracy", "ik_seeding", "seed", "bracing", "handovers", "allow_place",
     "tight_fingers", "part_float", "hoist_releases", "witness_margin", "witness_draw",
-    "grasp_sampler", "grasp_sampler_keep", "grasp_sampler_candidates", "grasp_sampler_seed")
+    "witness_sets", "witness_set_spread",
+    "grasp_sampler", "grasp_sampler_keep", "grasp_sampler_candidates", "grasp_sampler_seed",
+    "grasp_sampler_margin", "grasp_sampler_pad_support")
 
 
 def _witnesses_reusable(saved_cfg, cfg):
+  # a key MISSING from the saved config means the plan predates that flag -- it was
+  # produced with the flag at its DEFAULT, so compare against the RunConfig default
+  # instead of declaring a mismatch (a bare `k not in saved_cfg` silently re-solved the
+  # witnesses of EVERY older plan file each time a new witness-affecting flag landed).
+  import dataclasses
+  from config import RunConfig
+  _defaults = {f.name: (None if f.default is dataclasses.MISSING else f.default)
+               for f in dataclasses.fields(RunConfig)}
   bad = [k for k in _WITNESS_FIELDS
-         if k not in saved_cfg or saved_cfg[k] != getattr(cfg, k, None)]
+         if saved_cfg.get(k, _defaults.get(k)) != getattr(cfg, k, None)]
   if bad:
     print("[witness-reuse] settings differ from the saved witnesses on: "
           + ", ".join(bad) + " -- re-solving instead of reusing.")
@@ -1440,7 +1520,9 @@ def run(cfg):
                        "--grasp-translations (face-enumerator variant families).")
     set_sampled_grasps({"seed": cfg.grasp_sampler_seed,
                         "candidates": cfg.grasp_sampler_candidates,
-                        "keep": cfg.grasp_sampler_keep})
+                        "keep": cfg.grasp_sampler_keep,
+                        "margin": cfg.grasp_sampler_margin,
+                        "pad_support": cfg.grasp_sampler_pad_support})
     print(f"[flag] --grasp-sampler ACTIVE: mesh-sampled grasp DB (trimesh surface sampling; "
           f"{cfg.grasp_sampler_candidates} candidates -> {cfg.grasp_sampler_keep} kept per "
           f"shape via farthest-point downsampling; suction + antipodal blocks; seed "
@@ -1448,6 +1530,13 @@ def run(cfg):
           f"only replay under the same sampler settings (saved with the plan).")
   else:
     set_sampled_grasps(None)
+  if getattr(cfg, "stable_rest_poses", False):
+    from problem import set_stable_rest_poses
+    set_stable_rest_poses(True)
+    print("[flag] --stable-rest-poses ACTIVE: placements come from the shape's TRUE stable "
+          "rest orientations (convex hull + mass-weighted centre of mass), not the six "
+          "axis-aligned faces. Placement id 5 still means 'as anchored'. Grasp ids are "
+          "unaffected; PLACEMENT ids rebind, so plans do not cross the flag.")
   if cfg.plain_box:
     from problem import set_plain_box
     set_plain_box(True)
@@ -1747,11 +1836,36 @@ def run(cfg):
       print(f"[flag] --place-eq-weight {cfg.place_eq_weight:g}: PLACE object-pose eq "
             f"constraints weighted up from the 1e1 default. A place is the DATUM later mates "
             f"are measured against, so its residual is not local.")
+    if robot_ik is not None and getattr(cfg, "grasp_eq_weight", None) is not None:
+      robot_ik.grasp_eq_weight = float(cfg.grasp_eq_weight)
+      print(f"[flag] --grasp-eq-weight {cfg.grasp_eq_weight:g}: pick/add_grasp tool-pose eq "
+            f"weighted up from the 1e1 default, so the solve LANDS ON the grasp-DB pose.")
+    if robot_ik is not None and getattr(cfg, "grasp_accuracy", None) is not None:
+      robot_ik.grasp_pose_reject = float(cfg.grasp_accuracy)
+      print(f"[flag] --grasp-accuracy {cfg.grasp_accuracy:g}m: pick/add_grasp witnesses "
+            f"REJECTED when the achieved tool pose misses the grasp-DB pose by more "
+            f"(the attach freezes the ACHIEVED relation).")
     if robot_ik is not None and cfg.mate_accuracy is not None:
       robot_ik.mate_residual_reject = float(cfg.mate_accuracy)
       print(f"[flag] --mate-accuracy {cfg.mate_accuracy:g}m: assemble witnesses REJECTED when "
             f"the achieved mate misses by more than that (rai's own feasibility verdict does "
             f"not enforce it).")
+    # RESIDUAL BUDGET. Both witness gates bound an error that ends up as PENETRATION in the
+    # exported problem, and motion planning rejects a goal that penetrates more than its own
+    # tolerance -- as "no path" at that mode, with nothing pointing at the cause.
+    #   * a mate that stops d short overlaps its parent by ~d (flush parts touch at 0);
+    #   * a grasp that misses the DB pose by d is FROZEN at the achieved relation by the
+    #     attach, while later witnesses assume the DB relation, so d lands in the next seat.
+    # Measured on compound-demo: grasp residuals 89-236um under a 1000um gate produced a
+    # 110um seat penetration against a 100um tolerance -> no path. The knobs are a BUDGET.
+    _mp_tol = float(getattr(cfg, "mp_collision_tolerance", 0.0) or 0.0)
+    for _name, _val in (("--mate-accuracy", getattr(cfg, "mate_accuracy", None)),
+                        ("--grasp-accuracy", getattr(cfg, "grasp_accuracy", None))):
+      if _val is not None and _mp_tol > 0.0 and float(_val) >= _mp_tol:
+        print(f"[flag] !!! {_name} {float(_val):g} is NOT tighter than "
+              f"--mp-collision-tolerance {_mp_tol:g}: an accepted witness may penetrate more "
+              f"than motion planning allows, which surfaces as 'no path' at that mode. Use "
+              f"{_name} < {_mp_tol:g}.")
     if robot_ik is not None and cfg.ik_accuracy is not None:
       robot_ik.nlp_stop_tolerance = float(cfg.ik_accuracy)
       print(f"[flag] --ik-accuracy {cfg.ik_accuracy:g}: NLP stopTolerance tightened from rai's "
@@ -1837,6 +1951,9 @@ def run(cfg):
       print(f"[strict-collisions] vetoed {robot_ik.strict_rejects} dirty KOMO witnesses "
             f"(> {cfg.strict_collisions:g}m total penetration).")
     if robot_ik is not None and cfg.mate_accuracy is not None:
+      if getattr(cfg, "grasp_accuracy", None) is not None:
+        print(f"[grasp-accuracy] vetoed {robot_ik.grasp_rejects} off-pose grasps "
+              f"(> {cfg.grasp_accuracy:g}m tool residual).")
       print(f"[mate-accuracy] vetoed {robot_ik.mate_rejects} under-seated mates "
             f"(> {cfg.mate_accuracy:g}m residual).")
     if fail_rec is not None and fail_rec.steps:
@@ -1866,6 +1983,7 @@ def run(cfg):
               f"rejected unless every non-intended pair (non-hand arm vs part, arm vs other "
               f"arm) clears the margin; restarts hunt for fat-neighbourhood keyframes.")
       opt_witnesses = None
+      witness_alts = None                                    # --witness-sets alternatives
       if plan is not None and cfg.optimize_witnesses is not None:
         if robot_ik is None:
           print("[witopt] --optimize-witnesses needs --real-ik; skipping.")
@@ -1875,13 +1993,19 @@ def run(cfg):
           # witness drift between stages. Reused only when every witness-shaping setting
           # matches the saved config; --refresh-witnesses forces the re-solve.
           if cfg.load_plan and not cfg.refresh_witnesses and _witnesses_reusable(_saved_cfg, cfg):
-            from plan_io import read_witnesses
+            from plan_io import read_witnesses, read_witness_sets
             opt_witnesses = read_witnesses(cfg.load_plan,
                                            list(robot_ik.C.getJointNames()), len(plan))
             if opt_witnesses is not None:
               print(f"[witness-reuse] {sum(w is not None for w in opt_witnesses)} persisted "
                     f"witnesses loaded from {cfg.load_plan}; witness optimization SKIPPED "
                     "(--refresh-witnesses to re-solve).")
+              if cfg.witness_sets and cfg.witness_sets >= 2:
+                witness_alts = read_witness_sets(cfg.load_plan,
+                                                 list(robot_ik.C.getJointNames()), len(plan))
+                if witness_alts:
+                  print(f"[witsets-reuse] {len(witness_alts)} persisted witness set(s) "
+                        f"loaded from {cfg.load_plan}.")
           if opt_witnesses is None and cfg.optimize_witnesses == "floor":
             from witness_floor import optimize_witnesses_floor
             # floor mode CONSTRAINS clearance (a per-step normalised floor) rather than
@@ -1891,6 +2015,11 @@ def run(cfg):
               print(f"[witfloor] NOTE: --witness-clearance {cfg.witness_clearance} is IGNORED "
                     "in floor mode (the floor is a constraint, not a weight); use "
                     "--witness-branch-budget to buy a higher floor.")
+            if cfg.witness_sets and cfg.witness_sets >= 2:
+              print(f"[witsets] --witness-sets {cfg.witness_sets} ACTIVE: exporting up to "
+                    f"{cfg.witness_sets} same-grasp IK-branch alternatives per task as "
+                    f"GoalSets (spread >= {cfg.witness_set_spread:g} rad); OFF = "
+                    "byte-identical export.")
             opt_witnesses, _rep = optimize_witnesses_floor(
                 C, assembly, plan, robots, robot_ik,
                 gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
@@ -1898,7 +2027,9 @@ def run(cfg):
                 branch_budget=cfg.witness_branch_budget,
                 branch_metric=cfg.witness_branch_metric,
                 reconfig_thresh=cfg.witness_reconfig_thresh,
-                draw_seed=cfg.witness_draw)
+                draw_seed=cfg.witness_draw,
+                witness_sets=cfg.witness_sets, set_spread=cfg.witness_set_spread)
+            witness_alts = _rep.get("wit_alts") or None
           elif opt_witnesses is None:
             opt_witnesses, _rep = optimize_witnesses(
                 C, assembly, plan, robots, robot_ik, cost=cfg.optimize_witnesses,
@@ -1913,7 +2044,8 @@ def run(cfg):
         # instead of re-solving them.
         from plan_io import witness_block
         save_plan(cfg.save, cfg, plan,
-                  witnesses=witness_block(list(robot_ik.C.getJointNames()), opt_witnesses))
+                  witnesses=witness_block(list(robot_ik.C.getJointNames()), opt_witnesses,
+                                          alts=witness_alts))
       if plan is not None and cfg.utilization:
         from solver import utilization_report
         utilization_report(C, assembly, plan, robots, witnesses=opt_witnesses,
@@ -2012,7 +2144,9 @@ def run(cfg):
                                  robot_robot_margin=cfg.mp_robot_margin,
                                  robot_margin_ramp=cfg.mp_margin_ramp,
                                  table_margin=cfg.mp_table_margin,
-              table_float=cfg.part_float if cfg.mp_table_margin else 0.0)
+              table_float=cfg.part_float if cfg.mp_table_margin else 0.0,
+              witness_sets=(witness_alts if cfg.witness_sets
+                            and cfg.witness_sets >= 2 else None))
           print(f"[motion-plan] {'SEQUENCE' if cfg.mp_sequence else 'DEPGRAPH'} problem, "
                 f"{len(prob.tasks)} tasks")
           if cfg.mp_clearance:

@@ -63,7 +63,7 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
                              grasp_table=None, clear_margin=0.4, alpha=None,
                              branch_weight=10.0, branch_budget=0, alpha_lo=0.0,
                              branch_metric="sign", reconfig_thresh=np.pi / 2.0, verbose=True,
-                             draw_seed=None):
+                             draw_seed=None, witness_sets=0, set_spread=0.05):
   """Returns (witnesses, report). `alpha` fixes the floor; None => BISECT for the highest
   feasible one. The floor is per-step NORMALISED (`eps_i = alpha * best_clearance_at_step_i`)
   because a global floor would be dictated by the tightest step -- an insertion has the gripper
@@ -360,12 +360,136 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
     wit[i] = w                              # seeded from home and would carry a stale value
                                             # for any mover arm the candidate leaves unset)
 
+  # ---- witness SETS (--witness-sets K): diverse same-grasp alternatives per step ---------
+  # Selected from the SAME candidate pool the DP scored, gated exactly like the canonical
+  # witness (hard non-penetration, the DP's own clearance floor, the grasp-relation filter)
+  # PLUS a frozen-object gate: every grasped part must sit at the canonical member's world
+  # pose (<=2mm/1deg). That last gate is what makes sets safe for handovers/add_grasps where
+  # the object pose is genuinely free -- diversity then lives ONLY in the arms' IK branches
+  # for the same EE poses (the wrist-basin diversity the planner needs), never in the object.
+  # Member 0 is the DP's canonical witness itself, byte-equal to wit[i].
+  wit_alts = {}
+  if witness_sets and int(witness_sets) >= 2:
+    _K = int(witness_sets)
+    _SET_KINDS = ("pick", "place", "add_grasp", "handover")
+    def _part_world(q, part):
+      fkC.setJointState(q)
+      f = fkC.getFrame(part)
+      return (np.asarray(f.getPosition(), dtype=float),
+              np.asarray(f.getRotationMatrix(), dtype=float))
+    # ALL eligible plan steps, NOT just the ladder's -- the r9 endgame proved the difference:
+    # its wall release pins arms whose last moves (handover 33, add_grasps 36/37) are outside
+    # `steps` (the ladder harvested no candidates there), so the harvest skipped exactly the
+    # tasks whose diversity the terminal reverse-seeding needs. The generator needs no ladder
+    # candidates; for non-ladder steps the emitted witness itself is the base.
+    _eligible = [i for i, a in enumerate(plan)
+                 if a[0] in _SET_KINDS and wit[i] is not None]
+    for i in _eligible:
+      b = bind_wit.get(i)
+      if b is None:
+        b = wit[i]                                         # non-ladder step: emitted == base
+      mv = movers.get(i) or _involved(plan[i], states[i], states[i + 1], robots, robot_ik)
+      gp = grasped.get(i) if grasped.get(i) is not None else _grasped_parts(i)
+      base_w = wit[i]
+      ref_pw = {p: _part_world(base_w, p) for p in set(gp.values())}
+      # ACTIVE branch enumeration (solver.branch_witnesses). The harvested pool alone is
+      # STARVED: restarts land in the canonical basin and without ssik there is no analytic
+      # enumerator, so picks offer 1-2 candidates within 0.05 rad of the canonical and
+      # handovers' diversity lives in the object-moving dimension the gates must freeze
+      # (measured on cross: ZERO sets from 110 pool candidates). The generator re-solves each
+      # acting arm alone for its canonical tool pose from branch-flip seeds -- everything else
+      # frozen at bind's witness -- and its finds join the SAME pool, gates and greedy
+      # selection as the harvested candidates.
+      gen_maps, gfun = robot_ik.branch_witnesses(
+          tuple(plan[i]), states[i], states[i + 1], assembly, base_w, mv,
+          max_seeds=12, time_budget=6.0, min_dist=float(set_spread))
+      if verbose:
+        print(f"[witsets-gen] step {i} {plan[i][0]}: {gfun['seeds']} seeds tried, "
+              f"{gfun['solved']} converged, {gfun['gated']} gated, "
+              f"{gfun['exact']} exact turns, {gfun['kept']} kept")
+      scored2, gaps2, emitted = [], [], []
+      for c in [dict(x) for x in cand.get(i, [])] + gen_maps:
+        t, mn = clearance_at(dict(c), mv, i)
+        scored2.append(t)
+        gaps2.append(mn)
+        w = b.copy()
+        for n, v in c.items():
+          w[name_idx[n]] = v
+        emitted.append(w)
+      best_c2 = max((scored2[k] for k in range(len(emitted)) if gaps2[k] >= 0.0),
+                    default=0.0)
+      # ALTERNATIVES ARE GATED LOOSER THAN THE CHAIN. The DP floor (best_a, often 0.99 when
+      # clearance is free) exists to CHOOSE one chain; holding alternatives to it leaves only
+      # the canonical candidate and no set at all (measured on cross: 110 candidates, 0 sets).
+      # A member must be SAFE -- non-penetrating and at least half the step's best clearance --
+      # not clearance-optimal; the planner picks among members by connectability, not comfort.
+      alt_floor = min(best_a, 0.5) * best_c2
+      pool = []
+      n_gap = n_floor = n_grasp = n_pose = 0
+      for k, w in enumerate(emitted):
+        if gaps2[k] < 0.0:
+          n_gap += 1
+          continue
+        if scored2[k] < alt_floor - 1e-9:
+          n_floor += 1
+          continue
+        ok = True
+        for r, part in gp.items():
+          if r not in mv:
+            continue                                       # inherited from bind: identical
+          # judged against the canonical MEMBER (base_w), NOT bind's witness: at a handover
+          # the DP may hold the object elsewhere than bind did (its grasp gate has a
+          # least-bad fallback; measured 717mm on cross steps 19/33), and a member gated
+          # against bind would then disagree with member 0 about the frozen object's pose.
+          dp, da = _rel_delta(w, base_w, r, part)
+          if dp * 1000.0 > 5.0 or da > 5.0:                # same grasp as the canonical member
+            ok = False
+            n_grasp += 1
+            break
+        if ok:
+          for part, (p0, R0) in ref_pw.items():
+            p1, R1 = _part_world(w, part)
+            ca = (float(np.trace(R0.T @ R1)) - 1.0) / 2.0
+            if (float(np.linalg.norm(p1 - p0)) > 2e-3
+                or float(np.degrees(np.arccos(min(1.0, max(-1.0, ca))))) > 1.0):
+              ok = False
+              n_pose += 1
+              break
+        if ok:
+          pool.append(w)
+      # greedy farthest-point on the movers' WRIST joints (the IK-branch coordinates)
+      last3 = [name_idx[n] for r in mv for n in arm_joints[r][-3:]]
+      def _wd(a, bq):
+        return float(np.linalg.norm(a[last3] - bq[last3]))
+      members = [base_w.copy()]
+      while len(members) < _K and pool:
+        dmin = [min(_wd(w, m) for m in members) for w in pool]
+        kb = int(np.argmax(dmin))
+        if dmin[kb] < float(set_spread):
+          break
+        members.append(pool.pop(kb))
+      if len(members) >= 2:
+        wit_alts[i] = members
+        if verbose:
+          ds = [_wd(members[0], m) for m in members[1:]]
+          print(f"[witsets] step {i} {plan[i][0]}: {len(members)} members, wrist spread "
+                f"{min(ds):.2f}-{max(ds):.2f} rad")
+      elif verbose:
+        print(f"[witsets] step {i} {plan[i][0]}: NO set -- {len(emitted)} candidates, "
+              f"dropped {n_gap} penetration / {n_floor} floor / {n_grasp} grasp / "
+              f"{n_pose} object-pose; pool {len(pool)}"
+              + (" (all within spread of the canonical)" if pool else ""))
+    if verbose and wit_alts:
+      print(f"[witsets] --witness-sets {_K}: {len(wit_alts)} step(s) carry witness sets")
+
   robot_ik.strip_inactive_collision = _strip0
   robot_ik.harvest_all_branches = _harvest0
   rep = {"alpha": best_a, "cost": cost, "crossings": crossings,
          "crossings_no_floor": ref, "front": front, "steps": len(steps),
          "candidates": sum(len(cand[i]) for i in steps),
          "seconds": time.perf_counter() - t0}
+  if witness_sets and int(witness_sets) >= 2:
+    rep["wit_alts"] = wit_alts
   if verbose:
     print(f"[witfloor] alpha={best_a:.2f}: {crossings} branch crossings "
           f"(={ref} with NO floor, so the clearance is free), {rep['candidates']} candidates "
