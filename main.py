@@ -1130,6 +1130,17 @@ def build_parser():
       help="With --motion-plan: shortcut iteration cap (default 1000; NOT time-bounded).",
   )
   g_mp.add_argument(
+      "--mp-shortcut-strategy", choices=("native", "pair_then_gain"), default="native",
+      help="With --motion-plan: native mr_bench shortcutter (default), or the local experimental "
+           "pair-then-gain strategy. The latter first validates compatible two-arm shortcuts, "
+           "then uses gain-guided single-arm cleanup; it never patches mr_bench.",
+  )
+  g_mp.add_argument(
+      "--mp-shortcut-pair-checks", type=int, default=200, metavar="N",
+      help="With --mp-shortcut-strategy pair_then_gain: native collision validations reserved "
+           "for the initial pair phase (default 200).",
+  )
+  g_mp.add_argument(
       "--mp-shortcut-res", type=float, default=None, metavar="R",
       help="With --motion-plan: shortcut collision resolution (default: env collision_resolution, "
            "~10x faster than mr_bench's own 0.001 for identical quality).",
@@ -2179,6 +2190,8 @@ def run(cfg):
           mp_path, _ = MP.run_birrt(
               prob, runtime=cfg.mp_runtime, shortcut=not cfg.mp_no_shortcut,
               shortcut_iters=cfg.mp_shortcut_iters, shortcut_resolution=cfg.mp_shortcut_res,
+              shortcut_strategy=cfg.mp_shortcut_strategy,
+              shortcut_pair_checks=cfg.mp_shortcut_pair_checks,
               optimize=cfg.mp_optimize, seed=cfg.mp_seed,
               stall_timeout=cfg.mp_stall_timeout)
           if not mp_path and cfg.mp_stall_timeout is not None:

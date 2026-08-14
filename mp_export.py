@@ -460,12 +460,24 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
   except Exception:
     pass
 
+  # `_too_close` runs once for every sampled configuration.  The current active task is
+  # unchanged while a Mode object is reused along an interpolated segment, but
+  # SequenceMixin finds it by repeatedly scanning `sequence`.  Cache per exact Mode object
+  # (rather than merely task IDs, which could alias different scene graphs); this is local to
+  # our margin wrapper and leaves mr_bench untouched.
+  _task_by_mode = {}
+
   def _task_of(m):
+    key = id(m)
+    if key in _task_by_mode:
+      return _task_by_mode[key]
     try:
       combos = env.get_valid_next_task_combinations(m)
-      return env.get_active_task(m, combos[0] if combos else None)
+      task = env.get_active_task(m, combos[0] if combos else None)
     except Exception:
-      return None
+      task = None
+    _task_by_mode[key] = task
+    return task
 
   def _goals(m):
     """{robot: goal EE position} for the mode's task; cached, C restored."""
@@ -757,7 +769,8 @@ def run_motion_planner(problem, runtime=30.0, verbose=True):
 
 
 def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
-              shortcut_resolution=None, optimize=False, verbose=True, seed=None,
+              shortcut_resolution=None, shortcut_strategy="native",
+              shortcut_pair_checks=200, optimize=False, verbose=True, seed=None,
               stall_timeout=None):
   """Run Bidirectional RRT* to the FIRST solution (optimize=False), then optionally apply
   robot/mode shortcutting as a post-process. Returns (path, info). No cost optimization --
@@ -771,7 +784,12 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
   PERF: robot_mode_shortcut's OWN default collision resolution is 0.001 -- 10x FINER than the
   env's collision_resolution (0.01, what BiRRT itself used), for zero quality gain but ~10x
   the wall-clock (measured: 46s -> 4.6s, identical cost). We default `shortcut_resolution` to
-  the env's collision_resolution so shortcutting checks no finer than the planner did."""
+  the env's collision_resolution so shortcutting checks no finer than the planner did.
+
+  `shortcut_strategy="pair_then_gain"` is an opt-in local experimental shortcutter.  It does
+  not edit or monkey-patch mr_bench: an early, fixed number of compatible two-robot candidates
+  is certified by the same native predicate, then the remaining budget uses gain-guided
+  single-robot candidates.  "native" retains the historical mr_bench implementation."""
   _ensure_mrbench()
   if seed is not None:
     # mr_bench draws from the GLOBAL numpy RNG throughout (sampling, tree ops, shortcut index
@@ -861,16 +879,43 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
     before = path_cost(path, problem.batch_config_cost)
     res = (shortcut_resolution if shortcut_resolution is not None
            else getattr(problem, "collision_resolution", 0.01))
-    if verbose:
-      print(f"[mp/birrt] shortcutting (up to {shortcut_iters} iters, resolution {res}, "
-            "not time-bounded)...")
-    # PASS THE ENV'S OWN TOLERANCE. robot_mode_shortcut's default is tolerance=0.01 = 1cm of
-    # ALLOWED PENETRATION, which silently overrode the strict 1e-4/1e-6 tolerance the path was
-    # planned at -- the one loose stage in the zero-collision-tolerance chain. Cost impact is
-    # nil (measured: finals within seed noise at 1e-4); acceptance is just honest now.
-    path, sc_info = robot_mode_shortcut(problem, path, max_iter=shortcut_iters, resolution=res,
-                                        tolerance=getattr(problem, "collision_tolerance", 0.01))
-    info["shortcut"] = sc_info
+    strategy = str(shortcut_strategy).strip().lower()
+    if strategy == "native":
+      if verbose:
+        print(f"[mp/birrt] shortcutting (native; up to {shortcut_iters} iters, resolution {res}, "
+              "not time-bounded)...")
+      # PASS THE ENV'S OWN TOLERANCE. robot_mode_shortcut's default is tolerance=0.01 = 1cm of
+      # ALLOWED PENETRATION, which silently overrode the strict 1e-4/1e-6 tolerance the path was
+      # planned at -- the one loose stage in the zero-collision-tolerance chain. Cost impact is
+      # nil (measured: finals within seed noise at 1e-4); acceptance is just honest now.
+      path, sc_info = robot_mode_shortcut(problem, path, max_iter=shortcut_iters, resolution=res,
+                                          tolerance=getattr(problem, "collision_tolerance", 0.01))
+      info["shortcut"] = sc_info
+    elif strategy == "pair_then_gain":
+      if shortcut_pair_checks < 0:
+        raise ValueError("shortcut_pair_checks must be non-negative")
+      exp_dir = _os.path.join(_os.path.dirname(__file__), "experiments", "shortcut-sampling")
+      if exp_dir not in sys.path:
+        sys.path.insert(0, exp_dir)
+      import ideation_samplers as _shortcut_exp
+      # The pair sampler consumes NumPy's global stream like mr_bench.  Give gainprop a private
+      # random stream as well; a supplied --mp-seed makes the whole shortcut pass repeatable.
+      exp_seed = int(seed) if seed is not None else int(np.random.randint(0, 2**32 - 1))
+      if verbose:
+        print(f"[mp/birrt] shortcutting (pair_then_gain; {shortcut_pair_checks} pair checks, "
+              f"up to {shortcut_iters} total, resolution {res}, seed {exp_seed})...")
+      sc_stats = {}
+      path, sc_info = _shortcut_exp.shortcut_run(
+          problem, path, "pair_then_gain", max_iter=shortcut_iters,
+          max_attempts=max(2500, 5 * shortcut_iters), resolution=res,
+          tolerance=getattr(problem, "collision_tolerance", 0.01),
+          interpolation_resolution=0.5, seed=exp_seed,
+          pair_checks=int(shortcut_pair_checks), stats_out=sc_stats)
+      info["shortcut"] = sc_info
+      info["shortcut_stats"] = sc_stats
+    else:
+      raise ValueError(f"unknown shortcut_strategy {shortcut_strategy!r}")
+    info["shortcut_strategy"] = strategy
     if verbose:
       after = path_cost(path, problem.batch_config_cost)
       print(f"[mp/birrt] shortcut: {len(path)} states, cost {before:.3f} -> {after:.3f}")

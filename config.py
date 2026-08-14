@@ -171,6 +171,8 @@ class RunConfig:
   mp_no_shortcut: bool = False
   mp_shortcut_iters: int = 1000
   mp_shortcut_res: Optional[float] = None
+  mp_shortcut_strategy: str = "native"
+  mp_shortcut_pair_checks: int = 200
   mp_clearance: bool = False
   mp_cograsp: bool = False
   mp_save: Optional[str] = None
