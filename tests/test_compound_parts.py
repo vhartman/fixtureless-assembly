@@ -98,3 +98,64 @@ def test_sim_geoms_split_mass_by_volume():
   v_box = 0.05 * 0.05 * 0.03
   v_cyl = np.pi * 0.018 ** 2 * 0.03
   assert masses[0] == pytest.approx(v_box / (v_box + v_cyl))
+
+
+def test_peg_hole_compound_preserves_the_open_pocket():
+  """The seated peg occupies the socket's concavity without penetrating any convex child."""
+  asm = P.make_assembly("peg-hole", 2)
+  assert asm.part_shape("obj_0")[0] == "compound"
+  assert len(P._compound_children(asm.part_shape("obj_0"))) == 5
+  C = P.make_subassembly_scene(asm, tuple(asm.objects))
+  C.computeCollisions()
+  assert C.getCollisionFree(), C.getCollisions()
+
+
+def test_peg_hole_mujoco_contains_five_socket_geoms_and_the_peg():
+  import sim as S
+  asm = P.make_assembly("peg-hole", 2)
+  poses = {
+      "obj_0": np.array([0.0, 0.0, 0.025, 1.0, 0.0, 0.0, 0.0]),
+      "obj_1": np.array([0.0, 0.0, 0.038, 1.0, 0.0, 0.0, 0.0]),
+  }
+  state = P.State(parent={"obj_0": ("table",), "obj_1": ("part", "obj_0")},
+                  supports={"obj_0": frozenset({("table",)}),
+                            "obj_1": frozenset({("mate", "obj_0")})},
+                  poses=poses)
+  xml = S.build_mjcf(asm, state, ["a1"])
+  # Five convex pieces make the socket; the peg remains one cylinder geom.
+  socket_body = xml.split('<body name="obj_0"', 1)[1].split("</body>", 1)[0]
+  peg_body = xml.split('<body name="obj_1"', 1)[1].split("</body>", 1)[0]
+  assert socket_body.count("<geom") == 5
+  assert peg_body.count("<geom") == 1 and 'type="cylinder"' in peg_body
+
+
+def test_peg_stool_has_three_real_collision_free_sockets():
+  asm = P.make_assembly("peg-stool", 4)
+  assert asm.part_shape("obj_0")[0] == "compound"
+  # Seat plate + raised vacuum pad + four convex walls for each of three blind sockets.
+  assert len(P._compound_children(asm.part_shape("obj_0"))) == 14
+  assert all(np.allclose(asm.mate_axes[f"obj_{i}"], [0.0, 0.0, 1.0])
+             for i in range(1, 4))
+  C = P.make_subassembly_scene(asm, tuple(asm.objects))
+  C.computeCollisions()
+  assert C.getCollisionFree(), C.getCollisions()
+
+
+def test_peg_stool_mujoco_keeps_the_socket_concavities():
+  import sim as S
+  asm = P.make_assembly("peg-stool", 4)
+  poses = {}
+  for part in asm.objects:
+    pos = asm.position_in_base(part)
+    poses[part] = np.r_[pos, [1.0, 0.0, 0.0, 0.0]]
+  state = P.State(parent={"obj_0": ("table",),
+                          **{f"obj_{i}": ("part", "obj_0") for i in range(1, 4)}},
+                  supports={"obj_0": frozenset({("table",)}),
+                            **{f"obj_{i}": frozenset({("mate", "obj_0")})
+                               for i in range(1, 4)}},
+                  poses=poses)
+  xml = S.build_mjcf(asm, state, ["a1"])
+  seat_body = xml.split('<body name="obj_0"', 1)[1].split("</body>", 1)[0]
+  assert seat_body.count("<geom") == 14
+  assert all(xml.split(f'<body name="obj_{i}"', 1)[1].split("</body>", 1)[0]
+             .count('type="cylinder"') == 1 for i in range(1, 4))

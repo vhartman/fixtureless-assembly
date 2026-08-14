@@ -618,14 +618,15 @@ def _write_robot_dofs(C, robot, q_full):
 
 def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
                       recorder=None, bracing=False, witnesses=None, wrench_gk=None):
-  """Replay a plan on a SINGLE persistent config: for each action we solve the skill IK,
-  write the active arms' DOFs into the live config (so the arms keep their poses between
-  steps), and mirror the scene-graph re-parenting with C.attach (so grabbed parts stay
-  attached and follow the arm). Effectively a set_to_state(); view() loop.
+  """Replay a plan on a SINGLE persistent config: for each action we load its supplied
+  witness, or solve the skill IK only when no witness was supplied; then write the active
+  arms' DOFs into the live config (so arms keep their poses between steps) and mirror the
+  scene-graph re-parenting with C.attach (so grabbed parts stay attached and follow the arm).
+  Effectively a set_to_state(); view() loop.
 
   Because non-active arms are left where they are (not reset to home), this reads as a
   continuous choreography. It is still not a collision-checked trajectory -- only the
-  per-action key configs are IK-solved. Each view() is blocking -- close to advance.
+  per-action key configs are loaded/IK-solved. Each view() is blocking -- close to advance.
   With `recorder` (a viser_view.ViserRecorder) the steps are RECORDED instead of viewed;
   call recorder.serve() afterwards for the scrubbable web view."""
   if robots is None:

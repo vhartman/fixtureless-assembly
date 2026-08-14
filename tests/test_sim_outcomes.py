@@ -19,6 +19,7 @@ rather than failing, so a fresh checkout stays green.
 import os
 import re
 import sys
+import json
 
 import pytest
 
@@ -28,6 +29,16 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def _have(*files):
   return all(os.path.exists(os.path.join(REPO, f)) for f in files)
+
+
+def _has_final_export(path):
+  """Physics replay is meaningful only for a modern path with its exact task/keyframe bundle."""
+  try:
+    with open(os.path.join(REPO, path)) as f:
+      data = json.load(f)
+    return isinstance(data, dict) and isinstance(data.get("mp_export"), dict)
+  except (OSError, ValueError):
+    return False
 
 
 def _run(capsys, argv):
@@ -55,11 +66,14 @@ def _summary(out):
   return int(m.group(1)), int(m.group(2)), first
 
 
+# The old local car path is retained as data, but it predates the exact task/keyframe export.
+# Never turn an outcome regression into a fresh IK solve: skip it until the path is regenerated.
 CAR = ["run", "car-mini-new.json", "--v2", "--mp-path", "mp-car-mini-new.json"]
 
 
-@pytest.mark.skipif(not _have("car-mini-new.json", "mp-car-mini-new.json"),
-                    reason="car-mini plan/path pair not present")
+@pytest.mark.skipif(not (_have("car-mini-new.json", "mp-car-mini-new.json") and
+                         _has_final_export("mp-car-mini-new.json")),
+                    reason="modern car-mini path with embedded final export not present")
 def test_car_mini_actuated_executes_cleanly(capsys):
   """The compliant-arm reference case. Catches anything that breaks --actuated end to end:
   the arm model, the servos, the velocity feedforward, the settle gate, the weld wrench.
@@ -73,8 +87,9 @@ def test_car_mini_actuated_executes_cleanly(capsys):
   assert n_ok == n_tot, f"{n_ok}/{n_tot}"
 
 
-@pytest.mark.skipif(not _have("car-mini-new.json", "mp-car-mini-new.json"),
-                    reason="car-mini plan/path pair not present")
+@pytest.mark.skipif(not (_have("car-mini-new.json", "mp-car-mini-new.json") and
+                         _has_final_export("mp-car-mini-new.json")),
+                    reason="modern car-mini path with embedded final export not present")
 def test_car_mini_mocap_corridor_executes_cleanly_and_verifies(capsys):
   """The DEFAULT path plus corridor retiming. Also pins the corridor's own verification: with
   the legitimate-contact filter in place car-mini's schedule is genuinely collision-free, so a
@@ -92,22 +107,18 @@ def test_car_mini_mocap_corridor_executes_cleanly_and_verifies(capsys):
 
 
 @pytest.mark.skipif(not _have("car-mini-new.json", "mp-car-mini-new.json"),
-                    reason="car-mini plan/path pair not present")
-def test_a_mismatched_plan_and_path_pair_is_refused(capsys, tmp_path):
-  """A saved path indexes tasks by INTEGER id, so replaying it against a different task
-  structure relinks every attach at the wrong moment. The count-only guard could not see a
-  same-count/different-semantics pair; the signature can."""
-  import json
-  states = json.load(open(os.path.join(REPO, "mp-car-mini-new.json")))
-  bad = tmp_path / "mp-bad.json"
-  json.dump({"states": states, "task_signature": "deadbeefdeadbeef"}, open(bad, "w"))
-  out = _run(capsys, ["run", "car-mini-new.json", "--v2", "--mp-path", str(bad)])
-  assert "TASK-SIGNATURE MISMATCH" in out
-  assert "actions ok" not in out, "it executed anyway despite a mismatched pair"
+                    reason="legacy car-mini plan/path pair not present")
+def test_a_legacy_path_without_final_export_is_refused(capsys):
+  """A bare-list path has neither exact tasks nor final keyframes. Replay must not improvise
+  replacements by re-solving IK; regeneration is safer than a plausible-looking wrong run."""
+  out = _run(capsys, CAR)
+  assert "has no final post-fusion export block" in out
+  assert "Refusing to re-solve IK" in out
+  assert "actions ok" not in out, "legacy path executed despite lacking its exact export"
 
 
-@pytest.mark.skipif(not _have("cross8.json", "mp.json"),
-                    reason="cross8 plan/path pair not present")
+@pytest.mark.skipif(not (_have("cross8.json", "mp.json") and _has_final_export("mp.json")),
+                    reason="modern cross8 path with embedded final export not present")
 def test_cross8_warns_that_its_assembles_have_no_funnel(capsys):
   """cross8 was planned with pre_insertion=0, so every assemble drives the held part straight
   to a pose already in contact and it arrives LATERALLY -- 0.213mm of penetration while the
@@ -130,3 +141,60 @@ def test_main_refuses_to_silently_do_nothing():
   with pytest.raises(SystemExit) as e:
     main.main(cfg_args)
   assert "need a plan" in str(e.value)
+
+
+def test_car_mini_wheel_rims_rest_on_sim_table():
+  """A rotated cylinder must use its real support extent in both the planner and MuJoCo.
+
+  This catches the car-specific failure where the four flat scatter wheels appeared inside
+  the table, as well as collision/visual proxy offsets that make the wheel float above it.
+  """
+  import numpy as np
+  import mujoco
+
+  import assembly as A
+  from env import make_four_robot_env
+  import sim as S
+
+  asm = A.make_assembly("car-mini", 5)
+  C = make_four_robot_env(num_robots=1, floating_ee=True, vacuum=False)
+  A.add_disassembled_obj(C, asm, spacing=0.2, float_height=0.002)
+  state = A.get_initial_state(C, asm)
+  model = mujoco.MjModel.from_xml_string(S.build_mjcf(asm, state, []))
+  data = mujoco.MjData(model)
+  for _ in range(100):
+    mujoco.mj_step(model, data)
+
+  table_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "table")
+  table_top = float(data.geom_xpos[table_id, 2] + model.geom_size[table_id, 2])
+  for part in ("obj_1", "obj_2", "obj_3", "obj_4"):
+    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, part)
+    geom_ids = np.flatnonzero(model.geom_bodyid == body_id)
+    assert len(geom_ids) == 1, f"{part} must be one physical/visual cylinder"
+    geom_id = int(geom_ids[0])
+    assert model.geom_type[geom_id] == mujoco.mjtGeom.mjGEOM_CYLINDER
+    axis = np.asarray(data.geom_xmat[geom_id]).reshape(3, 3)[:, 2]
+    radius, half_length = model.geom_size[geom_id, :2]
+    half_z = abs(float(axis[2])) * half_length + np.hypot(axis[0], axis[1]) * radius
+    rim_bottom = float(data.geom_xpos[geom_id, 2] - half_z)
+    assert abs(rim_bottom - table_top) < 5e-4, (part, rim_bottom, table_top)
+
+
+def test_topple_error_respects_primitive_rotational_symmetry():
+  """Rolling a round peg is not toppling it; tilting its axis still is."""
+  import numpy as np
+
+  import assembly as A
+  import sim as S
+
+  asm = A.make_assembly("peg-stool", 4)
+  identity = np.array([1.0, 0.0, 0.0, 0.0])
+  axial_roll = np.array([np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)])
+  axis_tilt = np.array([np.cos(np.pi / 12), np.sin(np.pi / 12), 0.0, 0.0])
+
+  assert S._part_orientation_error(asm, "obj_1", identity, axial_roll) < 1e-12
+  assert S._part_orientation_error(asm, "obj_1", identity, axis_tilt) == pytest.approx(
+      np.pi / 6)
+  # The compound seat has no declared rotational symmetry.
+  assert S._part_orientation_error(asm, "obj_0", identity, axial_roll) == pytest.approx(
+      np.pi / 2)

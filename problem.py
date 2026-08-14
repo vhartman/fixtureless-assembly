@@ -863,6 +863,165 @@ class CompoundDemoAssembly(Assembly):
     self.assembly_dependencies = {}
 
 
+class PegHoleAssembly(Assembly):
+  """A two-part concavity smoke test: a cylindrical peg inserted into a blind socket.
+
+  The socket is ONE rigid part represented as a ``compound`` of five convex boxes: a floor
+  and four non-overlapping walls around a square pocket.  Keeping those convex children
+  separate is essential -- their union has a real cavity which the peg can enter, while the
+  rest of the pipeline can continue using convex collision geometry per child.  The final
+  peg pose leaves 0.5mm axial seating clearance above the pocket floor and 4mm radial
+  clearance to each wall, so strict collision checks test the cavity rather than numerical
+  contact at its boundary.
+
+  This intentionally stays tiny: the socket begins upright on the table, the peg begins
+  upright beside it, and the only mate is a top-down insertion along -z.  Use
+  ``--grasp-sampler`` because the socket is compound; ``--stable-rest-poses`` exercises the
+  geometry-derived placement table as well.
+  """
+
+  def __init__(self, n_parts=2, outer=0.08, hole=0.032, depth=0.04,
+               floor=0.01, peg_radius=0.012, peg_length=0.055):
+    assert 1 <= int(n_parts) <= 2, "peg-hole is a socket and one peg"
+    self.n_parts = int(n_parts)
+    self.outer = float(outer)
+    self.hole = float(hole)
+    self.depth = float(depth)
+    self.floor = float(floor)
+    self.peg_radius = float(peg_radius)
+    self.peg_length = float(peg_length)
+    self.cube_size = self.outer                         # scatter/marker sizing only
+    self.cube_radius = 0.0
+    super().__init__()
+
+  def define(self):
+    outer, hole = self.outer, self.hole
+    depth, floor = self.depth, self.floor
+    wall = (outer - hole) / 2.0
+    assert wall > 0.0 and self.peg_radius < hole / 2.0
+    wall_at = hole / 2.0 + wall / 2.0
+    floor_z = -(depth + floor) / 2.0                    # total bounds: [-.025, +.025]
+    wall_z = (floor - depth) / 2.0                      # walls start on the floor's top
+    sharp = 0.0                                         # preserve the authored hole clearance
+
+    self.objects = [f"obj_{i}" for i in range(self.n_parts)]
+    self.base = "obj_0"
+    self.part_shapes["obj_0"] = ("compound", [
+        {"shape": ("box", [outer, outer, floor, sharp]),
+         "pos": [0.0, 0.0, floor_z]},
+        {"shape": ("box", [wall, outer, depth, sharp]),
+         "pos": [wall_at, 0.0, wall_z]},
+        {"shape": ("box", [wall, outer, depth, sharp]),
+         "pos": [-wall_at, 0.0, wall_z]},
+        {"shape": ("box", [hole, wall, depth, sharp]),
+         "pos": [0.0, wall_at, wall_z]},
+        {"shape": ("box", [hole, wall, depth, sharp]),
+         "pos": [0.0, -wall_at, wall_z]},
+    ])
+    if self.n_parts > 1:
+      self.part_shapes["obj_1"] = ("cylinder", [self.peg_length, self.peg_radius])
+      # Pocket floor top = -depth/2.  Put the peg bottom 0.5mm above it: enough to avoid a
+      # numerical contact being counted as penetration while still representing a seated peg.
+      seated_z = -depth / 2.0 + self.peg_length / 2.0 + 0.0005
+      self.assembly_relative_poses["obj_1"] = ["obj_0", np.array([0.0, 0.0, seated_z])]
+      self.mate_axes["obj_1"] = np.array([0.0, 0.0, -1.0])
+    self.assembly_dependencies = {}
+    self.masses = {"obj_0": 0.35, "obj_1": 0.10}
+
+
+class PegStoolAssembly(Assembly):
+  """A three-legged stool whose legs really insert into blind sockets in the seat.
+
+  ``ChairAssembly(..., parts=5)`` is intentionally faithful to the original ``chair.g``
+  geometry, where the legs merely meet the underside of the seat.  This variant is the
+  slightly richer follow-up to :class:`PegHoleAssembly`: the seat is ONE rigid compound
+  part consisting of a plate and three downward-facing square socket collars.  Each round
+  leg enters a collar by 24.5mm and stops 0.5mm short of the plate.  Thus every leg mate
+  exercises a genuine concavity while the completed object has the familiar stool support
+  geometry needed by the wrench checks.
+
+  The compound has 14 non-overlapping convex children (plate + four walls per socket + a
+  shallow central top pad).  The pad is not decorative: it gives the vacuum wrist 25mm of
+  clearance above the broad seat plate, so the shared 5mm IK gate does not reject an
+  otherwise useful seat hold.
+  Use ``--grasp-sampler`` for the compound seat.  A fleet with at least one vacuum gripper
+  is recommended: the vacuum holds the broad seat while two-finger grippers insert legs.
+  """
+
+  def __init__(self, n_parts=4, seat_x=0.18, seat_y=0.14, seat_thickness=0.018,
+               socket_outer=0.04, socket_hole=0.030, socket_depth=0.025,
+               leg_radius=0.0095, leg_length=0.11):
+    assert 1 <= int(n_parts) <= 4, "peg-stool is one seat and up to three legs"
+    self.n_parts = int(n_parts)
+    self.seat_x = float(seat_x)
+    self.seat_y = float(seat_y)
+    self.seat_thickness = float(seat_thickness)
+    self.socket_outer = float(socket_outer)
+    self.socket_hole = float(socket_hole)
+    self.socket_depth = float(socket_depth)
+    self.leg_radius = float(leg_radius)
+    self.leg_length = float(leg_length)
+    self.cube_size = self.seat_x                       # scatter/marker sizing only
+    self.cube_radius = 0.0
+    super().__init__()
+
+  def define(self):
+    sx, sy, st = self.seat_x, self.seat_y, self.seat_thickness
+    outer, hole, depth = self.socket_outer, self.socket_hole, self.socket_depth
+    wall = (outer - hole) / 2.0
+    assert wall > 0.0 and self.leg_radius < hole / 2.0
+    # Keep the sockets well inside the plate and well separated from one another.
+    # A triangle strictly contains the seat COM (unlike any three corners of a symmetric
+    # four-leg rectangle, where the COM lies exactly on a diagonal support edge).
+    socket_centres = [(0.055, 0.035), (-0.055, 0.035), (0.0, -0.045)]
+    assert all(abs(x) + outer / 2.0 <= sx / 2.0 and
+               abs(y) + outer / 2.0 <= sy / 2.0 for x, y in socket_centres)
+    wall_at = hole / 2.0 + wall / 2.0
+    wall_z = -st / 2.0 - depth / 2.0                # collar touches the plate underside
+
+    pad_x, pad_y, pad_h = 0.12, 0.10, 0.025
+    children = [
+        {"shape": ("box", [sx, sy, st, 0.0]), "pos": [0.0, 0.0, 0.0]},
+        {"shape": ("box", [pad_x, pad_y, pad_h, 0.0]),
+         "pos": [0.0, 0.0, st / 2.0 + pad_h / 2.0]},
+    ]
+    for cx, cy in socket_centres:
+      children.extend([
+          {"shape": ("box", [wall, outer, depth, 0.0]),
+           "pos": [cx + wall_at, cy, wall_z]},
+          {"shape": ("box", [wall, outer, depth, 0.0]),
+           "pos": [cx - wall_at, cy, wall_z]},
+          {"shape": ("box", [hole, wall, depth, 0.0]),
+           "pos": [cx, cy + wall_at, wall_z]},
+          {"shape": ("box", [hole, wall, depth, 0.0]),
+           "pos": [cx, cy - wall_at, wall_z]},
+      ])
+
+    self.objects = [f"obj_{i}" for i in range(self.n_parts)]
+    self.base = "obj_0"
+    self.part_shapes["obj_0"] = ("compound", children)
+    # This is a small wooden seat/support fixture, not another 50mm benchmark cube.  Giving
+    # it a realistic base mass also makes the wrench model's table-friction prediction match
+    # execution: at 0.45kg a nominally axial 20N insertion could move the whole fixture after
+    # a tiny transient side contact, although the quasi-static wrench check correctly saw no
+    # lateral insertion load.  Keep the slender legs light; scaling the whole assembly instead
+    # overloads their two-finger grasps without addressing the support mismatch.
+    self.masses["obj_0"] = 0.75
+    # Cylinders scatter horizontally, as in ChairAssembly: both end faces remain reachable
+    # and a two-finger grasp does not occupy the end that must enter the socket.
+    leg_scatter = np.array([np.sqrt(0.5), 0.0, -np.sqrt(0.5), 0.0])
+    leg_top = -st / 2.0 - 0.0005                    # 0.5mm short of the blind end
+    leg_z = leg_top - self.leg_length / 2.0
+    for i, (cx, cy) in enumerate(socket_centres[:max(0, self.n_parts - 1)], start=1):
+      part = f"obj_{i}"
+      self.part_shapes[part] = ("cylinder", [self.leg_length, self.leg_radius])
+      self.scatter_orientations[part] = leg_scatter
+      self.assembly_relative_poses[part] = ["obj_0", np.array([cx, cy, leg_z])]
+      self.assembly_dependencies[part] = ["obj_0"]
+      self.mate_axes[part] = np.array([0.0, 0.0, 1.0])
+      self.masses[part] = 0.08
+
+
 class SlotPinAssembly(Assembly):
   """STAGED-MATE test assembly (A11): base + a CANTILEVER bar slotted into its side + a PIN
   that fastens the bar. The bar's mate is staged (a slot until the pin lands): unheld and
@@ -1018,28 +1177,37 @@ class ChairAssembly(Assembly):
 # ============================================================================================
 
 
+_ASSEMBLY_KINDS = {"cross": (CubeCrossAssembly, 7), "cube": (CubeGridAssembly, 8),
+                   "arch": (ArchAssembly, 7), "arch-seq": (ArchSequentialAssembly, 7),
+                   "cube-plates": (CubePlatesAssembly, 8),
+                   "cube-plates-2x2x3": (lambda n_parts: CubePlatesAssembly(2, 2, 3, n_parts=n_parts), 12),
+                   "cuboid-tower": (CuboidTowerAssembly, 8),
+                   "car": (CarAssembly, 5),
+                   # mini car: whole car scaled to width=0.03 -> wheels are discs of diameter
+                   # 0.8w*2 = 0.048, comfortably inside the two-finger's ~0.078 inner gap, so the
+                   # fingers can take a wheel ACROSS THE DIAMETER (radial side grasp) -- the
+                   # grasp-DB's curved-surface entries, which the two-finger keeps (vacuum drops).
+                   "car-mini": (lambda n_parts: CarAssembly(n_parts=n_parts, width=0.03), 5),
+                   "slot-pin": (SlotPinAssembly, 3),
+                   "peg-hole": (PegHoleAssembly, 2),
+                   "peg-stool": (PegStoolAssembly, 4),
+                   "mesh-demo": (MeshDemoAssembly, 3),
+                   "compound-demo": (CompoundDemoAssembly, 3),
+                   "chair": (ChairAssembly, 8)}
+
+
+def assembly_max_parts(kind):
+  """The largest --parts value the assembly builds; make_assembly clamps to it silently."""
+  return _ASSEMBLY_KINDS[kind][1]
+
+
 def make_assembly(kind, n_parts):
   """Assembly factory for the CLI: cross (cube cross), cube (2x2x2 grid), arch (bridge --
   known-flawed star, see class doc), arch-seq (arch shape built as a sequential chain),
   cube-plates (2x2x2 as two stacked 2x2 plates), cube-plates-2x2x3 (three stacked 2x2
   plates, 12 cubes), cuboid-tower (laid-down 2:1:1 cuboids stacked along z -- the first
   non-cube assembly). The plates family generalizes to any WxDxH via CubePlatesAssembly."""
-  kinds = {"cross": (CubeCrossAssembly, 7), "cube": (CubeGridAssembly, 8),
-           "arch": (ArchAssembly, 7), "arch-seq": (ArchSequentialAssembly, 7),
-           "cube-plates": (CubePlatesAssembly, 8),
-           "cube-plates-2x2x3": (lambda n_parts: CubePlatesAssembly(2, 2, 3, n_parts=n_parts), 12),
-           "cuboid-tower": (CuboidTowerAssembly, 8),
-           "car": (CarAssembly, 5),
-           # mini car: whole car scaled to width=0.03 -> wheels are discs of diameter
-           # 0.8w*2 = 0.048, comfortably inside the two-finger's ~0.078 inner gap, so the
-           # fingers can take a wheel ACROSS THE DIAMETER (radial side grasp) -- the
-           # grasp-DB's curved-surface entries, which the two-finger keeps (vacuum drops).
-           "car-mini": (lambda n_parts: CarAssembly(n_parts=n_parts, width=0.03), 5),
-           "slot-pin": (SlotPinAssembly, 3),
-           "mesh-demo": (MeshDemoAssembly, 3),
-           "compound-demo": (CompoundDemoAssembly, 3),
-           "chair": (ChairAssembly, 8)}
-  cls, max_n = kinds[kind]
+  cls, max_n = _ASSEMBLY_KINDS[kind]
   return cls(n_parts=min(n_parts, max_n))
 
 def _part_index(part):
@@ -1920,20 +2088,32 @@ def _sampled_grasp_views(spec, offset):
       # own two axes as (x, z) makes the triple LEFT-handed -- _mat_to_quat then returns a
       # reflected frame, so the recovered approach and closing axes are not the ones that
       # were chosen. The existing convention tests caught exactly that.
-      x = np.cross(y, z)
       mid = 0.5 * (p + p2)
-      _, _t_exit = None, _ray_exit(spec, mid, -z)          # stand off the approach-side surface
-      t = float(np.linalg.norm(_t_exit[0] - mid))
-      pose = np.concatenate([mid - z * (t + offset), _mat_to_quat(np.column_stack([x, y, z]))])
       # label = the contacted surface class; min_dim 0.0 keeps the vacuum seal gate shut
       # for pinch candidates (the suction block is the vacuum's own candidate family).
       # BOTH pads must clear the edges -- a pinch is only as good as its worse contact.
       # each PAD lies in the plane the closing axis y is normal to, and it is long along
       # the approach z -- so the rectangle's axes are (x across, z along).
+      x = np.cross(y, z)
       _sup = (min(_pad_support(mesh, p, -y, x, z, _rect),
                   _pad_support(mesh, p2, y, x, z, _rect)) if min_support > 0.0 else 1.0)
-      antip.append((pose, surf, 0.0, np.concatenate([mid, 0.02 * y, 0.02 * z]),
-                    min(float(clr[k]), float(_edge_clearance(mesh, p2)[0])), _sup, "pinch"))
+      # A pinch has TWO physically different approach directions for the same contact pair.
+      # Keeping only ``z`` is not merely a lost wrist-roll: for a peg, +axis puts the palm
+      # above the peg (through the socket plate at the seated pose), while -axis keeps the
+      # palm below the socket.  Emit both and let FPS retain directional diversity.  This is
+      # the sampled/mesh counterpart of the face enumerator's two in-plane rolls.
+      for z_dir in (z, -z):
+        x_dir = np.cross(y, z_dir)                         # right-handed (x, y, z)
+        p_exit, _n_exit = _ray_exit(spec, mid, -z_dir)     # approach-side surface
+        t = float(np.linalg.norm(p_exit - mid))
+        pose = np.concatenate([
+            mid - z_dir * (t + offset),
+            _mat_to_quat(np.column_stack([x_dir, y, z_dir])),
+        ])
+        antip.append((pose, surf, 0.0,
+                      np.concatenate([mid, 0.02 * y, 0.02 * z_dir]),
+                      min(float(clr[k]), float(_edge_clearance(mesh, p2)[0])),
+                      _sup, "pinch"))
 
   keep = cfgv["keep"]
   k_suc = (keep + 1) // 2
@@ -2358,20 +2538,28 @@ def _shape_half_extents(spec):
 
 def _shape_half_extent_along(spec, d_part):
   # half extent of the shape along direction `d_part` given in the PART frame (accounts
-  # for the spec's shape rotation). Exact for axis-aligned directions.
+  # for the spec's shape rotation). Exact for axis-aligned directions and for cylinders
+  # (support function), box-cover otherwise.
   if spec[0] == "compound":
     d = np.asarray(d_part, dtype=float)
     return max(abs(float(d @ pos)) + _shape_half_extent_along(sub, d)
                for sub, pos in _compound_children(spec))
   q = _shape_quat(spec)
   d = d_part if q is None else _quat_to_R(q).T @ np.asarray(d_part, dtype=float)
+  if spec[0] == "cylinder":
+    # EXACT support along d in the SHAPE frame: |d_z|*l/2 + sqrt(dx^2+dy^2)*r. The
+    # bounding-box form |d|@[r,r,l/2] is right only at cardinal axes and WRONG in between
+    # (a flat wheel got l/2 = 6mm instead of r = 24mm and started inside the sim table).
+    l, rad = spec[1][0], spec[1][1]
+    return float(np.abs(d[2]) * l / 2.0 + np.hypot(d[0], d[1]) * rad)
   return float(np.abs(d) @ _shape_half_extents(spec))
 
 
 def _shape_half_z(spec, R):
   # half extent along WORLD z when the PART frame is rotated by R (the shape's own
   # rotation inside the part frame is composed in). Exact for our axis-aligned placement
-  # rotations; a safe over-approximation for general R.
+  # rotations, for spheres, and for cylinders (support function); a safe over-approximation
+  # for general rotations of meshes.
   if spec[0] == "compound":
     # per child: how far its centre drops below the part origin, plus its own half-z.
     # EXACT per-child bound, so an asymmetric compound still rests at the right height.
@@ -2381,6 +2569,14 @@ def _shape_half_z(spec, R):
     return _shape_half_extents(spec)[2]
   q = _shape_quat(spec)
   R_total = R if q is None else R @ _quat_to_R(q)
+  if spec[0] == "cylinder":
+    # EXACT support along world z: |u_z|*l/2 + sqrt(1-u_z^2)*r with u = the world-z
+    # direction in the shape frame. The old bounding-box form |u|@[r,r,l/2] undercounts
+    # whenever the axis is off the world axes (measured: a scattered flat car wheel got
+    # l/2 = 6mm instead of r = 24mm, and the sim started it 18mm inside the table).
+    l, rad = spec[1][0], spec[1][1]
+    u = R_total[2, :]
+    return float(np.abs(u[2]) * l / 2.0 + np.hypot(u[0], u[1]) * rad)
   return float(np.abs(R_total[2, :]) @ _shape_half_extents(spec))
 
 
@@ -3322,13 +3518,19 @@ def releases(state, assembly, robots, gripper_kind=None):
           continue                    # letting go would drop it -> not allowed
         if ns.parent.get(p) == ("gripper", r):
           # HANDOVER completion: the released grasp was the kinematic root, but another grasp
-          # still holds the group -> re-root the tree onto that remaining holder (canonical
-          # choice: the lowest-index still-grasped part). This is the case add_grasp enables.
+          # still holds the group -> re-root the tree onto that remaining holder.  Contacts are
+          # frozensets, so the tie-break must cover BOTH the grasped part and the robot.  Chair's
+          # final co-grasp has a1 and a3 on the same obj_0; breaking the tie only on obj_0 made
+          # the new root depend on PYTHONHASHSEED, and a saved ``place a1`` then disappeared
+          # from the successor set whenever a3 happened to win the set iteration order.
           remaining = [(cc[2], cc[1], cc[3]) for pp in group
                        for cc in ns.supports[pp] if cc[0] == "grasp"]
           if not remaining:
             continue                  # no other holder to take it (should not happen if supported)
-          q, r2, gid2 = min(remaining, key=lambda t: _part_index(t[0]))
+          robot_rank = {rr: i for i, rr in enumerate(robots)}
+          q, r2, gid2 = min(
+              remaining,
+              key=lambda t: (_part_index(t[0]), robot_rank.get(t[1], len(robot_rank)), t[1]))
           ns.parent = _rerooted(ns.parent, q)
           ns.parent[q] = ("gripper", r2)
           ns.grasp.pop(p, None)
@@ -4340,8 +4542,10 @@ def _group_stable_affine(state, assembly, group, gripper_kind, f0, point, gens):
   # CONSERVATIVE robust check: one AFFINE contact-force policy must hold across the whole
   # uncertainty box (wrench.equilibrium_robust_affine), vs _group_stable_loaded's EXACT per-corner
   # test. Builds the nominal wrench w0 and the box's generator wrenches delta_j about the group
-  # centroid, then a single LP. Feasibility here implies every corner is stable (sound); it is
-  # stricter (rejects loads that would need the contacts to switch strategy per realization).
+  # centroid, then a single LP. SOUNDNESS LIMIT: the deltas linearize the box, so feasibility
+  # implies every TRUE corner is stable only when the box has no point-shift generators
+  # (offset == 0) -- with shift and tilt together the corners carry a bilinear cross couple
+  # that no linear policy can express. _robust_stable guards this (falls back to corners).
   centroid, w_grav, G, ub, bounds, _ = _grounding_caps(state, assembly, group, gripper_kind)
   f0 = np.asarray(f0, dtype=float); point = np.asarray(point, dtype=float)
   w0 = w_grav + wrench.point_force_wrench(f0, point - centroid)
@@ -4355,16 +4559,32 @@ def _group_stable_affine(state, assembly, group, gripper_kind, f0, point, gens):
   return wrench.equilibrium_robust_affine(G, ub, w0, deltas, bounds=bounds)
 
 
+# one-shot process warning: affine robust mode cannot express the tilt-x-shift cross couple
+_AFFINE_FALLBACK_WARNED = [False]
+
+
 def _robust_stable(state, assembly, group, gripper_kind, f_world, point, mag, scale=1.0):
   # dispatch the robust insertion-stability check by wrench.PARAMS['robust_mode']:
   #   'corners' (default, EXACT): every uncertainty-box corner must be balanceable, the contacts
   #             free to rechoose their force split per realization (fully-adjustable robustness).
-  #   'affine'  (CONSERVATIVE): one fixed affine force-response policy must cover the whole box
-  #             (an open-loop / fixed-compliance grasp) -- a single LP, stricter, still sound.
+  #   'affine': one fixed affine force-response policy (open-loop grasp) covers the LINEARIZED
+  #             box -- a single LP, stricter per axis. It is sound ONLY when the box has one
+  #             axis KIND (force-only or shift-only): with both --insertion-noise (tilt shear)
+  #             and --insertion-offset (point shift) the true corners carry a bilinear cross
+  #             couple that no linear policy can express, so the dispatch FALLS BACK to the
+  #             exact corners test and warns once per process.
   # Identical to the plain nominal check when insertion_uncertainty is off (no generators).
-  if wrench.PARAMS.get("robust_mode", "corners") == "affine" and wrench.PARAMS.get("insertion_uncertainty"):
-    f0, pt, gens = _insertion_uncertainty_gens(f_world, point, mag, scale=scale)
-    return _group_stable_affine(state, assembly, group, gripper_kind, f0, pt, gens)
+  unc = wrench.PARAMS.get("insertion_uncertainty")
+  if wrench.PARAMS.get("robust_mode", "corners") == "affine" and unc:
+    if float(unc.get("lateral", 0.0)) > 0.0 and float(unc.get("offset", 0.0)) > 0.0:
+      if not _AFFINE_FALLBACK_WARNED[0]:
+        _AFFINE_FALLBACK_WARNED[0] = True
+        print("[wrench] --robust-mode affine with BOTH --insertion-noise and --insertion-offset "
+              "cannot be sound (an affine policy cannot express the tilt-x-shift cross "
+              "couple): using the exact 'corners' test instead.")
+    else:
+      f0, pt, gens = _insertion_uncertainty_gens(f_world, point, mag, scale=scale)
+      return _group_stable_affine(state, assembly, group, gripper_kind, f0, pt, gens)
   return _group_stable_loaded(state, assembly, group, gripper_kind,
                               _insertion_uncertainty_variants(f_world, point, mag, scale=scale))
 

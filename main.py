@@ -1,5 +1,6 @@
 import argparse
 import os as _os
+import sys as _sys
 
 # BEFORE rai loads: RAI_QUIET=1 drops rai's libccd/pairCollision spam at the fd (see rai_quiet).
 # Env var as well as a flag so it can be exported once instead of typed on every run.
@@ -177,8 +178,8 @@ def build_parser():
   g_scene.add_argument(
       "--assembly",
       choices=["cross", "cube", "arch", "arch-seq", "cube-plates", "cube-plates-2x2x3",
-               "cuboid-tower", "car", "car-mini", "slot-pin", "mesh-demo", "compound-demo",
-               "chair"],
+               "cuboid-tower", "car", "car-mini", "slot-pin", "peg-hole", "peg-stool",
+               "mesh-demo", "compound-demo", "chair"],
       default="cross",
       help="Assembly to build: cross (cube cross, 7), cube (2x2x2 grid, 8), "
            "arch (two pillars + lintel, 7 -- known-flawed star model), "
@@ -188,7 +189,10 @@ def build_parser():
            "cuboid-tower (jenga-style: 2 laid cuboids per level, levels rotated 90deg, up to 8), "
            "car (cuboid body + 4 sideways cylinder wheels, 5), "
            "car-mini (car scaled to w=0.03: wheels fit ACROSS the two-finger gap), "
-           "slot-pin (base + cantilever bar + fastening pin -- the --staged-mates testbed). "
+           "slot-pin (base + cantilever bar + fastening pin -- the --staged-mates testbed), "
+           "peg-hole (compound blind socket + top-down cylindrical peg, 2 -- concavity smoke "
+           "test; use --grasp-sampler), peg-stool (compound seat with three real downward "
+           "sockets + cylindrical legs, 4; use --grasp-sampler and a vacuum gripper). "
            "Default: cross.",
   )
   g_solver.add_argument(
@@ -526,9 +530,11 @@ def build_parser():
       "--robust-mode", choices=("corners", "affine"), default="corners",
       help="How the insertion-uncertainty box is checked. 'corners' (default): EXACT -- every box "
            "corner must be balanceable, contacts free to rechoose their force split per "
-           "realization. 'affine': CONSERVATIVE -- one fixed affine force-response policy (an "
-           "open-loop / fixed-compliance grasp that cannot sense the seating error and "
-           "re-optimize) must cover the whole box; a single LP, stricter, still sound.",
+           "realization. 'affine': one fixed affine force-response policy (an open-loop / "
+           "fixed-compliance grasp) covers the LINEARIZED box -- a single LP, stricter per "
+           "axis, but sound only without a positional offset; with BOTH --insertion-noise and "
+           "--insertion-offset the planner falls back to 'corners' (an affine policy cannot "
+           "express the tilt-x-shift cross couple).",
   )
   g_phys.add_argument(
       "--no-inserter-check", dest="inserter_check", action="store_false",
@@ -707,14 +713,14 @@ def build_parser():
            "pairs). Traded against movement by this weight. Best with the dp-* modes.",
   )
   g_witness.add_argument(
-      "--witness-sets", type=int, default=0, metavar="K",
+      "--witness-sets", type=int, default=4, metavar="K",
       help="WITNESS SETS: export up to K same-grasp IK-branch alternatives per task (member 0 "
            "= the canonical witness) as mr_bench GoalSets, so the motion planner gets several "
            "diverse keyframes per transition instead of one. Alternatives come from the "
            "witfloor candidate pool, pass the same gates as the canonical witness, keep every "
            "grasped part at the canonical world pose (handover/add_grasp diversity = arm "
-           "branches only), and are selected greedy-max-min on wrist-joint spread. 0/1 = OFF "
-           "(byte-identical). Requires --optimize-witnesses floor.")
+           "branches only), and are selected greedy-max-min on wrist-joint spread. Default 4; "
+           "0/1 = OFF. Requires --optimize-witnesses floor.")
   g_witness.add_argument(
       "--witness-set-spread", type=float, default=0.05, metavar="RAD",
       help="--witness-sets: minimum wrist-joint distance between accepted members (rad); "
@@ -728,15 +734,13 @@ def build_parser():
            "ladder (byte-identical).",
   )
   g_witness.add_argument(
-      "--witness-margin", type=float, default=None, metavar="M",
-      help="ROBUST KEYFRAMES: reject any witness whose posed scene has a NON-INTENDED pair "
-           "closer than M metres -- (non-hand arm link) vs (part), and (arm) vs (other arm). "
-           "Intended contacts stay legal (hand-vs-payload, part-part mates, table). Applied "
-           "to the WITNESS passes only (witfloor/optimize/fuse/pre-skill re-solves; the "
-           "search is untouched). Keyframes that are legal by a hair (measured: -1.35mm "
-           "forearm inside the arm's own cargo on chair-8) sample fine but can never be "
-           "CONNECTED by the motion planner; a margin makes the exported anchors plannable. "
-           "Try 0.005.",
+      "--witness-margin", type=float, default=0.005, metavar="M",
+      help="SHARED SEARCH+WITNESS hard clearance: reject every IK whose posed scene has a "
+           "non-intended arm/part, inter-robot, or non-adjacent self-collision pair closer "
+           "than M. Only the acting hand/target and each holder's own payload are exempt "
+           "(plus part/part and table pairs). The SAME gate runs during search and every "
+           "later witness/fusion/funnel solve, so post-processing is never stricter than "
+           "search. Default 0.005m; 0 disables.",
   )
   g_witness.add_argument(
       "--witness-branch-budget", type=int, default=5, metavar="N",
@@ -937,10 +941,10 @@ def build_parser():
   )
   g_skills.add_argument(
       "--skill", type=float, nargs="?", const=0.05, default=0.0, metavar="DELTA",
-      help="Shorthand: enable ALL pre-skill splits (--pre-pick/--pre-place/--pre-add-grasp/"
-           "--pre-insertion) at DELTA metres (default 0.05) -- treat pick, place, brace, and "
-           "mate as skills. An explicit per-skill --pre-* flag overrides this for that skill. "
-           "Default off.",
+      help="Shorthand: set ALL approach/departure funnels (--pre-pick/--pre-place/"
+           "--pre-add-grasp/--pre-insertion/--post-release) to DELTA metres (default 0.05). "
+           "An explicit per-skill flag overrides this for that skill. The individual funnels "
+           "already default to 0.05; this is mainly a convenient common retune.",
   )
   g_skills.add_argument(
       "--pre-insertion", type=float, nargs="?", const=0.05, default=0.05, metavar="DELTA",
@@ -955,22 +959,29 @@ def build_parser():
            "0 = single un-split assemble.",
   )
   g_skills.add_argument(
-      "--pre-pick", type=float, nargs="?", const=0.05, default=0.0, metavar="DELTA",
+      "--pre-pick", type=float, nargs="?", const=0.05, default=0.05, metavar="DELTA",
       help="Like --pre-insertion, for PICK (EXPORT/REPLAY only): split each pick into a GOTO to "
            "the pre-grasp pose (gripper retracted DELTA m along its -approach axis, default "
-           "0.05) + the real grasp at the pick witness. Default off.",
+           "0.05) + the real grasp at the pick witness. Default 0.05; 0 disables.",
   )
   g_skills.add_argument(
-      "--pre-place", type=float, nargs="?", const=0.05, default=0.0, metavar="DELTA",
+      "--pre-place", type=float, nargs="?", const=0.05, default=0.05, metavar="DELTA",
       help="Like --pre-insertion, for PLACE (EXPORT/REPLAY only): split each place into a GOTO "
            "to the pre-place pose (object lifted DELTA m in +z off its rest pose, default 0.05) "
-           "+ the real set-down at the place witness. Default off.",
+           "+ the real set-down at the place witness. Default 0.05; 0 disables.",
   )
   g_skills.add_argument(
-      "--pre-add-grasp", type=float, nargs="?", const=0.05, default=0.0, metavar="DELTA",
+      "--pre-add-grasp", type=float, nargs="?", const=0.05, default=0.05, metavar="DELTA",
       help="Like --pre-pick, for ADD_GRASP (the brace/handover reach; EXPORT/REPLAY only): split "
            "each add_grasp into a GOTO to the pre-grasp (gripper retracted DELTA m along its "
-           "-approach axis, default 0.05) + the real brace reach. Default off.",
+           "-approach axis, default 0.05) + the real brace reach. Default 0.05; 0 disables.",
+  )
+  g_skills.add_argument(
+      "--post-release", type=float, nargs="?", const=0.05, default=0.05, metavar="DELTA",
+      help="POST-RELEASE departure funnel (EXPORT/REPLAY only): after the detach task, add a "
+           "GOTO that retracts the released gripper DELTA m along its -approach axis while "
+           "the endpoint IK pins every other arm at the release keyframe. BiRRT remains "
+           "unconstrained between endpoints. Default 0.05; 0 disables.",
   )
   g_skills.add_argument(
       "--fuse-pre-skill", action="store_true", default=None,
@@ -1019,12 +1030,14 @@ def build_parser():
       "--fuse-cograsp", action=argparse.BooleanOptionalAction, default=True,
       help="Default ON (2026-07-29). With --motion-plan: AFTER witness optimization and BEFORE the export, re-solve "
            "each (add_grasp, assemble) witness PAIR as ONE 2-phase KOMO instead of two "
-           "independent single-keyframe IK solves. The two solves agree on the "
-           "object-relative gripper pose but land in different arm BRANCHES (measured "
-           "4-5 rad apart), and since a brace exports as a bare goto the co-grasp is then "
-           "unconstrained between keyframes -- the braced gripper swings metres away and "
-           "back while nominally welded to the object. A low-weight cross-phase cost on the "
-           "brace joint delta and the held object's pose delta collapses that. Per pair it "
+           "independent single-keyframe IK solves. With --pre-insertion, add_grasp and the "
+           "inserter share the funnel-mouth keyframe; pre-switch support changes and releases "
+           "reuse the adjacent coupled endpoint instead of introducing another transport "
+           "keyframe. The ordinary motion planner remains free to detour between endpoints; "
+           "no controller or interior path constraint is injected here. The shared MP task "
+           "goals are always exported; this flag "
+           "controls the additional witness re-solve, which requires one kinematic mode. This avoids "
+           "transporting a closed co-grasp between unrelated IK branches. Per pair it "
            "is ALL-OR-NOTHING: any failed/violated/not-improved solve keeps BOTH originals. "
            "Pair with --mp-cograsp --mp-sequence to measure the effect.",
   )
@@ -1087,6 +1100,21 @@ def build_parser():
            "--optimize-witnesses/--witness-clearance/--vacuum/--goal-on-table). Needs "
            "--real-ik (for the IK witnesses); if --optimize-witnesses is not given, RAW "
            "search witnesses are used. See the --mp-* flags for planner options.",
+  )
+  g_mp.add_argument(
+      "--mp-export-save", metavar="FILE", default=None,
+      help="Persist the FINAL motion-planning export (post-fusion skill witnesses, every "
+           "pre-skill keyframe, witness sets, export settings and task signature). Written "
+           "before --mp-modes/planning, so it also works when no motion path is found.",
+  )
+  g_mp.add_argument(
+      "--mp-export-load", metavar="FILE", default=None,
+      help="Load a final motion-planning export and skip ALL witness/fusion/pre-skill IK "
+           "solves. The saved plan and joint order must match exactly; missing keyframes or "
+           "a changed task signature are fatal instead of being silently re-solved. Saved "
+           "collision/clearance settings are defaults; explicitly supplied --mp-collision-"
+           "tolerance/--mp-robot-margin/--mp-margin-ramp/--mp-table-margin values override "
+           "them without changing the persisted keyframes.",
   )
   g_mp.add_argument(
       "--mp-sequence", action=argparse.BooleanOptionalAction, default=True,
@@ -1183,7 +1211,17 @@ def build_parser():
            "Unseeded, the same command yields paths whose failure CLASSES differ run to run "
            "(measured: one draw grazes the table at 57N, the next has no table contact), so "
            "any A/B without this is noise. Default None = historical unseeded behaviour. "
-           "Saved with the plan; sim.py reuses it unless overridden.",
+           "Saved with the plan; sim.py reuses it unless overridden. With the real clock a "
+           "seeded run is only APPROXIMATELY reproducible -- add --mp-fake-clock for bit-exact "
+           "determinism.",
+  )
+  g_mp.add_argument(
+      "--mp-fake-clock", action=argparse.BooleanOptionalAction, default=False,
+      help="With --motion-plan (and --mp-seed): replace the wall clock with a deterministic "
+           "fake clock (+1ms per consultation) so the run is BIT-EXACT reproducible -- in "
+           "exchange --mp-runtime becomes a CONSULTATION budget, NOT wall seconds, so the "
+           "tree phase can run much longer than the budget. Off by default: --mp-seed alone "
+           "seeds the draw but keeps the real clock and true wall-second termination.",
   )
   g_mp.add_argument(
       "--mp-table-margin", type=float, default=0.0, metavar="M",
@@ -1276,12 +1314,50 @@ def build_parser():
   return parser
 
 
+def _scan_flags(parser, argv):
+  # Pre-parse scan of the raw argv: returns (duplicates, explicit_dests).
+  # Argparse silently keeps the LAST occurrence of a repeated flag, so a repeated --seed
+  # (or any other flag) is a footgun the parsed result cannot reveal -- scan the tokens
+  # instead. Exact for this CLI: no short options, and no flag's VALUE starts with '-'.
+  # (A '--' token ends the scan, argparse-style.)
+  toks = list(_sys.argv[1:]) if argv is None else list(argv)
+  dups = {}
+  explicit = set()
+  for tok in toks:
+    if tok == "--":
+      break
+    if not tok.startswith("-"):
+      continue
+    name = tok.split("=", 1)[0]
+    act = parser._option_string_actions.get(name)
+    if act is None:
+      continue
+    dest = act.dest
+    explicit.add(dest)
+    if dest in dups:
+      dups[dest][1] += 1
+    else:
+      dups[dest] = [name, 1]
+  return dups, explicit
+
+
+def _warn_duplicate_flags(parser, argv):
+  dups, _ = _scan_flags(parser, argv)
+  for dest, (name, n) in dups.items():
+    if n > 1:
+      print(f"[flag] !!! '{name}' appears {n} times: argparse keeps only the LAST value, so "
+            f"every earlier occurrence is silently dead"
+            + (" (use --mp-seed for a separate motion-plan seed)" if dest == "seed" else "")
+            + ".")
+
+
 def parse_args(argv=None):
   # Two-pass layering for --config: parse once to see if a config FILE was named; if so, load
   # it as the parser's DEFAULTS and re-parse so unspecified flags take the file's value while
   # any explicit command-line flag still wins (CLI > file > built-in default). Without --config
   # this is exactly `build_parser().parse_args(argv)` -- one pass, byte-identical to before.
   parser = build_parser()
+  _warn_duplicate_flags(parser, argv)
   args = parser.parse_args(argv)
   if getattr(args, "config", None):
     from config import RunConfig
@@ -1296,7 +1372,7 @@ _SAVE_CONFIG_FIELDS = (
     "scatter_spacing", "perturb_start_pose", "seed", "wrench", "grasp_model", "insert_force",
     "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
     "bracing", "robust_mode", "dense_grasps", "random_init", "part_float", "inhand_reorient",
-    "pre_insertion", "pre_pick", "pre_place", "pre_add_grasp", "staged_mates",
+    "pre_insertion", "pre_pick", "pre_place", "pre_add_grasp", "post_release", "staged_mates",
     "allow_curved_grasps", "grippers", "grasp_compliance",
     "vacuum_scale", "tf_close_torque", "dominance", "useful_grasps", "brace_resting",
     "ignore_gravity",                                    # weightless stability: a plan searched
@@ -1321,7 +1397,7 @@ _SAVE_CONFIG_FIELDS = (
     "tight_fingers",                                     # changes what the grasp DB filters out
     "ik_seeding",                                        # off => witness IK fails on re-picks/
     # reorienting places, and mp_export then exports the arm's PREVIOUS config as the goal
-    "pre_pick", "pre_place", "pre_add_grasp",            # each SPLITS an action into two tasks:
+    "pre_pick", "pre_place", "pre_add_grasp", "post_release", # each SPLITS an action into tasks:
     # unsaved, a replay/sim rebuild has fewer tasks than the --mp-path it loads, and the path
     # indexes tasks by integer id. pre_insertion was already saved; these three were not.
     "witness_margin", "witness_draw",                    # robust-keyframe gate + ladder
@@ -1342,6 +1418,8 @@ _SAVE_CONFIG_FIELDS = (
     "mp_robot_margin", "mp_margin_ramp",                 # clearance the path was planned with
     "mp_table_margin",                                   # carried-part-vs-table transit clearance
     "mp_seed",                                           # reproducible BiRRT draw (None = unseeded)
+    "mp_fake_clock",                                     # fake deterministic clock: runtime becomes
+    # a CONSULTATION budget (bit-exact seeded replay)
     "min_sep", "place_cells", "prefer_center", "brace_for_assembly_only", "lru_robots",
     "anon_robots", "declutter", "por",
     # LAYOUT: these feed add_disassembled_obj, so without them the replay/sim rebuilds a
@@ -1353,6 +1431,16 @@ _SAVE_CONFIG_FIELDS = (
 def save_plan(path, cfg, plan, witnesses=None):
   from plan_io import write_plan
   config = {k: getattr(cfg, k) for k in _SAVE_CONFIG_FIELDS}
+  # A plan can only be replay-gated as strictly as the SEARCH that selected it.  This marker
+  # separates new plans (where --witness-margin is installed before search) from old files
+  # where the same config key described a witness-only post-pass.  Preserve the source
+  # certificate across --load-plan + --save; never accidentally upgrade an old plan merely
+  # because it was copied through a newer executable.
+  _cert = getattr(cfg, "_search_witness_margin", None)
+  if _cert is None:
+    _cert = (cfg.witness_margin if cfg.solve and cfg.real_ik
+             and cfg.witness_margin is not None else 0.0)
+  config["_search_witness_margin"] = float(_cert)
   write_plan(path, config, plan, witnesses=witnesses)
   print(f"[save] wrote {len(plan)}-action plan + scene config"
         + (" + witnesses" if witnesses is not None else "") + f" to {path}")
@@ -1376,14 +1464,15 @@ _WITNESS_FIELDS = (
 def _witnesses_reusable(saved_cfg, cfg):
   # a key MISSING from the saved config means the plan predates that flag -- it was
   # produced with the flag at its DEFAULT, so compare against the RunConfig default
-  # instead of declaring a mismatch (a bare `k not in saved_cfg` silently re-solved the
-  # witnesses of EVERY older plan file each time a new witness-affecting flag landed).
-  import dataclasses
+  # (the single source of defaults) instead of declaring a mismatch (a bare `k not in
+  # saved_cfg` silently re-solved the witnesses of EVERY older plan file each time a new
+  # witness-affecting flag landed).
   from config import RunConfig
-  _defaults = {f.name: (None if f.default is dataclasses.MISSING else f.default)
-               for f in dataclasses.fields(RunConfig)}
+  # These two defaults became non-zero after saved witness blocks already existed.  Missing
+  # keys therefore mean the historical OFF values, not today's fresh-run defaults.
+  legacy = {"witness_margin": None, "witness_sets": 0}
   bad = [k for k in _WITNESS_FIELDS
-         if saved_cfg.get(k, _defaults.get(k)) != getattr(cfg, k, None)]
+         if saved_cfg.get(k, legacy.get(k, RunConfig.default_for(k))) != getattr(cfg, k, None)]
   if bad:
     print("[witness-reuse] settings differ from the saved witnesses on: "
           + ", ".join(bad) + " -- re-solving instead of reusing.")
@@ -1488,9 +1577,59 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
   return plan
 
 
-def run(cfg):
+def _should_hoist_plan(cfg, explicit=None):
+  """Apply the release-hoist pass to fresh solves, or when explicitly requested on load."""
+  return bool(cfg.hoist_releases and
+              (not cfg.load_plan or (explicit and "hoist_releases" in explicit)))
+
+
+def _merge_mp_export_clearance_settings(cfg, saved, explicit=None):
+  """Layer motion-planner clearance knobs for ``--mp-export-load``.
+
+  A final export is a zero-IK replay artifact, so its exact tasks/keyframes and structural
+  settings remain authoritative.  Collision/clearance values are planner tuning knobs,
+  however: the export supplies reproducible defaults, while an option explicitly present on
+  THIS command line must win (the same CLI > file rule used by ``--config``).  Previously the
+  four assignments in the load branch unconditionally restored the export and silently made
+  e.g. ``--mp-collision-tolerance 0.1`` ineffective.
+
+  Returns ``(values, sources)`` where sources are suitable for the effective-settings log.
+  ``explicit=None`` is the library-call case and deliberately keeps the saved artifact exact.
+  """
+  explicit = set(explicit or ())
+  specs = (
+      ("collision_tolerance", "mp_collision_tolerance", float),
+      ("robot_robot_margin", "mp_robot_margin", float),
+      ("robot_margin_ramp", "mp_margin_ramp", float),
+      ("table_margin", "mp_table_margin", float),
+  )
+  values, sources = {}, {}
+  for saved_key, cfg_key, cast in specs:
+    cli_value = cast(getattr(cfg, cfg_key))
+    if cfg_key in explicit:
+      values[saved_key], sources[saved_key] = cli_value, "CLI"
+    else:
+      values[saved_key] = cast(saved.get(saved_key, cli_value))
+      sources[saved_key] = "export"
+
+  # table_float is not a CLI flag of its own.  It is the part/table start clearance paired
+  # with --mp-table-margin: preserve the saved value unless that margin was explicitly
+  # retuned, in which case derive it from this run's reconstructed scene.
+  if "mp_table_margin" in explicit:
+    values["table_float"] = float(cfg.part_float) if values["table_margin"] else 0.0
+    sources["table_float"] = "CLI/scene"
+  else:
+    fallback = float(cfg.part_float) if values["table_margin"] else 0.0
+    values["table_float"] = float(saved.get("table_float", fallback))
+    sources["table_float"] = "export"
+  return values, sources
+
+
+def run(cfg, explicit=None):
   # cfg: RunConfig -- the single typed configuration object for the whole run. Every setting
   # below reads a cfg field; the thin main() wrapper builds cfg from the parsed CLI args.
+  # explicit: set of dests the caller put on the command line (main()'s argv scan); None for
+  # library callers. The dead-flag warnings below fire only for explicit flags.
   if cfg.optimize_witnesses == "off":          # 'floor' is the default; 'off' is the escape
     cfg.optimize_witnesses = None
   set_seed(cfg.seed)                           # reproducible numpy + rai (KOMO) RNG
@@ -1676,6 +1815,15 @@ def run(cfg):
       robot_types=cfg.robot_types or cfg.robot,   # --robot for all; --robot-types overrides
   )
 
+  from problem import assembly_max_parts
+  _maxp = assembly_max_parts(cfg.assembly)
+  if cfg.parts > _maxp:
+    if explicit and "parts" in explicit:
+      print(f"[flag] !!! --parts {cfg.parts} exceeds {cfg.assembly}'s maximum of {_maxp}: "
+            f"clamped to {_maxp} -- this run builds {_maxp} parts.")
+    else:
+      print(f"[flag] NOTE: --assembly {cfg.assembly} has at most {_maxp} parts; the default "
+            f"--parts {cfg.parts} is clamped to {_maxp}.")
   assembly = make_assembly(cfg.assembly, cfg.parts)
 
   if cfg.ladder_lns is not None:
@@ -1722,6 +1870,11 @@ def run(cfg):
   if cfg.grid_init is not None:
     print(f"[flag] --grid-init {cfg.grid_init} ACTIVE: parts packed shoulder-to-shoulder in a "
           f"{cfg.grid_init}-wide grid (relocation stress); scatter line / --random-init ignored.")
+  if (explicit and "scatter_spacing" in explicit
+      and (cfg.random_init is not None or cfg.grid_init is not None)):
+    print(f"[flag] NOTE: --scatter-spacing {cfg.scatter_spacing:g} has NO EFFECT here: "
+          f"{'--random-init' if cfg.random_init is not None else '--grid-init'} overrides the "
+          f"scatter line.")
   C = add_disassembled_obj(C, assembly, perturb_start_pose=cfg.perturb_start_pose,
                            spacing=cfg.scatter_spacing, random_init=cfg.random_init,
                            float_height=cfg.part_float, min_sep=cfg.min_sep,
@@ -1810,7 +1963,8 @@ def run(cfg):
   # (optimize_witnesses/fuse_cograsp/hoist_releases/fuse_pre_skill left this list on
   # 2026-07-29: they are DEFAULTS now, so "present without a plan" is no longer a request
   # being silently dropped -- only explicitly-asked-for outputs still warrant the error.)
-  _NEEDS_PLAN = ("motion_plan", "save", "mp_save", "utilization")
+  _NEEDS_PLAN = ("motion_plan", "save", "mp_save", "mp_export_save", "mp_export_load",
+                 "utilization")
   if not (cfg.solve or cfg.load_plan):
     _asked = [f"--{a.replace('_', '-')}" for a in _NEEDS_PLAN if getattr(cfg, a, None)]
     if _asked:
@@ -1819,6 +1973,8 @@ def run(cfg):
           f"given -- nothing would happen.\n"
           f"  --solve            run the search\n"
           f"  --load-plan FILE   re-run the post-passes/export on a saved plan (no search)")
+  if (cfg.mp_export_save or cfg.mp_export_load) and not cfg.motion_plan:
+    raise SystemExit("main.py: --mp-export-save/--mp-export-load require --motion-plan")
   if cfg.solve or cfg.load_plan:
     robots = get_robots(C)
     robot_ik = RobotIK(C, robots) if cfg.real_ik else None
@@ -1837,6 +1993,17 @@ def run(cfg):
       robot_ik.strip_inactive_collision = False
       print("[flag] --witness-robot-collisions ACTIVE: other robots' collision kept ON in IK "
             "(search + witness opt); idle arms are at HOME in the IK scene.")
+    if cfg.witness_margin is not None and robot_ik is not None:
+      # ONE clearance contract, installed BEFORE search. The old implementation enabled this
+      # only after a discrete plan existed, so witness optimization could reject every IK the
+      # search itself had accepted -- exactly the contract violation this flag is meant to
+      # prevent. Search, persisted witnesses, fusion and pre/post-skill solves now all call
+      # RobotIK._clearance_ok with the same value and pair classification.
+      robot_ik.clearance_reject = float(cfg.witness_margin)
+      print(f"[flag] --witness-margin {cfg.witness_margin*1000:.0f}mm ACTIVE IN SEARCH + "
+            "WITNESS PASSES: every accepted IK clears the same hard non-intended-pair gate "
+            "(arm/part, inter-robot and non-adjacent self-collision); later passes may rank "
+            "or diversify but cannot strengthen search feasibility.")
     if robot_ik is not None and cfg.mate_eq_weight is not None:
       robot_ik.mate_eq_weight = float(cfg.mate_eq_weight)
       print(f"[flag] --mate-eq-weight {cfg.mate_eq_weight:g}: assemble mate eq constraints "
@@ -1897,10 +2064,10 @@ def run(cfg):
                " NOTE: idle arms are STRIPPED from skill scenes (add "
                "--witness-robot-collisions to gate arm-arm penetration too)."))
     if cfg.skill > 0.0:
-      # shorthand: fill in every pre-skill split not set explicitly, then let the per-skill
-      # blocks below apply/announce them (an explicit --pre-* keeps its own value).
-      for _f in ("pre_insertion", "pre_pick", "pre_place", "pre_add_grasp"):
-        if getattr(cfg, _f) <= 0.0:
+      # shorthand: set every funnel not explicitly overridden on this command. Checking the
+      # CLI presence rather than `<= 0` matters now that funnels default ON.
+      for _f in ("pre_insertion", "pre_pick", "pre_place", "pre_add_grasp", "post_release"):
+        if not explicit or _f not in explicit:
           setattr(cfg, _f, cfg.skill)
       print(f"[flag] --skill {cfg.skill:g} ACTIVE: enabling all pre-skill splits (pick, place, "
             "add_grasp, assemble) as skills.")
@@ -1922,6 +2089,12 @@ def run(cfg):
       print(f"[flag] --pre-add-grasp ACTIVE: MP export splits each add_grasp into a goto to the "
             f"pre-grasp ({cfg.pre_add_grasp:g}m gripper retract) + the real brace reach. "
             "Search/plan unchanged.")
+    if robot_ik is not None and cfg.post_release > 0.0:
+      robot_ik.post_release_delta = cfg.post_release
+      print(f"[flag] --post-release ACTIVE: MP export appends a departure GOTO after each "
+            f"detach ({cfg.post_release:g}m gripper retract); its endpoint IK holds every "
+            "other arm at the release keyframe, while the MP path interior stays "
+            "unconstrained. Search/plan unchanged.")
     if cfg.view_cheap_checks:
       set_cheap_check_debug(True)
     fail_rec = None
@@ -1943,9 +2116,27 @@ def run(cfg):
       # was asked for. The scene still comes from --config/CLI, so it must MATCH the saved plan.
       from plan_io import read_plan as _read_saved_plan
       _saved_cfg, plan = _read_saved_plan(cfg.load_plan)
+      # Keep the original search certificate if this plan is written out again.
+      cfg._search_witness_margin = float(_saved_cfg.get("_search_witness_margin", 0.0))
       plan = [tuple(a) for a in plan]
       print(f"[load-plan] {len(plan)} actions read from {cfg.load_plan}; search SKIPPED "
             f"(post-passes and export run on the plan as saved).")
+      # The hard margin is now a SEARCH feasibility criterion. Strengthening it while search
+      # is explicitly skipped would recreate the old contract violation: post-processing could
+      # reject a plan under a gate its search never saw. A weaker/equal replay is safe; a
+      # stronger one requires a fresh solve so the discrete plan is certified too.
+      # Old files have no certificate: their --witness-margin, if present, was installed
+      # only after search and therefore certifies 0m here.
+      _old_m = float(_saved_cfg.get("_search_witness_margin", 0.0))
+      _new_m = 0.0 if cfg.witness_margin is None else float(cfg.witness_margin)
+      # A final export contains all keyframes/tasks and --mp-export-load performs no IK at
+      # all, so no new gate is applied in that exact-replay path.
+      if not (cfg.motion_plan and cfg.mp_export_load) and _new_m > _old_m + 1e-12:
+        raise ValueError(
+            f"--witness-margin {_new_m:g}m is stricter than the {_old_m:g}m gate used by "
+            f"the search saved in {cfg.load_plan}. Because --load-plan skips search, applying "
+            "it only to witnesses is forbidden. Re-run with --solve under the new margin, or "
+            "keep the saved margin for this plan.")
       for _k in ("assembly", "parts", "num_robots", "seed"):
         if _saved_cfg.get(_k) is not None and _saved_cfg.get(_k) != getattr(cfg, _k, None):
           print(f"[load-plan] !!! scene MISMATCH on '{_k}': saved {_saved_cfg.get(_k)!r} vs "
@@ -1961,6 +2152,12 @@ def run(cfg):
     if robot_ik is not None and cfg.strict_collisions is not None:
       print(f"[strict-collisions] vetoed {robot_ik.strict_rejects} dirty KOMO witnesses "
             f"(> {cfg.strict_collisions:g}m total penetration).")
+    if robot_ik is not None and robot_ik.clearance_reject is not None:
+      print(f"[ik-clearance] vetoed {robot_ik.margin_rejects} IK candidate(s) below the "
+            f"shared {robot_ik.clearance_reject*1000:.1f}mm search/witness margin.")
+      rows = sorted(robot_ik.margin_reject_pairs.items(), key=lambda kv: kv[1], reverse=True)
+      for (reason, fa, fb), count in rows[:5]:
+        print(f"  [ik-clearance] {reason:11s} {fa} ~ {fb}: {count} veto(es)")
     if robot_ik is not None and cfg.mate_accuracy is not None:
       if getattr(cfg, "grasp_accuracy", None) is not None:
         print(f"[grasp-accuracy] vetoed {robot_ik.grasp_rejects} off-pose grasps "
@@ -1975,7 +2172,13 @@ def run(cfg):
       print(f"plan ({len(plan)} actions):")
       for step in plan:
         print("  ", step)
-      if cfg.hoist_releases:
+      # A saved plan already contains every post-pass that ran before save_plan. Reapplying
+      # the non-idempotent hoist on --load-plan can move releases a SECOND time, so the motion
+      # path is then for a different action order than the JSON which sim.py reloads. The
+      # saved true value documents how the plan was made; it is not a request to mutate it on
+      # every load. An explicit CLI --hoist-releases remains the opt-in way to apply the pass
+      # to an older/unhoisted file.
+      if _should_hoist_plan(cfg, explicit):
         # BEFORE save/witnesses/utilization/motion-plan, so all downstream consumers see the
         # hoisted plan (witnesses are solved for the hoisted states).
         from solver import hoist_releases
@@ -1985,17 +2188,10 @@ def run(cfg):
                               bracing=cfg.bracing)
       if cfg.save is not None:
         save_plan(cfg.save, cfg, plan)
-      if cfg.witness_margin is not None and robot_ik is not None:
-        # ROBUST-KEYFRAME gate for everything from here on (witfloor, fuse, pre-skill, raw
-        # export solves). Deliberately NOT set during the search: plans stay identical; only
-        # the shipped keyframes change.
-        robot_ik.clearance_reject = float(cfg.witness_margin)
-        print(f"[flag] --witness-margin {cfg.witness_margin*1000:.0f}mm ACTIVE: witnesses "
-              f"rejected unless every non-intended pair (non-hand arm vs part, arm vs other "
-              f"arm) clears the margin; restarts hunt for fat-neighbourhood keyframes.")
       opt_witnesses = None
       witness_alts = None                                    # --witness-sets alternatives
-      if plan is not None and cfg.optimize_witnesses is not None:
+      if (plan is not None and cfg.optimize_witnesses is not None
+          and not (cfg.motion_plan and cfg.mp_export_load)):
         if robot_ik is None:
           print("[witopt] --optimize-witnesses needs --real-ik; skipping.")
         else:
@@ -2079,28 +2275,81 @@ def run(cfg):
         else:
           import mp_export as MP
           gk = wrench_kind_arg(C, robots) if cfg.wrench else None
-          # witnesses: the optimized set if --optimize-witnesses was given, else RAW (sweeps=0)
-          mp_wit = opt_witnesses
-          if mp_wit is None:
-            mp_wit, _ = optimize_witnesses(
-                C, assembly, plan, robots, robot_ik, cost="ee", sweeps=0,
-                gripper_kind=gk, handovers=cfg.handovers, allow_place=cfg.allow_place,
-                bracing=cfg.bracing, verbose=False,
-                robot_collisions=cfg.witness_robot_collisions)
-          if cfg.fuse_cograsp:
-            from solver import fuse_cograsp_witnesses
-            print("[flag] --fuse-cograsp ACTIVE: re-solving each (add_grasp, assemble) "
-                  "witness pair as ONE 2-phase KOMO so the brace arm keeps its IK branch "
-                  "across both keyframes.")
-            mp_wit, _frep = fuse_cograsp_witnesses(
-                C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
-                handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing)
+          _loaded_export = None
+          _export_bracing = cfg.bracing
+          _export_depgraph = not cfg.mp_sequence
+          _export_collision_tolerance = cfg.mp_collision_tolerance
+          _export_robot_margin = cfg.mp_robot_margin
+          _export_margin_ramp = cfg.mp_margin_ramp
+          _export_table_margin = cfg.mp_table_margin
+          _export_table_float = cfg.part_float if cfg.mp_table_margin else 0.0
+          mp_pre = None
+          _cograsp_pre = {}
+          if cfg.mp_export_load:
+            _loaded_export = MP.load_export_bundle(
+                cfg.mp_export_load, plan, list(robot_ik.C.getJointNames()))
+            mp_wit = _loaded_export["witnesses"]
+            mp_pre = _loaded_export["pre_witnesses"]
+            witness_alts = _loaded_export["witness_sets"]
+            _es = _loaded_export["settings"]
+            _export_bracing = bool(_es.get("bracing", _export_bracing))
+            _export_depgraph = bool(_es.get("depgraph", _export_depgraph))
+            _clearance, _clearance_source = _merge_mp_export_clearance_settings(
+                cfg, _es, explicit)
+            _export_collision_tolerance = _clearance["collision_tolerance"]
+            _export_robot_margin = _clearance["robot_robot_margin"]
+            _export_margin_ramp = _clearance["robot_margin_ramp"]
+            _export_table_margin = _clearance["table_margin"]
+            _export_table_float = _clearance["table_float"]
+            robot_ik.pre_insertion_delta = float(
+                _es.get("pre_insertion", robot_ik.pre_insertion_delta))
+            robot_ik.pre_pick_delta = float(_es.get("pre_pick", robot_ik.pre_pick_delta))
+            robot_ik.pre_place_delta = float(_es.get("pre_place", robot_ik.pre_place_delta))
+            robot_ik.pre_add_grasp_delta = float(
+                _es.get("pre_add_grasp", robot_ik.pre_add_grasp_delta))
+            robot_ik.post_release_delta = float(
+                _es.get("post_release", robot_ik.post_release_delta))
+            print(f"[mp-export-reuse] final post-fusion export loaded from "
+                  f"{cfg.mp_export_load}: {sum(w is not None for w in mp_wit)} skill and "
+                  f"{len(mp_pre)} pre-skill keyframes; ALL witness IK/fusion solves SKIPPED.")
+            print("[mp-export-settings] effective "
+                  f"collision_tolerance={_export_collision_tolerance:g} "
+                  f"[{_clearance_source['collision_tolerance']}], "
+                  f"robot_margin={_export_robot_margin:g} "
+                  f"[{_clearance_source['robot_robot_margin']}], "
+                  f"margin_ramp={_export_margin_ramp:g} "
+                  f"[{_clearance_source['robot_margin_ramp']}], "
+                  f"table_margin={_export_table_margin:g} "
+                  f"[{_clearance_source['table_margin']}], "
+                  f"table_float={_export_table_float:g} "
+                  f"[{_clearance_source['table_float']}].")
+          else:
+            # witnesses: the optimized set if --optimize-witnesses was given, else RAW
+            # (sweeps=0). This is the ONE-TIME export path; replay loads its final artifact.
+            mp_wit = opt_witnesses
+            if mp_wit is None:
+              mp_wit, _ = optimize_witnesses(
+                  C, assembly, plan, robots, robot_ik, cost="ee", sweeps=0,
+                  gripper_kind=gk, handovers=cfg.handovers, allow_place=cfg.allow_place,
+                  bracing=cfg.bracing, verbose=False,
+                  robot_collisions=cfg.witness_robot_collisions)
+            if cfg.fuse_cograsp:
+              from solver import fuse_cograsp_witnesses
+              print("[flag] --fuse-cograsp ACTIVE: re-solving each (add_grasp, assemble) "
+                    "witness pair as ONE 2-phase KOMO. add_grasp shares the assembly's "
+                    "funnel-mouth rendezvous at the keyframe level; the ordinary motion "
+                    "planner remains free to detour between endpoints.")
+              mp_wit, _frep = fuse_cograsp_witnesses(
+                  C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
+                  handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing)
+              _cograsp_pre = dict(_frep.get("pre_witnesses") or {})
           # LAST GATE: re-check the witnesses we are about to SHIP. Every earlier gate ran at
           # SOLVE time, and the object that leaves here is not the object that was solved --
           # optimize_witnesses* emits a splice and fuse_cograsp re-solves the pair again. A
           # dirty mate keyframe must fail HERE, named, not surface as an unexplained motion-
           # planner rejection three stages later.
-          if cfg.strict_mate_collisions and robot_ik.penetration_reject is not None:
+          if (_loaded_export is None and cfg.strict_mate_collisions
+              and robot_ik.penetration_reject is not None):
             from solver import validate_export_witnesses
             mp_wit, _bad = validate_export_witnesses(
                 C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
@@ -2117,7 +2366,8 @@ def run(cfg):
                     "(only the intended mate contact exempt).")
           # AFTER fusing: this pass never re-solves a SKILL witness, so a fused pair survives
           # untouched -- it only replaces the pre-* GOTO keyframes the exporter would solve.
-          mp_pre = None
+          if _loaded_export is None:
+            mp_pre = None
           # DEFAULT ON where the pin can actually bite. It cannot for `pick` or a solo
           # `place` (_ik_pick/_ik_place already restrict the scene to the acting arm, so
           # pin_applied == 0 and the pass rejects) -- that is 6/14 splits on car-mini and 16/22
@@ -2127,13 +2377,13 @@ def run(cfg):
           # Now safe to default because a REJECTED split falls back to the exporter's own solve
           # (mp_export._SOLVE_IT) instead of degrading to a zero-length funnel.
           _pin_default = (cfg.pre_insertion or 0.0) > 0.0 or (cfg.pre_add_grasp or 0.0) > 0.0
-          if cfg.fuse_pre_skill is None:
+          if _loaded_export is None and cfg.fuse_pre_skill is None:
             cfg.fuse_pre_skill = _pin_default
             if _pin_default:
               print("[sim] --fuse-pre-skill defaulted ON (a --pre-insertion/--pre-add-grasp "
                     "split is present, which is where the pin bites). Disable with "
                     "--no-fuse-pre-skill.")
-          if cfg.fuse_pre_skill:
+          if _loaded_export is None and cfg.fuse_pre_skill:
             from solver import fuse_pre_skill_witnesses
             print("[flag] --fuse-pre-skill ACTIVE: each pre-* GOTO keyframe is re-solved with "
                   "every arm that does NOT move with the skill PINNED (hard eq) to the skill "
@@ -2145,21 +2395,73 @@ def run(cfg):
             mp_pre, _prep = fuse_pre_skill_witnesses(
                 C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
                 handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing)
-          if cfg.mp_collision_tolerance != 0.01:
-            print(f"[flag] --mp-collision-tolerance={cfg.mp_collision_tolerance:g}: exported "
+          # The generic pre-skill pass knows how to pin an ordinary funnel, but the cograsp
+          # pass solves the stronger three-arm rendezvous. Its accepted keyframes therefore
+          # win for the paired assemble indices.
+          if _loaded_export is None and _cograsp_pre:
+            mp_pre = dict(mp_pre or {})
+            mp_pre.update(_cograsp_pre)
+            print(f"[cograsp-chain] using {len(_cograsp_pre)} fused add_grasp/pre-assemble "
+                  "rendezvous keyframe(s).")
+          if _export_collision_tolerance != 0.01:
+            print(f"[flag] --mp-collision-tolerance={_export_collision_tolerance:g}: exported "
                   f"problem validates configs at this total-penetration budget.")
+          if cfg.mp_seed is not None and not cfg.mp_fake_clock:
+            print(f"[flag] NOTE: --mp-seed {cfg.mp_seed}: BiRRT draws are seeded, but "
+                  f"termination uses the REAL wall clock, so runs are only approximately "
+                  f"reproducible under machine jitter. Add --mp-fake-clock for bit-exact "
+                  f"determinism.")
+          if cfg.mp_fake_clock:
+            print(f"[flag] NOTE: --mp-fake-clock ACTIVE: BiRRT swaps the wall clock for a "
+                  f"deterministic fake clock, so --mp-runtime {cfg.mp_runtime:g} is a "
+                  f"CONSULTATION budget, NOT wall seconds -- the tree phase can run much "
+                  f"longer than {cfg.mp_runtime:g} s.")
+          _resolved_pre = dict(mp_pre or {})
           prob = MP.make_problem(C, assembly, plan, mp_wit, robots, robot_ik, gk,
-                                 collision_tolerance=cfg.mp_collision_tolerance,
-                                 bracing=cfg.bracing, depgraph=not cfg.mp_sequence,
+                                 collision_tolerance=_export_collision_tolerance,
+                                 bracing=_export_bracing, depgraph=_export_depgraph,
                                  pre_witnesses=mp_pre,
-                                 robot_robot_margin=cfg.mp_robot_margin,
-                                 robot_margin_ramp=cfg.mp_margin_ramp,
-                                 table_margin=cfg.mp_table_margin,
-              table_float=cfg.part_float if cfg.mp_table_margin else 0.0,
-              witness_sets=(witness_alts if cfg.witness_sets
-                            and cfg.witness_sets >= 2 else None))
-          print(f"[motion-plan] {'SEQUENCE' if cfg.mp_sequence else 'DEPGRAPH'} problem, "
+                                 robot_robot_margin=_export_robot_margin,
+                                 robot_margin_ramp=_export_margin_ramp,
+                                 table_margin=_export_table_margin,
+                                 table_float=_export_table_float,
+                                 witness_sets=witness_alts,
+                                 resolved_pre_witnesses=_resolved_pre,
+                                 resolve_missing_pre=(_loaded_export is None),
+                                 task_records=(None if _loaded_export is None else
+                                               _loaded_export["tasks"]),
+                                 saved_step_names=(None if _loaded_export is None else
+                                                   _loaded_export["step_names"]),
+                                 saved_sequence_names=(None if _loaded_export is None else
+                                                       _loaded_export["sequence_names"]))
+          print(f"[motion-plan] {'DEPGRAPH' if _export_depgraph else 'SEQUENCE'} problem, "
                 f"{len(prob.tasks)} tasks")
+          if _loaded_export is not None:
+            _want_sig = _loaded_export.get("task_signature")
+            _have_sig = MP.task_signature(prob)
+            if _want_sig is not None and _have_sig != _want_sig:
+              raise ValueError(
+                  f"final motion export task signature changed: saved {_want_sig}, rebuilt "
+                  f"{_have_sig}; refusing to replay against different task semantics")
+          _export_settings = {
+              "bracing": bool(_export_bracing), "depgraph": bool(_export_depgraph),
+              "collision_tolerance": float(_export_collision_tolerance),
+              "robot_robot_margin": float(_export_robot_margin or 0.0),
+              "robot_margin_ramp": float(_export_margin_ramp or 0.0),
+              "table_margin": float(_export_table_margin or 0.0),
+              "table_float": float(_export_table_float or 0.0),
+              "pre_insertion": float(robot_ik.pre_insertion_delta),
+              "pre_pick": float(robot_ik.pre_pick_delta),
+              "pre_place": float(robot_ik.pre_place_delta),
+              "pre_add_grasp": float(robot_ik.pre_add_grasp_delta),
+              "post_release": float(robot_ik.post_release_delta),
+          }
+          _mp_export_bundle = MP.make_export_bundle(
+              prob, plan, list(robot_ik.C.getJointNames()), mp_wit, _resolved_pre,
+              witness_sets=witness_alts, settings=_export_settings)
+          if cfg.mp_export_save:
+            MP.save_export_bundle(cfg.mp_export_save, _mp_export_bundle)
+            print(f"[mp-export] saved final zero-IK replay artifact -> {cfg.mp_export_save}")
           if cfg.mp_clearance:
             # pass OUR per-step scene so the report can name parts that sit elsewhere here
             from solver import _replay_states as _rs, _search_context as _sc
@@ -2193,7 +2495,7 @@ def run(cfg):
               shortcut_strategy=cfg.mp_shortcut_strategy,
               shortcut_pair_checks=cfg.mp_shortcut_pair_checks,
               optimize=cfg.mp_optimize, seed=cfg.mp_seed,
-              stall_timeout=cfg.mp_stall_timeout)
+              stall_timeout=cfg.mp_stall_timeout, fake_clock=cfg.mp_fake_clock)
           if not mp_path and cfg.mp_stall_timeout is not None:
             # STRUCTURED stuck report for outer loops: name the frontier tasks (their names
             # embed the plan step), so a bandit can compute ban candidates without parsing
@@ -2209,7 +2511,8 @@ def run(cfg):
               print("[flag] --mp-cograsp ACTIVE: checking co-grasp rigidity along the path.")
               MP.report_cograsp_drift(C, prob, mp_path, robot_ik)
             if cfg.mp_save is not None:
-              MP.save_path(cfg.mp_save, mp_path, problem=prob)
+              MP.save_path(cfg.mp_save, mp_path, problem=prob,
+                           mp_export_bundle=_mp_export_bundle)
               print(f"[motion-plan] saved path -> {cfg.mp_save} (load in sim with "
                     f"`sim.py run <plan.json> --v2 --mp-path {cfg.mp_save}`)")
             if cfg.mp_viser:
@@ -2255,9 +2558,11 @@ def main(argv=None, args=None):
   # CLI / entry wrapper: build the typed RunConfig from parsed CLI args (or an override
   # namespace a caller passed) and hand it to run(). Library callers may instead build a
   # RunConfig directly and call run(cfg) -- no argparse, no namespace round-trip.
+  explicit = None
   if args is None:
     args = parse_args(argv)
-  return run(RunConfig.from_namespace(args))
+    explicit = _scan_flags(build_parser(), argv)[1]
+  return run(RunConfig.from_namespace(args), explicit=explicit)
 
 
 if __name__ == "__main__":

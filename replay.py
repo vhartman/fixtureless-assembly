@@ -6,18 +6,18 @@ plays the path back:
 
     python replay.py plan.json                 # step through in the rai viewer (blocking)
     python replay.py plan.json --viser         # scrubbable web view (viser)
-    python replay.py plan.json --real-ik       # replay with arm IK (re-solves per action)
+    python replay.py plan.json --real-ik       # replay saved arm witnesses (zero IK solves)
     python replay.py plan.json --no-view       # rebuild + validate the replay, no window
 
-A plan saved from a --real-ik run replays with IK by default; pass --real-ik to force IK on a
-geometric plan. IK replay re-runs the per-action IK (deterministic under the saved seed) --
-only the expensive SEARCH is skipped, not the IK.
+A plan saved from a --real-ik run replays with its persisted witnesses by default. Replay never
+silently resolves missing IK; ``--resolve-ik`` is the explicit one-time diagnostic escape hatch.
 """
 import argparse
 
 from assembly import *
 from env import make_four_robot_env
-from plan_io import read_plan
+from plan_io import read_plan, read_witnesses
+from config import saved_cfg as _saved
 
 
 _WRENCH_PARAMS0 = None
@@ -51,14 +51,14 @@ def apply_wrench_params(cfg):
     _WRENCH_PARAMS0 = copy.deepcopy(wrench.PARAMS)
   else:
     _restore_in_place(wrench.PARAMS, _WRENCH_PARAMS0)
-  wrench.PARAMS["grasp_model"] = cfg["grasp_model"]
-  wrench.PARAMS["check_inserter"] = cfg["inserter_check"]
-  wrench.PARAMS["insert_force"]["_default"] = cfg["insert_force"]
-  wrench.PARAMS["curved_grasp_torque_scale"] = cfg["curved_torque_scale"]
+  wrench.PARAMS["grasp_model"] = _saved(cfg, "grasp_model")
+  wrench.PARAMS["check_inserter"] = _saved(cfg, "inserter_check")
+  wrench.PARAMS["insert_force"]["_default"] = _saved(cfg, "insert_force")
+  wrench.PARAMS["curved_grasp_torque_scale"] = _saved(cfg, "curved_torque_scale")
   wrench.PARAMS["insertion_uncertainty"] = (
-      None if cfg["insertion_noise"] is None
-      else {"lateral": cfg["insertion_noise"], "offset": cfg["insertion_offset"]})
-  wrench.PARAMS["robust_mode"] = cfg.get("robust_mode", "corners")
+      None if _saved(cfg, "insertion_noise") is None
+      else {"lateral": _saved(cfg, "insertion_noise"), "offset": _saved(cfg, "insertion_offset")})
+  wrench.PARAMS["robust_mode"] = _saved(cfg, "robust_mode")
   # weightless stability -- without this a plan searched under --ignore-gravity is
   # unreproducible here (its successor set differs). .get(): older files predate the key.
   wrench.PARAMS["ignore_gravity"] = bool(cfg.get("ignore_gravity"))
@@ -89,35 +89,39 @@ def build_scene(cfg):
     ks = (ks + [ks[-1]] * cfg["num_robots"])[:cfg["num_robots"]]
     gripper_list = [k == "vacuum" for k in ks]
   any_tf = (gripper_list is not None and not all(gripper_list)) or \
-      (gripper_list is None and not cfg["vacuum"])
+      (gripper_list is None and not _saved(cfg, "vacuum"))
   set_rolls_per_face(2 if any_tf else 1)
-  set_dense_grasps(bool(cfg.get("dense_grasps")) and any_tf)
-  set_inhand_reorient(bool(cfg.get("inhand_reorient")))    # plan may contain reorient edges
+  set_dense_grasps(bool(_saved(cfg, "dense_grasps")) and any_tf)
+  set_inhand_reorient(bool(_saved(cfg, "inhand_reorient")))    # plan may contain reorient edges
   from problem import set_staged_mates, set_allow_curved_grasps, set_plain_box
-  set_staged_mates(bool(cfg.get("staged_mates")))          # staged-mate invariant, as searched
-  set_allow_curved_grasps(bool(cfg.get("allow_curved_grasps")))  # grasp table must match the search
+  set_staged_mates(bool(_saved(cfg, "staged_mates")))          # staged-mate invariant, as searched
+  set_allow_curved_grasps(bool(_saved(cfg, "allow_curved_grasps")))  # grasp table must match the search
   from problem import set_grasp_translations
-  set_grasp_translations(int(cfg.get("grasp_translations") or 0))  # grasp IDS index this DB:
+  set_grasp_translations(int(_saved(cfg, "grasp_translations")))  # grasp IDS index this DB:
   # a replay with a different count would read every saved grasp id against a different table.
   from problem import set_banned_actions
   set_banned_actions(())                                   # search-only; never active in replays
   from problem import set_sampled_grasps
-  set_sampled_grasps({"seed": int(cfg.get("grasp_sampler_seed") or 0),
-                      "candidates": int(cfg.get("grasp_sampler_candidates") or 200),
-                      "keep": int(cfg.get("grasp_sampler_keep") or 12),
+  set_sampled_grasps({"seed": int(_saved(cfg, "grasp_sampler_seed")),
+                      "candidates": int(_saved(cfg, "grasp_sampler_candidates")),
+                      "keep": int(_saved(cfg, "grasp_sampler_keep")),
                       # LEGACY-FAITHFUL: a plan saved BEFORE the edge margin existed carries
                       # no key and was built with NO margin -- reconstructing it at today's
                       # DEFAULT would rebind every saved grasp id. Missing => 0.0, not 0.008.
-                      "margin": float(cfg.get("grasp_sampler_margin") or 0.0),
-                      "pad_support": float(cfg.get("grasp_sampler_pad_support") or 0.0)}
-                     if cfg.get("grasp_sampler") else None)  # sampled ids: same hazard class
-  set_plain_box(bool(cfg.get("plain_box")))                # cube collision geometry must match
+                      "margin": float(_saved(cfg, "grasp_sampler_margin", legacy=0.0)),
+                      # pad_support's default never changed, so a missing key means today's
+                      # default (0.75) -- the historical `or 0.0` here was wrong.
+                      "pad_support": float(_saved(cfg, "grasp_sampler_pad_support"))}
+                     if _saved(cfg, "grasp_sampler") else None)  # sampled ids: same hazard class
+  set_plain_box(bool(_saved(cfg, "plain_box")))                # cube collision geometry must match
   from problem import set_stable_rest_poses
   # PLACEMENT ids index the per-group table, so a replay must fill it the same way the
   # search did. Missing key => False, which is what every plan saved before the flag used.
-  set_stable_rest_poses(bool(cfg.get("stable_rest_poses")))
+  set_stable_rest_poses(bool(_saved(cfg, "stable_rest_poses")))
   from env import set_tight_fingers
-  set_tight_fingers(bool(cfg.get("tight_fingers")))        # GRIPPER collision geometry likewise
+  # LEGACY-FAITHFUL: tight fingers became the DEFAULT on 2026-07-29, so a plan saved before
+  # the flag was persisted was certified with the FAT proxy. Missing => False, not True.
+  set_tight_fingers(bool(_saved(cfg, "tight_fingers", legacy=False)))
   # -- set unconditionally (not under an `if`): a stale global from a previous scene in the same
   # process would rebuild this one with the wrong finger proxy (FRAGILITY 1.10).
   from problem import set_dominance, set_useful_grasps_enabled
@@ -133,11 +137,11 @@ def build_scene(cfg):
   # these were persisted was solved with.
   from problem import (set_brace_for_assembly_only, set_extra_place_cells, set_prefer_center,
                        set_anonymous_robots, set_lru_robots)
-  set_brace_for_assembly_only(bool(cfg.get("brace_for_assembly_only")))
-  set_extra_place_cells(int(cfg.get("place_cells") or 0))
-  set_prefer_center(bool(cfg.get("prefer_center")))
-  set_anonymous_robots(bool(cfg.get("anon_robots")))
-  set_lru_robots(bool(cfg.get("lru_robots")))
+  set_brace_for_assembly_only(bool(_saved(cfg, "brace_for_assembly_only")))
+  set_extra_place_cells(int(_saved(cfg, "place_cells")))
+  set_prefer_center(bool(_saved(cfg, "prefer_center")))
+  set_anonymous_robots(bool(_saved(cfg, "anon_robots")))
+  set_lru_robots(bool(_saved(cfg, "lru_robots")))
   # and drop the cross-scene CACHES: they outlive a scene and are not keyed on every global
   # that feeds them, so a previous scene's entries would be served to this one.
   from problem import reset_wrench_cache, reset_grasp_pose_cache
@@ -145,22 +149,25 @@ def build_scene(cfg):
   reset_grasp_pose_cache()
   apply_wrench_params(cfg)
   C = make_four_robot_env(num_robots=cfg["num_robots"], floating_ee=cfg["floating_ee"],
-                          vacuum=gripper_list if gripper_list is not None else cfg["vacuum"],
-                          robot_types=cfg.get("robot_types") or cfg.get("robot", "ur10"))
+                          vacuum=gripper_list if gripper_list is not None else _saved(cfg, "vacuum"),
+                          robot_types=_saved(cfg, "robot_types") or _saved(cfg, "robot"))
   assembly = make_assembly(cfg["assembly"], cfg["parts"])
   # min_sep/grid/grid_gap MUST be passed too: they shape the initial scatter, so omitting them
   # rebuilt a different layout than the plan was solved in (FRAGILITY 1.8). Absent keys keep the
   # parser defaults, which is what a plan saved before they were persisted was solved with.
   C = add_disassembled_obj(C, assembly, perturb_start_pose=cfg["perturb_start_pose"],
                            spacing=cfg["scatter_spacing"],
-                           random_init=cfg.get("random_init"),
-                           float_height=cfg.get("part_float", 0.015),
-                           min_sep=cfg.get("min_sep"), grid=cfg.get("grid_init"),
-                           grid_gap=cfg.get("grid_gap", 0.1))
+                           random_init=_saved(cfg, "random_init"),
+                           # LEGACY-FAITHFUL: the historical float was 0.015; the 0.002 default
+                           # came later. Missing => 0.015, what pre-flag plans were solved with.
+                           float_height=_saved(cfg, "part_float", legacy=0.015),
+                           min_sep=_saved(cfg, "min_sep"), grid=_saved(cfg, "grid_init"),
+                           grid_gap=_saved(cfg, "grid_gap"))
   return C, assembly
 
 
-def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=True):
+def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=True,
+           resolve_ik=False):
   """Rebuild the saved scene and replay the plan. Returns the ViserRecorder (or None) so a
   headless caller can inspect the recorded steps without serving."""
   cfg, plan = read_plan(path)
@@ -168,7 +175,7 @@ def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=T
   robots = get_robots(C)
   use_ik = bool(cfg.get("real_ik")) or real_ik
   print(f"[replay] {cfg['assembly']} ({cfg['parts']} parts), {cfg['num_robots']} robots, "
-        f"{len(plan)} actions, {'IK' if use_ik else 'geometric'} replay")
+        f"{len(plan)} actions, {'persisted arm-keyframe' if use_ik else 'geometric'} replay")
   # recorder=None => the built-in BLOCKING rai viewer (the default interactive replay). For
   # --viser we record then serve; for --no-view (headless validation) we record into a
   # throwaway recorder so the replay runs without opening any window.
@@ -176,20 +183,41 @@ def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=T
   if viser or not view:
     from viser_view import ViserRecorder
     recorder = ViserRecorder()
-  brace = bool(cfg.get("bracing"))                           # match the search that made the plan
+  brace = bool(_saved(cfg, "bracing", legacy=False))         # match the search that made the plan
   if use_ik:
     rik = RobotIK(C, robots)
-    rik.pre_insertion_delta = float(cfg.get("pre_insertion") or 0.0)  # pre-skill split config (export/replay)
-    rik.pre_pick_delta = float(cfg.get("pre_pick") or 0.0)
-    rik.pre_place_delta = float(cfg.get("pre_place") or 0.0)
-    rik.pre_add_grasp_delta = float(cfg.get("pre_add_grasp") or 0.0)
-    if cfg.get("witness_robot_collisions"):                # replay IK sees the same scene
+    rik.pre_insertion_delta = float(_saved(cfg, "pre_insertion", legacy=0.0))  # pre-skill split (export/replay)
+    # These funnels now default ON for fresh runs.  A missing key in an old plan means they
+    # were OFF; silently adding split tasks would invalidate every saved task id.
+    rik.pre_pick_delta = float(_saved(cfg, "pre_pick", legacy=0.0))
+    rik.pre_place_delta = float(_saved(cfg, "pre_place", legacy=0.0))
+    rik.pre_add_grasp_delta = float(_saved(cfg, "pre_add_grasp", legacy=0.0))
+    rik.post_release_delta = float(_saved(cfg, "post_release", 0.0))
+    if _saved(cfg, "witness_robot_collisions", legacy=False):  # replay IK sees the same scene
       rik.strip_inactive_collision = False
-    if cfg.get("strict_collisions") is not None:           # same witness gate as the search
-      rik.penetration_reject = float(cfg["strict_collisions"])
+    _sc = _saved(cfg, "strict_collisions", legacy=None)      # same witness gate as the search
+    if _sc is not None:
+      rik.penetration_reject = float(_sc)
       rik.col_weight = 1e2
+    witnesses = read_witnesses(path, list(rik.C.getJointNames()), len(plan))
+    needs_ik = {"pick", "place", "stow", "assemble", "add_grasp", "handover"}
+    missing = ([] if witnesses is None else
+               [i for i, (a, w) in enumerate(zip(plan, witnesses))
+                if a[0] in needs_ik and w is None])
+    if (witnesses is None or missing) and not resolve_ik:
+      raise SystemExit(
+          "real-arm replay has no compatible persisted witness"
+          + (" block" if witnesses is None else f" for required plan step(s) {missing}")
+          + "; refusing to resolve IK implicitly. Re-save the plan with witnesses, or pass "
+            "--resolve-ik for an explicit one-time diagnostic solve.")
+    if witnesses is None or missing:
+      print("[replay] --resolve-ik explicitly requested: resolving per-action IK because the "
+            "plan has missing/incompatible persisted witnesses.")
+    else:
+      print(f"[replay] {sum(w is not None for w in witnesses)} persisted witnesses loaded; "
+            "per-action IK solving SKIPPED.")
     visualize_plan_ik(C, assembly, plan, robots=robots, robot_ik=rik,
-                      recorder=recorder, bracing=brace)
+                      recorder=recorder, bracing=brace, witnesses=witnesses)
   else:
     visualize_plan(C, assembly, plan, robots=robots, recorder=recorder, bracing=brace)
   if viser and serve:
@@ -203,8 +231,12 @@ def parse_args():
   p.add_argument("--viser", action="store_true", help="Scrubbable web view instead of the "
                  "blocking rai viewer.")
   p.add_argument("--viser-port", type=int, default=8080, help="Port for --viser (default 8080).")
-  p.add_argument("--real-ik", action="store_true", help="Replay with arm IK (re-runs per-action "
-                 "IK; a plan saved from --real-ik already replays with IK).")
+  p.add_argument("--real-ik", action="store_true", help="Replay real-arm keyframes (a plan "
+                 "saved from --real-ik already enables this). Persisted witnesses are required "
+                 "and no IK is solved unless --resolve-ik is also passed.")
+  p.add_argument("--resolve-ik", action="store_true",
+                 help="Explicitly allow per-action IK solving when no persisted witnesses are "
+                      "available. Replay otherwise fails instead of silently re-solving.")
   p.add_argument("--no-view", dest="view", action="store_false",
                  help="Rebuild + run the replay without opening a window (validation only).")
   return p.parse_args()
@@ -212,4 +244,5 @@ def parse_args():
 
 if __name__ == "__main__":
   a = parse_args()
-  replay(a.path, viser=a.viser, view=a.view, real_ik=a.real_ik, viser_port=a.viser_port)
+  replay(a.path, viser=a.viser, view=a.view, real_ik=a.real_ik,
+         viser_port=a.viser_port, resolve_ik=a.resolve_ik)

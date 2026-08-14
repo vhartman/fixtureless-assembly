@@ -78,6 +78,8 @@ import numpy as np
 from math import sqrt as _sqrt
 import arm_model
 
+from config import saved_cfg as _saved
+
 import retiming                                              # portable path->trajectory retiming
 
 try:
@@ -110,6 +112,7 @@ CARRY_LIFT = 0.12               # m   : held parts are carried this high above t
                                 # symbolic); without it a mate onto a HELD target jams into
                                 # the table (measured: 21.8N > 15N cap on cross-3 rollout 2).
 RECORD_EVERY = 8                # frames: sample qpos+grasp forces every N sim steps (~62fps)
+PATH_PREFLIGHT_TOL = 1e-4       # m: strict MP contract; above RAI's ~micrometre collision noise
 BREAK_SUSTAIN = 0.02            # s : a grasp breaks only if overloaded CONTINUOUSLY this long.
                                 # Instantaneous 2ms contact-impulse spikes (measured 15.6N on
                                 # a carried group, invisible at recording resolution) are
@@ -119,6 +122,12 @@ BREAK_SUSTAIN = 0.02            # s : a grasp breaks only if overloaded CONTINUO
 WELD_TIMECONST = 0.004          # s   : solref timeconst of the grasp/mate welds (stiff: with
                                 # MuJoCo's soft default the mocap-anchored weld SAGS mm-scale
                                 # under carry loads -- measured 7-8mm, enough to miss a seat).
+
+
+class PathPreflightError(RuntimeError):
+  """A saved motion path violates an invariant retiming cannot repair."""
+
+
 KINK_TAU = 2.0 * WELD_TIMECONST # s   : time the grasp interface takes to absorb a VELOCITY
                                 # STEP (a C0 path corner), i.e. peak |F| = m|dv|/KINK_TAU.
                                 # MEASURED on car-mini: a 1.24 m/s step on a 0.30kg group
@@ -290,8 +299,11 @@ def _compound_geoms_xml(spec, mu, mass, group, rgba):
     sq = sub[2] if len(sub) > 2 else None
     gq = ' quat="1 0 0 0"' if sq is None else f' quat="{sq[0]} {sq[1]} {sq[2]} {sq[3]}"'
     gp = f' pos="{pos[0]} {pos[1]} {pos[2]}"'
-    out.append(_geom_xml(sub, mu).replace(
-        "mass_placeholder", f'mass="{mass * w}" group="{group}" rgba="{rgba}"{gq}{gp}'))
+    out.append(_geom_xml(sub, mu)
+               .replace("mass_placeholder",
+                        f'mass="{mass * w}" group="{group}" rgba="{rgba}"{gq}{gp}')
+               .replace("vis_placeholder",
+                        f'group="{group}" rgba="{rgba}"{gq}{gp}'))
   return "".join(out)
 
 
@@ -305,6 +317,8 @@ def _geom_xml(spec, mu):
   if kind == "box":
     return f'<geom type="box" size="{p[0]/2} {p[1]/2} {p[2]/2}" {fr} mass_placeholder/>'
   if kind == "cylinder":
+    # MuJoCo cylinder size is [radius, half-length]. The geom quaternion added by
+    # build_mjcf carries the shape-local cylinder axis into the part frame.
     return f'<geom type="cylinder" size="{p[1]} {p[0]/2}" {fr} mass_placeholder/>'
   if kind == "sphere":
     return f'<geom type="sphere" size="{p[0]}" {fr} mass_placeholder/>'
@@ -708,7 +722,9 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
     else:
       g = _geom_xml(spec, mu_table).replace(
           "mass_placeholder",
-          f'mass="{mass}" group="{GROUP_PART}" rgba="{palette[i % len(palette)]}"{gq}')
+          f'mass="{mass}" group="{GROUP_PART}" rgba="{palette[i % len(palette)]}"{gq}').replace(
+          "vis_placeholder",
+          f'group="{GROUP_PART}" rgba="{palette[i % len(palette)]}"{gq}')
     parts_xml.append(
         f'<body name="{p}" pos="{pose[0]} {pose[1]} {pose[2]}" '
         f'quat="{q[0]} {q[1]} {q[2]} {q[3]}"><freejoint/>{g}</body>')
@@ -803,7 +819,13 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
        is what threw the actuated arm (32 rad/s) and what zeroed the grasp weld's force in the
        kinematic mode. Body poses are quaternions, so only ranges were affected. -->
   <compiler angle="radian"/>
-  <option timestep="{DT}" integrator="implicitfast"/>
+  <!-- A flat native cylinder against a box otherwise gets only one contact in MuJoCo and
+       slowly sinks through the table (the car-mini wheel rim ended up 13mm below the top).
+       multiccd asks the convex collider for the full contact patch: the wheel stays a single
+       cylinder for both collision and rendering, with no hidden box proxy. -->
+  <option timestep="{DT}" integrator="implicitfast">
+    <flag multiccd="enable"/>
+  </option>
   <asset>
     <texture name="grid" type="2d" builtin="checker" rgb1="0.2 0.25 0.3"
              rgb2="0.25 0.3 0.35" width="512" height="512"/>
@@ -1653,7 +1675,7 @@ class SimExecutor:
       exp = self._expected_pose(states[-1], p)
       report.final_pose_err[p] = (
           float(np.linalg.norm(self.scene.part_pose(p)[:3] - exp[:3])),
-          _quat_angle(self.scene.part_pose(p)[3:], exp[3:]))
+          _part_orientation_error(self.assembly, p, self.scene.part_pose(p)[3:], exp[3:]))
     if rec is not None:
       _save_recording(record, self.scene, rec, report)
     return report
@@ -1691,7 +1713,7 @@ class SimExecutor:
         if float(np.linalg.norm(got[:2] - exp[:2])) > SLIDE_TOL:
           return ActionResult(action, False, "slid",
                               f"{p} {float(np.linalg.norm(got[:2]-exp[:2]))*1000:.0f}mm")
-        if _quat_angle(got[3:], exp[3:]) > TOPPLE_ANG:
+        if _part_orientation_error(a, p, got[3:], exp[3:]) > TOPPLE_ANG:
           return ActionResult(action, False, "toppled", p)
     if action[0] == "assemble" and not self._seated(action[2]):
       return ActionResult(action, False, "not_seated", action[2])
@@ -1722,6 +1744,27 @@ def _quat_angle(q1, q2):
   d = abs(float(np.dot(np.asarray(q1) / np.linalg.norm(q1),
                        np.asarray(q2) / np.linalg.norm(q2))))
   return 2.0 * np.arccos(min(1.0, d))
+
+
+def _part_orientation_error(assembly, part, q1, q2):
+  """Physical orientation error modulo a primitive's continuous symmetries.
+
+  A round loose peg can roll on the table without toppling: rotation about a cylinder's
+  local z axis changes its quaternion but not its geometry.  Comparing raw quaternions made
+  the v1 judge stop a peg-stool replay after an innocuous 4.9mm roll (the cylinder axis had
+  moved only 0.00019deg).  Spheres have no observable orientation; boxes, compounds and
+  meshes retain the ordinary full-quaternion comparison.  The absolute cylinder-axis dot
+  also accounts for its identical end caps.
+  """
+  kind = assembly.part_shape(part)[0]
+  if kind == "sphere":
+    return 0.0
+  if kind == "cylinder":
+    a1 = _quat_to_R(np.asarray(q1, dtype=float))[:, 2]
+    a2 = _quat_to_R(np.asarray(q2, dtype=float))[:, 2]
+    d = abs(float(np.dot(a1, a2)))
+    return float(np.arccos(np.clip(d, -1.0, 1.0)))
+  return _quat_angle(q1, q2)
 
 
 def _rel_pos(pose_a, pose_b):
@@ -2221,6 +2264,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         spline=False, spline_per_seg=8, spline_tension=0.5,
                         articulated=False, actuated=False, use_planner_table=False,
                         corridor_margin=0.0, weld_timeconst=None, limit_rate=False,
+                        path_preflight=True, path_preflight_tolerance=PATH_PREFLIGHT_TOL,
+                        path_preflight_resolution=None,
                         skill_servo=False, servo_force=6.0, servo_max_dev=0.010,
                         servo_tol=0.002, servo_torque_guard=None,
                         servo_place_seat=False, compliant_follow=False,
@@ -2550,10 +2595,11 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             f"welded, gripper released; expect downstream failures.")
     else:
       scene.attach(parent, child)
-    # map to the plan action (for the taxonomy label + expected-state judge), if this task is
-    # the FINAL task of an action (pre-insertion gotos have no frames and never reach here).
+    # Every framed task is the physical side effect of its plan action. Usually that is the
+    # final split task; --post-release deliberately appends a frame-less departure AFTER the
+    # detach, so requiring `is-final` here would lose the release result entirely.
     lbl = name_of.get(t.name)
-    act = tuple(plan[lbl[0]]) if (lbl and lbl[1]) else ("attach", parent, child)
+    act = tuple(plan[lbl[0]]) if lbl else ("attach", parent, child)
     if _trace:
       pp = scene.part_pose(child)[:3]
       pj = scene.part_pose(parent)[:3] if parent in assembly.objects else (
@@ -2566,7 +2612,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       rec["marks"].append((len(rec["qpos"]), repr(act)))
     if seat_miss is not None:
       report.results.append(ActionResult(act, False, "not_seated", f"{seat_miss*1000:.1f}mm"))
-    elif lbl and lbl[1]:
+    elif lbl:
       report.results.append(_judge_resting(scene, assembly, act, states[lbl[0] + 1]))
 
   if verbose:
@@ -2598,6 +2644,100 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         f"({', '.join(problem.tasks[t].name for t in _unfired)}) complete at NO stretch "
         f"boundary -- their attach events would never fire. The path is missing their modes "
         f"and repair could not restore them; re-export the path for this plan.")
+
+  # A shortcut path stores every collision-check interpolation sample. They certify the edge,
+  # but they are not geometric knots: feeding all of them to Catmull-Rom multiplies spline
+  # certification work and makes the simulator depend on serialization density. Compact each
+  # MODE independently, so every task boundary and its exact witness remain pinned.
+  stretches, _compact = retiming.compact_stretches(stretches)
+  if _compact["removed"]:
+    _drift = abs(_compact["arc_after"] - _compact["arc_before"])
+    print(f"[sim/mp] path compaction: {_compact['before']} stretch waypoint(s) -> "
+          f"{_compact['after']} ({_compact['removed']} redundant interpolation samples "
+          f"removed); arc {_compact['arc_after']:.2f} rad, change {_drift:.2e}. "
+          f"Mode barriers and witness configurations preserved exactly.")
+
+  # ALIGNMENT BY MODE IDENTITY: the saved path's lightweight modes carry task_ids only, so
+  # match each per-stretch path mode to the rebuilt chain mode with the SAME active-task set
+  # (unique in a sequence problem -- progression is monotone). This is needed by both the
+  # strict base-path preflight and corridor construction.
+  stretch_mode = None
+  _conf = None
+  if corridor:
+    import mp_export as _MP
+    chain = _MP.mode_sequence(problem)
+    _ids = lambda m: frozenset(int(t) for t in np.atleast_1d(m.task_ids))
+    chain_by_ids = {_ids(m): m for m in chain}
+    path_mode_ids, pm = [], mp_path[0].mode
+    for st in mp_path:
+      if st.mode != pm or not path_mode_ids:
+        pm = st.mode
+        path_mode_ids.append(_ids(pm))
+    missing = [i for i in path_mode_ids if i not in chain_by_ids]
+    if len(path_mode_ids) != len(stretches) or missing:
+      raise RuntimeError(f"[sim/mp] mode alignment failed: {len(path_mode_ids)} path modes vs "
+                         f"{len(stretches)} stretches, {len(missing)} unmatched in the rebuilt "
+                         f"{len(chain)}-mode chain -- saved path and rebuilt problem disagree; "
+                         f"re-export with matching flags.")
+    stretch_mode = [chain_by_ids[i] for i in path_mode_ids]
+    conf_type = type(problem.get_start_pos())
+    def _conf(fq):
+      return conf_type.from_list([np.asarray(fq)[ridx[r]] for r in robots])
+
+    # STRICT BASE-PATH PREFLIGHT. Retiming can only change WHEN a configuration is visited; it
+    # cannot repair a collision or an out-of-range joint already present on the diagonal. Do
+    # this before spline/corridor work so a relaxed planner path fails in seconds with the
+    # concrete mode/edge/pair instead of spending minutes in futile corridor refinement.
+    if path_preflight:
+      _ptol = float(path_preflight_tolerance)
+      _pres = (float(path_preflight_resolution) if path_preflight_resolution is not None else
+               float(getattr(problem, "collision_resolution", 0.01)))
+
+      def _strict_free(fq, mode):
+        ok = bool(problem.is_collision_free(
+            _conf(fq), mode, collision_tolerance=_ptol))
+        if ok:
+          return True, None
+        try:
+          pen = float(problem.C.getCollisionsTotalPenetration())
+          pairs = sorted(
+              [(str(c[0]), str(c[1]), float(c[2]))
+               for c in problem.C.getCollisions(0.0) if float(c[2]) < 0.0],
+              key=lambda x: x[2])[:5]
+        except Exception:
+          pen, pairs = float("nan"), []
+        return False, {"penetration": pen, "pairs": pairs}
+
+      _limits = getattr(problem, "limits", None)
+      if _limits is None:
+        _limits = C_fk.getJointLimits()
+      _audit = retiming.audit_path(
+          stretches, stretch_mode, _strict_free, limits=_limits, resolution=_pres)
+      if not _audit["ok"]:
+        _mids = sorted(_ids(stretch_mode[_audit["stretch"]]))
+        _where = (f"stretch {_audit['stretch']} mode task_ids={_mids}, "
+                  f"edge {_audit['edge']} at {_audit['alpha']:.3f}")
+        if _audit["kind"] == "joint_limits":
+          rows = []
+          for j, lo, hi in zip(_audit["joint_indices"], _audit["lower"], _audit["upper"]):
+            nm = jnames[j] if j < len(jnames) else f"joint[{j}]"
+            rows.append(f"{nm}={_audit['q'][j]:.6g} outside [{lo:.6g},{hi:.6g}]")
+          raise PathPreflightError(
+              f"[sim/mp] strict base-path preflight FAILED at {_where}: joint limit "
+              f"violation(s): {'; '.join(rows)}. Spline/corridor construction was not "
+              f"started; regenerate the motion path.")
+        detail = _audit.get("detail") or {}
+        pairs = detail.get("pairs") or []
+        pair_msg = (", ".join(f"{a}~{b} {-d*1000:.2f}mm" for a, b, d in pairs)
+                    if pairs else "no concrete penetrating pair reported")
+        raise PathPreflightError(
+            f"[sim/mp] strict base-path preflight FAILED at {_where}: total penetration "
+            f"{detail.get('penetration', float('nan'))*1000:.3f}mm exceeds "
+            f"{_ptol*1000:.3f}mm; {pair_msg}. Checked {_audit['samples']} sample(s) at "
+            f"{_pres:g}rad resolution. Spline/corridor construction was not started; "
+            f"re-plan this edge instead of retiming or relaxing it.")
+      print(f"[sim/mp] strict base-path preflight: {_audit['samples']} sample(s) at "
+            f"{_pres:g}rad resolution, collision tolerance {_ptol:g}, joint limits OK.")
 
   arm_dims = [np.asarray(ridx[r], int) for r in robots]
   # --arm-rate: JOINT_RATE is nominally a PER-ARM joint speed, but it is applied to the
@@ -2673,31 +2813,6 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     # attachments are a function of events fired, not arm positions, so mode_sequence[fired]
     # is the exact world state. A crossing arm whose next step would collide (e.g. sweep a
     # region where a part still sits, or another arm's lane) HOLDS until the world clears.
-    import mp_export as _MP
-    chain = _MP.mode_sequence(problem)
-    # ALIGNMENT BY MODE IDENTITY: the saved path's lightweight modes carry task_ids only, so
-    # match each per-stretch path mode to the rebuilt chain mode with the SAME active-task set
-    # (unique in a sequence problem -- progression is monotone). The path may collapse chain
-    # transitions that share a config (invisible goto completions), so counting fired tasks
-    # under-counts; the task_ids set is the unambiguous key. World state after `fired`
-    # barriers = the mode stretch `fired` executes under.
-    _ids = lambda m: frozenset(int(t) for t in np.atleast_1d(m.task_ids))
-    chain_by_ids = {_ids(m): m for m in chain}
-    path_mode_ids, pm = [], mp_path[0].mode
-    for st in mp_path:
-      if st.mode != pm or not path_mode_ids:
-        pm = st.mode
-        path_mode_ids.append(_ids(pm))
-    missing = [i for i in path_mode_ids if i not in chain_by_ids]
-    if len(path_mode_ids) != len(stretches) or missing:
-      raise RuntimeError(f"[sim/mp] mode alignment failed: {len(path_mode_ids)} path modes vs "
-                         f"{len(stretches)} stretches, {len(missing)} unmatched in the rebuilt "
-                         f"{len(chain)}-mode chain -- saved path and rebuilt problem disagree; "
-                         f"re-export with matching flags.")
-    stretch_mode = [chain_by_ids[i] for i in path_mode_ids]  # mode in force during stretch k
-    conf_type = type(problem.get_start_pos())
-    def _conf(fq):
-      return conf_type.from_list([np.asarray(fq)[ridx[r]] for r in robots])
     def _pair_pens(qc, m):                                   # (planner ok?, {pair: depth>0})
       # `depth` is measured against the MARGIN, not against contact: depth = margin - gap, so a
       # pair merely CLOSER than the margin already scores > 0 and a penetrating one scores
@@ -3630,7 +3745,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     exp = np.asarray(_state_part_poses(states[-1], assembly, lift=CARRY_LIFT)[p], dtype=float)
     report.final_pose_err[p] = (
         float(np.linalg.norm(scene.part_pose(p)[:3] - exp[:3])),
-        _quat_angle(scene.part_pose(p)[3:], exp[3:]))
+        _part_orientation_error(assembly, p, scene.part_pose(p)[3:], exp[3:]))
   if scene.mate_caps is not None and scene._mate_max:
     # per-mate load maxima -- this is the calibration readout: caps must sit ABOVE every
     # value seen in a normal run and BELOW the load of an abusive hold (car by one wheel).
@@ -3660,7 +3775,7 @@ def _judge_resting(scene, assembly, action, expect_state):
       if float(np.linalg.norm(got[:2] - exp[:2])) > SLIDE_TOL:
         return ActionResult(action, False, "slid",
                             f"{p} {float(np.linalg.norm(got[:2]-exp[:2]))*1000:.0f}mm")
-      if _quat_angle(got[3:], exp[3:]) > TOPPLE_ANG:
+      if _part_orientation_error(assembly, p, got[3:], exp[3:]) > TOPPLE_ANG:
         return ActionResult(action, False, "toppled", p)
   return ActionResult(action, True)
 
@@ -3804,7 +3919,7 @@ def _gripper_kinds_from_cfg(cfg, robots):
   if ks:                                                    # mixed EEs (--grippers CSV)
     ks = (ks + [ks[-1]] * len(robots))[:len(robots)]
     return {r: ks[i] for i, r in enumerate(robots)}
-  return {r: ("vacuum" if cfg.get("vacuum") else "two_finger") for r in robots}
+  return {r: ("vacuum" if _saved(cfg, "vacuum") else "two_finger") for r in robots}
 
 
 def _states_from_plan(cfg, C, asm, robots, plan):
@@ -3815,8 +3930,8 @@ def _states_from_plan(cfg, C, asm, robots, plan):
   # MIXED-EE aware: gripper_kind(C) says "vacuum" whenever ANY vacuum frame exists, which
   # prices every arm's grasps with vacuum caps on a mixed scene -- the successor set then
   # cannot reproduce two-finger actions (user-hit on the chair: "cannot reproduce action 2").
-  gk = A.wrench_kind_arg(C, robots) if cfg.get("wrench") else None
-  brace = bool(cfg.get("bracing"))
+  gk = A.wrench_kind_arg(C, robots) if _saved(cfg, "wrench") else None
+  brace = bool(_saved(cfg, "bracing", legacy=False))
   _, gt = A._search_context(C, asm, robots)
   states = [A.get_initial_state(C, asm)]
   for i, act in enumerate(plan):
@@ -3897,55 +4012,96 @@ def _cli_run(a):
     # and mp_export silently substituted the arm's PREVIOUS config, so the part was never
     # carried anywhere (measured on car-mini: obj_0's two reorienting places became 0.07deg
     # no-ops, the base stayed flat, and every wheel then missed its mate by ~70mm).
-    _seed = cfg.get("ik_seeding")
-    rik.ik_seeding = True if _seed is None else bool(_seed)
+    rik.ik_seeding = bool(_saved(cfg, "ik_seeding"))
     # VERBATIM from the saved config -- 0.0 means NO pre-insertion split. (A silent `or 0.05`
     # default here rebuilt the problem WITH split tasks while the saved path used unsplit
     # task ids -> every attach after the first assemble fired at the wrong task; user-hit.)
-    rik.pre_insertion_delta = float(cfg.get("pre_insertion") or 0.0)
-    # ...and the OTHER three splits, for the same reason: each one ADDS a task, so a rebuild
+    rik.pre_insertion_delta = float(_saved(cfg, "pre_insertion", legacy=0.0))
+    # ...and the OTHER four splits, for the same reason: each one ADDS a task, so a rebuild
     # that misses them produces a shorter task list than the saved --mp-path was planned
     # against, and the path indexes tasks by integer id (the signature guard below catches it,
     # but only if we even try). pre_insertion alone was restored here.
-    rik.pre_pick_delta = float(cfg.get("pre_pick") or 0.0)
-    rik.pre_place_delta = float(cfg.get("pre_place") or 0.0)
-    rik.pre_add_grasp_delta = float(cfg.get("pre_add_grasp") or 0.0)
+    rik.pre_pick_delta = float(_saved(cfg, "pre_pick", legacy=0.0))
+    rik.pre_place_delta = float(_saved(cfg, "pre_place", legacy=0.0))
+    rik.pre_add_grasp_delta = float(_saved(cfg, "pre_add_grasp", legacy=0.0))
+    rik.post_release_delta = float(_saved(cfg, "post_release", 0.0))
     # ...and the eq WEIGHTS, which decide how exactly a mate/place lands. Both were saved but
     # never restored here, so the sim re-solved every witness at the default 1e1 and got
-    # different keyframes than the export it is supposed to be replaying.
-    if cfg.get("mate_eq_weight") is not None:
-      rik.mate_eq_weight = float(cfg["mate_eq_weight"])
-    if cfg.get("place_eq_weight") is not None:
-      rik.place_eq_weight = float(cfg["place_eq_weight"])
-    if cfg.get("mate_accuracy") is not None:
-      rik.mate_residual_reject = float(cfg["mate_accuracy"])
-    if cfg.get("grasp_accuracy") is not None:
-      rik.grasp_pose_reject = float(cfg["grasp_accuracy"])
-    if cfg.get("grasp_eq_weight") is not None:
-      rik.grasp_eq_weight = float(cfg["grasp_eq_weight"])
-    if cfg.get("ik_accuracy") is not None:
-      rik.nlp_stop_tolerance = float(cfg["ik_accuracy"])
-    if cfg.get("witness_margin") is not None:
-      rik.clearance_reject = float(cfg["witness_margin"])   # robust-keyframe gate, as exported
-    if cfg.get("witness_robot_collisions"):
+    # different keyframes than the export it is supposed to be replaying. (LEGACY None: the
+    # 1e2 defaults came later; pre-flag plans were solved at rai's 1e1 = flag off.)
+    _mew = _saved(cfg, "mate_eq_weight", legacy=None)
+    if _mew is not None:
+      rik.mate_eq_weight = float(_mew)
+    _pew = _saved(cfg, "place_eq_weight", legacy=None)
+    if _pew is not None:
+      rik.place_eq_weight = float(_pew)
+    _ma = _saved(cfg, "mate_accuracy")
+    if _ma is not None:
+      rik.mate_residual_reject = float(_ma)
+    _ga = _saved(cfg, "grasp_accuracy")
+    if _ga is not None:
+      rik.grasp_pose_reject = float(_ga)
+    _gew = _saved(cfg, "grasp_eq_weight")
+    if _gew is not None:
+      rik.grasp_eq_weight = float(_gew)
+    _ika = _saved(cfg, "ik_accuracy")
+    if _ika is not None:
+      rik.nlp_stop_tolerance = float(_ika)
+    _wm = _saved(cfg, "witness_margin")
+    if _wm is not None:
+      rik.clearance_reject = float(_wm)   # robust-keyframe gate, as exported
+    if _saved(cfg, "witness_robot_collisions", legacy=False):
       rik.strip_inactive_collision = False
-    if cfg.get("strict_collisions") is not None:
+    _sc = _saved(cfg, "strict_collisions", legacy=None)
+    if _sc is not None:
       rik.strip_inactive_collision = False
-      rik.penetration_reject = float(cfg["strict_collisions"])
+      rik.penetration_reject = float(_sc)
       rik.col_weight = 1e2
     # successor flags MUST match the search that produced the plan, or the state re-derivation
     # inside optimize_witnesses can't reproduce an action (e.g. car-mini's add_grasp needs
     # bracing=True). bracing is saved; handovers/allow_place aren't (they default True).
-    brace = bool(cfg.get("bracing"))
-    _hand = cfg.get("handovers"); _hand = True if _hand is None else bool(_hand)
-    _aplace = cfg.get("allow_place"); _aplace = True if _aplace is None else bool(_aplace)
+    brace = bool(_saved(cfg, "bracing", legacy=False))
+    _hand = bool(_saved(cfg, "handovers"))
+    _aplace = bool(_saved(cfg, "allow_place"))
+    _saved_mp_path = None
+    _final_export = None
+    if a.mp_path:
+      _saved_mp_path = MP.load_path(a.mp_path)
+      try:
+        _final_export = MP.load_export_bundle(
+            a.mp_path, plan, list(rik.C.getJointNames()), required=False)
+      except ValueError as e:
+        print(f"[sim/mp] invalid final export: {e}")
+        return
+      if _final_export is None and not getattr(a, "refresh_witnesses", False):
+        print("[sim/mp] saved motion path has no final post-fusion export block. Refusing to "
+              "re-solve IK during replay. Re-export the path with current --mp-save, or pass "
+              "--refresh-witnesses to explicitly authorize the legacy rebuild.")
+        return
+      if _final_export is not None and getattr(a, "refresh_witnesses", False):
+        print("[sim/mp] --refresh-witnesses explicitly requested: ignoring the embedded final "
+              "export and running the legacy witness/pre-skill rebuild.")
+        _final_export = None
+      if _final_export is not None:
+        _es = _final_export["settings"]
+        rik.pre_insertion_delta = float(_es.get("pre_insertion", rik.pre_insertion_delta))
+        rik.pre_pick_delta = float(_es.get("pre_pick", rik.pre_pick_delta))
+        rik.pre_place_delta = float(_es.get("pre_place", rik.pre_place_delta))
+        rik.pre_add_grasp_delta = float(
+            _es.get("pre_add_grasp", rik.pre_add_grasp_delta))
+        rik.post_release_delta = float(
+            _es.get("post_release", rik.post_release_delta))
+        brace = bool(_es.get("bracing", brace))
+        print(f"[sim/mp] final post-fusion export embedded in {a.mp_path}: "
+              f"{sum(w is not None for w in _final_export['witnesses'])} skill and "
+              f"{len(_final_export['pre_witnesses'])} pre-skill keyframes; IK solves: 0.")
     # WITNESS PERSISTENCE: the plan file may carry the export-time optimized keyframes
     # (main.py --save writes them since 2026-07-29). The sim restores every witness-shaping
     # setting from the SAME file's config block, so a present block is by construction the
     # set this rebuild would try to reproduce -- reusing it removes both the re-solve time
     # and the last source of witness drift between the export and the sim.
-    wit = None
-    if not getattr(a, "refresh_witnesses", False):
+    wit = _final_export["witnesses"] if _final_export is not None else None
+    if wit is None and not getattr(a, "refresh_witnesses", False):
       from plan_io import read_witnesses
       wit = read_witnesses(a.path, list(rik.C.getJointNames()), len(plan))
       if wit is not None:
@@ -3961,21 +4117,21 @@ def _cli_run(a):
       from witness_floor import optimize_witnesses_floor
       wit, _ = optimize_witnesses_floor(
           C, asm, plan, robots, rik, gripper_kind=gk, handovers=_hand, allow_place=_aplace,
-          bracing=brace, branch_budget=cfg.get("witness_branch_budget"),
-          branch_metric=cfg.get("witness_branch_metric"),
-          reconfig_thresh=cfg.get("witness_reconfig_thresh"),
-          draw_seed=cfg.get("witness_draw"))
+          bracing=brace, branch_budget=_saved(cfg, "witness_branch_budget"),
+          branch_metric=_saved(cfg, "witness_branch_metric"),
+          reconfig_thresh=_saved(cfg, "witness_reconfig_thresh"),
+          draw_seed=_saved(cfg, "witness_draw"))
     elif _witopt:
       wit, _ = optimize_witnesses(C, asm, plan, robots, rik, cost=_witopt,
                                   gripper_kind=gk, handovers=_hand, allow_place=_aplace,
-                                  bracing=brace, clear_weight=cfg.get("witness_clearance") or 0.0,
-                                  robot_collisions=bool(cfg.get("witness_robot_collisions")),
+                                  bracing=brace, clear_weight=float(_saved(cfg, "witness_clearance")),
+                                  robot_collisions=bool(_saved(cfg, "witness_robot_collisions", legacy=False)),
                                   verbose=False)
     else:
       wit, _ = optimize_witnesses(C, asm, plan, robots, rik, cost="ee", sweeps=0,
                                   gripper_kind=gk, bracing=brace, handovers=_hand,
                                   allow_place=_aplace,
-                                  robot_collisions=bool(cfg.get("witness_robot_collisions")),
+                                  robot_collisions=bool(_saved(cfg, "witness_robot_collisions", legacy=False)),
                                   verbose=False)
     # depgraph=False is DELIBERATE and must stay: execute_motion_plan consumes a SEQUENCE-style
     # mode chain (one stretch per mode, in order). Rebuilding main's depgraph problem here to
@@ -3987,15 +4143,28 @@ def _cli_run(a):
     # are owned by kinematic root), so the margin covers part-vs-OTHER-ARM -- while a RESTING
     # part is owned by nobody and keeps zero clearance to the table, which a place needs.
     # sim's internal planning never passed this, so --mp-robot-margin was inert on this route.
-    prob = MP.make_problem(C, asm, plan, wit, robots, rik, gk, bracing=brace,
-                           depgraph=False, collision_tolerance=a.mp_tolerance,
-                           robot_robot_margin=float(cfg.get("mp_robot_margin") or 0.0),
-                           robot_margin_ramp=float(cfg.get("mp_margin_ramp") or 0.0),
-                           table_margin=float(cfg.get("mp_table_margin") or 0.0),
-                           table_float=(float(cfg.get("part_float") or 0.0)
-                                        if cfg.get("mp_table_margin") else 0.0))
+    _es = _final_export["settings"] if _final_export is not None else {}
+    prob = MP.make_problem(
+        C, asm, plan, wit, robots, rik, gk, bracing=brace,
+        depgraph=bool(_es.get("depgraph", False)),
+        collision_tolerance=float(_es.get("collision_tolerance", a.mp_tolerance)),
+        pre_witnesses=(_final_export["pre_witnesses"] if _final_export is not None else None),
+        robot_robot_margin=float(_es.get(
+            "robot_robot_margin", _saved(cfg, "mp_robot_margin", legacy=0.0))),
+        robot_margin_ramp=float(_es.get(
+            "robot_margin_ramp", _saved(cfg, "mp_margin_ramp", legacy=0.0))),
+        table_margin=float(_es.get("table_margin", _saved(cfg, "mp_table_margin"))),
+        table_float=float(_es.get(
+            "table_float", (float(_saved(cfg, "part_float", legacy=0.015))
+                            if _saved(cfg, "mp_table_margin") else 0.0))),
+        witness_sets=(_final_export["witness_sets"] if _final_export is not None else None),
+        resolve_missing_pre=(_final_export is None),
+        task_records=(None if _final_export is None else _final_export["tasks"]),
+        saved_step_names=(None if _final_export is None else _final_export["step_names"]),
+        saved_sequence_names=(None if _final_export is None else
+                              _final_export["sequence_names"]))
     if a.mp_path:                                          # load a saved BiRRT path -> no re-plan
-      path = MP.load_path(a.mp_path)
+      path = _saved_mp_path
       print(f"[sim] loaded motion path ({len(path)} states) from {a.mp_path} -- skipping BiRRT")
       # ALIGNMENT GUARD: the path's mode task-ids index MAIN's task list; the rebuilt problem
       # must have the identical task structure or every attach fires at the wrong time.
@@ -4029,7 +4198,8 @@ def _cli_run(a):
       # seed precedence: sim CLI > the seed the plan was SOLVED/exported with > unseeded.
       _mseed = a.mp_seed if a.mp_seed is not None else cfg.get("mp_seed")
       path, _ = MP.run_birrt(prob, runtime=a.mp_runtime, verbose=a.verbose, seed=_mseed,
-                             optimize=a.mp_optimize)
+                             optimize=a.mp_optimize,
+                             fake_clock=bool(_saved(cfg, "mp_fake_clock")))
     if not path:
       print("[sim] motion planner found no path.")
       return
@@ -4069,7 +4239,13 @@ def _cli_run(a):
                               use_planner_table=getattr(a, 'planner_table', False),
                               corridor_margin=getattr(a, 'corridor_margin', 0.0),
                               weld_timeconst=getattr(a, 'weld_timeconst', 0.0),
-                              limit_rate=getattr(a, 'limit_rate', False))
+                              limit_rate=getattr(a, 'limit_rate', False),
+                              path_preflight=a.path_preflight,
+                              path_preflight_tolerance=(
+                                  a.path_preflight_tolerance
+                                  if a.path_preflight_tolerance is not None else
+                                  PATH_PREFLIGHT_TOL),
+                              path_preflight_resolution=a.path_preflight_resolution)
   else:
     rep = SimExecutor(asm, gripper_kinds=gripper_kinds, gui=a.gui).execute(
         plan, states, record=a.record)
@@ -4088,8 +4264,8 @@ def _build_cli():
   r = sub.add_parser("run", help="execute a saved plan (main.py --save) in physics")
   r.add_argument("path", help="plan JSON written by `main.py ... --save plan.json`")
   r.add_argument("--v2", action=argparse.BooleanOptionalAction, default=True,
-                 help="REAL-ARM motion-plan execution: rebuild witnesses + run mr_bench BiRRT "
-                      "for the SAVED discrete plan, then FK-synced arms follow the path in "
+                 help="REAL-ARM motion-plan execution: load the saved final MP export/path (or "
+                      "build them for a fresh plan), then FK-synced arms follow the path in "
                       "sim. Needs a plan saved from a --real-ik (non-floating) run. Default "
                       "ON since 2026-07-29; --no-v2 executes the plan with floating-gripper "
                       "keyframes (v1).")
@@ -4382,10 +4558,23 @@ def _build_cli():
                       "Applied before witnesses/problem/sim so IK, the oracle and the MuJoCo "
                       "capsules agree. Default 1.0 = untouched. Not for validation runs: "
                       "clearances no longer match the planner's certified geometry.")
+  r.add_argument("--path-preflight", action=argparse.BooleanOptionalAction, default=True,
+                 help="Before spline/corridor construction, densely check the SAVED diagonal "
+                      "path against strict collision and joint limits. Default ON: retiming "
+                      "cannot repair a bad base path, so fail immediately with the exact "
+                      "mode/edge/pair instead of spending minutes refining its corridor.")
+  r.add_argument("--path-preflight-tolerance", type=float, default=None, metavar="M",
+                 help=f"Strict base-path penetration tolerance (default {PATH_PREFLIGHT_TOL:g}m, "
+                      "the production MP contract and above RAI's micrometre numerical noise; "
+                      "independent of any relaxed --mp-collision-tolerance used to produce "
+                      "the path).")
+  r.add_argument("--path-preflight-resolution", type=float, default=None, metavar="RAD",
+                 help="Maximum per-joint interpolation step in the base-path audit (default: "
+                      "the planner collision resolution, normally 0.01rad).")
   r.add_argument("--refresh-witnesses", action="store_true",
-                 help="v2: IGNORE witnesses persisted in the plan file and re-solve the "
-                      "witness pass (default: reuse them -- they are the export-time "
-                      "keyframes, saved by main.py --save).")
+                 help="v2: explicitly IGNORE an embedded final MP export and run the legacy "
+                      "witness/pre-keyframe rebuild. Required to open an old --mp-path that "
+                      "predates final-export persistence; normal replay never resolves IK.")
   r.add_argument("--record", metavar="FILE", default=None, help="save a replayable .npz")
   r.add_argument("--gui", action="store_true", help="live MuJoCo viewer during execution")
   # (--prioritized and --smooth are REMOVED: the corridor is the certified successor of the
@@ -4404,6 +4593,11 @@ def _build_cli():
 if __name__ == "__main__":
   args = _build_cli().parse_args()
   if args.cmd == "run":
-    _cli_run(args)
+    try:
+      _cli_run(args)
+    except PathPreflightError as e:
+      import sys
+      print(str(e), file=sys.stderr)
+      raise SystemExit(2)
   else:
     replay_recording(args.path, speed=args.speed, loop=not args.no_loop)

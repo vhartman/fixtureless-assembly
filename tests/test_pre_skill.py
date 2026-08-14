@@ -279,7 +279,8 @@ class _State:
     return [{"obj_0"}, {"obj_1"}]
 
 
-def _tasks(pre_witnesses, delta=0.05, ik=None):
+def _tasks(pre_witnesses, delta=0.05, ik=None, resolve_missing_pre=True,
+           witness_sets=None):
   MP._ensure_mrbench()
   robots = ["a1", "a2"]
   plan = [("pick", "a1", "obj_0", 0), ("pick", "a2", "obj_1", 0)]
@@ -288,7 +289,9 @@ def _tasks(pre_witnesses, delta=0.05, ik=None):
   idx = {"a1": list(range(6)), "a2": list(range(6, 12))}
   rik = ik if ik is not None else _StubIK(robots, delta)
   return MP.build_tasks(None, plan, wit, states, robots, idx, rik, np.zeros(12),
-                        pre_witnesses=pre_witnesses), rik
+                        pre_witnesses=pre_witnesses,
+                        witness_sets=witness_sets,
+                        resolve_missing_pre=resolve_missing_pre), rik
 
 
 def test_build_tasks_consumes_supplied_keyframes_and_solves_nothing():
@@ -307,6 +310,13 @@ def test_build_tasks_without_the_argument_keeps_solving_them_itself():
   assert rik.solved == 2 and len(seq) == 5
 
 
+def test_loaded_final_export_refuses_a_missing_pre_keyframe_instead_of_solving():
+  ik = _StubIK(["a1", "a2"], 0.05)
+  with pytest.raises(ValueError, match="refusing to re-solve IK during replay"):
+    _tasks({0: np.full(12, 0.7)}, ik=ik, resolve_missing_pre=False)
+  assert ik.solved == 0
+
+
 def test_a_rejected_or_missing_keyframe_never_changes_the_task_structure():
   """THE fail-safe. sim.py --v2 rebuilds the task list from the saved config alone and executes
   a SAVED path against it, so a per-action structural decision the exporter made would shift
@@ -321,6 +331,242 @@ def test_a_rejected_or_missing_keyframe_never_changes_the_task_structure():
 def test_no_split_means_no_pre_tasks_at_all():
   (tasks, seq, _s), _ = _tasks({}, delta=0.0)
   assert seq == ["00_pick_a1_obj_0_0", "01_pick_a2_obj_1_0", "terminal"]
+
+
+def test_pre_skill_preserves_witness_set_and_conditions_skill_on_entry_member():
+  """A pair of plain GoalSets can cross A->B. The skill goal must read which pre member
+  actually entered the mode and return only the corresponding skill member."""
+  class _PairIK(_StubIK):
+    class _C:
+      @staticmethod
+      def getJointNames():
+        return [f"a{r}_j{j}" for r in (1, 2) for j in range(6)]
+
+    C = _C()
+
+    def pre_skill_witness(self, *args, **kwargs):
+      self.solved += 1
+      return np.asarray(args[4], dtype=float) + 0.4
+
+  ik = _PairIK(["a1", "a2"], 0.05)
+  canonical = np.full(12, 0.1)
+  alternative = canonical.copy()
+  alternative[:6] = 1.1
+  # Canonical pre is supplied by the consistency pass; only the alternative needs solving.
+  pre0 = canonical + 0.3
+  (tasks, _seq, _names), _ = _tasks(
+      {0: pre0, 1: np.full(12, 0.6)}, ik=ik,
+      witness_sets={0: [canonical, alternative]})
+  pre, skill = tasks[:2]
+  assert len(pre.goal.goals) == 2
+  assert isinstance(skill.goal, MP._PairedGoal)
+  assert ik.solved == 1
+
+  class _Mode:
+    pass
+  m = _Mode()
+  qentry = np.zeros(12)
+  qentry[:6] = pre.goal.goals[1]
+  m.entry_configuration = qentry
+  assert skill.goal.sample(m) == pytest.approx(alternative[:6])
+  # Persisted task records must retain the conditional mapping for zero-IK replay.
+  rebuilt = MP._task_from_record(MP._task_record(skill))
+  assert isinstance(rebuilt.goal, MP._PairedGoal)
+  assert rebuilt.goal.sample(m) == pytest.approx(alternative[:6])
+
+
+class _ChainState:
+  def __init__(self, groups, grasps, parent):
+    self._groups = [set(g) for g in groups]
+    self.parent = dict(parent)
+    self.supports = {p: [] for g in self._groups for p in g}
+    for r, part, gid in grasps:
+      self.supports[part].append(("grasp", r, part, gid))
+
+  def subassemblies(self):
+    return [set(g) for g in self._groups]
+
+  def bodies(self):
+    return set().union(*self._groups)
+
+
+class _ChainIK:
+  def __init__(self, robots):
+    self.robots = list(robots)
+    self.pre_pick_delta = self.pre_place_delta = self.pre_add_grasp_delta = 0.0
+    self.pre_insertion_delta = 0.05
+    self.gripper_frame = {r: r + "_tool" for r in robots}
+    self.solved = 0
+
+  def holders(self, state):
+    return {c[1]: (c[2], c[3]) for p in state.bodies()
+            for c in state.supports.get(p, ()) if c[0] == "grasp"}
+
+  def _holders_of_group(self, state, group):
+    return [r for r, (part, _gid) in self.holders(state).items() if part in group]
+
+  def pre_skill_witness(self, *args, **kwargs):
+    self.solved += 1
+    raise AssertionError("the supplied fused rendezvous must prevent an exporter re-solve")
+
+
+def _task_goal_by_robot(task, width=6):
+  q = np.asarray(task.goal.goal)
+  return {r: q[k * width:(k + 1) * width] for k, r in enumerate(task.robots)}
+
+
+def test_add_grasp_assembly_release_is_one_coupled_keyframe_chain():
+  """The brace closes only after every assembly participant reaches the funnel mouth. The
+  assembly and releases reuse adjacent endpoints, so no extra joint-transport keyframe is
+  introduced. The unconstrained motion planner may still detour between those endpoints."""
+  MP._ensure_mrbench()
+  robots = ["a1", "a2", "a3"]
+  idx = {r: list(range(6 * k, 6 * (k + 1))) for k, r in enumerate(robots)}
+  plan = [("add_grasp", "a1", "obj_0", 0),
+          ("assemble", "a3", "obj_1", "obj_0"),
+          ("release", "a3", "obj_1"),
+          ("release", "a1", "obj_0")]
+  # a2 initially holds the target and a3 the loose part; a1 joins at add_grasp.
+  s0 = _ChainState([{"obj_0"}, {"obj_1"}],
+                   [("a2", "obj_0", 1), ("a3", "obj_1", 2)],
+                   {"obj_0": ("gripper", "a2"), "obj_1": ("gripper", "a3")})
+  s1 = _ChainState([{"obj_0"}, {"obj_1"}],
+                   [("a1", "obj_0", 0), ("a2", "obj_0", 1),
+                    ("a3", "obj_1", 2)],
+                   {"obj_0": ("gripper", "a2"), "obj_1": ("gripper", "a3")})
+  s2 = _ChainState([{"obj_0", "obj_1"}],
+                   [("a1", "obj_0", 0), ("a2", "obj_0", 1),
+                    ("a3", "obj_1", 2)],
+                   {"obj_0": ("gripper", "a2"), "obj_1": ("part", "obj_0")})
+  s3 = _ChainState([{"obj_0", "obj_1"}],
+                   [("a1", "obj_0", 0), ("a2", "obj_0", 1)],
+                   {"obj_0": ("gripper", "a2"), "obj_1": ("part", "obj_0")})
+  s4 = _ChainState([{"obj_0", "obj_1"}],
+                   [("a2", "obj_0", 1)],
+                   {"obj_0": ("gripper", "a2"), "obj_1": ("part", "obj_0")})
+  q_add = np.concatenate([np.full(6, 1.0), np.full(6, 2.0), np.full(6, 3.0)])
+  q_pre = np.concatenate([np.full(6, 10.0), np.full(6, 20.0), np.full(6, 30.0)])
+  q_seat = np.concatenate([np.full(6, 11.0), np.full(6, 21.0), np.full(6, 31.0)])
+  rik = _ChainIK(robots)
+  tasks, seq, _names = MP.build_tasks(
+      None, plan, [q_add, q_seat, None, None], [s0, s1, s2, s3, s4], robots, idx, rik,
+      np.zeros(18), pre_witnesses={1: q_pre})
+
+  assert rik.solved == 0
+  assert seq == ["00_add_grasp_a1_obj_0_0",
+                 "01_pre_assemble_a3_obj_1_obj_0",
+                 "01_assemble_a3_obj_1_obj_0",
+                 "02_release_a3_obj_1", "03_release_a1_obj_0", "terminal"]
+  add, pre, seat, release, final_release = tasks[:5]
+  assert set(add.robots) == set(robots)                    # inserter joins the rendezvous task
+  for r in robots:
+    assert _task_goal_by_robot(add)[r] == pytest.approx(q_pre[idx[r]])
+    assert _task_goal_by_robot(pre)[r] == pytest.approx(q_pre[idx[r]])
+    assert _task_goal_by_robot(seat)[r] == pytest.approx(q_seat[idx[r]])
+    assert _task_goal_by_robot(release)[r] == pytest.approx(q_seat[idx[r]])
+    assert _task_goal_by_robot(final_release)[r] == pytest.approx(q_seat[idx[r]])
+  assert set(final_release.robots) == set(robots)            # same coupled release endpoint
+
+
+def test_post_release_retract_is_conditional_on_the_incoming_witness_member():
+  MP._ensure_mrbench()
+  robots = ["a1", "a2"]
+  idx = {"a1": list(range(6)), "a2": list(range(6, 12))}
+  plan = [("pick", "a1", "obj_0", 0), ("release", "a1", "obj_0")]
+  s0 = _ChainState([{"obj_0"}], [], {"obj_0": ("table",)})
+  s1 = _ChainState([{"obj_0"}], [("a1", "obj_0", 0)],
+                   {"obj_0": ("gripper", "a1")})
+  s2 = _ChainState([{"obj_0"}], [], {"obj_0": ("table",)})
+  q0 = np.concatenate([np.full(6, 1.0), np.full(6, 2.0)])
+  q1 = np.concatenate([np.full(6, 3.0), np.full(6, 2.0)])
+
+  class _PostIK(_ChainIK):
+    def __init__(self, rs):
+      super().__init__(rs)
+      self.post_release_delta = 0.05
+      self.pre_insertion_delta = 0.0
+
+    def post_release_witness(self, action, before, after, assembly, q):
+      out = np.asarray(q, dtype=float).copy()
+      out[idx[action[1]]] += 0.25
+      return out
+
+  rik = _PostIK(robots)
+  tasks, seq, names = MP.build_tasks(
+      None, plan, [q0, None], [s0, s1, s2], robots, idx, rik, np.zeros(12),
+      witness_sets={0: [q0, q1]})
+  assert seq == ["00_pick_a1_obj_0_0", "01_release_a1_obj_0",
+                 "01_post_release_a1_obj_0", "terminal"]
+  assert names[1] == ["01_release_a1_obj_0", "01_post_release_a1_obj_0"]
+  release, post = tasks[1:3]
+  assert len(release.goal.goals) == 2
+  assert isinstance(post.goal, MP._PairedGoal)
+
+  class _Mode:
+    pass
+  m = _Mode()
+  m.entry_configuration = q1.copy()
+  assert post.goal.sample(m) == pytest.approx(q1[idx["a1"]] + 0.25)
+
+
+def test_cograsp_rendezvous_shares_an_intervening_place_mode_switch():
+  """Cross has add_grasp -> place(target) -> assemble.  The place only switches the target
+  from a gripper parent to the table; it must happen at the shared rendezvous instead of
+  sending every holder to the old independently-solved place witness and back again."""
+  MP._ensure_mrbench()
+  robots = ["a1", "a2", "a3"]
+  idx = {r: list(range(6 * k, 6 * (k + 1))) for k, r in enumerate(robots)}
+  plan = [("add_grasp", "a1", "obj_0", 0),
+          ("place", "a2", "obj_0", 7),
+          ("assemble", "a3", "obj_1", "obj_0"),
+          ("release", "a3", "obj_1"),
+          ("release", "a1", "obj_0")]
+  s0 = _ChainState([{"obj_0"}, {"obj_1"}],
+                   [("a2", "obj_0", 1), ("a3", "obj_1", 2)],
+                   {"obj_0": ("gripper", "a2"), "obj_1": ("gripper", "a3")})
+  s1 = _ChainState([{"obj_0"}, {"obj_1"}],
+                   [("a1", "obj_0", 0), ("a2", "obj_0", 1),
+                    ("a3", "obj_1", 2)],
+                   {"obj_0": ("gripper", "a2"), "obj_1": ("gripper", "a3")})
+  s2 = _ChainState([{"obj_0"}, {"obj_1"}],
+                   [("a1", "obj_0", 0), ("a3", "obj_1", 2)],
+                   {"obj_0": ("table",), "obj_1": ("gripper", "a3")})
+  s3 = _ChainState([{"obj_0", "obj_1"}],
+                   [("a1", "obj_0", 0), ("a3", "obj_1", 2)],
+                   {"obj_0": ("table",), "obj_1": ("part", "obj_0")})
+  s4 = _ChainState([{"obj_0", "obj_1"}], [("a1", "obj_0", 0)],
+                   {"obj_0": ("table",), "obj_1": ("part", "obj_0")})
+  s5 = _ChainState([{"obj_0", "obj_1"}], [],
+                   {"obj_0": ("table",), "obj_1": ("part", "obj_0")})
+  q_add = np.concatenate([np.full(6, 1.0), np.full(6, 2.0), np.full(6, 3.0)])
+  q_old_place = np.concatenate([np.full(6, 4.0), np.full(6, 5.0), np.full(6, 6.0)])
+  q_pre = np.concatenate([np.full(6, 10.0), np.full(6, 20.0), np.full(6, 30.0)])
+  q_seat = np.concatenate([np.full(6, 11.0), np.full(6, 21.0), np.full(6, 31.0)])
+  rik = _ChainIK(robots)
+  tasks, seq, _names = MP.build_tasks(
+      None, plan, [q_add, q_old_place, q_seat, None, None],
+      [s0, s1, s2, s3, s4, s5], robots, idx, rik, np.zeros(18),
+      pre_witnesses={2: q_pre})
+
+  assert rik.solved == 0
+  assert seq[:4] == ["00_add_grasp_a1_obj_0_0", "01_place_a2_obj_0_7",
+                     "02_pre_assemble_a3_obj_1_obj_0",
+                     "02_assemble_a3_obj_1_obj_0"]
+  add, support_switch, pre, seat = tasks[:4]
+  assert set(add.robots) == {"a1", "a2"}
+  assert set(support_switch.robots) == {"a1", "a2"}
+  for r in add.robots:
+    # Persistent brace a1 comes from the assemble funnel; former holder a2 is absent from that
+    # post-place IK scene and must instead keep its physically meaningful place-witness slice.
+    expected_pre = q_old_place if r == "a2" else q_pre
+    assert _task_goal_by_robot(add)[r] == pytest.approx(expected_pre[idx[r]])
+    assert _task_goal_by_robot(support_switch)[r] == pytest.approx(expected_pre[idx[r]])
+  assert set(pre.robots) == {"a1", "a3"}
+  assert set(seat.robots) == {"a1", "a3"}
+  for r in pre.robots:
+    assert _task_goal_by_robot(pre)[r] == pytest.approx(q_pre[idx[r]])
+    assert _task_goal_by_robot(seat)[r] == pytest.approx(q_seat[idx[r]])
+  assert "a2" not in pre.robots                         # released holder may retract
 
 
 def test_the_pass_declines_cleanly_when_no_pre_split_is_active(arms):

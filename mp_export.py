@@ -15,9 +15,9 @@ ACTION -> TASK map (confirmed with the user 2026-07-20):
   pick(r,p,g)        -> pick,  frames=[gripper(r), p]
   place(r,p,.)       -> place, frames=[table, p]
   assemble(r,p,onto) -> place, frames=[onto, p]        (attach onto a PART, not only table)
-  release(r,p)       -> goto   (retract; the re-parent already happened at assemble/place)
-  add_grasp(r,p,g)   -> goto   (BIG TODO: should be a relative-pose gripper<->object
-                                CONSTRAINT -- supported on another mr_bench branch; goto now)
+  release(r,p)       -> goto   (zero-motion detach; the released object is re-parented)
+  add_grasp(r,p,g)   -> goto   (standalone: ordinary goal; before assemble: shared
+                                all-arm funnel rendezvous, coupled through its releases)
   handover(rB,p,g)   -> handover, robots=[rA_giver, rB], frames=[gripper(rB), p]
 """
 import sys
@@ -26,7 +26,10 @@ import os as _os
 
 import numpy as np
 
-_MRBENCH_SRC = "/home/valentin/git/postdoc/robotic-venv/mr_bench/src"
+_MRBENCH_SRC = _os.environ.get(
+    "MRBENCH_SRC",
+    _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "..", "mr_bench", "src")),
+)
 
 
 def _ensure_mrbench():
@@ -102,8 +105,57 @@ def _root_of(state, part, mate_parent):
 _SOLVE_IT = object()   # 'no keyframe supplied -- solve it here' (see build_tasks)
 
 
+class _PairedGoal:
+  """A goal whose member is selected by the mode's entry configuration.
+
+  Two independent GoalSets do NOT make a funnel pair: after reaching pre member A the planner
+  may freely sample skill member B. This conditional goal binds each skill/post member to the
+  corresponding pre/release member, using only the task robots' indices in the full entry
+  configuration. It is deliberately local rather than an mr_bench patch and is fully persisted
+  by the final-export task records below.
+  """
+  def __init__(self, conditions, goals, condition_indices):
+    self.conditions = [np.asarray(q, dtype=float).ravel() for q in conditions]
+    self.goals = [np.asarray(q, dtype=float).ravel() for q in goals]
+    self.condition_indices = np.asarray(condition_indices, dtype=int).ravel()
+    if len(self.conditions) != len(self.goals) or not self.goals:
+      raise ValueError("paired goal needs the same non-zero number of conditions and goals")
+
+  @staticmethod
+  def _flat_entry(mode):
+    q = mode.entry_configuration
+    if hasattr(q, "state"):
+      return np.asarray(q.state(), dtype=float).ravel()
+    return np.asarray(q, dtype=float).ravel()
+
+  def _member(self, mode, tolerance=1e-7):
+    entry = self._flat_entry(mode)[self.condition_indices]
+    dist = [float(np.linalg.norm(entry - c)) for c in self.conditions]
+    k = int(np.argmin(dist))
+    if dist[k] > tolerance:
+      raise ValueError(
+          f"No paired goal for mode entry (nearest condition is {dist[k]:.3g} away)")
+    return k
+
+  def satisfies_constraints(self, q, mode, tolerance):
+    try:
+      k = self._member(mode, max(float(tolerance), 1e-7))
+    except ValueError:
+      return False
+    return float(np.linalg.norm(np.asarray(q, dtype=float).ravel() - self.goals[k])) < tolerance
+
+  def sample(self, mode):
+    return self.goals[self._member(mode)]
+
+  def serialize(self):
+    return {"conditions": [q.tolist() for q in self.conditions],
+            "goals": [q.tolist() for q in self.goals],
+            "condition_indices": self.condition_indices.tolist()}
+
+
 def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
-                home_state, pre_witnesses=None, witness_sets=None):
+                home_state, pre_witnesses=None, witness_sets=None,
+                resolved_pre_witnesses=None, resolve_missing_pre=True):
   """Map the plan+witnesses to (tasks, sequence_names). robot_idx: {r: [joint indices]}
   in the problem config's joint order; witnesses[i] is the full-config keyframe for plan[i]
   (None for non-IK actions -> skipped, no motion goal needed).
@@ -120,8 +172,9 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
   hash to the SAME mode (no mode-graph growth). A later no-witness task (release,
   inhand_reorient) that pins arms last moved by a set-bearing task MIRRORS the set: member m
   pins each arm at ITS OWN member-m sub-vector (aligned whole-witness slices, never mixed),
-  so the diversity survives past the release instead of collapsing back to member 0. Steps
-  the export SPLITS (pre-* funnels) never receive sets here -- the caller excludes them."""
+  so the diversity survives past the release instead of collapsing back to member 0. A pre-*
+  split preserves the diversity as PAIRED GoalSets: funnel member m leads to skill member m;
+  failed alternative funnels drop that pair rather than mixing IK branches."""
   from multi_robot_multi_goal_planning.problems.planning_env import Task
   from multi_robot_multi_goal_planning.problems.core.goals import SingleGoal, GoalSet
 
@@ -133,6 +186,26 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
   # cur_alt[r] = (source plan index, [per-member sub-vectors]) when r was last moved by a
   # set-bearing task; reset whenever a set-less task moves r. Consumed by the mirroring below.
   cur_alt = {r: None for r in robots}
+  # Local cache because a cograsp rendezvous may need the following assemble's pre-witness
+  # BEFORE the exporter reaches that assemble step. A supplied mapping remains caller-owned.
+  pre_cache = dict(pre_witnesses or {})
+
+  def require_or_solve_pre(i, action, witness):
+    """Return the exact pre-skill keyframe, solving only during a FRESH export.
+
+    A loaded final export sets ``resolve_missing_pre=False``.  In that mode a missing entry is
+    corruption/incompatibility, never permission to call KOMO behind a viewer's back.
+    """
+    qpre = pre_cache.get(i, _SOLVE_IT)
+    if qpre is _SOLVE_IT:
+      if not resolve_missing_pre:
+        raise ValueError(
+            f"mp_export: final export is missing pre-skill keyframe for plan step {i} "
+            f"{tuple(action)}; refusing to re-solve IK during replay")
+      qpre = robot_ik.pre_skill_witness(
+          action, states[i], states[i + 1], assembly, witness)
+      pre_cache[i] = qpre
+    return qpre
 
   # mate tree exactly as mr_bench builds it: each assemble(r, part, onto) -> attach(onto, part)
   mate_parent = {a[2]: a[3] for a in plan if a[0] == "assemble"}
@@ -157,6 +230,16 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       cur_alt[r] = (src_index, [np.asarray(w)[robot_idx[r]].copy() for w in members])
     return GoalSet(goals)
 
+  def goal_for_paired(rs, conditions, members, src_index):
+    """Conditional member-m goal after a member-m entry, and update canonical bookkeeping."""
+    cond = [np.concatenate([np.asarray(w)[robot_idx[r]] for r in rs]) for w in conditions]
+    goals = [np.concatenate([np.asarray(w)[robot_idx[r]] for r in rs]) for w in members]
+    indices = np.concatenate([np.asarray(robot_idx[r], dtype=int) for r in rs])
+    for r in rs:
+      cur[r] = np.asarray(members[0])[robot_idx[r]]
+      cur_alt[r] = (src_index, [np.asarray(w)[robot_idx[r]].copy() for w in members])
+    return _PairedGoal(cond, goals, indices)
+
   def mirrored_pin(rs):
     """Goal for a no-witness task pinning `rs`: a GoalSet mirroring the members when every
     set-bearing arm shares ONE source task (aligned slices), else the canonical SingleGoal."""
@@ -170,6 +253,26 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       print("[witsets] pin over arms from DIFFERENT set sources "
             f"({sorted(srcs)}): falling back to the canonical pin.")
     return SingleGoal(np.concatenate([cur[r] for r in rs]))
+
+  def current_full_members(rs):
+    """Aligned full configurations represented by the current GoalSet source for ``rs``."""
+    base = np.asarray(home_state, dtype=float).copy()
+    for rr in robots:
+      base[robot_idx[rr]] = cur[rr]
+    srcs = {cur_alt[rr][0] for rr in rs if cur_alt[rr] is not None}
+    if len(srcs) != 1:
+      return [base]
+    src = next(iter(srcs))
+    n = len(next(cur_alt[rr] for rr in rs if cur_alt[rr] is not None)[1])
+    out = []
+    for m in range(n):
+      q = base.copy()
+      for rr in robots:
+        alt = cur_alt[rr]
+        if alt is not None and alt[0] == src:
+          q[robot_idx[rr]] = alt[1][m]
+      out.append(q)
+    return out
 
   def _support_frame(state, root):
     # the frame the released/placed assembly root should attach to. Scan the root's WHOLE
@@ -189,8 +292,86 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
   pre_place = getattr(robot_ik, "pre_place_delta", 0.0) > 0.0     # --pre-place:     split place
   pre_add_grasp = getattr(robot_ik, "pre_add_grasp_delta", 0.0) > 0.0  # --pre-add-grasp: split brace reach
   pre_ins = getattr(robot_ik, "pre_insertion_delta", 0.0) > 0.0   # --pre-insertion: split assemble
+  post_release = getattr(robot_ik, "post_release_delta", 0.0) > 0.0 # --post-release: split departure
+  # An add_grasp that directly braces a later assemble is not an independent destination.
+  # It is the start of one choreography: rendezvous/add brace -> short insertion -> release.
+  # The structural relation is shared with solver.fuse_cograsp_witnesses so the witness pass
+  # and task export cannot silently pair different actions.
+  from solver import cograsp_assembly_pairs
+  cograsp_pairs = cograsp_assembly_pairs(plan, states, robot_ik)
+  cograsp_chain = {i: j for i, j, _r, _p, _g in cograsp_pairs}
+  # Some valid plans switch the braced target's support before inserting (Cross does
+  # add_grasp -> place -> assemble).  The robots holding the target before that switch meet at
+  # one physically valid place keyframe; only holders that PERSIST across the switch remain
+  # pinned for assembly.  The released holder must be allowed to retract so the inserter can
+  # approach -- pinning the union of both sides made Cross's a1/a2 overlap by 106mm.
+  cograsp_bridge = {}
+  add_robots = {}
+  assembly_robots = {}
+  coupled_release_robots = {}
+  for _i, j, _r, _p, _g in cograsp_pairs:
+    ca = plan[j]
+    _add_rs = _active_robots(plan[_i], states[_i], robot_ik) or [plan[_i][1]]
+    _asm_rs = _active_robots(ca, states[j], robot_ik) or [ca[1]]
+    add_robots[j] = list(dict.fromkeys(add_robots.get(j, []) + _add_rs))
+    assembly_robots[j] = list(dict.fromkeys(assembly_robots.get(j, []) + _asm_rs))
+    for k in range(_i + 1, j):
+      old = cograsp_bridge.setdefault(k, j)
+      if old != j:
+        raise ValueError(
+            f"overlapping add_grasp chains assign plan step {k} to assemblies {old} and {j}")
+  bridged = set(cograsp_bridge.values())
+  rendezvous_robots = {
+      j: (list(add_robots[j]) if j in bridged else
+          list(dict.fromkeys(add_robots[j] + assembly_robots[j])))
+      for j in assembly_robots}
+  persistent_robots = {
+      j: [r for r in add_robots[j] if r in assembly_robots[j]] for j in assembly_robots}
+  for j in assembly_robots:
+    # Every immediately-following release is part of the atomic choreography. In particular,
+    # the SECOND release must still pin the already-released inserter: otherwise mr_bench can
+    # start that arm's next task early and detour a holder to avoid it while the co-grasp is
+    # nominally closed (measured on car-mini as a 23.1mm loop between two equal endpoints).
+    k = j + 1
+    while k < len(plan) and plan[k][0] == "release":
+      coupled_release_robots[k] = list(dict.fromkeys(
+          coupled_release_robots.get(k, []) + list(assembly_robots[j])))
+      k += 1
+  if cograsp_chain:
+    print(f"[cograsp-chain] coupled {len(cograsp_chain)} add_grasp task(s) to the following "
+          "assembly rendezvous.")
 
-  def split_skill(a, i, wit, involved, name, kind, mk_skill):
+  chain_goal_cache = {}
+
+  def chain_goal(j):
+    """Full-config rendezvous for one add_grasp -> assemble chain.
+
+    For a direct chain, the assemble pre-witness is the all-arm rendezvous.  Across a support
+    switch, persistent holders take that pre-witness while a holder released by the switch
+    takes its place-witness slice.  The inserter is deliberately NOT pulled into the earlier
+    add/place task: it approaches only after the former holder is free to retract.
+    """
+    if j in chain_goal_cache:
+      return chain_goal_cache[j]
+    ca = plan[j]
+    qpre = require_or_solve_pre(j, ca, witnesses[j]) if pre_ins else witnesses[j]
+    if qpre is None:
+      chain_goal_cache[j] = None
+      return None
+    q = np.asarray(qpre, dtype=float).copy()
+    former = set(rendezvous_robots[j]) - set(persistent_robots[j]) if j in bridged else set()
+    if former:
+      for k in sorted(k for k, jj in cograsp_bridge.items() if jj == j):
+        wk = witnesses[k]
+        if wk is None:
+          continue
+        step_robots = set(_active_robots(plan[k], states[k], robot_ik) or [plan[k][1]])
+        for rr in former & step_robots:
+          q[robot_idx[rr]] = np.asarray(wk, dtype=float)[robot_idx[rr]]
+    chain_goal_cache[j] = q
+    return q
+
+  def split_skill(a, i, wit, involved, name, kind, mk_skill, members=None):
     # --pre-*: prepend a GOTO to the pre-skill FUNNEL pose (skill witness backed off along its
     # approach axis) before the REAL skill task. Pure motion first (the collision-free approach
     # the free-space planner connects to), then the unchanged skill at the real witness -- so the
@@ -206,18 +387,54 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
     # PRE keyframes are the one thing the exporter may solve itself (a rejected --fuse-pre-skill
     # split has to fall back to something, and a zero-length funnel is worse). The SKILL witness
     # is a different matter -- see the hard failure below.
-    pre_wit = (pre_witnesses.get(i, _SOLVE_IT) if pre_witnesses is not None else _SOLVE_IT)
-    if pre_wit is _SOLVE_IT:
-      pre_wit = robot_ik.pre_skill_witness(a, states[i], states[i + 1], assembly, wit)
+    pre_wit = require_or_solve_pre(i, a, wit)
     pan = f"{i:02d}_pre_{kind}_{'_'.join(str(x) for x in a[1:])}"
-    if pre_wit is None and pre_witnesses is not None and i in pre_witnesses:
+    if pre_wit is None and i in pre_cache:
       # the fallback is silent in the historical path; once the consistency pass owns these
       # keyframes, say it -- a None here exports a pre GOTO whose goal EQUALS the skill goal.
       print(f"  [pre] {i:02d} {kind}: NO pre keyframe -- the goto goal equals the skill goal "
             f"(zero-length funnel)")
-    pre_goal = goal_for(involved, pre_wit if pre_wit is not None else wit)   # cur := T_pre
+    if not members:
+      pre_goal = goal_for(involved, pre_wit if pre_wit is not None else wit) # cur := T_pre
+      return [(pan, Task(pan, involved, pre_goal, type="goto")),
+              (name, mk_skill(goal_for(involved, wit)))]                     # cur := real witness
+
+    # GoalSets used to be silently discarded by every pre-skill split. Solve one funnel mouth
+    # per skill member so the planner keeps both branch diversity and a short, branch-consistent
+    # contact approach. Member 0 retains the canonical pre-witness (including any fused repair).
+    # Alternatives pin arms which should stay still; add_grasp pins the existing holders too,
+    # so only the arriving hand pays for the backoff.
+    if not resolve_missing_pre:
+      raise ValueError(
+          f"mp_export: task records are required to replay paired pre-skill GoalSets at "
+          f"plan step {i} {tuple(a)}; refusing to solve alternative funnels during replay")
+    joint_names = list(robot_ik.C.getJointNames())
+    moving = set(involved if kind == "place" else [a[1]])
+    pre_members = [np.asarray(pre_wit if pre_wit is not None else members[0], dtype=float)]
+    skill_members = [np.asarray(members[0], dtype=float)]
+    for m, member in enumerate(members[1:], 1):
+      member = np.asarray(member, dtype=float)
+      pin = {n: float(member[k]) for rr in robots if rr not in moving
+             for k, n in enumerate(joint_names) if n.startswith(rr + "_")}
+      qpre = robot_ik.pre_skill_witness(
+          a, states[i], states[i + 1], assembly, member, pin=pin or None)
+      if qpre is None:
+        print(f"[witsets] step {i} {kind}: alternative {m} has no feasible paired funnel -- "
+              "dropped from BOTH GoalSets.")
+        continue
+      pre_members.append(np.asarray(qpre, dtype=float))
+      skill_members.append(member)
+    if len(skill_members) < len(members):
+      print(f"[witsets] step {i} {kind}: {len(skill_members)}/{len(members)} paired "
+            "pre-skill branch(es) retained.")
+    if len(skill_members) >= 2:
+      pre_goal = goal_for_set(involved, pre_members, i)                     # cur := pre set
+      skill_goal = goal_for_paired(involved, pre_members, skill_members, i) # same member only
+    else:
+      pre_goal = goal_for(involved, pre_members[0])
+      skill_goal = goal_for(involved, skill_members[0])
     return [(pan, Task(pan, involved, pre_goal, type="goto")),
-            (name, mk_skill(goal_for(involved, wit)))]                       # cur := real witness
+            (name, mk_skill(skill_goal))]
 
   tasks, seq, step_names = [], [], []                             # step_names[i] = names of plan step i
   _NEEDS_WITNESS = ("pick", "place", "stow", "assemble", "add_grasp", "handover")
@@ -246,8 +463,33 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
     # held part (obj_0) snapped to that arm's home pose and every downstream mate misaligned.
     # `goal_for` poses each in task-robot order at its witness config, pinning the holder.
     involved = _active_robots(a, states[i], robot_ik) or [r]
+    goal_wit = wit
+    chain_j = cograsp_chain.get(i)
+    bridge_j = cograsp_bridge.get(i)
+    shared_j = chain_j if chain_j is not None else bridge_j
+    shared_robots = []
+    if shared_j is not None:
+      # A direct chain brings every assembly participant to the funnel before add_grasp.  A
+      # bridged chain instead pins only the pre-switch target holders through its place event;
+      # the inserter approaches afterwards and the released holder may retract.
+      shared_robots = rendezvous_robots[shared_j]
+      involved = list(dict.fromkeys(list(involved) + list(shared_robots)))
+      rendezvous = chain_goal(shared_j)
+      if rendezvous is not None:
+        if bridge_j is None:
+          goal_wit = rendezvous
+        else:
+          # Hybrid full witness: chain participants take the shared rendezvous slices; any
+          # unrelated actor keeps this bridge action's own witness (or its current config for
+          # a no-witness side effect).  Assigning this to `wit` below makes every ordinary task
+          # branch consume the pinned goal without duplicating the action-specific exporter.
+          goal_wit = np.asarray(rendezvous, dtype=float).copy()
+          source = None if wit is None else np.asarray(wit, dtype=float)
+          for rr in robots:
+            if rr not in shared_robots:
+              goal_wit[robot_idx[rr]] = cur[rr] if source is None else source[robot_idx[rr]]
+          wit = goal_wit
     # --witness-sets: members for THIS step, validated against the shipped canonical witness.
-    # Steps the export splits keep their single witness (the funnel pairing needs one member).
     smembers = None
     if witness_sets and i in witness_sets and wit is not None:
       _ms = witness_sets[i]
@@ -260,22 +502,20 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       # --pre-pick splits into a goto to the retracted pre-grasp + the real pick (grasp+attach).
       frames = [robot_ik.gripper_frame[r], _root_of(states[i], a[2], mate_parent)]
       mk = lambda g: Task(name, involved, g, type="pick", frames=frames)
-      emit = split_skill(a, i, wit, involved, name, kind, mk) if pre_pick else None
+      emit = (split_skill(a, i, wit, involved, name, kind, mk, smembers)
+              if pre_pick and bridge_j is None else None)
       if emit is None:
         t = mk(goal_for_set(involved, smembers, i) if smembers
                else goal_for(involved, wit))
-      elif smembers:
-        print(f"[witsets] step {i} pick is pre-split: set dropped (single witness kept).")
     elif kind == "place":
       # --pre-place splits into a goto to the lifted pre-place + the real place (set-down+attach).
       frames = ["table", _root_of(states[i], a[2], mate_parent)]
       mk = lambda g: Task(name, involved, g, type="place", frames=frames)
-      emit = split_skill(a, i, wit, involved, name, kind, mk) if pre_place else None
+      emit = (split_skill(a, i, wit, involved, name, kind, mk, smembers)
+              if pre_place and bridge_j is None else None)
       if emit is None:
         t = mk(goal_for_set(involved, smembers, i) if smembers
                else goal_for(involved, wit))
-      elif smembers:
-        print(f"[witsets] step {i} place is pre-split: set dropped (single witness kept).")
     elif kind == "assemble":
       # --pre-insertion splits into a goto to the funnel mouth + the real mate (seats at `wit`).
       frames = [a[3], a[2]]
@@ -292,8 +532,10 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       # v1: lone parts only, so the attach child is the part itself.
       _g = A.grasp_pose(assembly, a[2], a[3])
       _ee = np.concatenate([_g[:3], P._quat_mul(_g[3:], robot_ik.q_correction[r])])
-      t = Task(name, [r],
-               mirrored_pin([r]) if witness_sets else goal_for([r], None), type="pick",
+      _rs = involved if bridge_j is not None else [r]
+      t = Task(name, _rs,
+               (goal_for(_rs, wit) if bridge_j is not None else
+                (mirrored_pin(_rs) if witness_sets else goal_for(_rs, None))), type="pick",
                frames=[robot_ik.gripper_frame[r], a[2]],
                side_effect="make_appear", side_effect_data=P._pose_invert(_ee))
     elif kind == "release":
@@ -315,24 +557,57 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       root = _root_of(states[i + 1], a[2], mate_parent)
       grp = next((g for g in states[i + 1].subassemblies() if root in g), {root})
       rel_robots = list(dict.fromkeys([r] + robot_ik._holders_of_group(states[i + 1], grp)))
-      t = Task(name, rel_robots,
-               mirrored_pin(rel_robots) if witness_sets else goal_for(rel_robots, None),
-               type="place", frames=[_support_frame(states[i + 1], root), root])
+      if i in coupled_release_robots:
+        rel_robots = list(dict.fromkeys(rel_robots + coupled_release_robots[i]))
+      if bridge_j is not None:
+        rel_robots = list(dict.fromkeys(rel_robots + shared_robots))
+      release_members = current_full_members(rel_robots)
+      release_goal = (mirrored_pin(rel_robots) if len(release_members) >= 2
+                      else goal_for(rel_robots, None))
+      t = Task(name, rel_robots, release_goal, type="place",
+               frames=[_support_frame(states[i + 1], root), root])
+      if post_release:
+        # Detach first at the exact holding configuration, then add an explicit leave-contact
+        # endpoint whose IK keeps continuing holders at that configuration. An incoming
+        # GoalSet is retained member-for-member rather than allowing a branch switch. The
+        # ordinary motion planner remains unconstrained between these endpoints.
+        post_members = []
+        for m, qrel in enumerate(release_members):
+          qpost = robot_ik.post_release_witness(
+              a, states[i], states[i + 1], assembly, qrel)
+          if qpost is None:
+            print(f"  [post-release] {i:02d} member {m}: no retract keyframe -- departure "
+                  "goal equals release goal (zero-length funnel)")
+            qpost = qrel
+          elif getattr(robot_ik, "post_release_used_delta", None) is not None:
+            used = float(robot_ik.post_release_used_delta)
+            requested = float(robot_ik.post_release_delta)
+            if used < requested - 1e-12:
+              print(f"  [post-release] {i:02d} member {m}: full {requested*1000:.0f}mm "
+                    f"departure infeasible; using the largest ladder escape found "
+                    f"({used*1000:.0f}mm) under the same clearance gate.")
+          post_members.append(np.asarray(qpost, dtype=float))
+        pon = f"{i:02d}_post_release_{'_'.join(str(x) for x in a[1:])}"
+        pgoal = (goal_for_paired(rel_robots, release_members, post_members, i)
+                 if len(post_members) >= 2 else goal_for(rel_robots, post_members[0]))
+        emit = [(name, t), (pon, Task(pon, rel_robots, pgoal, type="goto"))]
     elif kind == "add_grasp":
-      # TODO(mp): a brace should be a RELATIVE-POSE CONSTRAINT gripper<->object, not a goto
-      # keyframe (other mr_bench branch). goto = motion to the brace pose for now.
-      # --pre-add-grasp splits into a goto to the retracted pre-grasp + the real brace reach.
+      # Direct coupled case: all participants rendezvous at the following assembly's funnel
+      # mouth. With an intervening support switch, only its pre-switch holders rendezvous here;
+      # the inserter approaches after the old holder releases. A standalone add_grasp keeps its
+      # historical goto (or --pre-add-grasp split).
       mk = lambda g: Task(name, involved, g, type="goto")
-      emit = split_skill(a, i, wit, involved, name, kind, mk) if pre_add_grasp else None
+      emit = (split_skill(a, i, goal_wit, involved, name, kind, mk, smembers)
+              if pre_add_grasp and chain_j is None else None)
       if emit is None:
-        t = mk(goal_for_set(involved, smembers, i) if smembers
-               else goal_for(involved, wit))
-      elif smembers:
-        print(f"[witsets] step {i} add_grasp is pre-split: set dropped.")
+        t = mk(goal_for_set(involved, smembers, i) if smembers and chain_j is None
+               else goal_for(involved, goal_wit))
     elif kind == "handover":
       rB = r
       rA = _holder_of(states[i], a[2])
       task_robots = [rA, rB] if rA is not None and rA != rB else [rB]
+      if bridge_j is not None:
+        task_robots = list(dict.fromkeys(task_robots + shared_robots))
       t = Task(name, task_robots,
                goal_for_set(task_robots, smembers, i) if smembers
                else goal_for(task_robots, wit), type="handover",
@@ -354,6 +629,9 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
             _SG(np.concatenate([np.asarray(home_state)[robot_idx[r]] for r in robots])))
   tasks.append(term)
   seq.append("terminal")
+  if resolved_pre_witnesses is not None:
+    resolved_pre_witnesses.clear()
+    resolved_pre_witnesses.update(pre_cache)
   return tasks, seq, step_names
 
 
@@ -550,6 +828,182 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
 
   qmargin = max(margin, table_margin)
 
+  # STRUCTURED REJECTION AUDIT.  MP_MARGIN_DEBUG used to print every veto, which turns a
+  # moderately hard run into hundreds of thousands of indistinguishable lines and still does
+  # not answer the useful question: "did OUR wrapper wedge this particular frontier mode?"
+  # Keep counters on the environment instead.  run_birrt prints a compact per-frontier/top-pair
+  # report at termination; callers/tests can inspect margin_rejection_stats directly.
+  _stats = {}
+  _last_rejection = [None]                    # final predicate call inside an edge check
+
+  def _mode_key(m):
+    try:
+      return tuple(int(x) for x in _np.atleast_1d(getattr(m, "task_ids", ()) or ()))
+    except Exception:
+      return ()
+
+  def _reset_stats():
+    _stats.clear()
+    _stats.update({"calls": 0, "base_rejects": 0, "base_passes": 0,
+                   "gate_rejects": 0, "base_by_mode": {}, "pass_by_mode": {},
+                   "gate_by_mode": {}, "records": {}, "base_audited_by_mode": {},
+                   "base_records": {}, "edge_rejects": 0, "edge_base_rejects": 0,
+                   "edge_gate_rejects": 0, "edge_by_mode": {}, "edge_records": {}})
+    _last_rejection[0] = None
+
+  _reset_stats()
+
+  def _bump(d, key):
+    d[key] = d.get(key, 0) + 1
+
+  def _veto(m, gate, fa, fb, observed, required, owners=(None, None), involved=(),
+            factor=None):
+    task = _task_of(m)
+    return {"mode": _mode_key(m), "task": getattr(task, "name", None), "gate": gate,
+            "frames": (str(fa), str(fb)), "owners": tuple(owners),
+            "involved": tuple(sorted(involved)), "observed": float(observed),
+            "required": float(required), "factor": None if factor is None else float(factor)}
+
+  def _record(reason):
+    mode = reason["mode"]
+    _stats["gate_rejects"] += 1
+    _bump(_stats["gate_by_mode"], mode)
+    key = (mode, reason["task"], reason["gate"], reason["frames"], reason["owners"])
+    rec = _stats["records"].get(key)
+    slack = reason["observed"] - reason["required"]
+    if rec is None:
+      rec = dict(reason, count=0, worst_slack=slack)
+      _stats["records"][key] = rec
+    rec["count"] += 1
+    # Retain the most strongly rejected concrete sample, so the printed d/requirement/factor
+    # belong together instead of mixing independent extrema into an impossible example.
+    if slack < rec["worst_slack"]:
+      rec.update({k: reason[k] for k in
+                  ("involved", "observed", "required", "factor")})
+      rec["worst_slack"] = slack
+    if _os.environ.get("MP_MARGIN_DEBUG"):
+      print(f"[margin-debug] VETO gate={reason['gate']} mode={list(mode)} "
+            f"task={reason['task']} {reason['frames'][0]} ~ {reason['frames'][1]} "
+            f"d={reason['observed']*1000:.1f}mm req={reason['required']*1000:.1f}mm "
+            f"owners={reason['owners']} involved={list(reason['involved'])}")
+
+  def _record_base_pairs(m, cap=64):
+    """Sample concrete base-predicate collision pairs without taxing every rejected check.
+
+    The underlying predicate leaves C at the rejected (q, mode).  Auditing the first ``cap``
+    failures per mode is enough to expose a systematic wall while bounding the extra RAI query
+    cost on a run with hundreds of thousands of ordinary edge collisions.
+    """
+    mode = _mode_key(m)
+    n = _stats["base_audited_by_mode"].get(mode, 0)
+    if n >= cap:
+      return
+    _stats["base_audited_by_mode"][mode] = n + 1
+    try:
+      collisions = env.C.getCollisions(0.0)
+    except Exception:
+      return
+    task = _task_of(m)
+    for c in collisions:
+      fa, fb, d = str(c[0]), str(c[1]), float(c[2])
+      if d >= 0.0:
+        continue
+      key = (mode, getattr(task, "name", None), fa, fb, _owner(fa), _owner(fb))
+      rec = _stats["base_records"].get(key)
+      if rec is None:
+        rec = {"mode": mode, "task": getattr(task, "name", None),
+               "frames": (fa, fb), "owners": (_owner(fa), _owner(fb)),
+               "count": 0, "min_distance": d}
+        _stats["base_records"][key] = rec
+      rec["count"] += 1
+      rec["min_distance"] = min(rec["min_distance"], d)
+
+  def _record_failed_edge(m):
+    mode = _mode_key(m)
+    _stats["edge_rejects"] += 1
+    _bump(_stats["edge_by_mode"], mode)
+    last = _last_rejection[0]
+    layer = None if last is None else last.get("layer")
+    if layer == "margin":
+      _stats["edge_gate_rejects"] += 1
+      return
+    _stats["edge_base_rejects"] += 1
+    try:
+      collisions = env.C.getCollisions(0.0)
+    except Exception:
+      return
+    task = _task_of(m)
+    for c in collisions:
+      fa, fb, d = str(c[0]), str(c[1]), float(c[2])
+      if d >= 0.0:
+        continue
+      key = (mode, getattr(task, "name", None), fa, fb, _owner(fa), _owner(fb))
+      rec = _stats["edge_records"].get(key)
+      if rec is None:
+        rec = {"mode": mode, "task": getattr(task, "name", None),
+               "frames": (fa, fb), "owners": (_owner(fa), _owner(fb)),
+               "count": 0, "min_distance": d}
+        _stats["edge_records"][key] = rec
+      rec["count"] += 1
+      rec["min_distance"] = min(rec["min_distance"], d)
+
+  def _report(frontier_task_ids=None, top=8):
+    """Print why this wrapper rejected base-valid samples, with frontier attribution."""
+    frontier = (() if frontier_task_ids is None else
+                tuple(int(x) for x in _np.atleast_1d(frontier_task_ids)))
+    calls, base, gate = _stats["calls"], _stats["base_rejects"], _stats["gate_rejects"]
+    passed = _stats["base_passes"]
+    print(f"[mp/margin] predicate audit: {calls} checks; base predicate rejected {base}; "
+          f"our added margin gates rejected {gate}/{passed} base-valid checks.")
+    if frontier:
+      print(f"[mp/margin] frontier mode {list(frontier)}: "
+            f"base rejected {_stats['base_by_mode'].get(frontier, 0)}, "
+            f"base-valid {_stats['pass_by_mode'].get(frontier, 0)}, "
+            f"our gates rejected {_stats['gate_by_mode'].get(frontier, 0)}.")
+    if not gate:
+      print("[mp/margin] our wrapper vetoed no base-valid sample; this run's blockage is not "
+            "caused by --mp-robot-margin/--mp-table-margin.")
+    else:
+      rows = list(_stats["records"].values())
+      # Put exact-frontier evidence first, then the most common concrete pair/reason overall.
+      rows.sort(key=lambda r: (r["mode"] == frontier, r["count"]), reverse=True)
+      for r in rows[:max(1, int(top))]:
+        factor = "" if r["factor"] is None else f" ramp={r['factor']:.3f}"
+        owners = "/".join("-" if x is None else str(x) for x in r["owners"])
+        print(f"[mp/margin] mode={list(r['mode'])} task={r['task']} gate={r['gate']} "
+              f"count={r['count']} pair={r['frames'][0]}~{r['frames'][1]} "
+              f"owners={owners} d={r['observed']*1000:.2f}mm "
+              f"required={r['required']*1000:.2f}mm{factor} "
+              f"involved={list(r['involved'])}")
+    # The base predicate is not our gate, but showing a bounded sample of its concrete pairs
+    # makes a "not us" result actionable rather than merely exculpatory.
+    brows = [r for r in _stats["base_records"].values()
+             if not frontier or r["mode"] == frontier]
+    brows.sort(key=lambda r: (r["count"], -r["min_distance"]), reverse=True)
+    audited = _stats["base_audited_by_mode"].get(frontier, 0) if frontier else sum(
+        _stats["base_audited_by_mode"].values())
+    if audited:
+      print(f"[mp/base] concrete collision pairs from {audited} sampled base rejection(s) "
+            + (f"at frontier {list(frontier)}:" if frontier else ":"))
+      for r in brows[:max(1, min(int(top), 5))]:
+        owners = "/".join("-" if x is None else str(x) for x in r["owners"])
+        print(f"[mp/base] task={r['task']} count={r['count']}/{audited} "
+              f"pair={r['frames'][0]}~{r['frames'][1]} owners={owners} "
+              f"min_penetration={r['min_distance']*1000:.2f}mm")
+    edge_n = _stats["edge_by_mode"].get(frontier, 0) if frontier else _stats["edge_rejects"]
+    if edge_n:
+      print(f"[mp/edge] failed edges at frontier {list(frontier)}: {edge_n} "
+            f"(base={_stats['edge_base_rejects']}, margin={_stats['edge_gate_rejects']} "
+            "globally); concrete first-hit pairs:")
+      erows = [r for r in _stats["edge_records"].values()
+               if not frontier or r["mode"] == frontier]
+      erows.sort(key=lambda r: (r["count"], -r["min_distance"]), reverse=True)
+      for r in erows[:max(1, min(int(top), 5))]:
+        owners = "/".join("-" if x is None else str(x) for x in r["owners"])
+        print(f"[mp/edge] task={r['task']} count={r['count']}/{edge_n} "
+              f"pair={r['frames'][0]}~{r['frames'][1]} owners={owners} "
+              f"min_penetration={r['min_distance']*1000:.2f}mm")
+
   def _too_close(m):
     task = _task_of(m)
     involved = set(getattr(task, "robots", ()) or ())
@@ -594,9 +1048,12 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
           # table); measured without this: 185N table press snapping the seat grasp.
           d_eff = d - table_float
           if d_eff < -0.001:
-            return True
-          if max(d_eff, 0.0) < table_margin * (1.5 * f - 0.5):
-            return True
+            return _veto(m, "table-contact-floor", fa, fb, d_eff, -0.001,
+                         owners=(ro, None), involved=involved, factor=f)
+          req = table_margin * (1.5 * f - 0.5)
+          if max(d_eff, 0.0) < req:
+            return _veto(m, "carried-part-table-margin", fa, fb, max(d_eff, 0.0), req,
+                         owners=(ro, None), involved=involved, factor=f)
         continue                             # table pairs never enter the robot-robot branch
       if margin <= 0.0 or d >= margin:
         continue
@@ -604,8 +1061,12 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
       if ra is None or rb is None or ra == rb:
         continue
       req = margin
+      gate = "robot-full-margin"
+      factor = 1.0
       if ra in involved and rb in involved:
         req = 0.0
+        gate = "robot-participant-ramp"
+        factor = 0.0
         if ramp > 0.0:
           if goals is None:
             goals = _goals(m)
@@ -613,9 +1074,11 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
             d_ee = max(float(_np.linalg.norm(
                 _np.asarray(env.C.getFrame(gripper_frame[r]).getPosition(), dtype=float)
                 - goals[r])) for r in (ra, rb) if r in goals)
-            req = margin * min(1.0, d_ee / ramp)
+            factor = min(1.0, d_ee / ramp)
+            req = margin * factor
           except Exception:
             req = 0.0
+            factor = 0.0
       elif ramp > 0.0 and (ra in involved) != (rb in involved):
         # ONE-SIDED relaxation (2026-07-30): an involved arm NEAR ITS GOAL is executing its
         # task posture, and that fixed posture can sit inside the margin of an UNINVOLVED
@@ -628,15 +1091,18 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
         # involved-pair and table ramps. Fail OPEN like the branch above: a missing goal
         # must not veto a state the base predicate accepts.
         rinv = ra if ra in involved else rb
+        gate = "robot-one-sided-ramp"
         if goals is None:
           goals = _goals(m)
         try:
           d_ee = float(_np.linalg.norm(
               _np.asarray(env.C.getFrame(gripper_frame[rinv]).getPosition(), dtype=float)
               - goals[rinv]))
-          req = margin * min(1.0, d_ee / ramp)
+          factor = min(1.0, d_ee / ramp)
+          req = margin * factor
         except Exception:
           req = 0.0
+          factor = 0.0
       # CLAMP AT CONTACT (2026-07-30): a fully-relaxed pair (req 0) must not be vetoed for a
       # sub-tolerance witness graze -- `d < req` with d = -0.1mm and req = 0 still fired,
       # so every transition whose goal formation TOUCHES (a seated mate, a co-grasp) was
@@ -645,18 +1111,30 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
       # clamping d at 0 keeps every positive requirement guarding real proximity while
       # handing at-or-below-contact states back to the tolerance.
       if max(d, 0.0) < req:
-        if _os.environ.get("MP_MARGIN_DEBUG"):
-          print(f"[margin-debug] VETO {fa} ~ {fb} d={d*1000:.1f}mm req={req*1000:.1f}mm "
-                f"owners=({ra},{rb}) involved={sorted(involved)}")
-        return True
-    return False
+        return _veto(m, gate, fa, fb, max(d, 0.0), req, owners=(ra, rb),
+                     involved=involved, factor=factor)
+    return None
 
   def _wrap(fn):
     def patched(*a, **kw):
-      if not fn(*a, **kw):                               # poses C at (mode, q) as a side effect
-        return False
       m = kw.get("m", a[1] if len(a) > 1 else None)
-      return not _too_close(m)
+      mode = _mode_key(m)
+      _stats["calls"] += 1
+      if not fn(*a, **kw):                               # poses C at (mode, q) as a side effect
+        _stats["base_rejects"] += 1
+        _bump(_stats["base_by_mode"], mode)
+        _record_base_pairs(m)
+        _last_rejection[0] = {"layer": "base", "mode": mode}
+        return False
+      _stats["base_passes"] += 1
+      _bump(_stats["pass_by_mode"], mode)
+      reason = _too_close(m)
+      if reason is not None:
+        _record(reason)
+        _last_rejection[0] = {"layer": "margin", "mode": mode, "reason": reason}
+        return False
+      _last_rejection[0] = None
+      return True
     return patched
 
   # BOTH full-scene predicates: BiRRT leans on the _np variant, so wrapping only
@@ -665,13 +1143,28 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
   # explicitly discounts collisions with the others, so a cross-robot margin would invert it.
   env.is_collision_free = _wrap(env.is_collision_free)
   env.is_collision_free_np = _wrap(env.is_collision_free_np)
+  _edge_fn = env.is_edge_collision_free
+
+  def _edge_patched(*a, **kw):
+    ok = _edge_fn(*a, **kw)
+    if not ok:
+      m = kw.get("m", a[2] if len(a) > 2 else None)
+      _record_failed_edge(m)
+    return ok
+
+  env.is_edge_collision_free = _edge_patched
+  env.margin_rejection_stats = _stats
+  env.reset_margin_rejection_stats = _reset_stats
+  env.report_margin_rejections = _report
   return env
 
 
 def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, bracing,
                  depgraph=False, collision_tolerance=0.01, pre_witnesses=None,
                  robot_robot_margin=0.0, robot_margin_ramp=0.0, table_margin=0.0,
-                 table_float=0.0, witness_sets=None):
+                 table_float=0.0, witness_sets=None, resolved_pre_witnesses=None,
+                 resolve_missing_pre=True, task_records=None, saved_step_names=None,
+                 saved_sequence_names=None):
   """Build a live mr_bench problem from our solved plan. depgraph=False -> SequenceMixin (a
   fixed total order); depgraph=True -> DependencyGraphMixin (the partial order, so the planner
   may reorder independent actions). Same tasks/frames/witnesses either way."""
@@ -704,9 +1197,23 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
         _n = sum(1 for v in witness_sets.values() if len(v) >= 2)
         print(f"[witsets] make_problem: {_n} task(s) carry witness GoalSets "
               f"(K up to {max(len(v) for v in witness_sets.values())}).")
-      self.tasks, seq, step_names = build_tasks(
-          assembly, plan, witnesses, states, self.robots, self.robot_idx, robot_ik, home,
-          pre_witnesses=pre_witnesses, witness_sets=witness_sets)
+      if task_records is None:
+        self.tasks, seq, step_names = build_tasks(
+            assembly, plan, witnesses, states, self.robots, self.robot_idx, robot_ik, home,
+            pre_witnesses=pre_witnesses, witness_sets=witness_sets,
+            resolved_pre_witnesses=resolved_pre_witnesses,
+            resolve_missing_pre=resolve_missing_pre)
+      else:
+        # FINAL-EXPORT replay: task goals/effects are data, not something inferred again from
+        # today's exporter. This closes the second drift channel after IK: a later change to
+        # involved-robot ordering or task splitting must not relink an old path creatively.
+        self.tasks = [_task_from_record(rec) for rec in task_records]
+        seq = list(saved_sequence_names or [t.name for t in self.tasks])
+        step_names = [list(xs) for xs in (saved_step_names or [])]
+        if len(step_names) != len(plan):
+          raise ValueError(
+              f"mp_export: persisted task map has {len(step_names)} plan steps, expected "
+              f"{len(plan)}")
       self.step_names = step_names                         # task names per plan action -- lets
       self.plan_actions = [tuple(a) for a in plan]         # sim.py map completed tasks back to
                                                            # plan actions (grasp/weld events)
@@ -717,6 +1224,7 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
         self.graph = _dependency_graph(plan, states, step_names, self.robots, robot_ik)
       else:
         self.sequence = self._make_sequence_from_names(seq)   # flat order (incl. terminal)
+      self.sequence_names = list(seq)
       # total allowed PENETRATION at validated configs (mr_bench semantics). 0.01 is the
       # historical default; pass ~0 (with --strict-collisions witnesses) for a plan whose
       # validated configs contain no tolerated penetration at all. Must be set BEFORE
@@ -771,7 +1279,7 @@ def run_motion_planner(problem, runtime=30.0, verbose=True):
 def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
               shortcut_resolution=None, shortcut_strategy="native",
               shortcut_pair_checks=200, optimize=False, verbose=True, seed=None,
-              stall_timeout=None):
+              stall_timeout=None, fake_clock=False):
   """Run Bidirectional RRT* to the FIRST solution (optimize=False), then optionally apply
   robot/mode shortcutting as a post-process. Returns (path, info). No cost optimization --
   the tree stops as soon as a valid path is found; shortcutting only removes slack.
@@ -780,6 +1288,13 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
   with its OWN budget (`shortcut_iters` successful shortcuts, or ~2.5x that many attempts) and
   is NOT time-limited -- on a long path it can dominate wall-clock. Lower `shortcut_iters`
   (or pass shortcut=False) to cap/skip it.
+
+  `seed` seeds the GLOBAL numpy + stdlib RNGs mr_bench draws from (the whole BiRRT+shortcut
+  draw). Termination still uses the REAL wall clock unless `fake_clock=True` swaps time.time
+  for a deterministic fake clock (+1ms per consultation) FOR THIS CALL ONLY -- the runtime
+  budget then becomes a CONSULTATION budget (NOT wall seconds), which is what makes a seeded
+  run bit-exact under machine jitter; with the real clock a seeded run is only approximately
+  reproducible. first-solution return still exits early; perf_counter stays real.
 
   PERF: robot_mode_shortcut's OWN default collision resolution is 0.001 -- 10x FINER than the
   env's collision_resolution (0.01, what BiRRT itself used), for zero quality gain but ~10x
@@ -797,11 +1312,19 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
     # BiRRT+shortcut draw REPRODUCIBLE. Unseeded, the same command yields paths whose failure
     # CLASSES differ (one draw grazes the table at 57N, the next has no table contact at all),
     # so every A/B on top was noise. None (the default) keeps the historical unseeded draw.
+    # The TERMINATION clock stays REAL (wall seconds) unless fake_clock=True below: a seeded
+    # draw under the real clock is only approximately reproducible (jitter shifts phase
+    # boundaries); bit-exact replay additionally needs fake_clock.
     import random as _random
     np.random.seed(int(seed))
     _random.seed(int(seed))
     print(f"[mp/birrt] RNG seeded: {int(seed)} (np.random + random) -- reproducible draw; "
-          f"runtime becomes a deterministic consultation budget, not wall seconds")
+          f"termination uses the "
+          + ("fake deterministic clock (consultation budget)"
+             if fake_clock else "REAL clock (wall seconds)"))
+  _reset_margin_audit = getattr(problem, "reset_margin_rejection_stats", None)
+  if callable(_reset_margin_audit):
+    _reset_margin_audit()                                  # report THIS planner pull, not setup
   from multi_robot_multi_goal_planning.planners.planner_birrtstar import BidirectionalRRTstar
   from multi_robot_multi_goal_planning.planners.rrtstar_base import BaseRRTConfig
   from multi_robot_multi_goal_planning.planners.shortcutting import robot_mode_shortcut
@@ -817,21 +1340,24 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
   # config) blacklists the whole chain to the start -> assert "Tried to add initial mode to the
   # invalid modes". Off, BiRRT plans the modes directly and just routes/searches per mode.
   cfg.with_mode_validation = False
-  # SEEDED runs also need a DETERMINISTIC clock: the tree search gates iterations on
+  # DETERMINISTIC-CLOCK OPTION (fake_clock=True): the tree search gates iterations on
   # time.time() elapsed (planner_birrtstar ptc.should_terminate), so machine jitter shifts a
   # phase boundary, the RNG stream offsets, and two identically-seeded draws diverge (measured:
-  # identical to state 15, different after). With a seed we swap time.time for a fake clock
+  # identical to state 15, different after). fake_clock swaps time.time for a fake clock
   # (+1ms per consultation) FOR THIS CALL ONLY: first-solution return still exits early, and
-  # the runtime budget becomes a deterministic consultation budget instead of wall seconds.
-  # perf_counter (pure accounting there) stays real. mr_bench itself is untouched.
+  # the runtime budget becomes a deterministic CONSULTATION budget instead of wall seconds --
+  # the tree phase can then run far longer than `runtime` wall seconds. perf_counter (pure
+  # accounting there) stays real. mr_bench itself is untouched.
   import time as _time_mod
   _real_time = _time_mod.time
-  if seed is not None:
+  if fake_clock:
     _fake_t = [_real_time()]
     def _fake_time():
       _fake_t[0] += 1e-3
       return _fake_t[0]
     _time_mod.time = _fake_time
+    print(f"[mp/birrt] fake clock ACTIVE: --mp-runtime {runtime:g} is a CONSULTATION budget "
+          f"(not wall seconds)")
   planner = BidirectionalRRTstar(problem, config=cfg)
   # PER-MODE PROGRESS BUDGET (stall_timeout, seconds): a wall shows up as the MODE FRONTIER
   # not growing while the tree burns transition attempts -- the "Failed to sample" stdout is
@@ -871,6 +1397,9 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
           f"{info['frontier_task_ids']}"
           + (f" -- STALLED (no frontier growth for {stall_timeout:g}s)"
              if info["stalled"] else ""))
+  _report_margin_audit = getattr(problem, "report_margin_rejections", None)
+  if callable(_report_margin_audit):
+    _report_margin_audit(info["frontier_task_ids"])
   if verbose:
     tag = "optimized" if optimize else "first solution"
     print(f"[mp/birrt] {tag}: {'%d states' % len(path) if path else 'NO path'}")
@@ -928,23 +1457,6 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
   return path, info
 
 
-def save_problem(path_json, build_params, robots, tasks, sequence_names):
-  """Persist the EXPORTED problem so the motion planner can be re-run later WITHOUT
-  re-solving the assembly: the scene is rebuilt from build_params, the goals are plain
-  joint vectors, types/frames are strings."""
-  data = {
-      "build_params": build_params,                        # to rebuild C_start
-      "robots": list(robots),
-      "sequence": list(sequence_names),
-      "tasks": [{"name": t.name, "robots": list(t.robots), "type": t.type,
-                 "frames": list(t.frames) if t.frames else None,
-                 "goal": (t.goal.goal.tolist() if hasattr(t.goal, "goal") else None)}
-                for t in tasks],
-  }
-  with open(path_json, "w") as f:
-    json.dump(data, f, indent=2)
-
-
 def task_signature(problem):
   """Fingerprint of the EXPORTED TASK STRUCTURE a path was planned against.
 
@@ -956,27 +1468,176 @@ def task_signature(problem):
   import hashlib
   h = hashlib.sha256()
   for t in problem.tasks:
-    h.update(("|".join([
+    fields = [
         str(getattr(t, "name", "")),
         str(getattr(t, "type", "")),
         ",".join(str(r) for r in (getattr(t, "robots", None) or [])),
         ",".join(str(f) for f in (getattr(t, "frames", None) or [])),
-    ]) + "\n").encode())
+    ]
+    h.update(("|".join(fields) + "\n").encode())
   return h.hexdigest()[:16]
 
 
-def save_path(path_json, path, problem=None):
+_EXPORT_FORMAT = "assembly-mp-export-v1"
+
+
+def _task_record(task):
+  goal = task.goal
+  members = getattr(goal, "goals", None)
+  paired = isinstance(goal, _PairedGoal)
+  return {"name": task.name, "robots": list(task.robots), "type": task.type,
+          "frames": None if task.frames is None else list(task.frames),
+          "goal_kind": "paired" if paired else ("set" if members is not None else "single"),
+          "goals": ([np.asarray(g, dtype=float).ravel().tolist() for g in members]
+                    if members is not None else
+                    [np.asarray(goal.goal, dtype=float).ravel().tolist()]),
+          "conditions": ([np.asarray(c, dtype=float).ravel().tolist()
+                          for c in goal.conditions] if paired else None),
+          "condition_indices": (goal.condition_indices.tolist() if paired else None),
+          "side_effect": getattr(task, "side_effect", None),
+          "side_effect_data": (None if getattr(task, "side_effect_data", None) is None else
+                               np.asarray(task.side_effect_data, dtype=float).ravel().tolist())}
+
+
+def _task_from_record(rec):
+  from multi_robot_multi_goal_planning.problems.planning_env import Task
+  from multi_robot_multi_goal_planning.problems.core.goals import SingleGoal, GoalSet
+  members = [np.asarray(g, dtype=float) for g in rec.get("goals") or []]
+  if not members:
+    raise ValueError(f"mp_export: persisted task {rec.get('name')!r} has no goal")
+  kind = rec.get("goal_kind")
+  if kind == "paired":
+    goal = _PairedGoal(rec.get("conditions") or [], members,
+                       rec.get("condition_indices") or [])
+  else:
+    goal = GoalSet(members) if kind == "set" else SingleGoal(members[0])
+  side_data = rec.get("side_effect_data")
+  task = Task(str(rec["name"]), list(rec.get("robots") or []), goal,
+              type=rec.get("type"), frames=rec.get("frames"),
+              side_effect=rec.get("side_effect"),
+              side_effect_data=(None if side_data is None else np.asarray(side_data, dtype=float)))
+  return task
+
+
+def make_export_bundle(problem, plan, joint_names, witnesses, pre_witnesses,
+                       witness_sets=None, settings=None):
+  """Serialize the FINAL, post-pass inputs that created an mr_bench problem.
+
+  Unlike the plan JSON's ``witnesses`` block, these are the witnesses *after* cograsp fusion,
+  plus every materialized pre-skill keyframe.  Supplying this bundle to ``make_problem`` with
+  ``resolve_missing_pre=False`` is therefore a zero-IK rebuild: it may reconstruct symbolic
+  attachments and collision geometry, but it can never call RobotIK.bind/KOMO.
+  """
+  vec = lambda w: None if w is None else [float(v) for v in np.asarray(w).ravel()]
+  return {
+      "format": _EXPORT_FORMAT,
+      "plan": [list(a) for a in plan],
+      "joints": list(joint_names),
+      "witnesses": [vec(w) for w in witnesses],
+      "pre_witnesses": {str(i): vec(w) for i, w in sorted((pre_witnesses or {}).items())},
+      "witness_sets": {str(i): [vec(w) for w in ws]
+                       for i, ws in sorted((witness_sets or {}).items())},
+      "settings": dict(settings or {}),
+      "tasks": [_task_record(t) for t in problem.tasks],
+      "step_names": [list(xs) for xs in getattr(problem, "step_names", [])],
+      "sequence_names": list(getattr(problem, "sequence_names",
+                                     [t.name for t in problem.tasks])),
+      "task_signature": task_signature(problem),
+  }
+
+
+def save_export_bundle(path_json, bundle):
+  with open(path_json, "w") as f:
+    json.dump(bundle, f, indent=2)
+
+
+def _export_blob(data):
+  if isinstance(data, dict) and data.get("format") == _EXPORT_FORMAT:
+    return data
+  if isinstance(data, dict):
+    return data.get("mp_export")
+  return None
+
+
+def load_export_bundle(path_json, plan, joint_names, required=True):
+  """Load and strictly validate a final export from a standalone file or saved MP path.
+
+  Returns arrays ready for ``make_problem``.  A malformed/mismatched bundle is fatal: replay
+  must never turn a persistence problem into an implicit IK re-solve.
+  """
+  with open(path_json) as f:
+    raw = json.load(f)
+  blob = _export_blob(raw)
+  if blob is None:
+    if required:
+      raise ValueError(
+          f"{path_json}: no {_EXPORT_FORMAT} block; refusing to rebuild witnesses during "
+          "replay (make one once with --mp-export-save, or explicitly refresh/re-export)")
+    return None
+  if blob.get("format") != _EXPORT_FORMAT:
+    raise ValueError(f"{path_json}: unsupported motion-export format {blob.get('format')!r}")
+  want_plan = [list(a) for a in plan]
+  if blob.get("plan") != want_plan:
+    raise ValueError(f"{path_json}: final export belongs to a different discrete plan")
+  if list(blob.get("joints") or []) != list(joint_names):
+    raise ValueError(f"{path_json}: final export joint order differs from the current scene")
+  n, nj = len(plan), len(joint_names)
+
+  def vec(w, where):
+    if w is None:
+      return None
+    q = np.asarray(w, dtype=float).ravel()
+    if q.size != nj:
+      raise ValueError(f"{path_json}: {where} has {q.size} joints, expected {nj}")
+    return q
+
+  ws = blob.get("witnesses") or []
+  if len(ws) != n:
+    raise ValueError(f"{path_json}: final export has {len(ws)} witnesses for {n} actions")
+  pre = {}
+  for k, w in (blob.get("pre_witnesses") or {}).items():
+    i = int(k)
+    if not 0 <= i < n:
+      raise ValueError(f"{path_json}: pre-witness index {i} is outside the plan")
+    pre[i] = vec(w, f"pre-witness {i}")
+  sets = {}
+  for k, members in (blob.get("witness_sets") or {}).items():
+    i = int(k)
+    if not 0 <= i < n:
+      raise ValueError(f"{path_json}: witness-set index {i} is outside the plan")
+    sets[i] = [vec(w, f"witness-set {i} member") for w in members]
+  tasks = list(blob.get("tasks") or [])
+  step_names = [list(xs) for xs in (blob.get("step_names") or [])]
+  sequence_names = list(blob.get("sequence_names") or [])
+  if not tasks or len(step_names) != n or len(sequence_names) != len(tasks):
+    raise ValueError(
+        f"{path_json}: final export lacks its exact task/step/sequence manifest; refusing "
+        "to infer current task semantics during replay")
+  return {"witnesses": [vec(w, f"witness {i}") for i, w in enumerate(ws)],
+          "pre_witnesses": pre, "witness_sets": sets or None,
+          "settings": dict(blob.get("settings") or {}),
+          "tasks": tasks, "step_names": step_names, "sequence_names": sequence_names,
+          "task_signature": blob.get("task_signature"), "raw": blob}
+
+
+def save_path(path_json, path, problem=None, mp_export_bundle=None):
   """Persist a solved BiRRT PATH (main --motion-plan --mp-save). Each mr_bench State ->
   {"q": joint vector, "mode": task_ids}. The discrete PLAN (main --save) must be saved from
   the SAME run: load_path replays against a problem REBUILT from that plan (make_problem is
   deterministic, so task ids / modes align).
 
-  FORMAT: a bare LIST historically; with `problem` it becomes
-  {"states": [...], "task_signature": ...} so a mismatched plan/path pair is DETECTED rather
-  than silently relinking at the wrong tasks. load_path reads both, so old files still work."""
+  FORMAT: a bare LIST historically; with `problem` it becomes a dict containing states and a
+  task signature. Current main.py also supplies ``mp_export_bundle``: the exact post-fusion
+  witnesses, pre-keyframes and task manifest are embedded beside the path, so viewers/sim need
+  no IK or task inference. load_path still reads the historical forms, but execution requires
+  an explicit legacy refresh when that final-export block is absent."""
   states = [s.to_dict() for s in path] if path else []
   blob = states if problem is None else {"states": states,
                                         "task_signature": task_signature(problem)}
+  if mp_export_bundle is not None:
+    if not isinstance(blob, dict):
+      blob = {"states": states}
+    blob["mp_export"] = mp_export_bundle
   with open(path_json, "w") as f:
     json.dump(blob, f, indent=2)
 
@@ -1021,6 +1682,7 @@ def load_path(path_json):
     states, sig = data, None
   out = [_PathState(d["q"], _Mode(d["mode"])) for d in states]
   load_path.last_signature = sig                             # checked by the caller, if present
+  load_path.last_export = _export_blob(data)
   return out
 
 
@@ -1321,13 +1983,13 @@ def report_cograsp_drift(C, problem, mp_path, robot_ik, tol_mm=1.0, tol_deg=1.0,
   report_problem_clearance (that one checks the task-goal KEYFRAMES; this one checks what
   happens BETWEEN them).
 
-  Two grippers on one group are a CLOSED kinematic loop, but the exporter never closes it:
-  add_grasp leaves as a bare type="goto" (see the TODO at the add_grasp branch of build_tasks)
-  and a continuing holder is pinned only by a joint goal, so between keyframes both tool
-  centres are welded to the SAME object yet free to move independently. This replays the
-  planned path through rai FK and measures, per co-grasp span and per gripper pair, how far
-  the pair's RELATIVE transform drifts from its value at the span's first path state -- a
-  perfect brace holds it at 0.
+  Two grippers on one group are a CLOSED kinematic loop. mr_bench does not project sampled
+  paths onto that relative-pose manifold. build_tasks couples the KEYFRAMES only: add_grasp
+  and pre-assemble share one all-arm rendezvous, and adjacent releases reuse the assembly
+  endpoint instead of adding a pointless transport goal. It deliberately does not add an
+  interior controller/manifold constraint; ordinary BiRRT may detour. This diagnostic
+  quantifies that distinction by replaying the path through rai FK and measuring how far
+  each gripper pair's relative transform drifts from the span's first state.
 
   FRAMES: robot_ik.gripper_frame[r], the tool centre the grasp IK constrains. Both frames are
   robot-mounted, so their relative pose is a pure function of q: the attach mode is irrelevant
@@ -1370,7 +2032,15 @@ def report_cograsp_drift(C, problem, mp_path, robot_ik, tol_mm=1.0, tol_deg=1.0,
   mkey = lambda m: tuple(np.atleast_1d(m.task_ids).tolist())
   order = {mkey(m): k for k, m in enumerate(mode_sequence(problem))}
   tid = {t.name: i for i, t in enumerate(problem.tasks)}
-  last = sorted(max(tid[nm] for nm in nms) for nms in problem.step_names if nms)
+  # Most split actions complete at their last task. A post-release departure is different:
+  # the discrete release/attach side effect fires at the preceding framed task, and the arm
+  # retracts in the already-released state. Prefer the last task carrying frames; fall back to
+  # the syntactic last task for pure-goto actions such as add_grasp.
+  by_name = {t.name: t for t in problem.tasks}
+  def _completion_tid(nms):
+    effect = [tid[nm] for nm in nms if getattr(by_name[nm], "frames", None)]
+    return max(effect) if effect else max(tid[nm] for nm in nms)
+  last = sorted(_completion_tid(nms) for nms in problem.step_names if nms)
   done = [int(np.searchsorted(last, order[mkey(st.mode)], side="left")) for st in mp_path]
 
   def cograsps(state):
@@ -1442,8 +2112,9 @@ def report_cograsp_drift(C, problem, mp_path, robot_ik, tol_mm=1.0, tol_deg=1.0,
             f"{other} rel {anchor}: max {mm:8.1f}mm @path[{kmm}], "
             f"{deg:6.1f}deg @path[{kdeg}]{flag}")
     if bad:
-      print("[cograsp] a co-grasp is a CLOSED kinematic loop the export does not close "
-            "(add_grasp -> type=\"goto\"): these are two grippers welded to ONE object moving "
-            "independently. Deviation is measured from the span's FIRST path state and is 0 "
-            "there by construction.")
+      print("[cograsp] a co-grasp is a CLOSED kinematic loop. The planner does not project "
+            "onto that manifold. Shared add/assemble/release KEYFRAMES prevent a separate "
+            "joint-transport goal but do not constrain the path interior, so detour drift is "
+            "expected here unless a controller-aware planner is used elsewhere. Deviation "
+            "is measured from the span's FIRST path state and is 0 there by construction.")
   return rows

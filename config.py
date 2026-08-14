@@ -20,6 +20,7 @@ Usage:
 CLI:  python main.py --config myrun.json --seed 3    (file is the base; --seed 3 overrides).
 """
 import argparse
+import dataclasses
 import json
 from dataclasses import dataclass, asdict, fields
 from typing import Optional
@@ -143,10 +144,10 @@ class RunConfig:
   optimize_witnesses: Optional[str] = "floor"
   witness_clearance: float = 0.0
   witness_draw: Optional[int] = None
-  witness_sets: int = 0
+  witness_sets: int = 4
   witness_set_spread: float = 0.05
   ban_actions: Optional[str] = None
-  witness_margin: Optional[float] = None
+  witness_margin: Optional[float] = 0.005
   witness_branch_budget: int = 5
   witness_branch_metric: str = "sign"
   witness_reconfig_thresh: float = 1.5707963267948966
@@ -156,9 +157,10 @@ class RunConfig:
   # -- skills / pre-insertion splits --
   skill: float = 0.0
   pre_insertion: float = 0.05
-  pre_pick: float = 0.0
-  pre_place: float = 0.0
-  pre_add_grasp: float = 0.0
+  pre_pick: float = 0.05
+  pre_place: float = 0.05
+  pre_add_grasp: float = 0.05
+  post_release: float = 0.05
   fuse_pre_skill: Optional[bool] = None   # None = auto (ON when a pre-insertion/
                                           # pre-add-grasp split is present)
 
@@ -176,11 +178,14 @@ class RunConfig:
   mp_clearance: bool = False
   mp_cograsp: bool = False
   mp_save: Optional[str] = None
+  mp_export_save: Optional[str] = None
+  mp_export_load: Optional[str] = None
   mp_collision_tolerance: float = 1e-4
   mp_robot_margin: float = 0.1
   mp_margin_ramp: float = 0.1
   mp_table_margin: float = 0.0
   mp_seed: Optional[int] = None
+  mp_fake_clock: bool = False
   mp_viser: bool = False
   mp_collision_view: bool = False
   mp_modes: bool = False
@@ -238,6 +243,17 @@ class RunConfig:
       raise ValueError(f"RunConfig: unknown key(s) {sorted(unknown)}")
     return cls(**{k: v for k, v in d.items() if k in known})
 
+  @classmethod
+  def default_for(cls, key):
+    """The built-in default of one field -- the SINGLE source of defaults for saved-plan
+    rebuilds. replay.py/sim.py resolve missing config keys through this (via saved_cfg)
+    instead of hand-copied literals, so the parser, RunConfig, and the rebuild paths can
+    never drift apart."""
+    for f in fields(cls):
+      if f.name == key:
+        return None if f.default is dataclasses.MISSING else f.default
+    raise KeyError(f"RunConfig has no field {key!r}")
+
   # ---- persistence (JSON; yaml not a project dep). NB: named to_file/from_file, not
   # save/load, because `save` is itself a config FIELD (the --save CLI dest) and a method of
   # the same name would shadow it. ----
@@ -253,6 +269,33 @@ class RunConfig:
     # A saved PLAN file (plan_io: {"config": {...}, "plan": [...]}) carries its config as a
     # nested block. Accept it directly so `--config plan.json --load-plan plan.json` (the
     # documented re-export idiom) works without hand-extracting the block.
-    if isinstance(d.get("config"), dict) and "plan" in d:
+    is_saved_plan = isinstance(d.get("config"), dict) and "plan" in d
+    if is_saved_plan:
       d = d["config"]
+      # New robustness defaults change search feasibility and exported task structure. A plan
+      # predating a field must replay with the historical OFF value, never acquire new tasks or
+      # a stronger IK gate merely because today's default changed.
+      legacy = {"witness_margin": None, "witness_sets": 0,
+                "pre_pick": 0.0, "pre_place": 0.0, "pre_add_grasp": 0.0,
+                "post_release": 0.0}
+      d = dict(d)
+      # Persistence-only provenance, deliberately not a RunConfig/CLI field.  It certifies
+      # the clearance gate that was active DURING SEARCH (as opposed to the historical
+      # witness-only --witness-margin).  main.py reads it from the raw plan before loading;
+      # RunConfig must ignore it so a saved plan remains usable as --config.
+      d.pop("_search_witness_margin", None)
+      for key, value in legacy.items():
+        d.setdefault(key, value)
     return cls.from_dict(d)
+
+
+def saved_cfg(cfg, key, legacy=None):
+  """Read one entry of a SAVED plan's config block. The saved value wins whenever the key is
+  present; a MISSING key means the plan predates that flag, and the value is the RunConfig
+  default (via RunConfig.default_for) -- the one place defaults live. `legacy` overrides that
+  ONLY for keys whose solve-time default differed from today's default (each call site names
+  the historical value and why), so old plans replay against the geometry/action space they
+  were actually solved in, not today's defaults."""
+  if key in cfg:
+    return cfg[key]
+  return RunConfig.default_for(key) if legacy is None else legacy

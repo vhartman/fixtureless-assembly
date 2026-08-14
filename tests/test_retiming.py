@@ -122,6 +122,67 @@ def test_split_stretches_matches_old():
     assert len(nq) == len(oq) and all(np.allclose(a, b) for a, b in zip(nq, oq))
 
 
+def test_compact_stretches_removes_dense_shortcut_samples_but_keeps_barriers():
+  # Two serialized straight shortcut edges in different modes. Their shared task witness must
+  # remain an exact endpoint of BOTH independently compacted stretches.
+  a = [np.array([x, 0.0]) for x in np.linspace(0.0, 1.0, 21)]
+  b = [np.array([1.0, y]) for y in np.linspace(0.0, 2.0, 31)]
+  out, rep = retiming.compact_stretches([(a, [3]), (b, [7])])
+  assert [len(w) for w, _ in out] == [2, 2]
+  assert out[0][1] == [3] and out[1][1] == [7]
+  assert np.array_equal(out[0][0][-1], a[-1])
+  assert np.array_equal(out[1][0][0], b[0])
+  assert np.array_equal(out[0][0][-1], out[1][0][0])
+  assert rep["removed"] == 48
+  assert abs(rep["arc_after"] - rep["arc_before"]) < 1e-12
+
+
+def test_compact_polyline_preserves_corners_and_collinear_backtracking():
+  corner = [np.array([0.0, 0.0]), np.array([0.5, 0.0]), np.array([1.0, 0.0]),
+            np.array([1.0, 1.0])]
+  compact = retiming.compact_polyline(corner)
+  assert len(compact) == 3
+  assert np.array_equal(compact[1], [1.0, 0.0])              # real corner survives
+
+  backtrack = [np.array([0.0]), np.array([1.0]), np.array([0.25]), np.array([2.0])]
+  compact = retiming.compact_polyline(backtrack)
+  assert len(compact) > 2                                   # same line, different path geometry
+  before = sum(np.linalg.norm(b - a) for a, b in zip(backtrack, backtrack[1:]))
+  after = sum(np.linalg.norm(b - a) for a, b in zip(compact, compact[1:]))
+  assert after == pytest.approx(before)
+
+
+def test_audit_path_checks_interpolated_configs_in_their_exact_mode():
+  modes = [object(), object()]
+  stretches = [([np.array([0.0]), np.array([1.0])], [1]),
+               ([np.array([1.0]), np.array([2.0])], [2])]
+  seen = []
+  def free(q, mode):
+    seen.append((float(q[0]), mode))
+    bad = mode is modes[0] and 0.49 <= q[0] <= 0.51
+    return (not bad), ({"pair": "arm~table"} if bad else None)
+  rep = retiming.audit_path(stretches, modes, free, limits=([-3.0], [3.0]),
+                            resolution=0.1)
+  assert not rep["ok"] and rep["kind"] == "collision"
+  assert rep["stretch"] == 0 and rep["alpha"] == pytest.approx(0.5)
+  assert rep["detail"] == {"pair": "arm~table"}
+  assert all(mode is modes[0] for _, mode in seen)            # failed before next mode
+
+
+def test_audit_path_reports_joint_limit_before_collision_callback():
+  calls = {"n": 0}
+  def free(_q, _mode):
+    calls["n"] += 1
+    return True
+  rep = retiming.audit_path(
+      [([np.array([0.0, 0.0]), np.array([0.0, 1.2])], [1])], [object()], free,
+      limits=([-1.0, -1.0], [1.0, 1.0]), resolution=0.1)
+  assert not rep["ok"] and rep["kind"] == "joint_limits"
+  assert rep["joint_indices"] == [1]
+  assert rep["q"][1] > 1.0
+  assert calls["n"] == rep["samples"] - 1
+
+
 def _two_arm_stretches():
   # 2 arms (1 dof each): arm0 moves 0->1->2 (mate at each barrier), arm1 moves 0->3->6.
   # barrier0 done by task 10 (arm0 acting), barrier1 done by task 11 (arm0 acting).

@@ -221,6 +221,27 @@ def test_fuse_cograsp_defaults_on_and_the_flag_turns_it_off():
   assert main.parse_args([]).mp_cograsp is False
 
 
+def test_holder_mapping_uses_canonical_robot_order():
+  """A state's grasp contacts are frozensets; their hash order must not leak into MP goals."""
+  import solver as S
+
+  class _HolderState:
+    supports = {"obj_0": frozenset({
+        ("grasp", "a2", "obj_0", 2),
+        ("grasp", "a0", "obj_0", 0),
+        ("grasp", "a1", "obj_0", 1),
+    })}
+
+    def bodies(self):
+      return ["obj_0"]
+
+  rik = object.__new__(S.RobotIK)
+  rik.robots = ["a0", "a1", "a2"]
+  holders = rik.holders(_HolderState())
+  assert list(holders) == rik.robots
+  assert rik._holders_of_group(_HolderState(), {"obj_0"}) == rik.robots
+
+
 def test_fuse_is_an_exact_noop_when_there_is_no_cograsp():
   """A plan without add_grasp has no (add_grasp, assemble) pair, so the pass must hand back
   the SAME witnesses in a NEW list -- no re-solve, no mutation of the caller's list."""
@@ -244,7 +265,7 @@ def test_fuse_is_an_exact_noop_when_there_is_no_cograsp():
   stub.C = C
   wit = [np.arange(3.0) if i % 2 else None for i in range(len(plan))]
   out, rep = S.fuse_cograsp_witnesses(C, asm, plan, wit, robots, stub, verbose=False)
-  assert rep == {"pairs": 0, "fused": 0, "rows": []}
+  assert rep == {"pairs": 0, "fused": 0, "rows": [], "pre_witnesses": {}}
   assert out is not wit and len(out) == len(wit)
   assert all(a is b for a, b in zip(out, wit))             # untouched, not merely equal
 

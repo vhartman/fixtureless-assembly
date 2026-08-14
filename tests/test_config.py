@@ -27,6 +27,26 @@ def test_defaults_match_parser():
     assert cd[k] == pd[k], f"default drift on {k}: RunConfig={cd[k]!r} parser={pd[k]!r}"
 
 
+def test_default_for_matches_field_defaults():
+  """RunConfig.default_for is THE source of defaults for saved-config rebuilds: it must agree
+  with the live field defaults, or replay/sim fallbacks silently drift."""
+  rc = RunConfig()
+  for k, v in rc.to_dict().items():
+    assert RunConfig.default_for(k) == v, f"default_for drift on {k}"
+
+
+def test_default_for_unknown_key_raises():
+  with pytest.raises(KeyError):
+    RunConfig.default_for("not_a_flag")
+
+
+def test_saved_cfg_saved_wins_missing_default_legacy_override():
+  from config import saved_cfg
+  assert saved_cfg({"seed": 7}, "seed") == 7
+  assert saved_cfg({}, "parts") == RunConfig.default_for("parts")
+  assert saved_cfg({}, "part_float", legacy=0.015) == 0.015
+
+
 def test_namespace_roundtrip():
   """A parsed namespace survives from_namespace -> to_namespace unchanged (all fields but the
   meta `config`)."""
@@ -68,6 +88,55 @@ def test_no_config_path_unchanged():
   for k, v in _parser_defaults().items():
     assert a[k] == v, f"{k} changed on the no-config path: {a[k]!r} != {v!r}"
   assert a.get("config") is None
+
+
+def test_loaded_plan_is_not_hoisted_twice_without_explicit_request():
+  """A saved plan already contains post-passes; its saved true flag is provenance only."""
+  fresh = RunConfig(hoist_releases=True)
+  loaded = RunConfig(load_plan="plan.json", hoist_releases=True)
+  assert main._should_hoist_plan(fresh, set())
+  assert not main._should_hoist_plan(loaded, set())
+  assert main._should_hoist_plan(loaded, {"hoist_releases"})
+  loaded.hoist_releases = False
+  assert not main._should_hoist_plan(loaded, {"hoist_releases"})
+
+
+def test_mp_export_clearance_settings_default_to_saved_artifact():
+  """Zero-IK export replay is exact unless this invocation explicitly retunes planning."""
+  cfg = RunConfig(mp_collision_tolerance=0.7, mp_robot_margin=0.6,
+                  mp_margin_ramp=0.5, mp_table_margin=0.4, part_float=0.03)
+  saved = {"collision_tolerance": 1e-4, "robot_robot_margin": 0.1,
+           "robot_margin_ramp": 0.1, "table_margin": 0.02, "table_float": 0.007}
+  values, sources = main._merge_mp_export_clearance_settings(cfg, saved, explicit=set())
+  assert values == saved
+  assert set(sources.values()) == {"export"}
+
+
+def test_explicit_cli_overrides_mp_export_clearance_settings_independently():
+  """A named CLI knob wins without accidentally replacing the other saved defaults."""
+  cfg = RunConfig(mp_collision_tolerance=0.2, mp_robot_margin=0.0,
+                  mp_margin_ramp=0.03, mp_table_margin=0.04, part_float=0.012)
+  saved = {"collision_tolerance": 1e-4, "robot_robot_margin": 0.1,
+           "robot_margin_ramp": 0.1, "table_margin": 0.02, "table_float": 0.007}
+  values, sources = main._merge_mp_export_clearance_settings(
+      cfg, saved, explicit={"mp_collision_tolerance", "mp_robot_margin", "mp_table_margin"})
+  assert values == {"collision_tolerance": 0.2, "robot_robot_margin": 0.0,
+                    "robot_margin_ramp": 0.1, "table_margin": 0.04,
+                    "table_float": 0.012}
+  assert sources == {"collision_tolerance": "CLI", "robot_robot_margin": "CLI",
+                     "robot_margin_ramp": "export", "table_margin": "CLI",
+                     "table_float": "CLI/scene"}
+
+
+def test_explicit_zero_table_margin_also_zeros_derived_table_float():
+  cfg = RunConfig(mp_table_margin=0.0, part_float=0.012)
+  values, sources = main._merge_mp_export_clearance_settings(
+      cfg, {"table_margin": 0.02, "table_float": 0.007},
+      explicit={"mp_table_margin", "mp_margin_ramp"})
+  assert values["table_margin"] == 0.0
+  assert values["table_float"] == 0.0
+  assert values["robot_margin_ramp"] == cfg.mp_margin_ramp
+  assert sources["table_float"] == "CLI/scene"
 
 
 def test_run_library_entry():

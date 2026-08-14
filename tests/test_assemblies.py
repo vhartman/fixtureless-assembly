@@ -56,6 +56,29 @@ def _replay_ok(plan, asm, C, robots_list, gk, bracing=False):
   return s.is_goal(asm)
 
 
+def test_release_reroots_same_part_cograsps_by_robot_roster():
+  """Releasing the primary holder must choose a deterministic remaining root.
+
+  Chair ends with a1 and a3 co-grasping obj_0 after a2 releases it, followed by
+  ``place a1``.  Both remaining contacts are on the same part, so a part-only tie-break
+  leaked frozenset/PYTHONHASHSEED order into the symbolic state and intermittently made
+  that saved place action impossible to replay.
+  """
+  contacts = frozenset({("grasp", "a1", "obj_0", 8),
+                        ("grasp", "a2", "obj_0", 6),
+                        ("grasp", "a3", "obj_0", 1)})
+  state = A.State(parent={"obj_0": ("gripper", "a2")},
+                  grasp={"obj_0": 6}, supports={"obj_0": contacts})
+
+  def after_a2_release(roster):
+    return next(ns for action, ns in A.releases(state, None, roster)
+                if action == ("release", "a2", "obj_0"))
+
+  assert after_a2_release(["a1", "a2", "a3"]).parent["obj_0"] == ("gripper", "a1")
+  # The selection follows the explicit canonical roster, not lexical or set order.
+  assert after_a2_release(["a3", "a2", "a1"]).parent["obj_0"] == ("gripper", "a3")
+
+
 SLACK = 3                                                  # tolerated length jitter over baseline
 
 # (kind, n_parts, robots, weight, baseline_len). weight inf == greedy (keeps the hardest

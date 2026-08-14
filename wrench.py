@@ -87,10 +87,12 @@ PARAMS = {
     # how the insertion-uncertainty box is discharged into a stability check:
     #   "corners" (default, EXACT): every box corner must be balanceable, contacts free to
     #             rechoose their force split per realization (fully-adjustable robustness);
-    #   "affine"  (CONSERVATIVE): one fixed AFFINE force-response policy must cover the whole box
+    #   "affine": one fixed AFFINE force-response policy must cover the LINEARIZED box
     #             -- an open-loop / fixed-compliance grasp that cannot sense the seating error and
-    #             re-optimize. A single LP (vs 2^k corner solves); sound but stricter. See
-    #             equilibrium_robust_affine. Ignored when insertion_uncertainty is None.
+    #             re-optimize. A single LP (vs 2^k corner solves); stricter per axis, but sound
+    #             only without a positional offset (see equilibrium_robust_affine; the planner
+    #             falls back to 'corners' when both box axes are nonzero). Ignored when
+    #             insertion_uncertainty is None.
     "robust_mode": "corners",
     # GRASP COMPLIANCE (--grasp-compliance): per-kind multiplier on the INSERTION-UNCERTAINTY
     # box when that kind holds a body in the press's load path. A suction cup is a COMPLIANT
@@ -463,9 +465,12 @@ def equilibrium_robust_affine(G, ub, w0, deltas, bounds=None, tol=1e-6):
       lam(s) = lam0 + sum_j s_j * lam_j ,   s in [-1,1]^m
 
   that stays in [0,ub] AND balances w0 + sum_j s_j*delta_j for EVERY s in the box? Because an
-  affine policy is one admissible way to respond, its feasibility IMPLIES every corner is stable
-  (sound, conservative). It rejects cases that would require the contacts to switch strategy
-  between realizations. One LP replaces the 2^m corner solves.
+  affine policy is one admissible way to respond, its feasibility implies the corners OF THE
+  LINEARIZED BOX (w0 +- delta_j) are stable. SOUNDNESS LIMIT: when the box mixes force and
+  point-shift generators, the TRUE corners additionally carry a bilinear cross couple
+  (shift x tilt) that no linear policy can express -- this certificate is then not valid for
+  the true box (problem._robust_stable falls back to the exact corner test in that case).
+  One LP replaces the 2^m corner solves.
 
   Physical reading: lam0 is the nominal grasp/support load; lam_j is a fixed linear reaction gain
   to disturbance axis j -- an open-loop / fixed-compliance grasp that cannot sense the exact

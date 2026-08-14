@@ -854,6 +854,138 @@ def split_stretches(states, q_of, mode_of, taskids_of):
   return out
 
 
+def compact_polyline(points, atol=1e-9, rtol=1e-10):
+  """Remove redundant samples without changing a joint-space polyline.
+
+  mr_bench's shortcut pass serializes every interpolation sample along each accepted straight
+  edge.  Those samples are useful while checking the edge, but they are not geometric knots.
+  Passing all of them to ``spline_path`` turns one shortcut edge into dozens of independent
+  cubic spans and makes certification scale with serialization density rather than path shape.
+
+  A subsequence is collapsed only when (a) every point lies on its endpoint segment and (b)
+  its accumulated arc length equals the endpoint chord.  The second condition deliberately
+  preserves collinear backtracking.  Returned points are references to original samples, so
+  exact task witnesses are never numerically reconstructed.
+  """
+  P = [np.asarray(p, float) for p in points]
+  if len(P) <= 2:
+    return P
+
+  keep = {0, len(P) - 1}
+  stack = [(0, len(P) - 1)]
+  while stack:
+    lo, hi = stack.pop()
+    if hi <= lo + 1:
+      continue
+    a, b = P[lo], P[hi]
+    d = b - a
+    dd = float(d @ d)
+    seg = [float(np.linalg.norm(P[k + 1] - P[k])) for k in range(lo, hi)]
+    arc = float(sum(seg))
+    chord = float(np.sqrt(dd))
+    eps = float(atol) + float(rtol) * max(1.0, arc)
+
+    max_dev, split = -1.0, lo + 1
+    for k in range(lo + 1, hi):
+      if dd <= 1e-30:
+        dev = float(np.linalg.norm(P[k] - a))
+      else:
+        t = float(np.clip((P[k] - a) @ d / dd, 0.0, 1.0))
+        dev = float(np.linalg.norm(P[k] - (a + t * d)))
+      if dev > max_dev:
+        max_dev, split = dev, k
+
+    if max_dev <= eps and arc - chord <= eps:
+      continue                                             # exact monotone interpolation run
+    if max_dev <= eps:                                     # collinear but doubles back
+      cumulative = np.cumsum(seg)
+      split = lo + 1 + int(np.argmin(np.abs(cumulative[:-1] - 0.5 * arc)))
+    keep.add(split)
+    stack.append((lo, split))
+    stack.append((split, hi))
+  return [P[k] for k in sorted(keep)]
+
+
+def compact_stretches(stretches, atol=1e-9, rtol=1e-10):
+  """Compact every mode stretch independently, preserving all barrier endpoints."""
+  out, before, after = [], 0, 0
+  arc_before = arc_after = 0.0
+  for waypoints, done in stretches:
+    w = [np.asarray(q, float) for q in waypoints]
+    c = compact_polyline(w, atol=atol, rtol=rtol)
+    before += len(w)
+    after += len(c)
+    arc_before += sum(float(np.linalg.norm(b - a)) for a, b in zip(w, w[1:]))
+    arc_after += sum(float(np.linalg.norm(b - a)) for a, b in zip(c, c[1:]))
+    out.append((c, list(done)))
+  return out, {"before": before, "after": after, "removed": before - after,
+               "arc_before": arc_before, "arc_after": arc_after}
+
+
+def iter_stretch_samples(stretches, resolution=0.01):
+  """Yield dense, mode-local samples as ``(n, stretch, edge, alpha, q)``.
+
+  Resolution follows mr_bench's edge checker: maximum absolute joint motion, not composite
+  Euclidean arc.  Each stretch emits its first endpoint even when it duplicates the previous
+  stretch's last endpoint, because the attachment mode changed at that exact configuration.
+  """
+  resolution = float(resolution)
+  if resolution <= 0.0:
+    raise ValueError("path audit resolution must be positive")
+  n = 0
+  for k, (waypoints, _done) in enumerate(stretches):
+    w = [np.asarray(q, float) for q in waypoints]
+    if not w:
+      continue
+    yield n, k, 0, 0.0, w[0]
+    n += 1
+    for edge, (a, b) in enumerate(zip(w, w[1:])):
+      steps = max(1, int(np.ceil(float(np.max(np.abs(b - a))) / resolution)))
+      for j in range(1, steps + 1):
+        alpha = j / steps
+        yield n, k, edge, alpha, a + alpha * (b - a)
+        n += 1
+
+
+def audit_path(stretches, modes, free_of, limits=None, resolution=0.01,
+               joint_tolerance=1e-9):
+  """Strictly audit a mode-tagged base path before any smoothing or retiming.
+
+  ``free_of(q, mode)`` may return a bool or ``(bool, detail)``.  The first failure is returned
+  as structured data so callers can name the exact mode, edge, interpolation fraction, joint,
+  or collision pair.  A successful report contains the number of checked samples.
+  """
+  if len(stretches) != len(modes):
+    raise ValueError(f"path audit has {len(stretches)} stretches but {len(modes)} modes")
+  lim = None
+  if limits is not None:
+    lo, hi = (np.asarray(x, float) for x in limits)
+    lim = (lo, hi)
+  checked = 0
+  for sample, stretch, edge, alpha, q in iter_stretch_samples(stretches, resolution):
+    checked += 1
+    if lim is not None:
+      lo, hi = lim
+      if q.shape != lo.shape or q.shape != hi.shape:
+        raise ValueError(
+            f"path audit joint vector has shape {q.shape}, limits are {lo.shape}/{hi.shape}")
+      bad = np.flatnonzero((q < lo - joint_tolerance) | (q > hi + joint_tolerance))
+      if len(bad):
+        return {"ok": False, "kind": "joint_limits", "samples": checked,
+                "sample": sample, "stretch": stretch, "edge": edge, "alpha": alpha,
+                "q": q, "joint_indices": bad.tolist(), "lower": lo[bad], "upper": hi[bad]}
+    verdict = free_of(q, modes[stretch])
+    if isinstance(verdict, tuple):
+      ok, detail = verdict
+    else:
+      ok, detail = verdict, None
+    if not bool(ok):
+      return {"ok": False, "kind": "collision", "samples": checked,
+              "sample": sample, "stretch": stretch, "edge": edge, "alpha": alpha,
+              "q": q, "detail": detail}
+  return {"ok": True, "samples": checked}
+
+
 # =============================================================================================
 # CORRIDOR RETIMING  --  the principled replacement for greedy desync + wedge recovery.
 #

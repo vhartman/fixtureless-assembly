@@ -98,6 +98,22 @@ def test_antipodal_width_within_aperture():
   assert n_pinch > 0, "no antipodal rows sampled at all"
 
 
+def test_cylinder_pinches_include_both_axial_approaches():
+  """A peg held for insertion needs the palm on the free end, not through the socket.
+
+  Antipodal contacts fix the closing axis but leave two valid approach directions.  The
+  sampled DB must retain both signs, just as the face enumerator retains two pinch rolls.
+  """
+  P.set_sampled_grasps({"seed": 0, "candidates": 200, "keep": 12,
+                        "margin": 0.008, "pad_support": 0.75})
+  poses = P.part_grasp_poses(CYL)
+  meta = P.sampled_grasp_meta(CYL)
+  axial = [(P._quat_to_R(np.asarray(q[3:])) @ np.array([0.0, 0.0, 1.0]))[2]
+           for q, m in zip(poses, meta) if m["family"] == "pinch"]
+  assert any(z > 0.8 for z in axial), axial
+  assert any(z < -0.8 for z in axial), axial
+
+
 def test_cli_defaults_and_guard():
   assert RunConfig().grasp_sampler is False
   a = main.parse_args([])

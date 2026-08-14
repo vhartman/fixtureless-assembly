@@ -420,6 +420,8 @@ class RobotIK:
     self.pre_pick_delta = 0.0
     self.pre_place_delta = 0.0
     self.pre_add_grasp_delta = 0.0   # brace/handover reach: retract like pick (-z_EE)
+    self.post_release_delta = 0.0    # depart from a released grasp along the same -z_EE axis
+    self.post_release_used_delta = None  # actual adaptive departure used by the last solve
     self.pre_insertion_pull = 1.0   # qItself pull weight tying T_pre to the skill witness (<1e1)
     # DEPTH-GATED collision reject on the exact analytic branches (None = off). The full
     # solve's tolerant pose eq can rescue a GRAZING branch (measured: rescues sat at <=10mm
@@ -449,16 +451,24 @@ class RobotIK:
                                                         # maintenance pins keep 1e1 -- raising
                                                         # a FROZEN pair's weight makes solves
                                                         # infeasible, see _add_pin's comment)
-    # --witness-margin (metres, None = off): ROBUST-KEYFRAME gate. A witness is rejected
-    # unless every NON-INTENDED pair clears this margin: (non-hand arm link) vs (part) and
-    # (arm link) vs (other arm's link). Intended contacts stay legal: the HAND touching its
-    # payload, part-part mates, anything with the table. Motivation (chair-8): keyframes
-    # legal-by-a-hair (-1.35mm forearm inside the arm's OWN carried leg, within the
-    # penetration tolerance) have measure-near-zero connectable neighbourhoods -- the motion
-    # planner samples them but can never CONNECT them. Robust keyframes make the exported
-    # anchors fat enough to plan to. Scoped by main to the WITNESS passes (search untouched).
+    # --witness-margin (metres, None/0 = off): SHARED SEARCH+WITNESS clearance gate. Every
+    # accepted search IK and every later witness re-solve uses this SAME predicate; a post-pass
+    # is never allowed to invent a stricter notion of feasibility than the discrete search.
+    # The gate covers every non-intended arm/part, inter-arm and non-adjacent self-collision
+    # pair reported by rai. Only pair-specific grasp contacts are exempt (a hand touching the
+    # payload attached to THAT hand, or the acting hand touching THIS action's grasp target),
+    # plus part/part and table pairs. This hard minimum complements witness_floor's summed
+    # robot/table score: many far pairs can no longer hide one measure-near-zero pair.
     self.clearance_reject = None
     self.margin_rejects = 0
+    self.margin_reject_pairs = {}
+    self.last_margin_reject = None
+    # Some rai configs with a released, formerly attached multi-part group expose six named
+    # arm joints but retain a seventh internal qIndex slot. Constant-initializing such a KOMO
+    # with the otherwise-correct six-value analytic seed raises instead of merely rejecting
+    # the seed. Remember those action/scene shapes and fall back to KOMO's own initializer.
+    self.seed_init_incompatible = set()
+    self.seed_init_skips = 0
     # DEBUG: set env PEN_VIEW_ACTION='pick a1 obj_1 0' to open a BLOCKING C.view(True) on the
     # FIRST penetration check of that exact action (space-joined tuple) -- prints the colliding
     # frame pairs and shows the skill scene at the checked witness. For inspecting whether a
@@ -496,8 +506,14 @@ class RobotIK:
 
   def holders(self, state):
     # {robot: (grasped_part, grasp_id)} -- who holds what, at which grasp, in this state.
-    return {c[1]: (c[2], c[3]) for p in state.bodies()
-            for c in state.supports.get(p, ()) if c[0] == "grasp"}
+    # Contacts are frozensets, whose iteration order changes with Python's hash seed.  Keep
+    # this mapping in the scene's canonical robot order: several downstream task builders
+    # preserve dict iteration order when concatenating multi-robot goals, so leaking the set
+    # order here made identical plan rebuilds produce different task signatures (and could
+    # swap goal-vector slices between robots).
+    found = {c[1]: (c[2], c[3]) for p in state.bodies()
+             for c in sorted(state.supports.get(p, ())) if c[0] == "grasp"}
+    return {r: found[r] for r in self.robots if r in found}
 
   def ee_target(self, robot, part, grasp_id, assembly):
     # the gripper's target pose relative to its grasped part: the part's generated grasp,
@@ -1059,44 +1075,103 @@ class RobotIK:
 
   _HAND_TOKENS = ("gripper", "palm", "finger", "robotiq", "vacuum")
 
+  def _arm_of_frame(self, frame):
+    for r in self.robots:
+      if str(frame).startswith(r + "_") or str(frame) == r:
+        return r
+    return None
+
+  @staticmethod
+  def _part_of_frame(frame):
+    f = str(frame)
+    if not f.startswith("obj_"):
+      return None
+    # Compound collision geometry is named obj_N__shape/...; the logical part is obj_N.
+    return f.split("__", 1)[0]
+
+  def _is_hand_frame(self, frame):
+    return any(t in str(frame) for t in self._HAND_TOKENS)
+
+  def _part_is_payload_of(self, C, part, robot):
+    """Whether ``part`` sits below ``robot``'s gripper in this skill scene.
+
+    scene_for attaches a held assembly root to its kinematic holder and the remaining members
+    below that root. Walking parents therefore recognises the WHOLE payload, not only the exact
+    frame named by the grasp. Failure is conservative: an uninspectable ancestry is not an
+    intended contact.
+    """
+    if part is None or robot is None:
+      return False
+    try:
+      f, seen = C.getFrame(part), set()
+      while f is not None and f.name not in seen:
+        if f.name == self.gripper_frame.get(robot):
+          return True
+        seen.add(f.name)
+        f = f.getParent()
+    except Exception:
+      return False
+    return False
+
+  def _intended_hand_part(self, C, hand_frame, part_frame, robot):
+    """Pair-specific grasp exemption; unrelated hand/part proximity remains gated."""
+    part = self._part_of_frame(part_frame)
+    if part is None or robot is None or not self._is_hand_frame(hand_frame):
+      return False
+    if self._part_is_payload_of(C, part, robot):
+      return True
+    action = tuple(self._cur_action or ())
+    return (len(action) >= 3 and action[0] in ("pick", "add_grasp", "handover")
+            and action[1] == robot and action[2] == part)
+
+  def _clearance_pair_reason(self, C, fa, fb):
+    """Return the hard-gate class for a pair, or None when it is out of scope/intended."""
+    fa, fb = str(fa), str(fb)
+    ra, rb = self._arm_of_frame(fa), self._arm_of_frame(fb)
+    pa, pb = self._part_of_frame(fa), self._part_of_frame(fb)
+
+    if ra is not None and rb is not None:
+      if ra != rb:
+        return "inter-robot"
+      # rai's collidable-pair set already removes adjacent kinematic geometry. Keep the
+      # gripper's own internal mechanics exempt, but gate every other reported same-arm pair
+      # (including the measured ur_coll8~ur_coll5 Cube failure).
+      if self._is_hand_frame(fa) and self._is_hand_frame(fb):
+        return None
+      return "self"
+
+    if ra is not None and pb is not None:
+      if self._intended_hand_part(C, fa, fb, ra):
+        return None
+      return "arm-part"
+    if rb is not None and pa is not None:
+      if self._intended_hand_part(C, fb, fa, rb):
+        return None
+      return "arm-part"
+    return None
+
   def _clearance_ok(self, C, q):
-    """--witness-margin gate (see clearance_reject above): posed at witness q, veto if any
-    non-intended pair sits closer than the margin. Pair classes checked: non-hand arm link
-    vs part (catches the forearm-inside-own-cargo class), and arm link vs OTHER arm's link
-    (only arms posed in this scene -- idle arms at HOME are out of scope here; the export
-    validates the chained scene). Table pairs, part-part pairs and the hand-vs-anything are
-    intended-contact territory and stay exempt."""
+    """Shared search/witness hard clearance gate (see ``clearance_reject`` above)."""
     M = self.clearance_reject
-    if M is None or C is None or q is None:
+    if M is None or M <= 0.0 or C is None or q is None:
       return True
     saved = C.getJointState()
     C.setJointState(np.asarray(q, dtype=float))
-    def _arm_of(f):
-      for r in self.robots:
-        if f.startswith(r):
-          return r
-      return None
-    def _is_hand(f):
-      return any(t in f for t in self._HAND_TOKENS)
-    def _is_part(f):
-      return f.startswith("obj_")
     bad = None
     for c in C.getCollisions(M):
       fa, fb, d = c[0], c[1], float(c[2])
       if d >= M:
         continue
-      ra, rb = _arm_of(fa), _arm_of(fb)
-      arm_a = ra is not None and not _is_hand(fa)
-      arm_b = rb is not None and not _is_hand(fb)
-      # non-hand arm link vs part; or two DIFFERENT arms' links (hands included there:
-      # two hands should not be within the margin of each other either)
-      if (arm_a and _is_part(fb)) or (arm_b and _is_part(fa)) \
-         or (ra is not None and rb is not None and ra != rb):
-        bad = (fa, fb, d)
+      reason = self._clearance_pair_reason(C, fa, fb)
+      if reason is not None:
+        bad = (str(fa), str(fb), d, reason)
         break
     C.setJointState(saved)
     if bad is not None:
       self.margin_rejects += 1
+      self.last_margin_reject = bad
+      key = (bad[3], bad[0], bad[1])
+      self.margin_reject_pairs[key] = self.margin_reject_pairs.get(key, 0) + 1
       return False
     return True
 
@@ -1110,7 +1185,22 @@ class RobotIK:
     # ones (an exact analytic pose may collide, whereas the KOMO's tolerant pose eq can settle on
     # a nearby collision-free pose the discrete IK solutions don't cover), hence the fallback.
     for seed in (seeds or []):
-      komo.initWithConstant(np.asarray(seed, dtype=float))
+      seed = np.asarray(seed, dtype=float)
+      skey = (self._cur_action,
+              tuple(C.getJointNames()) if C is not None else (), int(seed.size))
+      if skey in self.seed_init_incompatible:
+        break
+      # KOMO's path exposes its INTERNAL q width.  It can be one larger than both
+      # C.getJointState() and C.getJointNames() after the stable-joint reparenting described
+      # above. Detect that before calling into rai: catching its setDofState exception is too
+      # late because the C++ LogToken may subsequently abort while unwinding.
+      path0 = np.asarray(komo.getPath())
+      expected = int(path0.shape[-1]) if path0.ndim >= 2 and path0.size else seed.size
+      if expected != seed.size:
+        self.seed_init_incompatible.add(skey)
+        self.seed_init_skips += 1
+        break
+      komo.initWithConstant(seed)
       r = self._nlp(komo).solve().dict()
       if r["feasible"] and self._pen_ok(C, komo.getPath()[-1]) and self._clearance_ok(C, komo.getPath()[-1]):
         self._last_res = r
@@ -1942,6 +2032,78 @@ class RobotIK:
       else:
         ok, w = self._ik_assemble(action, s0, s1, assembly, None, backoff=delta, warm=warm)
     finally:
+      self._opt_pull = None
+      self._pin_joints = None
+    return w if ok else None
+
+  def post_release_witness(self, action, s0, s1, assembly, release_witness=None):
+    """EXPORT helper for the missing second half of a contact funnel: RELEASE -> RETRACT.
+
+    A release itself has no IK witness; it fires at the configuration inherited from the
+    preceding grasp/assemble task. After the re-parent, solve a 5cm (configurable) departure
+    along the released grasp's -approach axis while every other arm is hard-pinned at that
+    release configuration. This makes the narrow contact exit explicit instead of asking a
+    random free-space sampler to discover it from a measure-near-zero boundary state.
+
+    The same full RobotIK clearance predicate used by search gates this solve. DELTA is a
+    requested maximum: if the full departure is unreachable in the contact pocket, retry a
+    deterministic 80/60/40/20/10% ladder.  A short non-zero escape is still a useful funnel
+    mouth and is strictly better than silently collapsing the release back to a zero-length
+    task. Failure of the whole ladder returns None; mp_export retains deterministic structure.
+    """
+    self.post_release_used_delta = None
+    if self.post_release_delta <= 0.0 or release_witness is None or action[0] != "release":
+      return None
+    robot = action[1]
+    held = self.holders(s0).get(robot)
+    if held is None:
+      return None
+    gpart, gid = held
+    fake = ("pick", robot, gpart, gid)
+    warm = np.asarray(release_witness, dtype=float)
+    names = list(self.C.getJointNames())
+    pin = {n: float(warm[k]) for k, n in enumerate(names)
+           if not n.startswith(robot + "_")}
+    single0, strip0 = self.single_arm_ik, self.strip_inactive_collision
+    # Full scene is deliberate: the release departure must clear the continuing holders at
+    # their actual keyframe configs, not a restricted scene which silently homes them.
+    self.single_arm_ik = False
+    self.strip_inactive_collision = False
+    try:
+      group = next((g for g in s1.subassemblies() if gpart in g), {gpart})
+      other_holders = [r for r, (p, _g) in self.holders(s1).items() if p in group]
+      if other_holders:
+        fake = ("add_grasp", robot, gpart, gid)
+      ok, w = False, None
+      # Keep this ladder deterministic and bounded.  In car-mini the inserted hand could
+      # leave by 5mm but not by 10-50mm; another release cleared at 20mm but self-collided at
+      # 30mm.  Retrying the SAME gate at shorter distances completes both funnels without
+      # weakening clearance or inventing a different feasibility rule after search.
+      for frac in (1.0, 0.8, 0.6, 0.4, 0.2, 0.1):
+        delta = self.post_release_delta * frac
+        self._opt_pull = {"mode": "joint", "robot": robot,
+                          "qmap": {n: float(warm[k]) for k, n in enumerate(names)},
+                          "weight": self.pre_insertion_pull, "rot_weight": 1.0}
+        self._pin_joints = pin
+        if other_holders:
+          ok, w = self._ik_add_grasp(
+              fake, s1, s1, assembly, None, backoff=delta, warm=warm)
+        else:
+          # Do not add a constant warm start to this pick-style departure KOMO. After a
+          # release from a now-mated multi-part group, rai can retain an internal stable-joint
+          # qIndex hole while exposing the expected named arm joints. The joint pull above
+          # still selects the release branch, and the ordinary initialization/restarts avoid
+          # relying on that inconsistent internal indexing. _solve_ik also shape-checks any
+          # analytic seeds before calling into rai.
+          ok, w = self._ik_pick(
+              fake, s1, s1, assembly, None, backoff=delta, warm=None)
+        self._opt_pull = None
+        self._pin_joints = None
+        if ok and w is not None:
+          self.post_release_used_delta = delta
+          break
+    finally:
+      self.single_arm_ik, self.strip_inactive_collision = single0, strip0
       self._opt_pull = None
       self._pin_joints = None
     return w if ok else None
@@ -2819,6 +2981,33 @@ def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
   return out, bad
 
 
+def cograsp_assembly_pairs(plan, states, robot_ik):
+  """Map each add_grasp to the first assemble that uses that brace without moving it.
+
+  This is the structural definition shared by witness fusion and MP export. A handover uses
+  the same reach IK but has different ownership semantics, so it is intentionally excluded.
+  Returns ``(add_index, assemble_index, brace_robot, grasped_part, grasp_id)`` tuples.
+  """
+  out = []
+  for i, a in enumerate(plan):
+    if not a or a[0] != "add_grasp":
+      continue
+    rb, gpart, gid = a[1], a[2], a[3]
+    for k in range(i + 1, len(plan)):
+      b = plan[k]
+      if b[0] != "assemble":
+        if len(b) > 1 and b[1] == rb:
+          break                                             # the brace arm moved first
+        continue
+      if robot_ik.holders(states[k]).get(rb) != (gpart, gid):
+        break                                               # the brace is no longer in place
+      target = next((g for g in states[k].subassemblies() if b[3] in g), ())
+      if gpart in target:
+        out.append((i, k, rb, gpart, gid))
+      break
+  return out
+
+
 def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
                            gripper_kind=None, handovers=True, allow_place=True,
                            bracing=False, grasp_table=None, weight=1e0,
@@ -2835,14 +3024,13 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
   welded to the object.
 
   THE FIX. For each (add_grasp, assemble) pair the add_grasp enables, replace the two
-  independent solves with ONE KOMO over TWO keyframes -- phase 1 carries the add_grasp
-  keyframe's constraints, phase 2 the assemble keyframe's -- plus a low-weight cross-phase
-  COST (weight ~1e0 against the 1e1 eq, the _add_pull convention: cost never beats
-  feasibility) on the brace arm's joint delta and the held object's pose delta. When the
-  braced group is HELD its pose is a free variable, so the optimiser can simply not move it
-  and the brace config becomes identical at both frames. When the group RESTS on the table
-  its pose is pinned and only the brace-joint term can help -- the report says which case
-  applied per pair.
+  independent solves with ONE KOMO over TWO keyframes. With pre-insertion enabled, phase 1
+  carries BOTH the add-grasp constraints and the insertion-funnel pose; phase 2 carries the
+  seated assemble constraints. Every holder of the target group is hard-coupled across the
+  phases. The inserter alone pays for the short insertion. The accepted phase-1 witness is
+  also returned as the assemble pre-witness, so MP export gives add_grasp and pre-assemble
+  the SAME all-arm goal. Without pre-insertion, the historical low-weight brace/object
+  cross-phase costs are retained.
 
   NO MODE SWITCH is needed: the brace exists at both keyframes as an OBJECTIVE (scene_for
   attaches only the primary gripper-parented root), so both keyframes live in the SAME
@@ -2855,7 +3043,9 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
   Otherwise BOTH original witnesses are kept -- a half-applied pair (the brace pinned at one
   keyframe only) is strictly worse than either extreme.
 
-  Returns (witnesses, report). `witnesses` is a NEW list; the input is never mutated."""
+  Returns (witnesses, report). `witnesses` is a NEW list; the input is never mutated.
+  ``report["pre_witnesses"]`` maps an accepted assemble index to the shared
+  add-grasp/pre-insertion keyframe."""
   import time
   t0 = time.perf_counter()
   if grasp_table is None:
@@ -2868,31 +3058,11 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
   # floor. Either way a fused keyframe may never be dirtier than the witness it replaces.
   pen_gate = robot_ik.penetration_reject if robot_ik.penetration_reject is not None else 1e-4
 
-  def pairs():
-    # (add_grasp i, assemble j) where the assemble is the FIRST one the brace enables: it
-    # must mate onto the braced group while that brace is still in place, and the brace arm
-    # must not do anything else in between. handover routes through the same skill IK but has
-    # different semantics (the giver lets go), so it is deliberately out of scope.
-    for i, a in enumerate(plan):
-      if a[0] != "add_grasp":
-        continue
-      rb, gpart, gid = a[1], a[2], a[3]
-      for k in range(i + 1, len(plan)):
-        if plan[k][0] != "assemble":
-          if plan[k][1] == rb:
-            break                                           # the brace arm moves on first
-          continue
-        if robot_ik.holders(states[k]).get(rb) != (gpart, gid):
-          break                                             # brace no longer in place
-        tgrp = next((g for g in states[k].subassemblies() if plan[k][3] in g), ())
-        if gpart in tgrp:
-          yield i, k, rb, gpart, gid
-        break
-
   out = list(witnesses)
   rows = []
+  chain_pre = {}
   claimed = {}                                              # assemble index -> the add_grasp that took it
-  for i, j, rb, gpart, gid in pairs():
+  for i, j, rb, gpart, gid in cograsp_assembly_pairs(plan, states, robot_ik):
     tag = f"[fuse] {i}->{j} brace {rb} on {gpart}"
     if witnesses[i] is None or witnesses[j] is None:
       rows.append((i, j, rb, False, "a witness is missing"))
@@ -2930,11 +3100,19 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
     ee_t = robot_ik.ee_target(rb, gpart, gid, assembly)
     rel_pos = np.asarray(assembly.relative_pose(part)[1], dtype=float)
     rel_quat = np.array([1.0, 0.0, 0.0, 0.0])
+    axis = assembly.mate_axis(part)
+    pre_delta = float(getattr(robot_ik, "pre_insertion_delta", 0.0) or 0.0)
+    chain_active = pre_delta > 0.0 and axis is not None
+    pre_rel_pos = _backoff_mate(rel_pos, axis, pre_delta) if chain_active else rel_pos
     moving = sorted(next((g for g in states[j].subassemblies() if part in g), (part,)))
     grp = next((g for g in states[i + 1].subassemblies() if gpart in g), (gpart,))
     root = _group_root(states[i + 1], grp)
     held = states[i + 1].parent.get(root, (None,))[0] == "gripper"
     bidx = [k for k, n in enumerate(names) if n.startswith(rb + "_")]
+    target_grp = next((g for g in states[j].subassemblies() if onto in g), (onto,))
+    target_holders = robot_ik._holders_of_group(states[j], target_grp)
+    locked_names = [n for n in names if any(n.startswith(r + "_") for r in target_holders)]
+    locked_idx = [k for k, n in enumerate(names) if n in locked_names]
 
     def build(bias):
       komo = ry.KOMO(Ca, phases=2, slicesPerPhase=1, kOrder=1, enableCollisions=True)
@@ -2955,12 +3133,24 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
       komo.addControlObjective([], 1, 1e-1)
       robot_ik._add_grasp_objectives(komo, rb, gpart, ee_t, phase=1)
       robot_ik._add_grasp_maintenance(komo, states[i], assembly, phase=1)
+      if chain_active:
+        # The insertion arm arrives at the funnel mouth WHILE the brace is added. Target
+        # holders do not transport the assembly afterwards; only the inserter traverses the
+        # final pre_delta. This is the atomic add_grasp -> assemble choreography.
+        robot_ik._assemble_objectives(
+            komo, part, onto, pre_rel_pos, rel_quat, bias, phase=1)
       robot_ik._assemble_objectives(komo, part, onto, rel_pos, rel_quat, bias, phase=2)
       robot_ik._add_grasp_maintenance(komo, states[j], assembly, phase=2)
-      # CROSS-PHASE COST: the brace arm's joint delta plus the held object's pose delta. The
-      # object terms are inert when the group rests on the table (its pose is pinned there).
-      komo.addObjective([2, 2], ry.FS.qItself, [n for n in names if n.startswith(rb + "_")],
-                        ry.OT.sos, [weight], [], order=1)
+      # A target held by two arms is a closed chain. With a funnel, freeze every target
+      # holder across the two phases as a hard equality. The old soft brace-only pull was not
+      # enough: rejected car-mini pairs later drifted 138-436mm inside the MP path.
+      if chain_active and locked_names:
+        komo.addObjective([2, 2], ry.FS.qItself, locked_names,
+                          ry.OT.eq, [1e1], [], order=1)
+      else:
+        komo.addObjective([2, 2], ry.FS.qItself,
+                          [n for n in names if n.startswith(rb + "_")],
+                          ry.OT.sos, [weight], [], order=1)
       komo.addObjective([2, 2], ry.FS.position, [gpart], ry.OT.sos, [weight], [], order=1)
       komo.addObjective([2, 2], ry.FS.quaternion, [gpart], ry.OT.sos, [weight], [], order=1)
       return komo
@@ -2970,23 +3160,26 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
     # constraint and it won every measured pair), then unbiased random restarts. KOMO adds
     # init noise and rai's RNG is not seeded by PYTHONHASHSEED, so a single-shot solve flips
     # feasible/infeasible run to run; the sweep is what makes the pass reliable.
-    best, how = None, None
+    candidates = []
     for bias in list(_ASSEMBLE_BIAS_ORIENTATIONS) + [None]:
       komo = build(bias)
-      for sname, seed in (("assemble", witnesses[j]), ("add_grasp", witnesses[i])):
-        komo.initWithConstant(np.asarray(seed, dtype=float))
+      seeds = (("paired", np.vstack([witnesses[i], witnesses[j]])),
+               ("assemble", np.vstack([witnesses[j], witnesses[j]])),
+               ("add_grasp", np.vstack([witnesses[i], witnesses[i]])))
+      for sname, seed_path in seeds:
+        try:
+          komo.initWithPath(np.asarray(seed_path, dtype=float))
+        except Exception:
+          komo.initWithConstant(np.asarray(seed_path[-1], dtype=float))
         if robot_ik._nlp(komo).solve().dict()["feasible"]:
-          best, how = np.asarray(komo.getPath()).copy(), f"bias={bias} seed={sname}"
-          break
-      if best is not None:
-        break
-    if best is None:
-      komo = build(None)
-      for _ in range(6):
-        komo.initRandom()
-        if robot_ik._nlp(komo).solve().dict()["feasible"]:
-          best, how = np.asarray(komo.getPath()).copy(), "bias=None seed=random"
-          break
+          candidates.append((np.asarray(komo.getPath()).copy(),
+                             f"bias={bias} seed={sname}"))
+    komo = build(None)
+    for restart in range(6):
+      komo.initRandom()
+      if robot_ik._nlp(komo).solve().dict()["feasible"]:
+        candidates.append((np.asarray(komo.getPath()).copy(),
+                           f"bias=None seed=random#{restart}"))
 
     # RE-VALIDATION in the two ORIGINAL single-phase scenes (contact flags included), which
     # is what catches an exclusion-set mismatch the fused KOMO could not see.
@@ -3012,6 +3205,11 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
                 (Ca, ry.FS.quaternionRel, [robot_ik.gripper_frame[rb], gpart], ee_t[3:], True),
                 (Cb, ry.FS.positionRel, [part, onto], rel_pos, False),
                 (Cb, ry.FS.quaternionRel, [part, onto], rel_quat, True)]
+      if chain_active:
+        checks.extend([
+            (Ca, ry.FS.positionRel, [part, onto], pre_rel_pos, False),
+            (Ca, ry.FS.quaternionRel, [part, onto], rel_quat, True),
+        ])
       for Cx, st in ((Ca, states[i]), (Cb, states[j])):
         for r, pt, tgt in robot_ik.maintenance_grasps(st, assembly):
           checks.append((Cx, ry.FS.positionRel, [robot_ik.gripper_frame[r], pt], tgt[:3], False))
@@ -3027,29 +3225,48 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
       return (pos, ang, float(Ca.getCollisionsTotalPenetration()), p2)
 
     o_pos, o_ang, o_p1, o_p2 = residuals(witnesses[i], witnesses[j])
-    o_dq = float(np.linalg.norm(np.asarray(witnesses[j])[bidx] - np.asarray(witnesses[i])[bidx]))
+    didx = locked_idx if chain_active and locked_idx else bidx
+    o_dq = float(np.linalg.norm(np.asarray(witnesses[j])[didx] - np.asarray(witnesses[i])[didx]))
     Ca.setJointState(np.asarray(witnesses[i], dtype=float))
     Cb.setJointState(np.asarray(witnesses[j], dtype=float))
     o_mm, o_deg = _pose_deviation(Ca.getFrame(gpart).getPose(), Cb.getFrame(gpart).getPose())
 
-    why = None
-    if best is None:
-      why = "KOMO infeasible (all biases + restarts)"
-    else:
-      n_pos, n_ang, n_p1, n_p2 = residuals(best[0], best[1])
-      n_dq = float(np.linalg.norm(best[1][bidx] - best[0][bidx]))
-      Ca.setJointState(best[0])
-      Cb.setJointState(best[1])
+    # "feasible" is only KOMO's internal verdict. The strict collision and residual gates
+    # below are intentionally stronger. Historically the pass stopped at the FIRST feasible
+    # basin, then rejected it here without trying the remaining analytic seeds. On car-mini
+    # that discarded three otherwise promising pairs for micrometre-scale collision misses.
+    # Evaluate every feasible basin until one passes the gates; retain the least-bad rejected
+    # one only for an informative diagnostic.
+    best = how = None
+    best_metrics = None
+    why = "KOMO infeasible (all biases + restarts)"
+    best_score = np.inf
+    for cand, cand_how in candidates:
+      n_pos, n_ang, n_p1, n_p2 = residuals(cand[0], cand[1])
+      n_dq = float(np.linalg.norm(cand[1][didx] - cand[0][didx]))
+      Ca.setJointState(cand[0])
+      Cb.setJointState(cand[1])
       n_mm, n_deg = _pose_deviation(Ca.getFrame(gpart).getPose(), Cb.getFrame(gpart).getPose())
+      reason = None
       if n_pos > max(pos_tol, o_pos):
-        why = f"position residual {n_pos*1000:.2f}mm > gate"
+        reason = f"position residual {n_pos*1000:.2f}mm > gate"
       elif n_ang > max(ang_tol, o_ang):
-        why = f"orientation residual {n_ang:.2f}deg > gate"
+        reason = f"orientation residual {n_ang:.2f}deg > gate"
       elif n_p1 > max(pen_gate, o_p1) or n_p2 > max(pen_gate, o_p2):
-        why = (f"penetration {n_p1*1000:.2f}/{n_p2*1000:.2f}mm > gate "
-               f"{max(pen_gate, o_p1)*1000:.2f}/{max(pen_gate, o_p2)*1000:.2f}mm")
+        reason = (f"penetration {n_p1*1e6:.2f}/{n_p2*1e6:.2f}um > gate "
+                  f"{max(pen_gate, o_p1)*1e6:.2f}/{max(pen_gate, o_p2)*1e6:.2f}um")
       elif n_dq >= o_dq:
-        why = f"brace delta not improved ({o_dq:.3f} -> {n_dq:.3f} rad)"
+        reason = f"brace delta not improved ({o_dq:.3f} -> {n_dq:.3f} rad)"
+      score = max(n_pos / max(pos_tol, o_pos), n_ang / max(ang_tol, o_ang),
+                  n_p1 / max(pen_gate, o_p1), n_p2 / max(pen_gate, o_p2))
+      if reason is None or score < best_score:
+        best, how, why = cand, cand_how, reason
+        best_metrics = (n_dq, n_mm, n_deg)
+        best_score = score
+      if reason is None:
+        break
+    if best_metrics is not None:
+      n_dq, n_mm, n_deg = best_metrics
 
     case = "HELD" if held else "TABLE-RESTING"
     if verbose:
@@ -3061,6 +3278,8 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
              f"   ACCEPTED [{how}]"))
     if why is None:
       out[i], out[j] = best[0].copy(), best[1].copy()
+      if chain_active:
+        chain_pre[j] = best[0].copy()                       # add_grasp == pre-assemble goal
       claimed[j] = i                                        # only on ACCEPT: a rejected pair
                                                             # leaves out[j] untouched, so a
                                                             # later add_grasp may still use it
@@ -3070,7 +3289,8 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
   if verbose:
     print(f"[fuse] {acc}/{len(rows)} (add_grasp, assemble) pair(s) fused in "
           f"{time.perf_counter() - t0:.1f}s; the rest keep BOTH original witnesses.")
-  return out, {"pairs": len(rows), "fused": acc, "rows": rows}
+  return out, {"pairs": len(rows), "fused": acc, "rows": rows,
+               "pre_witnesses": chain_pre}
 
 
 def _pre_gate(o, n, pen_gate, max_dq, hold_dq, hold_mm, pos_tol, ang_tol):
