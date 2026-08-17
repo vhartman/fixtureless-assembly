@@ -89,7 +89,7 @@ except ImportError:                                        # module must import 
   mujoco = None
   HAVE_MUJOCO = False
 
-from problem import (grasp_pose, _pose_compose, _quat_to_R, _shape_half_z,
+from problem import (grasp_pose, _pose_compose, _pose_invert, _quat_to_R, _shape_half_z,
                      _state_part_poses)
 
 
@@ -1023,7 +1023,7 @@ class SimScene:
     self.model.eq_data[eq_id][10] = 1.0                    # torquescale
     self.data.eq_active[eq_id] = 1
 
-  def grasp(self, robot, part, gid=None):
+  def grasp(self, robot, part, gid=None, grasp_part=None):
     eq = self._eq_id(f"grasp_{robot}_{part}")
     self._activate_weld(eq, self._body_id(self.grasp_anchor[robot]), self._body_id(part))
     kind = self.gripper_kinds.get(robot, "vacuum")
@@ -1038,11 +1038,22 @@ class SimScene:
     if _model is None:
       return
     import problem as _P
-    _g7 = np.asarray(_P.grasp_pose(self.assembly, part, gid), dtype=float)   # flat [pos, quat]
+    # mr_bench welds a gripper to the fixed ROOT of an already-mated group, while the actual
+    # contact may be on a descendant.  A handover of a stool held by one leg is exactly this:
+    # frames=[gripper, obj_0] but State records grasp(robot, obj_3, gid).  Reusing ``gid`` as
+    # though it indexed obj_0 loses the grasp frame and makes the breakaway fall back to a
+    # scalar torque cap. Express the contacted part's grasp pose in the welded root's frame.
+    grasp_part = part if grasp_part is None else grasp_part
+    _g7 = np.asarray(_P.grasp_pose(self.assembly, grasp_part, gid), dtype=float)
+    if grasp_part != part:
+      root_T_part = _pose_compose(_pose_invert(self.part_pose(part)),
+                                  self.part_pose(grasp_part))
+      _g7 = _pose_compose(root_T_part, _g7)
     _gp, _gq = _g7[:3], _g7[3:]
     _R = np.zeros(9)
     mujoco.mju_quat2Mat(_R, _gq)
-    self._hold_info[robot] = {"eq": eq, "part": part, "gid": gid, "model": _model,
+    self._hold_info[robot] = {"eq": eq, "part": part, "grasp_part": grasp_part,
+                              "gid": gid, "model": _model,
                               "caps": _caps, "gp": _gp,
                               "Rg": _R.reshape(3, 3)}
     for gid in self._holdex.get(robot, ()):                # wrist cluster exempt while holding
@@ -1202,12 +1213,15 @@ class SimScene:
       # frame-based replay only carries [parent, child], but the discrete state knows which
       # grasp of `child` is held. Falls back to the conservative scalar if unavailable.
       _gid = None
+      _grasp_part = None
       if self.expect_state is not None:
         try:
-          _gid = _held_grasp_id(self.expect_state, child)
+          _grasp_part, _gid = _held_grasp_id(
+              self.expect_state, child, robot=parent_frame.split("_", 1)[0])
         except ValueError:
           _gid = None
-      self.grasp(parent_frame.split("_", 1)[0], child, gid=_gid)
+      self.grasp(parent_frame.split("_", 1)[0], child, gid=_gid,
+                 grasp_part=_grasp_part)
 
   def net_contact_force(self, part):
     """Net world-frame CONTACT force ON `part` (N). This is the admittance trigger for
@@ -1636,7 +1650,7 @@ class SimExecutor:
         # s_post has the group held -> _state_part_poses lifts it by CARRY_LIFT
         self._move(robot, self._ee_pose_for(s_post, act[2], act[3]), report, act)
       elif kind == "assemble":
-        gid = _held_grasp_id(s_pre, act[2])
+        _grasped, gid = _held_grasp_id(s_pre, act[2], robot=robot)
         target = _pose_compose(self._seated_pose_sim(act[2]),      # seat = parent's SIM pose
                                grasp_pose(self.assembly, act[2], gid))
         # mate axis is in the PART/ASSEMBLY frame -> rotate into WORLD by the parent's actual
@@ -1651,7 +1665,7 @@ class SimExecutor:
         if self._seated(act[2]):
           self.scene.weld_mate(act[2])
       elif kind == "place":
-        gid = _held_grasp_id(s_pre, act[2])
+        _grasped, gid = _held_grasp_id(s_pre, act[2], robot=robot)
         self._move(robot, self._ee_pose_for(s_post, act[2], gid), report, act)
         self.scene.release(robot)
         self._reattach_holders(s_post, act[2])
@@ -1772,11 +1786,20 @@ def _rel_pos(pose_a, pose_b):
                                                  - np.asarray(pose_a[:3]))
 
 
-def _held_grasp_id(state, part):
-  for c in state.supports.get(part, ()):
-    if c[0] == "grasp" and c[2] == part:
-      return c[3]
-  raise ValueError(f"{part} not held in this state")
+def _held_grasp_id(state, part, robot=None):
+  """Return ``(contacted_part, gid)`` for a grasp holding ``part``'s rigid group.
+
+  The motion-planning attach child is the group's fixed mate-tree root, not necessarily the
+  part touched by the gripper.  Looking only in ``state.supports[part]`` therefore discarded
+  the grasp id on every post-assembly handover and silently selected scalar sim caps.
+  """
+  group = next((g for g in state.subassemblies() if part in g), (part,))
+  for p in sorted(group):
+    for c in state.supports.get(p, ()):
+      if c[0] == "grasp" and c[2] == p and (robot is None or c[1] == robot):
+        return p, c[3]
+  who = "" if robot is None else f" by {robot}"
+  raise ValueError(f"{part}'s group not held{who} in this state")
 
 
 def _holder_of(state, part, exclude=None):

@@ -132,13 +132,96 @@ def test_peg_hole_mujoco_contains_five_socket_geoms_and_the_peg():
 def test_peg_stool_has_three_real_collision_free_sockets():
   asm = P.make_assembly("peg-stool", 4)
   assert asm.part_shape("obj_0")[0] == "compound"
-  # Seat plate + raised vacuum pad + four convex walls for each of three blind sockets.
-  assert len(P._compound_children(asm.part_shape("obj_0"))) == 14
+  # Plain seat plate + four convex walls for each of three blind sockets: no vacuum pedestal.
+  assert len(P._compound_children(asm.part_shape("obj_0"))) == 13
   assert all(np.allclose(asm.mate_axes[f"obj_{i}"], [0.0, 0.0, 1.0])
              for i in range(1, 4))
   C = P.make_subassembly_scene(asm, tuple(asm.objects))
   C.computeCollisions()
   assert C.getCollisionFree(), C.getCollisions()
+
+
+def test_peg_stool_cuboid_square_legs_fit_the_real_sockets():
+  asm = P.make_assembly("peg-stool-cuboid", 4)
+  assert asm.part_shape("obj_0")[0] == "compound"
+  assert len(P._compound_children(asm.part_shape("obj_0"))) == 13
+  for i in range(1, 4):
+    kind, prm = asm.part_shape(f"obj_{i}")[:2]
+    assert kind == "box" and prm[2] > prm[0]              # a long square leg, not a cube
+    assert prm[0] == prm[1]
+    sq = asm.scatter_orientations.get(f"obj_{i}")         # initial pose: LYING on the table
+    assert sq is not None
+    leg_axis_world = P._quat_to_R(np.asarray(sq, dtype=float)) @ np.array([0.0, 0.0, 1.0])
+    assert abs(float(leg_axis_world[2])) < 0.5            # long axis horizontal, not standing
+  assert all(np.allclose(asm.mate_axes[f"obj_{i}"], [0.0, 0.0, 1.0])
+             for i in range(1, 4))
+  C = P.make_subassembly_scene(asm, tuple(asm.objects))
+  C.computeCollisions()
+  assert C.getCollisionFree(), C.getCollisions()          # square pegs clear the socket corners
+
+
+def test_peg_stool_cuboid_4_legs():
+  asm = P.make_assembly("peg-stool-cuboid-4", 5)
+  assert len(asm.objects) == 5
+  # Plain seat plate + four convex walls for each of FOUR blind sockets.
+  assert len(P._compound_children(asm.part_shape("obj_0"))) == 17
+  for i in range(1, 5):
+    kind, prm = asm.part_shape(f"obj_{i}")[:2]
+    assert kind == "box" and prm[0] == prm[1] and prm[2] > prm[0]
+    assert asm.scatter_orientations.get(f"obj_{i}") is not None   # lying flat
+  assert all(np.allclose(asm.mate_axes[f"obj_{i}"], [0.0, 0.0, 1.0])
+             for i in range(1, 5))
+  C = P.make_subassembly_scene(asm, tuple(asm.objects))
+  C.computeCollisions()
+  assert C.getCollisionFree(), C.getCollisions()
+
+
+def test_peg_stool_4_legs_round():
+  asm = P.make_assembly("peg-stool-4", 5)
+  assert len(asm.objects) == 5
+  assert len(P._compound_children(asm.part_shape("obj_0"))) == 17
+  for i in range(1, 5):
+    assert asm.part_shape(f"obj_{i}")[0] == "cylinder"
+  C = P.make_subassembly_scene(asm, tuple(asm.objects))
+  C.computeCollisions()
+  assert C.getCollisionFree(), C.getCollisions()
+
+
+def test_peg_stool_tight_clearance_kinds():
+  import pytest as _pytest
+  # round peg: radius = hole/2 - c
+  asm = P.make_assembly("peg-stool-tight", 4)
+  kind, prm = asm.part_shape("obj_1")[:2]
+  assert kind == "cylinder"
+  assert abs(prm[1] - (asm.socket_hole / 2.0 - asm.peg_clearance)) < 1e-9
+  # square peg: side = hole - c*sqrt(2), so the CORNER gap is exactly the kind's c
+  asm2 = P.make_assembly("peg-stool-cuboid-tight", 4)
+  kind2, prm2 = asm2.part_shape("obj_1")[:2]
+  assert kind2 == "box"
+  assert abs(prm2[0] - (asm2.socket_hole - asm2.peg_clearance * np.sqrt(2.0))) < 1e-9
+  assert abs((asm2.socket_hole - prm2[0]) / np.sqrt(2.0) - asm2.peg_clearance) < 1e-9
+  # the tight stools still assemble collision-free
+  for a in (asm, asm2):
+    C = P.make_subassembly_scene(a, tuple(a.objects))
+    C.computeCollisions()
+    assert C.getCollisionFree(), C.getCollisions()
+  # four-leg tight kind
+  a4 = P.make_assembly("peg-stool-cuboid-4-tight", 5)
+  assert len(a4.objects) == 5 and a4.part_shape("obj_1")[0] == "box"
+  C4 = P.make_subassembly_scene(a4, tuple(a4.objects))
+  C4.computeCollisions()
+  assert C4.getCollisionFree(), C4.getCollisions()
+  # an impossible square clearance raises at build time
+  with _pytest.raises(AssertionError):
+    P.PegStoolAssembly(leg_kind="box", peg_clearance=0.022)
+
+
+def test_peg_stool_cuboid_rejects_oversized_square_legs():
+  # side >= hole: the peg's DIAGONAL no longer clears the hole's diagonal
+  import pytest as _pytest
+  with _pytest.raises(AssertionError):
+    P.PegStoolAssembly(leg_kind="box", leg_side=0.031)
+
 
 
 def test_peg_stool_mujoco_keeps_the_socket_concavities():
@@ -156,6 +239,6 @@ def test_peg_stool_mujoco_keeps_the_socket_concavities():
                   poses=poses)
   xml = S.build_mjcf(asm, state, ["a1"])
   seat_body = xml.split('<body name="obj_0"', 1)[1].split("</body>", 1)[0]
-  assert seat_body.count("<geom") == 14
+  assert seat_body.count("<geom") == 13
   assert all(xml.split(f'<body name="obj_{i}"', 1)[1].split("</body>", 1)[0]
              .count('type="cylinder"') == 1 for i in range(1, 4))

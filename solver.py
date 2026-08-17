@@ -125,10 +125,18 @@ class CollisionChecker:
       else:
         parts.append(("H", members, grasps))
     # extras likewise: robot -> kind (3-tuples), so the pick gate's verdicts are shared
-    # across same-kind arms.
+    # across same-kind arms. A ("pose", part, pose7) extra is an EXPLICIT grasp pose (the
+    # grasp DB is still being built and has no ids yet -- the scene-aware sampler uses this)
+    # and is keyed on the rounded pose.
+    _g = []
+    for g in extra_grasps:
+      if len(g) == 3 and g[0] == "pose":
+        _g.append(("pose", g[1], tuple(np.round(np.asarray(g[2], dtype=float), 4))))
+      else:
+        _g.append(tuple(g))
     ex = tuple(sorted((self._robot_kind.get(g[0], g[0]),) + tuple(g[1:]) if len(g) == 3
-                      else tuple(g) for g in extra_grasps)) if self.mixed \
-        else tuple(sorted(tuple(g) for g in extra_grasps))
+                      else tuple(g) for g in _g)) if self.mixed \
+        else tuple(sorted(tuple(g) for g in _g))
     return (tuple(sorted(parts)), ex)
 
   def _scene_for(self, state, assembly, extra_grasps=()):
@@ -164,10 +172,11 @@ class CollisionChecker:
 
     # each grasp goes to a slot of ITS HOLDER'S GRIPPER KIND (same-kind arms are
     # interchangeable floating-EE geometry; with uniform grippers any assignment matches the
-    # old sequential zip). extra_grasps entries may be (gpart, gid) or (robot, gpart, gid);
-    # robot-less extras take any free slot (callers pass the robot when it matters).
+    # old sequential zip). extra_grasps entries may be (gpart, gid), (robot, gpart, gid) or
+    # ("pose", gpart, pose7); robot-less extras take any free slot (callers pass the robot
+    # when it matters), and a pose extra never calls grasp_pose (the DB may not exist yet).
     used = set()
-    assigns = []                                           # (slot_idx, gpart, grasp_id)
+    assigns = []                                           # (slot_idx, gpart, gid-or-pose)
     robot_grasps = [(c[1], c[2], c[3]) for p in state.bodies()
                     for c in state.supports.get(p, ()) if c[0] == "grasp"]
     extras = [g if len(g) == 3 else (None, g[0], g[1]) for g in extra_grasps]
@@ -184,8 +193,11 @@ class CollisionChecker:
       used.add(i)
       assigns.append((i, gpart, gid))
     for i, gpart, grasp_id in assigns:
-      grasp_world = _pose_compose(np.asarray(part_poses[gpart], dtype=float),
-                                  grasp_pose(assembly, gpart, grasp_id))
+      if isinstance(grasp_id, np.ndarray):                 # ("pose", part, pose7) extra
+        gpose = np.asarray(grasp_id, dtype=float)
+      else:
+        gpose = grasp_pose(assembly, gpart, grasp_id)
+      grasp_world = _pose_compose(np.asarray(part_poses[gpart], dtype=float), gpose)
       brt, qc = self._slot_tool[i]
       base_world = _ee_root_pose(grasp_world, brt, qc)
       root = C_col.getFrame(self.slots[i] + "ur_base")
@@ -211,7 +223,7 @@ class CollisionChecker:
     # getCollisionFree -- the cheap layer must not be stricter than the (soft) IK.
     # VERDICT-MEMOIZED on the discrete scene signature (see _sig): building the rai scene
     # + collision query costs ~2ms and dominated whole-search profiles (~90%).
-    key = self._sig(state, tuple(map(tuple, extra_grasps)))
+    key = self._sig(state, extra_grasps)                   # _sig normalizes every extra form
     hit = self._verdicts.get(key)
     if hit is not None:
       return hit
@@ -250,6 +262,15 @@ class CollisionChecker:
     # candidate (None = any slot, the uniform behaviour).
     extra = [(robot, gpart, grasp_id)] if robot is not None else [(gpart, grasp_id)]
     return self._check(s0, assembly, extra_grasps=extra, note=note)
+
+  def pose_collision_free(self, state, gpart, grasp_pose_7, assembly, note=""):
+    """The same floating-EE gate for an EXPLICIT grasp pose (part frame) instead of a grasp
+    id. Used by the scene-aware grasp sampler: it filters candidates while the DB is still
+    being built, so grasp ids do not exist yet and calling back through grasp_pose would
+    recurse. The EE stands at compose(part's state pose, pose); everything else is the
+    ordinary pick gate."""
+    return self._check(state, assembly,
+                       extra_grasps=[("pose", gpart, grasp_pose_7)], note=note)
 
 
 def _wrist_table_pair(a, b):
@@ -475,6 +496,8 @@ class RobotIK:
     # --strict-collisions witness rejection is real. Off unless the env var is set.
     self._pen_view_action = os.environ.get("PEN_VIEW_ACTION")
     self._pen_viewed = False
+    self._funnel_solve = False                        # set while solving a --pre-*/departure
+                                                      # funnel mouth: table pairs gate at ~0
     self._cur_action = None                               # set per _ik_* call (for the view)
     # HARD-reject depth (see _probe_branch_combos): only when EVERY exact branch penetrates
     # beyond this does the probe reject without a KOMO. Conservative on purpose (near the
@@ -1051,6 +1074,17 @@ class RobotIK:
     else:
       pen = self.mate_penetration(C, *self._mate_exempt)
     reject = pen > self.penetration_reject
+    if not reject and getattr(self, "_funnel_solve", False):
+      # FUNNEL-MOUTH solves (--pre-* backoffs): the payload/arm may not penetrate the TABLE.
+      # The strict gate bounds only TOTAL penetration, and the margin gate exempts part/table
+      # pairs (parts legitimately rest on the table at d == 0), so a backoff pointing into the
+      # tabletop was accepted -- measured on the tight stool: a pre-insertion whose mate sits
+      # close to the table sank the leg into the tabletop. Gate every table pair at a hard
+      # near-zero tolerance; a rejected rung walks the delta ladder in pre_skill_witness.
+      for _a, _b, d in C.getCollisions():
+        if (str(_a) == "table" or str(_b) == "table") and d < -1e-4:
+          reject = True
+          break
 
     if (self._pen_view_action is not None and not self._pen_viewed
         and self._cur_action is not None
@@ -1962,6 +1996,10 @@ class RobotIK:
           feasible = False
       if feasible:
         break
+    if (feasible and witness is not None and backoff <= 0.0
+        and self.pre_insertion_delta > 0.0
+        and not self._funnel_witness_ok(action, s0, s1, assembly, witness)):
+      feasible, witness = False, None                     # -> the unbiased restart fallback
     if not feasible:                                      # fallback: unbiased random restarts
       komo = self._assemble_komo(C, part_name, onto, rel_pos, rel_quat, None)
       self._add_pull(komo, C, robot)                    # witness-opt pull (no-op in search)
@@ -1973,6 +2011,10 @@ class RobotIK:
         if self.mate_residual(C, witness, part_name, onto, rel_pos) > self.mate_residual_reject:
           self.mate_rejects += 1
           feasible, witness = False, None
+    if (feasible and witness is not None and backoff <= 0.0
+        and self.pre_insertion_delta > 0.0
+        and not self._funnel_witness_ok(action, s0, s1, assembly, witness)):
+      feasible, witness = False, None
     if not feasible:
       self._log_failure(action, C, komo)
 
@@ -1983,6 +2025,26 @@ class RobotIK:
         komo.view(True, f"assemble IK: {robot} mates {part} -> {onto}")
 
     return feasible, witness
+
+  def _funnel_witness_ok(self, action, s0, s1, assembly, witness):
+    """FUNNEL COUPLING (--pre-insertion): an ACCEPTED assemble witness must also stand a
+    pre-insertion funnel mouth -- the exporter's own pre_skill_witness (its delta ladder +
+    table gate), PINNED so only the mover and the moved group's co-holders may leave the
+    witness config (the same movers rule as fuse_pre_skill_witnesses). This makes "the export
+    finds a funnel keyframe" a property OF the witness, not of export-time luck: the witness
+    solver now prefers target float heights that leave funnel room, and witness-optimization
+    candidates (also produced by _ik_assemble) inherit the same guarantee. Delta remains a
+    REQUESTED MAXIMUM (the ladder accepts the largest feasible rung), so the search never
+    rejects a witness the exporter could have used. Only for the REAL mate solve (backoff==0);
+    the funnel solves themselves must not recurse."""
+    part = action[2]
+    moving = next((g for g in s0.subassemblies() if part in g), (part,))
+    movers = {action[1]} | {r for r, (pt, _g) in self.holders(s0).items() if pt in moving}
+    names = self.C.getJointNames()
+    pin = {n: float(witness[k]) for r in self.robots if r not in movers
+           for k, n in enumerate(names) if n.startswith(r + "_")}
+    return self.pre_skill_witness(action, s0, s1, assembly,
+                                  skill_witness=witness, pin=pin) is not None
 
   def pre_skill_witness(self, action, s0, s1, assembly, skill_witness=None, pin=None):
     """EXPORT/REPLAY helper for --pre-pick/--pre-place/--pre-insertion: the PRE-skill GOTO
@@ -2022,19 +2084,32 @@ class RobotIK:
     # records whether it actually pinned anything so the caller can tell those apart.
     self.pin_applied = None
     self._pin_joints = pin
+    self._funnel_solve = True
     try:
-      if kind == "pick":
-        ok, w = self._ik_pick(action, s0, s1, assembly, None, backoff=delta, warm=warm)
-      elif kind == "place":
-        ok, w = self._ik_place(action, s0, s1, assembly, None, backoff=delta, warm=warm)
-      elif kind == "add_grasp":
-        ok, w = self._ik_add_grasp(action, s0, s1, assembly, None, backoff=delta, warm=warm)
-      else:
-        ok, w = self._ik_assemble(action, s0, s1, assembly, None, backoff=delta, warm=warm)
+      # DELTA is a REQUESTED MAXIMUM: the full backoff can point into a nearby obstacle (the
+      # classic case: an insertion whose mate sits just above the tabletop -- backing off
+      # along -mate_axis sinks the part into the table). Walk a deterministic fraction
+      # ladder (1.0/0.8/0.6/0.4/0.2/0.1); each rung is gated by the FULL skill acceptance
+      # INCLUDING the funnel table-clearance in _pen_ok. A short non-zero funnel mouth is
+      # strictly better than a colliding one, and a failed ladder falls back to the skill
+      # witness (the caller keeps today's keyframe).
+      for frac in (1.0, 0.8, 0.6, 0.4, 0.2, 0.1):
+        d = delta * frac
+        if kind == "pick":
+          ok, w = self._ik_pick(action, s0, s1, assembly, None, backoff=d, warm=warm)
+        elif kind == "place":
+          ok, w = self._ik_place(action, s0, s1, assembly, None, backoff=d, warm=warm)
+        elif kind == "add_grasp":
+          ok, w = self._ik_add_grasp(action, s0, s1, assembly, None, backoff=d, warm=warm)
+        else:
+          ok, w = self._ik_assemble(action, s0, s1, assembly, None, backoff=d, warm=warm)
+        if ok and w is not None:
+          return w
+      return None
     finally:
+      self._funnel_solve = False
       self._opt_pull = None
       self._pin_joints = None
-    return w if ok else None
 
   def post_release_witness(self, action, s0, s1, assembly, release_witness=None):
     """EXPORT helper for the missing second half of a contact funnel: RELEASE -> RETRACT.
@@ -2069,6 +2144,8 @@ class RobotIK:
     # their actual keyframe configs, not a restricted scene which silently homes them.
     self.single_arm_ik = False
     self.strip_inactive_collision = False
+    # the departure may not sink into the TABLE either (same funnel gate as --pre-*)
+    self._funnel_solve = True
     try:
       group = next((g for g in s1.subassemblies() if gpart in g), {gpart})
       other_holders = [r for r, (p, _g) in self.holders(s1).items() if p in group]
@@ -2104,6 +2181,7 @@ class RobotIK:
           break
     finally:
       self.single_arm_ik, self.strip_inactive_collision = single0, strip0
+      self._funnel_solve = False
       self._opt_pull = None
       self._pin_joints = None
     return w if ok else None
@@ -6172,7 +6250,8 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
                   weight, max_nodes, verbose, gripper_kind=None, handovers=True,
                   allow_place=True, bracing=False, grasp_cap=None, h_extra=None,
                   part_grasp_allow=None, brace_allow=None, deadline=None,
-                  lazy_fill=False, cost_bound=None, forbid_assemble=None, settle_ref=None):
+                  lazy_fill=False, cost_bound=None, forbid_assemble=None, settle_ref=None,
+                  h_extra_shift=None):
   # a small COMPLETE search that adds part `p` to the assembly `ideal` and leaves it SETTLED:
   # p mated, no loose part left in a gripper, and the assembly ending held by at most one
   # carrier OR resting on the table -- WHICHEVER the search finds. It forces neither a
@@ -6235,18 +6314,39 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
     if h_extra is not None:
       # The labeled abstraction (FULL-assembly cost-to-go) keeps exactly two roles here:
       #   * h=inf PRUNES states the full assembly cannot be finished from (sound);
-      #   * its VARIATION tie-breaks locally-equal siblings -- the resting-FACE and
-      #     hold/brace pricing the counting h is blind to.
-      # It must NOT join via max(): for a MODULE fill it is a large CONSTANT (module-
+      #   * its VARIATION prices resting-FACE and hold/brace choices the counting h is
+      #     blind to -- e.g. under --insertion-noise the frictionless table-rest mate is
+      #     infeasible and the abstraction is the ONLY component that knows the target
+      #     must be robot-held (measured: without it the noise fill wandered the flat
+      #     local-h shell for >180s on the 2-part stool while the plan sat 4 actions deep).
+      # MODULE fills must NOT join via max(): for them he is a large CONSTANT (module-
       # internal progress is invisible to the base-ideal abstraction), and max(local, he)
       # flattened h -> the mini search degenerated to uniform-cost and exhausted max_nodes
-      # on the chair's back+posts module under mixed EEs (a 4-action solution in plain
-      # sight, "fill-in failed" every time). As an EPSILON term (<= 0.1, below one local
-      # step) it orders siblings without ever drowning the local gradient.
+      # on the chair's back+posts module (a 4-action solution in plain sight, "fill-in
+      # failed" every time). Non-module fills (settle_ref is None) take max() -- there he
+      # is a genuine cost-to-go and admissible-enough for a fill (suboptimal plans are
+      # fine; the main search owns optimality).
       he = h_extra(s)
       if he == float("inf"):
         return float("inf")
-      hv = hv + min(he, 1e3) * 1e-4
+      if settle_ref is None:
+        # SHIFT to the FILL's goal: `he` is the FULL-assembly cost-to-go, which falls by
+        # ~1 for every action that advances ANY part -- so along every plausible prefix
+        # f = g + max(hv, he) is FLAT and the fill A* floods one giant f-shell before the
+        # goal branch (measured: peg-stool-cuboid-4-tight x keep 20 x noise 0.001 +
+        # --vacuum-no-assemble: the arm-held chain sits 5 actions deep at f = f_start and
+        # the flat shell exhausts max_nodes first). Subtracting the settled {ideal+p}
+        # value (the milestone oracle's dist) turns `he` into THIS fill's cost-to-go:
+        # 4 -> 3 -> 3 -> 2 -> 1 -> 0 along the intended chain, so the shell collapses to
+        # states that are actually close to finishing THIS part. The shift can overestimate
+        # (the oracle is an underestimate at the settled states), which a fill accepts:
+        # completeness needs a finite search, not optimality. Module fills keep the epsilon
+        # join (their settle key hides in a big constant).
+        sh = he - h_extra_shift if h_extra_shift is not None else he
+        if sh > hv:
+          hv = sh
+      else:
+        hv = hv + min(he, 1e3) * 1e-4          # epsilon tie-break below one local step
     return hv
 
   def _held_grasp(s, part):                              # raw grasp id `part` is currently held by
@@ -6316,22 +6416,35 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
     # measured lazy economics (61 validations vs 19,515 eager checks on the cross) into
     # the fills -- the 2x2x3 module-fill bottleneck (325-373s/fill at R=4-real was
     # dominated by failed IK binds at pop).
-    bl = set()
-    ok_cache = set()                                      # (state, action) IK-validated
+    # SOLVE-SCOPED blacklist/ok sets (stored on the RobotIK, which lives exactly one
+    # scene): an IK verdict is a deterministic function of (action, scene signature) --
+    # robot_ik.bind's own cache already guarantees the same query returns the same
+    # verdict -- so a failure/acceptance learned in ONE fill/round stays valid in every
+    # later one. Before this the sets were per-fill: each fill re-bound and re-searched
+    # the same doomed edges (measured: the 2-part stool under --insertion-noise +
+    # --vacuum-no-assemble spent >180s re-validating, and solved in seconds once the
+    # sets were shared).
+    bl = getattr(robot_ik, "_fill_bl", None)
+    if bl is None:
+      bl = robot_ik._fill_bl = set()
+      ok_cache = robot_ik._fill_ok = set()               # (state, action) IK-validated
+    else:
+      ok_cache = robot_ik._fill_ok
 
-    def succ_lazy(s):
-      for a, ns in succ_fn(s):
-        if (s, a) not in bl:
-          yield a, ns
-
-    def cheap_only(prev, act, ns):
-      return cheap_feasible(act, prev, ns, assembly, checker)
+    engine = _IncrementalLazySearch(
+        start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
+        weight=weight, blacklist=bl,
+        cheap_gate=lambda prev, act, ns: cheap_feasible(act, prev, ns, assembly, checker))
 
     for _round in range(200):
-      subplan = _astar(start, goal_fn=goal_fn, succ_fn=succ_lazy, cost_fn=action_cost,
-                       h_fn=h_fn, cheap_fn=None, edge_check_fn=cheap_only,
-                       weight=weight, max_nodes=max_nodes, verbose=False,
-                       tag=f"add {p} lazy", deadline=deadline, cost_bound=cost_bound)
+      # INCREMENTAL repair (the global lazy search's engine, LPA*-style): the heap and the
+      # claimed tree PERSIST across rounds; a blacklisted edge only un-claims its own
+      # search-tree subtree and re-injects the recorded alternate entries. The old
+      # fresh-_astar loop restarted from scratch every round and, keyed on (state, action),
+      # needed a round PER failing (grasp-combination state, action) pair -- measured on
+      # the 5-part tight stool at keep 40: 16 fully-valid arm-held chains exist, yet 200
+      # restarts never covered the leg-grasp x seat-grasp space (95 s x fill, then failure).
+      subplan = engine.search(max_nodes, deadline=deadline)
       if subplan is None:
         return None, None
       s = start
@@ -6348,11 +6461,9 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
           if not okb:
             # VALIDATE-ALL per round: binds are checks, not state changes, so the suffix
             # states stay well-defined -- keep replaying and blacklist EVERY failing edge
-            # this round. Collapses rounds from #failures to #failure-layers (measured:
-            # first-failure needed 130 rounds/145s on the obj_11 fill). The global lazy
-            # search measured validate-all HARMFUL -- there the doomed-suffix IK cost
-            # dominates; in a tiny fill the re-search dominates, inverting the trade.
+            # this round, each with an incremental tree repair.
             bl.add((s, a))
+            engine.delete_edge(s, a, ns)
             valid = False
           else:
             ok_cache.add((s, a))
@@ -6479,20 +6590,13 @@ def _add_parts(start, ps, ideal, assembly, robots, checker, grasp_table, robot_i
     bl = set()                                            # (state, action) IK-refuted edges
     ok_cache = set()
 
-    def succ_lazy(s):
-      for a, ns in succ_fn(s):
-        if (s, a) not in bl:
-          yield a, ns
-
-    def cheap_only(prev, act, ns):
-      return cheap_feasible(act, prev, ns, assembly, checker)
+    engine = _IncrementalLazySearch(
+        start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
+        weight=weight, blacklist=bl,
+        cheap_gate=lambda prev, act, ns: cheap_feasible(act, prev, ns, assembly, checker))
 
     for _round in range(200):
-      subplan = _astar(start, goal_fn=goal_fn, succ_fn=succ_lazy, cost_fn=action_cost,
-                       h_fn=h_fn, cheap_fn=None, edge_check_fn=cheap_only, weight=weight,
-                       max_nodes=max_nodes, verbose=False,
-                       tag="add " + "+".join(ps) + " lazy", deadline=deadline,
-                       cost_bound=cost_bound)
+      subplan = engine.search(max_nodes, deadline=deadline)
       if subplan is None:
         return None, None
       s = start
@@ -6508,6 +6612,7 @@ def _add_parts(start, ps, ideal, assembly, robots, checker, grasp_table, robot_i
           okb, _w = robot_ik.bind(a, s, ns, assembly)
           if not okb:
             bl.add((s, a))                                # validate-all (see _add_one_part)
+            engine.delete_edge(s, a, ns)
             valid = False
           else:
             ok_cache.add((s, a))
@@ -6862,6 +6967,11 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
 
   def fill(s, q, ideal, fb=None, forbid=None, settle=None):
     allow, unbraced_ok, ballow = hints(_subasm_key(ideal), q)
+    # h-shift for NON-module fills: the settled {ideal+q} abstraction value (see
+    # _add_one_part.h_fn). Module fills (settle is not None) keep the epsilon join.
+    shift = None
+    if settle is None:
+      shift = oracle(set(ideal), q)
     dense = _problem._DENSE_GRASPS
     # phases, narrowest first: (grasp_cap, bracing, mate_allow, brace_allow). A FULL phase (all
     # grasps, no brace restriction) always precedes escalation -- the completeness net when a
@@ -6885,7 +6995,8 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
                               handovers=handovers, allow_place=allow_place, bracing=br,
                               grasp_cap=cap, h_extra=h_lab.value, part_grasp_allow=ma,
                               brace_allow=ba, deadline=deadline, lazy_fill=lazy_fills,
-                              cost_bound=fb, forbid_assemble=forbid, settle_ref=settle)
+                              cost_bound=fb, forbid_assemble=forbid, settle_ref=settle,
+                              h_extra_shift=shift)
       if sub is not None:
         return sub, s2
     return None, None

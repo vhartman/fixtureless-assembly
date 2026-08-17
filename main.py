@@ -179,6 +179,9 @@ def build_parser():
       "--assembly",
       choices=["cross", "cube", "arch", "arch-seq", "cube-plates", "cube-plates-2x2x3",
                "cuboid-tower", "car", "car-mini", "slot-pin", "peg-hole", "peg-stool",
+               "peg-stool-4", "peg-stool-cuboid", "peg-stool-cuboid-4",
+               "peg-stool-tight", "peg-stool-4-tight",
+               "peg-stool-cuboid-tight", "peg-stool-cuboid-4-tight",
                "mesh-demo", "compound-demo", "chair"],
       default="cross",
       help="Assembly to build: cross (cube cross, 7), cube (2x2x2 grid, 8), "
@@ -192,7 +195,14 @@ def build_parser():
            "slot-pin (base + cantilever bar + fastening pin -- the --staged-mates testbed), "
            "peg-hole (compound blind socket + top-down cylindrical peg, 2 -- concavity smoke "
            "test; use --grasp-sampler), peg-stool (compound seat with three real downward "
-           "sockets + cylindrical legs, 4; use --grasp-sampler and a vacuum gripper). "
+           "sockets + cylindrical legs, 4; use --grasp-sampler and a vacuum gripper), "
+           "peg-stool-4 (the same stool with FOUR cylindrical legs, 5), "
+           "peg-stool-cuboid (the peg-stool with SQUARE cuboid legs, 4), "
+           "peg-stool-cuboid-4 (the four-legged stool with SQUARE cuboid legs, 5), and "
+           "the four -tight kinds (same four stools, peg size derived from the socket hole "
+           "so the nominal clearance is 1mm instead of ~5mm; a square peg's CORNER gap is "
+           "the binding clearance). All stool variants: use --grasp-sampler and a vacuum "
+           "gripper; the clearance is a constructor parameter (PegStoolAssembly peg_clearance). "
            "Default: cross.",
   )
   g_solver.add_argument(
@@ -298,6 +308,35 @@ def build_parser():
            "whether a pinch holds or pivots and whether a cup can seal. A shape too small "
            "for the patch (a thin leg) keeps its best-supported candidates instead. "
            "Default 0.75; 0 disables. Saved with the plan -- it rebinds grasp ids.",
+  )
+  g_ik.add_argument(
+      "--grasp-sampler-wrap", type=float, default=None, metavar="W",
+      help="--grasp-sampler: CURVATURE-FAIR pad-support metric (opt-in; off = the legacy "
+           "metric, byte-identical). A pad sample counts as supported when its DEFORMATION "
+           "DISTANCE (signed distance to the surface) RELATIVE TO THE NEAREST CONTACT is "
+           "<= W metres -- the pad's wrap budget. The legacy metric lifts the whole pad "
+           "along the centre normal and caps each ray at lift+depth: it scores a real side "
+           "pinch of a peg (a compliant pad wrapping a 12.5mm-radius barrel, ~3mm sagitta "
+           "over the 20mm pad) as ~0.3 and, worse, can never see the wrap roll (pads across "
+           "the circumference, palm approaching from the side) because its rigid rays miss "
+           "the barrel. e.g. 0.006 "
+           "admits the axis-aligned pads on the peg; 0.012 also admits the side-approach "
+           "wrap roll (~10mm bend). Flat faces (deformation 0) gate exactly as before. The "
+           "flag also EMITS the complementary roll (pads ACROSS the part, approach from the "
+           "side) for every surface -- for a flat long box (the cuboid peg) that is the only "
+           "pinch whose palm does not sit at the peg END and collide with the seat during "
+           "insertion. Saved with the plan -- it rebinds grasp ids.",
+  )
+  g_ik.add_argument(
+      "--grasp-sampler-scenes", action="store_true",
+      help="--grasp-sampler: SCENE-AWARE sampling (opt-in). Every raw candidate is tagged "
+           "with two floating-EE verdicts -- feasible at the part's INITIAL pose (the PICK "
+           "set) and feasible at the part's ASSEMBLED pose (the ASSEMBLE set) -- and the "
+           "keep budget splits into per-set quotas, so the DB provably contains a pick-able "
+           "grasp, an assemble-able grasp and free-space (handover) grasps for every part "
+           "instead of hoping the uniform cloud covers all three. The DB becomes per PART "
+           "INSTANCE (identical legs filter differently). Deterministic; saved with the "
+           "plan -- it rebinds grasp ids.",
   )
   g_ik.add_argument(
       "--grasp-sampler-margin", type=float, default=0.008, metavar="M",
@@ -427,12 +466,37 @@ def build_parser():
            "the weak suction/friction path; the default since 2026-07-29).",
   )
   g_phys.add_argument(
+      "--table-friction", type=float, default=None, metavar="MU", dest="table_mu",
+      help="With --wrench: model the TABLE support as a FRICTION cone (lateral capacity "
+           "mu x normal per support point) instead of the FRICTIONLESS unilateral default. "
+           "A table-rest target can then resist the lateral shear --insertion-noise adds "
+           "(the unilateral default rejects ANY lateral load, so rest-on-table assembly "
+           "with noise on is impossible). Default off (unilateral, byte-identical).",
+  )
+  g_phys.add_argument(
       "--vacuum-scale", type=float, default=None, metavar="FACTOR",
       help="With --wrench: scale ALL of the VACUUM's capability by this factor (every force "
            "AND torque cap -- push, pull, lateral, couples -- across whichever grasp model "
            "is active), leaving the friction ratio mu and the two-finger untouched. e.g. 0.1 "
            "= a cup a tenth as capable everywhere: still picks a light part but holds almost "
            "nothing against gravity or a press. Default off (factor 1).",
+  )
+  g_phys.add_argument(
+      "--two-finger-scale", type=float, default=None, metavar="FACTOR",
+      help="With --wrench: scale ALL of the TWO-FINGER's capability by this factor (every "
+           "force AND torque cap -- push, pull, lateral, couples -- across whichever grasp "
+           "model is active), leaving the friction ratio mu and the vacuum untouched. e.g. "
+           "3.0 = strong fingers that hold the seat edge-grasps the lever arm rejects. "
+           "Default off (factor 1).",
+  )
+  g_phys.add_argument(
+      "--vacuum-engage-force", type=float, default=0.0, metavar="N",
+      help="With --wrench: transient force a vacuum cup applies ALONG its approach axis while "
+           "seating/sealing on the surface. Before pick/add_grasp/handover adds the new "
+           "contact, the table and EXISTING holders must balance this point load at the cup. "
+           "It is not kept as a permanent load after attachment: the cup/suction preload is "
+           "then internal and the normal holding envelope belongs to --grasp-model. "
+           "0 disables (compatibility default); try 5N.",
   )
   g_phys.add_argument(
       "--tf-close-torque", type=float, default=None, metavar="NM",
@@ -1137,6 +1201,15 @@ def build_parser():
            "when a hold's acquisition locks an unconnectable homotopy. Never applied to "
            "replays (saved plans cannot contain banned actions).",
   )
+  g_search.add_argument(
+      "--vacuum-no-assemble", action="store_true",
+      help="SEARCH-scoped CAPABILITY ban: no assemble may involve a vacuum arm -- as the "
+           "acting robot, the holder of the inserted part or of the target, or a brace "
+           "contact. The vacuum may pick and hand over only (the role split: the vacuum "
+           "picks the flat seat, a two-finger receives the handover and does the mates). "
+           "Needs --wrench (the per-robot kind map only flows under it). Never applied to "
+           "replays.",
+  )
   g_mp.add_argument(
       "--mp-stall-timeout", type=float, default=None, metavar="SEC",
       help="With --motion-plan: stop BiRRT early once the MODE FRONTIER has not grown for "
@@ -1374,7 +1447,9 @@ _SAVE_CONFIG_FIELDS = (
     "bracing", "robust_mode", "dense_grasps", "random_init", "part_float", "inhand_reorient",
     "pre_insertion", "pre_pick", "pre_place", "pre_add_grasp", "post_release", "staged_mates",
     "allow_curved_grasps", "grippers", "grasp_compliance",
-    "vacuum_scale", "tf_close_torque", "dominance", "useful_grasps", "brace_resting",
+    "vacuum_scale", "two_finger_scale", "vacuum_engage_force", "tf_close_torque", "dominance",
+    "table_mu",
+    "useful_grasps", "brace_resting",
     "ignore_gravity",                                    # weightless stability: a plan searched
     # weightless contains releases/lateral mates that are UNSTABLE under gravity, so a rebuild
     # without it cannot reproduce the actions (user-hit: sim StopIteration on a cross-12 plan)
@@ -1394,6 +1469,8 @@ _SAVE_CONFIG_FIELDS = (
     "grasp_sampler", "grasp_sampler_keep",               # --grasp-sampler: sampled ids only
     "grasp_sampler_candidates", "grasp_sampler_seed",    # replay under identical settings
     "grasp_sampler_margin", "grasp_sampler_pad_support",
+    "grasp_sampler_wrap",                                 # curvature-fair support metric (None = legacy)
+    "grasp_sampler_scenes",                              # scene-aware set split (rebinds ids)
     "tight_fingers",                                     # changes what the grasp DB filters out
     "ik_seeding",                                        # off => witness IK fails on re-picks/
     # reorienting places, and mp_export then exports the arm's PREVIOUS config as the goal
@@ -1458,7 +1535,8 @@ _WITNESS_FIELDS = (
     "tight_fingers", "part_float", "hoist_releases", "witness_margin", "witness_draw",
     "witness_sets", "witness_set_spread",
     "grasp_sampler", "grasp_sampler_keep", "grasp_sampler_candidates", "grasp_sampler_seed",
-    "grasp_sampler_margin", "grasp_sampler_pad_support")
+    "grasp_sampler_margin", "grasp_sampler_pad_support", "grasp_sampler_wrap",
+    "grasp_sampler_scenes")
 
 
 def _witnesses_reusable(saved_cfg, cfg):
@@ -1660,7 +1738,12 @@ def run(cfg, explicit=None):
   any_two_finger = (gripper_list is not None and not all(gripper_list)) or not cfg.vacuum
   set_rolls_per_face(2 if any_two_finger else 1)
   set_dense_grasps(cfg.dense_grasps and any_two_finger)
-  from problem import set_sampled_grasps
+  from problem import set_sampled_grasps, clear_sampled_scene_ctx
+  if cfg.grasp_sampler_scenes and not cfg.grasp_sampler:
+    raise SystemExit("--grasp-sampler-scenes requires --grasp-sampler")
+  # a previous in-process run's scene filter must not leak into THIS run's assembly
+  # definition (define() queries the grasp DB, which raises under a stale part-less ctx).
+  clear_sampled_scene_ctx()
   if cfg.grasp_sampler:
     if cfg.dense_grasps or cfg.grasp_translations:
       # dense/translations are FACE-ENUMERATOR variant families and several id-arithmetic
@@ -1672,7 +1755,8 @@ def run(cfg, explicit=None):
                         "candidates": cfg.grasp_sampler_candidates,
                         "keep": cfg.grasp_sampler_keep,
                         "margin": cfg.grasp_sampler_margin,
-                        "pad_support": cfg.grasp_sampler_pad_support})
+                        "pad_support": cfg.grasp_sampler_pad_support,
+                        "wrap": cfg.grasp_sampler_wrap})
     print(f"[flag] --grasp-sampler ACTIVE: mesh-sampled grasp DB (trimesh surface sampling; "
           f"{cfg.grasp_sampler_candidates} candidates -> {cfg.grasp_sampler_keep} kept per "
           f"shape via farthest-point downsampling; suction + antipodal blocks; seed "
@@ -1767,6 +1851,19 @@ def run(cfg, explicit=None):
           "Labeled/collapsed h model the inverse-reorient edge (cost 1) -> h stays admissible.")
   import wrench
   wrench.PARAMS["grasp_model"] = cfg.grasp_model  # capability model (used when --wrench)
+  if cfg.table_mu is not None:
+    wrench.PARAMS["table_model"] = "friction"
+    wrench.PARAMS["table_mu"] = float(cfg.table_mu)
+    print(f"[flag] --table-friction ACTIVE: table support is a friction cone (mu {cfg.table_mu:g}); "
+          "the frictionless unilateral default rejects ANY lateral load on a table-rest "
+          "target (e.g. every --insertion-noise corner).")
+  if cfg.vacuum_engage_force < 0.0:
+    raise ValueError("--vacuum-engage-force must be non-negative")
+  wrench.PARAMS["vacuum_engage_force"] = float(cfg.vacuum_engage_force)
+  if cfg.wrench and cfg.vacuum_engage_force > 0.0:
+    print(f"[flag] --vacuum-engage-force {cfg.vacuum_engage_force:g}N ACTIVE: every vacuum "
+          "pick/add_grasp/handover must have its pre-existing supports balance the cup's "
+          "transient approach-axis sealing load.")
   if cfg.vacuum_scale is not None:
     vs = float(cfg.vacuum_scale)                          # scale EVERY vacuum force+torque cap
     for _model in wrench.PARAMS["grasp"].values():         # all models; mu (a ratio) is left as-is
@@ -1777,6 +1874,16 @@ def run(cfg, explicit=None):
             vac[_k] = vac[_k] * vs
     print(f"[flag] --vacuum-scale ACTIVE: vacuum capability x{vs:g} (all forces + torques; "
           "two-finger and mu unchanged).")
+  if cfg.two_finger_scale is not None:
+    ts = float(cfg.two_finger_scale)                     # scale EVERY two-finger force+torque cap
+    for _model in wrench.PARAMS["grasp"].values():        # all models; mu (a ratio) is left as-is
+      tf = _model.get("two_finger")
+      if tf:
+        for _k in tf:
+          if _k != "mu":
+            tf[_k] = tf[_k] * ts
+    print(f"[flag] --two-finger-scale ACTIVE: two-finger capability x{ts:g} "
+          "(all forces + torques; vacuum and mu unchanged).")
   if cfg.tf_close_torque is not None:
     wrench.PARAMS["grasp"]["asymmetric"]["two_finger"]["T_close"] = float(cfg.tf_close_torque)
     print(f"[flag] --tf-close-torque ACTIVE: two-finger closing-axis torque cap = "
@@ -1800,6 +1907,14 @@ def run(cfg, explicit=None):
   if cfg.ban_actions:
     print(f"[flag] --ban-actions ACTIVE: {cfg.ban_actions} (successor generator filters "
           f"matching actions; search only)")
+  if cfg.vacuum_no_assemble:
+    from problem import set_kind_forbid
+    set_kind_forbid(("vacuum:assemble",))
+    print("[flag] --vacuum-no-assemble ACTIVE: no assemble may involve a vacuum arm "
+          "(actor, inserted-part/target holder, or brace) -- the vacuum may pick and hand "
+          "over only."
+          + ("" if cfg.wrench else " NOTE: needs --wrench (the per-robot kind map only "
+             "flows under it); without it the forbid has NO effect."))
   if cfg.ignore_gravity:
     print("[flag] --ignore-gravity ACTIVE: parts weightless in the wrench check "
           "(only insertion/applied loads must be resisted).")
@@ -1879,6 +1994,15 @@ def run(cfg, explicit=None):
                            spacing=cfg.scatter_spacing, random_init=cfg.random_init,
                            float_height=cfg.part_float, min_sep=cfg.min_sep,
                            grid=cfg.grid_init, grid_gap=cfg.grid_gap)
+
+  if cfg.grasp_sampler_scenes:
+    from problem import install_sampled_scene_ctx
+    install_sampled_scene_ctx(C, assembly, robots=get_robots(C))
+    print("[flag] --grasp-sampler-scenes ACTIVE: every sampled candidate is tagged with "
+          "floating-EE verdicts at its INITIAL pose (PICK set) and ASSEMBLED pose "
+          "(ASSEMBLE set); the keep budget splits into per-set quotas, so the DB provably "
+          "contains pick-able, assemble-able and free-space (handover) grasps per part. "
+          "Grasp ids are per PART INSTANCE.")
 
   if cfg.check_init:
     chk_robots = get_robots(C)

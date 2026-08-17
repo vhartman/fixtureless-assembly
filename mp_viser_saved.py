@@ -38,38 +38,68 @@ def main():
     rik = RobotIK(C, robots)
     rik.ik_seeding = bool(cfg.get("ik_seeding", True))
     export_path = args.mp_export or mpf
-    try:
-        saved = MP.load_export_bundle(
-            export_path, plan, list(rik.C.getJointNames()))
-    except ValueError as e:
-        raise SystemExit(str(e)) from e
-    wit, pre = saved["witnesses"], saved["pre_witnesses"]
-    settings = saved["settings"]
-    rik.pre_insertion_delta = float(settings.get("pre_insertion", 0.0))
-    rik.pre_pick_delta = float(settings.get("pre_pick", 0.0))
-    rik.pre_place_delta = float(settings.get("pre_place", 0.0))
-    rik.pre_add_grasp_delta = float(settings.get("pre_add_grasp", 0.0))
-    rik.post_release_delta = float(settings.get("post_release", 0.0))
+    saved = MP.load_export_bundle(
+        export_path, plan, list(rik.C.getJointNames()), required=False)
+    legacy = saved is None
+    if legacy:
+        # PRE-EXPORT mp file: the path predates the embedded final export.  Visual replay
+        # can still use the SOLVED witnesses persisted in the plan file; only the pre-*
+        # keyframes the exporter fused later are missing, and make_problem re-solves those
+        # (IK only, no BiRRT).  A strictly zero-IK replay still needs a bundle: make one
+        # once with --mp-export-save or pass --mp-export <bundle.json>.
+        from plan_io import read_witnesses
+        wit = read_witnesses(path, list(rik.C.getJointNames()), len(plan))
+        if not wit:
+            raise SystemExit(
+                f"{path}: no persisted witnesses and {mpf} has no export block; "
+                "nothing to view without solving")
+        print(f"[viser] LEGACY visual replay: {export_path} has no embedded export; using "
+              "the plan's solved witnesses and re-solving only missing pre-keyframes "
+              "(no BiRRT). For a strict zero-IK replay, make an export bundle first "
+              "(--mp-export-save).")
+        pre, settings, witness_sets = {}, {}, None
+        tasks = step_names = sequence_names = None
+    else:
+        wit, pre = saved["witnesses"], saved["pre_witnesses"]
+        settings = saved["settings"]
+        witness_sets = saved["witness_sets"]
+        tasks = saved["tasks"]
+        step_names = saved["step_names"]
+        sequence_names = saved["sequence_names"]
+    rik.pre_insertion_delta = float(settings.get("pre_insertion",
+                                                 cfg.get("pre_insertion", 0.0)))
+    rik.pre_pick_delta = float(settings.get("pre_pick", cfg.get("pre_pick", 0.0)))
+    rik.pre_place_delta = float(settings.get("pre_place", cfg.get("pre_place", 0.0)))
+    rik.pre_add_grasp_delta = float(settings.get("pre_add_grasp",
+                                                 cfg.get("pre_add_grasp", 0.0)))
+    rik.post_release_delta = float(settings.get("post_release",
+                                                cfg.get("post_release", 0.0)))
     brace = bool(settings.get("bracing", cfg.get("bracing", True)))
     prob = MP.make_problem(
         C, asm, plan, wit, robots, rik, gk, bracing=brace,
-        depgraph=bool(settings.get("depgraph", False)),
-        collision_tolerance=float(settings.get("collision_tolerance", 1e-4)),
+        depgraph=bool(settings.get("depgraph", not cfg.get("mp_sequence", False))),
+        collision_tolerance=float(settings.get("collision_tolerance",
+                                               cfg.get("mp_collision_tolerance", 1e-4))),
         pre_witnesses=pre,
-        robot_robot_margin=float(settings.get("robot_robot_margin", 0.0)),
-        robot_margin_ramp=float(settings.get("robot_margin_ramp", 0.0)),
-        table_margin=float(settings.get("table_margin", 0.0)),
-        table_float=float(settings.get("table_float", 0.0)),
-        witness_sets=saved["witness_sets"], resolve_missing_pre=False,
-        task_records=saved["tasks"], saved_step_names=saved["step_names"],
-        saved_sequence_names=saved["sequence_names"])
+        robot_robot_margin=float(settings.get("robot_robot_margin",
+                                              cfg.get("mp_robot_margin", 0.0))),
+        robot_margin_ramp=float(settings.get("robot_margin_ramp",
+                                             cfg.get("mp_margin_ramp", 0.0))),
+        table_margin=float(settings.get("table_margin",
+                                        cfg.get("mp_table_margin", 0.0))),
+        table_float=float(settings.get("table_float", cfg.get("part_float", 0.002))),
+        witness_sets=witness_sets, resolve_missing_pre=legacy,
+        task_records=tasks, saved_step_names=step_names,
+        saved_sequence_names=sequence_names)
 
     have_sig = MP.task_signature(prob)
-    if saved["task_signature"] is not None and have_sig != saved["task_signature"]:
+    if not legacy and saved["task_signature"] is not None \
+            and have_sig != saved["task_signature"]:
         raise SystemExit("saved final export no longer rebuilds the same task signature; "
                          "refusing to replay against changed task semantics")
-    print(f"[viser] {len(prob.tasks)} tasks rebuilt from persisted final export {export_path}; "
-          "IK solves: 0")
+    print(f"[viser] {len(prob.tasks)} tasks rebuilt "
+          f"({'legacy: plan witnesses + IK-only pre-keyframes' if legacy else 'from persisted final export ' + export_path}); "
+          "IK solves: 0" if not legacy else "")
 
     mp = MP.load_path(mpf)
     print(f"[viser] loaded {len(mp)} states from {mpf}")

@@ -24,6 +24,7 @@ MODE = {"seed": 3, "candidates": 64, "keep": 8}
 @pytest.fixture(autouse=True)
 def _clean_sampler_state():
   yield
+  P.clear_sampled_scene_ctx()
   P.set_sampled_grasps(None)
   P.reset_grasp_pose_cache()
 
@@ -114,9 +115,128 @@ def test_cylinder_pinches_include_both_axial_approaches():
   assert any(z < -0.8 for z in axial), axial
 
 
+def test_wrap_metric_keeps_peg_side_pinches():
+  """A peg lying on a table is picked from the side: fingers close ACROSS the diameter
+  (closing axis perpendicular to the peg axis) and the palm approaches radially. The
+  sampler's roll search only lays the pads ALONG the axis, so without the flag no radial
+  side pinch exists at all; the legacy lift+depth metric would drop it anyway (the pad
+  bends over the barrel, a ~12 mm sagitta over its 20 mm half-length, far past the 5 mm
+  legacy budget). --grasp-sampler-wrap W adds the wrap roll AND scores it curvature-fair
+  (surface drop relative to the nearest contact <= W), so at W=0.015 the side pinch passes
+  the 0.75 support gate, and the wrap flag reserves part of the pinch quota for the side
+  approach so FPS cannot race it out."""
+  gates = {"seed": 0, "candidates": 200, "keep": 12,
+           "margin": 0.008, "pad_support": 0.75}
+  peg = ("cylinder", (0.15, 0.0125))
+
+  def _side_radial(poses, meta):
+    out = []
+    for q, m in zip(poses, meta):
+      if m["family"] != "pinch":
+        continue
+      R = P._quat_to_R(np.asarray(q[3:]))
+      y = R @ np.array([0.0, 1.0, 0.0])                    # closing axis, part frame
+      z = R @ np.array([0.0, 0.0, 1.0])                    # approach axis, part frame
+      if abs(float(y[2])) < 0.5 and abs(float(z[2])) < 0.5:   # across the diameter, from
+        out.append((float(z[2]), float(m["pad_support"])))    # the side (radial approach)
+    return out
+
+  P.set_sampled_grasps(dict(gates, wrap=None))             # legacy: no wrap roll emitted
+  legacy = _side_radial(P.part_grasp_poses(peg), P.sampled_grasp_meta(peg))
+  assert legacy == [], legacy                              # documents the pre-flag hole
+
+  P.set_sampled_grasps(dict(gates, wrap=0.015))
+  poses = P.part_grasp_poses(peg)
+  meta = P.sampled_grasp_meta(peg)
+  side = _side_radial(poses, meta)
+  assert len(side) >= 2, side                       # the wrap-roll quota (keep 12 -> 2 slots)
+  assert all(s >= 0.75 for _nz, s in side), side    # admitted above the gate, no fallback
+  # the gate still holds for every retained pinch (no silent fallback under the wrap flag)
+  assert all(m["pad_support"] >= 0.75
+             for q, m in zip(poses, meta) if m["family"] == "pinch")
+
+
 def test_cli_defaults_and_guard():
   assert RunConfig().grasp_sampler is False
+  assert RunConfig().grasp_sampler_scenes is False
   a = main.parse_args([])
   assert a.grasp_sampler is False and a.grasp_sampler_keep == 12
   with pytest.raises(SystemExit):
     main.run(RunConfig(grasp_sampler=True, dense_grasps=True, solve=False, view=False))
+  with pytest.raises(SystemExit):
+    main.run(RunConfig(grasp_sampler_scenes=True, solve=False, view=False))
+
+
+def test_wrap_emits_side_roll_for_long_boxes():
+  """A long flat box (the cuboid peg) needs the SIDE pinch: fingers across the short
+  dimension, palm approaching perpendicular to the long axis. Without the complementary
+  roll the sampler only emits pads-along-the-long-axis pinches, whose palm sits at the peg
+  END and collides with the seat during insertion -- the cuboid-peg failure the user hit."""
+  gates = {"seed": 0, "candidates": 200, "keep": 12, "margin": 0.008, "pad_support": 0.5}
+  peg = ("box", (0.02, 0.02, 0.11, 0.0))                  # long axis = part z, like the legs
+
+  def _side(poses, meta):
+    out = []
+    for q, m in zip(poses, meta):
+      if m["family"] != "pinch":
+        continue
+      R = P._quat_to_R(np.asarray(q[3:]))
+      y = R @ np.array([0.0, 1.0, 0.0])                   # closing axis, part frame
+      z = R @ np.array([0.0, 0.0, 1.0])                   # approach axis, part frame
+      if abs(float(y[2])) < 0.5 and abs(float(z[2])) < 0.5:   # across the short dimension,
+        out.append(float(m["pad_support"]))                   # approach from the side
+    return out
+
+  P.set_sampled_grasps(dict(gates, wrap=None))            # legacy: no complementary roll
+  assert _side(P.part_grasp_poses(peg), P.sampled_grasp_meta(peg)) == []
+
+  P.set_sampled_grasps(dict(gates, wrap=0.1))
+  side = _side(P.part_grasp_poses(peg), P.sampled_grasp_meta(peg))
+  assert side, "no side pinch of the long box with --grasp-sampler-wrap 0.1"
+  assert all(s >= 0.5 for s in side)                      # admitted above the support gate
+
+
+def test_scene_aware_sets_free_pick_asm():
+  """--grasp-sampler-scenes: the DB per PART INSTANCE is split into FREE / PICK (floating-EE
+  clear at the initial pose) / ASSEMBLE (clear at the seated pose) sets with per-set quotas.
+  Every tagged row must re-pass its own set's check, and identical parts get their OWN DB."""
+  import env
+  from problem import add_disassembled_obj, get_robots, make_assembly
+  P.set_sampled_grasps({"seed": 0, "candidates": 64, "keep": 12,
+                        "margin": 0.008, "pad_support": 0.75})
+  C = env.make_four_robot_env(num_robots=1, floating_ee=False, vacuum=False)
+  asm = make_assembly("cross", 3)
+  C = add_disassembled_obj(C, asm, spacing=0.2)
+  P.install_sampled_scene_ctx(C, asm, robots=get_robots(C))
+  spec = asm.part_shape("obj_1")
+  poses = P.part_grasp_poses(spec, part="obj_1")
+  meta = P.sampled_grasp_meta(spec, part="obj_1")
+  assert len(poses) == len(meta) == 12
+  assert all("set" in m for m in meta)
+  sets = {m["set"] for m in meta}
+  assert sets <= {"free", "pick", "asm"}
+  assert "pick" in sets and "free" in sets            # a cube on the table has both pools
+  ctx = P._SAMPLED_SCENE_CTX
+  for pose, m in zip(poses, meta):
+    state = ctx["s0"] if m["set"] == "pick" else ctx["s_full"] if m["set"] == "asm" else None
+    if state is not None:                             # tagged rows re-pass their own gate
+      assert ctx["checker"].pose_collision_free(state, "obj_1", pose, asm)
+  # identical shape, different instance: its own DB (same raw cloud, own filter)
+  spec2 = asm.part_shape("obj_2")
+  assert spec2[0] == "box" and spec2[1] == spec[1]
+  poses2 = P.part_grasp_poses(spec2, part="obj_2")
+  assert len(poses2) == 12
+  assert any(not np.array_equal(a, b) for a, b in zip(poses2, poses))   # own filter per instance
+  # a part-less query under the scene ctx must fail loudly, never silently unfiltered
+  with pytest.raises(ValueError):
+    P.part_grasp_poses(spec)
+
+
+def test_scene_aware_off_is_byte_identical():
+  P.set_sampled_grasps({"seed": 0, "candidates": 64, "keep": 12})
+  before = [np.array(p) for p in P.part_grasp_poses(CUBE)]
+  P.reset_grasp_pose_cache()                          # rebuild without any scene context
+  after = P.part_grasp_poses(CUBE)
+  assert len(before) == len(after)
+  for a, b in zip(before, after):
+    np.testing.assert_array_equal(a, b)

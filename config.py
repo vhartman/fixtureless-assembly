@@ -98,7 +98,10 @@ class RunConfig:
   # -- physics / wrench model --
   wrench: bool = True
   grasp_model: str = "asymmetric"
+  table_mu: Optional[float] = None
   vacuum_scale: Optional[float] = None
+  two_finger_scale: Optional[float] = None
+  vacuum_engage_force: float = 0.0
   tf_close_torque: Optional[float] = None
   curved_torque_scale: Optional[float] = None
   grasp_compliance: Optional[float] = None
@@ -111,6 +114,7 @@ class RunConfig:
   bracing: bool = True
   brace_resting: bool = False
   brace_for_assembly_only: bool = False
+  vacuum_no_assemble: bool = False
   staged_mates: bool = False
   mixed_wrench_h: bool = False
   allow_curved_grasps: bool = False
@@ -136,6 +140,8 @@ class RunConfig:
   grasp_sampler_seed: int = 0
   grasp_sampler_margin: float = 0.008
   grasp_sampler_pad_support: float = 0.75
+  grasp_sampler_wrap: Optional[float] = None
+  grasp_sampler_scenes: bool = False
   stable_rest_poses: bool = False
   tight_fingers: bool = True
   quiet_rai: bool = False

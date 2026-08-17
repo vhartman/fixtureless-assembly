@@ -52,6 +52,10 @@ def apply_wrench_params(cfg):
   else:
     _restore_in_place(wrench.PARAMS, _WRENCH_PARAMS0)
   wrench.PARAMS["grasp_model"] = _saved(cfg, "grasp_model")
+  tm = cfg.get("table_mu")                                  # friction-cone table model
+  if tm is not None:
+    wrench.PARAMS["table_model"] = "friction"
+    wrench.PARAMS["table_mu"] = float(tm)
   wrench.PARAMS["check_inserter"] = _saved(cfg, "inserter_check")
   wrench.PARAMS["insert_force"]["_default"] = _saved(cfg, "insert_force")
   wrench.PARAMS["curved_grasp_torque_scale"] = _saved(cfg, "curved_torque_scale")
@@ -59,6 +63,9 @@ def apply_wrench_params(cfg):
       None if _saved(cfg, "insertion_noise") is None
       else {"lateral": _saved(cfg, "insertion_noise"), "offset": _saved(cfg, "insertion_offset")})
   wrench.PARAMS["robust_mode"] = _saved(cfg, "robust_mode")
+  # Vacuum sealing is a successor gate, so replay must restore it before walking the saved
+  # action list. Missing in an old plan means the compatibility default (0 N).
+  wrench.PARAMS["vacuum_engage_force"] = float(_saved(cfg, "vacuum_engage_force"))
   # weightless stability -- without this a plan searched under --ignore-gravity is
   # unreproducible here (its successor set differs). .get(): older files predate the key.
   wrench.PARAMS["ignore_gravity"] = bool(cfg.get("ignore_gravity"))
@@ -73,6 +80,14 @@ def apply_wrench_params(cfg):
         for _k in vac:
           if _k != "mu":
             vac[_k] = vac[_k] * float(vs)
+  ts = cfg.get("two_finger_scale")                          # scale every two-finger force+torque cap
+  if ts is not None:
+    for _model in wrench.PARAMS["grasp"].values():
+      tf = _model.get("two_finger")
+      if tf:
+        for _k in tf:
+          if _k != "mu":
+            tf[_k] = tf[_k] * float(ts)
   tfc = cfg.get("tf_close_torque")                          # two-finger closing-axis torque cap
   if tfc is not None:
     wrench.PARAMS["grasp"]["asymmetric"]["two_finger"]["T_close"] = float(tfc)
@@ -101,6 +116,8 @@ def build_scene(cfg):
   # a replay with a different count would read every saved grasp id against a different table.
   from problem import set_banned_actions
   set_banned_actions(())                                   # search-only; never active in replays
+  from problem import set_kind_forbid
+  set_kind_forbid(())                                      # search-only; never active in replays
   from problem import set_sampled_grasps
   set_sampled_grasps({"seed": int(_saved(cfg, "grasp_sampler_seed")),
                       "candidates": int(_saved(cfg, "grasp_sampler_candidates")),
@@ -111,7 +128,10 @@ def build_scene(cfg):
                       "margin": float(_saved(cfg, "grasp_sampler_margin", legacy=0.0)),
                       # pad_support's default never changed, so a missing key means today's
                       # default (0.75) -- the historical `or 0.0` here was wrong.
-                      "pad_support": float(_saved(cfg, "grasp_sampler_pad_support"))}
+                      "pad_support": float(_saved(cfg, "grasp_sampler_pad_support")),
+                      # None = the legacy support metric; a value switches to the
+                      # curvature-fair wrap metric (rebinds ids -> saved with the plan).
+                      "wrap": _saved(cfg, "grasp_sampler_wrap")}
                      if _saved(cfg, "grasp_sampler") else None)  # sampled ids: same hazard class
   set_plain_box(bool(_saved(cfg, "plain_box")))                # cube collision geometry must match
   from problem import set_stable_rest_poses
@@ -147,6 +167,9 @@ def build_scene(cfg):
   from problem import reset_wrench_cache, reset_grasp_pose_cache
   reset_wrench_cache()
   reset_grasp_pose_cache()
+  from problem import clear_sampled_scene_ctx
+  clear_sampled_scene_ctx()                 # a previous scene's filter must not leak into
+  # make_assembly below (define() queries the grasp DB, which raises under a stale ctx).
   apply_wrench_params(cfg)
   C = make_four_robot_env(num_robots=cfg["num_robots"], floating_ee=cfg["floating_ee"],
                           vacuum=gripper_list if gripper_list is not None else _saved(cfg, "vacuum"),
@@ -163,6 +186,11 @@ def build_scene(cfg):
                            float_height=_saved(cfg, "part_float", legacy=0.015),
                            min_sep=_saved(cfg, "min_sep"), grid=_saved(cfg, "grid_init"),
                            grid_gap=_saved(cfg, "grid_gap"))
+  if _saved(cfg, "grasp_sampler_scenes", legacy=False):
+    # the scene-filtered DB is per PART INSTANCE and its ids are what the plan indexes: the
+    # replay scene must install the same filter context or every saved grasp id misreads.
+    from problem import install_sampled_scene_ctx, get_robots as _get_robots
+    install_sampled_scene_ctx(C, assembly, robots=_get_robots(C))
   return C, assembly
 
 

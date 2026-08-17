@@ -275,31 +275,57 @@ def visualize_grasps_viser(C, assembly, recorder=None, view=True, useful=None):
   free-floating EE at every candidate grasp of the part's DB. Coloring: if `useful` (a
   {part: set of mate-viable grasp ids}, e.g. solver.compute_useful_grasps) is given, green =
   mate-viable / grey = not; else green = FLAT surface / orange = CURVED (part_grasp_surfaces).
-  A quick way to eyeball what grasps exist per part and which can seat the mate. With a
-  ViserRecorder it records + returns it (serve() for the web view); else blocking rai view."""
+  Extra per-part frames when the data exists:
+    * `useful`     -- ONLY the mate-viable grasps (can seat the mate: press-aligned holds).
+    * PICK / ASSEMBLE / FREE -- the --grasp-sampler-scenes sets (initial-scene-feasible,
+      seated-pose-feasible, free-space/handover), read from the sampler meta. Useful is NOT
+      the pick set: a side grasp of a peg picks and hands over fine but cannot transmit the
+      insertion press, so it is not mate-viable.
+  With a ViserRecorder it records + returns it (serve() for the web view); else blocking rai
+  view."""
   import problem as _p
   gpath = _scene_floating_ee_path(C)
   base = np.array([0.0, 0.0, 0.6, 1.0, 0.0, 0.0, 0.0])     # part parked mid-air, identity
   GREEN, ORANGE, GREY = [0.2, 0.8, 0.3, 1], [0.95, 0.55, 0.1, 1], [0.6, 0.6, 0.6, 1]
+  SET_NAMES = {"pick": "PICK", "asm": "ASSEMBLE", "free": "FREE/handover"}
 
-  def show(part):
+  def show(part, only=None):
+    # only: None = every grasp; "useful" = the mate-viable set; else a scene-set tag.
     Cv = make_world()
     add_part_frame(Cv, part, assembly.part_shape(part))
     Cv.getFrame(part).setPosition(base[:3]); Cv.getFrame(part).setQuaternion(base[3:])
     spec = assembly.part_shape(part)
-    surf = _p.part_grasp_surfaces(spec)
-    ids = list(range(len(_p.part_grasp_poses(spec))))
+    surf = _p.part_grasp_surfaces(spec, part=part)
+    ids = list(range(len(_p.part_grasp_poses(spec, part=part))))
     U = (useful or {}).get(part)
+    set_tags = None
+    if only in SET_NAMES:
+      mets = _p.sampled_grasp_meta(spec, part=part)
+      set_tags = {i: (m.get("set") if m else None) for i, m in enumerate(mets)} if mets else {}
+    shown = 0
     for gid in ids:
+      if only == "useful" and (U is None or gid not in U):
+        continue
+      if only in SET_NAMES and set_tags.get(gid) != only:
+        continue
       gw = _pose_compose(base, grasp_pose(assembly, part, gid))
       pref = f"g{gid}_"
       place_floating_ee(Cv, gw, gpath, prefix=pref)
-      col = (GREEN if gid in U else GREY) if U is not None else \
-          (GREEN if surf[gid] == "flat" else ORANGE)
+      col = (GREEN if gid in U else GREY) if (U is not None and only in (None, "useful")) \
+          else (GREEN if only in SET_NAMES else
+                (GREEN if surf[gid] == "flat" else ORANGE))
       color_gripper(Cv, pref, col)
-    nflat = sum(1 for s in surf if s == "flat")
-    tag = f" useful={sorted(U)}" if U is not None else f" ({nflat} flat, {len(ids)-nflat} curved)"
-    label = f"{part} [{spec[0]}]: {len(ids)} grasps{tag}"
+      shown += 1
+    if only == "useful":
+      label = f"{part} [{spec[0]}]: {shown} USEFUL grasps (mate-viable only, of {len(ids)})"
+    elif only in SET_NAMES:
+      label = (f"{part} [{spec[0]}]: {shown} {SET_NAMES[only]} grasps "
+               f"(of {len(ids)})")
+    else:
+      nflat = sum(1 for s in surf if s == "flat")
+      tag = f" useful={sorted(U)}" if U is not None else \
+          f" ({nflat} flat, {len(ids)-nflat} curved)"
+      label = f"{part} [{spec[0]}]: {len(ids)} grasps{tag}"
     if recorder is not None:
       recorder.record(Cv, label)
     elif view:
@@ -308,6 +334,14 @@ def visualize_grasps_viser(C, assembly, recorder=None, view=True, useful=None):
 
   for part in assembly.objects:
     show(part)
+    if (useful or {}).get(part):
+      show(part, only="useful")
+    # the scene-aware sets (--grasp-sampler-scenes): one frame per purpose, so 'which grasp
+    # can pick / hand over / assemble' is visible directly instead of implied by useful.
+    mets = _p.sampled_grasp_meta(assembly.part_shape(part), part=part)
+    if any(m and "set" in m for m in mets):
+      for tag in ("pick", "asm", "free"):
+        show(part, only=tag)
   return recorder
 
 

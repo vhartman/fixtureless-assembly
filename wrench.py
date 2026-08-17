@@ -46,6 +46,10 @@ PARAMS = {
     # unaffected either way (topological support; these are only read when wrench is on).
     "grasp_model": "isotropic",     # "isotropic" (original box) | "directional" | "asymmetric"
     "table_model": "unilateral",    # wrench table model (no-wrench table stays topological)
+    # FRICTION table model (--table-friction MU sets table_model to "friction"): the friction
+    # cone coefficient. The unilateral default is frictionless, so a table-rest target cannot
+    # resist ANY lateral load (every --insertion-noise corner adds one).
+    "table_mu": 0.3,
 
     "grasp": {
         # ISOTROPIC (original): a bounded axis-aligned wrench box -- push/pull up to F_max on
@@ -102,6 +106,13 @@ PARAMS = {
     # (byte-identical); needs insertion_uncertainty to have any effect (it scales the box).
     # Avoidance of imprecise-holder assembly is then EMERGENT, not a hardcoded prohibition.
     "grasp_compliance": None,                           # e.g. {"two_finger": 1.0, "vacuum": 3.5}
+    # VACUUM ENGAGEMENT: a real cup is pushed onto the surface before the seal/contact exists.
+    # This is a TRANSIENT point load along the grasp approach axis, balanced by the table or
+    # the group's PRE-EXISTING holders. problem.py gates pick/add_grasp/handover with it before
+    # adding the new contact. It is intentionally not part of grasp_capability: after sealing,
+    # suction and cup compression are an internal preload and only their NET holding envelope
+    # belongs in the equilibrium LP. Zero preserves old saved-plan successor sets.
+    "vacuum_engage_force": 0.0,                         # N; --vacuum-engage-force
     # VACUUM SEAL: the cup can only grip a FLAT face at least as large as its seal -- a face
     # smaller than the cup leaves the seal partially open (no vacuum, no grip). The grasp
     # generator drops vacuum candidates whose contacted face's smallest extent is below this
@@ -194,9 +205,28 @@ def cap_table_unilateral(points):
   # UNILATERAL table support: at each support point, a normal force that can only PUSH UP
   # (+z), never pull, and no tangential (frictionless) component. The set of such points is
   # the support polygon. Unbounded magnitude (the table takes any downward load).
+  # NOTE the frictionless choice means a table-rest target rejects ANY lateral load --
+  # including the 1e-3 N shear a --insertion-noise box adds. The friction model exists
+  # for exactly that.
   n = np.array([0.0, 0.0, 1.0])
   G = [_force_gen(n, p) for p in points]
   return np.array(G).T, np.full(len(G), np.inf)
+
+
+def cap_table_friction(points, mu):
+  # FRICTION table support: per point a LINEARIZED FRICTION PYRAMID (the standard cone
+  # polyhedron): generators n + mu*e for e in +-x, +-y. A nonneg combination of the four
+  # edges yields f_normal = sum(lambda) and |f_tangential| <= mu * f_normal -- a real table
+  # takes lateral loads through friction (mu ~ 0.3), so a table-rest target CAN resist the
+  # shear an --insertion-noise box adds. Unbounded magnitude; the unilateral model is the
+  # mu -> 0 limit.
+  n = np.array([0.0, 0.0, 1.0])
+  G, ub = [], []
+  for p in points:
+    for e in ((1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)):
+      G.append(_force_gen(n + mu * np.array([e[0], e[1], 0.0]), p))
+      ub.append(np.inf)
+  return np.array(G).T, np.array(ub, float)
 
 
 def cap_grasp_box(point, F_max, T_max):
@@ -285,11 +315,14 @@ def grasp_capability(point, n, t1, t2, gripper_kind, surface="flat"):
   return G, ub
 
 
-_TABLE_BUILDERS = {"unilateral": cap_table_unilateral}
+_TABLE_BUILDERS = {"unilateral": cap_table_unilateral, "friction": cap_table_friction}
 
 
 def table_capability(points):
-  return _TABLE_BUILDERS[PARAMS["table_model"]](points)
+  model = PARAMS["table_model"]
+  if model == "friction":
+    return _TABLE_BUILDERS["friction"](points, float(PARAMS.get("table_mu", 0.3)))
+  return _TABLE_BUILDERS[model](points)
 
 
 # ---------------------------------------------------------------------------------------

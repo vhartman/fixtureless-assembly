@@ -34,6 +34,9 @@ class _Config:
   def getJointState(self):
     return self.q.copy()
 
+  def getJointNames(self):
+    return ["a1_shoulder", "a2_shoulder"]
+
   def setJointState(self, q):
     self.q = np.asarray(q, dtype=float).copy()
 
@@ -53,6 +56,7 @@ class _Mode:
 class _Env:
   def __init__(self):
     self.C = _Config()
+    self.limits = np.array([[-1.0, -1.0], [1.0, 1.0]])
     self.base_ok = True
     self.task = _Task()
 
@@ -115,3 +119,28 @@ def test_margin_audit_distinguishes_base_rejection_from_our_gate(capsys):
   assert "concrete collision pairs from 1 sampled base rejection" in out
   assert "min_penetration=-12.00mm" in out
   assert "failed edges at frontier [7, 9]: 1" in out
+
+
+def test_wrapper_rejects_and_reports_joint_limit_violation(capsys):
+  env = _Env()
+  env.C.collisions = []
+  MP._install_robot_margin(
+      env, 0.0, ["a1", "a2"], {"a1": "a1_ee", "a2": "a2_ee"})
+
+  assert not env.is_collision_free_np(np.array([0.0, 1.125]), _Mode())
+  stats = env.margin_rejection_stats
+  assert stats["base_rejects"] == 0
+  assert stats["gate_rejects"] == 1
+  rec = next(iter(stats["records"].values()))
+  assert rec["gate"] == "joint-limit"
+  assert rec["frames"] == ("a2_shoulder", "upper")
+  assert rec["observed"] == 1.125
+  assert rec["required"] == 1.0
+  assert rec["worst_slack"] == -0.125
+
+  env.report_margin_rejections([7, 9])
+  out = capsys.readouterr().out
+  assert "gate=joint-limit" in out
+  assert "joint=a2_shoulder" in out
+  assert "value=1.125000rad upper=1.000000rad" in out
+  assert "violation=0.125rad" in out

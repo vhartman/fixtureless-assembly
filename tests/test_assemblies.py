@@ -56,6 +56,31 @@ def _replay_ok(plan, asm, C, robots_list, gk, bracing=False):
   return s.is_goal(asm)
 
 
+def test_vacuum_engagement_force_is_a_pre_contact_support_load():
+  """The cup's sealing push is checked before the new vacuum contact can help balance it.
+
+  A cube on the frictionless table accepts a top-down push, but cannot balance a horizontal
+  side push. A two-finger acquisition is unaffected by this vacuum-specific transient.
+  """
+  A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 1)
+  C = make_four_robot_env(num_robots=1, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  state = A.get_initial_state(C, asm)
+  group = state.subassemblies()[0]
+  saved = W.PARAMS.get("vacuum_engage_force", 0.0)
+  W.PARAMS["vacuum_engage_force"] = 5.0
+  try:
+    kinds = {"a1": "vacuum"}
+    # With one roll per face, ids 4 and 0 are the +z (top) and +x (side) surface grasps.
+    assert A._vacuum_engagement_stable(state, asm, group, "a1", "obj_0", 4, kinds)
+    assert not A._vacuum_engagement_stable(state, asm, group, "a1", "obj_0", 0, kinds)
+    assert A._vacuum_engagement_stable(
+        state, asm, group, "a1", "obj_0", 0, {"a1": "two_finger"})
+  finally:
+    W.PARAMS["vacuum_engage_force"] = saved
+
+
 def test_release_reroots_same_part_cograsps_by_robot_roster():
   """Releasing the primary holder must choose a deterministic remaining root.
 

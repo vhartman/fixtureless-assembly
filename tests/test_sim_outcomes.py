@@ -143,6 +143,23 @@ def test_main_refuses_to_silently_do_nothing():
   assert "need a plan" in str(e.value)
 
 
+def test_group_root_handover_recovers_descendant_grasp_id():
+  """mr_bench attaches the fixed group root, but the gripper can touch a mated descendant."""
+  import sim as S
+
+  class _State:
+    supports = {
+        "obj_0": frozenset(),
+        "obj_3": frozenset({("mate", "obj_0"), ("grasp", "a2", "obj_3", 6)}),
+    }
+
+    @staticmethod
+    def subassemblies():
+      return [frozenset({"obj_0", "obj_3"})]
+
+  assert S._held_grasp_id(_State(), "obj_0", robot="a2") == ("obj_3", 6)
+
+
 def test_car_mini_wheel_rims_rest_on_sim_table():
   """A rotated cylinder must use its real support extent in both the planner and MuJoCo.
 

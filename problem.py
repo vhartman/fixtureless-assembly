@@ -940,18 +940,38 @@ class PegStoolAssembly(Assembly):
   exercises a genuine concavity while the completed object has the familiar stool support
   geometry needed by the wrench checks.
 
-  The compound has 14 non-overlapping convex children (plate + four walls per socket + a
-  shallow central top pad).  The pad is not decorative: it gives the vacuum wrist 25mm of
-  clearance above the broad seat plate, so the shared 5mm IK gate does not reject an
-  otherwise useful seat hold.
+  The compound has 13 non-overlapping convex children (the seat plate plus four walls per
+  socket).  Its top is deliberately one plain broad surface: no artificial vacuum pedestal.
   Use ``--grasp-sampler`` for the compound seat.  A fleet with at least one vacuum gripper
   is recommended: the vacuum holds the broad seat while two-finger grippers insert legs.
+
+  ``leg_kind="box"`` (--assembly peg-stool-cuboid) keeps the SAME seat and sockets but gives
+  every leg a SQUARE cross-section.  A square peg fits a square hole when side < hole (the
+  peg's DIAGONAL clears the hole's diagonal); the stock side = 0.020 in the 0.030 hole leaves
+  a generous ~7mm corner gap.
+
+  ``legs=4`` (--assembly peg-stool-4 / peg-stool-cuboid-4) puts FOUR legs under the seat in
+  a symmetric rectangle.  The stock stool is deliberately three-legged: a triangle of
+  contacts is always coplanar (no wobble) and strictly contains the seat COM, whereas any
+  three corners of the four-leg rectangle put the COM on a support DIAGONAL.  All four legs
+  restore a strict interior COM with the classic stool look.
+
+  ``peg_clearance`` (the -tight kinds) derives the leg size from the socket hole so the
+  NOMINAL clearance is exactly the given value instead of the stock ~5mm: a round peg gets
+  radius = hole/2 - c, a square peg gets side = hole - c*sqrt(2) (its CORNER is the binding
+  constraint, so this yields corner gap == c). Set it in code to try any clearance; the
+  constructor asserts the value is geometrically possible.
   """
 
   def __init__(self, n_parts=4, seat_x=0.18, seat_y=0.14, seat_thickness=0.018,
                socket_outer=0.04, socket_hole=0.030, socket_depth=0.025,
-               leg_radius=0.0095, leg_length=0.11):
-    assert 1 <= int(n_parts) <= 4, "peg-stool is one seat and up to three legs"
+               leg_radius=0.0095, leg_length=0.11, leg_kind="cylinder",
+               leg_side=0.020, legs=3, peg_clearance=None):
+    assert legs in (3, 4), f"peg-stool has three or four legs, not {legs}"
+    assert leg_kind in ("cylinder", "box"), f"peg-stool leg kind {leg_kind!r}"
+    self.legs = int(legs)
+    assert 1 <= int(n_parts) <= self.legs + 1, \
+        f"peg-stool is one seat and up to {self.legs} legs"
     self.n_parts = int(n_parts)
     self.seat_x = float(seat_x)
     self.seat_y = float(seat_y)
@@ -961,6 +981,9 @@ class PegStoolAssembly(Assembly):
     self.socket_depth = float(socket_depth)
     self.leg_radius = float(leg_radius)
     self.leg_length = float(leg_length)
+    self.leg_kind = leg_kind
+    self.leg_side = float(leg_side)
+    self.peg_clearance = None if peg_clearance is None else float(peg_clearance)
     self.cube_size = self.seat_x                       # scatter/marker sizing only
     self.cube_radius = 0.0
     super().__init__()
@@ -969,21 +992,23 @@ class PegStoolAssembly(Assembly):
     sx, sy, st = self.seat_x, self.seat_y, self.seat_thickness
     outer, hole, depth = self.socket_outer, self.socket_hole, self.socket_depth
     wall = (outer - hole) / 2.0
-    assert wall > 0.0 and self.leg_radius < hole / 2.0
+    assert wall > 0.0
     # Keep the sockets well inside the plate and well separated from one another.
-    # A triangle strictly contains the seat COM (unlike any three corners of a symmetric
-    # four-leg rectangle, where the COM lies exactly on a diagonal support edge).
-    socket_centres = [(0.055, 0.035), (-0.055, 0.035), (0.0, -0.045)]
+    # THREE legs sit in a triangle that strictly contains the seat COM (unlike any three
+    # corners of a symmetric four-leg rectangle, where the COM lies exactly on a support
+    # diagonal). FOUR legs sit in the full symmetric rectangle -- the COM is strictly
+    # interior again, and four contacts give the classic non-wobbling stool.
+    if self.legs == 4:
+      socket_centres = [(0.055, 0.035), (-0.055, 0.035), (0.055, -0.035), (-0.055, -0.035)]
+    else:
+      socket_centres = [(0.055, 0.035), (-0.055, 0.035), (0.0, -0.045)]
     assert all(abs(x) + outer / 2.0 <= sx / 2.0 and
                abs(y) + outer / 2.0 <= sy / 2.0 for x, y in socket_centres)
     wall_at = hole / 2.0 + wall / 2.0
     wall_z = -st / 2.0 - depth / 2.0                # collar touches the plate underside
 
-    pad_x, pad_y, pad_h = 0.12, 0.10, 0.025
     children = [
         {"shape": ("box", [sx, sy, st, 0.0]), "pos": [0.0, 0.0, 0.0]},
-        {"shape": ("box", [pad_x, pad_y, pad_h, 0.0]),
-         "pos": [0.0, 0.0, st / 2.0 + pad_h / 2.0]},
     ]
     for cx, cy in socket_centres:
       children.extend([
@@ -1007,19 +1032,48 @@ class PegStoolAssembly(Assembly):
     # lateral insertion load.  Keep the slender legs light; scaling the whole assembly instead
     # overloads their two-finger grasps without addressing the support mismatch.
     self.masses["obj_0"] = 0.75
-    # Cylinders scatter horizontally, as in ChairAssembly: both end faces remain reachable
-    # and a two-finger grasp does not occupy the end that must enter the socket.
-    leg_scatter = np.array([np.sqrt(0.5), 0.0, -np.sqrt(0.5), 0.0])
+    # Legs: round pegs (the stock stool) or SQUARE pegs (peg-stool-cuboid).  A square peg
+    # fits when its DIAGONAL clears the hole's diagonal: side < hole, and the corner gap is
+    # (hole - side)/sqrt(2). A peg_clearance derives the size from the hole for the tight
+    # kinds (corner gap == c for a square peg).
+    if self.peg_clearance is not None:
+      c = self.peg_clearance
+      if self.leg_kind == "box":
+        assert c * np.sqrt(2.0) < hole, \
+            f"square-peg clearance {c} is impossible in socket hole {hole}"
+        self.leg_side = hole - c * np.sqrt(2.0)
+      else:
+        assert c < hole / 2.0, f"round-peg clearance {c} is impossible in hole {hole}"
+        self.leg_radius = hole / 2.0 - c
+    if self.leg_kind == "box":
+      assert self.leg_side < hole, \
+          f"square leg side {self.leg_side} does not fit socket hole {hole}"
+      leg_spec = ("box", [self.leg_side, self.leg_side, self.leg_length, 0.0])
+      # LIE FLAT on the table (long axis -> world x), like the round legs: both end faces
+      # stay reachable and the grasp on the end that must enter the socket stays clear.
+      # Standing upright would leave only the top 20mm-square cap graspable.
+      leg_scatter = np.array([np.sqrt(0.5), 0.0, -np.sqrt(0.5), 0.0])
+      leg_mass = 0.11                    # volume-proportional to the round 19mm peg
+    else:
+      assert self.leg_radius < hole / 2.0
+      leg_spec = ("cylinder", [self.leg_length, self.leg_radius])
+      # Round legs scatter horizontally: both end faces stay reachable and a two-finger grasp
+      # does not occupy the end that enters the socket. The cylinder's axial roll is invisible,
+      # so with sampled grasps the free roll is chosen so one retained suction contact sits on
+      # the upper crown (a random barrel sample would let a vacuum push roll the loose leg).
+      leg_scatter = _horizontal_cylinder_scatter_with_top_suction(leg_spec)
+      leg_mass = 0.08
     leg_top = -st / 2.0 - 0.0005                    # 0.5mm short of the blind end
     leg_z = leg_top - self.leg_length / 2.0
     for i, (cx, cy) in enumerate(socket_centres[:max(0, self.n_parts - 1)], start=1):
       part = f"obj_{i}"
-      self.part_shapes[part] = ("cylinder", [self.leg_length, self.leg_radius])
-      self.scatter_orientations[part] = leg_scatter
+      self.part_shapes[part] = leg_spec
+      if leg_scatter is not None:
+        self.scatter_orientations[part] = leg_scatter
       self.assembly_relative_poses[part] = ["obj_0", np.array([cx, cy, leg_z])]
       self.assembly_dependencies[part] = ["obj_0"]
       self.mate_axes[part] = np.array([0.0, 0.0, 1.0])
-      self.masses[part] = 0.08
+      self.masses[part] = leg_mass
 
 
 class SlotPinAssembly(Assembly):
@@ -1191,6 +1245,22 @@ _ASSEMBLY_KINDS = {"cross": (CubeCrossAssembly, 7), "cube": (CubeGridAssembly, 8
                    "slot-pin": (SlotPinAssembly, 3),
                    "peg-hole": (PegHoleAssembly, 2),
                    "peg-stool": (PegStoolAssembly, 4),
+                   "peg-stool-4": (lambda n_parts: PegStoolAssembly(
+                       n_parts=n_parts, legs=4), 5),
+                   "peg-stool-cuboid": (lambda n_parts: PegStoolAssembly(
+                       n_parts=n_parts, leg_kind="box"), 4),
+                   "peg-stool-cuboid-4": (lambda n_parts: PegStoolAssembly(
+                       n_parts=n_parts, leg_kind="box", legs=4), 5),
+                   # TIGHT-PEG variants: the leg size derives from the hole so the nominal
+                   # clearance is 1mm (stock: ~5mm). Square pegs clear by corner gap == 1mm.
+                   "peg-stool-tight": (lambda n_parts: PegStoolAssembly(
+                       n_parts=n_parts, peg_clearance=0.001), 4),
+                   "peg-stool-4-tight": (lambda n_parts: PegStoolAssembly(
+                       n_parts=n_parts, legs=4, peg_clearance=0.001), 5),
+                   "peg-stool-cuboid-tight": (lambda n_parts: PegStoolAssembly(
+                       n_parts=n_parts, leg_kind="box", peg_clearance=0.004), 4),
+                   "peg-stool-cuboid-4-tight": (lambda n_parts: PegStoolAssembly(
+                       n_parts=n_parts, leg_kind="box", legs=4, peg_clearance=0.004), 5),
                    "mesh-demo": (MeshDemoAssembly, 3),
                    "compound-demo": (CompoundDemoAssembly, 3),
                    "chair": (ChairAssembly, 8)}
@@ -1206,7 +1276,9 @@ def make_assembly(kind, n_parts):
   known-flawed star, see class doc), arch-seq (arch shape built as a sequential chain),
   cube-plates (2x2x2 as two stacked 2x2 plates), cube-plates-2x2x3 (three stacked 2x2
   plates, 12 cubes), cuboid-tower (laid-down 2:1:1 cuboids stacked along z -- the first
-  non-cube assembly). The plates family generalizes to any WxDxH via CubePlatesAssembly."""
+  non-cube assembly), peg-stool / peg-stool-cuboid (three-legged stool with round or square
+  legs into real blind sockets). The plates family generalizes to any WxDxH via
+  CubePlatesAssembly."""
   cls, max_n = _ASSEMBLY_KINDS[kind]
   return cls(n_parts=min(n_parts, max_n))
 
@@ -1686,6 +1758,7 @@ def set_dense_grasps(flag):
 _SAMPLED_GRASPS = None         # None = off; else {"seed": int, "candidates": int, "keep": int}
 _SAMPLED_VIEWS_CACHE = {}
 _SAMPLED_META_CACHE = {}          # same key: per-candidate gate diagnostics (not the DB)
+_SAMPLED_SCENE_CTX = None         # --grasp-sampler-scenes: pick/assembly filter context
 _MAX_GRASP_WIDTH = 0.078       # two-finger max pinch width. The fixed-open robotiq pads
   # measure ~82mm inner gap (robotiq_tight.g capsules); 78mm keeps a seating margin. The EE
   # collision filter stays the final arbiter -- this only prunes hopeless candidates early.
@@ -1702,9 +1775,58 @@ def set_sampled_grasps(mode):
       "candidates": max(8, int(mode.get("candidates", 200))),
       "keep": max(2, int(mode.get("keep", 12))),
       "margin": float(mode.get("margin", 0.008)),
-      "pad_support": float(mode.get("pad_support", 0.75))}
+      "pad_support": float(mode.get("pad_support", 0.75)),
+      "wrap": (None if mode.get("wrap") is None else float(mode.get("wrap")))}
   _SAMPLED_VIEWS_CACHE.clear()
   _SAMPLED_META_CACHE.clear()
+
+
+def install_sampled_scene_ctx(C, assembly, robots=None):
+  """--grasp-sampler-scenes: give the sampled DB the two SCENE views it filters candidates
+  against -- the INITIAL scene (can this grasp pick the part where it lies?) and the FULLY
+  ASSEMBLED scene (can this grasp stand at the part's seated pose?) -- using the search's
+  OWN cheap floating-EE gate, so the filter and the search agree exactly. Rebuilds the
+  sampled caches; call BEFORE any grasp-table consumer. Every grasp-table consumer must then
+  thread the PART name: scene feasibility is per part INSTANCE (two identical legs sit in
+  different sockets), and a part-less query raises instead of silently serving unfiltered ids."""
+  global _SAMPLED_SCENE_CTX
+  from solver import _search_context            # deferred: solver imports us at module top
+  if robots is None:
+    robots = get_robots(C)
+  checker, _table = _search_context(C, assembly, robots)   # the search's own checker geometry
+  s0 = get_initial_state(C, assembly)
+  s_full = _full_assembly_state(assembly, s0)
+  poses_pick = tuple(sorted((p, tuple(np.round(np.asarray(s0.poses[p], dtype=float), 4)))
+                            for p in assembly.objects))
+  poses_asm = tuple(sorted((p, tuple(np.round(np.asarray(
+      _state_part_poses(s_full, assembly, lift=0.0)[p], dtype=float), 4)))
+                            for p in assembly.objects))
+  sig = ("scenes", poses_pick, poses_asm)
+  _SAMPLED_SCENE_CTX = {"checker": checker, "s0": s0, "s_full": s_full,
+                        "assembly": assembly, "sig": sig}
+  _SAMPLED_VIEWS_CACHE.clear()
+  _SAMPLED_META_CACHE.clear()
+
+
+def clear_sampled_scene_ctx():
+  """Drop the scene-filter context (a new scene is about to be built in this process)."""
+  global _SAMPLED_SCENE_CTX
+  _SAMPLED_SCENE_CTX = None
+  _SAMPLED_VIEWS_CACHE.clear()
+  _SAMPLED_META_CACHE.clear()
+
+
+def _full_assembly_state(assembly, s0):
+  # the fully-assembled on-table State: every part mated to the base, anchored at the base's
+  # initial pose. _state_part_poses' rest rule then lifts the group so its lowest part (the
+  # legs) rests on the table -- the exact seated geometry the assemble filter must see.
+  base = assembly.base
+  return State(parent={base: ("table",),
+                       **{p: ("part", base) for p in assembly.objects if p != base}},
+               supports={base: frozenset({("table",)}),
+                         **{p: frozenset({("mate", base)})
+                            for p in assembly.objects if p != base}},
+               poses={base: np.asarray(s0.poses[base], dtype=float).copy()})
 
 
 _FEATURE_EDGE_DEG = 30.0     # a CREASE, not a tessellation step -- see _mesh_feature_edges
@@ -1788,6 +1910,51 @@ def _pad_support(mesh, p, n, u, v, offsets, lift=0.002, depth=0.003):
   ok = np.zeros(len(O), dtype=bool)
   ok[np.asarray(idx_ray, dtype=int)[d <= lift + depth]] = True
   return float(ok.mean())
+
+
+def _pad_support_wrap(mesh, p, n, u, v, offsets, lift=0.002, wrap=0.006):
+  """CURVATURE-FAIR support fraction (--grasp-sampler-wrap): how much of the pad the surface
+  follows within the pad's WRAP (deformation) budget.
+
+  The legacy _pad_support lifts the whole pad along the CENTRE contact normal and counts a
+  sample only when a ray along that normal meets material within lift+depth. That model is
+  rigid: on a curved barrel the pad's outer columns sit the surface SAGITTA below the centre
+  normal, so a physically sound side pinch of a 12.5mm-radius peg (a compliant pad wrapping
+  the barrel) scored ~0.3 and every side grasp of the two-finger was dropped -- and the wrap
+  roll (pads across the circumference, radial approach) scored 0.6 no matter how generous
+  the budget, because a rigid ray along the centre normal MISSES the barrel once the pad
+  bends away from the tangent plane. A pad does not need the surface to be coplanar with the
+  centre contact -- it needs each sample to REACH the surface within what the pad can
+  deform.
+
+  Deformation distance: the signed distance from each lifted sample to the surface (positive
+  outside the material, pressed-in samples count as fully supported). The reference is the
+  NEAREST contact (the sample that deforms least) and a sample counts as supported when
+  d_j - d_min <= wrap. A far-side hit fails through the wrap budget (its deformation is
+  large). On a flat face every deformation is 0, so flat-face gating is unchanged. The peg
+  barrel: axis-roll pads deform ~3mm (sagitta over the 20mm half-length) and pass a small
+  wrap; the wrap roll (approach from the side) deforms ~10mm and needs ~0.012. Off
+  (wrap None) = the legacy metric, byte-identical. Non-watertight meshes have no signed
+  distance -- fall back to the legacy ray model there."""
+  O = (np.asarray(p, dtype=float)[None, :]
+       + offsets[:, 0:1] * np.asarray(u, dtype=float)[None, :]
+       + offsets[:, 1:2] * np.asarray(v, dtype=float)[None, :]
+       + float(lift) * np.asarray(n, dtype=float)[None, :])
+  try:
+    d = np.asarray(mesh.nearest.signed_distance(O), dtype=float)
+  except Exception:                                        # non-watertight mesh
+    D = np.repeat(-np.asarray(n, dtype=float)[None, :], len(O), axis=0)
+    loc, idx_ray, _tri = mesh.ray.intersects_location(O, D, multiple_hits=False)
+    d = np.full(len(O), np.inf)
+    if len(loc):
+      ii = np.asarray(idx_ray, dtype=int)
+      d[ii] = np.linalg.norm(np.asarray(loc, dtype=float) - O[ii], axis=1)
+  d[~np.isfinite(d)] = np.inf
+  d[d < 0.0] = 0.0                                        # pressed into the material: contact
+  dmin = float(d.min())
+  if not np.isfinite(dmin):
+    return 0.0
+  return float((np.isfinite(d) & (d - dmin <= float(wrap))).mean())
 
 
 def _pad_end_drop(mesh, p, n, along, half_len, miss=1.0):
@@ -2023,17 +2190,38 @@ def _fps_downsample(feats, keep):
   return sorted(chosen)
 
 
-def _sampled_grasp_views(spec, offset):
+def _sampled_keys(spec, offset, part=None):
+  """(base_key, cache_key) for the sampled DB. base_key seeds the RAW candidate cloud --
+  identical parts share it, so their clouds match. The cache key adds the PART INSTANCE and
+  the scene-filter signature (--grasp-sampler-scenes), so each part filters its own cloud."""
+  cfgv = _SAMPLED_GRASPS
+  base = (_spec_key(spec), float(offset), cfgv["seed"], cfgv["candidates"], cfgv["keep"],
+          float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)), cfgv.get("wrap"))
+  ctx = _SAMPLED_SCENE_CTX
+  return base, base + (part, (ctx["sig"] if ctx is not None else None))
+
+
+def _sampled_grasp_views(spec, offset, part=None):
   """The joint (poses, surfaces, min_dims) triple for the sampled path -- ONE memoized
   computation so the three parallel per-gid views cannot drift apart. Poses follow the
   enumerator's frame conventions exactly: local z = approach INTO the part (the asymmetric
   wrench model's press/pull sign hangs on it), local y = finger closing axis, position =
-  tool centre standing `offset` off the approach-side surface (the wrench moment arm)."""
+  tool centre standing `offset` off the approach-side surface (the wrench moment arm).
+
+  With the scene context installed (--grasp-sampler-scenes), `part` names the PART INSTANCE
+  and every candidate is additionally tagged pick-feasible (floating EE clear at the part's
+  INITIAL pose) and assemble-feasible (floating EE clear at the part's ASSEMBLED pose); the
+  keep budget then splits into per-set quotas so each purpose keeps a guaranteed share."""
   import zlib
   cfgv = _SAMPLED_GRASPS
+  ctx = _SAMPLED_SCENE_CTX
+  if ctx is not None and part is None:
+    raise ValueError("--grasp-sampler-scenes: the grasp DB is per PART INSTANCE; this spec "
+                     f"({spec!r}) was queried without a part name. Every grasp-table "
+                     "consumer must thread the part.")
   sq = _shape_quat(spec) if spec[0] != "compound" else None
-  key = (_spec_key(spec), float(offset), cfgv["seed"], cfgv["candidates"], cfgv["keep"],
-         float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)))
+  wrap = cfgv.get("wrap")
+  base_key, key = _sampled_keys(spec, offset, part)
   hit = _SAMPLED_VIEWS_CACHE.get(key)
   if hit is not None:
     return hit
@@ -2041,8 +2229,9 @@ def _sampled_grasp_views(spec, offset):
   mesh = _spec_mesh(spec)
   # PRIVATE RNG, seeded from (sampler seed, canonical spec key): byte-identical across
   # processes and entry points -- the global np.random stream is drained path-dependently
-  # by scatter layout and must never feed the id-bearing pipeline.
-  rng_seed = zlib.crc32(repr(key).encode())
+  # by scatter layout and must never feed the id-bearing pipeline. Identical parts share the
+  # same RAW cloud (the base_key has no part); only the scene filter below differs per part.
+  rng_seed = zlib.crc32(repr(base_key).encode())
   pts, fidx = trimesh.sample.sample_surface(mesh, cfgv["candidates"], seed=int(rng_seed))
   normals = mesh.face_normals[np.asarray(fidx, int)]
 
@@ -2069,9 +2258,13 @@ def _sampled_grasp_views(spec, offset):
     q = _grasp_quat_for_normal(n)
     pose = np.concatenate([p + offset * n, q])
     _u, _v = _plane_axes(n)                                # the cup sits in the contact plane
-    _sup = (_pad_support(mesh, p, n, _u, _v, _cup) if min_support > 0.0 else 1.0)
+    if min_support > 0.0:
+      _sup = (_pad_support_wrap(mesh, p, n, _u, _v, _cup, wrap=wrap) if wrap is not None
+              else _pad_support(mesh, p, n, _u, _v, _cup))
+    else:
+      _sup = 1.0
     suction.append((pose, surf, mind, np.concatenate([p, 0.02 * n]), float(clr[k]), _sup,
-                    "suction"))
+                    "suction", False))
     # ---- antipodal candidate: the opposing surface point within the aperture ----
     p2, n2 = _ray_exit(spec, p - 1e-9 * n, -n)
     width = float(np.linalg.norm(p2 - p))
@@ -2088,22 +2281,43 @@ def _sampled_grasp_views(spec, offset):
       # own two axes as (x, z) makes the triple LEFT-handed -- _mat_to_quat then returns a
       # reflected frame, so the recovered approach and closing axes are not the ones that
       # were chosen. The existing convention tests caught exactly that.
+      x = np.cross(y, z)
       mid = 0.5 * (p + p2)
       # label = the contacted surface class; min_dim 0.0 keeps the vacuum seal gate shut
       # for pinch candidates (the suction block is the vacuum's own candidate family).
       # BOTH pads must clear the edges -- a pinch is only as good as its worse contact.
       # each PAD lies in the plane the closing axis y is normal to, and it is long along
       # the approach z -- so the rectangle's axes are (x across, z along).
-      x = np.cross(y, z)
-      _sup = (min(_pad_support(mesh, p, -y, x, z, _rect),
-                  _pad_support(mesh, p2, y, x, z, _rect)) if min_support > 0.0 else 1.0)
       # A pinch has TWO physically different approach directions for the same contact pair.
       # Keeping only ``z`` is not merely a lost wrist-roll: for a peg, +axis puts the palm
       # above the peg (through the socket plate at the seated pose), while -axis keeps the
       # palm below the socket.  Emit both and let FPS retain directional diversity.  This is
       # the sampled/mesh counterpart of the face enumerator's two in-plane rolls.
-      for z_dir in (z, -z):
+      # --grasp-sampler-wrap adds the COMPLEMENTARY ROLL: the roll search above lays the pad
+      # LONG axis along the part (a barrel contact approaches along the peg axis; a long
+      # BOX's pads run along its long axis). A peg lying flat on a table is only pickable
+      # the other way -- pads across the short dimension, fingers across the thickness,
+      # approach from the side -- for a curved barrel that roll bends the pad to the
+      # surface (its support needs a wrap budget: sagitta over the pad length, ~12 mm on
+      # the 25 mm peg); for a flat box the same roll just crosses the narrow faces, but it
+      # is the ONLY grasp whose palm does not sit at the peg END (which collides with the
+      # seat during insertion). The wrap metric scores both exactly the same way.  Emit
+      # the complementary roll as an extra +- pair whenever the flag is set -- keeping the
+      # default DB byte-identical requires the default path to emit nothing extra.
+      z_rolls = [z, -z]
+      if wrap is not None:
+        z_rolls += [x, -x]
+      for zi, z_dir in enumerate(z_rolls):
         x_dir = np.cross(y, z_dir)                         # right-handed (x, y, z)
+        if min_support > 0.0:                              # support per roll: the wrap roll
+          if wrap is not None:                             # bends differently
+            _sup = min(_pad_support_wrap(mesh, p, -y, x_dir, z_dir, _rect, wrap=wrap),
+                       _pad_support_wrap(mesh, p2, y, x_dir, z_dir, _rect, wrap=wrap))
+          else:
+            _sup = min(_pad_support(mesh, p, -y, x_dir, z_dir, _rect),
+                       _pad_support(mesh, p2, y, x_dir, z_dir, _rect))
+        else:
+          _sup = 1.0
         p_exit, _n_exit = _ray_exit(spec, mid, -z_dir)     # approach-side surface
         t = float(np.linalg.norm(p_exit - mid))
         pose = np.concatenate([
@@ -2113,14 +2327,15 @@ def _sampled_grasp_views(spec, offset):
         antip.append((pose, surf, 0.0,
                       np.concatenate([mid, 0.02 * y, 0.02 * z_dir]),
                       min(float(clr[k]), float(_edge_clearance(mesh, p2)[0])),
-                      _sup, "pinch"))
+                      _sup, "pinch", zi >= 2))             # zi >= 2: the wrap-roll pair
 
   keep = cfgv["keep"]
   k_suc = (keep + 1) // 2
-  rows = []
-  for block, k_want in ((suction, k_suc), (antip, keep - k_suc)):
+  k_pinch = keep - k_suc
+
+  def _retain(block, k_want):
     if not block or k_want <= 0:
-      continue
+      return []
     if margin > 0.0 or min_support > 0.0:
       good = [b for b in block if b[4] >= margin and b[5] >= min_support]
       if len(good) < k_want:
@@ -2131,11 +2346,60 @@ def _sampled_grasp_views(spec, offset):
       else:
         block = good
     idx = _fps_downsample([b[3] for b in block], k_want)
-    rows.extend(block[i] for i in idx)
+    return [block[i] for i in idx]
+
+  if ctx is not None:
+    # --grasp-sampler-scenes: tag every raw candidate with its two scene verdicts, using the
+    # search's own floating-EE gate at the part's INITIAL pose (the PICK set) and at its
+    # ASSEMBLED pose (the ASSEMBLE set). Everything else is the FREE set (also the handover
+    # pool: a mid-air handover sees no table and no structure).
+    suction = [list(b) for b in suction]
+    antip = [list(b) for b in antip]
+    checker, s0, s_full, asm = ctx["checker"], ctx["s0"], ctx["s_full"], ctx["assembly"]
+    for blk in (suction, antip):
+      for b in blk:
+        b.append(bool(checker.pose_collision_free(s0, part, b[0], asm)))       # PICK
+        b.append(bool(checker.pose_collision_free(s_full, part, b[0], asm)))   # ASSEMBLE
+
+  def _retain_sets(block, k_want):
+    # scene-aware selection: a third of the quota to each scene-feasible set, FPS inside
+    # each pool (diversity per purpose), unused slots fall back to the FREE pool. A
+    # candidate in two pools is picked once. Without the scene context this is _retain.
+    if ctx is None:
+      return _retain(block, k_want)
+    q = max(1, k_want // 3)
+    pick_pool = [b for b in block if b[8]]
+    out = _retain(pick_pool, min(q, len(pick_pool)))
+    chosen = {id(b) for b in out}
+    asm_rest = [b for b in block if b[9] and id(b) not in chosen]
+    out_a = _retain(asm_rest, min(q, len(asm_rest)))
+    chosen.update(id(b) for b in out_a)
+    free_pool = [b for b in block if id(b) not in chosen]
+    out_f = _retain(free_pool, max(0, k_want - len(out) - len(out_a)))
+    return out + out_a + out_f
+
+  rows = _retain_sets(suction, k_suc)
+  if wrap is not None and any(b[7] for b in antip):
+    # --grasp-sampler-wrap emits the wrap roll (side approach) as an extra +- pair.  FPS
+    # alone races it out: once the wrap budget admits everything, every side-approach row
+    # shares a feature with its axial sibling (same mid, 0.02*approach) and the pinch quota
+    # fills with axial rows spread along the part before a side row is reached.  Give the
+    # side approach a guaranteed share of the pinch budget -- a strategy quota, exactly
+    # like the suction/pinch split -- so the planner can CHOOSE between grasping the peg
+    # from the end and from the side.  Unused slots (a flat box emits no wrap roll) fall
+    # back to the axial rows.
+    side_rows = _retain_sets([b for b in antip if b[7]], max(1, k_pinch // 3))
+    rows.extend(side_rows)
+    rows.extend(_retain_sets([b for b in antip if not b[7]], k_pinch - len(side_rows)))
+  else:
+    rows.extend(_retain_sets(antip, k_pinch))
   if not rows:
     raise ValueError(f"--grasp-sampler: no feasible candidates for shape {spec!r}")
   poses, surfs, mins, meta = [], [], [], []
-  for pose, surf, mind, _f, _clr, _sup, _fam in rows:
+  for row in rows:
+    pose, surf, mind, _f, _clr, _sup, _fam = row[:7]
+    _side = row[7]
+    _set = ("pick" if row[8] else ("asm" if row[9] else "free")) if len(row) > 8 else None
     if sq is not None:                                     # rotate into the PART frame
       pose = np.concatenate([_quat_to_R(sq) @ pose[:3], _quat_mul(sq, pose[3:])])
     pose = np.asarray(pose, dtype=float)
@@ -2145,8 +2409,10 @@ def _sampled_grasp_views(spec, offset):
     # the tests: re-deriving it outside is not possible for a pinch (the pad contact points
     # are not recoverable from the pose alone), and a wrong re-derivation reads as a
     # regression that is not there.
-    meta.append({"edge_clearance": float(_clr), "pad_support": float(_sup),
-                 "family": _fam})
+    _m = {"edge_clearance": float(_clr), "pad_support": float(_sup), "family": _fam}
+    if _set is not None:
+      _m["set"] = _set
+    meta.append(_m)
   # the returned view stays a 3-TUPLE: several call sites unpack it positionally, and the
   # diagnostics are not part of the grasp DB. They ride in a parallel cache on the same key.
   _SAMPLED_META_CACHE[key] = tuple(meta)
@@ -2154,18 +2420,46 @@ def _sampled_grasp_views(spec, offset):
   return hit
 
 
-def sampled_grasp_meta(spec, offset=0.01):
+def sampled_grasp_meta(spec, offset=0.01, part=None):
   """Per-candidate diagnostics of the sampled DB, parallel to part_grasp_poses: edge
   clearance, pad support, and the family a candidate came from. Empty when the sampler is
   off. It exists because a pinch's PAD contact points cannot be recovered from the grasp
-  pose alone, so neither a caller nor a test can re-derive what the gates measured."""
+  pose alone, so neither a caller nor a test can re-derive what the gates measured. With
+  --grasp-sampler-scenes each entry also carries "set": free/pick/asm."""
   if _SAMPLED_GRASPS is None:
     return ()
-  _sampled_grasp_views(spec, offset)                       # fills both caches
-  cfgv = _SAMPLED_GRASPS
-  key = (_spec_key(spec), float(offset), cfgv["seed"], cfgv["candidates"], cfgv["keep"],
-         float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)))
-  return _SAMPLED_META_CACHE.get(key, ())
+  _sampled_grasp_views(spec, offset, part)                  # fills both caches
+  return _SAMPLED_META_CACHE.get(_sampled_keys(spec, offset, part)[1], ())
+
+
+def _horizontal_cylinder_scatter_with_top_suction(spec):
+  """Horizontal cylinder pose whose free axial roll puts one sampled suction push through COM.
+
+  The base rotation maps cylinder-local +z (its axis) to world -x and local +x to world +z.
+  Rotating about local z changes no cylinder geometry, but lets a retained radial suction
+  candidate's approach axis map to world -z. The table can then balance its sealing push
+  without fictitious friction. With the face enumerator/no sampler, preserve the historical
+  scatter quaternion exactly.
+  """
+  q_flat = np.array([np.sqrt(0.5), 0.0, -np.sqrt(0.5), 0.0])
+  if _SAMPLED_GRASPS is None or spec[0] != "cylinder":
+    return q_flat
+  poses = part_grasp_poses(spec)
+  meta = sampled_grasp_meta(spec)
+  candidates = []
+  for i, (pose, md) in enumerate(zip(poses, meta)):
+    approach = _quat_to_R(np.asarray(pose[3:], dtype=float))[:, 2]
+    if md.get("family") != "suction" or abs(float(approach[2])) > 0.1:
+      continue                                             # cap or tilted candidate, not barrel
+    candidates.append((float(md.get("pad_support", 0.0)),
+                       float(md.get("edge_clearance", 0.0)), -i, approach))
+  if not candidates:
+    return q_flat
+  approach = max(candidates, key=lambda x: x[:3])[3]
+  # q_flat maps local -x to world -z. Pre-roll the chosen radial approach onto local -x.
+  theta = np.pi - np.arctan2(float(approach[1]), float(approach[0]))
+  q_roll = np.array([np.cos(theta / 2.0), 0.0, 0.0, np.sin(theta / 2.0)])
+  return _quat_mul(q_flat, q_roll)
 
 
 # EXTRA PLACE CELLS (experimental, OFF by default): classic `place` always lands a group at
@@ -2220,6 +2514,46 @@ def _action_banned(a, state=None):
     for g in state.subassemblies():
       if any(p in g for p in parts) and ctx <= set(g):
         return True
+  return False
+
+
+# --kind-role-forbid (SEARCH-scoped, like --ban-actions): a gripper KIND banned from an action
+# KIND. Unlike a ban pattern (which names a robot), this names a CAPABILITY: 'vacuum:assemble'
+# drops every assemble whose acting arm, inserted-part holder, target holder or brace contact
+# is a vacuum -- the vacuum may pick and hand over but never touch a mate. Reset per scene by
+# replay.build_scene; NEVER applied to replay walks (a plan saved under the forbid contains no
+# forbidden action anyway). Needs the gripper_kind map, which the search threads only under
+# --wrench (mixed EEs) -- without it the filter has no kind information and passes everything.
+_KIND_FORBID = {}
+
+
+def set_kind_forbid(patterns):
+  """patterns: 'kind:action' strings ('*' wildcard per field)."""
+  global _KIND_FORBID
+  out = {}
+  for pat in patterns or ():
+    kind, act = str(pat).split(":", 1)
+    if act == "*":
+      continue                                          # no per-kind blanket yet
+    out.setdefault(act, set()).add(kind)
+  _KIND_FORBID = {k: frozenset(v) for k, v in out.items()}
+
+
+def _kind_forbidden(a, state, gripper_kind):
+  if not _KIND_FORBID or a[0] not in _KIND_FORBID or gripper_kind is None:
+    return False
+  kinds = _KIND_FORBID[a[0]]
+  kind_of = gripper_kind.get if isinstance(gripper_kind, dict) else (lambda _r: gripper_kind)
+  if kind_of(a[1]) in kinds:
+    return True                                          # the acting arm itself
+  touched = {p for p in a[2:] if isinstance(p, str)}
+  for g in state.subassemblies():
+    if not touched & set(g):
+      continue
+    for p in g:
+      for c in state.supports.get(p, ()):
+        if c[0] == "grasp" and kind_of(c[1]) in kinds:
+          return True                                    # banned-arm hold or brace in the path
   return False
 
 
@@ -2580,7 +2914,7 @@ def _shape_half_z(spec, R):
   return float(np.abs(R_total[2, :]) @ _shape_half_extents(spec))
 
 
-def part_grasp_poses(spec, rolls=None, offset=0.01):
+def part_grasp_poses(spec, rolls=None, offset=0.01, part=None):
   """All candidate grasp poses of a part shape, in the part's OWN frame -- the per-part
   grasp DB the labeled tables index into (grasp_id = position in this list). V1 generator:
   the six axis-direction grasps at the FACE CENTER (approach along -direction, standoff =
@@ -2591,7 +2925,7 @@ def part_grasp_poses(spec, rolls=None, offset=0.01):
   -- per current model decision); spheres get the same six directions at radius standoff.
   Rotated/off-center grasp variants are a later, purely additive extension."""
   if _SAMPLED_GRASPS is not None:                          # --grasp-sampler second path
-    return _sampled_grasp_views(spec, offset)[0]
+    return _sampled_grasp_views(spec, offset, part)[0]
   if spec[0] in ("mesh", "compound"):
     raise ValueError("mesh/compound parts need --grasp-sampler: the 6-face enumerator's "
                      "grasp ids are cube-face semantics and would silently mis-model them")
@@ -2684,16 +3018,16 @@ def part_grasp_poses(spec, rolls=None, offset=0.01):
 def grasp_pose(assembly, part, grasp_id, offset=0.01):
   # grasp `grasp_id` of `part`, in the part's own frame (the shape-aware replacement for
   # raw cube_grasp_pose(gid, cube_size) -- identical values for cube parts).
-  return part_grasp_poses(assembly.part_shape(part), offset=offset)[grasp_id]
+  return part_grasp_poses(assembly.part_shape(part), offset=offset, part=part)[grasp_id]
 
 
-def part_grasp_surfaces(spec, rolls=None):
+def part_grasp_surfaces(spec, rolls=None, part=None):
   # surface TYPE contacted by each grasp in part_grasp_poses (parallel list): "flat" or
   # "curved". Box faces are flat; a cylinder's +-z caps are flat, its side is curved; a
   # sphere is curved everywhere. Used to restrict the VACUUM to flat surfaces (a suction
   # cup cannot seal on strong curvature) -- the two-finger keeps curved grasps.
   if _SAMPLED_GRASPS is not None:                          # --grasp-sampler second path
-    return list(_sampled_grasp_views(spec, 0.01)[1])
+    return list(_sampled_grasp_views(spec, 0.01, part)[1])
   if spec[0] in ("mesh", "compound"):
     raise ValueError("mesh/compound parts need --grasp-sampler (see part_grasp_poses)")
   if rolls is None:
@@ -2715,13 +3049,13 @@ def part_grasp_surfaces(spec, rolls=None):
   return out
 
 
-def part_grasp_face_min_dims(spec, rolls=None):
+def part_grasp_face_min_dims(spec, rolls=None, part=None):
   # smallest extent of the FLAT face each grasp contacts (parallel to part_grasp_poses /
   # part_grasp_surfaces; inf for curved surfaces -- the flat gate never fires there, the
   # curved gate already handles them). Used for the VACUUM SEAL gate: a suction cup cannot
   # seal on a face smaller than its own diameter (wrench.PARAMS['vacuum_seal_diameter']).
   if _SAMPLED_GRASPS is not None:                          # --grasp-sampler second path
-    return list(_sampled_grasp_views(spec, 0.01)[2])
+    return list(_sampled_grasp_views(spec, 0.01, part)[2])
   if spec[0] in ("mesh", "compound"):
     raise ValueError("mesh/compound parts need --grasp-sampler (see part_grasp_poses)")
   if rolls is None:
@@ -2884,11 +3218,11 @@ def compute_cube_grasps(assembly, subassembly, offset=0.01,
     # candidate grasps come from the part's own grasp DB (shape-aware; grasp_id indexes
     # the part's set). The DB pose is in the part frame; shift it into the subassembly
     # ref frame (parts are axis-aligned, so translation only).
-    surfaces = part_grasp_surfaces(assembly.part_shape(obj))
-    face_dims = part_grasp_face_min_dims(assembly.part_shape(obj))
+    surfaces = part_grasp_surfaces(assembly.part_shape(obj), part=obj)
+    face_dims = part_grasp_face_min_dims(assembly.part_shape(obj), part=obj)
     seal = wrench.PARAMS.get("vacuum_seal_diameter", 0.0)
     for grasp_id, local in enumerate(part_grasp_poses(assembly.part_shape(obj),
-                                                      offset=offset)):
+                                                      offset=offset, part=obj)):
       if vacuum and (surfaces[grasp_id] == "curved" or face_dims[grasp_id] < seal):
         continue                                          # no seal on curvature or on a face
                                                           # smaller than the cup (chair caps)
@@ -3023,7 +3357,14 @@ class State:
     return list(self.parent.keys())
 
   def subassemblies(self):
-    # connected components of parts joined by mate edges (union-find over "part" parents)
+    # connected components of parts joined by mate edges (union-find over "part" parents).
+    # MEMOIZED with the same lazy-cache invariant as key(): a State is never structurally
+    # edited after it is first queried (successors finish their edits before yielding). The
+    # fill's successor sweep calls this per assemble candidate and per h evaluation --
+    # measured 437k calls / 1.0s on the 2-part stool -- so the memo is a real constant win.
+    cached = getattr(self, "_subs", None)
+    if cached is not None:
+      return cached
     root = {p: p for p in self.parent}
 
     def find(x):
@@ -3039,7 +3380,8 @@ class State:
     comps = {}
     for p in self.parent:
       comps.setdefault(find(p), set()).add(p)
-    return [frozenset(s) for s in comps.values()]
+    self._subs = [frozenset(s) for s in comps.values()]
+    return self._subs
 
   # --- supports / statics ---
   def grounding_contacts(self, group):
@@ -3230,7 +3572,44 @@ def _grasp_usable(grasp_table, key, gpart, gid, robot):
   return not isinstance(grasp_table, GraspTable) or grasp_table.usable(key, gpart, gid, robot)
 
 
-def picks(state, assembly, robots, grasp_table=None, canonical=False):
+def _vacuum_engagement_stable(state, assembly, group, robot, gpart, grasp_id,
+                              gripper_kind):
+  """Can the OLD supports take a vacuum cup's transient sealing push?
+
+  The approach axis is grasp-local +z and points from the gripper into the part.  Crucially,
+  this checks ``state`` before the new grasp contact exists: letting the new vacuum contact
+  balance its own application force would make the gate vacuous.  Once attached, the cup's
+  pressure/contact preload is internal; ordinary grasp_capability prices only its net wrench.
+  """
+  global _VEG_CACHE
+  if gripper_kind is None:
+    return True                                             # --no-wrench baseline
+  kind_of = gripper_kind.get if isinstance(gripper_kind, dict) \
+      else (lambda _r: gripper_kind)
+  if kind_of(robot) != "vacuum":
+    return True
+  force = float(wrench.PARAMS.get("vacuum_engage_force", 0.0))
+  if force <= 0.0:
+    return True
+  # SOLVE-SCOPED VERDICT CACHE (same pattern/validity as the insertion gates, keyed on the
+  # STATE IDENTITY so a state re-generated in another fill round hits too -- object-level
+  # caches miss those). The verdict is a deterministic function of the state under fixed
+  # PARAMS (the key <-> pose bijection covers the pose payload). Cleared per solve/scene via
+  # reset_wrench_cache, so no cross-scene leakage.
+  key = (state.key(), _subasm_key(group), robot, gpart, grasp_id, _wrench_params_sig())
+  hit = _VEG_CACHE.get(key)
+  if hit is not None:
+    return hit
+  poses = _state_part_poses(state, assembly, lift=0.0)
+  point, approach, _t1, _t2 = _grasp_frame(
+      assembly, gpart, poses[gpart], grasp_id)
+  res = _group_stable(state, assembly, group, gripper_kind,
+                      applied=[(force * approach, point)])
+  _VEG_CACHE[key] = res
+  return res
+
+
+def picks(state, assembly, robots, grasp_table=None, canonical=False, gripper_kind=None):
   # a free robot grabs an on-table, not-yet-held subassembly on a collision-free face of
   # ANY of its parts, and lifts it (that part -> gripper; the tree is re-rooted there).
   #
@@ -3260,6 +3639,9 @@ def picks(state, assembly, robots, grasp_table=None, canonical=False):
       for gpart, grasp_id, _pose in labeled:              # grasp ANY part of the group
         if not _grasp_usable(grasp_table, key, gpart, grasp_id, r):
           continue                                        # mixed EEs: not this robot's gripper
+        if not _vacuum_engagement_stable(
+            state, assembly, group, r, gpart, grasp_id, gripper_kind):
+          continue                                        # existing table/holders cannot take seal push
         ns = _copy_edit_support(state)
         ns.parent = _rerooted(ns.parent, gpart)
         ns.parent[gpart] = ("gripper", r)
@@ -3434,7 +3816,7 @@ def _on_table_mateable_cached(assembly, part, face=_IDENTITY_FACE):
   return cache[key]
 
 
-def add_grasps(state, assembly, robots, grasp_table=None):
+def add_grasps(state, assembly, robots, grasp_table=None, gripper_kind=None):
   # a free robot adds a SECOND grasp (a brace) to an already-HELD subassembly -- the unfused
   # primitive behind HANDOVERS (add_grasp; release) and bracing. The new grasp is a SUPPORT
   # contact only; the kinematic `parent` is unchanged (the group stays rooted at its current
@@ -3459,12 +3841,15 @@ def add_grasps(state, assembly, robots, grasp_table=None):
           continue                                        # that grasp is already occupied
         if not _grasp_usable(grasp_table, key, gpart, grasp_id, r):
           continue                                        # mixed EEs: not this robot's gripper
+        if not _vacuum_engagement_stable(
+            state, assembly, group, r, gpart, grasp_id, gripper_kind):
+          continue                                        # check before adding the new support
         ns = _copy_edit_support(state)
         ns.supports[gpart] = ns.supports[gpart] | {("grasp", r, gpart, grasp_id)}
         yield ("add_grasp", r, gpart, grasp_id), ns
 
 
-def fused_handovers(state, assembly, robots, grasp_table=None):
+def fused_handovers(state, assembly, robots, grasp_table=None, gripper_kind=None):
   # FUSED handover: a free robot B takes a singly-held group from its holder A in ONE step
   # (B grasps a free face, A releases, the tree re-roots to B). Net holder count is UNCHANGED,
   # so unlike the unfused add_grasp;release it introduces no higher-h two-holder intermediate
@@ -3491,6 +3876,9 @@ def fused_handovers(state, assembly, robots, grasp_table=None):
           continue
         if not _grasp_usable(grasp_table, key, gpart, grasp_id, rB):
           continue                                          # mixed EEs: not B's gripper
+        if not _vacuum_engagement_stable(
+            state, assembly, group, rB, gpart, grasp_id, gripper_kind):
+          continue                                          # giver must withstand B's seal push
         ns = _copy_edit_support(state)
         ns.supports[root] = frozenset(                      # ...A lets go...
             c for c in ns.supports[root] if not (c[0] == "grasp" and c[1] == rA))
@@ -3833,12 +4221,15 @@ def successors(state, assembly, robots, grasp_table=None, canonical=False,
     # on cross-6/cross-7; on car-mini 2.1x fewer expansions but a 33% WORSE plan (cost 20->28
     # -- diving into the first workable mate commits before better variants are seen). Keep
     # picks-first; emission order is a tie-break lottery, don't retune it.
-    yield from picks(state, assembly, robots, grasp_table=grasp_table, canonical=canonical)
+    yield from picks(state, assembly, robots, grasp_table=grasp_table, canonical=canonical,
+                     gripper_kind=gripper_kind)
     yield from assembles(state, assembly, robots, gripper_kind=gripper_kind)  # incl. module joins
     if handovers:
-      yield from fused_handovers(state, assembly, robots, grasp_table=grasp_table)
+      yield from fused_handovers(state, assembly, robots, grasp_table=grasp_table,
+                                 gripper_kind=gripper_kind)
     if bracing:
-      yield from add_grasps(state, assembly, robots, grasp_table=grasp_table)
+      yield from add_grasps(state, assembly, robots, grasp_table=grasp_table,
+                            gripper_kind=gripper_kind)
     if _INHAND_REORIENT:
       yield from inhand_reorients(state, assembly, robots, grasp_table=grasp_table)
     yield from releases(state, assembly, robots, gripper_kind=gripper_kind)
@@ -3850,6 +4241,8 @@ def successors(state, assembly, robots, grasp_table=None, canonical=False,
     it = _gen()
     if _BANNED_ACTIONS:
       it = (x for x in it if not _action_banned(x[0], state))
+    if _KIND_FORBID:
+      it = (x for x in it if not _kind_forbidden(x[0], state, gripper_kind))
     if _BRACE_FOR_ASSEMBLY_ONLY and _has_brace(state):
       # a brace is present -> only consume it (assemble) or drop it (release); see the flag doc.
       it = (x for x in it if x[0][0] in ("assemble", "release"))
@@ -4339,10 +4732,13 @@ def _grasp_frame(assembly, part, part_pose, grasp_id):
 # same discrete structure (parts, placement face, grounding contacts, applied load) then hit
 # the same entry. Cleared per solve via reset_wrench_cache().
 _WRENCH_CACHE = {}
+# solve-scoped vacuum-engagement verdict cache (cleared with _WRENCH_CACHE).
+_VEG_CACHE = {}
 
 
 def reset_wrench_cache():
   _WRENCH_CACHE.clear()
+  _VEG_CACHE.clear()
 
 
 def reset_grasp_pose_cache():
@@ -4379,7 +4775,8 @@ def _grounding_caps(state, assembly, group, gripper_kind):
   cache = getattr(state, "_gcaps", None)
   if cache is None:
     cache = state._gcaps = {}
-  ckey = (_subasm_key(group), gk_key)
+  ckey = (_subasm_key(group), gk_key, wrench.PARAMS.get("table_model"),
+          wrench.PARAMS.get("table_mu"))
   hit = cache.get(ckey)
   if hit is not None:
     return hit
@@ -4394,7 +4791,8 @@ def _grounding_caps(state, assembly, group, gripper_kind):
     l2 = assembly._caps_cache = {}
   l2key = (members_sorted, on_table, _placement_face(state, group) if on_table else None,
            anchor_q, grasps, wrench.PARAMS.get("grasp_model"),
-           wrench.PARAMS.get("curved_grasp_torque_scale"), _ROLLS_PER_FACE)
+           wrench.PARAMS.get("curved_grasp_torque_scale"),
+           wrench.PARAMS.get("table_model"), wrench.PARAMS.get("table_mu"), _ROLLS_PER_FACE)
   anchor_pos = np.asarray(state.poses[base][:3], dtype=float)
   l2hit = l2.get(l2key)
   if l2hit is not None:
@@ -4724,22 +5122,72 @@ def _compliance_factor(state, assembly, group, gripper_kind):
   return f
 
 
+def _wrench_params_sig():
+  # a compact signature of every wrench.PARAMS knob these verdicts read, for cache keys.
+  # PARAMS may be re-tuned between scenes in one process (replay, tests), so a per-state
+  # verdict cache without this would serve stale answers across a re-tune.
+  def _sigv(x):
+    if isinstance(x, dict):
+      return tuple(sorted((k, _sigv(v)) for k, v in x.items()))
+    return x
+  unc = wrench.PARAMS.get("insertion_uncertainty")
+  return (wrench.PARAMS["grasp_model"],
+          _sigv(wrench.PARAMS.get("grasp", {})),      # the CAP VALUES themselves: --vacuum/
+                                                      # --two-finger-scale retunes them in-process,
+                                                      # and a sig without them serves stale LP
+                                                      # verdicts across a re-tune (measured:
+                                                      # --two-finger-scale 5 read the x1 verdict)
+          wrench.PARAMS.get("curved_grasp_torque_scale"),
+          wrench.PARAMS.get("table_model"), wrench.PARAMS.get("table_mu"),
+          _sigv(wrench.PARAMS.get("grasp_compliance")),
+          wrench.PARAMS.get("robust_mode"),
+          wrench.PARAMS.get("ignore_gravity"),
+          _sigv(wrench.PARAMS.get("insert_force", {})),
+          wrench.PARAMS.get("vacuum_engage_force"),
+          None if not unc else _sigv(unc))
+
+
 def _insertion_stable(state, assembly, group, gripper_kind, part, onto, d=None):
   # `group` (the TARGET) withstands the robust insertion reaction of `part` seating onto it.
   # A compliantly-held target wanders under the press -> its uncertainty box inflates.
+  # PER-STATE VERDICT CACHE: the gate is deterministic in the state (poses/supports are part
+  # of the state identity -- the search keeps the key <-> world-pose mapping a BIJECTION), and
+  # under --insertion-noise it costs 4 LP corners per call -- the fill asks it once per (state,
+  # assemble candidate), which measured thousands of redundant re-asks in a wandering fill.
+  # The PARAMS signature keeps the cache sound across in-process re-tunes (replay, tests).
+  key = (state.key(), part, onto,
+         _compliance_factor(state, assembly, group, gripper_kind), _wrench_params_sig())
+  cache = getattr(state, "_ins_cache", None)
+  if cache is None:
+    cache = state._ins_cache = {}
+  hit = cache.get(key)
+  if hit is not None:
+    return hit
   f_world, point = _insertion_load(state, assembly, part, onto, d)
-  return _robust_stable(state, assembly, group, gripper_kind, f_world, point,
-                        wrench.insert_force(part),
-                        scale=_compliance_factor(state, assembly, group, gripper_kind))
+  res = _robust_stable(state, assembly, group, gripper_kind, f_world, point,
+                       wrench.insert_force(part), scale=key[3])
+  cache[key] = res
+  return res
 
 
 def _inserter_stable(state, assembly, group, gripper_kind, part, onto, d=None):
   # the HELD `group` transmits its own weight plus the robust seating reaction through its
   # grasp(s). A compliant inserter grasp cannot place the press accurately -> box inflates.
+  # Same per-state verdict cache as _insertion_stable (the inserter side is asked just as
+  # often, with the same 4-corner cost under noise).
+  key = (state.key(), part, onto,
+         _compliance_factor(state, assembly, group, gripper_kind), _wrench_params_sig())
+  cache = getattr(state, "_iser_cache", None)
+  if cache is None:
+    cache = state._iser_cache = {}
+  hit = cache.get(key)
+  if hit is not None:
+    return hit
   f_world, point = _inserter_load(state, assembly, part, onto, d)
-  return _robust_stable(state, assembly, group, gripper_kind, f_world, point,
-                        wrench.insert_force(part),
-                        scale=_compliance_factor(state, assembly, group, gripper_kind))
+  res = _robust_stable(state, assembly, group, gripper_kind, f_world, point,
+                       wrench.insert_force(part), scale=key[3])
+  cache[key] = res
+  return res
 
 
 # reference anchor poses for the wrench precompute: absolute position is irrelevant (the

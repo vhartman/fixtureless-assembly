@@ -49,3 +49,12 @@ def test_replay_refuses_missing_witness_without_explicit_resolve(monkeypatch):
                       lambda *_a, **_kw: pytest.fail("visualizer must not be reached"))
   with pytest.raises(SystemExit, match="refusing to resolve IK implicitly"):
     R.replay("plan.json", view=True)
+
+
+def test_replay_restores_vacuum_engagement_successor_gate():
+  import wrench
+
+  R.apply_wrench_params({"vacuum_engage_force": 7.5})
+  assert wrench.PARAMS["vacuum_engage_force"] == 7.5
+  R.apply_wrench_params({})
+  assert wrench.PARAMS["vacuum_engage_force"] == 0.0

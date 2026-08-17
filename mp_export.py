@@ -677,7 +677,15 @@ def _dependency_graph(plan, states, step_names, robots, robot_ik):
 
 def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_margin=0.0,
                           table_float=0.0):
-  """MONKEY-PATCH a robot-robot clearance margin onto the exported problem (mr_bench unmodified).
+  """MONKEY-PATCH our planning gates onto the exported problem (mr_bench unmodified).
+
+  Joint limits are ALWAYS enforced here. mr_bench samples random configurations inside
+  ``env.limits``, but its RAI collision predicates accept an arbitrary supplied/interpolated
+  configuration without checking those limits. A BiRRT detour can therefore leave the legal
+  range even when both endpoints are valid (measured on peg-stool: shoulder_lift -0.338 while
+  its upper limit is -0.383 rad). Simulation correctly rejects such a path, much too late.
+  Keeping the check in the same wrapper as our extra clearance predicates means planning,
+  shortcutting, diagnostics, and simulation preflight all use the same hard boundary.
 
   `table_margin` adds the CARRIED-PART-vs-TABLE case (the transit graze: BiRRT+shortcut has no
   reason to stay high at a 0.1mm collision tolerance, so the executed path's mm-level tracking
@@ -835,6 +843,11 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
   # report at termination; callers/tests can inspect margin_rejection_stats directly.
   _stats = {}
   _last_rejection = [None]                    # final predicate call inside an edge check
+  _limits = _np.asarray(getattr(env, "limits", _np.empty((0, 0))), dtype=float)
+  try:
+    _joint_names = list(env.C.getJointNames())
+  except Exception:
+    _joint_names = []
 
   def _mode_key(m):
     try:
@@ -870,7 +883,7 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
     _bump(_stats["gate_by_mode"], mode)
     key = (mode, reason["task"], reason["gate"], reason["frames"], reason["owners"])
     rec = _stats["records"].get(key)
-    slack = reason["observed"] - reason["required"]
+    slack = reason.get("slack", reason["observed"] - reason["required"])
     if rec is None:
       rec = dict(reason, count=0, worst_slack=slack)
       _stats["records"][key] = rec
@@ -880,6 +893,7 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
     if slack < rec["worst_slack"]:
       rec.update({k: reason[k] for k in
                   ("involved", "observed", "required", "factor")})
+      rec["slack"] = slack
       rec["worst_slack"] = slack
     if _os.environ.get("MP_MARGIN_DEBUG"):
       print(f"[margin-debug] VETO gate={reason['gate']} mode={list(mode)} "
@@ -924,7 +938,7 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
     _bump(_stats["edge_by_mode"], mode)
     last = _last_rejection[0]
     layer = None if last is None else last.get("layer")
-    if layer == "margin":
+    if layer in ("margin", "gate"):
       _stats["edge_gate_rejects"] += 1
       return
     _stats["edge_base_rejects"] += 1
@@ -968,6 +982,13 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
       # Put exact-frontier evidence first, then the most common concrete pair/reason overall.
       rows.sort(key=lambda r: (r["mode"] == frontier, r["count"]), reverse=True)
       for r in rows[:max(1, int(top))]:
+        if r["gate"] == "joint-limit":
+          side = r["frames"][1]
+          print(f"[mp/gate] mode={list(r['mode'])} task={r['task']} gate=joint-limit "
+                f"count={r['count']} joint={r['frames'][0]} value={r['observed']:.6f}rad "
+                f"{side}={r['required']:.6f}rad "
+                f"violation={-r['worst_slack']:.6g}rad")
+          continue
         factor = "" if r["factor"] is None else f" ramp={r['factor']:.3f}"
         owners = "/".join("-" if x is None else str(x) for x in r["owners"])
         print(f"[mp/margin] mode={list(r['mode'])} task={r['task']} gate={r['gate']} "
@@ -1115,6 +1136,40 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
                      involved=involved, factor=factor)
     return None
 
+  def _joint_limit_veto(q, m):
+    """Return a structured veto for the first out-of-range joint, or None.
+
+    ``is_collision_free`` receives a Configuration while ``is_collision_free_np`` receives a
+    flat ndarray. q=None means "check the configuration already posed in C" in mr_bench.
+    The 1e-9 allowance is numerical noise only, not a planning margin.
+    """
+    if _limits.ndim != 2 or _limits.shape[0] != 2 or _limits.shape[1] == 0:
+      return None
+    try:
+      raw = env.C.getJointState() if q is None else (q.state() if hasattr(q, "state") else q)
+      flat = _np.asarray(raw, dtype=float).ravel()
+    except Exception:
+      return None
+    if flat.size != _limits.shape[1]:
+      return None
+    lo, hi = _limits[0], _limits[1]
+    bad_lo = _np.flatnonzero(flat < lo - 1e-9)
+    bad_hi = _np.flatnonzero(flat > hi + 1e-9)
+    if not bad_lo.size and not bad_hi.size:
+      return None
+    candidates = []
+    if bad_lo.size:
+      j = int(bad_lo[_np.argmax(lo[bad_lo] - flat[bad_lo])])
+      candidates.append((float(lo[j] - flat[j]), j, "lower", float(lo[j])))
+    if bad_hi.size:
+      j = int(bad_hi[_np.argmax(flat[bad_hi] - hi[bad_hi])])
+      candidates.append((float(flat[j] - hi[j]), j, "upper", float(hi[j])))
+    violation, j, side, bound = max(candidates)
+    name = _joint_names[j] if j < len(_joint_names) else f"joint[{j}]"
+    reason = _veto(m, "joint-limit", name, side, float(flat[j]), bound)
+    reason["slack"] = -violation
+    return reason
+
   def _wrap(fn):
     def patched(*a, **kw):
       m = kw.get("m", a[1] if len(a) > 1 else None)
@@ -1128,10 +1183,13 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
         return False
       _stats["base_passes"] += 1
       _bump(_stats["pass_by_mode"], mode)
-      reason = _too_close(m)
+      q = kw.get("q", a[0] if a else None)
+      reason = _joint_limit_veto(q, m)
+      if reason is None:
+        reason = _too_close(m)
       if reason is not None:
         _record(reason)
-        _last_rejection[0] = {"layer": "margin", "mode": mode, "reason": reason}
+        _last_rejection[0] = {"layer": "gate", "mode": mode, "reason": reason}
         return False
       _last_rejection[0] = None
       return True
@@ -1251,10 +1309,13 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
         print("[mp] WARNING: --mp-table-margin without --mp-margin-ramp demands the full margin "
               "AT the pick keyframe too, where the part is only part_float above the table -- "
               "the mode after every pick starts in violation and planning will wedge.")
-    _install_robot_margin(env, float(robot_robot_margin or 0.0), list(robots),
-                          robot_ik.gripper_frame, ramp=float(robot_margin_ramp),
-                          table_margin=float(table_margin or 0.0),
-                          table_float=float(table_float or 0.0))
+  # Always install: beyond the optional margin gates this supplies the joint-limit predicate
+  # missing from mr_bench's RAI collision checker. With both margins at zero it is cheap
+  # arithmetic and changes only configurations which simulation would reject anyway.
+  _install_robot_margin(env, float(robot_robot_margin or 0.0), list(robots),
+                        robot_ik.gripper_frame, ramp=float(robot_margin_ramp),
+                        table_margin=float(table_margin or 0.0),
+                        table_float=float(table_float or 0.0))
   return env
 
 
