@@ -61,8 +61,18 @@ UR5_PATHS = {
     (True, True): "./src/rai/ur10/ur10_vacuum_floating.g",
 }
 
+# UR5 with a RESTRICTED workspace -- same convention as UR10_LIMITED_PATHS (the *_limited
+# .g files override joint limits; the FLOATING variants have no arm joints -> reuse ur10).
+UR5_LIMITED_PATHS = {
+    (False, False): "./src/rai/ur5/ur5_two_finger_limited.g",
+    (False, True): "./src/rai/ur5/ur5_vacuum_limited.g",
+    (True, False): "./src/rai/ur10/ur10_two_finger_floating.g",
+    (True, True): "./src/rai/ur10/ur10_vacuum_floating.g",
+}
+
 # Prefix used by each robot type's .g file.
-ROBOT_PREFIXES = {"ur5": "ur_", "ur10": "ur_", "ur10_limited": "ur_", "kuka": "kuka_"}
+ROBOT_PREFIXES = {"ur5": "ur_", "ur5_limited": "ur_", "ur10": "ur_",
+                  "ur10_limited": "ur_", "kuka": "kuka_"}
 
 # Placement on the table: {robot_type: (rotation, position)} per robot slot.
 # Two layouts, one for <=4 robots and a tighter one for 5-6 robots.
@@ -77,8 +87,8 @@ LAYOUT_4 = {
     },
     "ur5": {
         "rot": [_LEFT, _LEFT, _RIGHT, _RIGHT],
-        "pos": [[-0.3, 0.3, 0.03], [0.5, 0.3, 0.03],
-                [0.5, -0.4, 0.03], [-0.3, -0.4, 0.03]],
+        "pos": [[-0.3, 0.4, 0.03], [0.5, 0.4, 0.03],
+                [0.5, -0.5, 0.03], [-0.3, -0.5, 0.03]],
     },
 }
 
@@ -188,6 +198,8 @@ def _robot_path(robot_type, floating_ee, vacuum):
         return os.path.join(HERE, UR10_LIMITED_PATHS[(floating_ee, vacuum)])
     if robot_type == "ur5":
         return os.path.join(HERE, UR5_PATHS[(floating_ee, vacuum)])
+    if robot_type == "ur5_limited":
+        return os.path.join(HERE, UR5_LIMITED_PATHS[(floating_ee, vacuum)])
     return os.path.join(HERE, "./src/rai/kuka_drake/kuka_two_finger.g")
 
 
@@ -229,7 +241,10 @@ def make_four_robot_env(
 
     for i in range(num_robots):
         robot_type = robot_types[i]
-        place = layout["ur10" if robot_type == "ur10_limited" else robot_type]
+        layout_key = ("ur10" if robot_type == "ur10_limited"
+                      else "ur5" if robot_type == "ur5_limited"
+                      else robot_type)
+        place = layout[layout_key]
         prefix = f"a{i + 1}_"
 
         C.addFile(

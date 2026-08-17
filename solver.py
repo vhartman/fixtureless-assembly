@@ -419,6 +419,10 @@ class RobotIK:
       # short along the part's own insertion axis. mr_bench then bakes that error in at attach
       # and the exported assembly disagrees with ours. Set to tighten.
     self.mate_pair_gate = False                           # --strict-mate-collisions (see _pen_ok)
+    self.keep_contacts = False                            # --always-contact: never disable a
+    # touched part's/group's contact in the skill IK -- the witness must clear the strict
+    # gate with EVERY contact on (grasp/mate contact included); an overlapping plan then
+    # fails its IK and the search re-runs. Default off (byte-identical).
     self._mate_exempt = None                              # (moving parts, target parts) while solving a mate
     self.harvest_branches = None                          # scratch list while harvesting
     self.harvest_all_branches = True                      # keep EVERY feasible analytic
@@ -875,7 +879,8 @@ class RobotIK:
       if st is None:
         continue
       for _r, (pt, _g) in self.holders(st).items():
-        set_part_contact(C0, pt, 0)
+        if not self.keep_contacts:
+          set_part_contact(C0, pt, 0)
     names0 = C0.getJointNames()
     # every mover arm's base-witness values ride along in each returned map (see docstring)
     mover_map = {n: float(base_witness[k]) for k, n in enumerate(names0)
@@ -1017,8 +1022,9 @@ class RobotIK:
         pen += -d
       return pen
     finally:
-      for mp in moving:
-        set_part_contact(C, mp, 0)
+      if not self.keep_contacts:
+        for mp in moving:
+          set_part_contact(C, mp, 0)
 
   def grasp_pose_residual(self, C, q, robot, part, ee_target):
     """|achieved positionRel(gripper, part) - the pinned grasp-DB target|, metres.
@@ -1551,8 +1557,10 @@ class RobotIK:
 
     # the gripper is SUPPOSED to touch the part it grasps (two-finger palm/fingers close
     # around it), so exclude the target part from collision -- otherwise the collision
-    # objective forbids the grasp itself.
-    set_part_contact(C, part_name, 0)
+    # objective forbids the grasp itself. --always-contact keeps it on: then the grasp must
+    # clear the strict gate WITH the finger-part contact, and overlapping grasps are re-searched.
+    if not self.keep_contacts:
+      set_part_contact(C, part_name, 0)
 
     if self.strip_inactive_collision:
       self._disable_inactive_collision(C, robot)          # drop other arms' contact pairs
@@ -1654,7 +1662,8 @@ class RobotIK:
     # exactly like pre-pick -- the pre-grasp funnel mouth for the brace/handover reach.
     if backoff > 0.0:
       ee_target = _backoff_ee(ee_target, backoff)
-    set_part_contact(C, gpart, 0)                        # the new gripper is meant to touch gpart
+    if not self.keep_contacts:
+      set_part_contact(C, gpart, 0)                      # the new gripper is meant to touch gpart
 
     def build(collisions):
       komo = ry.KOMO(C, phases=1, slicesPerPhase=1, kOrder=1, enableCollisions=collisions)
@@ -1908,8 +1917,9 @@ class RobotIK:
     # intended flush seating reads as penetration and IK fails. Arm-vs-rest collision stays on;
     # the cheap floating-EE check already covered the moved geometry vs the scene.
     moving = next((g for g in s0.subassemblies() if part in g), (part,))
-    for mp in moving:
-      set_part_contact(C, mp, 0)
+    if not self.keep_contacts:
+      for mp in moving:
+        set_part_contact(C, mp, 0)
     # ...but tell the GATE what was excluded and why. Disabling the group's contact is needed
     # for the SOLVE (the mate is flush against the target, so the intended contact would read as
     # penetration and the IK would never converge) -- it is NOT a reason to stop checking the
@@ -3003,8 +3013,9 @@ def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
     moving = frozenset(next((g for g in states[i].subassemblies() if part in g), (part,)))
     target = frozenset(next((g for g in states[i].subassemblies() if onto in g), (onto,)))
     Ci = robot_ik.scene_for(states[i], assembly)
-    for mp in moving:
-      set_part_contact(Ci, mp, 0)                         # same exclusion the solve used
+    if not robot_ik.keep_contacts:
+      for mp in moving:
+        set_part_contact(Ci, mp, 0)                       # same exclusion the solve used
 
     def pen_of(q):
       Ci.setJointState(np.asarray(q, dtype=float).ravel())
@@ -3261,9 +3272,10 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
 
     # RE-VALIDATION in the two ORIGINAL single-phase scenes (contact flags included), which
     # is what catches an exclusion-set mismatch the fused KOMO could not see.
-    set_part_contact(Ca, gpart, 0)
-    for mp in moving:
-      set_part_contact(Cb, mp, 0)
+    if not robot_ik.keep_contacts:
+      set_part_contact(Ca, gpart, 0)
+      for mp in moving:
+        set_part_contact(Cb, mp, 0)
     # ...but the assemble scene's penetration is then measured with the WHOLE moving group
     # switched off, so a fused witness that drives the part through an ARM reads as 0mm and
     # sails past the `n_p2 > max(pen_gate, o_p2)` gate below. That is how a mate collision
@@ -3506,11 +3518,12 @@ def fuse_pre_skill_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
     # SCORING SCENE: the skill's own scene and the skill's own contact exclusions, so a
     # penetration here is comparable with the one the skill IK itself gated on.
     Cs = robot_ik.scene_for(s0, assembly)
-    if kind in ("pick", "add_grasp"):
-      set_part_contact(Cs, a[2], 0)                        # the gripper is meant to touch it
-    elif kind == "assemble":
-      for mp in moving:
-        set_part_contact(Cs, mp, 0)                        # the seating contact is intended
+    if not robot_ik.keep_contacts:
+      if kind in ("pick", "add_grasp"):
+        set_part_contact(Cs, a[2], 0)                      # the gripper is meant to touch it
+      elif kind == "assemble":
+        for mp in moving:
+          set_part_contact(Cs, mp, 0)                      # the seating contact is intended
     parts = [p for p in s0.bodies() if p in Cs.getFrameNames()]
     stat = [p for p in parts if p not in moving]
 

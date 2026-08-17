@@ -59,9 +59,10 @@ def build_parser():
            "topological under mixed). Incompatible with --anon-robots (identity matters).",
   )
   g_scene.add_argument(
-      "--robot", choices=["ur10", "ur10_limited", "ur5"], default="ur10",
+      "--robot", choices=["ur10", "ur10_limited", "ur5", "ur5_limited"], default="ur10",
       help="Robot arm for all robots: ur10 (default), ur10_limited (ur10 with a tighter "
-           "shoulder-lift/elbow workspace), or ur5. With --floating-ee the arm is "
+           "shoulder-lift/elbow workspace), ur5, or ur5_limited (ur5 with the same "
+           "restricted workspace). With --floating-ee the arm is "
            "irrelevant (a generic floating gripper); it matters for the real arm (no --floating-ee "
            "/ --real-ik) -- note the ur5 has a much shorter reach (~0.85 m vs ~1.3 m).",
   )
@@ -497,6 +498,16 @@ def build_parser():
            "It is not kept as a permanent load after attachment: the cup/suction preload is "
            "then internal and the normal holding envelope belongs to --grasp-model. "
            "0 disables (compatibility default); try 5N.",
+  )
+  g_phys.add_argument(
+      "--vacuum-engage-friction", type=float, default=None, metavar="MU",
+      help="With --wrench and --vacuum-engage-force: give the TABLE support a STATIC friction "
+           "cone (mu) inside the ENGAGEMENT gate only. The sealing push of a near-vertical "
+           "approach has a small lateral component a real table holds by static friction, "
+           "which the global frictionless model rejects at ANY magnitude. Every other gate "
+           "(insertion, release, rest-on-table) keeps the global table model; a held part's "
+           "gripper contacts are untouched. e.g. 0.3 admits tilts up to ~17 deg (arctan mu), "
+           "so the ~2deg top-down grasps pass and the sideways ones stay rejected. Default off.",
   )
   g_phys.add_argument(
       "--tf-close-torque", type=float, default=None, metavar="NM",
@@ -1124,6 +1135,17 @@ def build_parser():
       default=argparse.SUPPRESS,
       help="Disable the strict witness-penetration gate (restores the pre-2026-07-29 default).",
   )
+  g_ik.add_argument(
+      "--always-contact", action=argparse.BooleanOptionalAction, default=True,
+      help="Default ON (2026-08-17): NEVER disable a touched part's/group's contact in the "
+           "skill IK. A witness is then accepted only if the whole scene clears the "
+           "--strict-collisions gate -- grasp and mate contact included; an overlapping plan "
+           "fails its IK and the search re-runs (blacklist/repair). Grasps whose finger proxy "
+           "geometrically overlaps the part fail too, which is the point: only genuinely "
+           "contact-clean witnesses pass. --no-always-contact restores the historical behavior "
+           "(the touched group's contact is switched off for the solve, which also hides "
+           "arm-vs-part and part-vs-part for that group).",
+  )
   g_mp.add_argument(
       "--mp-clearance", action="store_true",
       help="With --motion-plan: BEFORE running BiRRT, print a per-task-goal collision report "
@@ -1447,7 +1469,8 @@ _SAVE_CONFIG_FIELDS = (
     "bracing", "robust_mode", "dense_grasps", "random_init", "part_float", "inhand_reorient",
     "pre_insertion", "pre_pick", "pre_place", "pre_add_grasp", "post_release", "staged_mates",
     "allow_curved_grasps", "grippers", "grasp_compliance",
-    "vacuum_scale", "two_finger_scale", "vacuum_engage_force", "tf_close_torque", "dominance",
+    "vacuum_scale", "two_finger_scale", "vacuum_engage_force",
+    "vacuum_engage_friction", "tf_close_torque", "dominance",
     "table_mu",
     "useful_grasps", "brace_resting",
     "ignore_gravity",                                    # weightless stability: a plan searched
@@ -1460,7 +1483,7 @@ _SAVE_CONFIG_FIELDS = (
     # against a DIFFERENT successor set than the search that made it, and the first symptom is
     # optimize_witnesses*/replay failing with "cannot reproduce action ... from the successor
     # set". min_sep and place_cells change the place cells, the rest change the action space.
-    "strict_mate_collisions", "ik_accuracy", "mate_accuracy", "grasp_accuracy",
+    "strict_mate_collisions", "always_contact", "ik_accuracy", "mate_accuracy", "grasp_accuracy",
     "mate_eq_weight", "grasp_eq_weight",
     "place_eq_weight",                                   # a place is the DATUM later mates are
     # measured against, so its residual is not local (measured: body 3.91mm high, wheels then
@@ -1864,6 +1887,12 @@ def run(cfg, explicit=None):
     print(f"[flag] --vacuum-engage-force {cfg.vacuum_engage_force:g}N ACTIVE: every vacuum "
           "pick/add_grasp/handover must have its pre-existing supports balance the cup's "
           "transient approach-axis sealing load.")
+  wrench.PARAMS["vacuum_engage_friction"] = float(cfg.vacuum_engage_friction or 0.0)
+  if cfg.wrench and cfg.vacuum_engage_friction:
+    print(f"[flag] --vacuum-engage-friction {cfg.vacuum_engage_friction:g} ACTIVE: inside "
+          "the ENGAGEMENT gate only, the table gets a static friction cone (arctan(mu) "
+          f"~= {float(np.degrees(np.arctan(cfg.vacuum_engage_friction))):.0f} deg admissible "
+          "tilt); every other gate keeps the global table model.")
   if cfg.vacuum_scale is not None:
     vs = float(cfg.vacuum_scale)                          # scale EVERY vacuum force+torque cap
     for _model in wrench.PARAMS["grasp"].values():         # all models; mu (a ratio) is left as-is
@@ -2187,6 +2216,12 @@ def run(cfg, explicit=None):
             + ("" if cfg.witness_robot_collisions else
                " NOTE: idle arms are STRIPPED from skill scenes (add "
                "--witness-robot-collisions to gate arm-arm penetration too)."))
+    if robot_ik is not None and cfg.always_contact:
+      robot_ik.keep_contacts = True
+      print("[flag] --always-contact ACTIVE (default): no skill IK disables a touched part's "
+            "contact -- every witness must clear the strict-collisions gate with ALL contacts "
+            "on (grasp and mate contact included); overlapping plans fail their IK and are "
+            "re-searched. --no-always-contact restores the contact exclusions.")
     if cfg.skill > 0.0:
       # shorthand: set every funnel not explicitly overridden on this command. Checking the
       # CLI presence rather than `<= 0` matters now that funnels default ON.

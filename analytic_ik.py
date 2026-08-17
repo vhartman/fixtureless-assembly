@@ -68,6 +68,8 @@ _CAL = {
 # identical, so the analytic solver is the same; the caller applies the joint limits to the
 # returned branches (seed_configs returns all branches, limit filtering happens downstream).
 _CAL["ur10_limited"] = _CAL["ur10"]
+# ur5_limited likewise: same ur5e kinematics, tighter limits applied downstream.
+_CAL["ur5_limited"] = _CAL["ur5"]
 for _c in _CAL.values():
   _c["Binv"] = np.linalg.inv(_c["B"])
   _c["solver"] = None                                        # lazily loaded ssik module

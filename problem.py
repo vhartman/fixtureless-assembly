@@ -3591,6 +3591,13 @@ def _vacuum_engagement_stable(state, assembly, group, robot, gpart, grasp_id,
   force = float(wrench.PARAMS.get("vacuum_engage_force", 0.0))
   if force <= 0.0:
     return True
+  # SCOPED STATIC FRICTION (--vacuum-engage-friction): the transient sealing push happens
+  # while the part is only supported by the table / old holders. A real table resists the
+  # small lateral component of a near-vertical approach through STATIC friction, which the
+  # global frictionless unilateral model cannot (it rejects ANY lateral load). This gives the
+  # TABLE a friction cone for THIS check only -- every other gate keeps the global table
+  # model, and a held part's gripper contacts are untouched.
+  mu_engage = float(wrench.PARAMS.get("vacuum_engage_friction", 0.0) or 0.0)
   # SOLVE-SCOPED VERDICT CACHE (same pattern/validity as the insertion gates, keyed on the
   # STATE IDENTITY so a state re-generated in another fill round hits too -- object-level
   # caches miss those). The verdict is a deterministic function of the state under fixed
@@ -3603,8 +3610,10 @@ def _vacuum_engagement_stable(state, assembly, group, robot, gpart, grasp_id,
   poses = _state_part_poses(state, assembly, lift=0.0)
   point, approach, _t1, _t2 = _grasp_frame(
       assembly, gpart, poses[gpart], grasp_id)
-  res = _group_stable(state, assembly, group, gripper_kind,
-                      applied=[(force * approach, point)])
+  res = _group_stable(
+      state, assembly, group, gripper_kind,
+      applied=[(force * approach, point)],
+      table_override=("friction", mu_engage) if mu_engage > 0.0 else None)
   _VEG_CACHE[key] = res
   return res
 
@@ -4751,8 +4760,11 @@ def reset_grasp_pose_cache():
   _SAMPLED_META_CACHE.clear()
 
 
-def _grounding_caps(state, assembly, group, gripper_kind):
-  # Everything in the stability LP that does NOT depend on the applied load: the grounding
+def _grounding_caps(state, assembly, group, gripper_kind, table_override=None):
+  # table_override: (model, mu) for the vacuum ENGAGEMENT gate's scoped static friction --
+  # changes ONLY the table columns of THIS query, never the global PARAMS['table_model']
+  # every other gate reads. Everything in the stability LP that does NOT depend on the
+  # applied load: the grounding
   # generator matrix (G [6xK], ub [K]) + its precomputed linprog `bounds` and rounded cache-
   # key BYTES, the group centroid, and the gravity wrench. TWO cache levels:
   #   L1 per state (state._gcaps)      -- repeated queries on one state (16 noise corners).
@@ -4776,7 +4788,7 @@ def _grounding_caps(state, assembly, group, gripper_kind):
   if cache is None:
     cache = state._gcaps = {}
   ckey = (_subasm_key(group), gk_key, wrench.PARAMS.get("table_model"),
-          wrench.PARAMS.get("table_mu"))
+          wrench.PARAMS.get("table_mu"), table_override)
   hit = cache.get(ckey)
   if hit is not None:
     return hit
@@ -4792,7 +4804,8 @@ def _grounding_caps(state, assembly, group, gripper_kind):
   l2key = (members_sorted, on_table, _placement_face(state, group) if on_table else None,
            anchor_q, grasps, wrench.PARAMS.get("grasp_model"),
            wrench.PARAMS.get("curved_grasp_torque_scale"),
-           wrench.PARAMS.get("table_model"), wrench.PARAMS.get("table_mu"), _ROLLS_PER_FACE)
+           wrench.PARAMS.get("table_model"), wrench.PARAMS.get("table_mu"), _ROLLS_PER_FACE,
+           table_override)
   anchor_pos = np.asarray(state.poses[base][:3], dtype=float)
   l2hit = l2.get(l2key)
   if l2hit is not None:
@@ -4810,7 +4823,9 @@ def _grounding_caps(state, assembly, group, gripper_kind):
   caps = []
   if any(("table",) in state.supports.get(p, ()) for p in members):
     fp = _table_footprint(assembly, poses, members)
-    caps.append(wrench.table_capability([np.asarray(x, dtype=float) - centroid for x in fp]))
+    fpts = [np.asarray(x, dtype=float) - centroid for x in fp]
+    caps.append(wrench.table_capability_override(fpts, *table_override)
+                if table_override else wrench.table_capability(fpts))
   derate = wrench.PARAMS.get("curved_grasp_torque_scale") is not None
   for p in members:
     for c in sorted(state.supports.get(p, ())):
@@ -4830,12 +4845,14 @@ def _grounding_caps(state, assembly, group, gripper_kind):
   return hit
 
 
-def _group_stable(state, assembly, group, gripper_kind, applied=()):
+def _group_stable(state, assembly, group, gripper_kind, applied=(), table_override=None):
   # static-equilibrium feasibility for a subassembly: can its grounding contacts balance
   # gravity plus any `applied` [(force_vec_world, point_world), ...] (e.g. insertion)? The
   # load-independent contacts come from _grounding_caps (cached); here we only add the applied
-  # load to the gravity wrench and hit the LP cache / solve.
-  centroid, w_grav, G, ub, bounds, gbytes = _grounding_caps(state, assembly, group, gripper_kind)
+  # load to the gravity wrench and hit the LP cache / solve. table_override: scoped table
+  # model for the engagement gate, see _grounding_caps.
+  centroid, w_grav, G, ub, bounds, gbytes = _grounding_caps(
+      state, assembly, group, gripper_kind, table_override=table_override)
   w_ext = w_grav
   for f, pt in applied:
     w_ext = w_ext + wrench.point_force_wrench(f, np.asarray(pt, dtype=float) - centroid)
@@ -5144,6 +5161,7 @@ def _wrench_params_sig():
           wrench.PARAMS.get("ignore_gravity"),
           _sigv(wrench.PARAMS.get("insert_force", {})),
           wrench.PARAMS.get("vacuum_engage_force"),
+          wrench.PARAMS.get("vacuum_engage_friction"),
           None if not unc else _sigv(unc))
 
 

@@ -66,6 +66,9 @@ def apply_wrench_params(cfg):
   # Vacuum sealing is a successor gate, so replay must restore it before walking the saved
   # action list. Missing in an old plan means the compatibility default (0 N).
   wrench.PARAMS["vacuum_engage_force"] = float(_saved(cfg, "vacuum_engage_force"))
+  # The engagement gate's scoped static friction is the same successor-gate scope.
+  wrench.PARAMS["vacuum_engage_friction"] = float(
+      cfg.get("vacuum_engage_friction") or 0.0)
   # weightless stability -- without this a plan searched under --ignore-gravity is
   # unreproducible here (its successor set differs). .get(): older files predate the key.
   wrench.PARAMS["ignore_gravity"] = bool(cfg.get("ignore_gravity"))
@@ -227,6 +230,8 @@ def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=T
     if _sc is not None:
       rik.penetration_reject = float(_sc)
       rik.col_weight = 1e2
+    # --always-contact: the search never disabled touched contacts; the replay must not either.
+    rik.keep_contacts = bool(_saved(cfg, "always_contact", legacy=False))
     witnesses = read_witnesses(path, list(rik.C.getJointNames()), len(plan))
     needs_ik = {"pick", "place", "stow", "assemble", "add_grasp", "handover"}
     missing = ([] if witnesses is None else

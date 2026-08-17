@@ -50,6 +50,11 @@ PARAMS = {
     # cone coefficient. The unilateral default is frictionless, so a table-rest target cannot
     # resist ANY lateral load (every --insertion-noise corner adds one).
     "table_mu": 0.3,
+    # ENGAGEMENT-scoped static friction (--vacuum-engage-friction MU): the frictionless
+    # unilateral table rejects ANY lateral component of the cup's transient sealing push --
+    # even a ~2deg-tilted top-down approach. This gives the TABLE a static friction cone ONLY
+    # inside that transient check; every other gate keeps table_model/table_mu.
+    "vacuum_engage_friction": 0.0,
 
     "grasp": {
         # ISOTROPIC (original): a bounded axis-aligned wrench box -- push/pull up to F_max on
@@ -323,6 +328,15 @@ def table_capability(points):
   if model == "friction":
     return _TABLE_BUILDERS["friction"](points, float(PARAMS.get("table_mu", 0.3)))
   return _TABLE_BUILDERS[model](points)
+
+
+def table_capability_override(points, model, mu):
+  # SCOPED table model for ONE transient check (the vacuum engagement gate's static friction)
+  # that must NOT touch the global PARAMS['table_model'] -- every other stability gate reads
+  # that. model in {"unilateral", "friction"}; mu is the friction coefficient.
+  if model == "friction":
+    return cap_table_friction(points, float(mu))
+  return cap_table_unilateral(points)
 
 
 # ---------------------------------------------------------------------------------------

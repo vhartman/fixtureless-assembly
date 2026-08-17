@@ -102,6 +102,7 @@ class RunConfig:
   vacuum_scale: Optional[float] = None
   two_finger_scale: Optional[float] = None
   vacuum_engage_force: float = 0.0
+  vacuum_engage_friction: Optional[float] = None
   tf_close_torque: Optional[float] = None
   curved_torque_scale: Optional[float] = None
   grasp_compliance: Optional[float] = None
@@ -127,6 +128,7 @@ class RunConfig:
   full_ik: bool = False
   strict_collisions: Optional[float] = 1e-6
   strict_mate_collisions: bool = False
+  always_contact: bool = True
   ik_accuracy: Optional[float] = None
   mate_accuracy: Optional[float] = None
   grasp_accuracy: Optional[float] = None

@@ -155,14 +155,24 @@ forensics. The robust artifacts and commands above are the current reproducible 
 ## Peg-in-hole examples
 
 `peg-hole` is the minimal two-part concavity check. `peg-stool` is the useful follow-up: its
-seat is one compound rigid body containing three blind square sockets, and three round legs are
-inserted 24.5 mm into those sockets. Use the sampled grasp database for both assemblies because
-their socket parts are compound. The stool also needs a mixed fleet: the vacuum gripper holds
-the broad seat while a two-finger gripper handles the cylindrical legs.
+seat is a plain plate containing three blind square sockets, and three round legs are inserted
+24.5 mm into those sockets. There is no raised vacuum pedestal/pad on top of the seat. The seat
+is one 13-child compound rigid body (plate plus 12 socket walls), so use the sampled grasp
+database. The stool needs a mixed fleet: the vacuum gripper holds the broad seat while a
+two-finger gripper handles the cylindrical legs.
 
 Milestones do **not** require placement to be disabled. `--milestones` only selects the search
 algorithm; placement successors remain enabled by default unless `--no-place` is explicitly
-passed. The successful stool plan below uses milestones and contains two seat placements.
+passed. The successful stool plan below uses both milestones and placement.
+
+`--vacuum-engage-force N` covers the load that exists while a cup approaches and seals. With
+`--wrench`, every vacuum `pick`, `add_grasp`, and fused `handover` first asks whether the
+supports which exist *before* the new grasp can balance an `N`-newton push along the cup's
+approach axis at the contact point. The new cup is deliberately absent from that LP, so it
+cannot balance its own engagement force. This is separate from the steady attached-grasp
+capability: after sealing, the cup preload is an internal balanced load and must not be added
+permanently to gravity/insertion wrenches. Default `0` preserves old plans; the stool run uses
+5 N. Two-finger grasps are unaffected.
 
 The reproducible wrench-enabled stool search is:
 
@@ -172,66 +182,70 @@ MPLCONFIGDIR=/tmp/assembly-mpl-cache python3 main.py --solve \
     --assembly peg-stool --parts 4 --num-robots 2 --robot ur10_limited \
     --grippers vacuum,two_finger --weight inf --beam 16 --milestones \
     --scatter-spacing 0.2 --sig-collapsed-h --sig-components press --real-ik \
-    --wrench --insert-force 20 --grasp-model asymmetric \
+    --wrench --vacuum-engage-force 5 --insert-force 20 --grasp-model asymmetric \
     --grasp-sampler --grasp-sampler-keep 12 --allow-curved-grasps \
     --bracing --seed 11023 --optimize-witnesses floor \
     --witness-margin 0.005 --witness-branch-budget 5 \
     --fuse-cograsp --tight-fingers --strict-collisions 1e-4 \
-    --save experiments/peg-stool-2r-mixed-wrench-wide-tol1e-4-seed11023-plan.json \
+    --save experiments/peg-stool-2r-mixed-wrench-flat-engage5-seed11023-plan.json \
     --quiet-rai --no-view
 ```
 
-This produced 16 actions, 13 persisted IK-bearing witnesses, eight witness sets, and no witness
-repairs. `--witness-margin 0.005` is the shared hard search/IK clearance gate. Floor witness
-optimization still maximizes additional clearance above that floor. The explicit
-`--strict-collisions 1e-4` is the numerical penetration contract used for this compound-part
-example and is repeated during motion planning.
-
-A no-wrench real-arm search was also run as a geometry diagnostic and completed with 21 actions
-and no repairs. The final search above instead uses the stricter wrench model, asymmetric
-grasps, 20 N insertion load, collapsed-h `press` signature, milestones, and placements; neither
-the no-wrench nor free-floating fallback is needed for the final result.
+This produced 12 actions, nine persisted IK-bearing witnesses, two witness sets, and three
+milestone repairs. It uses the wrench model, asymmetric grasps, the 5 N vacuum engagement load,
+20 N insertion load, collapsed-h `press` signature, milestones, and placement. The geometry
+therefore does not need the earlier no-wrench/free-floating fallback. `--witness-margin 0.005`
+is the shared hard search/IK clearance gate; floor witness optimization maximizes additional
+clearance above it. `--strict-collisions 1e-4` is the numerical penetration contract repeated
+during motion planning.
 
 For this assembly, keep the 5 cm funnel on insertion but disable the auxiliary pick/place/
 add-grasp/release funnels. The all-default-funnel problem contained an unsampleable auxiliary
 transition, while removing the insertion funnel made the simulated gripper hit the collars too
-hard. This command found a complete optimized 157-state path:
+hard. This command builds the exact final export and found a complete optimized path:
 
 ```bash
 PYTHONHASHSEED=0 NUMBA_CACHE_DIR=/tmp/assembly-numba-cache \
 MPLCONFIGDIR=/tmp/assembly-mpl-cache python3 main.py \
-    --config experiments/peg-stool-2r-mixed-wrench-wide-tol1e-4-seed11023-plan.json \
-    --load-plan experiments/peg-stool-2r-mixed-wrench-wide-tol1e-4-seed11023-plan.json \
+    --config experiments/peg-stool-2r-mixed-wrench-flat-engage5-seed11023-plan.json \
+    --load-plan experiments/peg-stool-2r-mixed-wrench-flat-engage5-seed11023-plan.json \
     --motion-plan --pre-pick 0 --pre-place 0 --pre-add-grasp 0 \
     --pre-insertion 0.05 --post-release 0 \
-    --mp-export-save experiments/peg-stool-2r-mixed-wrench-wide-tol1e-4-seed11023-insert-final-export.json \
+    --mp-export-save experiments/peg-stool-2r-mixed-wrench-flat-engage5-seed11023-final-export.json \
     --mp-runtime 90 --mp-shortcut-iters 100 --mp-seed 11023 \
     --mp-collision-tolerance 1e-4 --mp-robot-margin 0.1 --mp-margin-ramp 0.1 \
-    --mp-save experiments/mp-peg-stool-2r-mixed-wrench-wide-tol1e-4-seed11023-insert.json \
+    --mp-save experiments/mp-peg-stool-2r-mixed-wrench-flat-engage5-seed11023-limits.json \
     --quiet-rai --no-view
 ```
 
-The successful MP file embeds the exact post-fusion export. Physics replay reconstructs 13
-skill and three pre-skill keyframes from it and performs zero IK solves. To retry only motion
-planning, add `--mp-export-load ...insert-final-export.json`; do not refresh witnesses.
+The successful MP file has 116 states and embeds the exact post-fusion export: nine skill and
+three pre-skill keyframes. Replay performs zero IK solves. Motion-planning predicates now reject
+joint-limit violations as well as collisions/margins; this fixed a sampled shoulder detour that
+was outside the UR10 range even though both task endpoints were legal. To retry only motion
+planning, replace `--mp-export-save` with
+`--mp-export-load experiments/peg-stool-2r-mixed-wrench-flat-engage5-seed11023-final-export.json`;
+do not refresh witnesses.
 
 Run and replay the actuated simulation with:
 
 ```bash
 python3 sim.py run \
-    experiments/peg-stool-2r-mixed-wrench-wide-tol1e-4-seed11023-plan.json \
+    experiments/peg-stool-2r-mixed-wrench-flat-engage5-seed11023-plan.json \
     --v2 \
-    --mp-path experiments/mp-peg-stool-2r-mixed-wrench-wide-tol1e-4-seed11023-insert.json \
+    --mp-path experiments/mp-peg-stool-2r-mixed-wrench-flat-engage5-seed11023-limits.json \
     --actuated --corridor --corridor-rate-clamp --coll-scale 0.8 \
-    --spline --limit-rate --no-force-limits \
-    --record experiments/peg-stool-2r-mixed-wrench-wide-tol1e-4-seed11023-actuated.npz
+    --spline --limit-rate --no-force-limits --servo-torque-guard 0.7 \
+    --record experiments/peg-stool-2r-mixed-wrench-flat-engage5-seed11023-actuated.npz
 
 python3 sim.py replay \
-    experiments/peg-stool-2r-mixed-wrench-wide-tol1e-4-seed11023-actuated.npz
+    experiments/peg-stool-2r-mixed-wrench-flat-engage5-seed11023-actuated.npz
 ```
 
-The recording completed all 16 actions in 4,764 frames; its worst final position residual was
-1.3 mm. `--no-force-limits` disables only the predictive speed retimer: the current retimer
+The recording completed all 12 actions in 4,136 frames; its worst final position residual was
+2.0 mm. Strict preflight checked 3,392 samples and reported both collision tolerance and joint
+limits OK. `--servo-torque-guard 0.7` was needed for the long-lever support-switch approach:
+it engaged for 167 ticks where contact force was below the 6 N force trigger but grasp torque
+was approaching its cap. `--no-force-limits` disables only the predictive speed retimer: it
 assigns a table-supported assembly's entire load to one gripper and can incorrectly reduce a
 segment to zero speed. MuJoCo contact forces and physical grasp-break limits remain active, and
 the search still uses `--wrench`. `--coll-scale 0.8` is the requested debug-only arm collision
