@@ -10,7 +10,8 @@ Edit ur_wrist_2_joint: { q: -1.571 }
 Edit ur_wrist_3_joint: { q: 0.0 }
 
 Prefix: "ur_"
-Include: <../robotiq/robotiq.g>
+#Include: <../robotiq/robotiq.g>
+Include: <../robotiq/robotiq_tight.g>
 Edit ur_robotiq_base (ur_ee_link) { Q:"d(90 0 1 0) t(-.0 -.0 .036)" }
 
 #ur_ee_marker_back (ur_ee_link){
