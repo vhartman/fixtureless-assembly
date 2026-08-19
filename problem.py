@@ -881,7 +881,8 @@ class PegHoleAssembly(Assembly):
   """
 
   def __init__(self, n_parts=2, outer=0.08, hole=0.032, depth=0.04,
-               floor=0.01, peg_radius=0.012, peg_length=0.055):
+               floor=0.01, peg_radius=0.012, peg_length=0.055, chamfer=0.0,
+               hole_chamfer=0.0):
     assert 1 <= int(n_parts) <= 2, "peg-hole is a socket and one peg"
     self.n_parts = int(n_parts)
     self.outer = float(outer)
@@ -890,6 +891,10 @@ class PegHoleAssembly(Assembly):
     self.floor = float(floor)
     self.peg_radius = float(peg_radius)
     self.peg_length = float(peg_length)
+    self.chamfer = float(chamfer)
+    assert self.chamfer >= 0.0
+    self.hole_chamfer = float(hole_chamfer)
+    assert self.hole_chamfer >= 0.0
     self.cube_size = self.outer                         # scatter/marker sizing only
     self.cube_radius = 0.0
     super().__init__()
@@ -906,20 +911,41 @@ class PegHoleAssembly(Assembly):
 
     self.objects = [f"obj_{i}" for i in range(self.n_parts)]
     self.base = "obj_0"
-    self.part_shapes["obj_0"] = ("compound", [
-        {"shape": ("box", [outer, outer, floor, sharp]),
-         "pos": [0.0, 0.0, floor_z]},
-        {"shape": ("box", [wall, outer, depth, sharp]),
-         "pos": [wall_at, 0.0, wall_z]},
-        {"shape": ("box", [wall, outer, depth, sharp]),
-         "pos": [-wall_at, 0.0, wall_z]},
-        {"shape": ("box", [hole, wall, depth, sharp]),
-         "pos": [0.0, wall_at, wall_z]},
-        {"shape": ("box", [hole, wall, depth, sharp]),
-         "pos": [0.0, -wall_at, wall_z]},
-    ])
+    walls = [
+        {"shape": ("box", [wall, outer, depth, sharp]), "pos": [wall_at, 0.0, wall_z]},
+        {"shape": ("box", [wall, outer, depth, sharp]), "pos": [-wall_at, 0.0, wall_z]},
+        {"shape": ("box", [hole, wall, depth, sharp]), "pos": [0.0, wall_at, wall_z]},
+        {"shape": ("box", [hole, wall, depth, sharp]), "pos": [0.0, -wall_at, wall_z]},
+    ]
+    if self.hole_chamfer > 0.0:
+      # SOCKET-ENTRY CHAMFER: shorten every wall by c on the rim side and add a 45-degree
+      # trapezoid funnel prism at each rim edge -- the mouth widens from 2h to 2(h+c) and
+      # converges to the original pocket at depth c (the socket opens UP here).
+      c = self.hole_chamfer
+      rim_z = wall_z + depth / 2.0
+      for w in walls:
+        sx, sy, _, r = w["shape"][1]
+        w["shape"] = ("box", [sx, sy, depth - c, r])
+        w["pos"][2] -= c / 2.0
+      walls += [{"shape": sub, "pos": list(pos)}
+                for sub, pos in _hole_chamfer_children(hole / 2.0, wall, depth, rim_z, c,
+                                                       +1.0, outer, hole)]
+    self.part_shapes["obj_0"] = ("compound",
+                                 [{"shape": ("box", [outer, outer, floor, sharp]),
+                                   "pos": [0.0, 0.0, floor_z]}] + walls)
     if self.n_parts > 1:
-      self.part_shapes["obj_1"] = ("cylinder", [self.peg_length, self.peg_radius])
+      if self.chamfer > 0.0:
+        # CHAMFERED peg (--assembly peg-hole-chamfer): the -z end enters the socket and
+        # carries a 45-degree frustum lead-in, so a slightly misaligned descent slides
+        # instead of catching the rim. The peg becomes a 2-child compound (shortened
+        # cylinder body + inline convex-mesh tip); the total length is unchanged.
+        body, tip = _chamfer_tip(("cylinder", [self.peg_length, self.peg_radius]),
+                                 self.chamfer, -1.0)
+        self.part_shapes["obj_1"] = ("compound", [
+            {"shape": body[0], "pos": list(body[1])},
+            {"shape": tip[0], "pos": list(tip[1])}])
+      else:
+        self.part_shapes["obj_1"] = ("cylinder", [self.peg_length, self.peg_radius])
       # Pocket floor top = -depth/2.  Put the peg bottom 0.5mm above it: enough to avoid a
       # numerical contact being counted as penetration while still representing a seated peg.
       seated_z = -depth / 2.0 + self.peg_length / 2.0 + 0.0005
@@ -966,7 +992,8 @@ class PegStoolAssembly(Assembly):
   def __init__(self, n_parts=4, seat_x=0.18, seat_y=0.14, seat_thickness=0.018,
                socket_outer=0.04, socket_hole=0.030, socket_depth=0.025,
                leg_radius=0.0095, leg_length=0.11, leg_kind="cylinder",
-               leg_side=0.020, legs=3, peg_clearance=None):
+               leg_side=0.020, legs=3, peg_clearance=None, chamfer=0.0,
+               hole_chamfer=0.0):
     assert legs in (3, 4), f"peg-stool has three or four legs, not {legs}"
     assert leg_kind in ("cylinder", "box"), f"peg-stool leg kind {leg_kind!r}"
     self.legs = int(legs)
@@ -984,6 +1011,10 @@ class PegStoolAssembly(Assembly):
     self.leg_kind = leg_kind
     self.leg_side = float(leg_side)
     self.peg_clearance = None if peg_clearance is None else float(peg_clearance)
+    self.chamfer = float(chamfer)
+    assert self.chamfer >= 0.0
+    self.hole_chamfer = float(hole_chamfer)
+    assert self.hole_chamfer >= 0.0
     self.cube_size = self.seat_x                       # scatter/marker sizing only
     self.cube_radius = 0.0
     super().__init__()
@@ -1011,16 +1042,35 @@ class PegStoolAssembly(Assembly):
         {"shape": ("box", [sx, sy, st, 0.0]), "pos": [0.0, 0.0, 0.0]},
     ]
     for cx, cy in socket_centres:
-      children.extend([
-          {"shape": ("box", [wall, outer, depth, 0.0]),
-           "pos": [cx + wall_at, cy, wall_z]},
-          {"shape": ("box", [wall, outer, depth, 0.0]),
-           "pos": [cx - wall_at, cy, wall_z]},
-          {"shape": ("box", [hole, wall, depth, 0.0]),
-           "pos": [cx, cy + wall_at, wall_z]},
-          {"shape": ("box", [hole, wall, depth, 0.0]),
-           "pos": [cx, cy - wall_at, wall_z]},
-      ])
+      if self.hole_chamfer > 0.0:
+        # SOCKET-ENTRY CHAMFER: the collars open DOWN; every wall is shortened by c at the
+        # mouth and a 45-degree trapezoid funnel prism widens the mouth from 2h to 2(h+c).
+        c = self.hole_chamfer
+        rim_z = wall_z - depth / 2.0
+        children.extend([
+            {"shape": ("box", [wall, outer, depth - c, 0.0]),
+             "pos": [cx + wall_at, cy, wall_z + c / 2.0]},
+            {"shape": ("box", [wall, outer, depth - c, 0.0]),
+             "pos": [cx - wall_at, cy, wall_z + c / 2.0]},
+            {"shape": ("box", [hole, wall, depth - c, 0.0]),
+             "pos": [cx, cy + wall_at, wall_z + c / 2.0]},
+            {"shape": ("box", [hole, wall, depth - c, 0.0]),
+             "pos": [cx, cy - wall_at, wall_z + c / 2.0]},
+        ])
+        for sub, pos in _hole_chamfer_children(hole / 2.0, wall, depth, rim_z, c,
+                                               -1.0, outer, hole):
+          children.append({"shape": sub, "pos": [cx + pos[0], cy + pos[1], pos[2]]})
+      else:
+        children.extend([
+            {"shape": ("box", [wall, outer, depth, 0.0]),
+             "pos": [cx + wall_at, cy, wall_z]},
+            {"shape": ("box", [wall, outer, depth, 0.0]),
+             "pos": [cx - wall_at, cy, wall_z]},
+            {"shape": ("box", [hole, wall, depth, 0.0]),
+             "pos": [cx, cy + wall_at, wall_z]},
+            {"shape": ("box", [hole, wall, depth, 0.0]),
+             "pos": [cx, cy - wall_at, wall_z]},
+        ])
 
     self.objects = [f"obj_{i}" for i in range(self.n_parts)]
     self.base = "obj_0"
@@ -1063,6 +1113,15 @@ class PegStoolAssembly(Assembly):
       # the upper crown (a random barrel sample would let a vacuum push roll the loose leg).
       leg_scatter = _horizontal_cylinder_scatter_with_top_suction(leg_spec)
       leg_mass = 0.08
+    if self.chamfer > 0.0:
+      # CHAMFERED insertion tip (the -chamfer stool kinds): the leg keeps its length, but
+      # its +z end -- the one that enters the downward-facing socket -- tapers by
+      # `chamfer` over the same distance (45-degree lead-in). The leg becomes a 2-child
+      # compound (full body + inline convex-mesh frustum tip). The socket is unchanged.
+      body, tip = _chamfer_tip(leg_spec, self.chamfer, 1.0)
+      leg_spec = ("compound", [
+          {"shape": body[0], "pos": list(body[1])},
+          {"shape": tip[0], "pos": list(tip[1])}])
     leg_top = -st / 2.0 - 0.0005                    # 0.5mm short of the blind end
     leg_z = leg_top - self.leg_length / 2.0
     for i, (cx, cy) in enumerate(socket_centres[:max(0, self.n_parts - 1)], start=1):
@@ -1261,6 +1320,36 @@ _ASSEMBLY_KINDS = {"cross": (CubeCrossAssembly, 7), "cube": (CubeGridAssembly, 8
                        n_parts=n_parts, leg_kind="box", peg_clearance=0.004), 4),
                    "peg-stool-cuboid-4-tight": (lambda n_parts: PegStoolAssembly(
                        n_parts=n_parts, leg_kind="box", legs=4, peg_clearance=0.004), 5),
+                   # CHAMFERED kinds: every peg/leg's INSERTION end carries a 4mm 45-degree
+                   # frustum lead-in (an inline convex mesh) AND every socket mouth carries a
+                   # 45-degree ENTRY chamfer of its own (the rim widens into a funnel): peg
+                   # 6mm (wall 24mm), stool 4mm (wall 5mm). A slightly misaligned insertion
+                   # slides down both facets instead of catching the rim -- the execution-
+                   # friendly variants of the same assemblies (same clearances, mate axes).
+                   "peg-hole-chamfer": (lambda n_parts: PegHoleAssembly(
+                       n_parts=n_parts, chamfer=0.004, hole_chamfer=0.006), 2),
+                   "peg-stool-chamfer": (lambda n_parts: PegStoolAssembly(
+                       n_parts=n_parts, chamfer=0.004, hole_chamfer=0.004), 4),
+                   "peg-stool-4-chamfer": (lambda n_parts: PegStoolAssembly(
+                       n_parts=n_parts, legs=4, chamfer=0.004, hole_chamfer=0.004), 5),
+                   "peg-stool-cuboid-chamfer": (lambda n_parts: PegStoolAssembly(
+                       n_parts=n_parts, leg_kind="box", chamfer=0.004,
+                       hole_chamfer=0.004), 4),
+                   "peg-stool-cuboid-4-chamfer": (lambda n_parts: PegStoolAssembly(
+                       n_parts=n_parts, leg_kind="box", legs=4, chamfer=0.004,
+                       hole_chamfer=0.004), 5),
+                   "peg-stool-tight-chamfer": (lambda n_parts: PegStoolAssembly(
+                       n_parts=n_parts, peg_clearance=0.001, chamfer=0.004,
+                       hole_chamfer=0.004), 4),
+                   "peg-stool-4-tight-chamfer": (lambda n_parts: PegStoolAssembly(
+                       n_parts=n_parts, legs=4, peg_clearance=0.001, chamfer=0.004,
+                       hole_chamfer=0.004), 5),
+                   "peg-stool-cuboid-tight-chamfer": (lambda n_parts: PegStoolAssembly(
+                       n_parts=n_parts, leg_kind="box", peg_clearance=0.004,
+                       chamfer=0.004, hole_chamfer=0.004), 4),
+                   "peg-stool-cuboid-4-tight-chamfer": (lambda n_parts: PegStoolAssembly(
+                       n_parts=n_parts, leg_kind="box", legs=4, peg_clearance=0.004,
+                       chamfer=0.004, hole_chamfer=0.004), 5),
                    "mesh-demo": (MeshDemoAssembly, 3),
                    "compound-demo": (CompoundDemoAssembly, 3),
                    "chair": (ChairAssembly, 8)}
@@ -2664,6 +2753,11 @@ _MESH_CACHE = {}
 
 
 def _mesh_key(prm):
+  if "verts" in prm:
+    # INLINE convex mesh (generated shapes, e.g. chamfer tips): key on the rounded
+    # vertices so identical meshes share one asset. No file path involved.
+    v = np.asarray(prm["verts"], dtype=float)
+    return ("verts", tuple(np.round(v.ravel(), 12).tolist()))
   path = prm["file"]
   if not os.path.isabs(path):
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
@@ -2736,23 +2830,122 @@ def _compound_mesh(spec):
 
 def _load_mesh(prm):
   """Memoized mesh load for a ("mesh", {...}) spec's params. Returns
-  {"mesh": centered+scaled trimesh, "hull": convex-hull vertices (N,3), "half": AABB half
-  extents} -- one object per (path, scale), shared by every consumer."""
+  {"mesh": centered trimesh, "hull": convex-hull vertices (N,3), "half": AABB half
+  extents} -- one object per mesh, shared by every consumer. Two sources: a FILE
+  ({"file", ["scale"]}) or INLINE VERTICES ({"verts": (N,3)}) -- the latter for generated
+  convex shapes (chamfer tips), authored anywhere in shape space and centred here like a
+  file mesh so every downstream contract (half extents, ray exit, mass) is identical."""
   key = _mesh_key(prm)
   hit = _MESH_CACHE.get(key)
   if hit is None:
     import trimesh
-    m = trimesh.load(key[0], force="mesh")
-    if key[1] != 1.0:
-      m.apply_scale(key[1])
-    lo, hi = np.asarray(m.bounds, dtype=float)
-    m.apply_translation(-(lo + hi) / 2.0)
-    hull = m.convex_hull
+    if key[0] == "verts":
+      v = np.asarray(prm["verts"], dtype=float)
+      lo, hi = v.min(axis=0), v.max(axis=0)
+      m = trimesh.PointCloud(v - (lo + hi) / 2.0).convex_hull
+      hull = m
+    else:
+      m = trimesh.load(key[0], force="mesh")
+      if key[1] != 1.0:
+        m.apply_scale(key[1])
+      lo, hi = np.asarray(m.bounds, dtype=float)
+      m.apply_translation(-(lo + hi) / 2.0)
+      hull = m.convex_hull
     hit = _MESH_CACHE[key] = {
         "mesh": m, "hull": np.asarray(hull.vertices, dtype=float), "hull_mesh": hull,
         "half": (np.asarray(m.bounds[1], dtype=float)
                  - np.asarray(m.bounds[0], dtype=float)) / 2.0}
   return hit
+
+
+def _chamfer_tip(spec, chamfer, end):
+  """((body_spec, body_pos), (tip_spec, tip_pos)) -- split a cylinder/box peg at its
+  INSERTION end (`end`: +1.0 = +z end, -1.0 = -z end) into a shortened full-section body
+  and a convex-mesh FRUSTUM tip of height `chamfer`: the full cross-section at the inner
+  end tapers linearly down to (full - chamfer) at the outer end -- a 45-degree chamfered
+  lead-in. The total part length is preserved (body - chamfer, tip + chamfer), so
+  part-frame extents, grasp standoffs and rest heights are unchanged. The tip is an
+  inline-vertices mesh, realized as a convex hull in rai and a mesh geom in MuJoCo."""
+  kind, p = spec[0], spec[1]
+  assert kind in ("box", "cylinder"), f"chamfer tips need a box/cylinder peg, not {kind!r}"
+  L = float(p[2]) if kind == "box" else float(p[0])
+  c = float(chamfer)
+  e = float(end)
+  assert 0.0 < c < L / 2.0, f"chamfer {c:g} is impossible on a peg of length {L:g}"
+  if kind == "box":
+    s = float(p[0])
+    assert abs(float(p[1]) - s) < 1e-12, "chamfered box pegs need a square cross-section"
+    assert 2.0 * c < s, f"chamfer {c:g} consumes a square peg of side {s:g}"
+    corners = np.array([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]])
+    base = np.column_stack([corners * (s / 2.0), np.full(4, -e * c / 2.0)])
+    endc = np.column_stack([corners * ((s - 2.0 * c) / 2.0), np.full(4, e * c / 2.0)])
+    body = (("box", [s, s, L - c, float(p[3])]), np.array([0.0, 0.0, -e * c / 2.0]))
+  else:
+    r = float(p[1])
+    assert c < r, f"chamfer {c:g} consumes a peg of radius {r:g}"
+    n = 12
+    a = np.arange(n) * (2.0 * np.pi / n)
+    base = np.column_stack([r * np.cos(a), r * np.sin(a), np.full(n, -e * c / 2.0)])
+    endc = np.column_stack([(r - c) * np.cos(a), (r - c) * np.sin(a),
+                            np.full(n, e * c / 2.0)])
+    body = (("cylinder", [L - c, r]), np.array([0.0, 0.0, -e * c / 2.0]))
+  tip = (("mesh", {"verts": np.vstack([base, endc])}),
+         np.array([0.0, 0.0, e * (L / 2.0 - c / 2.0)]))
+  return body, tip
+
+
+def _hole_chamfer_children(h, wall, depth, z_rim, c, open_dir, len_outer, len_hole):
+  """[(child_spec, pos)] -- the four 45-degree SOCKET-ENTRY chamfer funnels of one square
+  pocket. Each wall's inner rim corner is rebuilt as a widening trapezoid prism (an inline
+  convex mesh): at the rim plane the mouth half-width is h+c, converging to the original h
+  at depth c -- a funnel that guides a slightly misaligned insertion down the facet instead
+  of catching the rim. open_dir: +1.0 = the socket opens UP (rim at the top), -1.0 = opens
+  DOWN. The CALLER shortens each wall box by c on the rim side; the prisms fill exactly that
+  band and stay inside the wall footprint (c < wall and c < depth asserted). The +-x prisms
+  run along y over `len_outer`, so the four funnels meet at the pocket corners."""
+  assert 0.0 < c < wall and 0.0 < c < depth, \
+      f"hole chamfer {c:g} exceeds wall {wall:g} or depth {depth:g}"
+  s = float(open_dir)
+  assert abs(s) == 1.0
+  # cross-section in the (across, z) plane, LOCAL to the prism centre:
+  #   A=(h, -s*c)  B=(h+wall, -s*c)  C=(h+wall, 0)  D=(h+c, 0)
+  # A-D is the 45-degree guide facet (slope 1); B-C is the wall's outer face.
+  a_c, z_c = h + wall / 2.0, -s * c / 2.0
+  ac = np.array([h, h + wall, h + wall, h + c], dtype=float) - a_c
+  zl = np.array([-s * c, -s * c, 0.0, 0.0], dtype=float) - z_c
+  out = []
+  for axis, along in (("x", len_outer), ("y", len_hole)):
+    ends = np.repeat([-along / 2.0, along / 2.0], 4)
+    if axis == "x":
+      base = np.column_stack([np.tile(ac, 2), ends, np.tile(zl, 2)])
+      across_col = 0
+    else:
+      base = np.column_stack([ends, np.tile(ac, 2), np.tile(zl, 2)])
+      across_col = 1
+    for sign in (+1.0, -1.0):
+      # MIRROR the across axis for the -sign wall so the guide facet ALWAYS faces the
+      # pocket (the -sign wall's inner face is at -h, not +h): without the mirror the
+      # facet lands on the wall's OUTER face and the mouth chamfer faces outside.
+      v = base.copy()
+      v[:, across_col] *= sign
+      pos = (np.array([sign * a_c, 0.0, z_rim + z_c]) if axis == "x"
+             else np.array([0.0, sign * a_c, z_rim + z_c]))
+      out.append((("mesh", {"verts": v}), pos))
+  return out
+
+
+def _rest_axis_spec(spec):
+  """A compound whose children are ONE cylinder plus mesh tip(s) -- a chamfered round peg
+  -- rests like the bare cylinder (neutral on its curved side). Returns the cylinder child,
+  or None when the spec is not cylinder-like."""
+  if spec[0] == "cylinder":
+    return spec
+  if spec[0] == "compound":
+    cyl = [s for s, _ in _compound_children(spec) if s[0] == "cylinder"]
+    other = [s for s, _ in _compound_children(spec) if s[0] != "cylinder"]
+    if len(cyl) == 1 and other and all(s[0] == "mesh" for s in other):
+      return cyl[0]
+  return None
 
 
 _PLAIN_BOX = False                                         # --plain-box: sharp ST.box instead of
@@ -4532,10 +4725,14 @@ def _rest_stable(assembly, group, ref, face, anchor_q, tol=1e-4, span_tol=1e-3):
     spec = assembly.part_shape(ref)
     if spec[0] == "sphere":
       return True
-    if spec[0] == "cylinder":
+    # A cylinder-LIKE spec also covers a chamfered round peg (compound of one cylinder
+    # body + mesh tip): it still rolls neutrally on its curved side, so the lying-side
+    # placement stays available to the chamfered kinds.
+    axis_spec = _rest_axis_spec(spec)
+    if axis_spec is not None:
       pose = np.asarray(poses[ref], dtype=float)
       R = _quat_to_R(pose[3:])
-      sq = _shape_quat(spec)
+      sq = _shape_quat(axis_spec)
       if sq is not None:
         R = R @ _quat_to_R(sq)
       axis = R[:, 2]                                         # cylinder axis, world frame

@@ -1359,7 +1359,17 @@ class CorridorStepper:
 
   def __init__(self, P, arm_dims, bar_s, acting, cor, dt, joint_rate=DEFAULT_JOINT_RATE,
                ramp_dist=DEFAULT_RAMP_DIST, ramp_min=DEFAULT_RAMP_MIN, dwell=0.0,
-               vmax=None, amax=None, limit_ds=None, rate_clamp=False):
+               vmax=None, amax=None, limit_ds=None, rate_clamp=False, fire_all=True,
+               pace=False, settle_nom=0.0, trace=False):
+    # fire_all=False: FIRE-FLOW gate -- an event fires as soon as its ACTING arms rest at the
+    # barrier, without waiting for laggard arms to arrive. Laggards are still capped at the
+    # pending barrier (no-pass), so they use the settle/servo window to arrive, never to cross.
+    # pace=True: CONSTANT-SPEED ARRIVAL PACING -- the runtime analogue of the offline second
+    # pass (_corridor_spread): instead of sprinting to the pending barrier and stopping at the
+    # no-pass cap, every arm cruises so that it reaches the barrier at the common fire instant
+    # (slowest ACTING arm's best-effort time + ramp + dwell + settle_nom). Recomputed each tick
+    # from CURRENT arcs, so it is feedback pacing, not a precomputed profile -- a guard/slowdown
+    # that delays the pace-setter re-paces everyone automatically.
     self.P = np.asarray(P, float)
     self.segs, self.D = arc_length(list(self.P))
     self.csum = np.concatenate([[0.0], np.cumsum(self.segs)]) if self.segs else np.array([0.0])
@@ -1369,6 +1379,21 @@ class CorridorStepper:
     self.bar_s = list(bar_s)
     self.act = [set(int(a) for a in acting[k]) for k in range(self.K)]
     self.cor, self.dt = cor, float(dt)
+    self.fire_all = bool(fire_all)
+    self.pace = bool(pace)
+    self.settle_nom = float(settle_nom)
+    self._pace_tgt = None                                   # per-arm anchored clocks (s)
+    self._pace_k = -1                                       # barrier the anchor belongs to
+    self._tgt_min = 0.0
+    self._pace_ticks = 0
+    self._est_at = 0
+    self._drift = 0.0                                     # guard/gate hold time on acting arms
+    self._in_preview = False
+    self._pf_sum = np.zeros(self.n)
+    self._pf_n = 0
+    self._why = np.zeros((self.n, 8), dtype=np.int64)       # stop-cause histogram
+    self._why_k = np.zeros((self.K, self.n), dtype=np.int64)  # at-cap ticks per barrier
+    self._trace = [] if trace else None                     # (s, pace_f, rf, fired) per tick
     self.joint_rate, self.ramp_dist, self.ramp_min = joint_rate, ramp_dist, ramp_min
     self.vmax, self.amax, self.limit_ds, self.rate_clamp = vmax, amax, limit_ds, rate_clamp
     self.n_dwell = int(round(dwell / dt)) if dt > 0 else 0
@@ -1441,14 +1466,155 @@ class CorridorStepper:
     om = min(others)
     return min(lim, om + self.cor["Lw"][r][_cor_at(self.cor, om)])
 
-  def tick(self, rate_factor=None):
+  def lock_pair(self, i, j, lo, hi):
+    """RUNTIME CEGAR: zero the corridor lead table for pair (i, j) over the arc window
+    [lo, hi] -- the same local lock the offline refinement used on schedule-VERIFY
+    counterexamples. The per-tick caps then force the pair together through the window, so
+    a desync violation discovered by the oracle becomes a PERMANENT corridor constraint
+    instead of a leaky one-tick hold: the composite reference can never re-enter the region
+    (the diagonal itself is clear there -- measured 191mm -- so forcing the pair together
+    resolves the overlap)."""
+    _A = self.cor["Lp"].get((min(i, j), max(i, j)))
+    if _A is None:
+      return
+    _g = np.asarray(self.cor["grid"], dtype=float)
+    _msk = (_g >= lo) & (_g <= hi)
+    if np.any(_A[_msk] > 1e-9):
+      _A[_msk, :] = 0.0
+
+  def tick(self, rate_factor=None, free_of=None):
     """Advance one dt. `rate_factor`: per-arm multiplier from RUNTIME triggers (1.0 = free;
     1/6 = proximity-paced; 0.0 = guard hold). Returns (q_ref, fire_ready) where fire_ready is
     the barrier index whose event should fire NOW (caller settles/seats/fires, then MUST call
-    confirm_fire()), or None."""
+    confirm_fire()), or None. `free_of`: optional callable fq -> False or a set of arm indices;
+    if the CANDIDATE config of this tick is not free, the offending arms hold for THIS tick
+    only -- a preventive gate, so a violation is never commanded (the old reactive check ran
+    AFTER the drive and responded with 0.25s freezes + permanent corridor locks, which were
+    exactly the standstills and the physics collision)."""
     self.steps += 1
     n, D, dt, eps = self.n, self.D, self.dt, self.eps
     cand = list(self.s)
+    # CONSTANT-SPEED ARRIVAL PACING (--pace): all arms reach the pending barrier at a common
+    # instant, cruising instead of sprinting to the no-pass cap and stopping. The fire instant
+    # is measured by previewing the natural tick rules from the CURRENT positions every 25
+    # ticks (it may shrink as arms advance -- re-planning). Runtime guard/gate holds on the
+    # ACTING arms extend the clock by exactly the held time (`_drift`), so a press that pins
+    # the pace-setter keeps everyone cruising at the planned speed instead of sprinting to the
+    # cap against a stale estimate (the measured 36 s dead stretch). Per-tick feedback corrects
+    # POSITIONS against the clock only -- unanchored re-estimation coupled through the A=0
+    # corridor locks (a slowed partner caps the pace-setter, the consensus slips, everyone
+    # crawls -- measured 10x the makespan) must not come back. The pace-setter runs at full
+    # speed; everyone else scales its arc rate to arrive exactly as the settle window ends.
+    pace_f = None
+    if self.pace and self.fired < self.K:
+      lim = min(self.bar_s[self.fired], D)
+      d = np.maximum(0.0, lim - np.asarray(self.s, dtype=float))
+      base_est = np.asarray(
+          [self.joint_rate / max(
+               self.share[r][_seg_index(self.csum, self.segs, self.s[r])], 1e-9)
+           for r in range(n)], dtype=float)
+      if not self.rate_clamp and self.vmax is not None:
+        # --corridor-rate-clamp caps the actual step at joint_rate anyway, so the boosted
+        # vmax caps only matter when the clamp is OFF; estimate with them then.
+        _vl = np.asarray([float(self.vmax[r][self._lim_at(self.vmax, self.s[r])])
+                          for r in range(n)], dtype=float)
+        _fl = self.ramp_min * self.joint_rate
+        base_est = np.minimum(base_est, np.where(_vl >= _fl, _vl, np.maximum(_vl, 1e-4)))
+      # LOCKED GROUPS: pairs whose corridor lead is ZERO on both sides at the current grid
+      # (the plan's rigid-coupling locks, e.g. two arms carrying the same part) MUST move
+      # together. Pacing them independently lets the lock cap the faster arm to the slower
+      # partner's crawl -- the fire then runs late and everyone parks at the no-pass cap
+      # (measured: at-cap ticks at EVERY barrier). Pace each group as ONE body: its remaining
+      # distance is the members' MAX, its cruise rate the members' MIN.
+      _parent = list(range(n))
+      def _find(x):
+        while _parent[x] != x:
+          _parent[x] = _parent[_parent[x]]
+          x = _parent[x]
+        return x
+      for _i in range(n):
+        for _j in range(_i + 1, n):
+          _A = self.cor["Lp"].get((_i, _j))
+          if _A is None:
+            continue
+          _g = _cor_at(self.cor, min(self.s[_i], self.s[_j]))
+          if _A[_g, 0] <= 1e-9 and _A[_g, 1] <= 1e-9:
+            _parent[_find(_i)] = _find(_j)
+      _groups = {}
+      for _r in range(n):
+        _groups.setdefault(_find(_r), []).append(_r)
+      if self._pace_k != self.fired:
+        self._pace_k = self.fired
+        self._tgt_min = 0.0
+        self._pace_ticks = 0
+        self._est_at = self.steps
+        self._drift = 0.0
+      if rate_factor is not None and any(
+          float(rate_factor[_r]) <= 0.0 and self.s[_r] < lim - 0.01
+          for _r in self.act[self.fired]):
+        # a runtime guard holds an ACTING arm short of the barrier: extend the fire
+        # clock by exactly the held time so everyone keeps cruising instead of
+        # sprinting to the cap against a now-stale estimate.
+        self._drift += dt
+      self._pace_ticks += 1
+      if self._pace_ticks % 25 == 1:
+        # CLOSED-LOOP ANCHOR (replaces the one-shot per-barrier anchor). Run the natural-
+        # profile preview -- tick rules forward with the corridor caps, ramp and dwell --
+        # from the CURRENT positions, every 25 ticks, and keep the MAXIMUM remaining gate
+        # time. The estimate may only GROW, so a guard/lock/servo delay that holds the
+        # pace-setter back extends everyone's clock smoothly, and nobody parks at the
+        # no-pass cap against a stale stretch-start prediction (the standstills the user
+        # kept seeing). The estimate cannot crawl: it is computed from the natural profiles,
+        # which are independent of the pacing factors, so there is no feedback loop.
+        _s_s, _s_vel, _s_hold = list(self.s), list(self.vel), list(self.hold)
+        _s_ready, _s_steps, _s_fired = self.ready, self.steps, self.fired
+        _s_why = self._why.copy()
+        _s_whyk = self._why_k.copy()
+        _s_floor = dict(self.floor_hits)
+        _pacc = self.pace
+        self.pace = False
+        self._in_preview = True
+        self.ready = None
+        _nprev = 0
+        while _nprev < 60000 and self.fired == _s_fired:
+          _nprev += 1
+          _, _fr = self.tick(None)
+          if _fr is not None:
+            break
+        self._in_preview = False
+        self.pace = _pacc
+        (self.s, self.vel, self.hold) = _s_s, _s_vel, _s_hold
+        self.ready, self.steps, self.fired = _s_ready, _s_steps, _s_fired
+        self._why, self._why_k, self.floor_hits = _s_why, _s_whyk, _s_floor
+        _t = max(_nprev * self.dt - self.n_dwell * self.dt, 0.0)
+        if _t > self._tgt_min + 0.05 and self._trace is not None:
+          print(f"[stepper] anchor k={self.fired}: grew to {_t:.3f}s "
+                f"(preview {_nprev} ticks) bar={self.bar_s[self.fired]:.2f}")
+        # may shrink as arms advance (re-plan); guard delays live in _drift
+        self._tgt_min = _t
+        self._est_at = self.steps
+      t_arr = max(self._tgt_min + self._drift - (self.steps - self._est_at) * dt,
+                  self.dt)
+      self._pace_tgt = np.asarray(
+          [t_arr if any(_r in self.act[self.fired] for _r in _groups[_find(_i)])
+           else t_arr + self.n_dwell * self.dt + self.settle_nom
+           for _i in range(n)], dtype=float)
+      pace_f = np.ones(n)
+      for _gid, _mem in _groups.items():
+        if any(_r in self.act[self.fired] for _r in _mem):
+          continue                                    # acting groups: natural profile
+        _dm = float(max(d[_r] for _r in _mem))
+        _tg = self._pace_tgt[_mem[0]]
+        for _r in _mem:
+          if _dm > 1e-9 and _tg > 1e-9:
+            # Divide by the RAMP so the PACED speed d/tgt holds all the way to the barrier
+            # (want = base x f = base_est x ramp x f). f caps at 1, where the arm runs the
+            # natural ramp profile, whose travel time the group anchor already includes.
+            _ramp = self._ramp_of(_r, self.s[_r])
+            pace_f[_r] = float(np.clip(
+                _dm / (_tg * base_est[_r] * _ramp), 0.0, 1.0))
+      self._pf_sum += pace_f
+      self._pf_n += 1
     for r in range(n):
       if self.s[r] >= D - eps or self.steps <= self.hold[r]:
         self.vel[r] = 0.0
@@ -1469,8 +1635,11 @@ class CorridorStepper:
           # into a gentle ramp-down -- the arm kept descending at speed through the whole
           # near-zone and grazed at 65N (measured, first online run). The offline pacing was
           # clean precisely because freezing the reference is INSTANT; match that: a factor
-          # bounds the final rate this very tick, factor 0 = hold now.
+          # bounds the final rate this very tick, factor 0 = hold now. The arrival-pacing
+          # factor (--pace) rides the same channel: min of both caps.
           want = min(want, base * float(rate_factor[r]))
+        if pace_f is not None and pace_f[r] < 1.0:
+          want = min(want, base * float(pace_f[r]))
         self.vel[r] = want
         cand[r] = min(lim, self.s[r] + want * dt)
         if self.rate_clamp and cand[r] > self.s[r] + eps:
@@ -1483,14 +1652,63 @@ class CorridorStepper:
               break
             cand[r] = self.s[r] + (cand[r] - self.s[r]) * max(budget / moved, 0.25)
           self.vel[r] = (cand[r] - self.s[r]) / dt
+    _cand_pre = list(cand)
     for _ in range(2):
       for r in range(n):
         cand[r] = min(cand[r], max(self.s[r], self._cap_corridor(r, cand)))
+    if free_of is not None:
+      # PREVENTIVE COLLISION GATE: judge the candidate config BEFORE it is commanded; the
+      # offending arms hold for this one tick (their stepper state stays consistent with what
+      # is actually driven). The star-shaped certificate is unsound for simultaneous multi-arm
+      # desync, and the old post-drive check let up to 10 ticks of penetration through before
+      # freezing everyone for 0.25s -- the collision and the standstills the user saw.
+      _fq = np.empty(self.P.shape[1])
+      for _r in range(n):
+        _fq[self.arm_dims[_r]] = self._cfg(cand[_r])[self.arm_dims[_r]]
+      _who = free_of(_fq)
+      if _who:
+        for _r in _who:
+          if cand[_r] > self.s[_r]:
+            cand[_r] = self.s[_r]
+            self.vel[_r] = 0.0
+            if self.pace and self.fired < self.K and _r in self.act[self.fired]:
+              self._drift += dt                 # the gate held the pace-setter
+    # STOP-CAUSE HISTOGRAM (diagnostics): why did each arm not advance this tick?
+    # 0 at the pending-barrier cap (no-pass gate), 1 post-fire hold, 2 pace factor < 0.05,
+    # 3 servo rate factor 0 (guard), 4 path end, 5 moved, 6 corridor cap, 7 crawl.
+    for r in range(n):
+      if self.s[r] >= D - eps:
+        self._why[r, 4] += 1
+      elif self.steps <= self.hold[r]:
+        self._why[r, 1] += 1
+      elif self.fired < self.K and self.s[r] >= min(self.bar_s[self.fired], D) - eps:
+        self._why[r, 0] += 1
+        self._why_k[self.fired, r] += 1
+      elif pace_f is not None and pace_f[r] < 0.05:
+        self._why[r, 2] += 1
+      elif rate_factor is not None and rate_factor[r] <= 0.0:
+        self._why[r, 3] += 1
+      elif _cand_pre[r] > self.s[r] + eps and cand[r] <= self.s[r] + eps:
+        self._why[r, 6] += 1
+      elif cand[r] > self.s[r] + eps:
+        self._why[r, 5] += 1
+      else:
+        self._why[r, 7] += 1
+    if self._trace is not None and not self._in_preview:
+      self._trace.append((np.asarray(self.s, dtype=float).copy(),
+                          np.asarray(pace_f, dtype=float).copy()
+                          if pace_f is not None else np.ones(n),
+                          np.asarray(rate_factor, dtype=float).copy()
+                          if rate_factor is not None else np.ones(n),
+                          self.fired))
     self.s = cand
     fire_ready = None
     if self.fired < self.K \
-        and all(self.s[r] >= self.bar_s[self.fired] - eps for r in self.act[self.fired]) \
-        and min(self.s) >= self.bar_s[self.fired] - eps:
+        and all(self.s[r] >= self.bar_s[self.fired] - eps
+                or (rate_factor is not None and rate_factor[r] <= 0.0
+                    and self.s[r] >= self.bar_s[self.fired] - 0.01)
+                for r in self.act[self.fired]) \
+        and (not self.fire_all or min(self.s) >= self.bar_s[self.fired] - eps):
       if self.ready is None:
         self.ready = self.steps
       if self.steps - self.ready >= self.n_dwell:

@@ -381,8 +381,13 @@ def _arm_shape_frames(C, robots, visual=True):
           # ATTACHED part (a held cube hangs 35mm from the tip, inside the wrist capsule).
           out.append((n, n, (k, sz), True, info.get("contact") == -2, GROUP_COLL, tint))
         else:
-          # gripper primitives (vacuum tip, gripper_fill): visual-only, never collide.
-          out.append((n, n, (k, sz), False, False, GROUP_VISUAL, tint))
+          # gripper primitives (palm, fingers, vacuum tip, gripper_fill): these DO collide in
+          # rai (the oracle sees them as colliding pairs), so the executed model must collide
+          # them too -- visual-only made the rendered gripper pass through parts with no
+          # physics response (user-caught: palm 28mm into a leg). NOT exempt: the palm keeps
+          # >5mm clearance from its own held part (measured), and net_contact_force already
+          # excludes weld partners, so hold contacts cannot pollute the guard.
+          out.append((n, n, (k, sz), True, False, GROUP_VISUAL, tint))
   return out
 
 
@@ -433,6 +438,9 @@ def scale_arm_collision_shapes(C, robots, factor, verbose=True):
 
 
 GRAVITY = 9.81
+ARM_ARM_CONTACTS = False   # --arm-arm-contacts: contype 1 on actuated arm geoms (real
+                           # arm-arm physics). Default contype 2 masks arm-arm contacts because
+                           # mocap chains interpenetrating at handovers produce phantom forces.
 ARTICULATED_LINK_MASS = 50.0     # kg: --articulated links are driven kinematically, so this is
 ARTICULATED_LINK_INERTIA = 5.0   # not a real inertia -- it only has to dominate a held part
                                  # (~0.5kg) so the weld reaction cannot move the arm.
@@ -771,7 +779,7 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
     _arm_meshes = any(e[2][0] == "mesh" for e in arms)
     body_xml, articulated_joints = arm_model.build_arms_mjcf(
         articulated_C, robots, collide_fn=arm_model.collides_like_sim,
-        group=GROUP_COLL, contype="2", conaffinity="1",
+        group=GROUP_COLL, contype=("1" if ARM_ARM_CONTACTS else "2"), conaffinity="1",
         meshes=_arm_meshes, assets=_arm_assets, mesh_group=GROUP_VISUAL,
         # links must SWAMP the payload: the chain is integrated by mj_step even though we
         # drive it kinematically, so a light link welded to a part lets the solver throw it.
@@ -906,6 +914,7 @@ class SimScene:
     self._rai_joints = []
     self._ctrl_i = self._ctrl_j = self._vadr_i = self._qadr_i = self._qadr_j = \
         np.zeros(0, dtype=int)
+    self._rai_hinge = np.zeros(0, dtype=bool)
     self._ctrl_ff = np.zeros(0, dtype=float)
     if self.articulated:
       for jn in articulated_C.getJointNames():
@@ -914,6 +923,11 @@ class SimScene:
           self._qadr[jn] = int(self.model.jnt_qposadr[jid])
           self._vadr[jn] = int(self.model.jnt_dofadr[jid])
       self._rai_joints = list(articulated_C.getJointNames())
+      self._rai_hinge = np.zeros(len(self._rai_joints), dtype=bool)
+      for _i, _jn in enumerate(self._rai_joints):
+        _jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, _jn)
+        if _jid >= 0 and self.model.jnt_type[_jid] == mujoco.mjtJoint.mjJNT_HINGE:
+          self._rai_hinge[_i] = True
       self._ctrl_adr = {}
       for jn in self._rai_joints:
         aid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, jn)
@@ -941,6 +955,7 @@ class SimScene:
            if _jn in self._qadr]
     self._qadr_i = np.asarray([a for a, _ in _qi], dtype=int)
     self._qadr_j = np.asarray([j for _, j in _qi], dtype=int)
+    self._hinge_i = self._rai_hinge[[_j for _, _j in _qi]]
     self.gripper_kinds = gripper_kinds or {}
     self.active_grasps = {}                                # robot -> (eq_id, part, fcap, tcap)
     self._hold_info = {}                                   # robot -> grasp-frame info (directional caps)
@@ -1060,14 +1075,36 @@ class SimScene:
       self.model.geom_contype[gid] = 0
       self.model.geom_conaffinity[gid] = 0
 
-  def tracking_error(self, q):
+  def tracking_error(self, q, robots=None):
     """max |q_actual - q_commanded| over the arm dofs, rad. With actuators the trajectory is a
     REFERENCE, so this is the number that decides whether a mate still lands on its witness --
-    SEAT_POS_TOL is 10mm, so even ~0.01 rad at a 1m lever is already marginal."""
+    SEAT_POS_TOL is 10mm, so even ~0.01 rad at a 1m lever is already marginal. Hinge joints
+    are wrapped into (-pi, pi]: q and q+2pi are the SAME pose, so a plant resting at the +
+    side of a +-pi joint while the command says - is CONVERGED, not 6.28 rad off (measured:
+    every settle ran its full budget because exactly this wrap defeated the test).
+
+    `robots`: optional iterable of robot names -- measure ONLY their dofs. Fire-flow settle
+    needs this: arms that are deliberately still MOVING through the corridor carry their own
+    tracking residual, which must not count against the acting arms' arrival test."""
     q = np.asarray(q, dtype=float)
     if self._qadr_i.size == 0:
       return 0.0
-    return float(np.abs(self.data.qpos[self._qadr_i] - q[self._qadr_j]).max())
+    if robots is None:
+      d = self.data.qpos[self._qadr_i] - q[self._qadr_j]
+      d = np.where(self._hinge_i, (d + np.pi) % (2.0 * np.pi) - np.pi, d)
+      return float(np.abs(d).max())
+    mask_i, mask_j, mask_h = [], [], []
+    for i, jn in enumerate(self._rai_joints):
+      if jn.split("_", 1)[0] in robots:
+        mask_i.append(self._qadr[jn])                      # QPOS address -- _vadr is the DOF
+        mask_j.append(i)                                   # space (qvel) and indexes qpos
+        mask_h.append(bool(self._rai_hinge[i]))            # wrongly once free joints precede
+    if not mask_i:
+      return 0.0
+    d = self.data.qpos[mask_i] - q[mask_j]
+    d = np.where(np.asarray(mask_h, dtype=bool),
+                 (d + np.pi) % (2.0 * np.pi) - np.pi, d)
+    return float(np.abs(d).max())
 
   def command_arm_q(self, q, qdot=None):
     """ACTUATED: hand the joint targets to the position servos and let MuJoCo track them.
@@ -1914,16 +1951,21 @@ class _SkillServo:
                   self.scene._body_id(self.scene.grasp_anchor[robot]))
     return jacp[:, self.dofs[robot]]
 
-  def update(self):
+  def update(self, only=None):
     """Once per control tick, BEFORE building the adjusted reference: read each held part's
     net contact force (last step's state -- one tick late is immaterial at 5ms) and integrate
-    the per-arm yield offsets."""
+    the per-arm yield offsets. `only`: optional iterable of robot names to update -- the
+    fire-flow window uses it to keep integrating ONLY the flowing arms, so a window spent at
+    a contact barrier cannot silently integrate yield offsets on the arms pinned there."""
     self._hot = 0.0
-    self._hot_by = {}
+    if only is None:
+      self._hot_by = {}
     if self.compliant:
-      self._update_compliant()
+      self._update_compliant(only)
       return
     for r, g in self.scene.active_grasps.items():
+      if only is not None and r not in only:
+        continue
       part = g[1]
       F = self.scene.net_contact_force(part)
       mag = float(np.sqrt(F @ F))
@@ -1934,7 +1976,7 @@ class _SkillServo:
         _, tmag = self.scene._weld_wrench(g[0])
         tfrac = tmag / max(self.torque_guard * float(g[3]), 1e-9)
         if tfrac > 1.0:
-          hot = max(hot, self.f0 + 1e-3)                   # engages guard + funnel like a press
+          hot = max(hot, 4.0 * self.f0 + 1e-3)          # engages guard + funnel like a press
           # drive the yield by the NORMALISED torque excess (mapped through f0 so the gain
           # keeps its m/(N*s) meaning); direction stays the net contact push -- at a lever
           # press, backing off along the push shortens the drag the same way.
@@ -1957,12 +1999,14 @@ class _SkillServo:
         o = o * (1.0 - self.decay)
       self.off[r] = o
 
-  def _update_compliant(self):
+  def _update_compliant(self, only=None):
     """--compliant-follow: ONE admittance loop over EVERY arm, driven by the whole-branch
     contact force -- a press on a bare gripper (pick approach, pre-weld) or an arm link
     yields exactly like a cargo press. Yield deadband c_f0 < f0, so the reference deviates
     before the guard/funnel (which keep reading the same magnitudes via _hot) engage."""
     for r in self.dofs:
+      if only is not None and r not in only:
+        continue
       g = self.scene.active_grasps.get(r)
       F = self.scene.branch_contact_force(r)
       mag = float(np.sqrt(F @ F))
@@ -1973,7 +2017,7 @@ class _SkillServo:
         _, tmag = self.scene._weld_wrench(g[0])
         tfrac = tmag / max(self.torque_guard * float(g[3]), 1e-9)
         if tfrac > 1.0:
-          hot = max(hot, self.f0 + 1e-3)
+          hot = max(hot, 4.0 * self.f0 + 1e-3)
           excess = max(excess, (tfrac - 1.0) * self.f0)
           self.torque_holds += 1
       self._hot_by[r] = hot
@@ -2125,7 +2169,13 @@ class _SkillServo:
     if not hasattr(self, "_c_prev"):
       self._c_prev = {}
     for i, rn in enumerate(robot_names):
-      if getattr(self, "_hot_by", {}).get(rn, 0.0) > self.f0:
+      if getattr(self, "_hot_by", {}).get(rn, 0.0) > 4.0 * self.f0:
+        # HARD FREEZE ONLY AT THE BULLDOZE SCALE (same 4xf0 the seat/place ceremonies
+        # use). A planned contact (the co-hold carry, the pre-weld touch) reads a few
+        # newtons and must NOT stop the stepper -- freezing at 1xf0 deadlocked an
+        # 0.5 rad carry for 38 s when the carried leg touched the co-held seat
+        # (measured, stretch k=20). The yield offsets still engage at f0, so the
+        # reference yields softly; only a breakage-scale shove freezes the arm.
         f[i] = 0.0
         continue
       c = self._cargo_clearance(rn)
@@ -2281,6 +2331,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         corridor_lead_max=4.0, corridor_verify=0, corridor_refine=0,
                         corridor_cross_only=False, corridor_online=False,
                         rate_clamp=False, settle_tol=0.0, settle_max=1.0, couple_handovers=False,
+                        pace=False, dwell=DWELL_T, pace_trace=None,
                         directional_caps=False, mate_caps=None,
                         verify_efc_cache=False, force_limits=False, wrench_margin=1.0, mass_scale=1.0, inertia_factor=1.0,
                         corner_limits=True,
@@ -2315,6 +2366,17 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
   import robotic as ry
 
   robots = list(problem.robots)
+  import os as _osd
+  if _osd.environ.get("SIM_DEBUG_CONTACTS"):
+    for _n in ("a2_ur_palm", "a3_ur_finger2", "a2_ur_vacuum", "a2_gripper_fill",
+               "a2_coll1", "a2_coll7"):
+      for _tag, _cfg in (("C", C), ("problem.C", getattr(problem, "C", None))):
+        if _cfg is None:
+          continue
+        _i = _cfg.getFrame(_n).info()
+        print(f"[sim/debug] {_tag} {_n}: shape={_i.get('shape')} "
+              f"contact={_i.get('contact')} size={_i.get('size')}")
+    raise SystemExit(0)
   # FK config: a private copy so the caller's C is untouched.
   C_fk = ry.Config()
   C_fk.addConfigurationCopy(C)
@@ -2369,7 +2431,9 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           f"(arm_model), driven by SETTING qpos -- not {len(arms)} teleported mocap bodies. "
           f"Still perfectly stiff; run fk_compare.py to re-check the model.")
 
-  def settle_before_fire(q, touch_robots=()):
+  _hook_log = {"settle": [], "seat": []}                    # fire-window durations (sim s)
+
+  def settle_before_fire(q, touch_robots=(), flow=None, owned=None):
     """ACTUATED: hold the reference until the arm has actually ARRIVED, then fire.
 
     The schedule's dwell is a fixed DWELL_T, but a servo needs as long as it needs: measured on
@@ -2379,11 +2443,20 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     mate inherits it (measured pick-to-pick drift 0.05 -> 5 -> 40 -> 56mm before the damping
     fix). Waiting on the MEASURED error costs only the time actually needed, unlike raising
     DWELL_T for every transition whether it needs it or not. The stiff modes never need this
-    (their error is 0 by construction), so it is actuated-only."""
+    (their error is 0 by construction), so it is actuated-only.
+
+    `flow`: FIRE-FLOW (--corridor-online) callback. When given, each iteration calls it with
+    the held barrier config; it advances every NON-acting arm through its certified corridor,
+    drives the mixed config, steps the scene and returns the mixed q -- the tracking test
+    below then judges exactly what was commanded. `owned`: robot names the arrival test is
+    limited to under fire-flow (the acting arms); None = every arm (offline semantics)."""
     if not (actuated and settle_tol > 0.0):
       return
+    its = 0
+    _err0 = scene.tracking_error(q, owned)
+    _touch = False
     for _ in range(int(settle_max / DT)):
-      if scene.tracking_error(q) <= settle_tol:
+      if scene.tracking_error(q, owned) <= settle_tol:
         break
       if touch_robots and any(
           float(np.linalg.norm(scene.branch_contact_force(r))) > 1.0 for r in touch_robots):
@@ -2391,32 +2464,67 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         # IS the authored grasp interference (~1mm into the part) -- settling it closed is
         # what drove the 48-52N press the fresh weld then inherited and broke under. Fire
         # at touch instead; pick_lift owns the rest of the window.
+        _touch = True
         break
-      drive_q(q)                                             # qdot=0: hold, do not lead
-      scene.step(1, report, ("settle",))
+      if flow is not None:
+        q = flow(q)                                            # mixed: acting hold, others flow
+      else:
+        drive_q(q)                                             # qdot=0: hold, do not lead
+        scene.step(1, report, ("settle",))
+      its += 1
+    _errs = {}
+    for _r in (owned if owned is not None else robots):
+      _errs[_r] = scene.tracking_error(q, [_r])
+    _jerrs = []
+    for _i, _jn in enumerate(scene._rai_joints):
+      if _jn not in scene._qadr:
+        continue
+      _r = _jn.split("_", 1)[0]
+      if (owned is not None and _r not in owned) or (owned is None and _r not in robots):
+        continue
+      _d = float(scene.data.qpos[scene._qadr[_jn]] - q[_i])
+      if scene._rai_hinge[_i]:
+        _d = (_d + np.pi) % (2.0 * np.pi) - np.pi
+      _jerrs.append((_jn, _d))
+    _hook_log["settle"].append(
+        (its * DT, _err0, scene.tracking_error(q, owned), _touch, _errs,
+         list(owned) if owned is not None else None, _jerrs))
 
-  def seat_before_fire(tid, q_ref):
+  def seat_before_fire(tid, q_ref, flow_drive=None, flow_tick=None):
     """--skill-servo: contract the seat error toward the mate datum BEFORE the weld fires,
-    so attach()'s ideal-datum snap starts from millimetres instead of the tracking residual."""
+    so attach()'s ideal-datum snap starts from millimetres instead of the tracking residual.
+
+    `flow_drive`/`flow_tick`: FIRE-FLOW (--corridor-online) drive/tick pair -- `flow_drive`
+    mixes the servoed q_ref with the advancing non-acting arms' corridor configs before
+    driving; `flow_tick` steps the scene. Non-acting arms keep flowing while the seat
+    converges."""
     if servo is None:
       return
     t = problem.tasks[tid]
     fr = getattr(t, "frames", None)
     if not fr:
       return
+    _cnt = [0]
+    _base_tick = flow_tick if flow_tick is not None else \
+        (lambda: scene.step(1, report, ("servo",)))
+    def _tck():
+      _cnt[0] += 1
+      _base_tick()
+    _drv = flow_drive if flow_drive is not None else drive_q
     if fr[0] == "table" and len(fr) > 1 and fr[1] in assembly.objects and servo.place_ok:
       # --servo-place-seat: a PLACE fires by CONTACT, not by coordinate (see place_seat).
       _l = name_of.get(t.name)
       if _l is not None:
         exp = _state_part_poses(states[min(_l[0] + 1, len(states) - 1)], assembly,
                                 lift=CARRY_LIFT)[fr[1]]
-        servo.place_seat(q_ref, fr[1], np.asarray(exp, dtype=float), t.name, drive_q,
-                         lambda: scene.step(1, report, ("servo",)), settle_max)
+        servo.place_seat(q_ref, fr[1], np.asarray(exp, dtype=float), t.name, _drv, _tck,
+                         settle_max)
+        _hook_log["seat"].append(_cnt[0] * DT)
       return
     if fr[0] not in assembly.objects:
       return                                               # grasps/releases: no datum to seat
-    servo.seat(q_ref, fr[0], fr[1], t.name, drive_q,
-               lambda: scene.step(1, report, ("servo",)), settle_max)
+    servo.seat(q_ref, fr[0], fr[1], t.name, _drv, _tck, settle_max)
+    _hook_log["seat"].append(_cnt[0] * DT)
 
   def _touch_robots(tids):
     """--servo-pick: the arms whose fire at this barrier is a PICK -- their settle must
@@ -2442,10 +2550,11 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       return None
     return fr[1]
 
-  def lift_after_fire(tid, q_ref):
+  def lift_after_fire(tid, q_ref, flow_drive=None, flow_tick=None):
     """--servo-pick: own the fresh-weld window AFTER a pick fires -- rise until the new
     cargo is contact-free instead of tracking through the pressing grasp keyframe (see
-    _SkillServo.pick_lift). Handovers/places keep their own terminals."""
+    _SkillServo.pick_lift). Handovers/places keep their own terminals. `flow_drive`/
+    `flow_tick`: FIRE-FLOW pair, as in seat_before_fire."""
     if servo is None or not servo.pick_ok:
       return
     part = _pick_task(tid)
@@ -2454,8 +2563,9 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     holder = next((r for r, g in scene.active_grasps.items() if g[1] == part), None)
     if holder is None:
       return
-    servo.pick_lift(q_ref, holder, part, problem.tasks[tid].name, drive_q,
-                    lambda: scene.step(1, report, ("servo",)), settle_max)
+    _drv = flow_drive if flow_drive is not None else drive_q
+    _tck = flow_tick if flow_tick is not None else (lambda: scene.step(1, report, ("servo",)))
+    servo.pick_lift(q_ref, holder, part, problem.tasks[tid].name, _drv, _tck, settle_max)
 
   def servo_summary():
     # called from EVERY executor tail -- the corridor branch returns early, and the first
@@ -2472,6 +2582,30 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             f"(no held-part contact above {servo.f0:g}N).")
     for nm, e0, e1 in servo.seat_log:
       print(f"[sim/mp] --skill-servo seat {nm}: {e0*1000:.1f}mm -> {e1*1000:.1f}mm")
+    if _hook_log.get("settle"):
+      _n = len(_hook_log["settle"])
+      _ms = [s[0] for s in _hook_log["settle"]]
+      _e0 = [s[1] for s in _hook_log["settle"]]
+      _e1 = [s[2] for s in _hook_log["settle"]]
+      _nt = sum(1 for s in _hook_log["settle"] if s[3])
+      print(f"[sim/mp] settle windows: {_n} fired ({_nt} touch-broken), total "
+            f"{sum(_ms)*1000:.0f}ms sim, max {max(_ms)*1000:.0f}ms; "
+            f"err {max(_e0)*1000:.1f} -> {max(_e1)*1000:.1f} mrad")
+      _rmax = {}
+      for s in _hook_log["settle"]:
+        for r, v in s[4].items():
+          _rmax[r] = max(_rmax.get(r, 0.0), v)
+      print("[sim/mp] settle err by robot (max over windows, mrad): "
+            + ", ".join(f"{r} {v*1000:.1f}" for r, v in sorted(_rmax.items())))
+      print(f"[sim/mp] last settle owned: {_hook_log['settle'][-1][5]}")
+      _worst = max(_hook_log["settle"], key=lambda s: s[2])
+      _jtop = sorted(_worst[6], key=lambda jv: abs(jv[1]), reverse=True)[:10]
+      print("[sim/mp] worst-window joints (mrad): "
+            + ", ".join(f"{jn} {d*1000:+.1f}" for jn, d in _jtop))
+    if _hook_log.get("seat"):
+      print(f"[sim/mp] seat-servo windows: {len(_hook_log['seat'])} fired, total "
+            f"{sum(_hook_log['seat'])*1000:.0f}ms sim, "
+            f"max {max(_hook_log['seat'])*1000:.0f}ms")
     for nm, e0, fN, ok in servo.place_log:
       print(f"[sim/mp] --servo-place-seat {nm}: xy_err {e0*1000:.1f}mm, "
             f"end |F| {fN:.1f}N, {'TOUCHED' if ok else 'no touch (guard/budget)'}")
@@ -3051,6 +3185,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       _stretch_plan = [next((name_of[problem.tasks[int(t)].name][0] for t in stretches[k][1]
                              if problem.tasks[int(t)].name in name_of), None)
                        for k in range(len(stretches))]
+      _stretch_direct = [st is not None for st in _stretch_plan]
       _last = 0
       for k in range(len(_stretch_plan)):                     # a goto-only stretch inherits
         if _stretch_plan[k] is None:
@@ -3063,7 +3198,16 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         if st_idx is None:
           continue
         a0 = _bar[k - 1] if k else 0.0
-        for state in (states[st_idx], states[min(st_idx + 1, len(states) - 1)]):
+        # The WORLD STATE during a stretch is the state ENTERING its own action for a DIRECT
+        # stretch (the action's events fire at its END), and the previous action's POST state
+        # for an INHERITED goto stretch. Scanning BOTH states for every stretch locked the
+        # pair over the pre-assemble goto too, where the arms still hold SEPARATE parts --
+        # measured: a2 (leg in hand) forced to move with a3 (seat in hand) through the whole
+        # approach. A merge only exists in the post state, so it may only lock the stretches
+        # AFTER the action, never the approach before it.
+        _states = ([states[st_idx]] if _stretch_direct[k]
+                   else [states[min(st_idx + 1, len(states) - 1)]])
+        for state in _states:
           for grp in state.subassemblies():
             hold = sorted({robot_index[c[1]] for p in grp
                            for c in state.supports.get(p, ()) if c[0] == "grasp"
@@ -3098,6 +3242,9 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           spans[(i, j)] = spans.get((i, j), 0.0) + (b - a)
         print(f"[sim/mp] rigid couplings from the plan (same group held by 2 arms): " +
               ", ".join(f"arm{i}-arm{j} over {v:.0f} rad" for (i, j), v in sorted(spans.items())))
+        _ls = sorted({(i, j, round(a, 2), round(b, 2)) for i, j, a, b in _locked})
+        print(f"[sim/mp] rigid-coupling lock spans ({len(_ls)}): " +
+              ", ".join(f"arm{i}-arm{j}[{a},{b}]" for i, j, a, b in _ls))
       _vmax = _amax = None
       if force_limits:
         # ---- WRENCH-LIMITED MOTION -------------------------------------------------------
@@ -3439,10 +3586,15 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         print(retiming.corridor_width_report(cor))
         online_stepper = retiming.CorridorStepper(
             _P, arm_dims, _bar, acting, cor, DT, joint_rate=JOINT_RATE,
-            ramp_dist=RAMP_DIST, ramp_min=RAMP_MIN, dwell=DWELL_T,
+            ramp_dist=RAMP_DIST, ramp_min=RAMP_MIN, dwell=dwell,
             vmax=_vmax, amax=_amax, limit_ds=(_dsf if force_limits else None),
-            rate_clamp=rate_clamp)
+            rate_clamp=rate_clamp, fire_all=False,
+            pace=pace, settle_nom=settle_max, trace=(pace_trace is not None))
         online_fire_tids = [list(stretches[k][1]) for k in range(len(stretches))]
+        if pace:
+          print(f"[sim/mp] --pace ACTIVE: constant-speed arrival pacing -- every arm cruises "
+                f"to the pending barrier and reaches it at the common fire instant "
+                f"(slowest acting arm + dwell + {settle_max:g}s settle estimate).")
       for _pass in range(0 if corridor_online else max(0, corridor_refine) + 1):
         print(f"[sim/mp] --corridor STAGE A: certifying the desync envelope "
               f"(D={_D:.0f} rad, {len(robots)} arms, ds={_ds:g}"
@@ -3507,6 +3659,14 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           _ds *= 0.5                                         # world violations: finer grid
           print(f"[sim/mp] REFINING: no lockable arm pair; ds -> {_ds:g} "
                 f"(pass {_pass + 2}/{corridor_refine + 1})")
+      # (Continuous-motion PACING lived here and is REMOVED, measured: to pass the dense
+      # gate the paced phasing needed 2381 local pair locks -- i.e. the star-shaped
+      # certificate forced it back into near-lockstep, with stops WORSE than the greedy
+      # schedule (32-37% vs 11-13%), a 543s execution and a 607mm seat miss (19/22).
+      # Continuous cruise with desync needs a certificate over the paced desync set, not
+      # star probes -- a separate piece of work. The greedy schedule below is dense-clean
+      # (0/43548) and validated 21/21; its remaining stops are the ceremonies and the
+      # genuine syncs, i.e. task physics, not scheduling waste.)
       if traj is None and not corridor_online:
         raise RuntimeError("[sim/mp] corridor scheduling produced no trajectory")
       if traj is not None:
@@ -3591,7 +3751,17 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     # violation, LEADERS freeze and the laggard advances -- collapsing toward the diagonal,
     # which is the planner's own certified path, until the check clears. Certificate for
     # speed, sparse exact checks for soundness, diagonal for recovery.
-    _VCHK, _collapse_until, _n_viol, _n_lock = 10, 0, 0, 0
+    _VCHK = 3                                              # preventive-gate cadence
+    _settle_ema = None                                      # measured fire-ceremony duration
+    _n_gate = 0                                            # ticks the gate held an arm
+    def _safe(fq):
+      nonlocal _n_gate
+      if _n_tick % _VCHK:
+        return False
+      _who = collide(fq, online_stepper.fired)
+      if _who:
+        _n_gate += 1
+      return _who or False
     while not online_stepper.done():
       _n_tick += 1
       if _n_tick > _cap_steps:
@@ -3601,68 +3771,117 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       if servo is not None:
         servo.update()
         rf = servo.rate_factors(robots)
-      if _n_tick < _collapse_until:
-        _smin = min(online_stepper.s)
-        rf = [0.0 if online_stepper.s[_r] > _smin + 0.25
-              else (1.0 if rf is None else float(rf[_r])) for _r in range(len(robots))]
       if rf is not None:
         _paced += (np.asarray(rf) < 1.0)
         _held += (np.asarray(rf) <= 0.0)
-      qc0, fire_k = online_stepper.tick(rf)
-      if _n_tick % _VCHK == 0:
-        # THE SAME ORACLE AS OFFLINE VERIFY: `collide` judges against the CALIBRATED,
-        # mode-local per-pair allowances ("never closer than the certified path itself came
-        # in this mode") with the _legit_pair exemptions. Raw pair penetrations flagged
-        # legitimate formations -- handover arms 9.9mm "deep" exactly where the certified
-        # path puts them -- and over-locked without fixing anything (measured, v7).
-        _who = collide(qc0, online_stepper.fired)
-        _badp = set()
-        if _who:
-          _real = [(pr, dp) for pr, dp in getattr(collide, "last_pairs", [])
-                   if not _legit_pair(pr, online_stepper.fired)]
-          for _pr, _dp in _real:
-            _ai, _bj = _arm_of(_pr[0]), _arm_of(_pr[1])
-            if _ai is not None and _bj is not None and _ai != _bj:
-              _badp.add((min(_ai, _bj), max(_ai, _bj)))
-          _vpens = {pr: dp for pr, dp in _real}
-          _who = bool(_real)
-        if _who or _badp:
-          _n_viol += 1
-          _collapse_until = _n_tick + int(0.25 / DT)       # transient: separate NOW
-          # RUNTIME CEGAR: make the discovery PERMANENT, exactly like offline refinement --
-          # a transient collapse alone re-approached the same conflict every few hundred
-          # ticks (measured: 349 detected violations, same 85N failure). Zeroing the pair's
-          # corridor around the violation forces them through this region together for the
-          # REST of the run; the laggard-never-capped rule keeps progress guaranteed.
-          for (_i, _j) in _badp:
-            _A = online_stepper.cor["Lp"].get((_i, _j))
-            if _A is None:
-              continue
-            _g = online_stepper.cor["grid"]
-            _lo = min(online_stepper.s[_i], online_stepper.s[_j]) - 2.0
-            _hi = max(online_stepper.s[_i], online_stepper.s[_j]) + 2.0
-            _msk = (_g >= _lo) & (_g <= _hi)
-            if np.any(_A[_msk] > 1e-9):
-              _A[_msk, :] = 0.0
-              _n_lock += 1
-              print(f"[sim/mp] online-CEGAR: locked arm{_i}-arm{_j} over "
-                    f"[{max(_lo,0):.1f}, {_hi:.1f}] rad after a live violation "
-                    f"({', '.join(f'{a}~{b} {d*1000:.1f}mm' for (a,b),d in _vpens.items() if d>1e-4)})")
+      qc0, fire_k = online_stepper.tick(rf, free_of=_safe)
       qc = servo.adjust(qc0) if servo is not None else qc0
       drive_q(qc)
       scene.step(1, report, ("path",))
       if fire_k is not None:
-        settle_before_fire(qc0, _touch_robots(online_fire_tids[fire_k]))
+        # FIRE-FLOW: the online gate (fire_all=False) fires as soon as the ACTING arms rest
+        # at the barrier; laggard arms use the settle/servo window to keep advancing through
+        # their certified corridor (they were capped at the pending barrier pre-fire, so they
+        # ARRIVE -- never cross -- during the window). `acting_for` pins the acting arms plus
+        # every holder of a touched part; everyone else flows, with the micro-verify still
+        # policing the desync every _VCHK ticks and freezing any violating arm for the rest
+        # of this window.
+        _act = acting_for(online_fire_tids[fire_k])
+        print(f"[sim/mp] fire {fire_k}: tids {online_fire_tids[fire_k]} -> act {sorted(_act)}")
+        _freeze = set()
+        def _fire_factors():
+          if servo is None:
+            rf_f = np.ones(len(robots))
+            for _r in _act:
+              rf_f[_r] = 0.0
+            for _r in _freeze:
+              rf_f[_r] = 0.0
+            return rf_f
+          _fl = [r for r in range(len(robots)) if r not in _act]
+          servo.update(only=[robots[r] for r in _fl])
+          rf_f = servo.rate_factors(robots)
+          for _r in _act:
+            rf_f[_r] = 0.0
+          for _r in _freeze:
+            rf_f[_r] = 0.0
+          return rf_f
+        _fw_ticks = [0]
+        def _fire_mix(q_ref):
+          nonlocal _n_tick
+          _n_tick += 1
+          _qflow = online_stepper.tick(_fire_factors())[0]
+          _qm = np.asarray(q_ref, dtype=float).copy()
+          for _r in range(len(robots)):
+            if _r not in _act:
+              _qm[arm_dims[_r]] = _qflow[arm_dims[_r]]
+          return _qm
+        def _fire_verify(q_m):
+          _fw_ticks[0] += 1
+          if _fw_ticks[0] % _VCHK:
+            return
+          _who = collide(q_m, online_stepper.fired)
+          _bad = (set(_who) if _who else set()) - _act
+          if _bad:
+            _freeze.update(_bad)
+            print(f"[sim/mp] fire-flow: froze arm(s) {sorted(_bad)} for this fire "
+                  f"after a desync violation")
+        def _flow_settle(q_ref):
+          _qm = _fire_mix(q_ref)
+          _fire_verify(_qm)
+          drive_q(_qm)
+          scene.step(1, report, ("settle",))
+          return _qm
+        def _flow_drive(q_ref):
+          _qm = _fire_mix(q_ref)
+          _fire_verify(_qm)
+          drive_q(_qm)
+          return _qm
+        _flow_tick = lambda: scene.step(1, report, ("servo",))
+        _fw0 = online_stepper.steps
+        settle_before_fire(qc0, _touch_robots(online_fire_tids[fire_k]), flow=_flow_settle,
+                           owned=[robots[r] for r in _act])
         for tid in online_fire_tids[fire_k]:
-          seat_before_fire(tid, qc0)
+          seat_before_fire(tid, qc0, flow_drive=_flow_drive, flow_tick=_flow_tick)
           fire(tid)
-          lift_after_fire(tid, qc0)
+          lift_after_fire(tid, qc0, flow_drive=_flow_drive, flow_tick=_flow_tick)
         online_stepper.confirm_fire()
+        # The gate-to-confirm ceremony (dwell + settle + plant convergence) is what non-acting
+        # arms wait out at the no-pass cap, and its true duration is what settle_nom must
+        # predict for the NEXT anchor -- a fixed --settle-max was systematically short (the
+        # plant must physically converge after stopping; measured cap parking ~0.4-0.5s at
+        # the very first pick). Learn it: EMA over the measured windows.
+        _w = (online_stepper.steps - _fw0) * DT
+        _settle_ema = _w if _settle_ema is None else 0.7 * _settle_ema + 0.3 * _w
+        online_stepper.settle_nom = _settle_ema
+        print(f"[sim/mp] fire {online_stepper.fired - 1}: ceremony {_w*1000:.0f}ms, "
+              f"ema {_settle_ema*1000:.0f}ms")
     print(f"[sim/mp] --corridor-online: {_n_tick} ticks executed "
           f"({online_stepper.fired}/{online_stepper.K} events), no precomputed schedule; "
           f"paced ticks per arm {[int(x) for x in _paced]}, held {[int(x) for x in _held]}; "
-          f"micro-verify: {_n_tick // max(_VCHK, 1)} checks, {_n_viol} violation(s), "
-          f"{_n_lock} runtime lock(s)")
+          f"preventive gate: {_n_tick // max(_VCHK, 1)} checks, {_n_gate} hold(s)")
+    if pace:
+      print("[sim/mp] pace factors mean per arm: "
+            + ", ".join(f"{r} {v:.3f}" for r, v in zip(
+                robots, online_stepper._pf_sum / max(online_stepper._pf_n, 1))))
+      _lbl = ["at-cap", "hold", "pace<.05", "rf=0", "at-end", "moving", "corr-cap", "crawl"]
+      print("[sim/mp] stop causes per arm (ticks):")
+      for _i, _r in enumerate(robots):
+        print(f"  {_r}: " + ", ".join(f"{_lbl[_j]} {int(online_stepper._why[_i, _j])}"
+                                      for _j in range(8)))
+      _wk = online_stepper._why_k.sum(axis=1)
+      _hot = [k for k in range(online_stepper.K) if _wk[k] > 500]
+      if _hot:
+        print("[sim/mp] at-cap waits by barrier (ticks): "
+              + ", ".join(f"k{k} {int(_wk[k])}" for k in _hot))
+      if online_stepper._trace is not None and pace_trace:
+        _tr = online_stepper._trace
+        np.savez(pace_trace,
+                 s=np.asarray([t[0] for t in _tr]),
+                 pf=np.asarray([t[1] for t in _tr]),
+                 rf=np.asarray([t[2] for t in _tr]),
+                 fired=np.asarray([t[3] for t in _tr]),
+                 bar=np.asarray(online_stepper.bar_s))
+        print(f"[sim/mp] pace trace saved: {pace_trace} ({len(_tr)} ticks)")
   else:
     # ------------- THE OFFLINE EXECUTION LOOP (precomputed trajectory modes) -------------
     # Preprocessing (corridor schedule | lockstep trapezoid) yields `traj` + `fire_at`;
@@ -3975,7 +4194,12 @@ def _states_from_plan(cfg, C, asm, robots, plan):
 
 
 def _cli_run(a):
-  global JOINT_RATE
+  global JOINT_RATE, ARM_ARM_CONTACTS
+  ARM_ARM_CONTACTS = bool(getattr(a, "arm_arm_contacts", False))
+  if ARM_ARM_CONTACTS:
+    print("[sim] --arm-arm-contacts: ACTUATED arm geoms get contype 1 -- real "
+          "arm-arm collision physics. The certified handover formations overlap, so "
+          "expect pushes where the path passes grippers through each other.")
   if getattr(a, "joint_rate", None):
     JOINT_RATE = float(a.joint_rate)                          # per-arm cruise speed override
     print(f"[sim] --joint-rate {JOINT_RATE:g} rad/s (default 1.0)")
@@ -4249,6 +4473,7 @@ def _cli_run(a):
                               servo_place_seat=a.servo_place_seat,
                               rate_clamp=a.corridor_rate_clamp,
                               settle_tol=a.settle_tol, settle_max=a.settle_max,
+                              pace=a.pace, dwell=a.dwell, pace_trace=a.pace_trace,
                               directional_caps=a.directional_caps,
                               mate_caps=_mate_caps_from_args(a),
                               couple_handovers=a.couple_handovers,
@@ -4337,6 +4562,20 @@ def _build_cli():
                       "permissive in force (F_push vs a blanket F_pull), STRICTER in torque. "
                       "OFF by default: it regresses configs that pass today, which indicts the "
                       "hand-set couple caps rather than the test.")
+  r.add_argument("--dwell", type=float, default=0.15, metavar="SEC",
+                 help="--corridor-online: rest time of the acting arms before/after each fire "
+                      "(default 0.15s). The settle hook already holds the arm until it is "
+                      "converged, so a shorter dwell is safe and removes most of the standing "
+                      "time at every barrier.")
+  r.add_argument("--pace-trace", metavar="FILE", default=None,
+                 help="--pace: save the per-tick stepper state (s, pace factors, rate "
+                      "factors, fired) to FILE for offline analysis.")
+  r.add_argument("--pace", action="store_true",
+                 help="--corridor-online: CONSTANT-SPEED ARRIVAL PACING -- every arm cruises "
+                      "to the pending barrier at a constant arc rate and reaches it at the "
+                      "common fire instant (slowest acting arm + dwell + --settle-max as the "
+                      "settle estimate), instead of sprinting there and stopping at the "
+                      "no-pass cap. Runtime feedback, not a precomputed profile.")
   r.add_argument("--settle-tol", type=float, default=1e-3, metavar="RAD",
                  help="--actuated: before each attach fires, hold the reference until the max "
                       "joint tracking error is under RAD. DEFAULT 1e-3 (0 disables): settling "
@@ -4581,6 +4820,10 @@ def _build_cli():
                       "Applied before witnesses/problem/sim so IK, the oracle and the MuJoCo "
                       "capsules agree. Default 1.0 = untouched. Not for validation runs: "
                       "clearances no longer match the planner's certified geometry.")
+  r.add_argument("--arm-arm-contacts", action="store_true",
+                 help="ACTUATED arm geoms get contype 1 instead of 2: real arm-arm "
+                      "collision physics (default masks arm-arm to avoid phantom forces "
+                      "from mocap chains interpenetrating at handovers).")
   r.add_argument("--path-preflight", action=argparse.BooleanOptionalAction, default=True,
                  help="Before spline/corridor construction, densely check the SAVED diagonal "
                       "path against strict collision and joint limits. Default ON: retiming "

@@ -142,10 +142,14 @@ def _geom_xml(kind, size, rgba, group, contype, conaffinity="1"):
 
 
 def collides_like_sim(name):
-  """sim.py's rule: only rai's `_coll*` capsules are the collision model. The other arm
-  primitives (gripper_fill, vacuum tip) are decoration there, so an articulated arm must make
-  the same choice or its contacts would not be comparable with every result measured so far."""
-  return "_coll" in name
+  """sim.py's rule: rai's `_coll*` capsules AND the gripper primitives (palm, fingers,
+  gripper_fill, vacuum tip) are the collision model -- those DO collide in rai and show up
+  as colliding pairs in the oracle. Emitting the gripper primitives visual-only let the
+  executed gripper pass through parts with no physics response (user-caught: palm 28mm into
+  a leg, finger2 25mm into another palm)."""
+  if "_coll" in name:
+    return True
+  return any(k in name for k in ("palm", "finger", "gripper_fill", "vacuum"))
 
 
 def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, indent=4,

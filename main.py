@@ -179,10 +179,15 @@ def build_parser():
   g_scene.add_argument(
       "--assembly",
       choices=["cross", "cube", "arch", "arch-seq", "cube-plates", "cube-plates-2x2x3",
-               "cuboid-tower", "car", "car-mini", "slot-pin", "peg-hole", "peg-stool",
+               "cuboid-tower", "car", "car-mini", "slot-pin", "peg-hole", "peg-hole-chamfer",
+               "peg-stool",
                "peg-stool-4", "peg-stool-cuboid", "peg-stool-cuboid-4",
                "peg-stool-tight", "peg-stool-4-tight",
                "peg-stool-cuboid-tight", "peg-stool-cuboid-4-tight",
+               "peg-stool-chamfer", "peg-stool-4-chamfer",
+               "peg-stool-cuboid-chamfer", "peg-stool-cuboid-4-chamfer",
+               "peg-stool-tight-chamfer", "peg-stool-4-tight-chamfer",
+               "peg-stool-cuboid-tight-chamfer", "peg-stool-cuboid-4-tight-chamfer",
                "mesh-demo", "compound-demo", "chair"],
       default="cross",
       help="Assembly to build: cross (cube cross, 7), cube (2x2x2 grid, 8), "
@@ -202,7 +207,15 @@ def build_parser():
            "peg-stool-cuboid-4 (the four-legged stool with SQUARE cuboid legs, 5), and "
            "the four -tight kinds (same four stools, peg size derived from the socket hole "
            "so the nominal clearance is 1mm instead of ~5mm; a square peg's CORNER gap is "
-           "the binding clearance). All stool variants: use --grasp-sampler and a vacuum "
+           "the binding clearance). peg-hole-chamfer: the peg-hole peg with a 4mm 45-degree "
+           "CHAMFERED insertion tip (an inline convex mesh), and the eight -chamfer stool "
+           "kinds (same stools/clearances, every leg's insertion end carries the same "
+           "chamfer) -- a slightly misaligned insertion slides into the pocket instead of "
+           "catching the rim. The -chamfer kinds ALSO bevel every socket mouth with a "
+           "45-degree ENTRY chamfer of its own (peg-hole 6mm, stool 4mm): each hole rim "
+           "widens into a funnel, so tip and mouth facets guide the insertion together. "
+           "All stool variants: "
+           "use --grasp-sampler and a vacuum "
            "gripper; the clearance is a constructor parameter (PegStoolAssembly peg_clearance). "
            "Default: cross.",
   )
