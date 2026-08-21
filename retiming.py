@@ -218,14 +218,58 @@ class TimedTrajectory:
     return len(self.q)
 
 
+def motion_audit_indices(q, fires=(), resolution=0.01):
+  """Choose trajectory samples at bounded joint-path variation, plus all event poses.
+
+  A controller-rate trajectory can contain thousands of identical or near-identical 2 ms
+  samples.  Collision geometry depends on configuration, not elapsed wall time, so checking
+  all of those samples adds no information.  This selector guarantees that the accumulated
+  L-infinity joint variation between consecutive selected samples is at most ``resolution``
+  (apart from an individual controller step that already exceeds it).  The first/last sample
+  and every fire sample are unconditional; callers should test a fire pose in both modes.
+
+  ``resolution <= 0`` retains the old dense-every-controller-tick behaviour.  Returned indices
+  always refer to the original trajectory, which keeps collision diagnostics and local repair
+  windows meaningful.
+  """
+  q = np.asarray(q, dtype=float)
+  if q.ndim != 2:
+    raise ValueError("motion audit expects a (samples, dof) trajectory")
+  n = len(q)
+  if n == 0:
+    return np.empty(0, dtype=int)
+  resolution = float(resolution)
+  if resolution <= 0.0:
+    return np.arange(n, dtype=int)
+  mandatory = {0, n - 1}
+  mandatory.update(int(i) for i, _ in fires if 0 <= int(i) < n)
+  selected = [0]
+  travel = 0.0
+  for i in range(1, n):
+    step = float(np.max(np.abs(q[i] - q[i - 1])))
+    # Stop immediately before a step would make the unchecked joint-path variation exceed
+    # the requested scale.  Checking only q[i] would miss a curved/backtracking excursion.
+    if travel + step > resolution + 1e-15 and selected[-1] != i - 1:
+      selected.append(i - 1)
+      travel = step
+    else:
+      travel += step
+    if i in mandatory:
+      if selected[-1] != i:
+        selected.append(i)
+      travel = 0.0
+  return np.asarray(selected, dtype=int)
+
+
 def upsample_trajectory(traj, dt, q0=None):
   """Densify a ``TimedTrajectory`` by an integer factor without changing its timing/events.
 
   Coordination-space scheduling does not need to run at the 2ms physics-control rate: its
-  exact predicate already uses the motion planner's ~0.01rad edge scale.  Plan coarsely, then
-  use this helper to restore the controller rate and audit EVERY dense sample.  If that audit
-  rejects an interpolated state, the caller retries at a finer planning rate or falls back;
-  densification itself is therefore never treated as a collision certificate.
+  exact predicate already uses the motion planner's ~0.01rad edge scale. Plan coarsely, then
+  use this helper to restore the controller rate. The caller audits the result at bounded
+  joint-path variation with :func:`motion_audit_indices`; if that rejects an interpolated
+  state, it retries at a finer planning rate or falls back. Densification itself is therefore
+  never treated as a collision certificate.
 
   ``q0`` is the configuration at t=0.  ``traj.q[0]`` is conventionally the configuration
   after the first source tick, so supplying q0 preserves that first interval as well.
@@ -333,6 +377,26 @@ def _fill_shape(n_steps, ramp_steps):
   rs = int(max(1, min(ramp_steps, n_steps // 2)))
   w = np.ones(n_steps)
   ramp = (np.arange(rs) + 1.0) / (rs + 1.0)
+  w[:rs] = ramp
+  w[-rs:] = ramp[::-1]
+  tot = float(w.sum())
+  return w / tot if tot > 0 else w
+
+
+def _intent_shape(n_steps, ramp_steps):
+  """Normalized cruise increments with quintic velocity ramps.
+
+  The ordinary fill shape uses a linear velocity ramp, which is adequate for time spreading
+  but gives the compact intent burst an avoidable acceleration corner. Here the ramp velocity
+  follows quintic smootherstep: velocity, acceleration, and jerk meet the neighbouring zero or
+  constant-velocity section continuously in the ideal continuous curve. Midpoint sampling keeps
+  every interior increment positive, so the result remains one deliberate motion island.
+  """
+  n_steps = max(int(n_steps), 1)
+  rs = int(max(1, min(ramp_steps, n_steps // 2)))
+  w = np.ones(n_steps)
+  u = (np.arange(rs, dtype=float) + 0.5) / rs
+  ramp = u ** 3 * (10.0 + u * (-15.0 + 6.0 * u))
   w[:rs] = ramp
   w[-rs:] = ramp[::-1]
   tot = float(w.sum())
@@ -1139,6 +1203,36 @@ def motion_support(q, dt, arm_dims, stopped_rate=0.05):
           "mean_moving_rate": float(np.mean(moving_rates)) if moving_rates else 0.0}
 
 
+def _global_idle_from_moving(moving, dt):
+  """Summarize a boolean transition mask on which at least one robot moves."""
+  moving = np.asarray(moving, dtype=bool)
+  if not len(moving):
+    return {"episodes": 0, "samples": 0, "duration": 0.0, "longest": 0.0,
+            "quadratic_samples": 0}
+  padded = np.r_[False, ~moving, False]
+  edges = np.flatnonzero(padded[1:] != padded[:-1])
+  lengths = (edges[1::2] - edges[::2]).astype(int).tolist()
+  return {"episodes": len(lengths), "samples": int(sum(lengths)),
+          "duration": float(sum(lengths)) * float(dt),
+          "longest": float(max(lengths, default=0)) * float(dt),
+          # A convex coverage cost makes eliminating one glaring long empty stretch preferable
+          # to shaving the same number of samples from several harmless event dwells.
+          "quadratic_samples": int(sum(n * n for n in lengths))}
+
+
+def global_idle_stats(q, dt, arm_dims, stopped_rate=0.05):
+  """Durations of intervals in which no robot has meaningful joint motion."""
+  q = np.asarray(q, dtype=float)
+  if len(q) < 2:
+    return _global_idle_from_moving([], dt)
+  moving = np.zeros(len(q) - 1, dtype=bool)
+  threshold = max(float(stopped_rate), 0.0) * max(float(dt), 0.0)
+  for d in arm_dims:
+    moving |= np.linalg.norm(
+        np.diff(q[:, np.asarray(d, dtype=int)], axis=0), axis=1) >= threshold
+  return _global_idle_from_moving(moving, dt)
+
+
 def batch_phase_motions(traj, path, arm_dims, fire_actors, bar_s, locked=(),
                         min_motion=0.08, max_gap=0.35, stopped_rate=0.05,
                         collision_free=None, peak_growth=1.02,
@@ -1368,12 +1462,14 @@ def batch_phase_motions(traj, path, arm_dims, fire_actors, bar_s, locked=(),
 
 
 def foreign_switch_stops(q, dt, arm_dims, fires, fire_actors, stopped_rate=0.05,
-                         context=0.2):
+                         context=2.0):
   """Count stop-go transitions centred on another robot's event.
 
   A foreign switch is counted only when the robot has meaningful motion within ``context`` on
-  both sides but at least one transition immediately adjacent to the switch is stopped. Purely
-  idle robots are therefore not mislabeled.
+  both sides but at least one transition immediately adjacent to the switch is stopped. The
+  relatively broad default catches the visually obvious wait-at-a-waypoint case, where the
+  preceding motion ended a second before the event; a 0.2s window falsely reported zero on the
+  peg-stool recording. Purely idle robots are still not mislabeled.
   """
   q = np.asarray(q, dtype=float)
   if len(q) < 3:
@@ -1402,14 +1498,15 @@ def foreign_switch_stops(q, dt, arm_dims, fires, fire_actors, stopped_rate=0.05,
 
 def intentional_phase_motions(traj, path, arm_dims, fire_actors, bar_s, locked=(),
                               stopped_rate=0.05, collision_free=None,
-                              intent_rate=2.0, ramp_time=0.08, stop_time=0.02):
+                              intent_rate=1.5, ramp_time=0.15, stop_time=0.02):
   """Schedule one delayed continuous motion between each robot's OWN events.
 
   Foreign mode switches are not anchors: a burst may cross them with nonzero velocity provided
   the global barrier has been passed and the configuration is collision-free in both modes.
-  Each own-event-to-own-event interval is packed as one shortest rate-bounded ramped burst and
-  placed as late as possible; earlier placements are tried when event passage or the collision
-  corridor requires them. Rigid/collision-coupled intervals remain byte-exact.
+  Each own-event-to-own-event interval is packed as one continuous rate-bounded ramped motion.
+  The shortest duration that does not worsen all-robot idle is placed as late as possible;
+  earlier placements are tried when event passage or collision geometry requires them.
+  Rigid/collision-coupled intervals remain byte-exact.
   """
   if traj.progress is None:
     raise ValueError("intentional phase scheduling requires per-arm progress")
@@ -1422,8 +1519,41 @@ def intentional_phase_motions(traj, path, arm_dims, fire_actors, bar_s, locked=(
   fires = [(int(i), list(ev)) for i, ev in traj.fires]
   actors = [set(int(r) for r in a) for a in fire_actors]
   bars = [float(x) for x in bar_s]
-  segs, _ = arc_length(list(P))
+  segs, D = arc_length(list(P))
   csum = np.concatenate([[0.0], np.cumsum(segs)]) if segs else np.array([0.0])
+  # Use each arm's intrinsic joint-space arc as the scheduling coordinate. The shared path
+  # arc contains flat spans whenever only another robot moves; packing that coordinate still
+  # produces visible move-stop-move islands in this arm. Intrinsic arc removes exactly those
+  # bookkeeping flats while retaining the arm's certified geometric polyline.
+  arm_geom = []
+  coord_src = np.zeros_like(progress)
+  if segs:
+    seg_arr = np.asarray(segs, dtype=float)
+    for r, d in enumerate(dims):
+      AP = np.asarray(P[:, d], dtype=float)
+      aseg = np.linalg.norm(np.diff(AP, axis=0), axis=1)
+      acsum = np.concatenate([[0.0], np.cumsum(aseg)])
+      sval = np.clip(progress[:, r], 0.0, D)
+      idx = np.clip(np.searchsorted(csum, sval, side="right") - 1,
+                    0, len(seg_arr) - 1)
+      alpha = np.zeros(len(sval), dtype=float)
+      nz = seg_arr[idx] > 1e-12
+      alpha[nz] = (sval[nz] - csum[idx[nz]]) / seg_arr[idx[nz]]
+      coord_src[:, r] = acsum[idx] + np.clip(alpha, 0.0, 1.0) * aseg[idx]
+      coord_src[sval >= D - 1e-10, r] = acsum[-1]
+      # The inverse deliberately chooses the LAST shared-path vertex of an intrinsic flat.
+      # Advancing across a span where this arm's joints are identical is a bookkeeping phase
+      # jump, not physical motion, and lets foreign barriers be passed without inserting a stop.
+      uu, first_rev = np.unique(acsum[::-1], return_index=True)
+      last = len(acsum) - 1 - first_rev
+      order = np.argsort(uu)
+      arm_geom.append((AP, list(aseg), acsum, uu[order], csum[last[order]],
+                       AP[last[order]]))
+  else:
+    for d in dims:
+      AP = np.asarray(P[:, d], dtype=float)
+      arm_geom.append((AP, [], np.array([0.0]), np.array([0.0]), np.array([0.0]),
+                       AP[:1]))
   protected = np.zeros((len(q), len(dims)), dtype=bool)
   for row in locked:
     if len(row) == 3:
@@ -1434,10 +1564,11 @@ def intentional_phase_motions(traj, path, arm_dims, fire_actors, bar_s, locked=(
       protected[:, r] |= ((progress[:, r] >= float(lo) - 1e-9)
                           & (progress[:, r] <= float(hi) + 1e-9))
 
-  report = {"accepted": 0, "unresolved": [], "protected": 0,
+  report = {"accepted": 0, "unresolved": [], "protected": 0, "funnel_protected": 0,
             "collision_rejected": 0, "event_rejected": 0, "rate_rejected": 0,
-            "noeffect_rejected": 0, "accepted_windows": [],
+            "noeffect_rejected": 0, "accepted_windows": [], "collision_examples": [],
             "support_before": motion_support(q, traj.dt, dims, stopped_rate),
+            "global_idle_before": global_idle_stats(q, traj.dt, dims, stopped_rate),
             "smoothness_before": trajectory_smoothness(q, traj.dt, dims),
             "islands_before": len(motion_islands(q, traj.dt, dims, stopped_rate)),
             "slow_before": internal_slow_episodes(q, traj.dt, dims, stopped_rate),
@@ -1448,16 +1579,20 @@ def intentional_phase_motions(traj, path, arm_dims, fire_actors, bar_s, locked=(
   threshold_step = max(stopped_rate, 0.0) * traj.dt
 
   for r in range(len(dims)):
-    anchors = [(0, None)]
-    anchors.extend((fi, k) for k, (fi, _) in enumerate(fires)
-                   if k < len(actors) and r in actors[k] and 0 < fi < len(q) - 1)
-    anchors.append((len(q) - 1, None))
-    anchors = sorted(dict.fromkeys(anchors))
+    # Several zero-duration task transitions may share one sample. They are one physical
+    # stopping point, not a collection of zero-length scheduling intervals. Keep the final
+    # event index at that sample so the right-hand interval still knows it starts at an own
+    # event and retains the requested rest plateau.
+    anchor_at = {0: None, len(q) - 1: None}
+    for k, (fi, _) in enumerate(fires):
+      if k < len(actors) and r in actors[k] and 0 < fi < len(q) - 1:
+        anchor_at[fi] = k
+    anchors = sorted(anchor_at.items())
     for (a, ka), (b, kb) in zip(anchors, anchors[1:]):
       if b - a < 4:
         continue
-      s0, s1 = float(progress[a, r]), float(progress[b, r])
-      if s1 - s0 <= 1e-10:
+      c0, c1 = float(coord_src[a, r]), float(coord_src[b, r])
+      if c1 - c0 <= 1e-10:
         continue
       old_qarm = q[a:b + 1, dims[r]]
       old_step = np.linalg.norm(np.diff(old_qarm, axis=0), axis=1)
@@ -1465,6 +1600,15 @@ def intentional_phase_motions(traj, path, arm_dims, fire_actors, bar_s, locked=(
       old_islands = len(motion_islands(old_qarm, traj.dt, [np.arange(len(dims[r]))],
                                        stopped_rate))
       if old_active == 0:
+        continue
+      # An actor-free internal event is a pre-skill GOTO: not a stop or timing deadline, but
+      # the smoothed scheduler trace around it carries the skill funnel's coordinated holder
+      # timing and terminal corner-rate envelope. Independently repacking that approach stayed
+      # geometrically collision-free yet made car-mini miss seats and break grasps. Preserve
+      # the already continuous smoothed funnel; intent remains a transport postprocessor.
+      if any(a < fi < b and k < len(actors) and not actors[k]
+             for k, (fi, _) in enumerate(fires)):
+        report["funnel_protected"] += 1
         continue
       if np.any(protected[a:b + 1, r]):
         report["protected"] += 1
@@ -1476,15 +1620,27 @@ def intentional_phase_motions(traj, path, arm_dims, fire_actors, bar_s, locked=(
         report["unresolved"].append((r, a, b, "no room after own-event stops"))
         continue
       cap = float(intent_rate) * traj.dt + 1e-10
+      AP, aseg, acsum, inv_coord, inv_shared, inv_q = arm_geom[r]
 
       def _packed(move_steps, offset):
         ramp = max(1, min(ramp_steps, move_steps // 3))
-        inc = _fill_shape(move_steps, ramp) * (s1 - s0)
-        pseg = np.full(b - a + 1, s0, dtype=float)
+        inc = _intent_shape(move_steps, ramp) * (c1 - c0)
+        cseg = np.full(b - a + 1, c0, dtype=float)
         start = (left - a) + int(offset)
-        pseg[start + 1:start + move_steps + 1] = s0 + np.cumsum(inc)
-        pseg[start + move_steps + 1:] = s1
-        qa = np.asarray([config_at(list(P), csum, segs, float(s))[dims[r]] for s in pseg])
+        cseg[start + 1:start + move_steps + 1] = c0 + np.cumsum(inc)
+        cseg[start + move_steps + 1:] = c1
+        # Vectorized interpolation is equivalent to config_at here. Repeated intrinsic arc
+        # vertices are collapsed to their last (identical for this arm) configuration above.
+        # This function is evaluated dozens of times per interval during placement ranking;
+        # the former Python-per-sample loop dominated postprocessing wall time.
+        qa = np.column_stack([
+            np.interp(cseg, inv_coord, inv_q[:, j]) for j in range(inv_q.shape[1])])
+        pseg = np.interp(cseg, inv_coord, inv_shared)
+        # Preserve semantic event anchors exactly. The neighbouring intrinsic coordinate is
+        # free to skip a shared flat, but the own-event configuration/progress itself remains
+        # byte-for-byte the saved witness.
+        pseg[0], pseg[-1] = progress[a, r], progress[b, r]
+        qa[0], qa[-1] = q[a, dims[r]], q[b, dims[r]]
         peak = float(np.linalg.norm(np.diff(qa, axis=0), axis=1).max())
         return pseg, qa, peak
 
@@ -1499,45 +1655,102 @@ def intentional_phase_motions(traj, path, arm_dims, fire_actors, bar_s, locked=(
           high = mid
         else:
           low = mid + 1
-      move_steps = low
-      free = available - move_steps
-      # Latest feasible start is the visual objective. A descending grid supplies corridor
-      # alternatives without reintroducing a reactive online controller.
-      offsets = np.linspace(free, 0, min(9, free + 1)).round().astype(int).tolist()
+      min_steps = low
+      # The shortest possible burst is not always the best-looking one: if every other robot
+      # is idle too, it creates a dead scene. Explore progressively longer *continuous* motions
+      # up to the interval width. The hard global-idle non-regression below chooses the shortest
+      # duration that preserves coverage; it never turns this into reactive tick-level pacing.
+      durations = np.linspace(min_steps, available, min(7, available - min_steps + 1)) \
+          .round().astype(int).tolist()
+      durations.append(int(np.clip(old_active, min_steps, available)))
       accepted = False
-      for offset in dict.fromkeys(offsets):
-        pseg, qarm, peak = _packed(move_steps, offset)
-        if peak > cap:
-          report["rate_rejected"] += 1
-          continue
+      proposals = []
+      base_idle = global_idle_stats(q, traj.dt, dims, stopped_rate)
+      other_full = np.zeros(len(q) - 1, dtype=bool)
+      for rr, dd in enumerate(dims):
+        if rr != r:
+          other_full |= np.linalg.norm(np.diff(q[:, dd], axis=0), axis=1) >= threshold_step
+      source_r_moving = np.linalg.norm(
+          np.diff(q[:, dims[r]], axis=0), axis=1) >= threshold_step
+      for move_steps in dict.fromkeys(durations):
+        free = available - move_steps
+        offsets = np.linspace(free, 0, min(9, free + 1)).round().astype(int).tolist()
+        src_on = np.flatnonzero(old_step >= threshold_step)
+        if len(src_on):
+          src_centre = 0.5 * (float(src_on[0]) + float(src_on[-1]) + 1.0)
+          centred = int(round(src_centre - (left - a) - 0.5 * move_steps))
+          offsets.append(int(np.clip(centred, 0, free)))
+        for offset in dict.fromkeys(offsets):
+          pseg, qarm, peak = _packed(move_steps, offset)
+          if peak > cap:
+            report["rate_rejected"] += 1
+            continue
+          if any(a <= fi <= b and k < len(bars) and actors[k]
+                 and pseg[fi - a] < bars[k] - 1e-7
+                 for k, (fi, _) in enumerate(fires)):
+            report["event_rejected"] += 1
+            continue
+          new_moving = np.linalg.norm(np.diff(qarm, axis=0), axis=1) >= threshold_step
+          new_active = int(np.count_nonzero(new_moving))
+          new_islands = ((int(new_moving[0]) if len(new_moving) else 0)
+                         + int(np.count_nonzero(new_moving[1:] & ~new_moving[:-1])))
+          old_on = np.flatnonzero(old_step >= threshold_step)
+          new_on = np.flatnonzero(new_moving)
+          later_same_motion = (old_islands == 1 and new_islands == 1
+                               and new_active <= old_active
+                               and len(old_on) and len(new_on)
+                               and int(new_on[-1]) > int(old_on[-1]))
+          if (new_islands != 1
+              or (new_active >= old_active and old_islands <= 1 and not later_same_motion)):
+            report["noeffect_rejected"] += 1
+            continue
+          combined = other_full | source_r_moving
+          combined = combined.copy()
+          combined[a:b] = other_full[a:b] | new_moving
+          idle_stats = _global_idle_from_moving(combined, traj.dt)
+          # Appearance is primary: compacting one robot may not buy individual idle by making
+          # the whole scene emptier. Both duration and squared-run cost are monotone guards;
+          # the latter prevents one new glaring pause from replacing several tiny dwells.
+          if (idle_stats["samples"] > base_idle["samples"]
+              or idle_stats["quadratic_samples"] > base_idle["quadratic_samples"]):
+            report["noeffect_rejected"] += 1
+            continue
+          # First minimize this robot's moving support, then place that continuous motion as
+          # late as coverage allows. Remaining idle cost is only a final tie-breaker.
+          proposals.append(((new_active, -int(offset),
+                             idle_stats["quadratic_samples"]),
+                            int(move_steps), int(offset)))
+
+      # Collision checking is expensive. Rank all kinematically/event-feasible placements by
+      # the visual objective first, then query the scene only until the best certifiable one
+      # is found.
+      for _, move_steps, offset in sorted(proposals):
+        pseg, qarm, _ = _packed(move_steps, offset)
         pcol = progress[:, r].copy()
         pcol[a:b + 1] = pseg
-        if any(a <= fi <= b and k < len(bars) and pcol[fi] < bars[k] - 1e-7
-               for k, (fi, _) in enumerate(fires)):
-          report["event_rejected"] += 1
-          continue
         candidate = q.copy()
         candidate[a:b + 1, dims[r]] = qarm
         if collision_free is not None:
-          # Match plan_schedule's multi-rate contract: screen candidates on an exact 10ms
-          # grid (plus every mode switch), then let the caller's mandatory 2ms final audit
+          # Use the same multi-rate principle as plan_schedule: screen proposals on a coarse
+          # grid (plus every mode switch), then let the caller's mandatory final path-resolution audit
           # certify or restore the complete interval. Running the full scene predicate at
           # every 2ms sample for every rejected placement made this stage needlessly minutes
           # slower without strengthening final acceptance.
-          stride = max(1, int(round(0.01 / traj.dt)))
+          stride = max(1, int(round(0.02 / traj.dt)))
           samples = set(range(a, b + 1, stride))
           samples.update(fi for fi, _ in fires if a <= fi <= b)
           samples.update((a, b))
-          if any(not bool(collision_free(candidate[i], i)) for i in sorted(samples)):
+          bad_sample = next((i for i in sorted(samples)
+                             if not bool(collision_free(candidate[i], i))), None)
+          if bad_sample is not None:
             report["collision_rejected"] += 1
+            key = (r, a, b)
+            if (len(report["collision_examples"]) < 64
+                and not any(tuple(row[:3]) == key for row in report["collision_examples"])):
+              report["collision_examples"].append(
+                  (r, a, b, move_steps, offset, int(bad_sample),
+                   getattr(collision_free, "last_detail", None)))
             continue
-        new_active = int(np.count_nonzero(
-            np.linalg.norm(np.diff(qarm, axis=0), axis=1) >= threshold_step))
-        new_islands = len(motion_islands(
-            qarm, traj.dt, [np.arange(len(dims[r]))], stopped_rate))
-        if new_islands != 1 or (new_active >= old_active and old_islands <= 1):
-          report["noeffect_rejected"] += 1
-          continue
         q, progress[:, r] = candidate, pcol
         report["accepted"] += 1
         report["accepted_windows"].append((r, a, b))
@@ -1547,6 +1760,7 @@ def intentional_phase_motions(traj, path, arm_dims, fire_actors, bar_s, locked=(
         report["unresolved"].append((r, a, b, "no collision/event-feasible placement"))
 
   report["support_after"] = motion_support(q, traj.dt, dims, stopped_rate)
+  report["global_idle_after"] = global_idle_stats(q, traj.dt, dims, stopped_rate)
   report["smoothness_after"] = trajectory_smoothness(q, traj.dt, dims)
   report["islands_after"] = len(motion_islands(q, traj.dt, dims, stopped_rate))
   report["slow_after"] = internal_slow_episodes(q, traj.dt, dims, stopped_rate)
@@ -1573,7 +1787,7 @@ def smooth_phase_trajectory(traj, path, arm_dims, fire_actors, window=0.12,
 
   ``locked`` contains ``(i, j, s0, s1)`` rigid/collision coupling windows. For now the
   fire-to-fire intervals intersecting such a window are left byte-for-byte unchanged for the
-  involved arms. ``restore_intervals`` similarly restores complete intervals after a dense
+  involved arms. ``restore_intervals`` similarly restores complete intervals after a final
   collision counterexample. A final per-arm check restores any interval in which smoothing
   would exceed that robot's largest certified source step by more than two percent; fixed
   event times must not compress a nicer-looking phase curve into an actuator-hostile speed spike.

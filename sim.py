@@ -2358,7 +2358,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         phase_servo_time=0.15, phase_smooth=False, phase_smooth_time=0.12,
                         phase_batch=False, phase_batch_min_motion=0.08,
                         phase_batch_max_gap=0.35, phase_intent=False,
-                        phase_intent_ramp=0.08, phase_intent_rate=2.0,
+                        phase_intent_ramp=0.15, phase_intent_rate=1.5,
+                        phase_audit_resolution=0.01,
                         directional_caps=False, mate_caps=None,
                         verify_efc_cache=False, force_limits=False, wrench_margin=1.0, mass_scale=1.0, inertia_factor=1.0,
                         corner_limits=True,
@@ -2998,7 +2999,14 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       for tid in done_ids:
         t = problem.tasks[int(tid)]
         lbl = name_of.get(t.name)
-        if lbl:
+        # A pre-skill GOTO is a geometric funnel-mouth waypoint, not an execution event: it
+        # changes no attachment and has no servo/fire hook. Treating every named subtask as
+        # owned made the actor brake to rest there, then perform the tiny final approach as a
+        # second motion (most visibly a1's first peg-stool pick). Only an attaching task or the
+        # action's final task is a physical rest rendezvous. Unowned GOTO barriers remain exact
+        # path/event anchors but crossing robots may retain nonzero velocity through them.
+        _physical_event = bool(getattr(t, "frames", None)) or bool(lbl and lbl[1])
+        if lbl and _physical_event:
           pre = states[lbl[0]]                               # state entering the action
           for tok in plan[lbl[0]]:
             if tok in robot_index:                           # the acting robot(s)
@@ -3710,8 +3718,11 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         def _strict_collide(fq, fired):
           """Exact planner contract used both while scheduling and for final acceptance."""
           _ki = min(int(fired), len(stretch_mode) - 1)
+          _collide_t0 = _time.perf_counter()
           ok = bool(problem.is_collision_free(
               _conf(fq), stretch_mode[_ki], collision_tolerance=_ptol))
+          _strict_collide.calls += 1
+          _strict_collide.seconds += _time.perf_counter() - _collide_t0
           if ok:
             _strict_collide.last_pairs = []
             return False
@@ -3744,6 +3755,9 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           _strict_collide.last_pairs = sorted(pairs, key=lambda x: -x[1])
           return who                                      # empty set means static-world block
 
+        _strict_collide.calls = 0
+        _strict_collide.seconds = 0.0
+
         print("[sim/mp] --phase-schedule ACTIVE: visual-quality coordination-space plan; "
               f"preferred cruise {JOINT_RATE:g}rad/s, nominal servo reservations "
               f"{min(_event_budget or [0]):g}-{max(_event_budget or [0]):g}s, exact "
@@ -3759,39 +3773,57 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                 "yet part of this scheduler. Runtime wrench guards remain authoritative.")
 
         def _phase_audit(_traj, collect=False):
+          _audit_t0 = _time.perf_counter()
+          _audit_checks = 0
+          _audit_indices = retiming.motion_audit_indices(
+              _traj.q, _traj.fires or [], resolution=phase_audit_resolution)
+          def _audit_done(_result):
+            _phase_audit.last = {
+                "checks": _audit_checks,
+                "seconds": _time.perf_counter() - _audit_t0,
+                "samples": len(_audit_indices),
+                "trajectory_samples": len(_traj.q)}
+            return _result
           _at = {}
           _bad = []
           for _ii, _ev in (_traj.fires or []):
             _at.setdefault(int(_ii), 0)
             _at[int(_ii)] += 1                              # one mode transition per fire point
           _fired = 0
-          for _ii, _q in enumerate(_traj.q):
+          for _ii in _audit_indices:
+            _ii = int(_ii)
+            _q = _traj.q[_ii]
+            _audit_checks += 1
             if _strict_collide(_q, _fired) is not False:
               _hit = (_ii, _fired, list(_strict_collide.last_pairs[:5]))
               if not collect:
-                return _hit
+                return _audit_done(_hit)
               _bad.append(_hit)
             if _ii in _at:
               for _ in range(_at[_ii]):
                 _post = min(_fired + 1, len(stretch_mode) - 1)
+                _audit_checks += 1
                 if _strict_collide(_q, _post) is not False:
                   _hit = (_ii, _post, list(_strict_collide.last_pairs[:5]))
                   if not collect:
-                    return _hit
+                    return _audit_done(_hit)
                   _bad.append(_hit)
                 _fired += 1
-          return _bad if collect else None
+          return _audit_done(_bad if collect else None)
 
         _fallback_reason, traj = None, None
         # Scheduling at the 2ms physics rate repeats the expensive full-scene predicate five
         # times more often than the motion planner's own 0.01rad edge scale (chair took >6min
         # before reaching simulation). Plan at 10ms, interpolate back to 2ms, then keep the
-        # SAME dense acceptance audit below. A dense counterexample triggers 4ms and finally
+        # SAME path-resolution acceptance audit below. A counterexample triggers 4ms and finally
         # 2ms retries. Every planning grid is an integer multiple of the 2ms controller tick,
         # so fire points survive expansion exactly (5ms cannot be represented on that grid).
         _plan_dts = list(dict.fromkeys([max(DT, 0.01), max(DT, 0.004), DT]))
         _q_start = np.asarray(_phase_stretches[0][0][0], dtype=float)
         for _pdt in _plan_dts:
+          _search_t0 = _time.perf_counter()
+          _search_calls0 = _strict_collide.calls
+          _search_collision_s0 = _strict_collide.seconds
           try:
             _coarse = retiming.plan_schedule(
                 _phase_stretches, arm_dims, acting, _pdt, joint_rate=JOINT_RATE,
@@ -3802,15 +3834,23 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                 per_arm_rate=True)
           except RuntimeError as _e:
             _fallback_reason = f"{_pdt:g}s planning grid: {_e}"
+            print(f"[sim/mp] --phase-schedule {_pdt:g}s search failed after "
+                  f"{_time.perf_counter() - _search_t0:.2f}s; collision predicate "
+                  f"{_strict_collide.calls - _search_calls0} calls/"
+                  f"{_strict_collide.seconds - _search_collision_s0:.2f}s.")
             continue
+          print(f"[sim/mp] --phase-schedule {_pdt:g}s search: "
+                f"{_time.perf_counter() - _search_t0:.2f}s; collision predicate "
+                f"{_strict_collide.calls - _search_calls0} calls/"
+                f"{_strict_collide.seconds - _search_collision_s0:.2f}s.")
           traj = retiming.upsample_trajectory(_coarse, DT, q0=_q_start)
           _bad_phase = _phase_audit(traj)
           if _bad_phase is None:
             print(f"[sim/mp] --phase-schedule planning grid {_pdt:g}s -> {DT:g}s control "
-                  f"samples; dense audit accepted on attempt "
+                  f"samples; path-resolution audit accepted on attempt "
                   f"{_plan_dts.index(_pdt) + 1}/{len(_plan_dts)}.")
             break
-          _fallback_reason = (f"{_pdt:g}s schedule's dense audit failed at sample "
+          _fallback_reason = (f"{_pdt:g}s schedule's path-resolution audit failed at sample "
                               f"{_bad_phase[0]}, mode {_bad_phase[1]}: {_bad_phase[2]}")
           print(f"[sim/mp] --phase-schedule RETRY FINER: {_fallback_reason}")
           traj = None
@@ -3825,8 +3865,12 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             raise RuntimeError(
                 f"[sim/mp] synchronized fallback failed its exact audit at sample "
                 f"{_bad_phase[0]}, mode {_bad_phase[1]}: {_bad_phase[2]}")
-        print(f"[sim/mp] --phase-schedule exact final audit: {len(traj.q)} samples + "
-              f"{len(traj.fires)} post-switch poses collision-free.")
+        print(f"[sim/mp] --phase-schedule exact final audit: "
+              f"{_phase_audit.last['samples']}/{len(traj.q)} trajectory samples at "
+              f"<={phase_audit_resolution:g}rad joint-path variation + "
+              f"{len(traj.fires)} post-switch poses collision-free; "
+              f"{_phase_audit.last['checks']} predicate calls in "
+              f"{_phase_audit.last['seconds']:.2f}s.")
         if phase_smooth:
           if traj.progress is None:
             raise RuntimeError(
@@ -3872,7 +3916,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                 traj = _cand
                 print(f"[sim/mp] --phase-smooth ACTIVE: Gaussian phase-rate smoothing over "
                       f"{phase_smooth_time:g}s; every fire vector pinned, monotonicity and "
-                      f"actor stops preserved. Exact 2ms audit passed; restored "
+                      f"actor stops preserved. Exact {phase_audit_resolution:g}rad "
+                      f"path-resolution audit passed; restored "
                       f"{len(_restore)}/{_smooth_rep['intervals']} collision-sensitive "
                       f"interval(s) and {_smooth_rep['locked_arm_intervals']} rigid arm-"
                       f"interval(s); {_smooth_rep['rate_limited_arm_intervals']} arm-"
@@ -3891,7 +3936,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
               _restore |= _new
               print(f"[sim/mp] --phase-smooth local fallback pass {_smooth_pass + 1}: "
                     f"restoring fire interval(s) {sorted(_new)} after "
-                    f"{len(_bad_smooth)} dense collision rejection(s).")
+                    f"{len(_bad_smooth)} path-resolution collision rejection(s).")
             else:
               raise RuntimeError(
                   "[sim/mp] --phase-smooth REQUIRED but its collision repair did not "
@@ -3903,12 +3948,25 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           # or C2. It may flow through another arm's event, but checks both worlds there.
           _batch_source = traj
           _fire_samples = [int(i) for i, _ in traj.fires]
-          _batch_locks = list(_locked) + list(getattr(traj, "couplings", ()))
+          # Scheduler-created collision couplings certify its particular trace but are not a
+          # physical equality. The intent pass deliberately searches a new trace and certifies
+          # it again, so only true co-hold/handover locks remain immutable there. Conservative
+          # local batching retains the scheduler couplings as before.
+          _batch_locks = (list(_locked) if phase_intent else
+                          list(_locked) + list(getattr(traj, "couplings", ())))
 
           def _batch_free(_q, _sample):
+            _bt0 = _time.perf_counter()
+            def _bdone(_ok):
+              _batch_free.calls += 1
+              _batch_free.seconds += _time.perf_counter() - _bt0
+              return _ok
+            _batch_free.last_detail = None
             _fired = int(np.searchsorted(_fire_samples, int(_sample), side="left"))
             if _strict_collide(_q, _fired) is not False:
-              return False
+              _batch_free.last_detail = (
+                  int(_sample), _fired, list(_strict_collide.last_pairs[:5]))
+              return _bdone(False)
             # The event changes attachments at this exact configuration. Check every
             # successive post-switch mode if multiple zero-duration events share a sample.
             for _j, _fi in enumerate(_fire_samples):
@@ -3916,15 +3974,51 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                 continue
               _post = min(_fired + 1, len(stretch_mode) - 1)
               if _strict_collide(_q, _post) is not False:
-                return False
+                _batch_free.last_detail = (
+                    int(_sample), _post, list(_strict_collide.last_pairs[:5]))
+                return _bdone(False)
               _fired += 1
-            return True
+            return _bdone(True)
+          _batch_free.calls = 0
+          _batch_free.seconds = 0.0
 
           if phase_intent:
             _batch, _batch_rep = retiming.intentional_phase_motions(
                 traj, _P, arm_dims, acting, _bar, locked=_batch_locks,
                 stopped_rate=0.05 * JOINT_RATE, collision_free=_batch_free,
                 intent_rate=phase_intent_rate, ramp_time=phase_intent_ramp)
+            # One Gauss-Seidel refinement removes robot-order bias. On the first pass a1 is
+            # placed against a2's still-spread source trace; after a2 is compacted, a1 may be
+            # able to shift later without reopening an all-robot gap. Equal-support edits are
+            # allowed only when their arrival moves later and both global-idle guards hold.
+            _refined, _ref_rep = retiming.intentional_phase_motions(
+                _batch, _P, arm_dims, acting, _bar, locked=_batch_locks,
+                stopped_rate=0.05 * JOINT_RATE, collision_free=_batch_free,
+                intent_rate=phase_intent_rate, ramp_time=phase_intent_ramp)
+            if _ref_rep["accepted"]:
+              _batch = _refined
+              for _key in ("collision_rejected", "event_rejected", "rate_rejected",
+                           "noeffect_rejected"):
+                _batch_rep[_key] += _ref_rep[_key]
+              for _row in _ref_rep["collision_examples"]:
+                if (len(_batch_rep["collision_examples"]) < 64
+                    and not any(tuple(_old[:3]) == tuple(_row[:3])
+                                for _old in _batch_rep["collision_examples"])):
+                  _batch_rep["collision_examples"].append(_row)
+              _wins = list(dict.fromkeys(
+                  list(_batch_rep["accepted_windows"])
+                  + list(_ref_rep["accepted_windows"])))
+              _batch_rep["accepted_windows"] = _wins
+              _batch_rep["accepted"] = len(_wins)
+              _resolved = set(_ref_rep["accepted_windows"])
+              _batch_rep["unresolved"] = [
+                  row for row in _batch_rep["unresolved"] if tuple(row[:3]) not in _resolved]
+              for _key in ("support_after", "global_idle_after", "smoothness_after",
+                           "islands_after", "slow_after", "foreign_stops_after"):
+                _batch_rep[_key] = _ref_rep[_key]
+              _batch_rep["refined"] = _ref_rep["accepted"]
+            else:
+              _batch_rep["refined"] = 0
           else:
             _batch, _batch_rep = retiming.batch_phase_motions(
                 traj, _P, arm_dims, acting, _bar, locked=_batch_locks,
@@ -3932,7 +4026,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                 stopped_rate=0.05 * JOINT_RATE, collision_free=_batch_free)
           _bad_batch = _phase_audit(_batch)
           _restored_batch_windows = set()
-          # The planner predicate has internal state/caches, so retain the same final dense
+          # The planner predicate has internal state/caches, so retain the same final
           # audit used everywhere else. If it finds a counterexample missed during a local
           # proposal check, restore the connected accepted window(s), not the whole batch.
           while _bad_batch is not None:
@@ -3969,12 +4063,20 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                 traj.q, traj.dt, arm_dims, stopped_rate=0.05 * JOINT_RATE)
             _batch_support = retiming.motion_support(
                 traj.q, traj.dt, arm_dims, stopped_rate=0.05 * JOINT_RATE)
+            _batch_global_idle = retiming.global_idle_stats(
+                traj.q, traj.dt, arm_dims, stopped_rate=0.05 * JOINT_RATE)
+            _batch_smoothness = retiming.trajectory_smoothness(
+                traj.q, traj.dt, arm_dims)
+            _batch_foreign_stops = retiming.foreign_switch_stops(
+                traj.q, traj.dt, arm_dims, traj.fires, acting,
+                stopped_rate=0.05 * JOINT_RATE)
             _proposed = (_batch_rep['accepted'] if phase_intent else _batch_rep['merged'])
             _kept = _proposed - len(_restored_batch_windows)
             if phase_intent:
               _sb = _batch_rep["support_before"]
+              _gi0 = _batch_rep["global_idle_before"]
               _sm0, _sm1 = (_batch_rep["smoothness_before"],
-                            _batch_rep["smoothness_after"])
+                            _batch_smoothness)
               if (_kept <= 0
                   or _batch_support["moving_samples"] >= _sb["moving_samples"]):
                 raise RuntimeError(
@@ -3990,16 +4092,33 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                     f"{_batch_rep['islands_before']} -> {_batch_after}, internal slow gaps "
                     f"{_batch_rep['slow_before']} -> {_batch_internal_slow}, foreign-switch "
                     f"stops {_batch_rep['foreign_stops_before']} -> "
-                    f"{_batch_rep['foreign_stops_after']}; "
+                    f"{_batch_foreign_stops}; all-robot idle "
+                    f"{_gi0['duration']:.1f}s -> {_batch_global_idle['duration']:.1f}s "
+                    f"(longest {_gi0['longest']:.1f}s -> "
+                    f"{_batch_global_idle['longest']:.1f}s); "
                     f"accel RMS {100 * (_sm1['accel_rms'] / max(_sm0['accel_rms'], 1e-12) - 1):+.1f}%, "
                     f"jerk RMS {100 * (_sm1['jerk_rms'] / max(_sm0['jerk_rms'], 1e-12) - 1):+.1f}%. "
                     f"Rejected {_batch_rep['collision_rejected']} collision-sensitive, "
                     f"{_batch_rep['event_rejected']} event-passage, "
                     f"{_batch_rep['rate_rejected']} peak-rate, "
                     f"{len(_batch_rep['unresolved'])} unresolved interval(s), "
-                    f"{_batch_rep['protected']} rigidly protected interval(s); final "
-                    f"audit locally restored {len(_restored_batch_windows)} merge(s). Exact "
-                    "2ms audit passed, including both modes at switches.")
+                    f"{_batch_rep['protected']} rigidly protected and "
+                    f"{_batch_rep.get('funnel_protected', 0)} skill-funnel interval(s); final "
+                    f"audit locally restored {len(_restored_batch_windows)} interval(s). Exact "
+                    f"{phase_audit_resolution:g}rad path-resolution audit passed, including "
+                    f"both modes at switches. Coordinate "
+                    f"refinement shifted {_batch_rep.get('refined', 0)} interval(s) later. "
+                    f"Collision profile: candidate screen {_batch_free.calls} calls/"
+                    f"{_batch_free.seconds:.2f}s; final audit "
+                    f"{_phase_audit.last['checks']} calls/"
+                    f"{_phase_audit.last['seconds']:.2f}s.")
+              if _batch_rep["unresolved"]:
+                print(f"[sim/mp] --phase-intent unresolved examples: "
+                      f"{_batch_rep['unresolved'][:6]}")
+              if _batch_rep["collision_examples"]:
+                print(f"[sim/mp] --phase-intent first collision by interval "
+                      f"(arm,a,b,steps,offset,sample,detail): "
+                      f"{_batch_rep['collision_examples'][:12]}")
             else:
               print(f"[sim/mp] --phase-batch ACTIVE: kept {_kept}/{_batch_rep['merged']} "
                     f"certified short-motion merge(s); motion islands "
@@ -4012,7 +4131,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                     f"{_batch_rep['event_rejected']} event/coupling, "
                     f"{_batch_rep['rate_rejected']} peak-rate, "
                     f"{_batch_rep['quality_rejected']} visual-quality proposal(s); final audit locally "
-                    f"restored {len(_restored_batch_windows)} merge(s). Exact 2ms audit passed, "
+                    f"restored {len(_restored_batch_windows)} merge(s). Exact "
+                    f"{phase_audit_resolution:g}rad path-resolution audit passed, "
                     "including both modes at switches.")
           else:
             traj = _batch_source
@@ -4197,7 +4317,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           print(f"[sim/mp] PHASE SCHEDULE: {len(traj.q)} samples vs {len(base.q)} "
                 f"synchronized ({100 * (1 - len(traj.q) / max(len(base.q), 1)):+.1f}% "
                 f"duration, informational only), {len(traj.fires)} fire points; every "
-                "candidate and final sample checked exactly")
+                "scheduler candidate and final path-resolution sample checked exactly")
         else:
           print(f"[sim/mp] STAGES B+C: {len(traj.q)} samples vs {len(base.q)} lockstep "
                 f"({100 * (1 - len(traj.q) / max(len(base.q), 1)):+.1f}% makespan), "
@@ -4803,6 +4923,8 @@ def _cli_run(a):
     raise SystemExit("[sim] --phase-intent-ramp must be positive")
   if a.phase_intent_rate <= 0.0:
     raise SystemExit("[sim] --phase-intent-rate must be positive")
+  if a.phase_audit_resolution < 0.0:
+    raise SystemExit("[sim] --phase-audit-resolution must be non-negative")
   if a.c2_samples_per_seg < 1:
     raise SystemExit("[sim] --c2-samples-per-seg must be at least 1")
   if not 0.0 < a.c2_control_ratio <= 1.0:
@@ -5087,6 +5209,7 @@ def _cli_run(a):
                               phase_intent=a.phase_intent,
                               phase_intent_ramp=a.phase_intent_ramp,
                               phase_intent_rate=a.phase_intent_rate,
+                              phase_audit_resolution=a.phase_audit_resolution,
                               corridor_ds=a.corridor_ds,
                               corridor_ds_lead=a.corridor_ds_lead,
                               corridor_lead_max=a.corridor_lead_max,
@@ -5233,7 +5356,8 @@ def _build_cli():
                       "joint-space path arc and Gaussian-filter that physical RATE while "
                       "pinning every complete mode-switch phase vector, actor stops, sharp "
                       "corner slowdowns, and rigid coupling intervals. The joint paths are never "
-                      "splined again. The result receives the same exact 2ms/pre+post-switch "
+                      "splined again. The result receives the same exact joint-path-resolution "
+                      "pre+post-switch "
                       "audit; collision-sensitive fire intervals revert locally to the raw "
                       "certified schedule. Strict: if no independent phase trace exists or a "
                       "useful collision-free smooth result cannot be certified, abort before "
@@ -5248,7 +5372,8 @@ def _build_cli():
                       "across a short stop into one smooth burst. Own task stops and rigid "
                       "couplings remain exact; crossing another robot's event is allowed only "
                       "after checking the global passage constraint and both event modes. "
-                      "Every merge is peak-rate guarded and the result gets the exact 2ms "
+                      "Every merge is peak-rate guarded and the result gets the exact "
+                      "joint-path-resolution "
                       "collision audit. Opt-in; the established pipeline is unchanged.")
   r.add_argument("--phase-batch-min-motion", type=float, default=0.08, metavar="RAD",
                  help="--phase-batch: an adjacent motion island must be smaller than this "
@@ -5258,18 +5383,25 @@ def _build_cli():
                       "(default 0.35s).")
   r.add_argument("--phase-intent", action=argparse.BooleanOptionalAction, default=False,
                  help="--phase-schedule: experimental alternative to --phase-batch. Minimize "
-                      "the temporal support of motion: merge every eligible pair of islands "
-                      "and pack it into the shortest intent-rate-bounded ramped burst, "
-                      "leaving clean idle time. Own events and rigid couplings remain exact; "
-                      "multiple placements are tried against the complete collision corridor "
-                      "and the final 2ms audit. Strict: abort if no support reduction survives.")
-  r.add_argument("--phase-intent-ramp", type=float, default=0.08, metavar="SEC",
-                 help="--phase-intent acceleration/deceleration ramp duration for each packed "
-                      "burst (default 0.08s).")
-  r.add_argument("--phase-intent-rate", type=float, default=2.0, metavar="RAD_S",
-                 help="--phase-intent target peak joint-space path rate (default 2rad/s). "
+                      "the temporal support of motion: between each robot's own events, pack "
+                      "its intrinsic joint-space path arc into one delayed, quintic-ramped, "
+                      "intent-rate-bounded motion. Foreign switches are not stop anchors; "
+                      "own events and true rigid couplings remain exact. Multiple placements "
+                      "are collision-screened and receive the final joint-path-resolution "
+                      "audit. Strict: abort "
+                      "if no support reduction survives.")
+  r.add_argument("--phase-intent-ramp", type=float, default=0.15, metavar="SEC",
+                 help="--phase-intent quintic velocity-ramp duration at each end of a packed "
+                      "motion (default 0.15s).")
+  r.add_argument("--phase-intent-rate", type=float, default=1.5, metavar="RAD_S",
+                 help="--phase-intent target peak joint-space path rate (default 1.5rad/s). "
                       "This is deliberately above the ordinary 1rad/s visual cruise so motion "
                       "support can shrink, while remaining below the limited UR arm rates.")
+  r.add_argument("--phase-audit-resolution", type=float, default=0.01, metavar="RAD",
+                 help="--phase-schedule: maximum accumulated L-infinity joint-path motion "
+                      "between final collision-audit samples (default 0.01rad, matching the "
+                      "motion planner edge scale). Every event pose is still checked in both "
+                      "modes. 0 restores dense checking at every 2ms controller tick.")
   r.add_argument("--settle-tol", type=float, default=2e-3, metavar="RAD",
                  help="--actuated: before each attach fires, hold the reference until the max "
                       "joint tracking error is under RAD. Default 2e-3: the actuated car has "
