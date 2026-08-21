@@ -14,6 +14,11 @@ from env import *
 from assembly import *
 from config import RunConfig
 
+def _rss_mb():
+  # A1/A6 instrumentation probe: peak RSS of THIS process in MB (ru_maxrss is KiB on Linux).
+  import resource
+  return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+
 def build_parser():
   parser = argparse.ArgumentParser(
       description="Spawn a multi-robot UR10 environment."
@@ -2316,6 +2321,7 @@ def run(cfg, explicit=None):
                 f"scene. Pass --config {cfg.load_plan} (its config block) to match.")
     else:
       try:
+        print(f"[rss] peak RSS before solve: {_rss_mb():.0f} MB")   # A1/A6 instrumentation
         plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
       except IKFailureLogDone:
         print(f"[ik-failures] window/cap reached -- search stopped for debugging "
@@ -2336,6 +2342,10 @@ def run(cfg, explicit=None):
               f"(> {cfg.grasp_accuracy:g}m tool residual).")
       print(f"[mate-accuracy] vetoed {robot_ik.mate_rejects} under-seated mates "
             f"(> {cfg.mate_accuracy:g}m residual).")
+    if robot_ik is not None and plan is not None:
+      # A1 INSTRUMENTATION: where the real-IK time went + a peak-RSS checkpoint (A6).
+      robot_ik.prof_report()
+      print(f"[rss] peak RSS after solve: {_rss_mb():.0f} MB")
     if fail_rec is not None and fail_rec.steps:
       print(f"[ik-failures] {len(fail_rec.steps)} failed binds recorded -- serving in "
             f"viser (Stop in the GUI to continue to the plan replay).")

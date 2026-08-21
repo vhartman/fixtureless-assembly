@@ -406,6 +406,23 @@ class RobotIK:
     self._reach_bounds = {}                               # robot -> sound max-reach (lazy)
     self.reach_rejects = 0                                # rejects by the reach-sphere bound
     self.analytic_rejects = 0                             # rejects by empty ssik solution sets
+    # A1 INSTRUMENTATION (pure counters/timers; ZERO behavior change): where bind/_solve_ik
+    # time goes. Summarized by prof_report() at the end of main.run(). Stage buckets
+    # (seeded/unseeded/restart) count EVERY _solve_ik call, including the reach precheck's
+    # relaxed solves -- precheck_time is the wall-clock view, the buckets the NLP-CPU view.
+    self.prof = {
+        "bind_calls": 0, "bind_cache_hits": 0, "bind_solves": 0,
+        "bind_success": 0, "bind_fail": 0, "bind_time": 0.0,
+        "precheck_calls": 0, "precheck_time": 0.0,
+        "seeded_solves": 0, "seeded_time": 0.0,
+        "unseeded_solves": 0, "unseeded_time": 0.0,
+        "restart_solves": 0, "restart_time": 0.0,
+        "post_calls": 0, "post_time": 0.0,                # _pen_ok + _clearance_ok gates
+        "getpath_calls": 0,                               # is getPath() worth hoisting?
+        "by_action": {},                                  # (kind, part, gid) -> [n, fails, s]
+        "calls_with_seeds": 0, "calls_without_seeds": 0,  # why so few analytic solves?
+        "wins": {},                                       # winning attempt histogram
+    }
     self.mate_eq_weight = None                            # None = 1e1 (rai default here)
     self.place_eq_weight = None                           # same, for _ik_place's object-pose eq
     self.mate_residual_reject = None                      # None = off; metres (--mate-accuracy)
@@ -720,6 +737,7 @@ class RobotIK:
   # own objective, then solves. Returns (feasible, witness or None).
   # ------------------------------------------------------------------------------------
   def bind(self, action, s0, s1, assembly, seed=None):
+    import time as _time
     kind = action[0]
     if kind == "release":
       return True, None                                   # no new reach
@@ -727,6 +745,8 @@ class RobotIK:
       # in-place skill: the arm keeps its config; the part rotates IN the gripper (no IK
       # target of its own -- downstream actions solve IK against the new grasp).
       return True, None
+    self.prof["bind_calls"] += 1                          # A1: real IK binds only
+    _bt0 = _time.perf_counter()
     # VERDICT + WITNESS CACHE on a discrete scene signature: the search re-probes the SAME
     # (action, scene) from many parent states, and a FAILED solve costs ~135ms (initial +
     # 12 restarts) vs ~5ms for a success -- measured 81 re-probed pick failures per 40
@@ -738,6 +758,7 @@ class RobotIK:
     if self._opt_pull is None:                            # pulled re-solves are step-specific:
       hit = self._ik_cache.get(key)                       # never read/write the cache for them
       if hit is not None:
+        self.prof["bind_cache_hits"] += 1
         return hit
     if kind == "pick":
       res = self._ik_pick(action, s0, s1, assembly, seed)
@@ -747,6 +768,18 @@ class RobotIK:
       res = self._ik_assemble(action, s0, s1, assembly, seed)
     else:                                                 # add_grasp / handover: 2nd arm
       res = self._ik_add_grasp(action, s0, s1, assembly, seed)
+    self.prof["bind_solves"] += 1
+    self.prof["bind_success" if res[0] else "bind_fail"] += 1
+    _dt = _time.perf_counter() - _bt0
+    self.prof["bind_time"] += _dt
+    # A1: per-(kind, part, grasp) attribution -- which actions burn the bind wall time.
+    _ak = (kind, action[2] if len(action) > 2 else None,
+           action[3] if len(action) > 3 else None)
+    _e = self.prof["by_action"].setdefault(_ak, [0, 0, 0.0])
+    _e[0] += 1
+    if not res[0]:
+      _e[1] += 1
+    _e[2] += _dt
     if self._opt_pull is None:
       self._ik_cache[key] = res
     return res
@@ -768,6 +801,40 @@ class RobotIK:
       else:
         parts.append(("H", members, grasps))
     return tuple(sorted(parts))
+
+  def prof_report(self):
+    # A1 INSTRUMENTATION summary: where real-IK time went. Pure print of self.prof (see
+    # __init__); stage buckets include the reach precheck's relaxed solves, so
+    # seeded+unseeded+restart time ~= the NLP-CPU total across precheck AND full solves.
+    p = self.prof
+    nlp_n = p["seeded_solves"] + p["unseeded_solves"] + p["restart_solves"]
+    nlp_t = p["seeded_time"] + p["unseeded_time"] + p["restart_time"]
+    print(f"[ik-prof] binds: {p['bind_calls']} called, {p['bind_cache_hits']} cache hits "
+          f"({100 * p['bind_cache_hits'] / max(1, p['bind_calls']):.0f}%), "
+          f"{p['bind_solves']} solved ({p['bind_success']} ok / {p['bind_fail']} failed), "
+          f"bind wall {p['bind_time']:.1f}s")
+    print(f"[ik-prof] NLP solves: {nlp_n} in {nlp_t:.1f}s "
+          f"(seeded {p['seeded_solves']}/{p['seeded_time']:.1f}s, "
+          f"unseeded {p['unseeded_solves']}/{p['unseeded_time']:.1f}s, "
+          f"restarts {p['restart_solves']}/{p['restart_time']:.1f}s)")
+    if nlp_n:
+      print(f"[ik-prof] per-solve avg {1000 * nlp_t / nlp_n:.0f}ms; restart share of NLP "
+            f"time {100 * p['restart_time'] / max(nlp_t, 1e-9):.0f}%")
+    print(f"[ik-prof] reach precheck: {p['precheck_calls']} relaxed solves in "
+          f"{p['precheck_time']:.1f}s ({self.precheck_rejects} rejects caught); "
+          f"post-solve gates {p['post_calls']}x in {p['post_time']:.1f}s; "
+          f"getPath calls {p['getpath_calls']}")
+    print(f"[ik-prof] _solve_ik calls with seeds: {p['calls_with_seeds']}, without: "
+          f"{p['calls_without_seeds']} "
+          f"({100 * p['calls_without_seeds'] / max(1, p['calls_with_seeds'] + p['calls_without_seeds']):.0f}% unseeded)")
+    if p["wins"]:
+      wins = ", ".join(f"{k}={v}" for k, v in sorted(p["wins"].items()))
+      print(f"[ik-prof] winning attempt distribution: {wins}")
+    ba = p["by_action"]
+    if ba:
+      print("[ik-prof] top actions by bind time (kind/part/grasp: n (failed) time):")
+      for (kind, part, gid), (n, nf, t) in sorted(ba.items(), key=lambda kv: -kv[1][2])[:12]:
+        print(f"[ik-prof]   {kind:9s} {part} g{gid}: {n}x ({nf} failed) {t:.1f}s")
 
   def _holders_of_group(self, state, group):
     # robots grasping any part of `group`
@@ -1224,7 +1291,18 @@ class RobotIK:
     # warm starts -- helps CONVERGENCE-limited reaches; note it does NOT help collision-limited
     # ones (an exact analytic pose may collide, whereas the KOMO's tolerant pose eq can settle on
     # a nearby collision-free pose the discrete IK solutions don't cover), hence the fallback.
-    for seed in (seeds or []):
+    import time as _time
+    if seeds:
+      self.prof["calls_with_seeds"] += 1
+    else:
+      self.prof["calls_without_seeds"] += 1
+
+    def _win(k):                                          # A1: winning-attempt histogram
+      if getattr(self, "_pc", False):
+        k = "pc_" + k                                     # precheck-sourced (relaxed solve)
+      self.prof["wins"][k] = self.prof["wins"].get(k, 0) + 1
+
+    for _si, seed in enumerate(seeds or []):
       seed = np.asarray(seed, dtype=float)
       skey = (self._cur_action,
               tuple(C.getJointNames()) if C is not None else (), int(seed.size))
@@ -1241,18 +1319,30 @@ class RobotIK:
         self.seed_init_skips += 1
         break
       komo.initWithConstant(seed)
+      import time as _time
+      _t0 = _time.perf_counter()
       r = self._nlp(komo).solve().dict()
-      if r["feasible"] and self._pen_ok(C, komo.getPath()[-1]) and self._clearance_ok(C, komo.getPath()[-1]):
-        self._last_res = r
-        if self.harvest_branches is not None:
-          # CANDIDATE HARVEST: keep going. The analytic seed set ENUMERATES the arm's exact
-          # pose branches (up to 8), but returning the FIRST feasible one is what makes the
-          # witness-ladder's pool thin -- measured, solo picks yielded ~3 candidates all in one
-          # basin, so the DP had nothing to choose between. Collect them all and let the ladder
-          # pick; None (the default) restores the early return exactly.
-          self.harvest_branches.append(komo.getPath()[-1])
-          continue
-        return True, komo.getPath()[-1]
+      self.prof["seeded_solves"] += 1
+      self.prof["seeded_time"] += _time.perf_counter() - _t0
+      if r["feasible"]:
+        self.prof["getpath_calls"] += 1
+        _t0 = _time.perf_counter()
+        _okp = self._pen_ok(C, komo.getPath()[-1])
+        _ok = _okp and self._clearance_ok(C, komo.getPath()[-1])
+        self.prof["post_calls"] += 1
+        self.prof["post_time"] += _time.perf_counter() - _t0
+        if _ok:
+          _win(f"seed{_si}")
+          self._last_res = r
+          if self.harvest_branches is not None:
+            # CANDIDATE HARVEST: keep going. The analytic seed set ENUMERATES the arm's exact
+            # pose branches (up to 8), but returning the FIRST feasible one is what makes the
+            # witness-ladder's pool thin -- measured, solo picks yielded ~3 candidates all in one
+            # basin, so the DP had nothing to choose between. Collect them all and let the ladder
+            # pick; None (the default) restores the early return exactly.
+            self.harvest_branches.append(komo.getPath()[-1])
+            continue
+          return True, komo.getPath()[-1]
     if self.harvest_branches:
       return True, self.harvest_branches[0]
     if seeds:
@@ -1261,16 +1351,40 @@ class RobotIK:
       # TOLERANCE slack (a nearby collision-free near-pose). A few tries cover that; the full
       # budget is for UNSEEDED solves where restarts must find the branches themselves.
       restarts = min(restarts, self.seed_restart_cap)
+    import time as _time
+    _t0 = _time.perf_counter()
     r = self._nlp(komo).solve().dict()
-    if r["feasible"] and self._pen_ok(C, komo.getPath()[-1]) and self._clearance_ok(C, komo.getPath()[-1]):
-      self._last_res = r
-      return True, komo.getPath()[-1]
-    for _ in range(restarts):
-      komo.initRandom()
-      r = self._nlp(komo).solve().dict()
-      if r["feasible"] and self._pen_ok(C, komo.getPath()[-1]) and self._clearance_ok(C, komo.getPath()[-1]):
+    self.prof["unseeded_solves"] += 1
+    self.prof["unseeded_time"] += _time.perf_counter() - _t0
+    if r["feasible"]:
+      self.prof["getpath_calls"] += 1
+      _t0 = _time.perf_counter()
+      _okp = self._pen_ok(C, komo.getPath()[-1])
+      _ok = _okp and self._clearance_ok(C, komo.getPath()[-1])
+      self.prof["post_calls"] += 1
+      self.prof["post_time"] += _time.perf_counter() - _t0
+      if _ok:
+        _win("unseeded")
         self._last_res = r
         return True, komo.getPath()[-1]
+    for _ri in range(restarts):
+      komo.initRandom()
+      _t0 = _time.perf_counter()
+      r = self._nlp(komo).solve().dict()
+      self.prof["restart_solves"] += 1
+      self.prof["restart_time"] += _time.perf_counter() - _t0
+      if r["feasible"]:
+        self.prof["getpath_calls"] += 1
+        _t0 = _time.perf_counter()
+        _okp = self._pen_ok(C, komo.getPath()[-1])
+        _ok = _okp and self._clearance_ok(C, komo.getPath()[-1])
+        self.prof["post_calls"] += 1
+        self.prof["post_time"] += _time.perf_counter() - _t0
+        if _ok:
+          _win(f"restart{_ri}")
+          self._last_res = r
+          return True, komo.getPath()[-1]
+    _win("none")
     self._last_res = r
     return False, None
 
@@ -1480,7 +1594,13 @@ class RobotIK:
     # without running the full solve. Residual-gated (see the reach_precheck comment in
     # __init__): a failed relaxed solve rejects only when it missed by a lot (eq >
     # precheck_eq_min); borderline failures fall through to the full solve, which decides.
+    import time as _time
+    _t0 = _time.perf_counter()
+    self._pc = True                                       # A1: tag wins as precheck-sourced
     ok0, _ = self._solve_ik(komo_nc)
+    self._pc = False
+    self.prof["precheck_calls"] += 1
+    self.prof["precheck_time"] += _time.perf_counter() - _t0
     if ok0:
       return False
     if (getattr(self, "_last_res", {}) or {}).get("eq", 0.0) <= self.precheck_eq_min:
@@ -6278,6 +6398,30 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
   # "loose held" and the goal FORCED a table set-down -- fine for the floating-EE checks,
   # IK-infeasible for real arms on the chair's back+posts module: every module fill died.
   relevant = set(ideal) | {p}
+
+  # A1 INSTRUMENTATION: per-fill bind deltas -- which fill burns the bind wall time, on what.
+  _fp0 = None
+  if robot_ik is not None:
+    _fp0 = (dict(robot_ik.prof),
+            {k: list(v) for k, v in robot_ik.prof["by_action"].items()})
+
+  def _fill_prof(tag):
+    if robot_ik is None or not verbose or _fp0 is None:
+      return
+    pr, (f0, fba) = robot_ik.prof, _fp0
+    db = pr["bind_solves"] - f0["bind_solves"]
+    if not db:
+      return
+    df = pr["bind_fail"] - f0["bind_fail"]
+    dt = pr["bind_time"] - f0["bind_time"]
+    dts = sorted(((k, v[0] - fba.get(k, [0, 0, 0.0])[0],
+                   v[1] - fba.get(k, [0, 0, 0.0])[1],
+                   v[2] - fba.get(k, [0, 0, 0.0])[2]) for k, v in pr["by_action"].items()),
+                 key=lambda x: -x[3])
+    tops = "; ".join(f"{k[0]}/{k[1]}/g{k[2]} x{n} ({nf} fail, {t:.1f}s)"
+                     for k, n, nf, t in dts[:4] if t > 0.01)
+    print(f"[fill-prof {tag}] binds={db} failed={df} bind_time={dt:.1f}s"
+          + (f": {tops}" if tops else ""))
   settle = settle_ref if settle_ref is not None else assembly.base
 
   def _comps(s):
@@ -6459,6 +6603,7 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
       # restarts never covered the leg-grasp x seat-grasp space (95 s x fill, then failure).
       subplan = engine.search(max_nodes, deadline=deadline)
       if subplan is None:
+        _fill_prof(f"{p}:exhausted")
         return None, None
       s = start
       valid = True
@@ -6488,7 +6633,9 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
           top = ", ".join(f"{k}:{c}" for k, c in kinds.most_common(6))
           print(f"[fill {p}] lazy converged after {_round + 1} rounds; refuted binds "
                 f"by (kind, robot, arg): {top}")
+        _fill_prof(f"{p}:ok")
         return subplan, s
+    _fill_prof(f"{p}:rounds-out")
     return None, None
 
   subplan = _astar(start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
@@ -6496,6 +6643,7 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
                    weight=weight, max_nodes=max_nodes, verbose=False,
                    tag=f"add {p}", deadline=deadline, cost_bound=cost_bound)
   if subplan is None:
+    _fill_prof(f"{p}:astar-fail")
     return None, None
   s = start
   for a in subplan:
@@ -6503,6 +6651,7 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
                                           gripper_kind=gripper_kind, handovers=handovers,
                                           allow_place=allow_place, bracing=bracing)
              if act == a)
+  _fill_prof(f"{p}:ok-astar")
   return subplan, s
 
 
