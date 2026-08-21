@@ -448,6 +448,19 @@ class RobotIK:
       # the DP had nothing to choose between -- measured, the harvest took one pick from 1
       # candidate/1 branch to 6/2. Set False to restore the first-feasible-only behaviour.
     self.seed_restart_cap = 2                             # random restarts left after seeds (see _solve_ik)
+    # RESTART BUDGETS (--ik-restarts / --precheck-restarts). MEASURED (peg-stool chamfer,
+    # 2026-08-21): all 208 precheck successes came from the FIRST relaxed attempt, and full-
+    # solve restarts win 25/202 with nothing at attempt >=7 -- see
+    # proposals/search-improvements.md. Lowering trades stochastic completeness for time.
+    self.restarts_full = 12
+    self.restarts_precheck = 12
+    # FAILURE-INFORMED ORDERING (--fail-order). Collects per-candidate outcome evidence and,
+    # when ON, reorders candidate sweeps never-tried-first / ascending fail rate. Ordering
+    # ONLY: every candidate stays reachable (the sweep is exhaustive either way), so
+    # completeness is untouched; only which equal-f variant is tried first changes.
+    # Evidence key -> [n, fails, eq_sum_on_fail] ("abias" = assemble bias sweep slot).
+    self.fail_order = False
+    self.action_stats = {}
     self.braced_analytic = True                           # per-arm analytic for BRACED place/assemble
     # PRE-INSERTION funnel (--pre-insertion), EXPORT/REPLAY ONLY: metres to back off along the
     # mate axis for the pre-assemble GOTO waypoint. 0.0 = off. The SEARCH is untouched -- the
@@ -1282,7 +1295,7 @@ class RobotIK:
       return False
     return True
 
-  def _solve_ik(self, komo, restarts=12, seeds=None, C=None):
+  def _solve_ik(self, komo, restarts=None, seeds=None, C=None):
     # solve a skill KOMO, retrying from fresh inits until one converges. KOMO seeds its guess
     # with a little noise, so a borderline-reachable target flips feasible/infeasible run-to-
     # run; restarts make bind reliable -- a genuinely feasible action returns a witness (instead
@@ -1292,6 +1305,8 @@ class RobotIK:
     # ones (an exact analytic pose may collide, whereas the KOMO's tolerant pose eq can settle on
     # a nearby collision-free pose the discrete IK solutions don't cover), hence the fallback.
     import time as _time
+    if restarts is None:
+      restarts = self.restarts_full                       # --ik-restarts (default 12)
     if seeds:
       self.prof["calls_with_seeds"] += 1
     else:
@@ -1597,7 +1612,7 @@ class RobotIK:
     import time as _time
     _t0 = _time.perf_counter()
     self._pc = True                                       # A1: tag wins as precheck-sourced
-    ok0, _ = self._solve_ik(komo_nc)
+    ok0, _ = self._solve_ik(komo_nc, restarts=self.restarts_precheck)
     self._pc = False
     self.prof["precheck_calls"] += 1
     self.prof["precheck_time"] += _time.perf_counter() - _t0
@@ -2107,10 +2122,22 @@ class RobotIK:
       if self._reach_precheck_reject(action, C, komo_nc):
         return False, None
 
-    biases = [bias_axes] if bias_axes is not None else _ASSEMBLE_BIAS_ORIENTATIONS
+    if bias_axes is not None:
+      sweep = [(0, bias_axes)]                             # forced single orientation (export)
+    elif self.fail_order:
+      # --fail-order: sweep the biases never-tried-first, then ascending fail rate, then
+      # canonical index (stable + deterministic). Pure reordering -- the sweep stays exhaustive,
+      # so completeness is untouched; only which equal-f variant is tried first changes.
+      def _bias_rank(ib):
+        i, _b = ib
+        n, f, eq = self.action_stats.get(("abias", part, onto, i), (0, 0, 0.0))
+        return (n == 0, f / n if n else 0.0, -eq, i)
+      sweep = sorted(enumerate(_ASSEMBLE_BIAS_ORIENTATIONS), key=_bias_rank)
+    else:
+      sweep = list(enumerate(_ASSEMBLE_BIAS_ORIENTATIONS))  # canonical order (default)
     komo = None
     feasible, witness = False, None
-    for bias in biases:                                   # deterministic orientation sweep
+    for bi, bias in sweep:                                # deterministic orientation sweep
       komo = self._assemble_komo(C, part_name, onto, rel_pos, rel_quat, bias)
       self._add_pull(komo, C, robot)                    # witness-opt pull (no-op in search)
       self._add_pin(komo, C)                            # pre-skill pin (no-op in search)
@@ -2124,6 +2151,12 @@ class RobotIK:
         if _mr > self.mate_residual_reject:
           self.mate_rejects += 1                       # under-seated: try the next bias/restart
           feasible = False
+      if bias_axes is None:                            # evidence: canonical bias slot id `bi`
+        _st = self.action_stats.setdefault(("abias", part, onto, bi), [0, 0, 0.0])
+        _st[0] += 1
+        if not feasible:
+          _st[1] += 1
+          _st[2] += float((getattr(self, "_last_res", {}) or {}).get("eq", 0.0) or 0.0)
       if feasible:
         break
     if (feasible and witness is not None and backoff <= 0.0

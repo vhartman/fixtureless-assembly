@@ -286,6 +286,30 @@ def build_parser():
            "(replacing the relaxed precheck), collision-probed branch combos, and warm starts "
            "for the KOMO. Calibrated arms only (ur5/ur10 two-finger); others keep the precheck.",
   )
+  g_ik.add_argument(
+      "--ik-restarts", type=int, default=12, metavar="N",
+      help="With --real-ik: random-restart budget of each FULL collision-aware KOMO solve "
+           "when no analytic seeds warm-start it (seeded solves already cap at 2). MEASURED "
+           "(peg-stool chamfer): restarts deliver 25/202 full-solve successes and nothing "
+           "wins at attempt >=7. Lower to trade stochastic completeness for time -- a missed "
+           "witness blacklists the edge (the fill's other candidates still run).",
+  )
+  g_ik.add_argument(
+      "--precheck-restarts", type=int, default=12, metavar="N",
+      help="Restart budget of the RELAXED reach-precheck solve. Its verdict is residual-gated "
+           "EVIDENCE only (borderline failures fall through to the full solve, which decides), "
+           "and MEASURED: all precheck successes came from the FIRST relaxed attempt -- the "
+           "default 12 burns restarts on hopeless calls for nothing.",
+  )
+  g_ik.add_argument(
+      "--fail-order", action=argparse.BooleanOptionalAction, default=False,
+      help="With --real-ik: failure-informed candidate ORDERING. Collects per-candidate "
+           "outcome evidence (assemble-bias slots first) and sweeps candidates never-tried-"
+           "first / ascending fail rate. Ordering ONLY -- every candidate stays reachable in "
+           "its exhaustive sweep, so completeness is untouched; equal-f tie-breaks change. "
+           "MEASURED motivation: assemble bias re-probes burned 70s/instance (obj_3 x56, "
+           "obj_4 x37), and the winning bias repeats across milestones.",
+  )
   g_phys.add_argument(
       "--dense-grasps", action="store_true",
       help="TWO-FINGER only: add the +-45deg WRIST-TILTED variant of every face grasp -- the "
@@ -2149,6 +2173,10 @@ def run(cfg, explicit=None):
   if cfg.solve or cfg.load_plan:
     robots = get_robots(C)
     robot_ik = RobotIK(C, robots) if cfg.real_ik else None
+    if robot_ik is not None:
+      robot_ik.restarts_full = cfg.ik_restarts
+      robot_ik.restarts_precheck = cfg.precheck_restarts
+      robot_ik.fail_order = cfg.fail_order
     if robot_ik is not None and cfg.full_ik:
       robot_ik.single_arm_ik = False
       robot_ik.strip_inactive_collision = False
