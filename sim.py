@@ -2357,7 +2357,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         pace=False, dwell=DWELL_T, pace_trace=None, phase_schedule=False,
                         phase_servo_time=0.15, phase_smooth=False, phase_smooth_time=0.12,
                         phase_batch=False, phase_batch_min_motion=0.08,
-                        phase_batch_max_gap=0.35,
+                        phase_batch_max_gap=0.35, phase_intent=False,
+                        phase_intent_ramp=0.08, phase_intent_rate=2.0,
                         directional_caps=False, mate_caps=None,
                         verify_efc_cache=False, force_limits=False, wrench_margin=1.0, mass_scale=1.0, inertia_factor=1.0,
                         corner_limits=True,
@@ -3828,8 +3829,11 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
               f"{len(traj.fires)} post-switch poses collision-free.")
         if phase_smooth:
           if traj.progress is None:
-            print("[sim/mp] --phase-smooth SKIPPED: the synchronized fallback has no "
-                  "independent phase trace.")
+            raise RuntimeError(
+                "[sim/mp] --phase-smooth REQUIRED but the phase scheduler fell back to a "
+                "synchronized trajectory with no independent phase trace. Aborting before "
+                "physics; rerun without --phase-smooth only if raw/synchronized execution "
+                "is explicitly desired.")
           else:
             _raw_traj = traj
             _restore = set()
@@ -3840,38 +3844,60 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             for _smooth_pass in range(3):
               _cand, _smooth_rep = retiming.smooth_phase_trajectory(
                   _raw_traj, _P, arm_dims, acting, window=phase_smooth_time,
-                  locked=_smooth_locks, restore_intervals=_restore)
+                  locked=_smooth_locks, restore_intervals=_restore,
+                  barrier_indices=_bi, ramp_dist=RAMP_DIST,
+                  corner_dv=retiming.DEFAULT_CORNER_DV)
               _bad_smooth = _phase_audit(_cand, collect=True)
               if not _bad_smooth:
-                traj = _cand
                 _br, _ar = _smooth_rep["before"], _smooth_rep["after"]
                 _jr = 100.0 * (1.0 - _ar["jerk_rms"] / max(_br["jerk_rms"], 1e-12))
                 _acr = 100.0 * (1.0 - _ar["accel_rms"] / max(_br["accel_rms"], 1e-12))
+                if not retiming.smoothness_not_worse(_br, _ar, tolerance=0.02):
+                  _pa0, _pa1 = _smooth_rep["phase_before"], _smooth_rep["phase_after"]
+                  _arms = ", ".join(
+                      f"a{_r} accel {100 * (_a['accel_rms'] / max(_b['accel_rms'], 1e-12) - 1):+.1f}%/"
+                      f"jerk {100 * (_a['jerk_rms'] / max(_b['jerk_rms'], 1e-12) - 1):+.1f}%"
+                      for _r, (_b, _a) in enumerate(zip(
+                          _smooth_rep["by_arm_before"], _smooth_rep["by_arm_after"])))
+                  raise RuntimeError(
+                      f"[sim/mp] --phase-smooth REQUIRED but its collision-free proposal "
+                      f"would change joint accel RMS by {-_acr:+.1f}% and jerk RMS by "
+                      f"{-_jr:+.1f}% (more than 2% worse is rejected). Phase-space accel "
+                      f"changes by {100 * (_pa1['accel_rms'] / max(_pa0['accel_rms'], 1e-12) - 1):+.1f}% "
+                      f"and jerk by {100 * (_pa1['jerk_rms'] / max(_pa0['jerk_rms'], 1e-12) - 1):+.1f}%; "
+                      f"max phase displacement {_smooth_rep['progress_max_delta']:.4g}rad; "
+                      f"corner-fixed increments {_smooth_rep['corner_fixed_increments']}; "
+                      f"per arm: {_arms}. Aborting before "
+                      "physics instead of executing the unsmoothed phase schedule.")
+                traj = _cand
                 print(f"[sim/mp] --phase-smooth ACTIVE: Gaussian phase-rate smoothing over "
                       f"{phase_smooth_time:g}s; every fire vector pinned, monotonicity and "
                       f"actor stops preserved. Exact 2ms audit passed; restored "
                       f"{len(_restore)}/{_smooth_rep['intervals']} collision-sensitive "
                       f"interval(s) and {_smooth_rep['locked_arm_intervals']} rigid arm-"
                       f"interval(s); {_smooth_rep['rate_limited_arm_intervals']} arm-"
-                      f"interval(s) kept raw to prevent peak-rate growth. Joint accel RMS "
+                      f"interval(s) kept raw to prevent peak-rate growth; "
+                      f"{_smooth_rep['corner_fixed_increments']} intentional corner-rate "
+                      f"increment(s) preserved. Joint accel RMS "
                       f"reduction {_acr:+.1f}%, jerk RMS reduction {_jr:+.1f}%.")
                 break
               _new = {retiming.phase_interval_at(_raw_traj, _i)
                       for _i, _m, _p in _bad_smooth} - _restore
               if not _new:
-                traj = _raw_traj
-                print("[sim/mp] --phase-smooth FALLBACK: a violation remained on already "
-                      "restored source intervals; executing the certified raw schedule.")
-                break
+                raise RuntimeError(
+                    "[sim/mp] --phase-smooth REQUIRED but a collision remained on already "
+                    "restored source intervals. Aborting before physics instead of executing "
+                    "the unsmoothed phase schedule.")
               _restore |= _new
               print(f"[sim/mp] --phase-smooth local fallback pass {_smooth_pass + 1}: "
                     f"restoring fire interval(s) {sorted(_new)} after "
                     f"{len(_bad_smooth)} dense collision rejection(s).")
             else:
-              traj = _raw_traj
-              print("[sim/mp] --phase-smooth FALLBACK after 3 passes: executing the "
-                    "certified raw phase schedule.")
-        if phase_batch and traj.progress is not None:
+              raise RuntimeError(
+                  "[sim/mp] --phase-smooth REQUIRED but its collision repair did not "
+                  "converge after 3 passes. Aborting before physics instead of executing "
+                  "the unsmoothed phase schedule.")
+        if (phase_batch or phase_intent) and traj.progress is not None:
           # Batch short move-stop-move islands only after the ordinary scheduler/smoother has
           # finished. This sibling pass does not care whether geometry came from Catmull-Rom
           # or C2. It may flow through another arm's event, but checks both worlds there.
@@ -3894,10 +3920,16 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
               _fired += 1
             return True
 
-          _batch, _batch_rep = retiming.batch_phase_motions(
-              traj, _P, arm_dims, acting, _bar, locked=_batch_locks,
-              min_motion=phase_batch_min_motion, max_gap=phase_batch_max_gap,
-              stopped_rate=0.05 * JOINT_RATE, collision_free=_batch_free)
+          if phase_intent:
+            _batch, _batch_rep = retiming.intentional_phase_motions(
+                traj, _P, arm_dims, acting, _bar, locked=_batch_locks,
+                stopped_rate=0.05 * JOINT_RATE, collision_free=_batch_free,
+                intent_rate=phase_intent_rate, ramp_time=phase_intent_ramp)
+          else:
+            _batch, _batch_rep = retiming.batch_phase_motions(
+                traj, _P, arm_dims, acting, _bar, locked=_batch_locks,
+                min_motion=phase_batch_min_motion, max_gap=phase_batch_max_gap,
+                stopped_rate=0.05 * JOINT_RATE, collision_free=_batch_free)
           _bad_batch = _phase_audit(_batch)
           _restored_batch_windows = set()
           # The planner predicate has internal state/caches, so retain the same final dense
@@ -3935,27 +3967,70 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             _batch_small = sum(x["arc"] < phase_batch_min_motion for x in _batch_rows)
             _batch_internal_slow = retiming.internal_slow_episodes(
                 traj.q, traj.dt, arm_dims, stopped_rate=0.05 * JOINT_RATE)
-            _kept = _batch_rep['merged'] - len(_restored_batch_windows)
-            print(f"[sim/mp] --phase-batch ACTIVE: kept {_kept}/{_batch_rep['merged']} "
-                  f"certified short-motion merge(s); motion islands "
-                  f"{_batch_rep['before']} -> {_batch_after}, small islands "
-                  f"(<{phase_batch_min_motion:g}rad) {_batch_rep['small_before']} -> "
-                  f"{_batch_small}, internal slow gaps "
-                  f"{_batch_rep['internal_slow_before']} -> "
-                  f"{_batch_internal_slow}. Rejected "
-                  f"{_batch_rep['collision_rejected']} collision-sensitive, "
-                  f"{_batch_rep['event_rejected']} event/coupling, "
-                  f"{_batch_rep['rate_rejected']} peak-rate, "
-                  f"{_batch_rep['quality_rejected']} visual-quality proposal(s); final audit locally "
-                  f"restored {len(_restored_batch_windows)} merge(s). Exact 2ms audit passed, "
-                  "including both modes at switches.")
+            _batch_support = retiming.motion_support(
+                traj.q, traj.dt, arm_dims, stopped_rate=0.05 * JOINT_RATE)
+            _proposed = (_batch_rep['accepted'] if phase_intent else _batch_rep['merged'])
+            _kept = _proposed - len(_restored_batch_windows)
+            if phase_intent:
+              _sb = _batch_rep["support_before"]
+              _sm0, _sm1 = (_batch_rep["smoothness_before"],
+                            _batch_rep["smoothness_after"])
+              if (_kept <= 0
+                  or _batch_support["moving_samples"] >= _sb["moving_samples"]):
+                raise RuntimeError(
+                    "[sim/mp] --phase-intent REQUIRED but no collision-certified reduction "
+                    "in motion support survived the final audit. Aborting before physics.")
+              print(f"[sim/mp] --phase-intent ACTIVE: kept {_kept}/"
+                    f"{_proposed} certified robot-owned interval(s); moving support "
+                    f"{_sb['moving_samples']} -> {_batch_support['moving_samples']} samples "
+                    f"(idle {100 * _sb['idle_fraction']:.1f}% -> "
+                    f"{100 * _batch_support['idle_fraction']:.1f}%), conditional moving rate "
+                    f"{_sb['mean_moving_rate']:.2f} -> "
+                    f"{_batch_support['mean_moving_rate']:.2f}rad/s; islands "
+                    f"{_batch_rep['islands_before']} -> {_batch_after}, internal slow gaps "
+                    f"{_batch_rep['slow_before']} -> {_batch_internal_slow}, foreign-switch "
+                    f"stops {_batch_rep['foreign_stops_before']} -> "
+                    f"{_batch_rep['foreign_stops_after']}; "
+                    f"accel RMS {100 * (_sm1['accel_rms'] / max(_sm0['accel_rms'], 1e-12) - 1):+.1f}%, "
+                    f"jerk RMS {100 * (_sm1['jerk_rms'] / max(_sm0['jerk_rms'], 1e-12) - 1):+.1f}%. "
+                    f"Rejected {_batch_rep['collision_rejected']} collision-sensitive, "
+                    f"{_batch_rep['event_rejected']} event-passage, "
+                    f"{_batch_rep['rate_rejected']} peak-rate, "
+                    f"{len(_batch_rep['unresolved'])} unresolved interval(s), "
+                    f"{_batch_rep['protected']} rigidly protected interval(s); final "
+                    f"audit locally restored {len(_restored_batch_windows)} merge(s). Exact "
+                    "2ms audit passed, including both modes at switches.")
+            else:
+              print(f"[sim/mp] --phase-batch ACTIVE: kept {_kept}/{_batch_rep['merged']} "
+                    f"certified short-motion merge(s); motion islands "
+                    f"{_batch_rep['before']} -> {_batch_after}, small islands "
+                    f"(<{phase_batch_min_motion:g}rad) {_batch_rep['small_before']} -> "
+                    f"{_batch_small}, internal slow gaps "
+                    f"{_batch_rep['internal_slow_before']} -> "
+                    f"{_batch_internal_slow}. Rejected "
+                    f"{_batch_rep['collision_rejected']} collision-sensitive, "
+                    f"{_batch_rep['event_rejected']} event/coupling, "
+                    f"{_batch_rep['rate_rejected']} peak-rate, "
+                    f"{_batch_rep['quality_rejected']} visual-quality proposal(s); final audit locally "
+                    f"restored {len(_restored_batch_windows)} merge(s). Exact 2ms audit passed, "
+                    "including both modes at switches.")
           else:
             traj = _batch_source
             _touch = [w for w in _batch_rep.get("accepted_windows", ())
                       if w[1] <= int(_bad_batch[0]) <= w[2]]
+            if phase_intent:
+              raise RuntimeError(
+                  f"[sim/mp] --phase-intent REQUIRED but final audit rejected sample "
+                  f"{_bad_batch[0]}, mode {_bad_batch[1]}: {_bad_batch[2]}; accepted windows "
+                  f"touching it: {_touch}. Aborting before physics.")
             print(f"[sim/mp] --phase-batch FALLBACK: final exact audit rejected sample "
                   f"{_bad_batch[0]}, mode {_bad_batch[1]}: {_bad_batch[2]}; accepted windows "
                   f"touching it: {_touch}. Executing the preceding certified trajectory.")
+        elif phase_batch or phase_intent:
+          raise RuntimeError(
+              f"[sim/mp] {'--phase-intent' if phase_intent else '--phase-batch'} REQUIRED "
+              "but no independent phase trace exists. "
+              "Aborting before physics instead of executing a synchronized/raw trajectory.")
         # Localize visually objectionable pauses in the planned reference.  The aggregate
         # motion-quality report below says how much stopping occurred, but not whether a long
         # all-arm plateau sits immediately before a mode switch (usually phase bookkeeping,
@@ -4714,12 +4789,20 @@ def _cli_run(a):
     raise SystemExit("[sim] --phase-smooth requires --phase-schedule")
   if a.phase_batch and not a.phase_schedule:
     raise SystemExit("[sim] --phase-batch requires --phase-schedule")
+  if a.phase_intent and not a.phase_schedule:
+    raise SystemExit("[sim] --phase-intent requires --phase-schedule")
+  if a.phase_intent and a.phase_batch:
+    raise SystemExit("[sim] --phase-intent and --phase-batch are alternative final stages")
   if a.c2_spline and not (a.corridor or a.phase_schedule):
     raise SystemExit("[sim] --c2-spline requires --corridor or --phase-schedule")
   if a.phase_smooth_time <= 0.0:
     raise SystemExit("[sim] --phase-smooth-time must be positive")
   if a.phase_batch_min_motion <= 0.0 or a.phase_batch_max_gap <= 0.0:
     raise SystemExit("[sim] --phase-batch thresholds must be positive")
+  if a.phase_intent_ramp <= 0.0:
+    raise SystemExit("[sim] --phase-intent-ramp must be positive")
+  if a.phase_intent_rate <= 0.0:
+    raise SystemExit("[sim] --phase-intent-rate must be positive")
   if a.c2_samples_per_seg < 1:
     raise SystemExit("[sim] --c2-samples-per-seg must be at least 1")
   if not 0.0 < a.c2_control_ratio <= 1.0:
@@ -5001,6 +5084,9 @@ def _cli_run(a):
                               phase_batch=a.phase_batch,
                               phase_batch_min_motion=a.phase_batch_min_motion,
                               phase_batch_max_gap=a.phase_batch_max_gap,
+                              phase_intent=a.phase_intent,
+                              phase_intent_ramp=a.phase_intent_ramp,
+                              phase_intent_rate=a.phase_intent_rate,
                               corridor_ds=a.corridor_ds,
                               corridor_ds_lead=a.corridor_ds_lead,
                               corridor_lead_max=a.corridor_lead_max,
@@ -5143,12 +5229,15 @@ def _build_cli():
                       "planning guess, not runtime feedback; execution still checks actual "
                       "convergence before the event and holds on an overrun.")
   r.add_argument("--phase-smooth", action=argparse.BooleanOptionalAction, default=False,
-                 help="--phase-schedule: postprocess each robot's monotone phase RATE with a "
-                      "Gaussian filter while pinning every complete mode-switch phase vector, "
-                      "actor stops, and rigid coupling intervals. The joint paths are never "
+                 help="--phase-schedule: map each robot's monotone shared phase to its own "
+                      "joint-space path arc and Gaussian-filter that physical RATE while "
+                      "pinning every complete mode-switch phase vector, actor stops, sharp "
+                      "corner slowdowns, and rigid coupling intervals. The joint paths are never "
                       "splined again. The result receives the same exact 2ms/pre+post-switch "
                       "audit; collision-sensitive fire intervals revert locally to the raw "
-                      "certified schedule.")
+                      "certified schedule. Strict: if no independent phase trace exists or a "
+                      "useful collision-free smooth result cannot be certified, abort before "
+                      "physics instead of executing the unsmoothed schedule.")
   r.add_argument("--phase-smooth-time", type=float, default=0.12, metavar="SEC",
                  help="--phase-smooth kernel support in seconds (default 0.12). Larger values "
                       "remove longer rate stutters but are more likely to require a local "
@@ -5167,6 +5256,20 @@ def _build_cli():
   r.add_argument("--phase-batch-max-gap", type=float, default=0.35, metavar="SEC",
                  help="--phase-batch: maximum stopped gap bridged into one motion "
                       "(default 0.35s).")
+  r.add_argument("--phase-intent", action=argparse.BooleanOptionalAction, default=False,
+                 help="--phase-schedule: experimental alternative to --phase-batch. Minimize "
+                      "the temporal support of motion: merge every eligible pair of islands "
+                      "and pack it into the shortest intent-rate-bounded ramped burst, "
+                      "leaving clean idle time. Own events and rigid couplings remain exact; "
+                      "multiple placements are tried against the complete collision corridor "
+                      "and the final 2ms audit. Strict: abort if no support reduction survives.")
+  r.add_argument("--phase-intent-ramp", type=float, default=0.08, metavar="SEC",
+                 help="--phase-intent acceleration/deceleration ramp duration for each packed "
+                      "burst (default 0.08s).")
+  r.add_argument("--phase-intent-rate", type=float, default=2.0, metavar="RAD_S",
+                 help="--phase-intent target peak joint-space path rate (default 2rad/s). "
+                      "This is deliberately above the ordinary 1rad/s visual cruise so motion "
+                      "support can shrink, while remaining below the limited UR arm rates.")
   r.add_argument("--settle-tol", type=float, default=2e-3, metavar="RAD",
                  help="--actuated: before each attach fires, hold the reference until the max "
                       "joint tracking error is under RAD. Default 2e-3: the actuated car has "
