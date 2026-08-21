@@ -21,6 +21,7 @@ rai -> MJCF conventions relied on here, all verified in fk_compare.py rather tha
   * a rai joint frame's relative transform CONTAINS the current joint value, so the tree must
     be read at q = 0 to recover the fixed mounting offset (see `_zeroed`).
 """
+import hashlib
 import os
 import numpy as np
 import robotic as ry
@@ -74,15 +75,52 @@ def joint_of(C, name):
 
 _MESH_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sim_meshes")
 
+# BUMP when the mesh geometry rai returns for these frames changes its convention. The .obj
+# files are cached forever by name, and a rai/scene upgrade changed the link-frame/mesh
+# convention underneath a populated cache once (measured: every arm link mesh rendered ~0.9m
+# off the real links -- the July files carried ~10cm local offsets, the current rai returns
+# ~1m visual-origin offsets that the current frame poses compensate exactly). The epoch stamp
+# purges the arm-mesh cache when it changes; part hull files (part_*) are not rai-derived and
+# are left alone.
+#
+# CONTENT-KEYED (v3): the SAME rai frame name carries DIFFERENT local mesh geometry per robot
+# model (measured: ur10 vs ur5_limited `*_wrist_1_link_0` frames sit 0.14m vs ~1m from their
+# wrist capsules, and the meshes follow). One file per frame name is therefore wrong across
+# scenes -- the first scene to write after a purge won and the others rendered butchered.
+# The stored filename now carries a short hash of the vertex/face content, so each model's
+# geometry gets its own file and the xml references whatever _write_obj returns.
+_MESH_CACHE_EPOCH = "v3"
+
 
 _ARM_COLORS = ["0.2 0.2 0.9 1", "0.9 0.2 0.2 1", "0.2 0.8 0.8 1", "0.9 0.7 0.1 1",
                "0.6 0.2 0.8 1", "0.4 0.9 0.3 1"]           # per-robot tint for the capsules
 
 
 def _write_obj(name, V, T):
-  """Cache a mesh as an .obj (MuJoCo has no .ply decoder), return its abs path. Written once."""
+  """Cache a mesh as an .obj (MuJoCo has no .ply decoder), return its abs path. Written once
+  per name AND per _MESH_CACHE_EPOCH (see above). The stored filename carries a short hash of
+  the vertex/face CONTENT: the same frame name resolves to different geometry in different
+  robot models, so the name alone must not share one file."""
+  Va = np.ascontiguousarray(V, dtype=np.float64)
+  Ta = np.ascontiguousarray(T, dtype=np.int64)
+  h = hashlib.sha1(Va.tobytes() + Ta.tobytes()).hexdigest()[:10]
   os.makedirs(_MESH_CACHE_DIR, exist_ok=True)
-  path = os.path.join(_MESH_CACHE_DIR, name + ".obj")
+  stamp = os.path.join(_MESH_CACHE_DIR, "__epoch__")
+  try:
+    with open(stamp) as f:
+      current = f.read().strip()
+  except OSError:
+    current = None
+  if current != _MESH_CACHE_EPOCH:
+    for fn in os.listdir(_MESH_CACHE_DIR):
+      if fn.endswith(".obj") and "_ur_" in fn:
+        try:
+          os.remove(os.path.join(_MESH_CACHE_DIR, fn))
+        except OSError:
+          pass
+    with open(stamp, "w") as f:
+      f.write(_MESH_CACHE_EPOCH)
+  path = os.path.join(_MESH_CACHE_DIR, f"{name}__m{h}.obj")
   if not os.path.exists(path):
     with open(path, "w") as f:
       f.write("".join(f"v {v[0]:.5f} {v[1]:.5f} {v[2]:.5f}\n" for v in V))
@@ -243,11 +281,23 @@ def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, inde
   return "\n".join(out), jnames
 
 
-def build_arms_mjcf(C, prefixes, **kw):
-  """MJCF for several arms plus the combined joint-name order."""
+def build_arms_mjcf(C, prefixes, contact_masks=None, **kw):
+  """MJCF for several arms plus the combined joint-name order.
+
+  ``contact_masks`` optionally supplies one ``(contype, conaffinity)`` pair per arm.  This
+  is required for real cross-arm physics: giving every link the same contact bit also turns
+  on collisions between links of the *same* articulated chain, which MuJoCo does not infer
+  from the planner's self-collision exclusions.
+  """
   xml, names = [], []
-  for p in prefixes:
-    x, jn = build_arm_mjcf(C, p, **kw)
+  if contact_masks is not None and len(contact_masks) != len(prefixes):
+    raise ValueError("contact_masks must have one entry per arm")
+  for i, p in enumerate(prefixes):
+    arm_kw = dict(kw)
+    if contact_masks is not None:
+      arm_kw["contype"], arm_kw["conaffinity"] = (
+          str(contact_masks[i][0]), str(contact_masks[i][1]))
+    x, jn = build_arm_mjcf(C, p, **arm_kw)
     xml.append(x)
     names.extend(jn)
   return "\n".join(xml), names

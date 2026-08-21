@@ -122,6 +122,12 @@ Chair: --assembly chair --parts 8 --num-robots 4 --robot ur10_limited --seed 1
 | Cube-8, 4 vacuum UR10 | 40 actions, 26 witness sets | 70 modes, 995 states | 3/4 pairs drift | `cube8-4r-vacuum-robust-seed11023-*` |
 | Chair-8, mixed UR10 | 38 actions, 21 witness sets | 64 modes, 903 states | 1/4 pairs drift | `chair8-4r-mixed-robust-seed1-*` |
 
+Current-audit note (2026-08-21): the car artifact in this table predates the strict
+interpolated joint-limit preflight. It is now rejected at stretch 4 because
+`a2_ur_wrist_2_joint=0.286711` exceeds its `0.28319` upper limit by 3.52 mrad. Regenerate its
+motion path before using it for simulation/controller evaluation; `--no-path-preflight` only
+turns it into an unsafe diagnostic and produced a large actuator tracking error in testing.
+
 Chair requires the established mixed fleet and curved vacuum contacts:
 
 ```bash
@@ -151,6 +157,129 @@ debug geometry override, so this rollout is not a certificate for the unscaled r
 
 The dated artifact discussions later in this README describe older plans and are retained for
 forensics. The robust artifacts and commands above are the current reproducible results.
+
+### Visual-quality phase scheduling in simulation
+
+A paper-style formulation, pseudocode, certification argument, and current limitations are in
+[PHASE_SCHEDULING.md](PHASE_SCHEDULING.md).
+
+Use `--phase-schedule` for the offline coordination-space scheduler. It keeps each robot on its
+already planned joint path and chooses only its monotone phase along that path. The objective is
+a calm reference—preferred cruise motion, fewer crawl/stop episodes, and ordinary-speed
+asynchronous arrival at the final pose—not minimum makespan. Mode order, acting/holding robot
+rendezvous, and monotonicity remain hard constraints.
+
+Every proposed phase step is checked with the rebuilt motion planner's complete predicate,
+including the saved robot-margin gates and the strict `--path-preflight-tolerance`. The complete
+schedule is then checked again at every 2 ms sample and on both sides of every mode switch. A
+coordination deadlock falls back to the synchronized path, which is audited too; an invalid
+fallback aborts rather than being simulated. Runtime tick-level collision gating is not the
+planner. `--phase-schedule` also defaults physical arm-arm contacts on as a backstop. The
+MuJoCo masks use one bit per robot, so cross-robot contacts are enabled without the old bug that
+also enabled enormous same-arm self-contact forces.
+
+Phase search runs first on a 10 ms coordination grid, then interpolates back to the 2 ms
+controller rate. Acceptance is still the complete 2 ms audit above. A dense counterexample
+automatically retries the phase search at 4 ms and 2 ms; all grids are exact multiples of the
+controller tick. This removes redundant planner calls on
+long assemblies without weakening the executed trajectory's certificate.
+
+Phase speed is measured in each robot's own joint-space arc, rather than the composite arc of
+all robots. A robot therefore moves at the requested visual cruise whenever it is actually
+moving, and spans where only another robot moves are skipped as zero-duration bookkeeping.
+Every configuration produced by those skips remains subject to the same collision predicate
+and dense final audit.
+
+`--phase-smooth` applies a second, time-domain postprocessor to the resulting per-robot phase
+rates. It does **not** fit another joint-space spline: that would cut geometric corners and
+invalidate the motion path. Instead it Gaussian-smooths non-negative phase increments over
+`--phase-smooth-time` (default 0.12 s), projects every fire-to-fire interval back to its exact
+phase displacement, pins the complete phase vector at every mode switch, retains actor stops,
+and leaves rigid co-hold/collision-coupling intervals unchanged. A per-robot guard rejects any
+interval that would exceed that robot's certified source peak rate. The complete result is then
+audited at 2 ms in both pre- and post-switch modes; collision-sensitive intervals revert locally
+to their original certified samples. Thus smoothing can reduce acceleration and jerk but can
+never become a reason to execute an unaudited shortcut.
+
+`--phase-servo-time SEC` is the fixed nominal pre-fire reservation used while forming the
+offline phase schedule (default 0.15 s per settle or seat operation, matching the measured
+car-mini mean rather than its 1 s worst-case cap). It is a guess made before execution, never
+an EMA or per-tick phase correction. At the event, convergence is checked only for its acting
+robots and holders; unrelated robots are intentionally moving and their tracking residual must
+not create a global stop. The old offline velocity-funnel/wrench loop is not applied underneath
+a phase schedule: it used the minimum factor as a second global clock and froze every robot
+when one placed part touched the table. The actor still gets its bounded compliant offset,
+event-owned settle/seat hooks, physical arm contacts, and the grasp breakaway monitor; the
+other independently scheduled arms keep flowing. A genuine event-servo overrun can still hold
+at that event, but no longer turns every contact tick into another global timeout.
+
+The actuated settle gate now defaults to `--settle-tol 0.002`. Car-mini's loaded a3 servo has
+a repeatable approximately 1.9 mrad steady-state residual; the former 1 mrad threshold waited
+the complete `--settle-max 1.0` s without reducing it. Two mrad is about 2 mm at a one-metre
+reach and matches the terminal seat-servo scale, while remaining far below the transient errors
+that the gate is intended to keep out of a newly activated weld. More generally, a residual
+below twice the requested tolerance that improves by less than one quarter of that tolerance
+over 0.1 s is recognized as the finite-gain servo's steady-state plateau; large or still-moving
+errors retain the normal gate and one-second safety bound.
+
+Current car-mini validation (saved plan/path only; no IK or motion replanning):
+
+```bash
+python3 sim.py run experiments/car-mini-ur10-new.json --v2 \
+    --mp-path experiments/car-mini-ur-10-new-mp.json \
+    --phase-schedule --phase-smooth --limit-rate \
+    --servo-torque-guard 0.6 \
+    --record experiments/car-mini-ur10-new-phase-smooth.npz
+
+python3 sim.py replay experiments/car-mini-ur10-new-phase-smooth.npz
+```
+
+This completed 19/19 actions. The phase reference has 37,976 control samples plus 34
+post-switch poses, all accepted by the exact final audit; recording every eighth physics tick
+produced 4,778 NPZ frames. The duration is printed only for context. Motion-quality reporting
+measures each robot from its first motion through its own final arrival and reports the
+harmless terminal idle tail
+separately, so an early-finishing arm is not encouraged to creep merely to end in synchrony.
+Car-mini's tight coordination and rigid-coupling windows leave relatively little freedom for
+postprocessing: reference acceleration/jerk RMS fell by 1.5% and the recorded physical values
+by approximately 0.8%, with the physical peak joint-space rate unchanged.
+
+Chair validates the same defaults on a longer mixed-EE UR5 plan (the historical filenames say
+"no-vacuum", but the saved config contains two vacuum and two two-finger grippers):
+
+```bash
+python3 sim.py run experiments/chair-no-vacuum-assemble.json --v2 \
+    --mp-path experiments/mp-chair-no-vacuum.json \
+    --phase-schedule --phase-smooth --limit-rate \
+    --servo-torque-guard 0.6 \
+    --record experiments/chair-no-vacuum-phase-smooth.npz
+
+python3 sim.py replay experiments/chair-no-vacuum-phase-smooth.npz
+```
+
+This completed 34/34 actions. The first 10 ms phase search succeeded, and all 79,060 expanded
+2 ms samples plus 60 post-switch poses passed the exact audit. The recording has 9,932 frames.
+Three small finite-gain residuals plateaued at up to 3.3 mrad; plateau detection reduced total
+settling from 3.002 s (three full timeouts) to 0.306 s while preserving the successful outcome.
+In the previously conspicuous `obj_1` handover-to-table-place interval, the repeated global
+force-guard freeze is gone: the longest all-robot stop fell from roughly 9.5 seconds to 0.53
+seconds, while the whole interval now takes 7.41 seconds and still completes successfully.
+The phase smoother required no collision-driven interval fallback on Chair. It reduced reference
+acceleration/jerk RMS by 14.5%/13.4% and recorded physical acceleration/jerk RMS by
+13.5%/16.0%, without increasing the recorded peak joint-space rate or changing the placement
+pause above.
+
+`--limit-rate` is deliberately ignored by this scheduler: it keeps the visual cruise at
+`--joint-rate` (1 rad/s by default) rather than racing the UR joint limits. The existing
+`--force-limits` tables are computed and reported but are not yet consumed by the phase
+scheduler; the runtime normalized wrench guard and break monitor remain active. This is the
+next safety-model integration, not a hidden claim.
+
+The older `--corridor-online --pace` artifacts are retained only for debugging. Their earlier
+“19/19” result was not a collision-free validation: arm-arm physics was masked, and the sparse
+three-tick preventive gate could advance unchecked from an already colliding state. In the
+recorded paced car run, two vacuum robots overlap by roughly 9 cm near frame 3544. Do not use
+that command or NPZ as the current baseline.
 
 ## Peg-in-hole examples
 
@@ -243,9 +372,11 @@ python3 sim.py replay \
 
 The recording completed all 12 actions in 4,136 frames; its worst final position residual was
 2.0 mm. Strict preflight checked 3,392 samples and reported both collision tolerance and joint
-limits OK. `--servo-torque-guard 0.7` was needed for the long-lever support-switch approach:
-it engaged for 167 ticks where contact force was below the 6 N force trigger but grasp torque
-was approaching its cap. `--no-force-limits` disables only the predictive speed retimer: it
+limits OK. That dated recording used the former torque-only meaning of
+`--servo-torque-guard 0.7`: it engaged for 167 ticks below the 6 N force trigger. The current
+guard is contact-conditioned as documented above, because a total weld wrench also contains
+the static gravity reaction and must not freeze transport indefinitely. `--no-force-limits`
+disables only the predictive speed retimer: it
 assigns a table-supported assembly's entire load to one gripper and can incorrectly reduce a
 segment to zero speed. MuJoCo contact forces and physical grasp-break limits remain active, and
 the search still uses `--wrench`. `--coll-scale 0.8` is the requested debug-only arm collision

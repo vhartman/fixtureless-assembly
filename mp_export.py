@@ -1214,6 +1214,12 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
   env.margin_rejection_stats = _stats
   env.reset_margin_rejection_stats = _reset_stats
   env.report_margin_rejections = _report
+  # Read-only structured reason for the most recent predicate call.  Post-processors that
+  # deliberately reuse this exact predicate (phase scheduling, path audits) need to know
+  # whether a rejection came from an arm pair, a carried-part/table margin, or a joint limit;
+  # scraping debug text loses the owner information required for coordination-space repair.
+  env.last_margin_rejection = lambda: (
+      None if _last_rejection[0] is None else dict(_last_rejection[0]))
   return env
 
 

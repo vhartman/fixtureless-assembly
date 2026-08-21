@@ -438,9 +438,8 @@ def scale_arm_collision_shapes(C, robots, factor, verbose=True):
 
 
 GRAVITY = 9.81
-ARM_ARM_CONTACTS = False   # --arm-arm-contacts: contype 1 on actuated arm geoms (real
-                           # arm-arm physics). Default contype 2 masks arm-arm contacts because
-                           # mocap chains interpenetrating at handovers produce phantom forces.
+ARM_ARM_CONTACTS = False   # --arm-arm-contacts: per-robot bits enable cross-arm physics while
+                           # excluding same-chain self contacts. Legacy mode masks all arm-arm.
 ARTICULATED_LINK_MASS = 50.0     # kg: --articulated links are driven kinematically, so this is
 ARTICULATED_LINK_INERTIA = 5.0   # not a real inertia -- it only has to dominate a held part
                                  # (~0.5kg) so the weld reaction cannot move the arm.
@@ -739,6 +738,14 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
   ee_colors = ["0.2 0.2 0.9 1", "0.9 0.2 0.2 1", "0.2 0.8 0.8 1", "0.9 0.7 0.1 1",
                "0.6 0.2 0.8 1", "0.4 0.9 0.3 1"]
   arm_mesh_assets = ""
+  # MuJoCo has no semantic notion of "same robot". One shared arm contact bit therefore
+  # enables both cross-robot contacts and catastrophic self-contact between adjacent links.
+  # Allocate one bit per robot; each arm accepts the part bit (1) and every OTHER arm bit.
+  _arm_bits = {r: 1 << (j + 1) for j, r in enumerate(robots)}
+  _all_arm_bits = sum(_arm_bits.values())
+  def _arm_contact_mask(robot):
+    bit = _arm_bits[robot]
+    return str(bit), str(1 | (_all_arm_bits ^ bit))
   if arms is None:                                         # v1: one gripper puck per robot
     for j, r in enumerate(robots):
       parts_xml.append(
@@ -754,7 +761,13 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
       # contype 2 / conaffinity 1: arm links collide with PARTS and the table, never with
       # each other (self/arm-arm clearance was the MOTION PLANNER's job; re-checking it
       # here on mocap bodies would only produce huge phantom forces on interpenetration).
-      con = 'contype="2" conaffinity="1"' if collide else 'contype="0" conaffinity="0"'
+      _owner = next((r for r in robots if body.startswith(r)), None)
+      if collide and ARM_ARM_CONTACTS and _owner is not None:
+        _ct, _ca = _arm_contact_mask(_owner)
+        con = f'contype="{_ct}" conaffinity="{_ca}"'
+      else:
+        con = ('contype="2" conaffinity="1"' if collide
+               else 'contype="0" conaffinity="0"')
       if geom_spec[0] == "mesh":                           # real link mesh (visual only)
         mesh_assets.append(f'<mesh name="m_{body}" file="{geom_spec[1]}"/>')
         geom = f'type="mesh" mesh="m_{body}"'
@@ -777,9 +790,12 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
     # mocap path would. They are visual-only, so the physics is identical either way.
     _arm_assets = []
     _arm_meshes = any(e[2][0] == "mesh" for e in arms)
+    _contact_masks = ([_arm_contact_mask(r) for r in robots]
+                      if ARM_ARM_CONTACTS else None)
     body_xml, articulated_joints = arm_model.build_arms_mjcf(
         articulated_C, robots, collide_fn=arm_model.collides_like_sim,
         group=GROUP_COLL, contype=("1" if ARM_ARM_CONTACTS else "2"), conaffinity="1",
+        contact_masks=_contact_masks,
         meshes=_arm_meshes, assets=_arm_assets, mesh_group=GROUP_VISUAL,
         # links must SWAMP the payload: the chain is integrated by mj_step even though we
         # drive it kinematically, so a light link welded to a part lets the solver throw it.
@@ -1898,14 +1914,13 @@ class _SkillServo:
     self.scene = scene
     self.dt = float(dt)
     self.f0 = float(force)
-    # --servo-torque-guard FRAC: engage the guarded hold + yield when a held part's GRASP
-    # TORQUE exceeds FRAC of its cap, independent of contact force. The force-only trigger
-    # (f0) is blind to long-lever cargo: the chair seat reaches its 0.8Nm cap at ~8N of
-    # table drag (lever ~0.1m), so by the 6N force trigger the torque already sits at ~74%
-    # of the cap and the 20ms breakage window beats the plant-bandwidth yield. Watching the
-    # SAME weld wrench the breakage monitor judges gives the servo the full ramp to react.
+    # --servo-torque-guard FRAC (historic flag name): engage guarded hold + yield when EITHER
+    # component of the measured grasp wrench exceeds FRAC of its own scalar cap. The former
+    # torque-only check still let a 25N grasp reach its force cap before the generic 24N
+    # bulldoze freeze could react; a normalized wrench guard uses the same force/torque and
+    # caps as the breakage monitor and therefore has an actual safety margin.
     self.torque_guard = None if torque_guard is None else float(torque_guard)
-    self.torque_holds = 0                                  # diagnostic: torque-triggered ticks
+    self.wrench_holds = 0                                  # normalized-wrench-triggered ticks
     # --compliant-follow: WHOLE-BRANCH admittance (arm links + gripper + cargo) with its own
     # LOWER deadband -- compliant following as the default tracking law, not a held-cargo-only
     # feature. The guard/funnel triggers (f0) keep their meaning: the reference starts
@@ -1972,16 +1987,23 @@ class _SkillServo:
       hot = mag
       excess = mag - self.f0
       if self.torque_guard is not None:
-        # torque-aware trigger (see __init__): same weld wrench the breakage monitor reads.
-        _, tmag = self.scene._weld_wrench(g[0])
-        tfrac = tmag / max(self.torque_guard * float(g[3]), 1e-9)
-        if tfrac > 1.0:
+        # Normalized force+torque trigger: same weld wrench/caps the break monitor judges.
+        fmag, tmag = self.scene._weld_wrench(g[0])
+        util = max(fmag / max(self.torque_guard * float(g[2]), 1e-9),
+                   tmag / max(self.torque_guard * float(g[3]), 1e-9))
+        # The weld wrench includes the payload's STATIC gravity reaction. It is safe (and
+        # necessary) to keep transporting a grasp whose nominal gravity utilization exceeds
+        # FRAC; freezing that case deadlocks forever because stopping cannot remove gravity.
+        # Turn utilization into a hard guard only when an EXTERNAL contact is simultaneously
+        # loading the branch. This is the failure we need to catch (car: 13.5N part contact
+        # drove a 0.67Nm grasp), and the contact direction gives admittance a way to recover.
+        if util > 1.0 and mag > self.f0:
           hot = max(hot, 4.0 * self.f0 + 1e-3)          # engages guard + funnel like a press
-          # drive the yield by the NORMALISED torque excess (mapped through f0 so the gain
-          # keeps its m/(N*s) meaning); direction stays the net contact push -- at a lever
-          # press, backing off along the push shortens the drag the same way.
-          excess = max(excess, (tfrac - 1.0) * self.f0)
-          self.torque_holds += 1
+          # Map normalized excess through f0 so the admittance gain keeps its m/(N*s) units.
+          # Direction remains the contact push; when the wrench is purely inertial the hard
+          # hold still removes its cause even though there is no contact direction to yield.
+          excess = max(excess, (util - 1.0) * self.f0)
+          self.wrench_holds += 1
       self._hot_by[r] = hot
       if hot > self._hot:
         self._hot = hot
@@ -2013,13 +2035,14 @@ class _SkillServo:
       hot = mag
       excess = mag - self.c_f0
       if self.torque_guard is not None and g is not None:
-        # identical torque-aware trigger to the plain path (long-lever cargo, see __init__)
-        _, tmag = self.scene._weld_wrench(g[0])
-        tfrac = tmag / max(self.torque_guard * float(g[3]), 1e-9)
-        if tfrac > 1.0:
+        # Identical normalized wrench trigger to the held-cargo path above.
+        fmag, tmag = self.scene._weld_wrench(g[0])
+        util = max(fmag / max(self.torque_guard * float(g[2]), 1e-9),
+                   tmag / max(self.torque_guard * float(g[3]), 1e-9))
+        if util > 1.0 and mag > self.f0:
           hot = max(hot, 4.0 * self.f0 + 1e-3)
-          excess = max(excess, (tfrac - 1.0) * self.f0)
-          self.torque_holds += 1
+          excess = max(excess, (util - 1.0) * self.f0)
+          self.wrench_holds += 1
       self._hot_by[r] = hot
       if hot > self._hot:
         self._hot = hot
@@ -2331,7 +2354,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         corridor_lead_max=4.0, corridor_verify=0, corridor_refine=0,
                         corridor_cross_only=False, corridor_online=False,
                         rate_clamp=False, settle_tol=0.0, settle_max=1.0, couple_handovers=False,
-                        pace=False, dwell=DWELL_T, pace_trace=None,
+                        pace=False, dwell=DWELL_T, pace_trace=None, phase_schedule=False,
+                        phase_servo_time=0.15, phase_smooth=False, phase_smooth_time=0.12,
                         directional_caps=False, mate_caps=None,
                         verify_efc_cache=False, force_limits=False, wrench_margin=1.0, mass_scale=1.0, inertia_factor=1.0,
                         corner_limits=True,
@@ -2455,9 +2479,23 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     its = 0
     _err0 = scene.tracking_error(q, owned)
     _touch = False
-    for _ in range(int(settle_max / DT)):
-      if scene.tracking_error(q, owned) <= settle_tol:
+    _plateau = False
+    _plateau_ticks = max(1, int(round(0.1 / DT)))
+    _plateau_err = _err0
+    for _k in range(int(settle_max / DT)):
+      _err = scene.tracking_error(q, owned)
+      if _err <= settle_tol:
         break
+      # Finite-gain position servos have a small payload-biased steady-state residual. Waiting
+      # the full timeout at that floor does nothing (car: 1.9mrad; chair: 3.3mrad, unchanged
+      # for 1s). Accept only a SMALL, demonstrably flat residual: below 2x the requested gate
+      # and improving by <25% of it over 100ms. A large error or one still converging cannot
+      # take this exit and retains the hard settle_max bound.
+      if _k and _k % _plateau_ticks == 0:
+        if _err <= 2.0 * settle_tol and _plateau_err - _err < 0.25 * settle_tol:
+          _plateau = True
+          break
+        _plateau_err = _err
       if touch_robots and any(
           float(np.linalg.norm(scene.branch_contact_force(r))) > 1.0 for r in touch_robots):
         # --servo-pick: the picking arm has TOUCHED its part. The remaining tracking error
@@ -2488,7 +2526,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       _jerrs.append((_jn, _d))
     _hook_log["settle"].append(
         (its * DT, _err0, scene.tracking_error(q, owned), _touch, _errs,
-         list(owned) if owned is not None else None, _jerrs))
+         list(owned) if owned is not None else None, _jerrs, _plateau))
 
   def seat_before_fire(tid, q_ref, flow_drive=None, flow_tick=None):
     """--skill-servo: contract the seat error toward the mate datum BEFORE the weld fires,
@@ -2588,9 +2626,11 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       _e0 = [s[1] for s in _hook_log["settle"]]
       _e1 = [s[2] for s in _hook_log["settle"]]
       _nt = sum(1 for s in _hook_log["settle"] if s[3])
+      _np = sum(1 for s in _hook_log["settle"] if len(s) > 7 and s[7])
       print(f"[sim/mp] settle windows: {_n} fired ({_nt} touch-broken), total "
             f"{sum(_ms)*1000:.0f}ms sim, max {max(_ms)*1000:.0f}ms; "
-            f"err {max(_e0)*1000:.1f} -> {max(_e1)*1000:.1f} mrad")
+            f"err {max(_e0)*1000:.1f} -> {max(_e1)*1000:.1f} mrad; "
+            f"{_np} small-residual plateau(s) accepted")
       _rmax = {}
       for s in _hook_log["settle"]:
         for r, v in s[4].items():
@@ -2612,9 +2652,9 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     for nm, f0_, fN, secs in servo.pick_log:
       print(f"[sim/mp] --servo-pick {nm}: fire |F| {f0_:.1f}N -> {fN:.1f}N "
             f"after {secs*1000:.0f}ms lift")
-    if servo.torque_holds:
-      print(f"[sim/mp] --servo-torque-guard: {servo.torque_holds} tick(s) engaged by the "
-            f"TORQUE trigger (force alone was below {servo.f0:g}N)")
+    if servo.wrench_holds:
+      print(f"[sim/mp] --servo-torque-guard: {servo.wrench_holds} tick(s) engaged by the "
+            "normalized FORCE/TORQUE grasp-wrench trigger")
 
   # NO-FUNNEL WARNING. An assemble whose export is a single task drives the held part STRAIGHT to
   # a pose that is already in contact, so it arrives LATERALLY and sweeps the target: measured on
@@ -2699,9 +2739,12 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
               "XY-to-anchor + bounded descent until sustained touch) instead of tracking the "
               "joint reference's z, which is authored against the planner's lower table.")
       if servo_torque_guard is not None:
-        print(f"[sim/mp] --servo-torque-guard {servo_torque_guard:g}: guarded hold + yield "
-              f"also engage at {servo_torque_guard:.0%} of a grasp's TORQUE cap -- the "
-              f"force-only trigger is blind to long-lever cargo (seat: cap reached at ~8N).")
+        _guard_action = ("local compliant yield engages; the independently scheduled arms "
+                         "keep flowing" if phase_schedule else "hold + yield engage")
+        print(f"[sim/mp] --servo-torque-guard {servo_torque_guard:g}: contact-conditioned "
+              f"grasp-wrench guard -- during external contact, {_guard_action} when FORCE "
+              f"or TORQUE reaches {servo_torque_guard:.0%} of its scalar breakaway cap "
+              "(static gravity alone never freezes transport).")
       print(f"[sim/mp] --skill-servo ACTIVE: held-part admittance (yield above "
             f"{servo_force:g}N, bounded {servo_max_dev*1000:g}mm, force-triggered so intended "
             f"contacts still happen) + terminal seat servo to the mate datum before each "
@@ -2845,8 +2888,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     # cannot repair a collision or an out-of-range joint already present on the diagonal. Do
     # this before spline/corridor work so a relaxed planner path fails in seconds with the
     # concrete mode/edge/pair instead of spending minutes in futile corridor refinement.
+    _ptol = float(path_preflight_tolerance)
     if path_preflight:
-      _ptol = float(path_preflight_tolerance)
       _pres = (float(path_preflight_resolution) if path_preflight_resolution is not None else
                float(getattr(problem, "collision_resolution", 0.01)))
 
@@ -3568,7 +3611,233 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
 
       _ds = corridor_ds
       _extra_locks, cor, traj = [], None, None
-      if corridor_online:
+
+      # OFFLINE PHASE SCHEDULING.  This is deliberately separate from the sampled corridor:
+      # it plans a monotone coordination-space curve (one phase per arm), checks every
+      # proposed configuration with the planner's exact predicate, and then audits the whole
+      # result again.  The objective is a calm, repeatable reference -- preferred cruise,
+      # few slow/stop episodes, and nominal ceremony reservations.  Makespan is only a
+      # consequence.  Runtime servos may hold on an exceptional overrun, but never re-time
+      # the nominal profile tick by tick.
+      if phase_schedule:
+        if corridor_online:
+          raise ValueError("--phase-schedule and --corridor-online are mutually exclusive")
+
+        _phase_stretches = []
+        for _k, _b in enumerate(_bi):
+          _a = 0 if _k == 0 else _bi[_k - 1]
+          _phase_stretches.append(([np.asarray(x, float) for x in _P[_a:_b + 1]],
+                                   list(stretches[_k][1])))
+
+        def _seat_has_budget(_tid):
+          if servo is None:
+            return False
+          _t = problem.tasks[_tid]
+          _fr = getattr(_t, "frames", None)
+          if not _fr:
+            return False
+          if _fr[0] in assembly.objects:
+            return True
+          return (_fr[0] == "table" and len(_fr) > 1
+                  and _fr[1] in assembly.objects and servo.place_ok)
+
+        _event_budget = []
+        for _tids in (list(st[1]) for st in stretches):
+          _b = phase_servo_time if (actuated and settle_tol > 0.0) else 0.0
+          _b += phase_servo_time * sum(_seat_has_budget(_tid) for _tid in _tids)
+          _event_budget.append(_b)
+
+        def _strict_collide(fq, fired):
+          """Exact planner contract used both while scheduling and for final acceptance."""
+          _ki = min(int(fired), len(stretch_mode) - 1)
+          ok = bool(problem.is_collision_free(
+              _conf(fq), stretch_mode[_ki], collision_tolerance=_ptol))
+          if ok:
+            _strict_collide.last_pairs = []
+            return False
+          pairs, who = [], set()
+          for _c in problem.C.getCollisions(0.0):
+            _d = float(_c[2])
+            if _d >= 0.0:
+              continue
+            _pr = (str(_c[0]), str(_c[1]))
+            pairs.append((_pr, -_d))
+            for _f in _pr:
+              _ar = _arm_of(_f)
+              if _ar is not None:
+                who.add(_ar)
+          # A strict rejection can come from our planning wrapper while every raw distance
+          # is still positive (notably --mp-robot-margin).  Preserve that wrapper's owners:
+          # otherwise the scheduler mislabels an arm-arm clearance veto as a static wall and
+          # cannot infer the local coupling that recovers the certified diagonal.
+          _last = (problem.last_margin_rejection()
+                   if hasattr(problem, "last_margin_rejection") else None)
+          _reason = (_last or {}).get("reason") if (_last or {}).get("layer") == "gate" else None
+          if _reason is not None:
+            _fr = tuple(str(x) for x in _reason.get("frames", ("?", "?")))
+            _gap = max(float(_reason.get("required", 0.0))
+                       - float(_reason.get("observed", 0.0)), 0.0)
+            pairs.append((_fr, _gap))
+            for _owner in _reason.get("owners", ()):
+              if _owner in robot_index:
+                who.add(robot_index[_owner])
+          _strict_collide.last_pairs = sorted(pairs, key=lambda x: -x[1])
+          return who                                      # empty set means static-world block
+
+        print("[sim/mp] --phase-schedule ACTIVE: visual-quality coordination-space plan; "
+              f"preferred cruise {JOINT_RATE:g}rad/s, nominal servo reservations "
+              f"{min(_event_budget or [0]):g}-{max(_event_budget or [0]):g}s, exact "
+              f"{_ptol:g}m collision predicate on every accepted step. Makespan is not "
+              "the objective; the synchronized reference is the certified fallback.")
+        if limit_rate:
+          print("[sim/mp] --phase-schedule: --limit-rate is intentionally not used to chase "
+                "joint limits; the preferred visual cruise remains --joint-rate. Joint "
+                "limits themselves remain hard constraints of the audited path.")
+        if force_limits:
+          print("[sim/mp] --phase-schedule: geometric scheduling uses the conservative "
+                "preferred cruise; the existing wrench speed/acceleration tables are not "
+                "yet part of this scheduler. Runtime wrench guards remain authoritative.")
+
+        def _phase_audit(_traj, collect=False):
+          _at = {}
+          _bad = []
+          for _ii, _ev in (_traj.fires or []):
+            _at.setdefault(int(_ii), 0)
+            _at[int(_ii)] += 1                              # one mode transition per fire point
+          _fired = 0
+          for _ii, _q in enumerate(_traj.q):
+            if _strict_collide(_q, _fired) is not False:
+              _hit = (_ii, _fired, list(_strict_collide.last_pairs[:5]))
+              if not collect:
+                return _hit
+              _bad.append(_hit)
+            if _ii in _at:
+              for _ in range(_at[_ii]):
+                _post = min(_fired + 1, len(stretch_mode) - 1)
+                if _strict_collide(_q, _post) is not False:
+                  _hit = (_ii, _post, list(_strict_collide.last_pairs[:5]))
+                  if not collect:
+                    return _hit
+                  _bad.append(_hit)
+                _fired += 1
+          return _bad if collect else None
+
+        _fallback_reason, traj = None, None
+        # Scheduling at the 2ms physics rate repeats the expensive full-scene predicate five
+        # times more often than the motion planner's own 0.01rad edge scale (chair took >6min
+        # before reaching simulation). Plan at 10ms, interpolate back to 2ms, then keep the
+        # SAME dense acceptance audit below. A dense counterexample triggers 4ms and finally
+        # 2ms retries. Every planning grid is an integer multiple of the 2ms controller tick,
+        # so fire points survive expansion exactly (5ms cannot be represented on that grid).
+        _plan_dts = list(dict.fromkeys([max(DT, 0.01), max(DT, 0.004), DT]))
+        _q_start = np.asarray(_phase_stretches[0][0][0], dtype=float)
+        for _pdt in _plan_dts:
+          try:
+            _coarse = retiming.plan_schedule(
+                _phase_stretches, arm_dims, acting, _pdt, joint_rate=JOINT_RATE,
+                ramp_dist=RAMP_DIST, ramp_min=RAMP_MIN, collide=_strict_collide,
+                # Effectively zero cells: candidates are exact; cache only identical states
+                # revisited by a CEGAR restart.
+                collide_ds=1e-9, dwell=dwell, event_durations=_event_budget,
+                per_arm_rate=True)
+          except RuntimeError as _e:
+            _fallback_reason = f"{_pdt:g}s planning grid: {_e}"
+            continue
+          traj = retiming.upsample_trajectory(_coarse, DT, q0=_q_start)
+          _bad_phase = _phase_audit(traj)
+          if _bad_phase is None:
+            print(f"[sim/mp] --phase-schedule planning grid {_pdt:g}s -> {DT:g}s control "
+                  f"samples; dense audit accepted on attempt "
+                  f"{_plan_dts.index(_pdt) + 1}/{len(_plan_dts)}.")
+            break
+          _fallback_reason = (f"{_pdt:g}s schedule's dense audit failed at sample "
+                              f"{_bad_phase[0]}, mode {_bad_phase[1]}: {_bad_phase[2]}")
+          print(f"[sim/mp] --phase-schedule RETRY FINER: {_fallback_reason}")
+          traj = None
+        if traj is None:
+          print(f"[sim/mp] --phase-schedule FALLBACK TO SYNCHRONIZED REFERENCE: "
+                f"{_fallback_reason}")
+          traj = retiming.build_trajectory(
+              _phase_stretches, DT, joint_rate=JOINT_RATE, ramp_dist=RAMP_DIST,
+              ramp_min=RAMP_MIN, dwell=dwell, event_durations=_event_budget)
+          _bad_phase = _phase_audit(traj)
+          if _bad_phase is not None:
+            raise RuntimeError(
+                f"[sim/mp] synchronized fallback failed its exact audit at sample "
+                f"{_bad_phase[0]}, mode {_bad_phase[1]}: {_bad_phase[2]}")
+        print(f"[sim/mp] --phase-schedule exact final audit: {len(traj.q)} samples + "
+              f"{len(traj.fires)} post-switch poses collision-free.")
+        if phase_smooth:
+          if traj.progress is None:
+            print("[sim/mp] --phase-smooth SKIPPED: the synchronized fallback has no "
+                  "independent phase trace.")
+          else:
+            _raw_traj = traj
+            _restore = set()
+            _smooth_rep = None
+            # The plan-derived locks protect rigid co-holds; the phase search's CEGAR locks
+            # protect locally fused collision passages discovered during this particular run.
+            _smooth_locks = list(_locked) + list(getattr(traj, "couplings", ()))
+            for _smooth_pass in range(3):
+              _cand, _smooth_rep = retiming.smooth_phase_trajectory(
+                  _raw_traj, _P, arm_dims, acting, window=phase_smooth_time,
+                  locked=_smooth_locks, restore_intervals=_restore)
+              _bad_smooth = _phase_audit(_cand, collect=True)
+              if not _bad_smooth:
+                traj = _cand
+                _br, _ar = _smooth_rep["before"], _smooth_rep["after"]
+                _jr = 100.0 * (1.0 - _ar["jerk_rms"] / max(_br["jerk_rms"], 1e-12))
+                _acr = 100.0 * (1.0 - _ar["accel_rms"] / max(_br["accel_rms"], 1e-12))
+                print(f"[sim/mp] --phase-smooth ACTIVE: Gaussian phase-rate smoothing over "
+                      f"{phase_smooth_time:g}s; every fire vector pinned, monotonicity and "
+                      f"actor stops preserved. Exact 2ms audit passed; restored "
+                      f"{len(_restore)}/{_smooth_rep['intervals']} collision-sensitive "
+                      f"interval(s) and {_smooth_rep['locked_arm_intervals']} rigid arm-"
+                      f"interval(s); {_smooth_rep['rate_limited_arm_intervals']} arm-"
+                      f"interval(s) kept raw to prevent peak-rate growth. Joint accel RMS "
+                      f"reduction {_acr:+.1f}%, jerk RMS reduction {_jr:+.1f}%.")
+                break
+              _new = {retiming.phase_interval_at(_raw_traj, _i)
+                      for _i, _m, _p in _bad_smooth} - _restore
+              if not _new:
+                traj = _raw_traj
+                print("[sim/mp] --phase-smooth FALLBACK: a violation remained on already "
+                      "restored source intervals; executing the certified raw schedule.")
+                break
+              _restore |= _new
+              print(f"[sim/mp] --phase-smooth local fallback pass {_smooth_pass + 1}: "
+                    f"restoring fire interval(s) {sorted(_new)} after "
+                    f"{len(_bad_smooth)} dense collision rejection(s).")
+            else:
+              traj = _raw_traj
+              print("[sim/mp] --phase-smooth FALLBACK after 3 passes: executing the "
+                    "certified raw phase schedule.")
+        # Localize visually objectionable pauses in the planned reference.  The aggregate
+        # motion-quality report below says how much stopping occurred, but not whether a long
+        # all-arm plateau sits immediately before a mode switch (usually phase bookkeeping,
+        # not useful settling).  Keep this compact and only report plateaus over 0.5s.
+        _tq = np.asarray(traj.q, dtype=float)
+        if len(_tq) > 1:
+          _moving = np.zeros(len(_tq) - 1, dtype=bool)
+          for _ad in arm_dims:
+            _moving |= np.linalg.norm(np.diff(_tq[:, _ad], axis=0), axis=1) >= 0.05 * DT
+          _pauses, _start = [], None
+          for _ii, _mv in enumerate(_moving):
+            if not _mv and _start is None:
+              _start = _ii
+            if (_mv or _ii == len(_moving) - 1) and _start is not None:
+              _end = _ii if _mv else _ii + 1
+              if (_end - _start) * DT >= 0.5:
+                _next = next(((_fi, _ev) for _fi, _ev in traj.fires if _fi >= _end), None)
+                _pauses.append((_start, _end, _next))
+              _start = None
+          if _pauses:
+            _worst = max(_pauses, key=lambda _x: _x[1] - _x[0])
+            print(f"[sim/mp] --phase-schedule longest all-arm reference pause: "
+                  f"{(_worst[1] - _worst[0]) * DT:.2f}s at samples "
+                  f"{_worst[0]}:{_worst[1]}, next fire {_worst[2]}.")
+
+      elif corridor_online:
         # ONLINE MODE: certify ONCE (Stage A, with the plan's rigid-coupling locks), then hand
         # the certificate to the executor -- Stage B/C offline scheduling (previously ~75% of
         # a run's wall time), the spread pass (and its known vmax hole) and schedule-VERIFY
@@ -3584,18 +3853,43 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                                         progress=(print if verbose else None))
         print(f"[sim/mp] STAGE A done in {_time.time() - t0:.0f}s")
         print(retiming.corridor_width_report(cor))
+        def _seat_has_budget(_tid):
+          if servo is None:
+            return False
+          _t = problem.tasks[_tid]
+          _fr = getattr(_t, "frames", None)
+          if not _fr:
+            return False
+          if _fr[0] in assembly.objects:
+            return True
+          return (_fr[0] == "table" and len(_fr) > 1
+                  and _fr[1] in assembly.objects and servo.place_ok)
+
+        # Actual convergence time is unknown, but it is not unbounded: each servo hook has
+        # the explicit `settle_max` budget. Schedule crossing arms against that upper bound.
+        # If a hook finishes early the mode opens early and they simply continue; if it uses
+        # its full budget they reach (rather than wait at) the no-pass barrier. This avoids
+        # pretending that an EMA of past, unrelated contacts predicts the next insertion.
+        _pre_fire_budget = []
+        for _tids in (list(st[1]) for st in stretches):
+          _b = settle_max if (actuated and settle_tol > 0.0) else 0.0
+          _b += settle_max * sum(_seat_has_budget(_tid) for _tid in _tids)
+          _pre_fire_budget.append(_b)
         online_stepper = retiming.CorridorStepper(
             _P, arm_dims, _bar, acting, cor, DT, joint_rate=JOINT_RATE,
             ramp_dist=RAMP_DIST, ramp_min=RAMP_MIN, dwell=dwell,
             vmax=_vmax, amax=_amax, limit_ds=(_dsf if force_limits else None),
             rate_clamp=rate_clamp, fire_all=False,
-            pace=pace, settle_nom=settle_max, trace=(pace_trace is not None))
+            pace=pace, settle_nom=_pre_fire_budget, trace=(pace_trace is not None))
         online_fire_tids = [list(stretches[k][1]) for k in range(len(stretches))]
         if pace:
-          print(f"[sim/mp] --pace ACTIVE: constant-speed arrival pacing -- every arm cruises "
-                f"to the pending barrier and reaches it at the common fire instant "
-                f"(slowest acting arm + dwell + {settle_max:g}s settle estimate).")
-      for _pass in range(0 if corridor_online else max(0, corridor_refine) + 1):
+          print(f"[sim/mp] --pace ACTIVE: feed-forward phase scheduling -- one fixed rate "
+                f"factor per corridor-coupled arm group and mode stretch. Acting groups meet "
+                f"at fire; crossing groups reserve the bounded pre-fire servo budget "
+                f"({min(_pre_fire_budget):g}-{max(_pre_fire_budget):g}s here). Runtime guards "
+                f"stay hard safety overrides.")
+      for _pass in range(0 if (corridor_online or phase_schedule)
+                         else max(0, corridor_refine) + 1):
         print(f"[sim/mp] --corridor STAGE A: certifying the desync envelope "
               f"(D={_D:.0f} rad, {len(robots)} arms, ds={_ds:g}"
               + (f", +{len(_extra_locks)} counterexample lock(s)" if _extra_locks else "") + ") ...")
@@ -3680,17 +3974,27 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                 " -- those waypoints are traversed at the CAP now (previously the floor "
                 "silently won). Expect a longer schedule; a near-zero cap means the LP "
                 "considers that waypoint untraversable.")
-        print(f"[sim/mp] STAGES B+C: {len(traj.q)} samples vs {len(base.q)} lockstep "
-              f"({100 * (1 - len(traj.q) / max(len(base.q), 1)):+.1f}% makespan), "
-              f"{len(traj.fires)} fire points, ZERO collision checks during scheduling")
+        if phase_schedule:
+          print(f"[sim/mp] PHASE SCHEDULE: {len(traj.q)} samples vs {len(base.q)} "
+                f"synchronized ({100 * (1 - len(traj.q) / max(len(base.q), 1)):+.1f}% "
+                f"duration, informational only), {len(traj.fires)} fire points; every "
+                "candidate and final sample checked exactly")
+        else:
+          print(f"[sim/mp] STAGES B+C: {len(traj.q)} samples vs {len(base.q)} lockstep "
+                f"({100 * (1 - len(traj.q) / max(len(base.q), 1)):+.1f}% makespan), "
+                f"{len(traj.fires)} fire points, ZERO collision checks during scheduling")
         print(retiming.format_motion_report(
             retiming.motion_report(base.q, DT, arm_dims, JOINT_RATE), "LOCKSTEP baseline"))
         print(retiming.format_motion_report(
-            retiming.motion_report(traj.q, DT, arm_dims, JOINT_RATE), "CORRIDOR"))
+            retiming.motion_report(traj.q, DT, arm_dims, JOINT_RATE),
+            "PHASE SCHEDULE" if phase_schedule else "CORRIDOR"))
         fire_at = {}
         for idx, ev in traj.fires:
-          for k in ev:                                       # fires carry stretch indices here
-            fire_at.setdefault(int(idx), []).extend(int(t) for t in stretches[int(k)][1])
+          if phase_schedule:                                 # actual task ids, like lockstep
+            fire_at.setdefault(int(idx), []).extend(int(t) for t in ev)
+          else:
+            for k in ev:                                     # corridor carries stretch indices
+              fire_at.setdefault(int(idx), []).extend(int(t) for t in stretches[int(k)][1])
       if _os.environ.get("SIM_WRENCH_TRACE"):
         # The trace must read the model AS EXECUTED: same arc grid, same smoothed derivatives,
         # same static term -- so it can only be built here, where those arrays exist.
@@ -3742,25 +4046,35 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     _n_tick = 0
     _paced = np.zeros(len(robots))                         # diagnostic: ticks with factor < 1
     _held = np.zeros(len(robots))                          # ticks with factor == 0 (guard)
-    # MICRO-VERIFY + DIAGONAL COLLAPSE. The Stage A certificate is STAR-SHAPED (arm i at s+d,
+    # EXACT COMMAND GATE + DIAGONAL COLLAPSE. The Stage A certificate is STAR-SHAPED (arm i at s+d,
     # everyone else AT s): two arms simultaneously off-diagonal is not certified, and offline
     # that unsoundness was caught by schedule-VERIFY + CEGAR -- which the online mode dropped.
     # Measured cost of dropping it: a3's link 5.2mm inside a1's cargo at 87N (seed 1), cargo
     # vs cargo at 3.1mm/47N (seed 2). Replacement: every VCHK ticks, one EXACT collision check
     # of the current commanded config (the same oracle Stage A probed with, ~0.5ms); on
     # violation, LEADERS freeze and the laggard advances -- collapsing toward the diagonal,
-    # which is the planner's own certified path, until the check clears. Certificate for
-    # speed, sparse exact checks for soundness, diagonal for recovery.
-    _VCHK = 3                                              # preventive-gate cadence
-    _settle_ema = None                                      # measured fire-ceremony duration
+    # which is the planner's own certified path, until the check clears. Judge the ACTUAL
+    # servo.adjust(fq), not the raw phase reference: the admittance may move a command by
+    # 10mm after the old checker accepted it, which invalidated its verdict. Keep the exact
+    # geometric oracle at its 3-tick / 6ms cadence: running it at 500Hz triples wall time,
+    # while the normalized physical wrench guard below still runs every 2ms and the break
+    # monitor itself requires 20ms sustained overload.
+    _VCHK = 3
+    _n_checks = 0
     _n_gate = 0                                            # ticks the gate held an arm
+    _n_servo_gate = 0                                      # violations introduced by adjustment
+    _stall_fire, _stall_tick = online_stepper.fired, 0
     def _safe(fq):
-      nonlocal _n_gate
+      nonlocal _n_checks, _n_gate, _n_servo_gate
       if _n_tick % _VCHK:
         return False
-      _who = collide(fq, online_stepper.fired)
+      _n_checks += 1
+      _qcmd = servo.adjust(fq) if servo is not None else fq
+      _who = collide(_qcmd, online_stepper.fired)
       if _who:
         _n_gate += 1
+        if servo is not None and not collide(fq, online_stepper.fired):
+          _n_servo_gate += 1
       return _who or False
     while not online_stepper.done():
       _n_tick += 1
@@ -3775,6 +4089,25 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         _paced += (np.asarray(rf) < 1.0)
         _held += (np.asarray(rf) <= 0.0)
       qc0, fire_k = online_stepper.tick(rf, free_of=_safe)
+      if online_stepper.fired != _stall_fire:
+        _stall_fire, _stall_tick = online_stepper.fired, _n_tick
+      elif _n_tick - _stall_tick >= 5000 and (_n_tick - _stall_tick) % 5000 == 0:
+        # A normal car-mini stretch is <3500 ticks. If a mode stays unchanged longer, print
+        # enough live state to distinguish pacing from a force/torque or geometry deadlock.
+        _wr = []
+        if servo is not None:
+          for _rn, _g in sorted(scene.active_grasps.items()):
+            _wf, _wt = scene._weld_wrench(_g[0])
+            _cf = float(np.linalg.norm(scene.branch_contact_force(_rn)))
+            _off = float(np.linalg.norm(servo.off.get(_rn, np.zeros(3))))
+            _wr.append(f"{_rn}:contact={_cf:.1f}N,wrench="
+                       f"{_wf/max(float(_g[2]),1e-9):.2f}F/"
+                       f"{_wt/max(float(_g[3]),1e-9):.2f}T,off={_off*1000:.1f}mm")
+        print(f"[sim/mp] STALL DIAGNOSTIC: event {online_stepper.fired}, "
+              f"{_n_tick - _stall_tick} ticks; s={np.round(online_stepper.s, 3).tolist()}, "
+              f"pace={np.round(online_stepper._pace_factor, 3).tolist()}, "
+              f"runtime={None if rf is None else np.round(rf, 3).tolist()}, "
+              f"gate-holds={_n_gate}; " + ("; ".join(_wr) if _wr else "no active grasps"))
       qc = servo.adjust(qc0) if servo is not None else qc0
       drive_q(qc)
       scene.step(1, report, ("path",))
@@ -3817,14 +4150,14 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           return _qm
         def _fire_verify(q_m):
           _fw_ticks[0] += 1
-          if _fw_ticks[0] % _VCHK:
-            return
           _who = collide(q_m, online_stepper.fired)
           _bad = (set(_who) if _who else set()) - _act
           if _bad:
+            _new = _bad - _freeze
             _freeze.update(_bad)
-            print(f"[sim/mp] fire-flow: froze arm(s) {sorted(_bad)} for this fire "
-                  f"after a desync violation")
+            if _new:
+              print(f"[sim/mp] fire-flow: froze arm(s) {sorted(_new)} for this fire "
+                    f"after a desync violation")
         def _flow_settle(q_ref):
           _qm = _fire_mix(q_ref)
           _fire_verify(_qm)
@@ -3840,27 +4173,38 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         _fw0 = online_stepper.steps
         settle_before_fire(qc0, _touch_robots(online_fire_tids[fire_k]), flow=_flow_settle,
                            owned=[robots[r] for r in _act])
+        # THE MODE SWITCH IS THE ATTACHMENT CHANGE, not the post-fire cleanup. Keep the old
+        # no-pass barrier only through the genuinely uncertain settle/seat phase. Once all
+        # relinks have fired, advance the stepper's topology immediately; non-acting arms may
+        # then cross the barrier while pick-lift/other cleanup continues. Keeping confirm()
+        # after lift made its variable duration part of global synchronization for no semantic
+        # reason, which no phase retimer can hide without eventually parking at the barrier.
         for tid in online_fire_tids[fire_k]:
           seat_before_fire(tid, qc0, flow_drive=_flow_drive, flow_tick=_flow_tick)
           fire(tid)
+        _pre_fire = (online_stepper.steps - _fw0) * DT
+        online_stepper.confirm_fire(defer_pace_replan=True)
+        for tid in online_fire_tids[fire_k]:
           lift_after_fire(tid, qc0, flow_drive=_flow_drive, flow_tick=_flow_tick)
-        online_stepper.confirm_fire()
-        # The gate-to-confirm ceremony (dwell + settle + plant convergence) is what non-acting
-        # arms wait out at the no-pass cap, and its true duration is what settle_nom must
-        # predict for the NEXT anchor -- a fixed --settle-max was systematically short (the
-        # plant must physically converge after stopping; measured cap parking ~0.4-0.5s at
-        # the very first pick). Learn it: EMA over the measured windows.
-        _w = (online_stepper.steps - _fw0) * DT
-        _settle_ema = _w if _settle_ema is None else 0.7 * _settle_ema + 0.3 * _w
-        online_stepper.settle_nom = _settle_ema
-        print(f"[sim/mp] fire {online_stepper.fired - 1}: ceremony {_w*1000:.0f}ms, "
-              f"ema {_settle_ema*1000:.0f}ms")
+        # Hold the old constant rates through cleanup, then plan the next stretch ONCE from
+        # the state actually reached. This is an event-triggered replan, not a tick feedback
+        # loop, and means the unknown lift duration cannot corrupt the next arrival forecast.
+        if pace:
+          online_stepper.replan_pace()
+        _budget = _pre_fire_budget[fire_k]
+        print(f"[sim/mp] fire {online_stepper.fired - 1}: pre-fire servo "
+              f"{_pre_fire*1000:.0f}ms / {_budget*1000:.0f}ms reserved; post-fire cleanup "
+              "overlapped with the next mode"
+              + (", then phase profile replanned once" if pace else ""))
     print(f"[sim/mp] --corridor-online: {_n_tick} ticks executed "
           f"({online_stepper.fired}/{online_stepper.K} events), no precomputed schedule; "
           f"paced ticks per arm {[int(x) for x in _paced]}, held {[int(x) for x in _held]}; "
-          f"preventive gate: {_n_tick // max(_VCHK, 1)} checks, {_n_gate} hold(s)")
+          f"preventive gate: {_n_checks} adjusted-command checks (every {_VCHK} ticks), "
+          f"{_n_gate} hold(s), "
+          f"{_n_servo_gate} adjustment-only")
     if pace:
-      print("[sim/mp] pace factors mean per arm: "
+      print(f"[sim/mp] feed-forward profiles planned: {online_stepper._pace_replans}; "
+            "pace factors mean per arm: "
             + ", ".join(f"{r} {v:.3f}" for r, v in zip(
                 robots, online_stepper._pf_sum / max(online_stepper._pf_n, 1))))
       _lbl = ["at-cap", "hold", "pace<.05", "rf=0", "at-end", "moving", "corr-cap", "crawl"]
@@ -3869,6 +4213,13 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         print(f"  {_r}: " + ", ".join(f"{_lbl[_j]} {int(online_stepper._why[_i, _j])}"
                                       for _j in range(8)))
       _wk = online_stepper._why_k.sum(axis=1)
+      _nonact = np.zeros(len(robots), dtype=np.int64)
+      for _k in range(online_stepper.K):
+        for _r in range(len(robots)):
+          if _r not in online_stepper.act[_k]:
+            _nonact[_r] += online_stepper._why_k[_k, _r]
+      print("[sim/mp] avoidable no-pass waits (non-acting arms only, ticks): "
+            + ", ".join(f"{_r} {int(_nonact[_i])}" for _i, _r in enumerate(robots)))
       _hot = [k for k in range(online_stepper.K) if _wk[k] > 500]
       if _hot:
         print("[sim/mp] at-cap waits by barrier (ticks): "
@@ -3880,7 +4231,11 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                  pf=np.asarray([t[1] for t in _tr]),
                  rf=np.asarray([t[2] for t in _tr]),
                  fired=np.asarray([t[3] for t in _tr]),
-                 bar=np.asarray(online_stepper.bar_s))
+                 bar=np.asarray(online_stepper.bar_s),
+                 acting=np.asarray([[r in a for r in range(len(robots))]
+                                    for a in online_stepper.act], dtype=bool),
+                 stop_causes=online_stepper._why.copy(),
+                 cap_waits=online_stepper._why_k.copy())
         print(f"[sim/mp] pace trace saved: {pace_trace} ({len(_tr)} ticks)")
   else:
     # ------------- THE OFFLINE EXECUTION LOOP (precomputed trajectory modes) -------------
@@ -3929,14 +4284,19 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       if servo is not None:
         servo.update()
         qc = servo.adjust(qc)
+      if servo is not None and not phase_schedule:
         # VELOCITY-FUNNEL PACING (GLOBAL CLOCK, funnel-scoped): hold the reference WHILE the
         # funnel demands slowness, re-evaluating every tick -- the executed descent
         # decelerates, measured vz drops, the factor recovers and the hold releases on its
         # own. Unlike the old binary near-zone (which crawled through every horizontal low
         # carry -- the user-reported "annoying global slowdown"), the funnel triggers only
         # while a cargo is actually DESCENDING near the table: ~hundreds of ticks per run.
-        # The clock is still global (offline schedule = one clock); the per-arm version
-        # lives in --corridor-online.
+        # The clock is still global in the legacy lockstep/corridor trajectories.  A phase
+        # schedule already has independent arm clocks and feed-forward servo reservations;
+        # applying this old min-over-arms loop underneath it freezes EVERY robot whenever
+        # one placed part touches the table (measured: 14s all-arm pause on chair).  Phase
+        # execution therefore keeps the compliant offset above but does not introduce a
+        # second, global reactive clock here.
         _fmin = float(np.min(servo.rate_factors(robots)))
         _reps = 0
         while _fmin < 0.999 and _reps < 11:
@@ -3973,7 +4333,14 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       scene.trace_ctx = i
       scene.step(1, report, (traj.phase[i],))
       if i in fire_at:
-        settle_before_fire(traj.q[i], _touch_robots(fire_at[i]))
+        # A phase-scheduled fire deliberately allows unrelated arms to keep moving through
+        # the rendezvous. Requiring THEIR instantaneous tracking residual to converge here
+        # turns that valid crossing motion into a global stop and was the remaining long
+        # pause in car-mini. Only the event's actors and holders have to be at the witness.
+        # Lockstep/corridor retain their historical all-arm check.
+        _owned = ([robots[r] for r in sorted(acting_for(fire_at[i]))]
+                  if phase_schedule else None)
+        settle_before_fire(traj.q[i], _touch_robots(fire_at[i]), owned=_owned)
         for tid in fire_at[i]:
           seat_before_fire(tid, traj.q[i])
           fire(tid)                                          # acting arms rest through the
@@ -4195,11 +4562,20 @@ def _states_from_plan(cfg, C, asm, robots, plan):
 
 def _cli_run(a):
   global JOINT_RATE, ARM_ARM_CONTACTS
-  ARM_ARM_CONTACTS = bool(getattr(a, "arm_arm_contacts", False))
+  if a.phase_schedule and a.corridor_online:
+    raise SystemExit("[sim] --phase-schedule and --corridor-online are mutually exclusive")
+  if a.phase_servo_time < 0.0:
+    raise SystemExit("[sim] --phase-servo-time must be non-negative")
+  if a.phase_smooth and not a.phase_schedule:
+    raise SystemExit("[sim] --phase-smooth requires --phase-schedule")
+  if a.phase_smooth_time <= 0.0:
+    raise SystemExit("[sim] --phase-smooth-time must be positive")
+  _aac = getattr(a, "arm_arm_contacts", None)
+  ARM_ARM_CONTACTS = bool(a.phase_schedule) if _aac is None else bool(_aac)
   if ARM_ARM_CONTACTS:
-    print("[sim] --arm-arm-contacts: ACTUATED arm geoms get contype 1 -- real "
-          "arm-arm collision physics. The certified handover formations overlap, so "
-          "expect pushes where the path passes grippers through each other.")
+    print("[sim] arm-arm contacts ACTIVE: per-robot contact masks enable cross-arm physics "
+          "but exclude same-chain self contacts -- physical backstop for the phase "
+          "schedule's exact geometric collision certificate.")
   if getattr(a, "joint_rate", None):
     JOINT_RATE = float(a.joint_rate)                          # per-arm cruise speed override
     print(f"[sim] --joint-rate {JOINT_RATE:g} rad/s (default 1.0)")
@@ -4457,7 +4833,12 @@ def _cli_run(a):
                               record=a.record, gui=a.gui, visual=_want_meshes,
                               verbose=a.verbose,
                               rate_boost=a.arm_rate,
-                              corridor=a.corridor, corridor_ds=a.corridor_ds,
+                              corridor=(a.corridor or a.phase_schedule),
+                              phase_schedule=a.phase_schedule,
+                              phase_servo_time=a.phase_servo_time,
+                              phase_smooth=a.phase_smooth,
+                              phase_smooth_time=a.phase_smooth_time,
+                              corridor_ds=a.corridor_ds,
                               corridor_ds_lead=a.corridor_ds_lead,
                               corridor_lead_max=a.corridor_lead_max,
                               corridor_verify=a.corridor_verify,
@@ -4571,22 +4952,49 @@ def _build_cli():
                  help="--pace: save the per-tick stepper state (s, pace factors, rate "
                       "factors, fired) to FILE for offline analysis.")
   r.add_argument("--pace", action="store_true",
-                 help="--corridor-online: CONSTANT-SPEED ARRIVAL PACING -- every arm cruises "
-                      "to the pending barrier at a constant arc rate and reaches it at the "
-                      "common fire instant (slowest acting arm + dwell + --settle-max as the "
-                      "settle estimate), instead of sprinting there and stopping at the "
-                      "no-pass cap. Runtime feedback, not a precomputed profile.")
-  r.add_argument("--settle-tol", type=float, default=1e-3, metavar="RAD",
+                 help="--corridor-online: FEED-FORWARD PHASE SCHEDULING. At each mode switch, "
+                      "predict the complete next stretch once and choose one fixed rate "
+                      "factor per corridor-coupled arm group. Acting groups meet at fire; "
+                      "crossing groups reserve the hard --settle-max budgets of applicable "
+                      "pre-fire hooks. No per-tick remaining-distance feedback; post-fire "
+                      "cleanup overlaps the next mode, and runtime guards remain hard safety "
+                      "overrides.")
+  r.add_argument("--phase-schedule", action=argparse.BooleanOptionalAction, default=False,
+                 help="Precompute a monotone coordination-space trajectory with one phase "
+                      "per robot. Visual quality is primary: preferred cruise motion, few "
+                      "unnecessary stops, and fixed nominal servo reservations; makespan is "
+                      "only a weak consequence. Every accepted phase step and the complete "
+                      "result are checked with the strict planner collision predicate. On a "
+                      "coordination failure it falls back to the synchronized reference. "
+                      "Incompatible with --corridor-online; replaces corridor Stage A/B/C.")
+  r.add_argument("--phase-servo-time", type=float, default=0.15, metavar="SEC",
+                 help="--phase-schedule: nominal feed-forward duration reserved for each "
+                      "joint-settle or seat-servo ceremony (default 0.15s each, matching the "
+                      "measured car-mini mean rather than the 1s worst-case cap). This is a "
+                      "planning guess, not runtime feedback; execution still checks actual "
+                      "convergence before the event and holds on an overrun.")
+  r.add_argument("--phase-smooth", action=argparse.BooleanOptionalAction, default=False,
+                 help="--phase-schedule: postprocess each robot's monotone phase RATE with a "
+                      "Gaussian filter while pinning every complete mode-switch phase vector, "
+                      "actor stops, and rigid coupling intervals. The joint paths are never "
+                      "splined again. The result receives the same exact 2ms/pre+post-switch "
+                      "audit; collision-sensitive fire intervals revert locally to the raw "
+                      "certified schedule.")
+  r.add_argument("--phase-smooth-time", type=float, default=0.12, metavar="SEC",
+                 help="--phase-smooth kernel support in seconds (default 0.12). Larger values "
+                      "remove longer rate stutters but are more likely to require a local "
+                      "collision-certified fallback.")
+  r.add_argument("--settle-tol", type=float, default=2e-3, metavar="RAD",
                  help="--actuated: before each attach fires, hold the reference until the max "
-                      "joint tracking error is under RAD. DEFAULT 1e-3 (0 disables): settling "
-                      "takes ~0.54s against a 0.15s DWELL_T, so attaches used to fire mid-"
-                      "convergence and _activate_weld froze the residual into the hand -- "
-                      "measured pick-to-pick drift 0.05 -> 56mm, and enabling this removed EVERY "
-                      "not_seated failure on cross-new. No effect unless --actuated. "
-                      "joint tracking error is under RAD (0 = off, byte-identical). The "
-                      "schedule dwells a fixed DWELL_T, but a servo settles when it settles "
-                      "(measured 0.54s vs a 0.15s dwell), and the grasp weld freezes whatever "
-                      "residual exists at fire time into the hand.")
+                      "joint tracking error is under RAD. Default 2e-3: the actuated car has "
+                      "a repeatable ~1.9mrad payload-biased floor, so the former 1e-3 default "
+                      "waited the full 1s timeout without improving. Two mrad is roughly 2mm "
+                      "at a 1m reach and matches the seat-servo scale; 0 disables the gate. "
+                      "The gate still prevents firing during the much larger transient that "
+                      "previously froze tracking residual into a new weld. A residual below "
+                      "2x RAD that improves by less than 0.25x RAD over 0.1s is accepted as "
+                      "the finite-gain servo's steady-state plateau instead of waiting the "
+                      "full --settle-max.")
   r.add_argument("--settle-max", type=float, default=1.0, metavar="SEC",
                  help="--settle-tol: give up waiting after this long (default 1.0s).")
   r.add_argument("--servo-pick", action=argparse.BooleanOptionalAction, default=False,
@@ -4600,7 +5008,9 @@ def _build_cli():
                       "-- contact force on arm links and the bare gripper (a pick approach "
                       "before any weld exists) yields the reference exactly like a cargo "
                       "press, with its own lower deadband --compliant-force. Compliant "
-                      "following as the default tracking law instead of held-cargo-only.")
+                      "following as the tracking law instead of held-cargo-only. EXPERIMENTAL: "
+                      "an unresolved branch collision can saturate the 10mm yield and hold "
+                      "the phase indefinitely; the stall diagnostic identifies this case.")
   r.add_argument("--compliant-force", type=float, default=3.0, metavar="N",
                  help="--compliant-follow yield deadband (N); the guard/funnel keep engaging "
                       "at --servo-force")
@@ -4628,12 +5038,13 @@ def _build_cli():
                       "datum-band grind that ratchets long-lever grasps to their torque "
                       "cap). Fires the place at the touched pose. Default off.")
   r.add_argument("--servo-torque-guard", type=float, default=None, metavar="FRAC",
-                 help="--skill-servo: ALSO engage the guarded hold + yield when a held part's "
-                      "grasp TORQUE exceeds FRAC of its cap (e.g. 0.6). The force-only 6N "
-                      "trigger is blind to long-lever cargo: the chair seat hits its 0.8Nm cap "
-                      "at ~8N of table drag, past the 20ms breakage window before the yield "
-                      "can react. Watches the same weld wrench the breakage monitor judges. "
-                      "Default off (byte-identical).")
+                 help="--skill-servo: normalized grasp-wrench guard (historic option name): "
+                      "during external contact above --servo-force, engage guarded hold + "
+                      "yield when either "
+                      "measured FORCE or TORQUE exceeds FRAC of its corresponding scalar "
+                      "breakaway cap (e.g. 0.6). Uses the same weld wrench and caps as the "
+                      "breakage monitor, but ignores gravity-only utilization so transport "
+                      "cannot deadlock. Default off (byte-identical).")
   r.add_argument("--servo-tol", type=float, default=0.002, metavar="M",
                  help="--skill-servo: seat-servo convergence tolerance (default 2mm).")
   r.add_argument("--corridor-online", action="store_true",
@@ -4820,10 +5231,12 @@ def _build_cli():
                       "Applied before witnesses/problem/sim so IK, the oracle and the MuJoCo "
                       "capsules agree. Default 1.0 = untouched. Not for validation runs: "
                       "clearances no longer match the planner's certified geometry.")
-  r.add_argument("--arm-arm-contacts", action="store_true",
-                 help="ACTUATED arm geoms get contype 1 instead of 2: real arm-arm "
-                      "collision physics (default masks arm-arm to avoid phantom forces "
-                      "from mocap chains interpenetrating at handovers).")
+  r.add_argument("--arm-arm-contacts", action=argparse.BooleanOptionalAction, default=None,
+                 help="Use per-robot MuJoCo contact bits for real cross-arm collision physics "
+                      "without enabling same-chain self contacts. Defaults ON with "
+                      "--phase-schedule (physical "
+                      "backstop for its exact audit) and OFF for legacy execution. Use "
+                      "--no-arm-arm-contacts only as a diagnostic override.")
   r.add_argument("--path-preflight", action=argparse.BooleanOptionalAction, default=True,
                  help="Before spline/corridor construction, densely check the SAVED diagonal "
                       "path against strict collision and joint limits. Default ON: retiming "

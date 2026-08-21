@@ -212,14 +212,62 @@ class TimedTrajectory:
   phase: list = field(default_factory=list)
   fires: list = field(default_factory=list)
   progress: object = None       # (M, n_arms) per-arm arc position, when the producer tracks it
+  couplings: list = field(default_factory=list)  # local (arms, s0, s1) equality windows, if any
 
   def __len__(self):
     return len(self.q)
 
 
+def upsample_trajectory(traj, dt, q0=None):
+  """Densify a ``TimedTrajectory`` by an integer factor without changing its timing/events.
+
+  Coordination-space scheduling does not need to run at the 2ms physics-control rate: its
+  exact predicate already uses the motion planner's ~0.01rad edge scale.  Plan coarsely, then
+  use this helper to restore the controller rate and audit EVERY dense sample.  If that audit
+  rejects an interpolated state, the caller retries at a finer planning rate or falls back;
+  densification itself is therefore never treated as a collision certificate.
+
+  ``q0`` is the configuration at t=0.  ``traj.q[0]`` is conventionally the configuration
+  after the first source tick, so supplying q0 preserves that first interval as well.
+  """
+  dt = float(dt)
+  if dt <= 0.0 or traj.dt <= 0.0:
+    raise ValueError("trajectory sample times must be positive")
+  ratio = float(traj.dt) / dt
+  factor = int(round(ratio))
+  if factor < 1 or not np.isclose(ratio, factor, rtol=0.0, atol=1e-9):
+    raise ValueError(f"source dt {traj.dt:g} is not an integer multiple of target dt {dt:g}")
+  if factor == 1:
+    return traj
+  src = np.asarray(traj.q, dtype=float)
+  if not len(src):
+    return TimedTrajectory(dt=dt, q=src.copy(), phase=[], fires=[], progress=None,
+                           couplings=list(traj.couplings))
+  prev = np.asarray(src[0] if q0 is None else q0, dtype=float)
+  out, phase = [], []
+  pout = [] if traj.progress is not None else None
+  pprev = (np.zeros(traj.progress.shape[1], dtype=float) if traj.progress is not None
+           else None)
+  for i, goal in enumerate(src):
+    pg = traj.progress[i] if traj.progress is not None else None
+    for j in range(1, factor + 1):
+      a = j / factor
+      out.append(prev + a * (goal - prev))
+      phase.append(traj.phase[i] if i < len(traj.phase) else "path")
+      if pout is not None:
+        pout.append(pprev + a * (pg - pprev))
+    prev = goal
+    if pout is not None:
+      pprev = pg
+  fires = [((int(i) + 1) * factor - 1, list(ev)) for i, ev in traj.fires]
+  return TimedTrajectory(dt=dt, q=np.asarray(out, dtype=float), phase=phase, fires=fires,
+                         progress=(np.asarray(pout, dtype=float) if pout is not None else None),
+                         couplings=list(traj.couplings))
+
+
 def build_trajectory(stretches, dt, joint_rate=DEFAULT_JOINT_RATE, ramp_dist=DEFAULT_RAMP_DIST,
                      ramp_min=DEFAULT_RAMP_MIN, dwell=0.0, settle=0.0, accel=None,
-                     arm_dims=None, vmax=None):
+                     arm_dims=None, vmax=None, event_durations=None):
   """Stitch per-mode stretches into one `TimedTrajectory` with v=0 (+ optional dwell)
   at every boundary where events fire, and a final settle hold.
 
@@ -229,14 +277,25 @@ def build_trajectory(stretches, dt, joint_rate=DEFAULT_JOINT_RATE, ramp_dist=DEF
   """
   q, phase, fires = [], [], []
   n_dwell = int(round(dwell / dt)) if dt > 0 else 0
+  if event_durations is None:
+    n_event = [0] * len(stretches)
+  else:
+    _event = np.asarray(event_durations, dtype=float).reshape(-1)
+    if len(_event) != len(stretches):
+      raise ValueError(
+          f"event_durations has {len(_event)} entries for {len(stretches)} events")
+    if np.any(_event < 0.0):
+      raise ValueError("event_durations must be non-negative")
+    n_event = (np.rint(_event / dt).astype(int).tolist() if dt > 0
+               else [0] * len(stretches))
   goal = None
-  for qs, events in stretches:
+  for k, (qs, events) in enumerate(stretches):
     for c in retime_stretch(qs, dt, joint_rate, ramp_dist, ramp_min, accel=accel,
                             arm_dims=arm_dims, vmax=vmax):
       q.append(c)
       phase.append("path")
     goal = np.asarray(qs[-1], float) if len(qs) else goal
-    for _ in range(n_dwell):                                 # settle to v~=0 before relinking
+    for _ in range(n_dwell + n_event[k]):                    # nominal servo + settle before fire
       q.append(goal)
       phase.append("dwell")
     fires.append((len(q) - 1, list(events)))                 # fire at rest, on the goal
@@ -340,13 +399,20 @@ def motion_report(q, dt, arm_dims, joint_rate, crawl=0.5, stopped=0.05):
   """Per-arm MOTION QUALITY of a retimed trajectory -- the metric that matters for
   execution: do the arms move smoothly, or do they keep crawling/stalling?
 
-  For each arm: the fraction of samples spent STOPPED (<stopped x cruise), CRAWLING
+  For each arm's ACTIVE interval (first motion through its own final arrival): the fraction
+  of samples spent STOPPED (<stopped x cruise), CRAWLING
   (stopped..crawl x cruise) and running near cruise, plus the number of separate SLOW
   EPISODES (contiguous below-crawl runs bracketed by near-cruise motion) -- an arm that
   decelerates 20 times over a run reads as "randomly slowing down" no matter what the
   makespan says. Stops at an arm's own task goals are legitimate; the episode count is
   meaningful against that baseline, so compare prioritized vs lockstep rather than
-  reading it absolutely. Returns [{arm, stopped, crawling, cruising, episodes, mean}]."""
+  reading it absolutely. Returns [{arm, stopped, crawling, cruising, episodes, mean}].
+
+  The terminal idle tail is reported separately.  It is not a visual defect: terminal
+  completion is intentionally asynchronous, so a robot that reaches home at a reasonable
+  speed may remain there while another finishes rather than creeping to manufacture a
+  synchronized final instant.
+  """
   q = np.asarray(q, float)
   out = []
   if len(q) < 2:
@@ -354,7 +420,15 @@ def motion_report(q, dt, arm_dims, joint_rate, crawl=0.5, stopped=0.05):
   for r, dims in enumerate(arm_dims):
     dims = np.asarray(dims, int)
     v = np.linalg.norm(np.diff(q[:, dims], axis=0), axis=1) / max(dt, 1e-12)
-    frac = v / max(joint_rate, 1e-12)
+    frac_all = v / max(joint_rate, 1e-12)
+    moving = np.flatnonzero(frac_all >= stopped)
+    if len(moving):
+      lo, hi = int(moving[0]), int(moving[-1]) + 1
+      frac = frac_all[lo:hi]
+      terminal_idle = max(0, len(frac_all) - hi) * dt
+    else:
+      frac = frac_all
+      terminal_idle = len(frac_all) * dt
     is_stop = frac < stopped
     is_slow = frac < crawl
     eps_n, prev_fast = 0, True
@@ -367,7 +441,8 @@ def motion_report(q, dt, arm_dims, joint_rate, crawl=0.5, stopped=0.05):
                 "crawling": float(np.mean(is_slow & ~is_stop)),
                 "cruising": float(np.mean(~is_slow)),
                 "episodes": eps_n,
-                "mean": float(np.mean(frac))})
+                "mean": float(np.mean(frac)),
+                "terminal_idle": float(terminal_idle)})
   return out
 
 
@@ -375,9 +450,9 @@ def format_motion_report(rows, label=""):
   """One compact line per arm from `motion_report` (see it for the metric definitions)."""
   head = f"[retiming] motion quality{' ' + label if label else ''}:"
   body = ["  arm%d: cruise %4.0f%%  crawl %4.0f%%  stopped %4.0f%%  "
-          "slow-episodes %3d  mean %.2f x cruise"
+          "slow-episodes %3d  mean %.2f x cruise  terminal-idle %.1fs"
           % (d["arm"], 100 * d["cruising"], 100 * d["crawling"], 100 * d["stopped"],
-             d["episodes"], d["mean"]) for d in rows]
+             d["episodes"], d["mean"], d["terminal_idle"]) for d in rows]
   return "\n".join([head] + body)
 
 
@@ -396,7 +471,8 @@ def plan_schedule(stretches, arm_dims, acting, dt,
                   joint_rate=DEFAULT_JOINT_RATE, ramp_dist=DEFAULT_RAMP_DIST,
                   ramp_min=DEFAULT_RAMP_MIN, corner_dv=DEFAULT_CORNER_DV,
                   priority=None, collide=None, dwell=0.0, collide_ds=0.01,
-                  settle=0.0, max_steps=None, stall_steps=None, rate_boost=False):
+                  settle=0.0, max_steps=None, stall_steps=None, rate_boost=False,
+                  event_durations=None, per_arm_rate=False):
   """PRIORITIZED, EVENT-DRIVEN retiming: arms desync so only the arm(s) ACTING at a
   barrier ramp to rest there; uninvolved arms CROSS the barrier without stopping.
   Events fire in DAG/sequence order, each once its acting arm(s) have arrived at rest
@@ -426,6 +502,16 @@ def plan_schedule(stretches, arm_dims, acting, dt,
                 (held part settles) and again after it (weld takes hold). Non-acting
                 arms keep moving throughout -- this replaces the composite executor's
                 all-arms dwell freeze.
+    event_durations: optional seconds reserved BEFORE each event in addition to `dwell`.
+                This is the nominal duration of the event's servo/seat operation, not a
+                measured runtime correction.  Reserving it in the offline schedule lets
+                crossing arms use that time without a reactive re-timing loop.  A runtime
+                overrun may still hold at the event; it never changes this planned profile.
+    per_arm_rate: interpret `joint_rate` in each arm's OWN joint-space arc instead of in the
+                composite all-arm arc. A phase span on which an arm is physically stationary
+                is bookkeeping and is skipped immediately; a moving arm realizes approximately
+                `joint_rate` regardless of how many other arms move in that composite segment.
+                Every resulting desynchronized configuration still goes through `collide`.
     collide_ds: arc-length cell (rad) for caching collide verdicts -- one query per
                 (mover, arm-cells, fired) cell, not per dt step. Verdicts are evaluated
                 with EVERY arm at its forward cell edge (clamped to its cap), so a safe
@@ -490,8 +576,26 @@ def plan_schedule(stretches, arm_dims, acting, dt,
   # rescaling, no new configurations, so it needs no extra collision reasoning of its own.
   _boost = arm_rate_boost(list(P), arm_dims) if rate_boost else None
 
-  def rate_at(s):
-    return joint_rate if _boost is None else joint_rate * _boost[_seg_index(csum, segs, s)]
+  # Per-arm share of every COMPOSITE segment.  A 1rad/s composite clock makes an arm whose
+  # share is 0.1 crawl at 0.1rad/s, and worse, makes a completely stationary arm spend real
+  # seconds traversing invisible phase before an event may fire (chair place: 9.5s with every
+  # physical joint stopped). Independent phase planning can normalize this safely because its
+  # candidates are collision checked. Zero-share runs are skipped; they change no geometry.
+  _d = np.diff(P, axis=0)
+  _tot = np.linalg.norm(_d, axis=1)
+  _share = np.ones((n, max(len(_d), 1)))
+  for _r in range(n):
+    _sr = np.linalg.norm(_d[:, np.asarray(arm_dims[_r], int)], axis=1)
+    _ok = _tot > 1e-12
+    _share[_r][_ok] = _sr[_ok] / _tot[_ok]
+
+  def rate_at(r, s):
+    i = _seg_index(csum, segs, s)
+    base = joint_rate if _boost is None else joint_rate * _boost[i]
+    if not per_arm_rate:
+      return base
+    sh = _share[r][i]
+    return np.inf if sh <= 1e-9 else base / sh
 
   def ramp_factor(r, s):
     if ramp_dist <= 0:
@@ -511,12 +615,44 @@ def plan_schedule(stretches, arm_dims, acting, dt,
         return bar_s[k]
     return D
 
+  def step_to(r, s, cap):
+    """One phase tick, skipping physically idle bookkeeping spans.
+
+    Moving steps stop at composite waypoint boundaries. This keeps the local share/rate exact
+    and prevents a high normalized phase rate from jumping across a corner. Idle spans may be
+    crossed in one call because arm r's configuration is bit-identical throughout them.
+    """
+    cur = float(s)
+    if per_arm_rate:
+      while cur < cap - 1e-12:
+        i = _seg_index(csum, segs, cur)
+        if _share[r][i] > 1e-9:
+          break
+        nxt = min(float(csum[i + 1]), float(cap))
+        if nxt <= cur + 1e-12:
+          break
+        cur = nxt
+    if cur >= cap - 1e-12:
+      return min(cur, cap)
+    i = _seg_index(csum, segs, cur)
+    nxt = min(float(csum[i + 1]), float(cap)) if per_arm_rate else float(cap)
+    return min(nxt, cur + rate_at(r, cur) * ramp_factor(r, cur) * dt)
+
   if max_steps is None:                                      # generous: n arms each may wait out
     full = D / max(joint_rate * dt, 1e-9)                    # the others (10x margin for ramps/holds)
     max_steps = int(10 * n * full) + 10000
   if stall_steps is None:
     stall_steps = max(int(5.0 / dt), 1000) if dt > 0 else 1000
   n_dwell = int(round(dwell / dt)) if dt > 0 else 0
+  if event_durations is None:
+    n_event = np.zeros(K, dtype=int)
+  else:
+    _event = np.asarray(event_durations, dtype=float).reshape(-1)
+    if len(_event) != K:
+      raise ValueError(f"event_durations has {len(_event)} entries for {K} events")
+    if np.any(_event < 0.0):
+      raise ValueError("event_durations must be non-negative")
+    n_event = np.rint(_event / dt).astype(int) if dt > 0 else np.zeros(K, dtype=int)
   eps = 1e-6
   import os as _os
   _trace = bool(_os.environ.get("RETIMING_TRACE"))
@@ -642,7 +778,7 @@ def plan_schedule(stretches, arm_dims, acting, dt,
         cap = min(cap_of(r, fired), entry.get(r, D))         # event cap AND coupling entry
         if s[r] >= cap - eps:
           continue                                           # parked: barrier or span entry
-        s_new = min(cap, s[r] + rate_at(s[r]) * ramp_factor(r, s[r]) * dt)
+        s_new = step_to(r, s[r], cap)
         if s_new > s[r] + eps * dt and blocked(r, s_new, cap) is not None:
           continue                                           # yield: hold, retry next tick
         progressed = progressed or s_new > s[r]
@@ -652,10 +788,9 @@ def plan_schedule(stretches, arm_dims, acting, dt,
       for comp in comps:
         if any(steps <= hold_until[r] for r in comp):
           continue                                           # a member rests through a dwell
-        step_sz = min(rate_at(s[r]) * ramp_factor(r, s[r]) * dt for r in comp)
         cap = min(min(cap_of(r, fired), entry.get(r, D)) for r in comp)
         base = max(s[r] for r in comp)                       # equal by construction; be safe
-        g_new = min(cap, base + step_sz)
+        g_new = min(step_to(r, base, cap) for r in comp)
         if g_new <= base + eps * dt:
           continue                                           # parked at a barrier inside span
         s_try = list(s)
@@ -676,7 +811,7 @@ def plan_schedule(stretches, arm_dims, acting, dt,
           cap = min(cap_of(r, fired), entry.get(r, D))
           if s[r] >= cap - eps:
             continue
-          s_cand[r] = min(cap, s[r] + rate_at(s[r]) * ramp_factor(r, s[r]) * dt)
+          s_cand[r] = step_to(r, s[r], cap)
           any_move = any_move or s_cand[r] > s[r] + eps * dt
         if any_move and _verdict(collide(assemble(s_cand), fired), -1) is None:
           s = s_cand
@@ -696,7 +831,10 @@ def plan_schedule(stretches, arm_dims, acting, dt,
           and min(s) >= bar_s[fired] - eps:
         if ready_since is None:
           ready_since = steps                                # pre-fire dwell: settle at rest
-        if steps - ready_since >= n_dwell:
+        # The servo duration is feed-forward schedule data.  It is deliberately not learned
+        # or adjusted from this execution: normal runs therefore keep the same phase profile,
+        # while an exceptional servo overrun is handled later by the executor's safety hold.
+        if steps - ready_since >= n_dwell + n_event[fired]:
           fires.append((len(q) - 1, done_ids[fired]))        # event completes, at rest, in order
           for r in act[fired]:
             hold_until[r] = steps + n_dwell                  # post-fire dwell: weld takes hold
@@ -727,7 +865,7 @@ def plan_schedule(stretches, arm_dims, acting, dt,
           cap = min(cap_of(r, fired), entry.get(r, D))
           if s[r] >= cap - eps:
             continue
-          s_new = min(cap, s[r] + rate_at(s[r]) * ramp_factor(r, s[r]) * dt)
+          s_new = step_to(r, s[r], cap)
           who = blocked(r, s_new, cap)
           if who is not None and _trace:
             print(f"[retiming trace] wedge scan: arm{r}@{s[r]:.3f} blocked by "
@@ -738,10 +876,9 @@ def plan_schedule(stretches, arm_dims, acting, dt,
             j = max(who, key=lambda j: abs(s[j] - s[r]))
             raise _Wedge(r, j, s[r], s[j])
         for comp in comps:                                   # a fused GROUP held by outside
-          step_sz = min(rate_at(s[r]) * ramp_factor(r, s[r]) * dt for r in comp)
           cap = min(min(cap_of(r, fired), entry.get(r, D)) for r in comp)
           base = max(s[r] for r in comp)
-          g_new = min(cap, base + step_sz)
+          g_new = min(step_to(r, base, cap) for r in comp)
           if g_new <= base + eps * dt:
             continue
           s_try = list(s)
@@ -816,9 +953,227 @@ def plan_schedule(stretches, arm_dims, acting, dt,
   for _ in range(int(round(settle / dt)) if dt > 0 else 0):
     q.append(q[-1] if q else assemble(s_final))
     phase.append("settle")
+  _coupling_rows = [((int(i), int(j)), float(a), float(b))
+                    for G, wins in couplings.items() for i, j in [sorted(G)] for a, b in wins]
   return TimedTrajectory(dt=dt, q=np.asarray(q, float) if q else np.zeros((0, dof)),
                          phase=phase, fires=fires,
-                         progress=np.asarray(prog, float) if prog else None)
+                         progress=np.asarray(prog, float) if prog else None,
+                         couplings=_coupling_rows)
+
+
+def phase_intervals(traj):
+  """Inclusive sample intervals separated by fire configurations.
+
+  Every interval shares its boundary fire sample with its neighbour. A phase smoother pins
+  those samples exactly, so replacing one interval by the certified source cannot introduce a
+  position discontinuity.
+  """
+  n = len(traj.q)
+  if n == 0:
+    return []
+  pts = [0] + [int(i) for i, _ in traj.fires] + [n - 1]
+  pts = sorted(set(min(max(i, 0), n - 1) for i in pts))
+  return [(a, b) for a, b in zip(pts[:-1], pts[1:]) if b >= a]
+
+
+def phase_interval_at(traj, sample):
+  """Index of the fire-to-fire interval containing ``sample``."""
+  iv = phase_intervals(traj)
+  if not iv:
+    return 0
+  sample = int(sample)
+  return next((k for k, (a, b) in enumerate(iv) if a <= sample <= b), len(iv) - 1)
+
+
+def trajectory_smoothness(q, dt, arm_dims):
+  """RMS joint acceleration and jerk, averaged over arms (diagnostic, not a constraint)."""
+  q = np.asarray(q, dtype=float)
+  if len(q) < 4:
+    return {"accel_rms": 0.0, "jerk_rms": 0.0}
+  aa, jj = [], []
+  for dims in arm_dims:
+    x = q[:, np.asarray(dims, dtype=int)]
+    v = np.diff(x, axis=0) / dt
+    a = np.diff(v, axis=0) / dt
+    j = np.diff(a, axis=0) / dt
+    aa.append(float(np.sqrt(np.mean(a * a))))
+    jj.append(float(np.sqrt(np.mean(j * j))))
+  return {"accel_rms": float(np.mean(aa)), "jerk_rms": float(np.mean(jj))}
+
+
+def smooth_phase_trajectory(traj, path, arm_dims, fire_actors, window=0.12,
+                            stop_time=0.02, iterations=3, locked=(),
+                            restore_intervals=()):
+  """Smooth per-arm PHASE RATES while preserving the geometric paths and event samples.
+
+  The raw prioritized scheduler changes rate one tick at a time. We convolve its non-negative
+  phase increments with a Gaussian kernel, project each fire-to-fire interval back onto its
+  exact phase displacement, and retain a short zero-rate neighbourhood for event actors.
+  Positivity gives monotone phase; interval projection pins every complete phase vector at
+  every mode switch. Configurations are rebuilt by evaluating each robot's original path at
+  its new phase -- no joint-space corner cutting.
+
+  ``locked`` contains ``(i, j, s0, s1)`` rigid/collision coupling windows. For now the
+  fire-to-fire intervals intersecting such a window are left byte-for-byte unchanged for the
+  involved arms. ``restore_intervals`` similarly restores complete intervals after a dense
+  collision counterexample. A final per-arm check restores any interval in which smoothing
+  would exceed that robot's largest certified source step by more than two percent; fixed
+  event times must not compress a nicer-looking phase curve into an actuator-hostile speed spike.
+  The caller MUST collision-audit the result; this routine is a smoothness proposal, not a
+  certificate.
+
+  Returns ``(trajectory, report)``.
+  """
+  if traj.progress is None:
+    raise ValueError("phase smoothing requires per-arm progress")
+  if window <= 0.0 or traj.dt <= 0.0:
+    raise ValueError("phase smoothing window and sample time must be positive")
+  src = np.asarray(traj.progress, dtype=float)
+  P = np.asarray(path, dtype=float)
+  dims = [np.asarray(d, dtype=int) for d in arm_dims]
+  if src.ndim != 2 or src.shape[1] != len(dims) or len(src) != len(traj.q):
+    raise ValueError("phase progress shape does not match trajectory/arms")
+  if len(P) < 1:
+    raise ValueError("phase smoothing requires a non-empty geometric path")
+  n, nr = src.shape
+  if n < 3:
+    return traj, {"restored": 0, "intervals": 0,
+                  "before": trajectory_smoothness(traj.q, traj.dt, dims),
+                  "after": trajectory_smoothness(traj.q, traj.dt, dims)}
+
+  segs, D = arc_length(list(P))
+  csum = np.concatenate([[0.0], np.cumsum(segs)]) if segs else np.array([0.0])
+  # x includes the t=0 phase before traj.q[0], hence increments d[k] land on sample k.
+  x = np.vstack([np.zeros((1, nr)), src])
+  d0 = np.maximum(np.diff(x, axis=0), 0.0)
+  fire_x = [int(i) + 1 for i, _ in traj.fires]
+  bounds = sorted(set([0] + fire_x + [n]))
+  inc_intervals = [(a, b) for a, b in zip(bounds[:-1], bounds[1:]) if b > a]
+  sample_intervals = phase_intervals(traj)
+  restore = {int(k) for k in restore_intervals}
+
+  # A rigidly co-held formation cannot be independently filtered. Preserve the source phase
+  # for those two arms over every event interval that intersects its coupling window.
+  arm_restore = set()
+  for row in locked:
+    if len(row) == 3:                                       # ((i,j), a, b)
+      (i, j), lo, hi = row
+    else:
+      i, j, lo, hi = row
+    i, j, lo, hi = int(i), int(j), float(lo), float(hi)
+    for k, (a, b) in enumerate(sample_intervals):
+      for r in (i, j):
+        vals = src[a:b + 1, r]
+        if len(vals) and float(vals.max()) >= lo - 1e-9 and float(vals.min()) <= hi + 1e-9:
+          arm_restore.add((r, k))
+
+  radius = max(2, int(round(0.5 * window / traj.dt)))
+  z = np.arange(-radius, radius + 1, dtype=float)
+  sigma = max(radius / 2.0, 1.0)
+  kernel = np.exp(-0.5 * (z / sigma) ** 2)
+  kernel /= kernel.sum()
+  weights = np.ones((n, nr), dtype=float)
+  # All robots start/end at rest. Only event actors stop at internal fire points; crossing
+  # robots retain a smooth, nonzero derivative through somebody else's mode switch.
+  centres = [(0, set(range(nr))), (n, set(range(nr)))]
+  centres += [(fx, set(fire_actors[k]) if k < len(fire_actors) else set())
+              for k, fx in enumerate(fire_x)]
+  half_stop = max(1, int(round(0.5 * stop_time / traj.dt)))
+  taper = max(1, radius)
+  mids = np.arange(n, dtype=float) + 0.5
+  for centre, actors in centres:
+    dist = np.abs(mids - float(centre))
+    w = np.ones(n, dtype=float)
+    w[dist <= half_stop] = 0.0
+    band = (dist > half_stop) & (dist < half_stop + taper)
+    u = (dist[band] - half_stop) / taper
+    w[band] = u * u * (3.0 - 2.0 * u)                       # smoothstep 0 -> 1
+    for r in actors:
+      weights[:, int(r)] = np.minimum(weights[:, int(r)], w)
+
+  cur = d0.copy()
+  for _ in range(max(1, int(iterations))):
+    proposal = np.empty_like(cur)
+    for r in range(nr):
+      pad = np.pad(cur[:, r], (radius, radius), mode="edge")
+      proposal[:, r] = np.convolve(pad, kernel, mode="same")[radius:radius + n]
+    proposal *= weights
+    proposal = np.maximum(proposal, 0.0)
+    for k, (a, b) in enumerate(inc_intervals):
+      for r in range(nr):
+        if k in restore or (r, k) in arm_restore:
+          proposal[a:b, r] = d0[a:b, r]
+          continue
+        target = float(np.sum(d0[a:b, r]))
+        got = float(np.sum(proposal[a:b, r]))
+        if target <= 1e-12:
+          proposal[a:b, r] = 0.0
+        elif got <= 1e-15:
+          proposal[a:b, r] = d0[a:b, r]
+        else:
+          proposal[a:b, r] *= target / got
+    cur = proposal
+
+  out_progress = np.cumsum(cur, axis=0)
+  # Exact restoration matters for rigid co-grasps: even harmless roundoff would turn equality
+  # into a tiny relative motion once differentiated by a stiff controller.
+  for k, (a, b) in enumerate(sample_intervals):
+    if k in restore:
+      out_progress[a:b + 1] = src[a:b + 1]
+    else:
+      for r in range(nr):
+        if (r, k) in arm_restore:
+          out_progress[a:b + 1, r] = src[a:b + 1, r]
+  # Remove roundoff at every event anchor explicitly.
+  for bx in bounds[1:]:
+    out_progress[bx - 1] = x[bx]
+  out_progress = np.maximum.accumulate(out_progress, axis=0)
+  out_progress = np.minimum(out_progress, D)
+  # Clipping can change a source endpoint by a few ulps. Re-apply certified intervals last so
+  # the promised exact rigid-coupling fallback is genuinely exact.
+  for k, (a, b) in enumerate(sample_intervals):
+    if k in restore:
+      out_progress[a:b + 1] = src[a:b + 1]
+    else:
+      for r in range(nr):
+        if (r, k) in arm_restore:
+          out_progress[a:b + 1, r] = src[a:b + 1, r]
+
+  plist = list(P)
+  def _rebuild(progress):
+    oq = np.asarray(traj.q, dtype=float).copy()              # preserve any non-arm columns
+    for kk in range(n):
+      for rr in range(nr):
+        oq[kk, dims[rr]] = config_at(
+            plist, csum, segs, float(progress[kk, rr]))[dims[rr]]
+    return oq
+
+  out_q = _rebuild(out_progress)
+  rate_restore = set()
+  src_q = np.asarray(traj.q, dtype=float)
+  source_peak = []
+  for r in range(nr):
+    _steps = np.linalg.norm(np.diff(src_q[:, dims[r]], axis=0), axis=1)
+    source_peak.append(float(_steps.max()) if len(_steps) else 0.0)
+  for k, (a, b) in enumerate(sample_intervals):
+    if b <= a:
+      continue
+    for r in range(nr):
+      new_step = np.linalg.norm(np.diff(out_q[a:b + 1, dims[r]], axis=0), axis=1)
+      new_max = float(new_step.max()) if len(new_step) else 0.0
+      if new_max > 1.02 * source_peak[r] + 1e-10:
+        out_progress[a:b + 1, r] = src[a:b + 1, r]
+        rate_restore.add((r, k))
+  if rate_restore:
+    out_q = _rebuild(out_progress)
+  out = TimedTrajectory(dt=traj.dt, q=out_q, phase=list(traj.phase),
+                        fires=[(int(i), list(ev)) for i, ev in traj.fires],
+                        progress=out_progress, couplings=list(traj.couplings))
+  return out, {"restored": len(restore), "intervals": len(inc_intervals),
+               "locked_arm_intervals": len(arm_restore),
+               "rate_limited_arm_intervals": len(rate_restore),
+               "before": trajectory_smoothness(traj.q, traj.dt, dims),
+               "after": trajectory_smoothness(out.q, out.dt, dims)}
 
 
 def split_stretches(states, q_of, mode_of, taskids_of):
@@ -1346,10 +1701,10 @@ class CorridorStepper:
   guarantee. The coarse certificate is honoured, not out-run: any state this stepper visits
   is inside the same certified set the offline scheduler used.
 
-  NOT inherited from offline: `_corridor_spread` (needs the future; its KNOWN HOLE of
-  exceeding wrench vmax 1.9x at corners is therefore also absent). Motion is the forward
-  profile: an early arm waits AT a barrier it acts on; with runtime-only slowdowns those
-  waits are the genuinely-required syncs, which is the point.
+  NOT inherited from offline: `_corridor_spread` (its KNOWN HOLE exceeds wrench vmax at
+  corners). Optional feed-forward pacing does use the future, but only through deterministic
+  rollouts at a mode boundary: it selects fixed group rates for the whole stretch. There is
+  no per-tick phase-error feedback, and runtime safety slowdowns remain explicit overrides.
 
   Interpolation is served from a PRECOMPUTED path cache: the offline pass paid ~2.4ms of
   Python per 5ms sample (config_at per arm per tick, x4 more in the rate-clamp backoff) --
@@ -1364,12 +1719,13 @@ class CorridorStepper:
     # fire_all=False: FIRE-FLOW gate -- an event fires as soon as its ACTING arms rest at the
     # barrier, without waiting for laggard arms to arrive. Laggards are still capped at the
     # pending barrier (no-pass), so they use the settle/servo window to arrive, never to cross.
-    # pace=True: CONSTANT-SPEED ARRIVAL PACING -- the runtime analogue of the offline second
-    # pass (_corridor_spread): instead of sprinting to the pending barrier and stopping at the
-    # no-pass cap, every arm cruises so that it reaches the barrier at the common fire instant
-    # (slowest ACTING arm's best-effort time + ramp + dwell + settle_nom). Recomputed each tick
-    # from CURRENT arcs, so it is feedback pacing, not a precomputed profile -- a guard/slowdown
-    # that delays the pace-setter re-paces everyone automatically.
+    # pace=True: FEED-FORWARD ARRIVAL PACING. At the start of each mode stretch, roll the
+    # deterministic corridor dynamics forward a few times and choose ONE rate factor per
+    # corridor-coupled arm group. The factors stay fixed until the mode fires: ordinary
+    # execution is therefore a planned phase profile, not a remaining-distance feedback law.
+    # Acting groups reach the fire together; crossing groups reserve the caller-supplied upper
+    # bound on pre-fire servo time. If the servo finishes early the barrier opens early and
+    # they simply continue; if it consumes the budget they reach the barrier without waiting.
     self.P = np.asarray(P, float)
     self.segs, self.D = arc_length(list(self.P))
     self.csum = np.concatenate([[0.0], np.cumsum(self.segs)]) if self.segs else np.array([0.0])
@@ -1381,13 +1737,12 @@ class CorridorStepper:
     self.cor, self.dt = cor, float(dt)
     self.fire_all = bool(fire_all)
     self.pace = bool(pace)
-    self.settle_nom = float(settle_nom)
-    self._pace_tgt = None                                   # per-arm anchored clocks (s)
-    self._pace_k = -1                                       # barrier the anchor belongs to
-    self._tgt_min = 0.0
-    self._pace_ticks = 0
-    self._est_at = 0
-    self._drift = 0.0                                     # guard/gate hold time on acting arms
+    _sn = np.asarray(settle_nom, dtype=float)
+    self.settle_nom = (float(_sn) if _sn.ndim == 0 else _sn.reshape(-1).copy())
+    self._pace_tgt = None                                   # per-arm target arrival times (s)
+    self._pace_factor = np.ones(self.n)                     # fixed within a mode stretch
+    self._pace_k = -1                                       # barrier the profile belongs to
+    self._pace_replans = 0
     self._in_preview = False
     self._pf_sum = np.zeros(self.n)
     self._pf_n = 0
@@ -1412,6 +1767,129 @@ class CorridorStepper:
     self.hold = [-1] * self.n
     self.floor_hits = {}
     self.eps = 1e-6
+
+  def _pace_groups(self, barrier):
+    """Connected components that have to share one phase-rate factor on this stretch.
+
+    A zero-width pairwise corridor anywhere between the current phase and ``barrier`` is a
+    rigid coordination span. Giving its members independent arrival clocks merely makes the
+    faster member bang into the corridor cap. Treating the component as one scheduling body
+    removes that avoidable stop while leaving the per-tick corridor projection authoritative.
+    """
+    parent = list(range(self.n))
+
+    def find(x):
+      while parent[x] != x:
+        parent[x] = parent[parent[x]]
+        x = parent[x]
+      return x
+
+    lo = min(self.s) if self.s else 0.0
+    grid = np.asarray(self.cor["grid"], dtype=float)
+    g0, g1 = _cor_at(self.cor, lo), _cor_at(self.cor, barrier)
+    mask = np.zeros(len(grid), dtype=bool)
+    mask[min(g0, g1):max(g0, g1) + 1] = True
+    for i in range(self.n):
+      for j in range(i + 1, self.n):
+        A = self.cor["Lp"].get((i, j))
+        if A is not None and np.any(np.max(A[mask], axis=1) <= self.eps):
+          parent[find(i)] = find(j)
+    groups = {}
+    for r in range(self.n):
+      groups.setdefault(find(r), []).append(r)
+    return list(groups.values())
+
+  def _pace_rollout(self, factors, barrier, max_ticks=60000):
+    """Predict arrival ticks under fixed factors without changing live stepper state."""
+    saved = (list(self.s), list(self.vel), self.fired, self.steps, self.ready,
+             list(self.hold), dict(self.floor_hits), self._why.copy(), self._why_k.copy(),
+             self.pace, self._in_preview)
+    self.pace = False
+    self._in_preview = True
+    arrived = np.where(np.asarray(self.s) >= barrier - self.eps, 0.0, np.inf)
+    for tick in range(1, max_ticks + 1):
+      self.tick(_pace_override=factors)
+      now = np.asarray(self.s) >= barrier - self.eps
+      arrived[np.isinf(arrived) & now] = tick
+      if np.isfinite(arrived).all():
+        break
+    (self.s, self.vel, self.fired, self.steps, self.ready, self.hold,
+     self.floor_hits, self._why, self._why_k, self.pace, self._in_preview) = saved
+    return arrived
+
+  def _prepare_pace(self):
+    """Build one fixed phase-rate schedule for the pending mode stretch.
+
+    This deliberately does no tick-by-tick position correction. A natural rollout supplies
+    feasible arrival times under the same ramps, wrench limits, acceleration limits and
+    corridor projection as execution. A small fixed-point iteration then slows each coupled
+    group so acting groups meet at one fire time and crossing groups meet at the bounded end
+    of the pre-fire ceremony. The resulting factors are held until ``confirm_fire``.
+    """
+    if self.fired >= self.K:
+      self._pace_factor = np.ones(self.n)
+      self._pace_tgt = np.zeros(self.n)
+      self._pace_k = self.fired
+      return
+    barrier = min(self.bar_s[self.fired], self.D)
+    groups = self._pace_groups(barrier)
+    natural = self._pace_rollout(np.ones(self.n), barrier)
+    if not np.isfinite(natural).all():
+      # The normal stepper will surface a real deadlock. Pacing must not invent a second,
+      # harder-to-diagnose failure mode merely because its preview did not terminate.
+      self._pace_factor = np.ones(self.n)
+      self._pace_tgt = np.full(self.n, np.inf)
+      self._pace_k = self.fired
+      return
+
+    settle = (float(self.settle_nom[min(self.fired, len(self.settle_nom) - 1)])
+              if isinstance(self.settle_nom, np.ndarray) else float(self.settle_nom))
+    ceremony = max(0.0, self.n_dwell * self.dt + settle)
+    act = self.act[self.fired]
+    natural_s = natural * self.dt
+    act_t = float(np.max(natural_s[list(act)])) if act else 0.0
+    crossing = [r for r in range(self.n) if r not in act]
+    cross_t = float(np.max(natural_s[crossing])) if crossing else 0.0
+    fire_t = max(act_t, cross_t - ceremony, self.dt)
+    end_t = fire_t + ceremony
+    targets = np.asarray([fire_t if r in act else end_t for r in range(self.n)])
+    factors = np.ones(self.n)
+
+    # A component containing an acting arm must arrive at fire time; a rigidly coupled
+    # crossing arm cannot continue during the ceremony, which is a physical coordination
+    # constraint rather than scheduler-induced waiting.
+    group_targets = []
+    for members in groups:
+      group_targets.append(fire_t if any(r in act for r in members) else end_t)
+
+    for _ in range(6):
+      arrival = self._pace_rollout(factors, barrier) * self.dt
+      if not np.isfinite(arrival).all():
+        factors[:] = 1.0
+        break
+      changed = False
+      for members, target in zip(groups, group_targets):
+        actual = float(np.max(arrival[members]))
+        if target <= self.dt:
+          continue
+        old = float(min(factors[r] for r in members))
+        new = float(np.clip(old * actual / target, 0.02, 1.0))
+        if abs(new - old) > 2e-3:
+          changed = True
+        for r in members:
+          factors[r] = new
+      if not changed:
+        break
+
+    # Report the target belonging to the entire coupled component, not merely to its
+    # individual members. This keeps trace/diagnostic output honest at rigid spans.
+    for members, target in zip(groups, group_targets):
+      for r in members:
+        targets[r] = target
+    self._pace_factor = factors
+    self._pace_tgt = targets
+    self._pace_k = self.fired
+    self._pace_replans += 1
 
   # -- fast path interpolation (vectorised config_at) ------------------------------------
   def _cfg(self, s):
@@ -1482,7 +1960,7 @@ class CorridorStepper:
     if np.any(_A[_msk] > 1e-9):
       _A[_msk, :] = 0.0
 
-  def tick(self, rate_factor=None, free_of=None):
+  def tick(self, rate_factor=None, free_of=None, _pace_override=None):
     """Advance one dt. `rate_factor`: per-arm multiplier from RUNTIME triggers (1.0 = free;
     1/6 = proximity-paced; 0.0 = guard hold). Returns (q_ref, fire_ready) where fire_ready is
     the barrier index whose event should fire NOW (caller settles/seats/fires, then MUST call
@@ -1494,125 +1972,15 @@ class CorridorStepper:
     self.steps += 1
     n, D, dt, eps = self.n, self.D, self.dt, self.eps
     cand = list(self.s)
-    # CONSTANT-SPEED ARRIVAL PACING (--pace): all arms reach the pending barrier at a common
-    # instant, cruising instead of sprinting to the no-pass cap and stopping. The fire instant
-    # is measured by previewing the natural tick rules from the CURRENT positions every 25
-    # ticks (it may shrink as arms advance -- re-planning). Runtime guard/gate holds on the
-    # ACTING arms extend the clock by exactly the held time (`_drift`), so a press that pins
-    # the pace-setter keeps everyone cruising at the planned speed instead of sprinting to the
-    # cap against a stale estimate (the measured 36 s dead stretch). Per-tick feedback corrects
-    # POSITIONS against the clock only -- unanchored re-estimation coupled through the A=0
-    # corridor locks (a slowed partner caps the pace-setter, the consensus slips, everyone
-    # crawls -- measured 10x the makespan) must not come back. The pace-setter runs at full
-    # speed; everyone else scales its arc rate to arrive exactly as the settle window ends.
-    pace_f = None
-    if self.pace and self.fired < self.K:
-      lim = min(self.bar_s[self.fired], D)
-      d = np.maximum(0.0, lim - np.asarray(self.s, dtype=float))
-      base_est = np.asarray(
-          [self.joint_rate / max(
-               self.share[r][_seg_index(self.csum, self.segs, self.s[r])], 1e-9)
-           for r in range(n)], dtype=float)
-      if not self.rate_clamp and self.vmax is not None:
-        # --corridor-rate-clamp caps the actual step at joint_rate anyway, so the boosted
-        # vmax caps only matter when the clamp is OFF; estimate with them then.
-        _vl = np.asarray([float(self.vmax[r][self._lim_at(self.vmax, self.s[r])])
-                          for r in range(n)], dtype=float)
-        _fl = self.ramp_min * self.joint_rate
-        base_est = np.minimum(base_est, np.where(_vl >= _fl, _vl, np.maximum(_vl, 1e-4)))
-      # LOCKED GROUPS: pairs whose corridor lead is ZERO on both sides at the current grid
-      # (the plan's rigid-coupling locks, e.g. two arms carrying the same part) MUST move
-      # together. Pacing them independently lets the lock cap the faster arm to the slower
-      # partner's crawl -- the fire then runs late and everyone parks at the no-pass cap
-      # (measured: at-cap ticks at EVERY barrier). Pace each group as ONE body: its remaining
-      # distance is the members' MAX, its cruise rate the members' MIN.
-      _parent = list(range(n))
-      def _find(x):
-        while _parent[x] != x:
-          _parent[x] = _parent[_parent[x]]
-          x = _parent[x]
-        return x
-      for _i in range(n):
-        for _j in range(_i + 1, n):
-          _A = self.cor["Lp"].get((_i, _j))
-          if _A is None:
-            continue
-          _g = _cor_at(self.cor, min(self.s[_i], self.s[_j]))
-          if _A[_g, 0] <= 1e-9 and _A[_g, 1] <= 1e-9:
-            _parent[_find(_i)] = _find(_j)
-      _groups = {}
-      for _r in range(n):
-        _groups.setdefault(_find(_r), []).append(_r)
+    # One factor vector for this complete mode stretch. `_pace_override` is used only by the
+    # deterministic rollout in `_prepare_pace`; it makes preview and execution share exactly
+    # the same acceleration/rate ordering without abusing the runtime safety-factor channel.
+    pace_f = _pace_override
+    if pace_f is None and self.pace and self.fired < self.K:
       if self._pace_k != self.fired:
-        self._pace_k = self.fired
-        self._tgt_min = 0.0
-        self._pace_ticks = 0
-        self._est_at = self.steps
-        self._drift = 0.0
-      if rate_factor is not None and any(
-          float(rate_factor[_r]) <= 0.0 and self.s[_r] < lim - 0.01
-          for _r in self.act[self.fired]):
-        # a runtime guard holds an ACTING arm short of the barrier: extend the fire
-        # clock by exactly the held time so everyone keeps cruising instead of
-        # sprinting to the cap against a now-stale estimate.
-        self._drift += dt
-      self._pace_ticks += 1
-      if self._pace_ticks % 25 == 1:
-        # CLOSED-LOOP ANCHOR (replaces the one-shot per-barrier anchor). Run the natural-
-        # profile preview -- tick rules forward with the corridor caps, ramp and dwell --
-        # from the CURRENT positions, every 25 ticks, and keep the MAXIMUM remaining gate
-        # time. The estimate may only GROW, so a guard/lock/servo delay that holds the
-        # pace-setter back extends everyone's clock smoothly, and nobody parks at the
-        # no-pass cap against a stale stretch-start prediction (the standstills the user
-        # kept seeing). The estimate cannot crawl: it is computed from the natural profiles,
-        # which are independent of the pacing factors, so there is no feedback loop.
-        _s_s, _s_vel, _s_hold = list(self.s), list(self.vel), list(self.hold)
-        _s_ready, _s_steps, _s_fired = self.ready, self.steps, self.fired
-        _s_why = self._why.copy()
-        _s_whyk = self._why_k.copy()
-        _s_floor = dict(self.floor_hits)
-        _pacc = self.pace
-        self.pace = False
-        self._in_preview = True
-        self.ready = None
-        _nprev = 0
-        while _nprev < 60000 and self.fired == _s_fired:
-          _nprev += 1
-          _, _fr = self.tick(None)
-          if _fr is not None:
-            break
-        self._in_preview = False
-        self.pace = _pacc
-        (self.s, self.vel, self.hold) = _s_s, _s_vel, _s_hold
-        self.ready, self.steps, self.fired = _s_ready, _s_steps, _s_fired
-        self._why, self._why_k, self.floor_hits = _s_why, _s_whyk, _s_floor
-        _t = max(_nprev * self.dt - self.n_dwell * self.dt, 0.0)
-        if _t > self._tgt_min + 0.05 and self._trace is not None:
-          print(f"[stepper] anchor k={self.fired}: grew to {_t:.3f}s "
-                f"(preview {_nprev} ticks) bar={self.bar_s[self.fired]:.2f}")
-        # may shrink as arms advance (re-plan); guard delays live in _drift
-        self._tgt_min = _t
-        self._est_at = self.steps
-      t_arr = max(self._tgt_min + self._drift - (self.steps - self._est_at) * dt,
-                  self.dt)
-      self._pace_tgt = np.asarray(
-          [t_arr if any(_r in self.act[self.fired] for _r in _groups[_find(_i)])
-           else t_arr + self.n_dwell * self.dt + self.settle_nom
-           for _i in range(n)], dtype=float)
-      pace_f = np.ones(n)
-      for _gid, _mem in _groups.items():
-        if any(_r in self.act[self.fired] for _r in _mem):
-          continue                                    # acting groups: natural profile
-        _dm = float(max(d[_r] for _r in _mem))
-        _tg = self._pace_tgt[_mem[0]]
-        for _r in _mem:
-          if _dm > 1e-9 and _tg > 1e-9:
-            # Divide by the RAMP so the PACED speed d/tgt holds all the way to the barrier
-            # (want = base x f = base_est x ramp x f). f caps at 1, where the arm runs the
-            # natural ramp profile, whose travel time the group anchor already includes.
-            _ramp = self._ramp_of(_r, self.s[_r])
-            pace_f[_r] = float(np.clip(
-                _dm / (_tg * base_est[_r] * _ramp), 0.0, 1.0))
+        self._prepare_pace()
+      pace_f = self._pace_factor
+    if pace_f is not None and not self._in_preview:
       self._pf_sum += pace_f
       self._pf_n += 1
     for r in range(n):
@@ -1626,6 +1994,11 @@ class CorridorStepper:
         want = base
         if self.vmax is not None:
           want = min(want, self._vlim(r, self.s[r]))
+        if pace_f is not None and pace_f[r] < 1.0:
+          # Planned pacing is a nominal rate, so it goes THROUGH the acceleration limiter.
+          # Runtime safety factors below remain hard instantaneous caps. The old order put
+          # both after amax, creating a velocity step whenever the feedback factor changed.
+          want = min(want, base * float(pace_f[r]))
         if self.amax is not None:
           am = max(float(self.amax[r][self._lim_at(self.amax, self.s[r])]), 1e-9)
           want = float(np.clip(want, self.vel[r] - am * dt, self.vel[r] + am * dt))
@@ -1635,11 +2008,8 @@ class CorridorStepper:
           # into a gentle ramp-down -- the arm kept descending at speed through the whole
           # near-zone and grazed at 65N (measured, first online run). The offline pacing was
           # clean precisely because freezing the reference is INSTANT; match that: a factor
-          # bounds the final rate this very tick, factor 0 = hold now. The arrival-pacing
-          # factor (--pace) rides the same channel: min of both caps.
+          # bounds the final rate this very tick, factor 0 = hold now.
           want = min(want, base * float(rate_factor[r]))
-        if pace_f is not None and pace_f[r] < 1.0:
-          want = min(want, base * float(pace_f[r]))
         self.vel[r] = want
         cand[r] = min(lim, self.s[r] + want * dt)
         if self.rate_clamp and cand[r] > self.s[r] + eps:
@@ -1671,8 +2041,6 @@ class CorridorStepper:
           if cand[_r] > self.s[_r]:
             cand[_r] = self.s[_r]
             self.vel[_r] = 0.0
-            if self.pace and self.fired < self.K and _r in self.act[self.fired]:
-              self._drift += dt                 # the gate held the pace-setter
     # STOP-CAUSE HISTOGRAM (diagnostics): why did each arm not advance this tick?
     # 0 at the pending-barrier cap (no-pass gate), 1 post-fire hold, 2 pace factor < 0.05,
     # 3 servo rate factor 0 (guard), 4 path end, 5 moved, 6 corridor cap, 7 crawl.
@@ -1717,11 +2085,22 @@ class CorridorStepper:
       self.ready = None
     return self.q_now(), fire_ready
 
-  def confirm_fire(self):
+  def confirm_fire(self, defer_pace_replan=False):
+    old_factor = self._pace_factor.copy()
     for r in self.act[self.fired]:
       self.hold[r] = self.steps + self.n_dwell
     self.fired += 1
     self.ready = None
+    if defer_pace_replan and self.pace:
+      # Keep the just-executed constant rates through post-fire cleanup. The caller invokes
+      # replan_pace() once cleanup actually completes, so its unknown duration does not make
+      # us predict and then repeatedly correct the next stretch while some arms are frozen.
+      self._pace_factor = old_factor
+      self._pace_k = self.fired
+
+  def replan_pace(self):
+    """Invalidate the feed-forward profile; the next tick plans once from the live state."""
+    self._pace_k = -1
 
   def done(self):
     return self.fired >= self.K and all(x >= self.D - self.eps for x in self.s)
