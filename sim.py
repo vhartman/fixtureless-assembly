@@ -2356,10 +2356,15 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         rate_clamp=False, settle_tol=0.0, settle_max=1.0, couple_handovers=False,
                         pace=False, dwell=DWELL_T, pace_trace=None, phase_schedule=False,
                         phase_servo_time=0.15, phase_smooth=False, phase_smooth_time=0.12,
+                        phase_batch=False, phase_batch_min_motion=0.08,
+                        phase_batch_max_gap=0.35,
                         directional_caps=False, mate_caps=None,
                         verify_efc_cache=False, force_limits=False, wrench_margin=1.0, mass_scale=1.0, inertia_factor=1.0,
                         corner_limits=True,
                         spline=False, spline_per_seg=8, spline_tension=0.5,
+                        c2_spline=False, c2_samples_per_seg=8, c2_control_ratio=0.55,
+                        c2_smooth_weight=0.03, c2_max_deviation=0.20,
+                        c2_resolution=0.01,
                         articulated=False, actuated=False, use_planner_table=False,
                         corridor_margin=0.0, weld_timeconst=None, limit_rate=False,
                         path_preflight=True, path_preflight_tolerance=PATH_PREFLIGHT_TOL,
@@ -3123,8 +3128,72 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       # s (world state from s), and read the violation's ARMS -- pairwise vs another arm, or
       # "world" vs the table/resting parts. Collisions being pairwise is what makes this a
       # handful of 2-D scans instead of a search in n dimensions.
+      # Map mode stretches back to symbolic actions once, before either geometry
+      # postprocessor.  The experimental C2 fitter uses only this small protection mask; the
+      # established rigid-coupling/corridor logic below remains untouched.
+      _stretch_plan = [next((name_of[problem.tasks[int(t)].name][0] for t in stretches[k][1]
+                             if problem.tasks[int(t)].name in name_of), None)
+                       for k in range(len(stretches))]
+      _stretch_direct = [st is not None for st in _stretch_plan]
+      _last = 0
+      for k in range(len(_stretch_plan)):
+        if _stretch_plan[k] is None:
+          _stretch_plan[k] = _last
+        else:
+          _last = _stretch_plan[k]
+
+      _c2_protected = set()
+      if c2_spline:
+        for k, st_idx in enumerate(_stretch_plan):
+          if st_idx is None:
+            continue
+          scan_states = ([states[st_idx]] if _stretch_direct[k]
+                         else [states[min(st_idx + 1, len(states) - 1)]])
+          for state in scan_states:
+            for grp in state.subassemblies():
+              holders = {robot_index[c[1]] for p in grp
+                         for c in state.supports.get(p, ()) if c[0] == "grasp"
+                         and c[1] in robot_index}
+              if len(holders) > 1:
+                _c2_protected.add(k)
+          # Geometry must respect the execution overlap even when the legacy corridor option
+          # that couples handover phases was not requested.  Collision checking cannot see a
+          # closed-chain relative-pose error, so always preserve these stretches.
+          if tuple(plan[st_idx])[0] == "handover":
+            _c2_protected.add(k)
+
       _P, _bi = retiming._composite(stretches)
-      if spline:
+      if c2_spline:
+        # EXPERIMENTAL GEOMETRY STAGE.  This is intentionally a sibling of --spline, not a
+        # modification of the now-stable phase scheduler: it consumes mode-local polylines,
+        # emits a certified replacement, and the existing pipeline sees ordinary waypoints.
+        import c2_smoothing as _c2
+        _limits = getattr(problem, "limits", None)
+        if _limits is None:
+          _limits = C_fk.getJointLimits()
+
+        def _c2_free(q, stretch_index):
+          return bool(problem.is_collision_free(
+              _conf(q), stretch_mode[min(stretch_index, len(stretch_mode) - 1)]))
+
+        _c2_stretches, _c2_rows, _c2_rep = _c2.smooth_stretches(
+            stretches, _c2_free, limits=_limits, protected=_c2_protected,
+            per_segment=c2_samples_per_seg, control_ratio=c2_control_ratio,
+            smooth_weight=c2_smooth_weight, max_deviation=c2_max_deviation,
+            resolution=c2_resolution)
+        _P, _bi = retiming._composite(_c2_stretches)
+        print(f"[sim/mp] --c2-spline ACTIVE: mode-local cubic B-splines, "
+              f"{_c2_rep['fitted']} stretch(es) fitted, "
+              f"{_c2_rep['protected']} rigid co-hold/handover stretch(es) protected, "
+              f"{_c2_rep['fallback']} unsafe fit(s) kept on the original path; "
+              f"{_c2_rep['input_points']} -> {_c2_rep['output_points']} waypoints, "
+              f"{_c2_rep['checked_samples']} dense certificate sample(s), max deviation "
+              f"{_c2_rep['max_deviation']:.3f} rad. Task witnesses exact.")
+        for _row in _c2_rows:
+          if _row.status == "fallback":
+            print(f"[sim/mp] --c2-spline stretch {_row.index} FALLBACK after "
+                  f"{_row.attempts} fit(s): {_row.reason}")
+      elif spline:
         # C1 SMOOTHING (--spline). The saved path is C0: every waypoint is a velocity
         # discontinuity, which is what forces the crawl-through-corners behaviour and what
         # makes a curvature-based wrench limit blow up. Catmull-Rom is C1 AND interpolates
@@ -3225,16 +3294,6 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       # for 17 actions (pre-insertion splits), so indexing `states` by barriers reads the
       # wrong support structure -- it claimed arms held parts they do not, which produced
       # 2-metre "lever arms" and absurd wrench limits (measured).
-      _stretch_plan = [next((name_of[problem.tasks[int(t)].name][0] for t in stretches[k][1]
-                             if problem.tasks[int(t)].name in name_of), None)
-                       for k in range(len(stretches))]
-      _stretch_direct = [st is not None for st in _stretch_plan]
-      _last = 0
-      for k in range(len(_stretch_plan)):                     # a goto-only stretch inherits
-        if _stretch_plan[k] is None:
-          _stretch_plan[k] = _last
-        else:
-          _last = _stretch_plan[k]
       _locked = []
       for k in range(len(stretches)):
         st_idx = _stretch_plan[k]
@@ -3812,6 +3871,91 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
               traj = _raw_traj
               print("[sim/mp] --phase-smooth FALLBACK after 3 passes: executing the "
                     "certified raw phase schedule.")
+        if phase_batch and traj.progress is not None:
+          # Batch short move-stop-move islands only after the ordinary scheduler/smoother has
+          # finished. This sibling pass does not care whether geometry came from Catmull-Rom
+          # or C2. It may flow through another arm's event, but checks both worlds there.
+          _batch_source = traj
+          _fire_samples = [int(i) for i, _ in traj.fires]
+          _batch_locks = list(_locked) + list(getattr(traj, "couplings", ()))
+
+          def _batch_free(_q, _sample):
+            _fired = int(np.searchsorted(_fire_samples, int(_sample), side="left"))
+            if _strict_collide(_q, _fired) is not False:
+              return False
+            # The event changes attachments at this exact configuration. Check every
+            # successive post-switch mode if multiple zero-duration events share a sample.
+            for _j, _fi in enumerate(_fire_samples):
+              if _fi != int(_sample):
+                continue
+              _post = min(_fired + 1, len(stretch_mode) - 1)
+              if _strict_collide(_q, _post) is not False:
+                return False
+              _fired += 1
+            return True
+
+          _batch, _batch_rep = retiming.batch_phase_motions(
+              traj, _P, arm_dims, acting, _bar, locked=_batch_locks,
+              min_motion=phase_batch_min_motion, max_gap=phase_batch_max_gap,
+              stopped_rate=0.05 * JOINT_RATE, collision_free=_batch_free)
+          _bad_batch = _phase_audit(_batch)
+          _restored_batch_windows = set()
+          # The planner predicate has internal state/caches, so retain the same final dense
+          # audit used everywhere else. If it finds a counterexample missed during a local
+          # proposal check, restore the connected accepted window(s), not the whole batch.
+          while _bad_batch is not None:
+            _sample = int(_bad_batch[0])
+            _wins = list(enumerate(_batch_rep.get("accepted_windows", ())))
+            _seed = {i for i, (_r, _lo, _hi) in _wins
+                     if i not in _restored_batch_windows and _lo <= _sample <= _hi}
+            if not _seed:
+              break
+            _group = set(_seed)
+            _changed = True
+            while _changed:                                # overlapping windows form one edit
+              _changed = False
+              for i, (r, lo, hi) in _wins:
+                if i in _group or i in _restored_batch_windows:
+                  continue
+                if any(r == _wins[j][1][0]
+                       and lo <= _wins[j][1][2] and _wins[j][1][1] <= hi for j in _group):
+                  _group.add(i)
+                  _changed = True
+            for i in _group:
+              r, lo, hi = _wins[i][1]
+              _batch.q[lo:hi + 1, arm_dims[r]] = _batch_source.q[lo:hi + 1, arm_dims[r]]
+              _batch.progress[lo:hi + 1, r] = _batch_source.progress[lo:hi + 1, r]
+            _restored_batch_windows |= _group
+            _bad_batch = _phase_audit(_batch)
+          if _bad_batch is None:
+            traj = _batch
+            _batch_rows = retiming.motion_islands(
+                traj.q, traj.dt, arm_dims, stopped_rate=0.05 * JOINT_RATE)
+            _batch_after = len(_batch_rows)
+            _batch_small = sum(x["arc"] < phase_batch_min_motion for x in _batch_rows)
+            _batch_internal_slow = retiming.internal_slow_episodes(
+                traj.q, traj.dt, arm_dims, stopped_rate=0.05 * JOINT_RATE)
+            _kept = _batch_rep['merged'] - len(_restored_batch_windows)
+            print(f"[sim/mp] --phase-batch ACTIVE: kept {_kept}/{_batch_rep['merged']} "
+                  f"certified short-motion merge(s); motion islands "
+                  f"{_batch_rep['before']} -> {_batch_after}, small islands "
+                  f"(<{phase_batch_min_motion:g}rad) {_batch_rep['small_before']} -> "
+                  f"{_batch_small}, internal slow gaps "
+                  f"{_batch_rep['internal_slow_before']} -> "
+                  f"{_batch_internal_slow}. Rejected "
+                  f"{_batch_rep['collision_rejected']} collision-sensitive, "
+                  f"{_batch_rep['event_rejected']} event/coupling, "
+                  f"{_batch_rep['rate_rejected']} peak-rate, "
+                  f"{_batch_rep['quality_rejected']} visual-quality proposal(s); final audit locally "
+                  f"restored {len(_restored_batch_windows)} merge(s). Exact 2ms audit passed, "
+                  "including both modes at switches.")
+          else:
+            traj = _batch_source
+            _touch = [w for w in _batch_rep.get("accepted_windows", ())
+                      if w[1] <= int(_bad_batch[0]) <= w[2]]
+            print(f"[sim/mp] --phase-batch FALLBACK: final exact audit rejected sample "
+                  f"{_bad_batch[0]}, mode {_bad_batch[1]}: {_bad_batch[2]}; accepted windows "
+                  f"touching it: {_touch}. Executing the preceding certified trajectory.")
         # Localize visually objectionable pauses in the planned reference.  The aggregate
         # motion-quality report below says how much stopping occurred, but not whether a long
         # all-arm plateau sits immediately before a mode switch (usually phase bookkeeping,
@@ -4568,8 +4712,24 @@ def _cli_run(a):
     raise SystemExit("[sim] --phase-servo-time must be non-negative")
   if a.phase_smooth and not a.phase_schedule:
     raise SystemExit("[sim] --phase-smooth requires --phase-schedule")
+  if a.phase_batch and not a.phase_schedule:
+    raise SystemExit("[sim] --phase-batch requires --phase-schedule")
+  if a.c2_spline and not (a.corridor or a.phase_schedule):
+    raise SystemExit("[sim] --c2-spline requires --corridor or --phase-schedule")
   if a.phase_smooth_time <= 0.0:
     raise SystemExit("[sim] --phase-smooth-time must be positive")
+  if a.phase_batch_min_motion <= 0.0 or a.phase_batch_max_gap <= 0.0:
+    raise SystemExit("[sim] --phase-batch thresholds must be positive")
+  if a.c2_samples_per_seg < 1:
+    raise SystemExit("[sim] --c2-samples-per-seg must be at least 1")
+  if not 0.0 < a.c2_control_ratio <= 1.0:
+    raise SystemExit("[sim] --c2-control-ratio must be in (0, 1]")
+  if a.c2_smooth_weight < 0.0:
+    raise SystemExit("[sim] --c2-smooth-weight must be non-negative")
+  if a.c2_max_deviation <= 0.0:
+    raise SystemExit("[sim] --c2-max-deviation must be positive")
+  if a.c2_resolution <= 0.0:
+    raise SystemExit("[sim] --c2-resolution must be positive")
   _aac = getattr(a, "arm_arm_contacts", None)
   ARM_ARM_CONTACTS = bool(a.phase_schedule) if _aac is None else bool(_aac)
   if ARM_ARM_CONTACTS:
@@ -4838,6 +4998,9 @@ def _cli_run(a):
                               phase_servo_time=a.phase_servo_time,
                               phase_smooth=a.phase_smooth,
                               phase_smooth_time=a.phase_smooth_time,
+                              phase_batch=a.phase_batch,
+                              phase_batch_min_motion=a.phase_batch_min_motion,
+                              phase_batch_max_gap=a.phase_batch_max_gap,
                               corridor_ds=a.corridor_ds,
                               corridor_ds_lead=a.corridor_ds_lead,
                               corridor_lead_max=a.corridor_lead_max,
@@ -4864,6 +5027,12 @@ def _cli_run(a):
                               corner_limits=a.corner_limits,
                               spline=a.spline, spline_per_seg=a.spline_per_seg,
                               spline_tension=a.spline_tension,
+                              c2_spline=a.c2_spline,
+                              c2_samples_per_seg=a.c2_samples_per_seg,
+                              c2_control_ratio=a.c2_control_ratio,
+                              c2_smooth_weight=a.c2_smooth_weight,
+                              c2_max_deviation=a.c2_max_deviation,
+                              c2_resolution=a.c2_resolution,
                               articulated=a.articulated, actuated=a.actuated,
                               use_planner_table=getattr(a, 'planner_table', False),
                               corridor_margin=getattr(a, 'corridor_margin', 0.0),
@@ -4984,6 +5153,20 @@ def _build_cli():
                  help="--phase-smooth kernel support in seconds (default 0.12). Larger values "
                       "remove longer rate stutters but are more likely to require a local "
                       "collision-certified fallback.")
+  r.add_argument("--phase-batch", action=argparse.BooleanOptionalAction, default=False,
+                 help="--phase-schedule: final common postprocessor for both the default and "
+                      "C2 geometries. Merge a small motion island and its neighbouring motion "
+                      "across a short stop into one smooth burst. Own task stops and rigid "
+                      "couplings remain exact; crossing another robot's event is allowed only "
+                      "after checking the global passage constraint and both event modes. "
+                      "Every merge is peak-rate guarded and the result gets the exact 2ms "
+                      "collision audit. Opt-in; the established pipeline is unchanged.")
+  r.add_argument("--phase-batch-min-motion", type=float, default=0.08, metavar="RAD",
+                 help="--phase-batch: an adjacent motion island must be smaller than this "
+                      "joint-space arc to be batched (default 0.08 rad).")
+  r.add_argument("--phase-batch-max-gap", type=float, default=0.35, metavar="SEC",
+                 help="--phase-batch: maximum stopped gap bridged into one motion "
+                      "(default 0.35s).")
   r.add_argument("--settle-tol", type=float, default=2e-3, metavar="RAD",
                  help="--actuated: before each attach fires, hold the reference until the max "
                       "joint tracking error is under RAD. Default 2e-3: the actuated car has "
@@ -5141,6 +5324,29 @@ def _build_cli():
   r.add_argument("--spline-tension", type=float, default=0.5, metavar="T",
                  help="--spline: Catmull-Rom tension; 0.5 = uniform, 0 = the original "
                       "polyline (default 0.5). Lower it for less deviation.")
+  r.add_argument("--c2-spline", action=argparse.BooleanOptionalAction, default=False,
+                 help="EXPERIMENTAL opt-in geometry postprocessor. Replace each free mode "
+                      "stretch with a cubic C2 configuration-space B-spline whose task "
+                      "witness endpoints remain exact. Ordinary MP waypoints are soft fit "
+                      "targets, so the curve may shorten/cut corners. Every emitted edge is "
+                      "densely checked for joint limits and collisions; an unsafe stretch "
+                      "falls back whole to the certified input. Rigid co-hold and handover "
+                      "stretches are left unchanged. When active this replaces --spline; "
+                      "phase scheduling/smoothing are otherwise unchanged.")
+  r.add_argument("--c2-samples-per-seg", type=int, default=8, metavar="N",
+                 help="--c2-spline: emitted curve samples per input waypoint interval "
+                      "(default 8). Certification also subdivides these at --c2-resolution.")
+  r.add_argument("--c2-control-ratio", type=float, default=0.55, metavar="R",
+                 help="--c2-spline: initial B-spline control-point count relative to input "
+                      "waypoints (default 0.55, range (0,1]). Fewer controls smooth more.")
+  r.add_argument("--c2-smooth-weight", type=float, default=0.03, metavar="W",
+                 help="--c2-spline: squared control-polygon curvature weight (default 0.03).")
+  r.add_argument("--c2-max-deviation", type=float, default=0.20, metavar="RAD",
+                 help="--c2-spline: hard composite-joint deviation bound from the source "
+                      "polyline at matched chord phase (default 0.20 rad).")
+  r.add_argument("--c2-resolution", type=float, default=0.01, metavar="RAD",
+                 help="--c2-spline: maximum per-joint step in the dense collision/joint-limit "
+                      "certificate (default 0.01 rad).")
   r.add_argument("--weld-timeconst", type=float, default=0.0, metavar="S",
                  help="solref timeconst of the grasp/mate welds (default 0.004 = near-rigid). "
                       "Two arms co-grasping one part form a closed chain, so under --actuated "

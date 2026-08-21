@@ -1001,6 +1001,227 @@ def trajectory_smoothness(q, dt, arm_dims):
   return {"accel_rms": float(np.mean(aa)), "jerk_rms": float(np.mean(jj))}
 
 
+def motion_islands(q, dt, arm_dims, stopped_rate=0.05):
+  """Contiguous per-arm motion bursts, measured on the actual joint reference.
+
+  A returned row is ``{"arm", "start", "end", "duration", "arc"}``, where ``start`` and
+  ``end`` are sample indices and ``arc`` is accumulated joint-space motion.  Tiny bursts
+  separated by stopped samples are the visually objectionable move-stop-move pattern that
+  aggregate stopped/crawl percentages do not localize.
+  """
+  q = np.asarray(q, dtype=float)
+  if len(q) < 2:
+    return []
+  out = []
+  threshold = max(float(stopped_rate), 0.0) * max(float(dt), 0.0)
+  for r, dims in enumerate(arm_dims):
+    step = np.linalg.norm(np.diff(q[:, np.asarray(dims, dtype=int)], axis=0), axis=1)
+    moving = step >= threshold
+    start = None
+    for j, yes in enumerate(moving):
+      if yes and start is None:
+        start = j
+      if start is not None and (not yes or j == len(moving) - 1):
+        stop = j - 1 if not yes else j                     # inclusive transition index
+        out.append({"arm": r, "start": start, "end": stop + 1,
+                    "duration": (stop - start + 1) * float(dt),
+                    "arc": float(step[start:stop + 1].sum())})
+        start = None
+  return out
+
+
+def internal_slow_episodes(q, dt, arm_dims, stopped_rate=0.05):
+  """Count sub-cruise runs bracketed by fast motion, excluding outer acceleration ramps."""
+  q = np.asarray(q, dtype=float)
+  total = 0
+  for dims in arm_dims:
+    v = np.linalg.norm(np.diff(q[:, np.asarray(dims, dtype=int)], axis=0), axis=1) / dt
+    slow = v < 10.0 * stopped_rate                           # 0.5 x nominal cruise
+    start = None
+    for i, yes in enumerate(slow):
+      if yes and start is None:
+        start = i
+      if start is not None and (not yes or i == len(slow) - 1):
+        end = i - 1 if not yes else i
+        if np.any(~slow[:start]) and np.any(~slow[end + 1:]):
+          total += 1
+        start = None
+  return total
+
+
+def batch_phase_motions(traj, path, arm_dims, fire_actors, bar_s, locked=(),
+                        min_motion=0.08, max_gap=0.35, stopped_rate=0.05,
+                        collision_free=None, peak_growth=1.02):
+  """Merge short move-stop-move islands into a single smooth motion.
+
+  This is a conservative final proposal after phase scheduling/smoothing.  Only adjacent
+  motion islands of one arm are considered, at least one of which must be smaller than
+  ``min_motion`` radians of accumulated joint motion and whose stopped gap is no longer than
+  ``max_gap`` seconds.  Their fixed total phase displacement is spread over the combined
+  window into one contiguous near-cruise burst with smooth acceleration/deceleration. The
+  short island is preferentially moved next to the larger one, leaving one longer stationary
+  period instead of crawling across the old gap. Thus the samples before and after the window,
+  trajectory duration, event indices, and final configuration do not change.
+
+  A merge never crosses that arm's own event, or a rigid/collision coupling window. Foreign
+  events may be crossed: the global passage inequality ``phase >= barrier`` is checked at
+  every fire, and ``collision_free(q, sample)`` can audit both the pre- and post-event modes.
+  The candidate is also rejected if it grows that arm's largest source joint step.  Returns a
+  new trajectory and a report; the source is always a valid whole-trajectory fallback.
+  """
+  if traj.progress is None:
+    raise ValueError("motion batching requires per-arm progress")
+  if min_motion <= 0.0 or max_gap <= 0.0:
+    raise ValueError("motion batching thresholds must be positive")
+  src_progress = np.asarray(traj.progress, dtype=float)
+  progress = src_progress.copy()
+  q = np.asarray(traj.q, dtype=float).copy()
+  P = np.asarray(path, dtype=float)
+  dims = [np.asarray(d, dtype=int) for d in arm_dims]
+  if len(q) != len(progress) or progress.ndim != 2 or progress.shape[1] != len(dims):
+    raise ValueError("motion batching progress shape does not match trajectory/arms")
+  segs, D = arc_length(list(P))
+  csum = np.concatenate([[0.0], np.cumsum(segs)]) if segs else np.array([0.0])
+  fires = [(int(i), list(ev)) for i, ev in traj.fires]
+  actors = [set(int(r) for r in a) for a in fire_actors]
+  bars = [float(x) for x in bar_s]
+  source_peak = [float(np.linalg.norm(np.diff(q[:, d], axis=0), axis=1).max())
+                 if len(q) > 1 else 0.0 for d in dims]
+
+  # Convert phase-space coupling windows to protected sample masks. Equality windows must be
+  # byte-exact; merely preserving the endpoints can still alter closed-chain relative speed.
+  protected = np.zeros((len(q), len(dims)), dtype=bool)
+  protected_phase = {r: [] for r in range(len(dims))}
+  for row in locked:
+    if len(row) == 3:
+      (i, j), lo, hi = row
+    else:
+      i, j, lo, hi = row
+    for r in (int(i), int(j)):
+      protected_phase[r].append((float(lo), float(hi)))
+      protected[:, r] |= ((progress[:, r] >= float(lo) - 1e-9)
+                          & (progress[:, r] <= float(hi) + 1e-9))
+
+  report = {"before": len(motion_islands(q, traj.dt, dims, stopped_rate)),
+            "after": 0, "merged": 0, "collision_rejected": 0,
+            "rate_rejected": 0, "event_rejected": 0, "noeffect_rejected": 0,
+            "quality_rejected": 0, "small_before": 0, "small_after": 0,
+            "internal_slow_before": 0, "internal_slow_after": 0,
+            "accepted_windows": []}
+
+  def arm_runs(r):
+    return [x for x in motion_islands(q, traj.dt, [dims[r]], stopped_rate)]
+
+  for r in range(len(dims)):
+    # Every accepted merge reduces the run count, so restarting the scan terminates.
+    while True:
+      runs = arm_runs(r)
+      report["small_before"] += 0                           # populated globally below
+      accepted = False
+      for left, right in zip(runs, runs[1:]):
+        gap = (right["start"] - left["end"]) * traj.dt
+        if gap <= 0.0 or gap > max_gap:
+          continue
+        if min(left["arc"], right["arc"]) >= min_motion:
+          continue
+        lo, hi = int(left["start"]), int(right["end"])
+        if hi - lo < 3:
+          continue
+        # Own event stops and equality spans are semantic, not cosmetic stutters.
+        own_fire = any(lo < fi < hi and k < len(actors) and r in actors[k]
+                       for k, (fi, _) in enumerate(fires))
+        crosses_lock = any(progress[hi, r] >= a - 1e-9 and progress[lo, r] <= b + 1e-9
+                           for a, b in protected_phase[r])
+        if own_fire or crosses_lock or np.any(protected[lo:hi + 1, r]):
+          report["event_rejected"] += 1
+          continue
+        delta = float(progress[hi, r] - progress[lo, r])
+        if delta <= 1e-12:
+          report["noeffect_rejected"] += 1
+          continue
+        steps = hi - lo
+        local_step = np.linalg.norm(np.diff(q[lo:hi + 1, dims[r]], axis=0), axis=1)
+        active_steps = max(3, int(np.count_nonzero(
+            local_step >= max(stopped_rate, 0.0) * traj.dt)))
+        taper_steps = max(1, min(int(round(0.04 / traj.dt)), steps // 4))
+        first_n = min(steps, active_steps + 2 * taper_steps)
+        durations = sorted(set([first_n, min(steps, (first_n + steps) // 2), steps]))
+        pair_accepted = False
+        for move_steps in durations:
+          free_steps = steps - move_steps
+          # Prefer absorbing the small afterthought into the large motion. The opposite side
+          # and a centred placement are tried if an event passage or collision needs them.
+          offsets = ([0, free_steps, free_steps // 2] if right["arc"] < left["arc"]
+                     else [free_steps, 0, free_steps // 2])
+          for offset in dict.fromkeys(offsets):
+            ramp = max(1, min(taper_steps, move_steps // 3))
+            inc = _fill_shape(move_steps, ramp) * delta
+            pseg = np.full(steps + 1, progress[lo, r], dtype=float)
+            pseg[offset + 1:offset + move_steps + 1] = progress[lo, r] + np.cumsum(inc)
+            pseg[offset + move_steps + 1:] = progress[hi, r]
+            pcol = progress[:, r].copy()
+            pcol[lo:hi + 1] = pseg
+
+            # Non-actors may move through a foreign switch, but every robot must already
+            # have passed that barrier when its post-event world becomes active.
+            event_ok = all(not (lo <= fi <= hi and k < len(bars)
+                                and pcol[fi] < bars[k] - 1e-7)
+                           for k, (fi, _) in enumerate(fires))
+            if not event_ok:
+              report["event_rejected"] += 1
+              continue
+            qarm = np.asarray([config_at(list(P), csum, segs, float(s))[dims[r]]
+                               for s in pcol[lo:hi + 1]])
+            new_peak = float(np.linalg.norm(np.diff(qarm, axis=0), axis=1).max())
+            if new_peak > peak_growth * source_peak[r] + 1e-10:
+              report["rate_rejected"] += 1
+              continue
+            candidate = q.copy()
+            candidate[lo:hi + 1, dims[r]] = qarm
+            if collision_free is not None and any(
+                not bool(collision_free(candidate[i], i)) for i in range(lo, hi + 1)):
+              report["collision_rejected"] += 1
+              continue
+            new_count = len(motion_islands(candidate, traj.dt, [dims[r]], stopped_rate))
+            if new_count >= len(runs):
+              report["noeffect_rejected"] += 1
+              continue
+            # Packing must not trade a literal stop for a comb of sub-cruise hesitations.
+            # Ignore the natural acceleration/deceleration at the outer ends of a burst and
+            # reject only NEW slow runs bracketed by fast motion.
+            old_slow = internal_slow_episodes(
+                q, traj.dt, [dims[r]], stopped_rate)
+            new_slow = internal_slow_episodes(
+                candidate, traj.dt, [dims[r]], stopped_rate)
+            if new_slow > old_slow:
+              report["quality_rejected"] += 1
+              continue
+            q, progress[:, r] = candidate, pcol
+            report["merged"] += 1
+            report["accepted_windows"].append((r, lo, hi))
+            accepted = pair_accepted = True
+            break
+          if pair_accepted:
+            break
+        if pair_accepted:
+          break
+      if not accepted:
+        break
+
+  before_rows = motion_islands(traj.q, traj.dt, dims, stopped_rate)
+  after_rows = motion_islands(q, traj.dt, dims, stopped_rate)
+  report["before"], report["after"] = len(before_rows), len(after_rows)
+  report["small_before"] = sum(x["arc"] < min_motion for x in before_rows)
+  report["small_after"] = sum(x["arc"] < min_motion for x in after_rows)
+  report["internal_slow_before"] = internal_slow_episodes(
+      traj.q, traj.dt, dims, stopped_rate)
+  report["internal_slow_after"] = internal_slow_episodes(
+      q, traj.dt, dims, stopped_rate)
+  out = TimedTrajectory(dt=traj.dt, q=q, phase=list(traj.phase), fires=fires,
+                        progress=progress, couplings=list(traj.couplings))
+  return out, report
+
+
 def smooth_phase_trajectory(traj, path, arm_dims, fire_actors, window=0.12,
                             stop_time=0.02, iterations=3, locked=(),
                             restore_intervals=()):
