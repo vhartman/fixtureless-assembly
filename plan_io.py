@@ -5,13 +5,50 @@ The persisted JSON is `{"config": {...}, "plan": [[action...], ...]}` plus an op
 `"witnesses"` block. `config` holds the scene-determining knobs (assembly, parts, robots,
 seed, scatter, wrench settings, ...) so replay.py can rebuild the identical scene; `plan` is
 the discrete action list produced by solve_assembly_problem (tuples <-> lists across JSON);
-`witnesses` (when present) persists the OPTIMIZED per-action IK keyframes, so the motion-plan
-and sim stages are pure functions of this file instead of re-solving the witness pass.
+`witnesses` (when present) persists the exact SEARCH per-action IK certificates, optionally
+replaced by feasibility-safe optimized keyframes, so motion-plan and sim stages are pure
+functions of this file instead of re-solving the witness pass.
 Written by main.py --save, read by replay.py / main.py --load-plan / sim.py."""
 import json
 
 
-def witness_block(joint_names, witnesses, alts=None):
+# Keep this deliberately local instead of importing solver._IK_ACTIONS: plan persistence is a
+# low-level module and must remain usable without importing robotic/RAI.  These are precisely
+# the actions for which RobotIK.bind produces a keyframe.
+IK_WITNESS_ACTIONS = frozenset(
+    {"pick", "assemble", "place", "set_down", "add_grasp", "handover"})
+
+
+def missing_required_witnesses(plan, witnesses):
+  """Indices of IK actions whose persisted keyframe is absent.
+
+  A null is correct for release and other purely discrete actions.  It is never a valid result
+  for an IK action: downstream code otherwise silently drops the corresponding task and only
+  much later reports a mode/path mismatch.
+  """
+  if witnesses is None or len(witnesses) != len(plan):
+    return [i for i, a in enumerate(plan) if a and a[0] in IK_WITNESS_ACTIONS]
+  return [i for i, a in enumerate(plan)
+          if a and a[0] in IK_WITNESS_ACTIONS and witnesses[i] is None]
+
+
+def require_complete_witnesses(plan, witnesses, *, who="witness export"):
+  """Fail closed unless every IK action has an aligned witness; return ``witnesses``."""
+  if witnesses is None:
+    raise ValueError(f"{who}: no witness list was produced")
+  if len(witnesses) != len(plan):
+    raise ValueError(
+        f"{who}: {len(witnesses)} witness entries for {len(plan)} plan actions")
+  missing = missing_required_witnesses(plan, witnesses)
+  if missing:
+    detail = ", ".join(f"{i}:{tuple(plan[i])}" for i in missing[:8])
+    if len(missing) > 8:
+      detail += f", ... ({len(missing)} total)"
+    raise ValueError(f"{who}: required IK witnesses are missing at {detail}")
+  return witnesses
+
+
+def witness_block(joint_names, witnesses, alts=None, stage=None):
   """Pack per-action full-config witnesses for persistence. Entry i belongs to plan[i];
   None entries (actions without an IK keyframe) stay null. `joint_names` records the joint
   ORDER the vectors are expressed in -- readers must refuse the block if their scene's joint
@@ -22,10 +59,21 @@ def witness_block(joint_names, witnesses, alts=None):
   files without the key load unchanged."""
   out = {"joints": list(joint_names),
          "wit": [None if w is None else [float(v) for v in w] for w in witnesses]}
+  if stage is not None:
+    if stage not in ("search", "optimized"):
+      raise ValueError(f"unknown witness stage {stage!r}")
+    out["stage"] = stage
   if alts:
     out["wit_alts"] = {str(i): [[float(v) for v in m] for m in ms]
                        for i, ms in sorted(alts.items())}
   return out
+
+
+def read_witness_stage(path):
+  """`search` or `optimized`; old pre-marker witness blocks were optimized exports."""
+  with open(path) as f:
+    blk = json.load(f).get("witnesses") or {}
+  return blk.get("stage", "optimized") if blk else None
 
 
 def write_plan(path, config, plan, witnesses=None):

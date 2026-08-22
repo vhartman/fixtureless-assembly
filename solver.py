@@ -363,6 +363,7 @@ class RobotIK:
     self.gripper_frame = {}
     self.q_correction = {}
     self.symmetric = {}                                # roll-free about the approach axis?
+    self.tool_kind = {}                                # analytic calibration is EE-specific
     self.robot_base = {}                               # subtree root, for single-arm IK
     self.robot_arm = {}                                # 'ur5' | 'ur10' -- picks the analytic solver
     self.base_link = {}                                # URDF base frame (ssik's reference)
@@ -372,10 +373,11 @@ class RobotIK:
       tool_center, _base_rel, q_corr = _gripper_rest_transforms(self.C, r + "_")
       self.gripper_frame[r] = tool_center
       self.q_correction[r] = q_corr
-      # the vacuum is rotationally symmetric about its suction axis -> roll is a free DOF,
-      # so we constrain only position + approach axis (5-DOF). the two-finger's fingers
-      # break that symmetry -> full pose (6-DOF).
+      # Vacuum is physically roll-symmetric.  Search IK currently chooses the grasp DB's
+      # canonical ALIGNED roll and constrains that full pose; ``symmetric`` tells witness
+      # ranking/deduplication that alternate vacuum wrist rolls are equivalent.
       self.symmetric[r] = "vacuum" in tool_center
+      self.tool_kind[r] = "vacuum" if self.symmetric[r] else "two_finger"
       self.robot_base[r] = r + "_ur_base"              # UR base frame; parented to the table
       # a FLOATING EE has no arm at all: no base_link frame, no kinematic chain -> analytic
       # IK / reach bounds are meaningless for it (robot_arm=None disables every ssik path).
@@ -461,6 +463,15 @@ class RobotIK:
     # Evidence key -> [n, fails, eq_sum_on_fail] ("abias" = assemble bias sweep slot).
     self.fail_order = False
     self.action_stats = {}
+    # OPT-IN open-witness probing.  The legacy bind/search path never reads these.  The
+    # dedicated scheduler calls probe_bind_batch(), which spends one bounded skill-aware tier,
+    # caches successes only, and revisits failures in later fairness epochs.
+    self.open_witness = False
+    self.open_witness_epochs = 2
+    self.open_witness_batch = 7
+    self._open_probe_attempt = None
+    self._open_probe_budget = 1
+    self._open_probe_random_only = False
     self.braced_analytic = True                           # per-arm analytic for BRACED place/assemble
     # PRE-INSERTION funnel (--pre-insertion), EXPORT/REPLAY ONLY: metres to back off along the
     # mate axis for the pre-assemble GOTO waypoint. 0.0 = off. The SEARCH is untouched -- the
@@ -796,6 +807,50 @@ class RobotIK:
     if self._opt_pull is None:
       self._ik_cache[key] = res
     return res
+
+  def probe_bind_once(self, action, s0, s1, assembly, attempt=0):
+    """One bounded probe for the opt-in open-witness scheduler.
+
+    This deliberately does not alter ``bind``'s legacy semantics.  A successful cached bind
+    remains reusable, but a failed verdict is evicted before and after the probe so stochastic
+    incompleteness cannot turn into a permanent edge blacklist.  Fixed-target analytic seeds
+    are tried as one finite bundle on visit zero.  Later visits make new progress with fresh
+    ``initRandom`` draws instead of replaying deterministic initializations.  Assemble probes
+    spend the batch across structured biases first, then fresh unbiased initializations.
+    """
+    return self.probe_bind_batch(action, s0, s1, assembly, attempt=attempt, budget=1)
+
+  def probe_bind_batch(self, action, s0, s1, assembly, attempt=0, budget=1):
+    """One OPEN visit containing a bounded batch, with scene/precheck setup paid once."""
+    budget = max(1, int(budget))
+    key = (action, self._scene_sig(s0))
+    cached = self._ik_cache.get(key)
+    if cached is not None and cached[0]:
+      return cached
+    self._ik_cache.pop(key, None)                         # never inherit a legacy false verdict
+    old_full, old_pre = self.restarts_full, self.restarts_precheck
+    old_probe = self._open_probe_attempt
+    old_budget = getattr(self, "_open_probe_budget", 1)
+    old_random = getattr(self, "_open_probe_random_only", False)
+    # Visit zero includes the ordinary initialization, hence B-1 random restarts.  A revisit
+    # is random-only and _solve_ik below turns the whole B into new initRandom draws.
+    self.restarts_full = max(0, budget - 1)
+    self.restarts_precheck = 0
+    self._open_probe_attempt = int(attempt)
+    self._open_probe_budget = budget
+    # Revisited ordinary skills must make new progress.  Assemble owns a structured bias cursor
+    # and switches this on only for its unbiased fallback after the remaining biases are tried.
+    self._open_probe_random_only = (int(attempt) > 0 and action[0] != "assemble")
+    try:
+      result = self.bind(action, s0, s1, assembly)
+    finally:
+      self.restarts_full, self.restarts_precheck = old_full, old_pre
+      self._open_probe_attempt = old_probe
+      self._open_probe_budget = old_budget
+      self._open_probe_random_only = old_random
+    if not result[0]:
+      self._ik_cache.pop(key, None)                       # OPEN, not disproven
+    return result
 
   def _scene_sig(self, state):
     # discrete signature of everything the per-skill IK scenes depend on: per subassembly
@@ -1307,6 +1362,18 @@ class RobotIK:
     import time as _time
     if restarts is None:
       restarts = self.restarts_full                       # --ik-restarts (default 12)
+    # An open-witness query is revisited by construction.  Visit zero tries the finite analytic
+    # bundle + ordinary initialization.  Later ordinary-skill visits must make NEW progress:
+    # replaying those deterministic initializations merely burns time, so use the tier's fresh
+    # initRandom draws.  Assemble controls this switch around its unbiased fallback so a
+    # structured bias is never accidentally expanded into a random batch.  Legacy calls have
+    # _open_probe_attempt=None and are bit-identical.
+    _open_random_only = (self._open_probe_attempt is not None
+                         and getattr(self, "_open_probe_random_only", False)
+                         and not getattr(self, "_pc", False))
+    if _open_random_only:
+      seeds = None
+      restarts = max(1, int(self._open_probe_budget))
     if seeds:
       self.prof["calls_with_seeds"] += 1
     else:
@@ -1367,21 +1434,23 @@ class RobotIK:
       # budget is for UNSEEDED solves where restarts must find the branches themselves.
       restarts = min(restarts, self.seed_restart_cap)
     import time as _time
-    _t0 = _time.perf_counter()
-    r = self._nlp(komo).solve().dict()
-    self.prof["unseeded_solves"] += 1
-    self.prof["unseeded_time"] += _time.perf_counter() - _t0
-    if r["feasible"]:
-      self.prof["getpath_calls"] += 1
+    r = None
+    if not _open_random_only:
       _t0 = _time.perf_counter()
-      _okp = self._pen_ok(C, komo.getPath()[-1])
-      _ok = _okp and self._clearance_ok(C, komo.getPath()[-1])
-      self.prof["post_calls"] += 1
-      self.prof["post_time"] += _time.perf_counter() - _t0
-      if _ok:
-        _win("unseeded")
-        self._last_res = r
-        return True, komo.getPath()[-1]
+      r = self._nlp(komo).solve().dict()
+      self.prof["unseeded_solves"] += 1
+      self.prof["unseeded_time"] += _time.perf_counter() - _t0
+      if r["feasible"]:
+        self.prof["getpath_calls"] += 1
+        _t0 = _time.perf_counter()
+        _okp = self._pen_ok(C, komo.getPath()[-1])
+        _ok = _okp and self._clearance_ok(C, komo.getPath()[-1])
+        self.prof["post_calls"] += 1
+        self.prof["post_time"] += _time.perf_counter() - _t0
+        if _ok:
+          _win("unseeded")
+          self._last_res = r
+          return True, komo.getPath()[-1]
     for _ri in range(restarts):
       komo.initRandom()
       _t0 = _time.perf_counter()
@@ -1400,7 +1469,7 @@ class RobotIK:
           self._last_res = r
           return True, komo.getPath()[-1]
     _win("none")
-    self._last_res = r
+    self._last_res = r or {}
     return False, None
 
   def _attached_arm_targets(self, C, s0, assembly, group, anchor_part, anchor_target, mover):
@@ -1556,14 +1625,13 @@ class RobotIK:
 
   def _analytic_reject_ok(self, robot):
     # may we use analytic IK for an EXACT reachability REJECT on a FIXED-target reach? Only when
-    # seeding is on, ssik has this arm calibrated, and the grasp is a full 6-DOF pose (two-finger):
-    # then an empty solution set means KINEMATICALLY UNREACHABLE -> reject with no KOMO. Excluded:
-    # the vacuum (5-DOF, free roll -> one roll's empty set is NOT "unreachable"), and uncalibrated
-    # arms / absent ssik. (Only the fixed on-table pick uses this; a held add_grasp target can move.)
-    if not self.ik_seeding or self.symmetric[robot]:
+    # seeding is on and ssik has this exact ARM + EE calibrated. Vacuum uses the canonical
+    # aligned roll already present in the target pose; an empty result remains UNKNOWN (the
+    # relaxed precheck handles it), while a nonempty result proves that fixed pose reachable.
+    if not self.ik_seeding:
       return False
     import analytic_ik
-    return analytic_ik.available(self.robot_arm[robot])
+    return analytic_ik.available(self.robot_arm[robot], self.tool_kind[robot])
 
   def _analytic_seeds(self, C, robot, ee_target, target_frame):
     # analytic (ssik) joint solutions for the active arm to place its tool center at `ee_target`
@@ -1572,7 +1640,8 @@ class RobotIK:
     # order, filtered to rai's arm limits. Empty unless ik_seeding is on AND this arm is
     # calibrated. Call AFTER _restrict_to_arm so C.getJointLimits() returns the 6 arm limits.
     import analytic_ik
-    if not self.ik_seeding or not analytic_ik.available(self.robot_arm[robot]):
+    tool_kind = self.tool_kind[robot]
+    if not self.ik_seeding or not analytic_ik.available(self.robot_arm[robot], tool_kind):
       return []
     if target_frame is None:
       ee_world = np.asarray(ee_target, dtype=float)
@@ -1598,7 +1667,7 @@ class RobotIK:
     except Exception:
       lo = hi = None
     out = []
-    for q in analytic_ik.seed_configs(self.robot_arm[robot], T):
+    for q in analytic_ik.seed_configs(self.robot_arm[robot], T, tool_kind=tool_kind):
       if lo is not None and len(q) == len(lo) and (np.any(q < lo) or np.any(q > hi)):
         continue                                            # outside rai's joint limits
       out.append(q)
@@ -2122,8 +2191,17 @@ class RobotIK:
       if self._reach_precheck_reject(action, C, komo_nc):
         return False, None
 
+    _open_attempt = self._open_probe_attempt
     if bias_axes is not None:
       sweep = [(0, bias_axes)]                             # forced single orientation (export)
+    elif _open_attempt is not None:
+      # Fair batched probe: a bounded SLICE of structured basins per visit, all in this one
+      # scene/precheck setup.  Once the six canonical basins have had a turn, later visits use
+      # a bounded random-only fallback below.  This avoids the first prototype's worst cost:
+      # rebuilding the scene and rerunning reach-precheck once PER bias.
+      _oa = int(_open_attempt)
+      _ob = max(1, int(self._open_probe_budget))
+      sweep = list(enumerate(_ASSEMBLE_BIAS_ORIENTATIONS))[_oa:_oa + _ob]
     elif self.fail_order:
       # --fail-order: sweep the biases never-tried-first, then ascending fail rate, then
       # canonical index (stable + deterministic). Pure reordering -- the sweep stays exhaustive,
@@ -2163,13 +2241,39 @@ class RobotIK:
         and self.pre_insertion_delta > 0.0
         and not self._funnel_witness_ok(action, s0, s1, assembly, witness)):
       feasible, witness = False, None                     # -> the unbiased restart fallback
-    if not feasible:                                      # fallback: unbiased random restarts
+    # Legacy bind: exhaustive structured sweep + six-restart fallback, bit-for-bit as before.
+    # Open batch: its first six effort slots are the structured biases; any slots LEFT AFTER
+    # that fund the unbiased fallback in the SAME scene/precheck setup.  Thus batch=7 means
+    # six canonical basins + one unbiased initialization, while a revisit starting at slot 7
+    # spends its whole batch on fresh random draws.
+    _open_fallback_budget = 0
+    if _open_attempt is not None:
+      _oa = int(_open_attempt)
+      _ob = max(1, int(self._open_probe_budget))
+      _nb = len(_ASSEMBLE_BIAS_ORIENTATIONS)
+      _open_fallback_budget = (_ob if _oa >= _nb else max(0, _oa + _ob - _nb))
+    _open_unbiased = _open_fallback_budget > 0
+    if not feasible and (_open_attempt is None or _open_unbiased):
       komo = self._assemble_komo(C, part_name, onto, rel_pos, rel_quat, None)
       self._add_pull(komo, C, robot)                    # witness-opt pull (no-op in search)
       self._add_pin(komo, C)                            # pre-skill pin (no-op in search)
       self._add_grasp_maintenance(komo, s0, assembly)
-      feasible, witness = self._solve_ik(
-          komo, restarts=6, seeds=([warm] if warm is not None else None), C=C)
+      _fb_restarts = (6 if _open_attempt is None else
+                      (max(0, _open_fallback_budget - 1)
+                       if int(_open_attempt) < len(_ASSEMBLE_BIAS_ORIENTATIONS)
+                       else _open_fallback_budget))
+      _old_random = getattr(self, "_open_probe_random_only", False)
+      _old_budget = self._open_probe_budget
+      if _open_attempt is not None:
+        self._open_probe_random_only = int(_open_attempt) > 0
+        self._open_probe_budget = _open_fallback_budget
+      try:
+        feasible, witness = self._solve_ik(
+            komo, restarts=_fb_restarts,
+            seeds=([warm] if warm is not None else None), C=C)
+      finally:
+        self._open_probe_random_only = _old_random
+        self._open_probe_budget = _old_budget
       if feasible and witness is not None and self.mate_residual_reject is not None:
         if self.mate_residual(C, witness, part_name, onto, rel_pos) > self.mate_residual_reject:
           self.mate_rejects += 1
@@ -2840,7 +2944,7 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
                        pull_weight=1.0, ee_rot_weight=0.3, sweeps=2, verbose=True,
                        gripper_kind=None, handovers=True, allow_place=True, bracing=False,
                        grasp_table=None, clear_weight=0.0, clear_margin=0.4,
-                       robot_collisions=False):
+                       robot_collisions=False, baseline_witnesses=None):
   """POST-PASS witness optimization (v1 of the witness-optimization plan): the DISCRETE
   plan is FIXED; each IK action is re-solved warm-pulled toward the ACTIVE arm's previous
   configuration, minimizing per-step active-arm movement in 'joint' space or 'ee' space
@@ -2932,11 +3036,18 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
           f"An add_grasp/handover in the plan needs bracing=True.")
     states.append(ns)
 
-  wit = [None] * len(plan)
-  for i, a in enumerate(plan):                            # baseline = the search's witnesses
-    if a[0] in _IK_ACTIONS:
-      ok, w = robot_ik.bind(a, states[i], states[i + 1], assembly)
-      wit[i] = w if ok else None
+  if baseline_witnesses is not None:
+    from plan_io import require_complete_witnesses
+    require_complete_witnesses(plan, baseline_witnesses,
+                               who="optimize_witnesses baseline")
+    wit = [None if w is None else np.asarray(w, dtype=float).copy()
+           for w in baseline_witnesses]
+  else:
+    wit = [None] * len(plan)
+    for i, a in enumerate(plan):                          # legacy: reconstruct the baseline
+      if a[0] in _IK_ACTIONS:
+        ok, w = robot_ik.bind(a, states[i], states[i + 1], assembly)
+        wit[i] = w if ok else None
 
   def total(ws):
     qmap = dict(home_map)
@@ -2973,12 +3084,16 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
         C, assembly, plan, robots, robot_ik, cost=metric, pull_weight=pull_weight,
         ee_rot_weight=ee_rot_weight, sweeps=sweeps, verbose=False,
         gripper_kind=gripper_kind, handovers=handovers, allow_place=allow_place,
-        bracing=bracing, grasp_table=grasp_table)  # warm start (no clearance filter)
+        bracing=bracing, grasp_table=grasp_table,
+        baseline_witnesses=wit)  # warm start (no clearance filter)
     cands = {}
     for i, a in enumerate(plan):
       if wit[i] is None:
         continue
-      cs = robot_ik.candidate_witnesses(a, states[i], states[i + 1], assembly)
+      # The persisted certificate is always a ladder member. Candidate harvesting can improve
+      # this baseline, but a failed/stochastic redraw can never erase it.
+      cs = [wit[i]] + list(
+          robot_ik.candidate_witnesses(a, states[i], states[i + 1], assembly) or [])
       if g_wit[i] is not None:
         cs.append(g_wit[i])
       seen, uniq = set(), []
@@ -3132,9 +3247,54 @@ def _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_pla
   return states
 
 
+def collect_plan_witnesses(C, assembly, plan, robots, robot_ik, *, gripper_kind=None,
+                           handovers=True, allow_place=True, bracing=False,
+                           grasp_table=None, resolve_missing=False, verbose=True):
+  """Collect exact IK certificates already found for ``plan``, aligned by plan index.
+
+  Positive RobotIK cache entries are the primary source; the open-witness pool is an explicit
+  second source so persistence does not depend on cache lifetime. ``resolve_missing`` is only
+  for a fresh solve after a plan-rewriting pass such as release hoisting: if the rewrite changes
+  an IK predecessor scene, that new edge must be certified before serialization. Loaded plans
+  pass False and therefore cannot accidentally redo IK here.
+  """
+  if grasp_table is None:
+    _checker, grasp_table = _search_context(C, assembly, robots)
+  states = _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
+                          bracing, grasp_table, "collect_plan_witnesses")
+  out = [None] * len(plan)
+  rebuilt = []
+  pool = getattr(robot_ik, "_open_witness_pool", None)
+  for i, a0 in enumerate(plan):
+    a = tuple(a0)
+    if a[0] not in _IK_ACTIONS:
+      continue
+    key = (a, robot_ik._scene_sig(states[i]))
+    hit = robot_ik._ik_cache.get(key)
+    w = hit[1] if hit is not None and hit[0] and hit[1] is not None else None
+    if w is None and pool is not None:
+      w = pool.witness_for(states[i], a)
+    if w is None and resolve_missing:
+      # A stale stochastic failure from a previously considered ordering is not a certificate.
+      # Hoisting has selected this edge, so give it one normal full-budget certification.
+      if hit is not None and not hit[0]:
+        robot_ik._ik_cache.pop(key, None)
+      ok, w2 = robot_ik.bind(a, states[i], states[i + 1], assembly)
+      w = w2 if ok else None
+      rebuilt.append((i, a, ok))
+    if w is not None:
+      out[i] = np.asarray(w, dtype=float).copy()
+  if verbose and rebuilt:
+    ok_n = sum(ok for _, _, ok in rebuilt)
+    print(f"[witness-persist] release hoisting/state rewriting required {len(rebuilt)} "
+          f"new IK certification(s): {ok_n} succeeded, {len(rebuilt) - ok_n} failed.")
+  return out
+
+
 def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
                               gripper_kind=None, handovers=True, allow_place=True,
-                              bracing=False, grasp_table=None, tol=None, verbose=True):
+                              bracing=False, grasp_table=None, tol=None, verbose=True,
+                              baseline_witnesses=None):
   """LAST GATE before mp_export: is the witness we are about to SHIP collision-free?
 
   Every earlier gate checks a witness at the moment it is SOLVED. Nothing checked the one that
@@ -3194,7 +3354,11 @@ def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
         # reintroduced the error and tightening the IK cannot help.
         _bres = float("nan")
         try:
-          _ok2, _w2 = robot_ik.bind(act, states[i], states[i + 1], assembly)
+          if baseline_witnesses is not None:
+            _w2 = baseline_witnesses[i]
+            _ok2 = _w2 is not None
+          else:
+            _ok2, _w2 = robot_ik.bind(act, states[i], states[i + 1], assembly)
           if _ok2 and _w2 is not None:
             Ci.setJointState(np.asarray(_w2, dtype=float).ravel())
             _v2, _ = Ci.eval(ry.FS.positionRel, [part, onto])
@@ -3210,7 +3374,11 @@ def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
     if p <= tol:
       continue
     swapped = False
-    ok, w0 = robot_ik.bind(act, states[i], states[i + 1], assembly)
+    if baseline_witnesses is not None:
+      w0 = baseline_witnesses[i]
+      ok = w0 is not None
+    else:
+      ok, w0 = robot_ik.bind(act, states[i], states[i + 1], assembly)
     if ok and w0 is not None and pen_of(w0) <= tol:
       out[i] = np.asarray(w0, dtype=float).ravel().copy()  # the search's own clean witness
       swapped, p = True, pen_of(out[i])
@@ -6598,6 +6766,39 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
                                             allow_place=allow_place, bracing=bracing)
                if act == a)
     return s
+
+  if lazy_fill and robot_ik is not None and getattr(robot_ik, "open_witness", False):
+    # OPT-IN fair witness validation lives in its own module and rebuilds this SMALL engine
+    # between effort epochs.  Nothing below (the measured permanent-blacklist path) changes.
+    from open_witness import run_open_lazy_fill
+
+    def _make_open_engine(suspended):
+      return _IncrementalLazySearch(
+          start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
+          weight=weight, blacklist=suspended,
+          cheap_gate=lambda prev, act, ns: cheap_feasible(
+              act, prev, ns, assembly, checker))
+
+    def _walk_open_plan(sub):
+      s = start
+      for a in sub:
+        ns = next(n2 for act2, n2 in successors(
+            s, assembly, robots, grasp_table=grasp_table,
+            gripper_kind=gripper_kind, handovers=handovers,
+            allow_place=allow_place, bracing=bracing) if act2 == a)
+        yield s, a, ns
+        s = ns
+
+    subplan, end, _orep = run_open_lazy_fill(
+        robot_ik=robot_ik, assembly=assembly, make_engine=_make_open_engine,
+        walk_plan=_walk_open_plan, is_ik=lambda a: a[0] in _IK_ACTIONS,
+        max_nodes=max_nodes, deadline=deadline,
+        max_epochs=robot_ik.open_witness_epochs, verbose=verbose, tag=p)
+    if subplan is None:
+      _fill_prof(f"{p}:open-effort")
+      return None, None
+    _fill_prof(f"{p}:ok-open")
+    return subplan, end
 
   if lazy_fill and robot_ik is not None:
     # LAZY-VALIDATED fill (LazySP hybrid, mirroring the global lazy search): the fill's

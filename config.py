@@ -89,6 +89,9 @@ class RunConfig:
   prefer_center: bool = False
   fill_window: int = 2
   lazy_fills: bool = True
+  open_witness: bool = False
+  open_witness_epochs: int = 2
+  open_witness_batch: int = 7
   lns_segments: bool = False
   handovers: bool = True
   allow_place: bool = True

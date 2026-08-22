@@ -6,11 +6,11 @@ per-skill KOMO. It helps CONVERGENCE-limited reaches; it does not help collision
 exact analytic pose may collide, whereas the KOMO's tolerant pose eq can settle on a nearby
 collision-free pose the discrete IK solutions don't cover), so the KOMO fallback stays.
 
-Per-arm calibration (rai model <-> ssik solver), each fit to RMS ~1e-8 and validated to 0.0
-rai-FK error over random targets:
+Per-arm AND per-tool calibration (rai model <-> ssik solver), each validated against rai FK
+over random targets:
 
     q_ssik = SIGN * q_rai + OFFSET
-    T_gripper_in_baselink = ssik_fk(q_ssik) @ B_TOOL          (B_TOOL = tool0 -> gripper_center)
+    T_ee_in_baselink = ssik_fk(q_ssik) @ B_TOOL               (B_TOOL = tool0 -> EE centre)
 
 so IK is:  q_rai = SIGN * (ssik.solve(T_target @ B_TOOL^-1).q - OFFSET).
 
@@ -43,24 +43,42 @@ def _artifact(name):
   return mod
 
 
-# --- per-arm calibration: SIGN, OFFSET, B_TOOL (tool0 -> gripper_center), and a solver loader ---
+# --- per-arm calibration: SIGN/OFFSET, tool0 -> EE-centre transforms, and solver loader ---
+#
+# The vacuum matrices are deliberately NOT inferred from the two-finger frame at call time.
+# They are the fixed transforms measured from the actual RAI models and FK-validated over
+# random configurations.  In particular the UR10 vacuum approaches along +x whereas its
+# Robotiq centre has a 90-degree tool rotation; reusing the latter produced seeds 106mm and
+# 90deg away from the requested vacuum pose, then incorrectly activated the seeded restart cap.
 _CAL = {
     "ur5": {
         "sign": np.array([1.0, 1.0, 1.0, 1.0, 1.0, -1.0]),
         "offset": np.array([-np.pi, -np.pi / 2.0, 0.0, -np.pi / 2.0, -np.pi, 0.0]),
-        "B": np.array([[0.0, -1.0, 0.0, 0.0],
-                       [-1.0, 0.0, 0.0, 0.0],
-                       [0.0, 0.0, -1.0, -0.3659],
-                       [0.0, 0.0, 0.0, 1.0]]),
+        "tools": {
+            "two_finger": np.array([[0.0, -1.0, 0.0, 0.0],
+                                     [-1.0, 0.0, 0.0, 0.0],
+                                     [0.0, 0.0, -1.0, -0.3659],
+                                     [0.0, 0.0, 0.0, 1.0]]),
+            "vacuum": np.array([[0.0, -1.0, 0.0, 0.0],
+                                 [-1.0, 0.0, 0.0, 0.0],
+                                 [0.0, 0.0, -1.0, -0.2959],
+                                 [0.0, 0.0, 0.0, 1.0]]),
+        },
         "load": lambda: _prebuilt("ur5e_ik"),
     },
     "ur10": {
         "sign": np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0]),
         "offset": np.array([0.0, 0.0, 0.0, 0.0, 0.0, 1.195343]),
-        "B": np.array([[0.930342, -0.366694, 0.0, 0.0],
-                       [0.366694, 0.930342, 0.0, 0.0],
-                       [0.0, 0.0, 1.0, 0.166],
-                       [0.0, 0.0, 0.0, 1.0]]),
+        "tools": {
+            "two_finger": np.array([[0.930342, -0.366694, 0.0, 0.0],
+                                     [0.366694, 0.930342, 0.0, 0.0],
+                                     [0.0, 0.0, 1.0, 0.166],
+                                     [0.0, 0.0, 0.0, 1.0]]),
+            "vacuum": np.array([[0.0, -0.366694, -0.930342, 0.0],
+                                 [0.0, 0.930342, -0.366694, 0.0],
+                                 [1.0, 0.0, 0.0, 0.060],
+                                 [0.0, 0.0, 0.0, 1.0]]),
+        },
         "load": lambda: _artifact("ur10_ik"),
     },
 }
@@ -71,7 +89,7 @@ _CAL["ur10_limited"] = _CAL["ur10"]
 # ur5_limited likewise: same ur5e kinematics, tighter limits applied downstream.
 _CAL["ur5_limited"] = _CAL["ur5"]
 for _c in _CAL.values():
-  _c["Binv"] = np.linalg.inv(_c["B"])
+  _c["tool_inv"] = {k: np.linalg.inv(B) for k, B in _c["tools"].items()}
   _c["solver"] = None                                        # lazily loaded ssik module
 
 
@@ -82,9 +100,9 @@ def _solver(robot_type):
   return c["solver"]
 
 
-def available(robot_type):
-  """Is there a calibrated analytic solver for this arm (and is ssik importable)?"""
-  if robot_type not in _CAL:
+def available(robot_type, tool_kind="two_finger"):
+  """Is this arm/tool pair calibrated (and is its optional ssik solver importable)?"""
+  if robot_type not in _CAL or tool_kind not in _CAL[robot_type]["tools"]:
     return False
   try:
     _solver(robot_type)
@@ -93,18 +111,19 @@ def available(robot_type):
     return False
 
 
-def seed_configs(robot_type, T_gripper_in_baselink):
-  """Analytic joint solutions (in RAI convention) placing the tool center at the target, a 4x4
-  SE3 pose expressed in the robot's `base_link` frame. Returns [] if the arm is uncalibrated,
-  ssik is unavailable, or the pose is unreachable."""
-  if robot_type not in _CAL:
+def seed_configs(robot_type, T_ee_in_baselink, tool_kind="two_finger"):
+  """Analytic RAI joint solutions placing the selected EE centre at a target 4x4 SE(3)
+  pose in ``base_link``.  Vacuum uses the canonical aligned EE roll supplied by the grasp
+  target; its physical roll symmetry does not require a second nonlinear variable here.
+  Returns [] if the pair is uncalibrated, ssik is unavailable, or the pose is unreachable."""
+  if robot_type not in _CAL or tool_kind not in _CAL[robot_type]["tools"]:
     return []
   try:
     U = _solver(robot_type)
   except Exception:
     return []
   c = _CAL[robot_type]
-  T_tool0 = np.asarray(T_gripper_in_baselink, dtype=float) @ c["Binv"]
+  T_tool0 = np.asarray(T_ee_in_baselink, dtype=float) @ c["tool_inv"][tool_kind]
   try:
     sols = U.solve(T_tool0, respect_limits=False)
   except Exception:

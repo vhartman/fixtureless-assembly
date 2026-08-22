@@ -158,6 +158,44 @@ debug geometry override, so this rollout is not a certificate for the unscaled r
 The dated artifact discussions later in this README describe older plans and are retained for
 forensics. The robust artifacts and commands above are the current reproducible results.
 
+### Experimental C2 geometric smoothing
+
+`--c2-spline` is a separate, opt-in geometry postprocessor. It replaces the default C1
+Catmull--Rom stage for that run; it does not modify phase scheduling, phase-rate smoothing,
+controllers, or event execution. Each mode-local free-motion stretch is fitted in composite
+joint space by a clamped cubic B-spline. Its two task-witness endpoints are hard equalities,
+while ordinary motion-planner waypoints are soft observations. The curve may therefore leave
+and shorten the saved polyline instead of merely retiming it.
+
+Safety is fail-closed. The emitted samples and the linear interpolation between every adjacent
+sample are checked at `--c2-resolution` (default 0.01 rad maximum per-joint step) with the
+mode's complete motion-planner collision predicate and the robot joint limits. Accepted fits
+also obey `--c2-max-deviation` (default 0.20 rad in composite configuration norm). The fitter
+tries progressively more faithful curves; if none certifies, that entire stretch stays on the
+original preflight-certified polyline. Stretches containing a rigid co-hold or handover are
+always protected because collision checking alone cannot enforce their closed-chain relative
+tool transform. C2 continuity is consequently claimed within accepted free-motion stretches,
+not across mode switches or protected/fallback stretches.
+
+The implementation is isolated in `c2_smoothing.py` and passes ordinary sampled waypoints to
+the existing postprocessing pipeline. The established version remains the default. A current
+car-mini evaluation command is:
+
+```bash
+python3 sim.py run experiments/car-mini-ur10-new.json --v2 \
+    --mp-path experiments/car-mini-ur-10-new-mp.json \
+    --phase-schedule --phase-smooth --phase-batch --c2-spline --limit-rate \
+    --servo-torque-guard 0.6 \
+    --record experiments/car-mini-ur10-new-c2-phase-batched.npz
+
+python3 sim.py replay experiments/car-mini-ur10-new-c2-phase-batched.npz
+```
+
+Useful experimental controls are `--c2-control-ratio` (fewer controls smooth more),
+`--c2-smooth-weight`, `--c2-samples-per-seg`, `--c2-max-deviation`, and
+`--c2-resolution`. Defaults should be treated as a conservative starting point; rejection does
+not require per-assembly tuning because local fallback is automatic.
+
 ### Visual-quality phase scheduling in simulation
 
 A paper-style formulation, pseudocode, certification argument, and current limitations are in
@@ -171,7 +209,9 @@ rendezvous, and monotonicity remain hard constraints.
 
 Every proposed phase step is checked with the rebuilt motion planner's complete predicate,
 including the saved robot-margin gates and the strict `--path-preflight-tolerance`. The complete
-schedule is then checked again at every 2 ms sample and on both sides of every mode switch. A
+schedule is then checked again at bounded joint-path variation and on both sides of every mode
+switch. The default `--phase-audit-resolution 0.01` rad matches the motion planner's edge scale;
+`--phase-audit-resolution 0` restores the old check at every 2 ms controller sample. A
 coordination deadlock falls back to the synchronized path, which is audited too; an invalid
 fallback aborts rather than being simulated. Runtime tick-level collision gating is not the
 planner. `--phase-schedule` also defaults physical arm-arm contacts on as a backstop. The
@@ -179,27 +219,113 @@ MuJoCo masks use one bit per robot, so cross-robot contacts are enabled without 
 also enabled enormous same-arm self-contact forces.
 
 Phase search runs first on a 10 ms coordination grid, then interpolates back to the 2 ms
-controller rate. Acceptance is still the complete 2 ms audit above. A dense counterexample
+controller rate. Acceptance uses the configuration-resolution audit above. A counterexample
 automatically retries the phase search at 4 ms and 2 ms; all grids are exact multiples of the
-controller tick. This removes redundant planner calls on
-long assemblies without weakening the executed trajectory's certificate.
+controller tick. Audit samples are selected using accumulated maximum-joint variation, not
+endpoint distance, so an out-and-back motion cannot be skipped. First/last samples and every
+event pose are unconditional. This avoids rechecking long stationary runs without changing the
+resolution contract used by motion planning.
 
 Phase speed is measured in each robot's own joint-space arc, rather than the composite arc of
 all robots. A robot therefore moves at the requested visual cruise whenever it is actually
 moving, and spans where only another robot moves are skipped as zero-duration bookkeeping.
 Every configuration produced by those skips remains subject to the same collision predicate
-and dense final audit.
+and final configuration-resolution audit.
 
 `--phase-smooth` applies a second, time-domain postprocessor to the resulting per-robot phase
 rates. It does **not** fit another joint-space spline: that would cut geometric corners and
-invalidate the motion path. Instead it Gaussian-smooths non-negative phase increments over
-`--phase-smooth-time` (default 0.12 s), projects every fire-to-fire interval back to its exact
-phase displacement, pins the complete phase vector at every mode switch, retains actor stops,
-and leaves rigid co-hold/collision-coupling intervals unchanged. A per-robot guard rejects any
-interval that would exceed that robot's certified source peak rate. The complete result is then
-audited at 2 ms in both pre- and post-switch modes; collision-sensitive intervals revert locally
+invalidate the motion path. Each robot's shared coordination phase is first converted to that
+robot's intrinsic accumulated joint-space arc. This is essential when a robot is stationary
+over a long span of the composite path: smoothing the composite coordinate would erase the
+scheduler's per-arm speed normalization and can amplify physical acceleration dramatically.
+The intrinsic non-negative increments are Gaussian-smoothed over `--phase-smooth-time` (default
+0.12 s), then each fire-to-fire interval receives a least-change non-negative projection onto
+its exact displacement. The complete shared phase vector remains pinned at every mode switch;
+actor stops, intentional sharp-corner slowdowns, and rigid co-hold/collision-coupling intervals
+remain hard constraints. A per-robot guard rejects any interval that would exceed that robot's
+certified source peak rate. The complete result is then
+audited at 0.01 rad joint-path resolution in both pre- and post-switch modes;
+collision-sensitive intervals revert locally
 to their original certified samples. Thus smoothing can reduce acceleration and jerk but can
-never become a reason to execute an unaudited shortcut.
+never become a reason to execute an unaudited shortcut. A collision-free proposal is also
+rejected if either acceleration or jerk RMS becomes more than 2% worse than its source.
+`--phase-smooth` is strict: if no independent phase trace exists, if the quality guard rejects
+the proposal, or if collision repair cannot certify it, the run aborts before physics and no
+recording is written. To execute a raw or synchronized schedule, omit `--phase-smooth`
+explicitly.
+
+`--phase-batch` is the final, geometry-independent cleanup for short move-stop-move patterns.
+It runs after `--phase-smooth`, so it works identically with the default Catmull--Rom geometry
+and with `--c2-spline`. For each robot it finds adjacent motion islands separated by at most
+`--phase-batch-max-gap` (default 0.35 s). If either island contains less than
+`--phase-batch-min-motion` (default 0.08 rad joint-space arc), it tries to pack that afterthought
+next to the larger motion as one near-cruise burst. It deliberately leaves one clean stationary
+period rather than spreading the same displacement into a long crawl.
+
+An arm's own task stop, a co-grasp/handover equality interval, the global event-passage rule,
+and the source peak joint rate remain hard constraints. Crossing another robot's mode switch is
+allowed only if the candidate is valid in both the pre- and post-switch worlds. Each local
+proposal is checked, followed by the complete configuration-resolution audit. A late counterexample restores only
+the connected offending merge windows. The log reports total motion islands, small islands,
+and internal slow gaps before and after; acceleration/deceleration at the two outer ends of one
+continuous motion are not counted as internal gaps. Mandatory task stops are therefore not
+misreported as removable visual defects.
+
+`--phase-intent` is a separate experimental alternative to `--phase-batch` for the stronger
+visual objective “move decisively, then be clearly idle.” It approximately minimizes the number
+of control samples on which any robot is moving, with fixed duration and event times. For each
+robot, its own task events partition time into robot-owned intervals. The complete intrinsic
+joint-space path arc in each eligible interval is packed into one delayed motion with 150 ms
+quintic velocity ramps and a peak path rate no greater than `--phase-intent-rate` (default
+1.5 rad/s). Using intrinsic rather than shared composite arc removes bookkeeping stops where only
+another robot moves. Several temporal placements are tried.
+
+Only the robot's own events are rest anchors. A foreign mode switch is a passage deadline and a
+pre/post-mode collision constraint, so the robot can cross it at nonzero velocity. True rigid
+co-hold/handover spans stay byte-exact. Scheduler-created collision couplings are not physical
+equalities: intent is allowed to explore them because its candidates are collision-screened and
+the complete result receives the 0.01 rad pre/post-switch audit. Monotonicity and every event
+witness remain exact.
+
+Pre-skill GOTO tasks are geometric passage waypoints, not rest events: they change no attachment
+and execute no skill hook, so their old task timestamp is not a hard phase deadline. However, an
+own-event interval containing such a waypoint is a contact-skill funnel: the already continuous
+phase-smoothed timing is retained there because it also encodes coordinated holder timing and the
+terminal low-rate approach expected by the seat servo. `--phase-intent` therefore compacts free
+transport and does not independently repack insertion/grasp funnels. For each eligible interval, several
+continuous durations are considered. A candidate may not increase either total all-robot idle or
+the squared lengths of its idle runs; among the survivors the shortest motion is placed latest.
+A second coordinate-refinement pass shifts earlier robots later after the other robots' compact
+motions are known. Thus maximizing individual idle cannot create a longer scene in which nothing
+moves.
+
+This objective is intentionally different from minimum makespan and minimum jerk. In practice,
+the ramped bursts can improve derivatives too, but that is measured rather than assumed.
+`--phase-intent` is fail-closed: if no certified motion-support reduction survives, simulation
+does not start. It is mutually exclusive with `--phase-batch`, but normally follows
+`--phase-smooth`. Compact timing explores farther from the synchronized diagonal, so a narrow
+coordination corridor naturally rejects many placements and limits the achievable idle gain.
+
+Current saved-path validation commands (no IK or motion replanning) are:
+
+```bash
+python3 sim.py run experiments/car-mini-ur10-new.json --v2 \
+    --mp-path experiments/car-mini-ur-10-new-mp.json \
+    --phase-schedule --phase-smooth --phase-intent --limit-rate \
+    --servo-torque-guard 0.6 \
+    --record experiments/car-mini-ur10-new-phase-intent-rad-audit.npz
+
+python3 sim.py run experiments/chair-no-vacuum-assemble.json --v2 \
+    --mp-path experiments/mp-chair-no-vacuum.json \
+    --phase-schedule --phase-smooth --phase-intent --limit-rate \
+    --servo-torque-guard 0.6 \
+    --record experiments/chair-phase-intent-rad-audit.npz
+```
+
+The car completed 19/19 actions in 4,423 replay frames; the chair completed 34/34 in
+9,172 frames. The car audit retained its known 10 ms-grid collision counterexample and accepted
+the 4 ms retry. Final-audit collision calls fell from 34,840 to 3,798 on car and from 72,635 to
+9,271 on chair. Use `python3 sim.py replay FILE.npz` to inspect either recording.
 
 `--phase-servo-time SEC` is the fixed nominal pre-fire reservation used while forming the
 offline phase schedule (default 0.15 s per settle or seat operation, matching the measured
@@ -227,14 +353,17 @@ Current car-mini validation (saved plan/path only; no IK or motion replanning):
 ```bash
 python3 sim.py run experiments/car-mini-ur10-new.json --v2 \
     --mp-path experiments/car-mini-ur-10-new-mp.json \
-    --phase-schedule --phase-smooth --limit-rate \
+    --phase-schedule --phase-smooth --phase-batch --limit-rate \
     --servo-torque-guard 0.6 \
-    --record experiments/car-mini-ur10-new-phase-smooth.npz
+    --record experiments/car-mini-ur10-new-phase-batched.npz
 
-python3 sim.py replay experiments/car-mini-ur10-new-phase-smooth.npz
+python3 sim.py replay experiments/car-mini-ur10-new-phase-batched.npz
 ```
 
-This completed 19/19 actions. The phase reference has 37,976 control samples plus 34
+This completed 19/19 actions. With the established C1 geometry, batching kept 52 certified
+merges and reduced motion islands from 207 to 155, sub-0.08-rad islands from 127 to 73, and
+internal slow gaps from 700 to 620. The
+phase reference has 37,976 control samples plus 34
 post-switch poses, all accepted by the exact final audit; recording every eighth physics tick
 produced 4,778 NPZ frames. The duration is printed only for context. Motion-quality reporting
 measures each robot from its first motion through its own final arrival and reports the
@@ -243,6 +372,82 @@ separately, so an early-finishing arm is not encouraged to creep merely to end i
 Car-mini's tight coordination and rigid-coupling windows leave relatively little freedom for
 postprocessing: reference acceleration/jerk RMS fell by 1.5% and the recorded physical values
 by approximately 0.8%, with the physical peak joint-space rate unchanged.
+
+With `--c2-spline`, the current run kept 26/28 proposed merges after two local audit
+restorations: motion islands fell 144 to 118, sub-0.08-rad islands 76 to 49, and internal slow
+gaps 373 to 332. It also completed 19/19 actions. Use the earlier C2 command to reproduce or
+replay `experiments/car-mini-ur10-new-c2-phase-batched.npz`.
+
+Current peg-stool chamfer evaluation uses the supplied saved plan and path directly. Both the
+established C1 geometry and opt-in C2 geometry now produce strict smoothed rollouts:
+
+```bash
+# Established C1 geometry
+python3 sim.py run experiments/peg-stool-4r-new-plan.json --v2 \
+    --mp-path experiments/mp-peg-stool-chamfer.json \
+    --phase-schedule --phase-smooth --phase-batch --limit-rate \
+    --servo-torque-guard 0.6 \
+    --record experiments/peg-stool-4r-new-phase-smoothed.npz
+
+# C2 geometry: strict, collision-audited intrinsic-arc smoothing
+python3 sim.py run experiments/peg-stool-4r-new-plan.json --v2 \
+    --mp-path experiments/mp-peg-stool-chamfer.json \
+    --phase-schedule --phase-smooth --phase-batch --c2-spline --limit-rate \
+    --servo-torque-guard 0.6 \
+    --record experiments/peg-stool-4r-new-c2-phase-smoothed.npz
+
+python3 sim.py replay experiments/peg-stool-4r-new-phase-smoothed.npz
+python3 sim.py replay experiments/peg-stool-4r-new-c2-phase-smoothed.npz
+```
+
+For C1, the 45,285-sample asynchronous reference and smoothed result pass the exact 2 ms
+collision audit. Intrinsic-arc smoothing reduces joint acceleration RMS by 26.7% and jerk RMS
+by 26.8%. Batching keeps 23/23 certified merges: motion islands fall 160 to 137,
+sub-0.08-rad islands 78 to 53, and internal slow gaps 459 to 435. Simulation completes 21/21
+actions and records 5,735 frames.
+
+An experimental intentional-motion rollout replaces `--phase-batch` with `--phase-intent`:
+
+```bash
+python3 sim.py run experiments/peg-stool-4r-new-plan.json --v2 \
+    --mp-path experiments/mp-peg-stool-chamfer.json \
+    --phase-schedule --phase-smooth --phase-intent --limit-rate \
+    --servo-torque-guard 0.6 \
+    --record experiments/peg-stool-4r-new-phase-intent-v6.npz
+
+python3 sim.py replay experiments/peg-stool-4r-new-phase-intent-v6.npz
+```
+
+At the default 1.5 rad/s intent rate, moving support falls from 67,590 to 62,701 robot-samples
+(idle fraction 59.1% to 62.1%), motion islands fall 171 to 121, and internal slow gaps fall 512
+to 363. Conditional moving speed rises from 0.68 to 0.73 rad/s. All-robot idle falls from 9.9 s
+to 7.8 s and its longest interval from 1.4 s to 1.2 s. The 150 ms quintic ramps reduce
+acceleration RMS by another 16.0% and jerk RMS by 16.7% relative to the already smoothed input.
+The actuated recording peaks around 1.72 rad/s instead of the former approximately 2.4 rad/s.
+All 13 accepted robot-owned intervals and the complete trajectory pass the exact audit; four
+intervals retain certified smoothed timing after no alternative can be certified, 19 intersect a
+true rigid span, and the coordinate-refinement pass shifts three intervals later. The wider
+foreign-stop diagnostic falls from 11 to 9. Simulation completes 21/21 actions and records 5,281
+frames.
+
+For C2, 14 stretches fit, 15 closed-chain stretches remain protected, and 3 unsafe fits retain
+their certified polylines. Its 45,575-sample asynchronous reference and smoothed result also
+pass the exact audit. Smoothing reduces acceleration RMS by 20.4% and jerk RMS by 20.5%.
+Batching keeps 17/17 certified merges, reducing motion islands 142 to 125, sub-0.08-rad islands
+63 to 44, and internal slow gaps 282 to 259. Simulation completes 21/21 actions and records
+5,772 frames.
+
+The two earlier runs have been retained only for diagnosing the visible stop-and-go behavior and
+renamed so they cannot be mistaken for smoothed results:
+
+```bash
+python3 sim.py replay experiments/peg-stool-4r-new-unsmoothed-diagnostic.npz
+python3 sim.py replay experiments/peg-stool-4r-new-c2-unsmoothed-diagnostic.npz
+```
+
+Those diagnostic recordings predate the strict contract and the intrinsic-arc fix. The C1 file
+used the synchronized fallback. The C2 file smoothed the composite arc, failed the quality guard,
+then applied short-motion batching to the raw schedule. Neither is phase-smoothed.
 
 Chair validates the same defaults on a longer mixed-EE UR5 plan (the historical filenames say
 "no-vacuum", but the saved config contains two vacuum and two two-finger grippers):
@@ -789,3 +994,180 @@ Flags used in both evaluations:
   only for older path files.
 - `--quiet-rai --no-view` suppresses known RAI collision-library noise and prevents blocking
   viewers. The three environment assignments fix hash order and put caches in writable paths.
+
+## Vacuum SS-IK and open witness search
+
+An intuitive and paper-style description of the current search pipeline—including the
+signature-collapsed backward pass, fact components, milestone fills and repair, open witness
+validation, and `--milestones-anytime`—is in [SEARCH_METHOD.md](SEARCH_METHOD.md).
+The proposed paper scope, evaluation matrix, simulation-realism work, and real-robot experiment
+plan are collected in [PAPER_PLAN.md](PAPER_PLAN.md).
+
+Analytic IK seeding is on by default with `--real-ik`. It is calibrated separately for the
+UR5/UR10 two-finger and vacuum tool frames; vacuum uses the grasp target's canonical aligned EE
+roll. `--no-ik-seeding` disables all SS-IK seeding and restores the nonlinear reach precheck.
+An empty vacuum solution set is not treated as a hard impossibility: the relaxed/full KOMO path
+still decides borderline targets.
+
+`--open-witness` is an experimental, isolated replacement for the permanent-failure behavior of
+lazy width-1 milestone fills. The first unresolved edge immediately invalidates the incumbent:
+later edges of that plan are not speculatively probed. That edge is suspended for the rest of
+the fairness epoch and reopened in the next epoch. Successes are cached; stochastic failures
+are not. Ordinary skills escalate through 2, 4, then `--open-witness-batch N` attempts. Assemble
+keeps one atomic N=7 structural batch: all six canonical orientation biases plus one unbiased
+initialization in a shared scene. Splitting that small bundle across epochs measured worse on
+peg-stool because the promising assembly did not reopen before greedy search found many other
+plans. `--open-witness-epochs N`
+(default 2) limits reopening effort per fill and is not an infeasibility certificate. The flag is
+off by default and does not alter the legacy `bind()`/lazy-fill path. A batch shares scene and
+reach-precheck setup.
+
+Every fresh `--real-ik --save` now writes the **exact successful search witness** for every IK
+action, even with `--optimize-witnesses off`. Open search retains the returned joint vector, not
+just a successful boolean, and aligns those vectors to the final action list before writing JSON.
+Release hoisting runs first; if it changes an IK predecessor scene, that changed edge is
+certified once as part of the fresh solve. An IK action with a null witness makes export fail
+immediately.
+
+Witness optimization is layered on top of this immutable feasibility baseline. Changing, for
+example, `off` to `floor` or changing the branch budget requests extra candidates but does not
+discard the saved search solution. Failed candidate harvesting falls back to the exact baseline.
+A normal `--load-plan`, `replay.py`, or sim replay never silently resolves missing IK.
+`--refresh-witnesses` is the explicit one-time escape hatch for a legacy plan that predates this
+persistence format; new files do not need it.
+
+Example search only (no motion planning):
+
+```bash
+python3 main.py --solve \
+  --assembly peg-stool-cuboid-4-tight-chamfer --parts 5 --num-robots 4 \
+  --robot ur5_limited --grippers vacuum,two_finger,two_finger,vacuum \
+  --weight 100 --milestones --sig-collapsed-h --sig-components press \
+  --real-ik --open-witness --open-witness-batch 7 --open-witness-epochs 1 \
+  --grasp-sampler --grasp-sampler-keep 20 --grasp-sampler-scenes \
+  --grasp-sampler-wrap 0.1 --grasp-sampler-pad-support 0.02 \
+  --wrench --grasp-model asymmetric --vacuum-no-assemble \
+  --vacuum-engage-force 5 --two-finger-scale 10000 --grasp-compliance \
+  --insert-force 0.1 --insertion-noise 0 --allow-curved-grasps \
+  --scatter-spacing 0.2 --seed 11023 --witness-margin 1e-4 \
+  --strict-collisions 1e-4 --optimize-witnesses off --witness-sets 0 \
+  --no-fuse-cograsp --quiet-rai --no-view \
+  --save experiments/bench-peg-stool-open-skill-tiered-plan.json
+```
+
+Historical V1 measurement on this command (before immediate replanning): true batched OPEN
+reproduced the legacy
+19-action plan in 38.3 s at 0.838 GB peak RSS. The otherwise identical legacy path took
+54.0 s at 0.840 GB: search is 29% faster, bind wall falls from 25.2 to 9.1 s, and NLP solves
+from 1,123 to 563. The two-part vacuum cube also improves from 9.7 s legacy to 6.6 s open.
+As a second control, legacy with its ordinary restart budget reduced to six and reach-precheck
+restarts disabled still took 66.0 s (31.9 s bind wall, 1,321 NLP solves) and selected a longer
+20-action plan. Thus the measured gain is not merely a larger hidden per-edge effort budget.
+The earlier one-bind-per-attempt prototype was much worse because it rebuilt the scene and
+reran reach-precheck for every attempt; batching is the performance-critical distinction. V1
+also kept validating the remainder of an incumbent after its first failure. That speculative
+failure harvesting helped peg-stool but violated ordinary lazy-validation semantics, so the
+current version stops immediately and is reported separately below.
+
+To add optimized, replayable witness sets without rerunning search or baseline IK:
+
+```bash
+python3 main.py \
+  --config experiments/bench-peg-stool-open-persisted-plan.json \
+  --load-plan experiments/bench-peg-stool-open-persisted-plan.json \
+  --optimize-witnesses floor --witness-sets 4 --witness-branch-budget 5 \
+  --save experiments/bench-peg-stool-open-persisted-floor-plan.json \
+  --quiet-rai --no-view
+
+python3 replay.py experiments/bench-peg-stool-open-persisted-floor-plan.json --no-view
+```
+
+For an older plan without a `witnesses` block, repair it deliberately once with
+`--refresh-witnesses --save NEW.json`. Without that flag, post-processing fails closed instead
+of gambling on a fresh IK draw.
+
+The corrected vacuum SS-IK itself does help on the hard case: the legacy search above took
+54.0 s and 0.84 GB with analytic seeding versus 143.6 s and 1.70 GB under
+`--no-ik-seeding`. The trivial two-part vacuum cube went the other way (9.7 s seeded versus
+6.6 s unseeded), because collision-limited failures can spend more on exact branches than the
+small nonlinear problem costs. The hard-case reduction is large enough to keep the calibrated
+vacuum path enabled by default.
+
+### Cross-assembly open-witness comparison
+
+The original full-plan-prevalidation comparison was repeated on the robust Car-mini, Cross, and Chair
+configurations on 2026-08-22. Both sides loaded the same saved configuration and disabled only
+post-search work (`--optimize-witnesses off --witness-sets 0 --no-fuse-cograsp`); motion
+planning was not run. The OPEN side additionally used
+`--open-witness --open-witness-batch 7 --open-witness-epochs 2`.
+
+| assembly | legacy search | V1 batched OPEN | change | NLP solves | bind wall | peak RSS | actions |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Car-mini robust, 3 UR10 limited | 34.33 s | 26.42 s | **-23.0%** | 1,384 -> 893 | 23.1 -> 15.6 s | 504 -> 488 MB | 26 -> 26 |
+| Cross-7 robust, 4 UR10 | 10.38 s | 10.09 s | -2.8% | 320 -> 264 | 2.0 -> 1.4 s | 737 -> 737 MB | 27 -> 28 |
+| Chair-8 robust, mixed UR10 | 70.86 s | 61.57 s | **-13.1%** | 2,751 -> 1,340 | 24.7 -> 15.6 s | 1,716 -> 1,700 MB | 33 -> 33 |
+
+These are single paired measurements, not statistical confidence intervals. Cross is already
+cheap and dominated by discrete search, so reducing its IK work does not materially improve the
+end-to-end time; its greedy (`--weight inf`) OPEN run also chose one extra action. Every real
+fill in all three OPEN runs completed in epoch one. These runs therefore validate the batching
+speedup but do not exercise real-instance reopening; the fairness/reopening behavior has a unit
+regression test.
+
+Car-mini and Cross were subsequently floor-optimized outside the timed region and replayed from
+18 and 22 persisted witnesses respectively, with per-action IK solving skipped. Chair's OPEN
+and legacy searches both found the same 33-action structure, but independently regenerated
+floor witnesses expose the same existing final co-hold problem: at the keyframe before step 32,
+`a1_ur_coll7` penetrates `obj_5/obj_6` by 17.65 mm total. Chair's search timing is useful as a
+matched performance comparison, but neither regenerated Chair artifact is claimed as a clean
+replay. The identical failure on both paths localizes it outside the OPEN policy.
+
+Current immediate-replan results use the same maximum batch but ordinary-skill tiers 2 -> 4 ->
+7. Assemble retains its atomic seven-slot bundle. These are again individual runs:
+
+| assembly | legacy | current OPEN | change | NLP solves | actions | replay |
+|---|---:|---:|---:|---:|---:|---|
+| Car-mini robust | 34.33 s | **23.25 s** | **-32.3%** | 1,384 -> 254 | 26 -> 25 | clean, 17 persisted witnesses |
+| Cross-7 robust | 10.38 s | 15.76 s | +51.8% | 320 -> 261 | 27 -> 27 | clean, 21 persisted witnesses |
+| Peg-stool chamfer | 54.0 s | **49.12 s** | -9.0% | 1,123 -> 538 | 19 -> 17 | old artifact predates exact persistence |
+
+Car-mini confirms that speculative tail validation can be very expensive. Peg-stool shows its
+opposite accidental benefit: one invalid incumbent often contained several independently doomed
+edges, and V1 harvested all of those refutations before replanning. Immediate replanning explores
+more sibling plans instead. Recovering that pruning without touching an already-invalid plan
+requires a better first-edge selector or the deferred persistent pending-edge scheduler. Cross is
+small and discrete-search dominated; its current single timing is not evidence of an IK
+regression because NLP work still falls, but it is not an end-to-end performance win.
+
+The old 17-action peg-stool artifact demonstrates the persistence bug: search found every edge,
+but its plan-only JSON discarded those vectors and a separate floor pass failed to rediscover
+step 2. It remains intentionally incomplete and should not be used for motion planning. A fresh
+end-to-end run after the fix produced a 20-action plan with all 16 required search witnesses;
+floor optimization retained all 16, and a second-process load of the floor artifact performed
+zero bind/NLP calls:
+
+- `experiments/bench-peg-stool-open-persisted-plan.json`
+- `experiments/bench-peg-stool-open-persisted-floor-plan.json`
+
+Car-mini and Cross earlier optimized artifacts are:
+
+- `experiments/bench-car-mini-open-skill-tiered-witness-plan.json`
+- `experiments/bench-cross7-open-skill-tiered-witness-plan.json`
+
+The benchmark form is:
+
+```bash
+# Replace CONFIG and TAG with one of:
+#   experiments/car-mini-3r-robust-seed11023-plan.json  / car-mini
+#   experiments/cross7-4r-robust-seed0-plan.json        / cross7
+#   experiments/chair8-4r-mixed-robust-seed1-plan.json  / chair8
+python3 main.py --config CONFIG --solve \
+  --no-open-witness --optimize-witnesses off --witness-sets 0 \
+  --no-fuse-cograsp --quiet-rai --no-view \
+  --save experiments/bench-TAG-legacy-plan.json
+
+python3 main.py --config CONFIG --solve \
+  --open-witness --open-witness-batch 7 --open-witness-epochs 2 \
+  --optimize-witnesses off --witness-sets 0 --no-fuse-cograsp \
+  --quiet-rai --no-view --save experiments/bench-TAG-open-b7e2-plan.json
+```

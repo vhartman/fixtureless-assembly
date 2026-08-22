@@ -63,7 +63,8 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
                              grasp_table=None, clear_margin=0.4, alpha=None,
                              branch_weight=10.0, branch_budget=0, alpha_lo=0.0,
                              branch_metric="sign", reconfig_thresh=np.pi / 2.0, verbose=True,
-                             draw_seed=None, witness_sets=0, set_spread=0.05):
+                             draw_seed=None, witness_sets=0, set_spread=0.05,
+                             baseline_witnesses=None):
   """Returns (witnesses, report). `alpha` fixes the floor; None => BISECT for the highest
   feasible one. The floor is per-step NORMALISED (`eps_i = alpha * best_clearance_at_step_i`)
   because a global floor would be dictated by the tightest step -- an insertion has the gripper
@@ -77,6 +78,12 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
     _checker, grasp_table = _search_context(C, assembly, robots)
   states = _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
                           bracing, grasp_table, "optimize_witnesses_floor")
+  if baseline_witnesses is not None:
+    from plan_io import require_complete_witnesses
+    require_complete_witnesses(plan, baseline_witnesses,
+                               who="optimize_witnesses_floor baseline")
+    baseline_witnesses = [None if w is None else np.asarray(w, dtype=float).copy()
+                          for w in baseline_witnesses]
   fkC = ry.Config()
   fkC.addConfigurationCopy(robot_ik.C)
   names = list(fkC.getJointNames())
@@ -169,15 +176,23 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
   cand, movers, bind_wit, grasped = {}, {}, {}, {}
   for i, a in enumerate(plan):
     act = tuple(a)
-    ok, w0 = robot_ik.bind(act, states[i], states[i + 1], assembly)
-    if not ok or w0 is None:
-      continue
+    if baseline_witnesses is not None:
+      w0 = baseline_witnesses[i]
+      if w0 is None:                                      # non-IK action
+        continue
+    else:
+      ok, w0 = robot_ik.bind(act, states[i], states[i + 1], assembly)
+      if not ok or w0 is None:
+        continue
     _w0 = np.asarray(w0, dtype=float).ravel()
     if _w0.size == len(names):
       bind_wit[i] = _w0                                        # see the emission note below
     movers[i] = _involved(act, states[i], states[i + 1], robots, robot_ik)
     grasped[i] = _grasped_parts(i)
-    cs = robot_ik.candidate_witnesses(act, states[i], states[i + 1], assembly) or [w0]
+    # Candidate harvesting is stochastic and may fail. The exact persisted/search witness is
+    # always present and is the immutable feasibility fallback for this layer.
+    cs = [w0] + list(
+        robot_ik.candidate_witnesses(act, states[i], states[i + 1], assembly) or [])
     norm = []
     for w in cs:
       w = np.asarray(w, dtype=float).ravel()
@@ -206,7 +221,8 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
   if not steps:
     robot_ik.strip_inactive_collision = _strip0
     robot_ik.harvest_all_branches = _harvest0
-    return [None] * len(plan), {"steps": 0}
+    return (list(baseline_witnesses) if baseline_witnesses is not None
+            else [None] * len(plan)), {"steps": 0}
 
   def solve(alpha_v):
     """Viterbi over the whole plan with a per-step clearance FLOOR. Returns (chain, cost) or
@@ -335,7 +351,10 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
   ok = [(av, xb, c) for av, xb, c in front if xb is not None and xb <= ref + branch_budget]
   best_a = max((av for av, _, _ in ok), default=0.0)
   # ---- emit the DP's own chain ---------------------------------------------------------
-  wit = [None] * len(plan)
+  # Start from the complete feasibility certificate and overwrite only layers for which the
+  # DP selected an improvement. Thus no optimizer outcome can turn a required keyframe null.
+  wit = ([None] * len(plan) if baseline_witnesses is None
+         else [None if w is None else w.copy() for w in baseline_witnesses])
   qm = dict(home_map)
   got, _why = solve(best_a)
   cost, chosen, crossings = got if got is not None else (None, [dict(cand[i][0]) for i in steps], -1)

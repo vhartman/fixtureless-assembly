@@ -284,7 +284,8 @@ def build_parser():
       help="With --real-ik: use analytic closed-form IK (ssik) on every fixed-target skill "
            "(pick/place/assemble-onto-table, incl. braced): exact per-arm reachability rejects "
            "(replacing the relaxed precheck), collision-probed branch combos, and warm starts "
-           "for the KOMO. Calibrated arms only (ur5/ur10 two-finger); others keep the precheck.",
+           "for the KOMO. Calibrated arm/tool pairs include ur5/ur10 with two-finger or "
+           "vacuum EEs; others keep the precheck.",
   )
   g_ik.add_argument(
       "--ik-restarts", type=int, default=12, metavar="N",
@@ -724,6 +725,28 @@ def build_parser():
            "cheap gate only and run real IK on candidate subplan edges (LazySP hybrid, "
            "IK failures blacklisted + rerun) -- the measured fix for module fills "
            "spending minutes on failed IK binds at pop.",
+  )
+  g_search.add_argument(
+      "--open-witness", action=argparse.BooleanOptionalAction, default=False,
+      help="EXPERIMENTAL opt-in for lazy milestone fills: give each blocking IK edge one "
+           "small batch, temporarily suspend it, and explore alternatives before revisiting "
+           "it in the next fairness epoch. Failed probes remain OPEN and are not stored in "
+           "the legacy permanent IK/edge blacklist. Default off: the measured legacy path "
+           "is unchanged.",
+  )
+  g_search.add_argument(
+      "--open-witness-epochs", type=int, default=2, metavar="N",
+      help="With --open-witness: maximum reopen/probe epochs per milestone fill (default 2). "
+           "This is an effort limit, not an infeasibility claim. 0 means unlimited and is "
+           "accepted only when the calling solver supplies a finite deadline.",
+  )
+  g_search.add_argument(
+      "--open-witness-batch", type=int, default=7, metavar="N",
+      help="With --open-witness: maximum bounded IK batch (default 7, must be >=1). "
+           "Ordinary skills escalate through min(N,2), min(N,4), then N attempts. Assemble "
+           "keeps one atomic N=7 structural bundle (six orientation biases + one unbiased "
+           "initialization) because splitting it was slower. A failed incumbent is abandoned "
+           "immediately; later edges are not speculatively probed.",
   )
   g_search.add_argument(
       "--lns-segments", action="store_true",
@@ -1621,6 +1644,29 @@ def _witnesses_reusable(saved_cfg, cfg):
           + ", ".join(bad) + " -- re-solving instead of reusing.")
   return not bad
 
+
+# These settings choose/rank EXTRA candidates but do not affect whether the persisted search
+# certificate itself remains a valid baseline.  In particular, changing `off` -> `floor` must
+# run floor optimization ON TOP OF the saved witness, not discard it and stochastically redo IK.
+_WITNESS_OPTIMIZER_FIELDS = {
+    "optimize_witnesses", "witness_branch_budget", "witness_branch_metric",
+    "witness_reconfig_thresh", "witness_clearance", "witness_draw",
+    "witness_sets", "witness_set_spread",
+}
+
+
+def _witnesses_baseline_compatible(saved_cfg, cfg):
+  """Whether saved feasible keyframes are safe inputs under the current scene/IK gates."""
+  from config import RunConfig
+  legacy = {"witness_margin": None, "witness_sets": 0}
+  fields = [k for k in _WITNESS_FIELDS if k not in _WITNESS_OPTIMIZER_FIELDS]
+  bad = [k for k in fields
+         if saved_cfg.get(k, legacy.get(k, RunConfig.default_for(k))) != getattr(cfg, k, None)]
+  if bad:
+    print("[witness-baseline] settings affecting witness feasibility differ on: "
+          + ", ".join(bad) + ".")
+  return not bad
+
 def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
   # Select the search engine from the cfg flags and run it; returns the plan (or None).
   # PURE dispatch: no global-state changes here (all set-up ran before this is called), so
@@ -2177,6 +2223,19 @@ def run(cfg, explicit=None):
       robot_ik.restarts_full = cfg.ik_restarts
       robot_ik.restarts_precheck = cfg.precheck_restarts
       robot_ik.fail_order = cfg.fail_order
+      robot_ik.open_witness = cfg.open_witness
+      robot_ik.open_witness_epochs = cfg.open_witness_epochs
+      robot_ik.open_witness_batch = cfg.open_witness_batch
+      if cfg.open_witness:
+        if cfg.open_witness_batch < 1:
+          raise SystemExit("main.py: --open-witness-batch must be >= 1")
+        print(f"[flag] --open-witness ACTIVE: failed lazy-fill IK probes stay open; "
+              f"ordinary effort escalates {min(cfg.open_witness_batch, 2)} -> "
+              f"{min(cfg.open_witness_batch, 4)} -> {cfg.open_witness_batch}, assemble uses "
+              f"an atomic {cfg.open_witness_batch}-slot structural batch; up to "
+              f"{cfg.open_witness_epochs or 'unlimited'} epoch(s). First unresolved edge "
+              "abandons the incumbent immediately. "
+              "Legacy bind and fill paths remain unchanged when this flag is off.")
     if robot_ik is not None and cfg.full_ik:
       robot_ik.single_arm_ik = False
       robot_ik.strip_inactive_collision = False
@@ -2396,9 +2455,59 @@ def run(cfg, explicit=None):
                               gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
                               handovers=cfg.handovers, allow_place=cfg.allow_place,
                               bracing=cfg.bracing)
+      # SEARCH CERTIFICATE PERSISTENCE. The exact witness that made each selected IK edge pass
+      # is the baseline for every later stage. Never ask a new process to rediscover it. A
+      # fresh plan is collected from the positive search cache/open pool; release hoisting may
+      # have changed a predecessor scene, in which case only those changed edges are certified
+      # here, before anything is written. A loaded plan is read-only unless the user explicitly
+      # asks for --refresh-witnesses.
+      from plan_io import missing_required_witnesses, read_witnesses, read_witness_stage, \
+          require_complete_witnesses, witness_block
+      joint_names = list(robot_ik.C.getJointNames()) if robot_ik is not None else []
+      baseline_witnesses = None
+      _saved_witness_stage = None
+      _need_witnesses = bool(robot_ik is not None and not (
+          cfg.motion_plan and cfg.mp_export_load))
+      if _need_witnesses and cfg.load_plan:
+        if _witnesses_baseline_compatible(_saved_cfg, cfg):
+          baseline_witnesses = read_witnesses(cfg.load_plan, joint_names, len(plan))
+          _saved_witness_stage = read_witness_stage(cfg.load_plan)
+        if (baseline_witnesses is not None and cfg.refresh_witnesses
+            and missing_required_witnesses(plan, baseline_witnesses)):
+          print("[witness-refresh] persisted block is incomplete; explicitly rebuilding the "
+                "legacy baseline because --refresh-witnesses was given.")
+          baseline_witnesses = None
+        if baseline_witnesses is None and cfg.refresh_witnesses:
+          from solver import collect_plan_witnesses
+          baseline_witnesses = collect_plan_witnesses(
+              C, assembly, plan, robots, robot_ik,
+              gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
+              handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
+              resolve_missing=True)
+        if baseline_witnesses is None and (
+            cfg.optimize_witnesses is not None or cfg.motion_plan or cfg.save is not None):
+          raise ValueError(
+              f"{cfg.load_plan} has no compatible complete search-witness certificate. "
+              "Refusing to stochastically redo IK during replay/post-processing. Re-run the "
+              "original solve once with this version, or explicitly pass --refresh-witnesses "
+              "to certify this legacy plan.")
+      elif _need_witnesses and not cfg.load_plan:
+        from solver import collect_plan_witnesses
+        baseline_witnesses = collect_plan_witnesses(
+            C, assembly, plan, robots, robot_ik,
+            gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
+            handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
+            resolve_missing=True)
+      if baseline_witnesses is not None:
+        require_complete_witnesses(plan, baseline_witnesses,
+                                   who="search-witness persistence")
+        print(f"[witness-persist] {sum(w is not None for w in baseline_witnesses)} exact "
+              "search witnesses aligned to the final plan; later stages need not redo IK.")
       if cfg.save is not None:
-        save_plan(cfg.save, cfg, plan)
-      opt_witnesses = None
+        save_plan(cfg.save, cfg, plan,
+                  witnesses=(witness_block(joint_names, baseline_witnesses, stage="search")
+                             if baseline_witnesses is not None else None))
+      opt_witnesses = baseline_witnesses
       witness_alts = None                                    # --witness-sets alternatives
       if (plan is not None and cfg.optimize_witnesses is not None
           and not (cfg.motion_plan and cfg.mp_export_load)):
@@ -2409,10 +2518,12 @@ def run(cfg, explicit=None):
           # this stage a pure function of the file -- no witfloor re-solve, no possibility of
           # witness drift between stages. Reused only when every witness-shaping setting
           # matches the saved config; --refresh-witnesses forces the re-solve.
-          if cfg.load_plan and not cfg.refresh_witnesses and _witnesses_reusable(_saved_cfg, cfg):
-            from plan_io import read_witnesses, read_witness_sets
-            opt_witnesses = read_witnesses(cfg.load_plan,
-                                           list(robot_ik.C.getJointNames()), len(plan))
+          _reuse_final = bool(cfg.load_plan and not cfg.refresh_witnesses
+                              and _witnesses_reusable(_saved_cfg, cfg)
+                              and baseline_witnesses is not None
+                              and _saved_witness_stage == "optimized")
+          if _reuse_final:
+            from plan_io import read_witness_sets
             if opt_witnesses is not None:
               print(f"[witness-reuse] {sum(w is not None for w in opt_witnesses)} persisted "
                     f"witnesses loaded from {cfg.load_plan}; witness optimization SKIPPED "
@@ -2423,7 +2534,7 @@ def run(cfg, explicit=None):
                 if witness_alts:
                   print(f"[witsets-reuse] {len(witness_alts)} persisted witness set(s) "
                         f"loaded from {cfg.load_plan}.")
-          if opt_witnesses is None and cfg.optimize_witnesses == "floor":
+          if not _reuse_final and cfg.optimize_witnesses == "floor":
             from witness_floor import optimize_witnesses_floor
             # floor mode CONSTRAINS clearance (a per-step normalised floor) rather than
             # weighting it, so there is nothing for --witness-clearance to scale. Say so
@@ -2445,24 +2556,28 @@ def run(cfg, explicit=None):
                 branch_metric=cfg.witness_branch_metric,
                 reconfig_thresh=cfg.witness_reconfig_thresh,
                 draw_seed=cfg.witness_draw,
-                witness_sets=cfg.witness_sets, set_spread=cfg.witness_set_spread)
+                witness_sets=cfg.witness_sets, set_spread=cfg.witness_set_spread,
+                baseline_witnesses=baseline_witnesses)
             witness_alts = _rep.get("wit_alts") or None
-          elif opt_witnesses is None:
+          elif not _reuse_final:
             opt_witnesses, _rep = optimize_witnesses(
                 C, assembly, plan, robots, robot_ik, cost=cfg.optimize_witnesses,
                 gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
                 handovers=cfg.handovers, allow_place=cfg.allow_place,
                 bracing=cfg.bracing, clear_weight=cfg.witness_clearance,
-                robot_collisions=cfg.witness_robot_collisions)
-      if cfg.save is not None and plan is not None and opt_witnesses is not None:
+                robot_collisions=cfg.witness_robot_collisions,
+                baseline_witnesses=baseline_witnesses)
+      if (cfg.save is not None and plan is not None and opt_witnesses is not None
+          and cfg.optimize_witnesses is not None):
         # RE-save with the optimized witnesses attached (the first save above is deliberately
         # EARLY so a witness-pass crash cannot lose the plan). With this block downstream
         # stages (main --load-plan --motion-plan, sim.py run) reuse the exact keyframes
         # instead of re-solving them.
-        from plan_io import witness_block
+        require_complete_witnesses(plan, opt_witnesses,
+                                   who="optimized witness export")
         save_plan(cfg.save, cfg, plan,
-                  witnesses=witness_block(list(robot_ik.C.getJointNames()), opt_witnesses,
-                                          alts=witness_alts))
+                  witnesses=witness_block(joint_names, opt_witnesses,
+                                          alts=witness_alts, stage="optimized"))
       if plan is not None and cfg.utilization:
         from solver import utilization_report
         utilization_report(C, assembly, plan, robots, witnesses=opt_witnesses,
@@ -2542,7 +2657,8 @@ def run(cfg, explicit=None):
                   C, assembly, plan, robots, robot_ik, cost="ee", sweeps=0,
                   gripper_kind=gk, handovers=cfg.handovers, allow_place=cfg.allow_place,
                   bracing=cfg.bracing, verbose=False,
-                  robot_collisions=cfg.witness_robot_collisions)
+                  robot_collisions=cfg.witness_robot_collisions,
+                  baseline_witnesses=baseline_witnesses)
             if cfg.fuse_cograsp:
               from solver import fuse_cograsp_witnesses
               print("[flag] --fuse-cograsp ACTIVE: re-solving each (add_grasp, assemble) "
@@ -2553,6 +2669,8 @@ def run(cfg, explicit=None):
                   C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
                   handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing)
               _cograsp_pre = dict(_frep.get("pre_witnesses") or {})
+          require_complete_witnesses(plan, mp_wit,
+                                     who="motion-plan witness export")
           # LAST GATE: re-check the witnesses we are about to SHIP. Every earlier gate ran at
           # SOLVE time, and the object that leaves here is not the object that was solved --
           # optimize_witnesses* emits a splice and fuse_cograsp re-solves the pair again. A
@@ -2563,7 +2681,8 @@ def run(cfg, explicit=None):
             from solver import validate_export_witnesses
             mp_wit, _bad = validate_export_witnesses(
                 C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
-                handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing)
+                handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
+                baseline_witnesses=baseline_witnesses)
             if _bad:
               print(f"[export-gate] {len(_bad)} assemble witness(es) STILL penetrate after "
                     f"falling back to the search's own witness -- the motion planner will "

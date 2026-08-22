@@ -5095,6 +5095,19 @@ def _cli_run(a):
       if wit is not None:
         print(f"[sim/mp] {sum(w is not None for w in wit)} persisted witnesses loaded from "
               f"{a.path} -- witness re-solve SKIPPED (--refresh-witnesses to re-solve).")
+    if not getattr(a, "refresh_witnesses", False):
+      if wit is None:
+        print("[sim/mp] plan has no compatible persisted search-witness certificate. "
+              "Refusing to resolve IK implicitly; regenerate the plan with current main.py, "
+              "or pass --refresh-witnesses for the explicit legacy repair path.")
+        return
+      from plan_io import require_complete_witnesses
+      try:
+        require_complete_witnesses(plan, wit, who="sim replay")
+      except ValueError as e:
+        print(f"[sim/mp] {e}. Refusing an incomplete artifact; regenerate it or pass "
+              "--refresh-witnesses explicitly.")
+        return
     # WHICH witness optimizer ran at export time, reproduced here. build_tasks SKIPS a task
     # whose witness is None, so a different optimizer -> a different None-pattern -> a task
     # chain that no longer matches the saved --mp-path ("mode alignment failed: N unmatched").
