@@ -183,6 +183,24 @@ def test_audit_path_reports_joint_limit_before_collision_callback():
   assert calls["n"] == rep["samples"] - 1
 
 
+def test_motion_audit_indices_use_joint_variation_and_pin_events():
+  q = np.array([[0.000], [0.002], [0.004], [0.006], [0.008], [0.010],
+                [0.012], [0.012], [0.012], [0.014]])
+  got = retiming.motion_audit_indices(q, fires=[(2, [1]), (8, [2])], resolution=0.01)
+  assert got.tolist() == [0, 2, 8, 9]
+  assert {0, 2, 8, 9}.issubset(set(got))
+  for a, b in zip(got, got[1:]):
+    variation = np.abs(np.diff(q[a:b + 1], axis=0)).max(axis=1).sum()
+    assert variation <= 0.01 + 1e-12
+
+
+def test_motion_audit_indices_dense_compatibility_and_backtracking():
+  q = np.array([[0.0], [0.004], [0.008], [0.004], [0.0]])
+  assert retiming.motion_audit_indices(q, resolution=0).tolist() == list(range(len(q)))
+  got = retiming.motion_audit_indices(q, resolution=0.01)
+  assert got.tolist() == [0, 2, 4]  # accumulated variation, not endpoint displacement
+
+
 def _two_arm_stretches():
   # 2 arms (1 dof each): arm0 moves 0->1->2 (mate at each barrier), arm1 moves 0->3->6.
   # barrier0 done by task 10 (arm0 acting), barrier1 done by task 11 (arm0 acting).
@@ -409,6 +427,351 @@ def test_schedule_dwell_rests_acting_arm_only():
   assert np.ptp(a1) > 0.01                                   # crossing arm kept moving
 
 
+def test_schedule_nominal_event_duration_is_feed_forward_slack():
+  # The planned servo budget delays the fire while the acting arm remains parked.  It does
+  # not freeze an unrelated arm: that arm consumes useful path during the nominal ceremony.
+  stretches, arm_dims, acting = _two_arm_stretches()
+  base = retiming.plan_schedule(stretches, arm_dims, acting, DT, RATE, RD, RM,
+                                dwell=0.0, event_durations=[0.0, 0.0])
+  budget = 0.20
+  timed = retiming.plan_schedule(stretches, arm_dims, acting, DT, RATE, RD, RM,
+                                 dwell=0.0, event_durations=[budget, 0.0])
+  i0, j0 = base.fires[0][0], timed.fires[0][0]
+  assert j0 - i0 == round(budget / DT)
+  assert np.ptp(timed.q[j0 - round(budget / DT):j0 + 1, 0]) < 1e-9
+  assert np.ptp(timed.q[j0 - round(budget / DT):j0 + 1, 1]) > 0.01
+
+
+def test_upsample_trajectory_preserves_duration_events_and_endpoints():
+  src = retiming.TimedTrajectory(
+      dt=0.01, q=np.asarray([[1.0, 2.0], [2.0, 4.0]]),
+      phase=["path", "dwell"], fires=[(1, [7])],
+      progress=np.asarray([[1.0, 1.0], [2.0, 2.0]]))
+  dense = retiming.upsample_trajectory(src, 0.002, q0=np.zeros(2))
+  assert len(dense.q) == 10
+  assert np.allclose(dense.q[4], src.q[0])
+  assert np.allclose(dense.q[-1], src.q[-1])
+  assert dense.fires == [(9, [7])]
+  assert dense.phase[:5] == ["path"] * 5
+  assert dense.phase[5:] == ["dwell"] * 5
+  assert np.allclose(dense.progress[4], src.progress[0])
+  assert np.allclose(dense.progress[-1], src.progress[-1])
+
+
+def test_per_arm_rate_skips_invisible_stationary_phase():
+  # Composite arc = arm0 moves, then arm1 moves. With a shared 1rad/s phase clock this takes
+  # roughly 2s. Independent phases should overlap the two real 1rad motions; neither arm must
+  # spend another second "moving" through the segment where its own q is constant.
+  st = [([np.array([0.0, 0.0]), np.array([1.0, 0.0]), np.array([1.0, 1.0])], [10])]
+  dims = [np.array([0]), np.array([1])]
+  shared = retiming.plan_schedule(st, dims, [{0, 1}], DT, RATE, RD, RM)
+  own = retiming.plan_schedule(st, dims, [{0, 1}], DT, RATE, RD, RM,
+                               per_arm_rate=True)
+  assert len(own.q) < 0.7 * len(shared.q)
+  assert np.allclose(own.q[-1], [1.0, 1.0])
+  assert [e for _, e in own.fires] == [[10]]
+
+
+def _stuttering_phase_trajectory():
+  """Two-arm diagonal path with the right event anchors but an ugly 0/2x rate pattern."""
+  P = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]])
+  segs, D = retiming.arc_length(list(P))
+  csum = np.concatenate([[0.0], np.cumsum(segs)])
+  n, fire = 401, 200
+  prog = np.zeros((n, 2))
+  for r in range(2):
+    d = np.where(np.arange(n) % 8 < 4, 1.0, 0.05)
+    if r == 0:                                               # actor rests around its fire
+      d[fire - 8:fire + 9] = 0.0
+    for a, b, total in ((0, fire + 1, D / 2), (fire + 1, n, D / 2)):
+      d[a:b] *= total / d[a:b].sum()
+    prog[:, r] = np.cumsum(d)
+  q = np.zeros((n, 2))
+  for k in range(n):
+    for r in range(2):
+      q[k, r] = retiming.config_at(list(P), csum, segs, prog[k, r])[r]
+  return P, retiming.TimedTrajectory(
+      dt=DT, q=q, phase=["path"] * n, fires=[(fire, [7])], progress=prog)
+
+
+def test_phase_smoothing_is_monotone_pins_events_and_reduces_jerk():
+  P, src = _stuttering_phase_trajectory()
+  dims = [np.array([0]), np.array([1])]
+  out, rep = retiming.smooth_phase_trajectory(
+      src, P, dims, [{0}], window=0.08, stop_time=0.016)
+
+  assert np.all(np.diff(out.progress, axis=0) >= -1e-12)
+  assert np.allclose(out.progress[200], src.progress[200])   # complete mode-switch vector pinned
+  assert np.allclose(out.progress[-1], src.progress[-1])
+  assert out.fires == src.fires
+  assert rep["after"]["jerk_rms"] < 0.5 * rep["before"]["jerk_rms"]
+  for r in range(2):
+    raw_peak = np.abs(np.diff(src.q[:, r])).max()
+    new_peak = np.abs(np.diff(out.q[:, r])).max()
+    assert new_peak <= 1.02 * raw_peak + 1e-10             # smoothing never creates a burst
+  # The actor has an actual rest neighbourhood, while the crossing arm is not forced to stop.
+  assert np.max(np.diff(out.progress[197:204, 0], axis=0)) < 1e-10
+  assert np.max(np.diff(out.progress[194:207, 1], axis=0)) > 1e-5
+
+
+def test_smoothness_quality_guard_rejects_material_regression():
+  before = {"accel_rms": 10.0, "jerk_rms": 100.0}
+  assert retiming.smoothness_not_worse(
+      before, {"accel_rms": 10.1, "jerk_rms": 99.0})
+  assert not retiming.smoothness_not_worse(
+      before, {"accel_rms": 10.3, "jerk_rms": 99.0})
+  assert not retiming.smoothness_not_worse(
+      before, {"accel_rms": 9.0, "jerk_rms": 103.0})
+
+
+def test_nonnegative_sum_projection_is_exact_and_least_change():
+  v = np.array([0.0, 0.2, 0.8, 0.3])
+  out = retiming._project_nonnegative_sum(v, 0.7)
+  assert np.all(out >= 0.0)
+  assert np.isclose(out.sum(), 0.7, atol=1e-14)
+  # KKT: every positive component receives the same additive correction; clamped entries
+  # cannot be made negative. Multiplicative normalization does not have this property.
+  active = out > 1e-12
+  assert np.ptp(out[active] - v[active]) < 1e-12
+
+
+def test_coupling_rendezvous_caps_both_members_until_both_arrive():
+  couplings = {frozenset((0, 1)): [[1.0, 2.0]]}
+
+  entry, comps = retiming._coupling_topology(couplings, [1.0, 0.4, 3.0], 3, 4.0)
+  assert entry == {0: 1.0, 1: 1.0}
+  assert comps == []
+
+  entry, comps = retiming._coupling_topology(couplings, [1.0, 1.0, 3.0], 3, 4.0)
+  assert entry == {}
+  assert comps == [[0, 1]]
+
+
+def test_phase_smoothing_preserves_rigid_coupling_intervals_exactly():
+  P, src = _stuttering_phase_trajectory()
+  dims = [np.array([0]), np.array([1])]
+  _, D = retiming.arc_length(list(P))
+  out, rep = retiming.smooth_phase_trajectory(
+      src, P, dims, [{0}], window=0.08, locked=[(0, 1, 0.0, D)])
+
+  assert np.array_equal(out.progress, src.progress)
+  assert np.array_equal(out.q, src.q)
+  assert rep["locked_arm_intervals"] == 4                   # 2 arms x 2 fire intervals
+
+
+def test_phase_smoothing_preserves_crossing_arm_corner_rate_envelope():
+  # Arm 0 owns the event. Arm 1 crosses a 90-degree path corner at its barrier phase with
+  # an intentional scheduler slowdown. Smoothing may change rates elsewhere but must not
+  # erase any source increment inside the corner ramp envelope.
+  P = np.array([[0.0, 0.0, 0.0],
+                [1.0, 1.0, 0.0],
+                [2.0, 1.0, 1.0]])
+  dims = [np.array([0]), np.array([1, 2])]
+  _, D = retiming.arc_length(list(P))
+  n, fire = 401, 200
+  inc = np.full((n, 2), D / n)
+  inc[fire - 20:fire + 20, 1] *= 0.25
+  inc[:fire, 1] *= (D / 2) / inc[:fire, 1].sum()
+  inc[fire:, 1] *= (D / 2) / inc[fire:, 1].sum()
+  inc[:fire, 0] *= (D / 2) / inc[:fire, 0].sum()
+  inc[fire:, 0] *= (D / 2) / inc[fire:, 0].sum()
+  prog = np.cumsum(inc, axis=0)
+  segs, _ = retiming.arc_length(list(P))
+  csum = np.concatenate([[0.0], np.cumsum(segs)])
+  q = np.zeros((n, 3))
+  for k in range(n):
+    for r in range(2):
+      q[k, dims[r]] = retiming.config_at(list(P), csum, segs, prog[k, r])[dims[r]]
+  src = retiming.TimedTrajectory(
+      dt=DT, q=q, phase=["path"] * n, fires=[(fire - 1, [7])], progress=prog)
+  out, rep = retiming.smooth_phase_trajectory(
+      src, P, dims, [{0}], window=0.08, barrier_indices=[1], ramp_dist=0.2,
+      corner_dv=0.2)
+
+  x = np.vstack([np.zeros((1, 2)), src.progress])
+  mid = 0.5 * (x[:-1, 1] + x[1:, 1])
+  fixed = np.abs(mid - csum[1]) <= 0.2 + 1e-9
+  assert np.any(fixed)
+  assert np.array_equal(np.diff(np.r_[0.0, out.progress[:, 1]])[fixed],
+                        np.diff(np.r_[0.0, src.progress[:, 1]])[fixed])
+  assert rep["corner_fixed_increments"] == int(np.count_nonzero(fixed))
+
+
+def _small_motion_island_trajectory():
+  # A long useful motion, 0.10s stop, then a visibly pointless 0.04rad afterthought.
+  n, dt = 80, 0.01
+  inc = np.zeros(n)
+  inc[2:27] = 0.01
+  inc[37:41] = 0.01
+  p = np.cumsum(inc)
+  q = p[:, None].copy()
+  return np.array([[0.0], [p[-1]]]), retiming.TimedTrajectory(
+      dt=dt, q=q, phase=["path"] * n, fires=[(32, [7])], progress=p[:, None])
+
+
+def test_phase_batch_merges_small_island_across_foreign_event():
+  P, src = _small_motion_island_trajectory()
+  out, rep = retiming.batch_phase_motions(
+      src, P, [np.array([0])], [set()], [0.10], min_motion=0.06, max_gap=0.2,
+      collision_free=lambda q, i: True)
+  assert rep["merged"] == 1
+  assert rep["after"] == rep["before"] - 1
+  assert rep["small_after"] < rep["small_before"]
+  assert rep["internal_slow_after"] < rep["internal_slow_before"]
+  assert np.all(np.diff(out.progress[:, 0]) >= -1e-12)
+  assert out.progress[32, 0] >= 0.10                        # global event passage retained
+  assert np.allclose(out.q[-1], src.q[-1])
+  assert out.fires == src.fires
+
+
+def test_phase_batch_never_crosses_own_event_or_accepted_collision():
+  P, src = _small_motion_island_trajectory()
+  own, own_rep = retiming.batch_phase_motions(
+      src, P, [np.array([0])], [{0}], [0.10], min_motion=0.06, max_gap=0.2,
+      collision_free=lambda q, i: True)
+  assert own_rep["merged"] == 0 and own_rep["event_rejected"] > 0
+  assert np.array_equal(own.q, src.q)
+
+  def reject_bridge(q, i):
+    return not (27 <= i <= 36 and q[0] > src.q[i, 0] + 1e-9)
+  blocked, block_rep = retiming.batch_phase_motions(
+      src, P, [np.array([0])], [set()], [0.10], min_motion=0.06, max_gap=0.2,
+      collision_free=reject_bridge)
+  assert block_rep["merged"] == 0 and block_rep["collision_rejected"] > 0
+  assert np.array_equal(blocked.q, src.q)
+
+
+def test_phase_intent_increases_idle_support_at_explicit_faster_rate():
+  P, src = _small_motion_island_trajectory()
+  out, rep = retiming.batch_phase_motions(
+      src, P, [np.array([0])], [set()], [0.10],
+      min_motion=float("inf"), max_gap=float("inf"),
+      collision_free=lambda q, i: True, maximize_idle=True,
+      intent_ramp_time=0.02, intent_rate=2.0)
+
+  assert rep["merged"] == 1
+  assert rep["support_after"]["moving_samples"] < rep["support_before"]["moving_samples"]
+  assert rep["support_after"]["idle_fraction"] > rep["support_before"]["idle_fraction"]
+  assert rep["support_after"]["mean_moving_rate"] > rep["support_before"]["mean_moving_rate"]
+  assert np.linalg.norm(np.diff(out.q, axis=0), axis=1).max() <= 2.0 * src.dt + 1e-9
+  assert np.all(np.diff(out.progress[:, 0]) >= -1e-12)
+  assert np.allclose(out.q[-1], src.q[-1])
+
+
+def test_phase_intent_preserves_rigid_coupling_window():
+  P, src = _small_motion_island_trajectory()
+  out, rep = retiming.batch_phase_motions(
+      src, P, [np.array([0])], [set()], [0.10],
+      locked=[(0, 0, 0.0, float(src.progress[-1, 0]))],
+      min_motion=float("inf"), max_gap=float("inf"),
+      collision_free=lambda q, i: True, maximize_idle=True,
+      intent_rate=2.0)
+  assert rep["merged"] == 0
+  assert np.array_equal(out.q, src.q)
+  assert np.array_equal(out.progress, src.progress)
+
+
+def test_phase_intent_uses_one_delayed_motion_across_foreign_switch():
+  dt, n = 0.01, 101
+  inc = np.zeros(n)
+  inc[10:50] = 0.01                                        # first hesitant motion
+  inc[65:90] = 0.016                                       # resumes after foreign switch
+  progress = np.cumsum(inc)[:, None]
+  P = np.array([[0.0], [float(progress[-1, 0])]])
+  src = retiming.TimedTrajectory(
+      dt=dt, q=progress.copy(), phase=["path"] * n,
+      fires=[(60, [1]), (90, [2])], progress=progress.copy())
+  acting = [{1}, {0}]                                      # first event is physical but foreign
+  assert retiming.foreign_switch_stops(
+      src.q, dt, [np.array([0])], src.fires, acting, stopped_rate=0.05) == 1
+
+  out, rep = retiming.intentional_phase_motions(
+      src, P, [np.array([0])], acting, [0.4, float(progress[90, 0])],
+      collision_free=lambda q, i: True, intent_rate=2.0, ramp_time=0.08,
+      stop_time=0.02)
+
+  assert rep["accepted"] == 1
+  assert rep["unresolved"] == []
+  assert rep["islands_before"] == 2 and rep["islands_after"] == 1
+  assert rep["foreign_stops_before"] == 1 and rep["foreign_stops_after"] == 0
+  # Joining the two motions is allowed to use slightly more individual support when that is
+  # what prevents a new all-robot dead interval; visual continuity is the primary objective.
+  assert rep["global_idle_after"]["samples"] <= rep["global_idle_before"]["samples"]
+  assert out.progress[60, 0] >= 0.4 - 1e-9                # foreign event passage
+  assert np.allclose(out.progress[90, 0], src.progress[90, 0])
+  assert np.allclose(out.q[88:91, 0], out.q[90, 0])       # own event still has a rest plateau
+
+
+def test_phase_intent_removes_shared_path_flats_from_one_robot_motion():
+  dt, n = 0.01, 201
+  # The middle composite segment belongs only to another robot. In shared progress arm0's
+  # two motions are separated by that bookkeeping flat; in its intrinsic arc they are one.
+  P = np.array([[0.0, 0.0], [0.5, 0.0], [0.5, 1.0], [1.0, 1.0]])
+  p = np.zeros(n)
+  p[10:51] = np.linspace(0.0, 0.5, 41)
+  p[51:101] = np.linspace(0.5, 1.5, 50)
+  p[101:130] = 1.5
+  p[130:171] = np.linspace(1.5, 2.0, 41)
+  p[171:] = 2.0
+  segs, _ = retiming.arc_length(list(P))
+  csum = np.r_[0.0, np.cumsum(segs)]
+  q = np.asarray([retiming.config_at(list(P), csum, segs, s) for s in p])
+  src = retiming.TimedTrajectory(
+      dt=dt, q=q, phase=["path"] * n,
+      fires=[(110, [1]), (180, [2])], progress=p[:, None])
+
+  out, rep = retiming.intentional_phase_motions(
+      src, P, [np.array([0])], [{1}, {0}], [1.0, 2.0],
+      collision_free=lambda q, i: True, intent_rate=2.0, ramp_time=0.08,
+      stop_time=0.02)
+
+  assert rep["accepted"] == 1
+  assert rep["islands_before"] == 2 and rep["islands_after"] == 1
+  assert len(retiming.motion_islands(out.q, dt, [np.array([0])], 0.05)) == 1
+  assert out.progress[110, 0] >= 1.0 - 1e-9             # foreign barrier still passed
+  assert np.allclose(out.q[178:181, 0], out.q[180, 0])   # own event remains a stop
+
+
+def test_phase_intent_places_compact_motion_to_cover_global_idle_first():
+  dt, n = 0.01, 101
+  P = np.array([[0.0, 0.0], [1.0, 1.0]])
+  D = np.sqrt(2.0)
+  p0 = np.linspace(0.0, D, n)
+  p1 = np.zeros(n)
+  p1[60:81] = np.linspace(0.0, D, 21)
+  p1[81:] = D
+  progress = np.c_[p0, p1]
+  q = progress / D
+  src = retiming.TimedTrajectory(
+      dt=dt, q=q, phase=["path"] * n, fires=[], progress=progress.copy())
+
+  out, rep = retiming.intentional_phase_motions(
+      src, P, [np.array([0]), np.array([1])], [], [],
+      locked=[(1, 1, 0.0, D)], collision_free=lambda q, i: True,
+      intent_rate=2.0, ramp_time=0.08, stop_time=0.02)
+
+  moving0 = np.linalg.norm(np.diff(out.q[:, [0]], axis=0), axis=1) >= 0.05 * dt
+  # Latest-first would overlap arm1's 60:80 motion and leave the beginning empty. Coverage
+  # scheduling instead uses that empty beginning; compact support itself is unchanged.
+  assert np.flatnonzero(moving0)[0] < 5
+  assert rep["global_idle_after"]["quadratic_samples"] \
+      < retiming.global_idle_stats(
+          np.c_[np.r_[np.zeros(42), np.linspace(0, 1, 59)], q[:, 1]],
+          dt, [np.array([0]), np.array([1])], 0.05)["quadratic_samples"]
+
+
+def test_phase_smoothing_can_restore_one_collision_sensitive_interval_exactly():
+  P, src = _stuttering_phase_trajectory()
+  dims = [np.array([0]), np.array([1])]
+  out, rep = retiming.smooth_phase_trajectory(
+      src, P, dims, [{0}], window=0.08, restore_intervals={0})
+  a, b = retiming.phase_intervals(src)[0]
+
+  assert np.array_equal(out.progress[a:b + 1], src.progress[a:b + 1])
+  assert np.array_equal(out.q[a:b + 1], src.q[a:b + 1])
+  assert rep["restored"] == 1
+
+
 def test_build_trajectory_fires_at_rest_and_concats_path():
   m0, m1 = _Mode([0]), _Mode([0, 1])
   path = [_St([0, 0], m0), _St([0.5, 0], m0), _St([0.5, 0], m1), _St([0.5, 0.4], m1)]
@@ -487,6 +850,53 @@ def test_corridor_schedule_zero_corridor_forces_lockstep():
 def _flat_corridor(n, D, ds=0.25):
   return retiming.certify_corridor(n, D, lambda i, s, d: True, lambda i, j, s, d: True,
                                    ds_grid=ds, ds_lead=ds, lead_max=3.0)
+
+
+def test_online_pace_is_fixed_per_mode_and_flows_crossing_arm_through_fire():
+  # arm0 has four times as much joint travel as arm1 and acts at the first barrier. A greedy
+  # arm1 reaches the no-pass cap early and parks. Feed-forward pacing must instead choose one
+  # fixed factor for the whole stretch, leave arm1 short of the cap when arm0 fires, and use
+  # the predicted ceremony window to finish the crossing motion.
+  P = [np.array([0.0, 0.0]), np.array([1.0, 0.25]), np.array([2.0, 0.5])]
+  dims = [np.array([0]), np.array([1])]
+  segs, D = retiming.arc_length(P)
+  bar = [segs[0], D]
+  cor = _flat_corridor(2, D, ds=0.05)
+  stepper = retiming.CorridorStepper(
+      P, dims, bar, [{0}, {0}], cor, DT, joint_rate=RATE, ramp_dist=RD, ramp_min=RM,
+      fire_all=False, pace=True, settle_nom=0.4, trace=True)
+
+  fire = None
+  for _ in range(10000):
+    _, fire = stepper.tick()
+    if fire is not None:
+      break
+  assert fire == 0
+  assert stepper.s[0] >= bar[0] - 1e-6                       # actor is at its witness
+  assert stepper.s[1] < bar[0] - 1e-3                        # crossing arm did not rush and park
+  pf = np.asarray([row[1] for row in stepper._trace])
+  assert np.ptp(pf[:, 0]) < 1e-12 and np.ptp(pf[:, 1]) < 1e-12  # no feedback chasing
+
+  # The real servo finishes much earlier than its 0.4s bound. Opening the mode early must not
+  # require an ETA correction: keep the same factor through cleanup and cross continuously.
+  q1 = []
+  for _ in range(int(round(0.1 / DT))):
+    q, _ = stepper.tick(rate_factor=np.array([0.0, 1.0]))    # actor rests during ceremony
+    q1.append(q[1])
+  assert np.ptp(q1) > 0.01                                  # nonactor keeps moving
+  assert np.ptp(np.diff(q1)) < 1e-10                         # at one constant planned velocity
+  assert stepper.s[1] < bar[0] - 1e-3                        # reserve was not exhausted
+  old_factor = stepper._pace_factor.copy()
+  stepper.confirm_fire(defer_pace_replan=True)               # actual attachment opens mode
+  q2 = []
+  for _ in range(20):
+    q, _ = stepper.tick()
+    q2.append(q[1])
+  assert np.allclose(stepper._pace_factor, old_factor)       # no correction during cleanup
+  assert np.min(np.diff(q2)) > 0.0                           # crosses without a stop
+  stepper.replan_pace()
+  stepper.tick()
+  assert stepper._pace_replans == 2                          # one event-triggered replan only
 
 
 def test_brakeable_makes_limit_reachable():

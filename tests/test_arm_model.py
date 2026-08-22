@@ -62,3 +62,23 @@ def test_model_loads_and_has_one_body_per_frame():
   frames = [n for n in C.getFrameNames() if n.startswith(prefix)]
   for f in frames:                                           # every rai frame is addressable
     assert mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_BODY, f) >= 0, f"{f} missing from MJCF"
+
+
+def test_per_arm_contact_masks_exclude_self_and_include_other_arm():
+  C = _env("ur10", n=2)
+  prefixes = A.get_robots(C)
+  # part/world bit is 1; arm bits are 2 and 4. Each arm accepts bit 1 and the OTHER arm bit.
+  xml, _ = arm_model.standalone_model(
+      C, prefixes, collide_fn=arm_model.collides_like_sim,
+      contact_masks=[(2, 1 | 4), (4, 1 | 2)])
+  m = mujoco.MjModel.from_xml_string(xml)
+  seen = {p: 0 for p in prefixes}
+  for gi in range(m.ngeom):
+    if not m.geom_contype[gi]:
+      continue
+    body = mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, int(m.geom_bodyid[gi]))
+    owner = next(p for p in prefixes if body.startswith(p))
+    expected = (2, 5) if owner == prefixes[0] else (4, 3)
+    assert (int(m.geom_contype[gi]), int(m.geom_conaffinity[gi])) == expected
+    seen[owner] += 1
+  assert all(seen.values())

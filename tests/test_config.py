@@ -101,6 +101,21 @@ def test_loaded_plan_is_not_hoisted_twice_without_explicit_request():
   assert not main._should_hoist_plan(loaded, {"hoist_releases"})
 
 
+def test_optimizer_change_keeps_search_witness_as_baseline_but_reoptimizes():
+  saved_run = RunConfig(optimize_witnesses=None, witness_branch_budget=0)
+  saved = {k: getattr(saved_run, k) for k in main._WITNESS_FIELDS}
+  current = RunConfig(optimize_witnesses="floor", witness_branch_budget=5)
+  assert main._witnesses_baseline_compatible(saved, current)
+  assert not main._witnesses_reusable(saved, current)
+
+
+def test_feasibility_setting_change_rejects_saved_witness_baseline():
+  saved_run = RunConfig(strict_collisions=1e-4)
+  saved = {k: getattr(saved_run, k) for k in main._WITNESS_FIELDS}
+  current = RunConfig(strict_collisions=1e-6)
+  assert not main._witnesses_baseline_compatible(saved, current)
+
+
 def test_mp_export_clearance_settings_default_to_saved_artifact():
   """Zero-IK export replay is exact unless this invocation explicitly retunes planning."""
   cfg = RunConfig(mp_collision_tolerance=0.7, mp_robot_margin=0.6,

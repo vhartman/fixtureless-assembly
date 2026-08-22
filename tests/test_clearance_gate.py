@@ -70,6 +70,15 @@ def test_ik_skips_a_seed_when_komo_exposes_a_wider_internal_q():
   rik.seed_init_skips = 0
   rik.harvest_branches = None
   rik.seed_restart_cap = 2
+  rik.restarts_full = 12
+  rik._open_probe_attempt = None
+  rik.prof = {
+      "calls_with_seeds": 0, "calls_without_seeds": 0, "wins": {},
+      "seeded_solves": 0, "seeded_time": 0.0,
+      "unseeded_solves": 0, "unseeded_time": 0.0,
+      "restart_solves": 0, "restart_time": 0.0,
+      "getpath_calls": 0, "post_calls": 0, "post_time": 0.0,
+  }
   rik._pen_ok = lambda _C, _q: True
   rik._clearance_ok = lambda _C, _q: True
 

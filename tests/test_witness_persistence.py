@@ -11,7 +11,8 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from plan_io import read_plan, read_witnesses, witness_block, write_plan
+from plan_io import missing_required_witnesses, read_plan, read_witnesses, \
+    read_witness_stage, require_complete_witnesses, witness_block, write_plan
 import mp_export as MP
 
 
@@ -38,6 +39,14 @@ def test_round_trip_exact(tmp_path):
   np.testing.assert_array_equal(out[2], wit[2])
 
 
+def test_witness_stage_distinguishes_early_search_save_from_completed_optimizer(tmp_path):
+  wit = [np.zeros(4), np.ones(4), None]
+  p = _write(tmp_path, witness_block(JOINTS, wit, stage="search"))
+  assert read_witness_stage(p) == "search"
+  p = _write(tmp_path, witness_block(JOINTS, wit, stage="optimized"))
+  assert read_witness_stage(p) == "optimized"
+
+
 def test_file_without_block_reads_as_none(tmp_path):
   p = _write(tmp_path, None)
   assert read_witnesses(p, JOINTS, len(PLAN)) is None
@@ -55,6 +64,15 @@ def test_plan_length_mismatch_is_refused(tmp_path, capsys):
   p = _write(tmp_path, witness_block(JOINTS, wit))
   assert read_witnesses(p, JOINTS, 5) is None
   assert "witness entries vs 5 plan actions" in capsys.readouterr().out
+
+
+def test_required_ik_witnesses_fail_closed_but_release_null_is_valid():
+  wit = [np.zeros(4), None, None]
+  assert missing_required_witnesses(PLAN, wit) == [1]
+  with pytest.raises(ValueError, match=r"1:\('assemble'"):
+    require_complete_witnesses(PLAN, wit, who="test artifact")
+  wit[1] = np.ones(4)
+  assert require_complete_witnesses(PLAN, wit) is wit
 
 
 def test_final_motion_export_round_trips_post_fusion_and_pre_keyframes(tmp_path):
