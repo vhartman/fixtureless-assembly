@@ -64,10 +64,13 @@ def build_parser():
            "topological under mixed). Incompatible with --anon-robots (identity matters).",
   )
   g_scene.add_argument(
-      "--robot", choices=["ur10", "ur10_limited", "ur5", "ur5_limited"], default="ur10",
+      "--robot", choices=["ur10", "ur10_limited", "ur5", "ur5_limited", "fr3"], default="ur10",
       help="Robot arm for all robots: ur10 (default), ur10_limited (ur10 with a tighter "
-           "shoulder-lift/elbow workspace), ur5, or ur5_limited (ur5 with the same "
-           "restricted workspace). With --floating-ee the arm is "
+           "shoulder-lift/elbow workspace), ur5, ur5_limited (ur5 with the same "
+           "restricted workspace), or fr3 -- TWO static Franka FR3 arms with robotiq "
+           "two-finger grippers on the table's -y edge (--num-robots is forced to 2; "
+           "EXPERIMENTAL: no analytic IK yet, validation runs the precheck+KOMO path). "
+           "With --floating-ee the arm is "
            "irrelevant (a generic floating gripper); it matters for the real arm (no --floating-ee "
            "/ --real-ik) -- note the ur5 has a much shorter reach (~0.85 m vs ~1.3 m).",
   )
@@ -184,7 +187,7 @@ def build_parser():
   g_scene.add_argument(
       "--assembly",
       choices=["cross", "cube", "arch", "arch-seq", "cube-plates", "cube-plates-2x2x3",
-               "cuboid-tower", "car", "car-mini", "slot-pin", "peg-hole", "peg-hole-chamfer",
+               "cuboid-tower", "fixture-rack", "car", "car-mini", "slot-pin", "peg-hole", "peg-hole-chamfer",
                "peg-stool",
                "peg-stool-4", "peg-stool-cuboid", "peg-stool-cuboid-4",
                "peg-stool-tight", "peg-stool-4-tight",
@@ -201,6 +204,8 @@ def build_parser():
            "cube-plates (2x2x2 cube as two stacked 2x2 plates, faithful DAG), "
            "cube-plates-2x2x3 (three stacked 2x2 plates, 12 cubes -- use --parts 12), "
            "cuboid-tower (jenga-style: 2 laid cuboids per level, levels rotated 90deg, up to 8), "
+           "fixture-rack (scalable base rail + repeated top-down posts and lateral brackets, "
+           "up to 13 parts), "
            "car (cuboid body + 4 sideways cylinder wheels, 5), "
            "car-mini (car scaled to w=0.03: wheels fit ACROSS the two-finger gap), "
            "slot-pin (base + cantilever bar + fastening pin -- the --staged-mates testbed), "
@@ -310,6 +315,22 @@ def build_parser():
            "its exhaustive sweep, so completeness is untouched; equal-f tie-breaks change. "
            "MEASURED motivation: assemble bias re-probes burned 70s/instance (obj_3 x56, "
            "obj_4 x37), and the winning bias repeats across milestones.",
+  )
+  g_ik.add_argument(
+      "--empty-seed-refutes", action=argparse.BooleanOptionalAction, default=False,
+      help="With --real-ik: treat an EMPTY calibrated analytic (ssik) seed set as a sound "
+           "unreachability proof and reject the bind WITHOUT relaxed precheck or KOMO. "
+           "Sound for the rai models because q1..q5 are roll-independent and wrist_3 spans "
+           ">= 2pi (so no other vacuum roll helps either); OFF keeps the legacy tolerant-"
+           "KOMO chance on exactly-unreachable poses. MEASURED motivation: empty-set binds "
+           "otherwise pay precheck + full-solve cost before failing anyway.",
+  )
+  g_ik.add_argument(
+      "--analytic-seed-cap", type=int, default=None, metavar="K",
+      help="With --real-ik and a calibrated arm: warm-start KOMO with only the K "
+           "best-ranked exact branches (shallowest collision first) instead of all of "
+           "them. Cuts the seeded-solve cost on binds whose branch set is large and "
+           "mostly colliding; None = legacy behaviour (all branches).",
   )
   g_phys.add_argument(
       "--dense-grasps", action="store_true",
@@ -2040,12 +2061,19 @@ def run(cfg, explicit=None):
     print("[flag] --goal-on-table ACTIVE: the finished assembly must rest on the table "
           "and be released (hands-off).")
 
-  C = make_four_robot_env(
-      num_robots=cfg.num_robots,
-      floating_ee=cfg.floating_ee,
-      vacuum=gripper_list if gripper_list is not None else cfg.vacuum,
-      robot_types=cfg.robot_types or cfg.robot,   # --robot for all; --robot-types overrides
-  )
+  if cfg.robot == "fr3":
+    num_duos = max(1, cfg.num_robots // 2)
+    if cfg.num_robots != 2 * num_duos:
+      print(f"[flag] fr3 duos: --num-robots {cfg.num_robots} -> {2 * num_duos} "
+            f"({num_duos} duo(s))")
+    C = make_fr3_duo_env(num_duos=num_duos)
+  else:
+    C = make_four_robot_env(
+        num_robots=cfg.num_robots,
+        floating_ee=cfg.floating_ee,
+        vacuum=gripper_list if gripper_list is not None else cfg.vacuum,
+        robot_types=cfg.robot_types or cfg.robot,   # --robot for all; --robot-types overrides
+    )
 
   from problem import assembly_max_parts
   _maxp = assembly_max_parts(cfg.assembly)
@@ -2223,6 +2251,8 @@ def run(cfg, explicit=None):
       robot_ik.restarts_full = cfg.ik_restarts
       robot_ik.restarts_precheck = cfg.precheck_restarts
       robot_ik.fail_order = cfg.fail_order
+      robot_ik.analytic_seed_cap = cfg.analytic_seed_cap
+      robot_ik.empty_seed_refutes = cfg.empty_seed_refutes
       robot_ik.open_witness = cfg.open_witness
       robot_ik.open_witness_epochs = cfg.open_witness_epochs
       robot_ik.open_witness_batch = cfg.open_witness_batch

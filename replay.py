@@ -174,9 +174,13 @@ def build_scene(cfg):
   clear_sampled_scene_ctx()                 # a previous scene's filter must not leak into
   # make_assembly below (define() queries the grasp DB, which raises under a stale ctx).
   apply_wrench_params(cfg)
-  C = make_four_robot_env(num_robots=cfg["num_robots"], floating_ee=cfg["floating_ee"],
-                          vacuum=gripper_list if gripper_list is not None else _saved(cfg, "vacuum"),
-                          robot_types=_saved(cfg, "robot_types") or _saved(cfg, "robot"))
+  if (_saved(cfg, "robot_types") or _saved(cfg, "robot")) == "fr3":
+    from env import make_fr3_duo_env
+    C = make_fr3_duo_env(num_duos=max(1, cfg["num_robots"] // 2))
+  else:
+    C = make_four_robot_env(num_robots=cfg["num_robots"], floating_ee=cfg["floating_ee"],
+                            vacuum=gripper_list if gripper_list is not None else _saved(cfg, "vacuum"),
+                            robot_types=_saved(cfg, "robot_types") or _saved(cfg, "robot"))
   assembly = make_assembly(cfg["assembly"], cfg["parts"])
   # min_sep/grid/grid_gap MUST be passed too: they shape the initial scatter, so omitting them
   # rebuilt a different layout than the plan was solved in (FRAGILITY 1.8). Absent keys keep the

@@ -24,6 +24,7 @@ class OpenWitnessReport:
   open_failures: int = 0
   exhausted: bool = False
   deadline: bool = False
+  budget_hits: int = 0
 
 
 class OpenWitnessPool:
@@ -117,6 +118,18 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
         return None, None, report
       subplan = engine.search(max_nodes, deadline=deadline)
       if subplan is None:
+        if getattr(engine, "budget_hit", False):
+          if deadline is not None and time.perf_counter() >= deadline:
+            report.deadline = True
+            return None, None, report
+          # The NODE budget (not the fair-effort limit) ended this epoch. Reopening stays
+          # intentional -- a fresh epoch restarts the discrete expansion allowance while the
+          # effort batches keep escalating -- but the outcome must not be reported as a plain
+          # "effort limit" (that used to conflate the two).
+          report.budget_hits += 1
+          if verbose:
+            print(f"[open-witness {tag}] epoch {epoch} ended on the node budget "
+                  f"(not exhaustion); reopening with escalated effort")
         break                                             # reopen all and increase effort
       valid = True
       end_state = None
@@ -143,6 +156,7 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
         return subplan, end_state, report
   report.exhausted = True
   if verbose:
+    tail = (f", {report.budget_hits} node-budget epoch(s)" if report.budget_hits else "")
     print(f"[open-witness {tag}] effort limit after {report.epochs} epoch(s), "
-          f"{report.probes} effort slots; failures remain OPEN (not blacklisted)")
+          f"{report.probes} effort slots{tail}; failures remain OPEN (not blacklisted)")
   return None, None, report

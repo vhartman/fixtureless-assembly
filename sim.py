@@ -351,6 +351,24 @@ _link_meshes = arm_model.link_meshes
 _ARM_COLORS = arm_model._ARM_COLORS
 
 
+def _obj_usable(obj):
+    """MuJoCo rejects meshes whose computed inertia is degenerate ('volume too small'):
+    filter converted display meshes that are flat/tiny before they reach build_mjcf."""
+    try:
+        vs = []
+        with open(obj) as fh:
+            for ln in fh:
+                if ln.startswith("v "):
+                    p = ln.split()
+                    vs.append((float(p[1]), float(p[2]), float(p[3])))
+        if len(vs) < 4:
+            return False
+        v = np.asarray(vs)
+        return bool(np.all(np.isfinite(v)) and float((v.max(0) - v.min(0)).max()) > 0.03)
+    except Exception:
+        return False
+
+
 def _arm_shape_frames(C, robots, visual=True):
   """Kinematic-body specs for the robots, each mirrored as an FK-synced mocap body. Returns
   [(body, fk_frame, geom, collide, exempt, group, rgba), ...] where
@@ -370,8 +388,13 @@ def _arm_shape_frames(C, robots, visual=True):
       if k == "mesh":
         if visual:
           try:
-            for si, (obj, rgba) in enumerate(_link_meshes(C, n)):
-              out.append((f"{n}__m{si}", n, ("mesh", obj), False, False, GROUP_VISUAL, rgba))
+            mi = 0
+            for obj, rgba in _link_meshes(C, n):
+              if not _obj_usable(obj):
+                continue                       # degenerate mesh: MuJoCo would reject it
+              out.append((f"{n}__m{mi}", n, ("mesh", obj), False, False,
+                          GROUP_VISUAL, rgba))
+              mi += 1
           except Exception:
             pass                                           # degenerate / no mesh: skip
       elif k in ("capsule", "cylinder", "sphere", "box", "ssBox"):
@@ -651,20 +674,34 @@ def joint_vmax(C):
   return np.asarray(out, dtype=float)
 
 
-def planner_table_top(C):
-  """Top z of the table the SEARCH reasoned about, read from the rai scene rather than
-  hard-coded: frame z + half thickness. build_mjcf otherwise derives the top from the lowest
-  PART bottom, which sits part_float above this."""
+def planner_table_geometry(C):
+  """Table geometry the search used: ``(x, y, half_x, half_y, half_z, top_z)``.
+
+  The old simulation only recovered the optional top height and otherwise used the global
+  ``TABLE_HALF`` footprint at the world origin. That happens to be unobtrusive for the old
+  UR scenes, but turns the FR3's 1.2 x 0.9 m bench into a 2.4 x 2.4 m platform. Read the
+  footprint and xy placement from the same rebuilt rai scene as the motion-planning oracle.
+  """
   try:
     f = C.getFrame("table")
-    return float(np.asarray(f.getPosition(), dtype=float)[2]) + float(f.getSize()[2]) / 2.0
+    pos = np.asarray(f.getPosition(), dtype=float)
+    size = np.asarray(f.getSize(), dtype=float)
+    return (float(pos[0]), float(pos[1]), float(size[0]) / 2.0,
+            float(size[1]) / 2.0, float(size[2]) / 2.0,
+            float(pos[2]) + float(size[2]) / 2.0)
   except Exception:
     return None
 
 
+def planner_table_top(C):
+  """Backward-compatible scalar accessor used by older callers/tests."""
+  geometry = planner_table_geometry(C)
+  return None if geometry is None else geometry[5]
+
+
 def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
                ee_anchor=None, articulated_C=None, actuated=False, planner_table_top=None,
-               weld_timeconst=None):
+               weld_timeconst=None, table_geometry=None):
   """The whole validation world as one MJCF string:
   - table (static), parts (free bodies at state.poses, shape quat baked into the geom),
   - robots: EITHER one mocap-driven gripper puck per robot (v1 keyframe mode) OR, when
@@ -696,6 +733,11 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
             f"({(table_top - float(planner_table_top))*1000:+.1f}mm); parts start that far above "
             f"it and settle instead of resting.")
     table_top = float(planner_table_top)
+  table_x, table_y = 0.0, 0.0
+  table_half_x, table_half_y = TABLE_HALF[:2]
+  table_half_z = table_top / 2.0
+  if table_geometry is not None:
+    table_x, table_y, table_half_x, table_half_y, table_half_z, _ = table_geometry
   parts_xml, eq_xml = [], []
   # <mesh> assets for MESH-shaped parts and mesh CHILDREN of compound parts (deduped by
   # asset name; _geom_xml references them)
@@ -755,6 +797,15 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
     anchor = {r: f"ee_{r}" for r in robots}
   else:                                                    # v2: FK-synced arm link bodies
     mesh_assets = []
+    # ensure every robot's ee-anchor exists as a drivable mocap body: shapeless alias
+    # frames (e.g. the fr3 duo's ur_gripper_center) never reach _arm_shape_frames, but
+    # grasp welds anchor to exactly this body name.
+    have = {a[0] for a in arms}
+    for r in robots:
+      n = ee_anchor[r]
+      if n not in have:
+        arms = list(arms) + [(n, n, ("sphere", [0.004]), False, False,
+                              GROUP_VISUAL, [0.9, 0.9, 0.9, 0.4])]
     for body, fkf, geom_spec, collide, _ex, group, rgba in arms:
       pose = arm_poses[fkf]
       q = pose[3:]
@@ -769,14 +820,20 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
         con = ('contype="2" conaffinity="1"' if collide
                else 'contype="0" conaffinity="0"')
       if geom_spec[0] == "mesh":                           # real link mesh (visual only)
-        mesh_assets.append(f'<mesh name="m_{body}" file="{geom_spec[1]}"/>')
+        mesh_assets.append(f'<mesh name="m_{body}" file="{geom_spec[1]}" inertia="shell"/>')
         geom = f'type="mesh" mesh="m_{body}"'
       else:
         geom = _arm_geom_xml(geom_spec)
+      # some rai colors arrive as 3-vectors, strings ('0.2 0.2 0.9 1'), or odd dtypes
+      if isinstance(rgba, str):
+        rgba = [float(v) for v in rgba.replace(",", " ").split()]
+      _rgba = [float(v) for v in np.asarray(rgba, dtype=float).ravel()] + [1.0] * 4
+      _rgba = ' '.join(f'{v:g}' for v in _rgba[:4])
       parts_xml.append(
           f'<body name="arm_{body}" mocap="true" pos="{pose[0]} {pose[1]} {pose[2]}" '
           f'quat="{q[0]} {q[1]} {q[2]} {q[3]}">'
-          f'<geom {geom} mass="1.0" {con} group="{group}" rgba="{rgba}"/></body>')
+          f'<inertial pos="0 0 0" mass="1" diaginertia="1e-4 1e-4 1e-4"/>'
+          f'<geom {geom} mass="1.0" {con} group="{group}" rgba="{_rgba}"/></body>')
     anchor = {r: f"arm_{ee_anchor[r]}" for r in robots}
     arm_mesh_assets = "".join(mesh_assets)
   if articulated_C is not None:
@@ -805,6 +862,19 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
         # only DOF-carrying bodies get real mass when actuated: rai has ~69 frames per arm, so
         # massing all of them built a 276kg arm and the servos diverged (3.65 -> 0.020 rad).
         static_mass=(1e-4 if actuated else None))
+    # The two FR3 arms are mounted on one separately-prefixed TMR carrier. It is fixed world
+    # decoration (no contacts or actuators), but belongs in the visual model and consequently
+    # in recorded NPZ XML. Export each discovered carrier from the same rai tree as the arms.
+    _base_xml = []
+    for _prefix in arm_model.fr3_base_prefixes(articulated_C):
+      _xml, _ = arm_model.build_arm_mjcf(
+          articulated_C, _prefix, collide=False, group=GROUP_VISUAL,
+          meshes=_arm_meshes, assets=_arm_assets, mesh_group=GROUP_VISUAL,
+          link_mass=1e-4, link_inertia=1e-5, static_mass=1e-4,
+          limits=False, frame_colors=True)
+      _base_xml.append(_xml)
+    if _base_xml:
+      body_xml = "\n".join(_base_xml + [body_xml])
     parts_xml = [x for x in parts_xml if 'name="arm_' not in x]      # drop the mocap mirrors
     parts_xml.append(body_xml)
     anchor = {r: ee_anchor[r] for r in robots}
@@ -832,9 +902,11 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
     if rel is not None:
       eq_xml.append(f'<weld name="mate_{p}" body1="{rel[0]}" body2="{p}" active="false" '
                     f'solref="{_wtc} 1"/>')
-  # the table box reaches from the FLOOR (z=0) to table_top: collision-identical for the
-  # parts (only the top face matters) but it looks like a table instead of a floating slab.
-  th = table_top / 2.0
+  # Preserve the planning scene's real slab thickness. Only its z centre follows the selected
+  # top height (normally the lowest floated part bottom; exactly the planner top under
+  # --planner-table). Stretching the box down to the floor made raised FR3 workbenches look
+  # like giant solid pedestals and introduced side/underside geometry absent from planning.
+  table_z = table_top - table_half_z
   return f"""
 <mujoco model="assembly_validation">
   <!-- MuJoCo's compiler defaults to angle="degree", so rai's joint ranges (radians) were being
@@ -863,8 +935,8 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
     <light pos="0.5 -0.5 2.5" dir="-0.2 0.2 -1" directional="true" castshadow="true"/>
     <geom name="floor" type="plane" size="4 4 0.1" material="grid" pos="0 0 0"
           group="{GROUP_ENV}"/>
-    <geom name="table" type="box" size="{TABLE_HALF[0]} {TABLE_HALF[1]} {th}"
-          pos="0 0 {th}" rgba="0.55 0.42 0.28 1" friction="{mu_table} 0.005 0.0001"
+    <geom name="table" type="box" size="{table_half_x} {table_half_y} {table_half_z}"
+          pos="{table_x} {table_y} {table_z}" rgba="0.55 0.42 0.28 1" friction="{mu_table} 0.005 0.0001"
           group="{GROUP_ENV}"/>
     {''.join(parts_xml)}
   </worldbody>
@@ -878,12 +950,14 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
 class SimScene:
   def __init__(self, assembly, state, robots, gripper_kinds=None, gui=False,
                arms=None, arm_poses=None, ee_anchor=None, articulated_C=None,
-               actuated=False, planner_table_top=None, weld_timeconst=None):
+               actuated=False, planner_table_top=None, weld_timeconst=None,
+               table_geometry=None):
     if not HAVE_MUJOCO:
       raise RuntimeError("mujoco not installed (pip install mujoco)")
     self.assembly = assembly
     self.xml = build_mjcf(assembly, state, robots, arms=arms, arm_poses=arm_poses,
                           planner_table_top=planner_table_top, weld_timeconst=weld_timeconst,
+                          table_geometry=table_geometry,
                           ee_anchor=ee_anchor, articulated_C=articulated_C,
                           actuated=actuated)
     self.model = mujoco.MjModel.from_xml_string(self.xml)
@@ -2447,6 +2521,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                    articulated_C=(C_fk if (articulated or actuated) else None),
                    actuated=actuated,
                    planner_table_top=(planner_table_top(C) if use_planner_table else None),
+                   table_geometry=planner_table_geometry(C),
                    weld_timeconst=weld_timeconst)
   scene.verify_efc_cache = bool(verify_efc_cache)
   scene.directional_caps = bool(directional_caps)

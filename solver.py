@@ -381,7 +381,13 @@ class RobotIK:
       self.robot_base[r] = r + "_ur_base"              # UR base frame; parented to the table
       # a FLOATING EE has no arm at all: no base_link frame, no kinematic chain -> analytic
       # IK / reach bounds are meaningless for it (robot_arm=None disables every ssik path).
-      if (r + "_ur_base_link") in names:
+      if (r + "_right_fr3v2_link0") in names or (r + "_left_fr3v2_link0") in names:
+        # FR3 duo: the env's ur_base_link alias marks the arm, but there is NO ssik
+        # calibration for franka yet -> robot_arm="fr3" keeps every analytic path disabled
+        # while base_link still anchors the reach-sphere bound.
+        self.robot_arm[r] = "fr3"
+        self.base_link[r] = r + "_ur_base_link"
+      elif (r + "_ur_base_link") in names:
         self.robot_arm[r] = "ur5" if (r + "_ur_arm_ur5") in names else "ur10"
         self.base_link[r] = r + "_ur_base_link"        # ssik solves in base_link's frame
       else:
@@ -462,7 +468,25 @@ class RobotIK:
     # completeness is untouched; only which equal-f variant is tried first changes.
     # Evidence key -> [n, fails, eq_sum_on_fail] ("abias" = assemble bias sweep slot).
     self.fail_order = False
+    # --analytic-seed-cap K: warm-start KOMO with only the K best-ranked exact branches
+    # (None = legacy: every branch). Caps the seeded-solve cost when a bind's exact branch
+    # set is large and mostly colliding.
+    self.analytic_seed_cap = None
     self.action_stats = {}
+    # --empty-seed-refutes: treat an EMPTY calibrated analytic seed set as a sound
+    # unreachability proof (skip relaxed precheck + KOMO). Sound because q1..q5 are
+    # roll-independent and q6 spans >= 2pi in the rai models; OFF preserves the legacy
+    # tolerant-KOMO chance on exactly-unreachable poses.
+    self.empty_seed_refutes = False
+    # ANALYTIC-REFUTATION STUDY: classify each bind by exact-IK coverage vs outcome, so we can
+    # decide whether ssik alone could replace KOMO acceptance/refutation. Coverage=True means
+    # every attached arm had a nonempty exact seed set (canonical roll for vacuum -- sound by
+    # q6-range >= 2pi in the rai models). Key stats: slack_rescued (coverage but KOMO only won
+    # off-seed => tolerance-slack mattered) and exactless_success (won with EMPTY exact set =>
+    # direct counterexample to analytic-only).
+    self.ana_stats = {}
+    self._ctx_seeds = None
+    self._last_win = ""
     # OPT-IN open-witness probing.  The legacy bind/search path never reads these.  The
     # dedicated scheduler calls probe_bind_batch(), which spends one bounded skill-aware tier,
     # caches successes only, and revisits failures in later fairness epochs.
@@ -770,6 +794,8 @@ class RobotIK:
       # target of its own -- downstream actions solve IK against the new grasp).
       return True, None
     self.prof["bind_calls"] += 1                          # A1: real IK binds only
+    self._ctx_seeds = None                                # set by the skill's seed computation
+    self._last_win = ""
     _bt0 = _time.perf_counter()
     # VERDICT + WITNESS CACHE on a discrete scene signature: the search re-probes the SAME
     # (action, scene) from many parent states, and a FAILED solve costs ~135ms (initial +
@@ -804,6 +830,19 @@ class RobotIK:
     if not res[0]:
       _e[1] += 1
     _e[2] += _dt
+    if self._ctx_seeds is not None:                       # analytic-refutation study
+      _ck, _cov, _ctool = self._ctx_seeds
+      _k = f"{_ck}/{_ctool}"
+      if res[0]:
+        if self._last_win.startswith("seed"):
+          _k += "/ok_seed"                                # exact branch certified the bind
+        elif _cov:
+          _k += "/slack_rescued"                          # exact branches existed but all failed
+        else:
+          _k += "/exactless_success"                      # won with NO exact solution at all
+      else:
+        _k += "/refutable_fail" if _cov else "/uncovered_fail"
+      self.ana_stats[_k] = self.ana_stats.get(_k, 0) + 1
     if self._opt_pull is None:
       self._ik_cache[key] = res
     return res
@@ -903,6 +942,10 @@ class RobotIK:
       print("[ik-prof] top actions by bind time (kind/part/grasp: n (failed) time):")
       for (kind, part, gid), (n, nf, t) in sorted(ba.items(), key=lambda kv: -kv[1][2])[:12]:
         print(f"[ik-prof]   {kind:9s} {part} g{gid}: {n}x ({nf} failed) {t:.1f}s")
+    if self.ana_stats:
+      print("[ik-prof] analytic-coverage outcomes (decides ssik-refutation viability):")
+      for k in sorted(self.ana_stats):
+        print(f"[ik-prof]   {k}: {self.ana_stats[k]}")
 
   def _holders_of_group(self, state, group):
     # robots grasping any part of `group`
@@ -1383,6 +1426,7 @@ class RobotIK:
       if getattr(self, "_pc", False):
         k = "pc_" + k                                     # precheck-sourced (relaxed solve)
       self.prof["wins"][k] = self.prof["wins"].get(k, 0) + 1
+      self._last_win = k
 
     for _si, seed in enumerate(seeds or []):
       seed = np.asarray(seed, dtype=float)
@@ -1469,6 +1513,12 @@ class RobotIK:
           self._last_res = r
           return True, komo.getPath()[-1]
     _win("none")
+    if _os.environ.get("SOLVER_IK_DEBUG"):
+      res_d = r or {}
+      print(f"[ik-debug] FAIL {getattr(self, '_cur_action', '?')} "
+            f"eq={res_d.get('eq', float('nan')):.3f} "
+            f"ineq={res_d.get('ineq', float('nan')):.3f} "
+            f"restarts={restarts} n_seeds={len(seeds or [])}")
     self._last_res = r or {}
     return False, None
 
@@ -1583,7 +1633,14 @@ class RobotIK:
       self.collision_rejects += 1
       return True, []                                     # every exact combo VERY deeply colliding
     scored.sort(key=lambda t: (t[0], t[1]))
-    return False, [q for _, _, q, _ in scored[:cap]]
+    top = scored[:cap]
+    # COLLISION-PRECHECKED SEEDING: a combo already measured beyond the HARD gate
+    # (collision_deep_reject, beyond the observed rescue ceiling) is not worth a KOMO
+    # attempt -- drop it from the warm-start set instead of paying a doomed solve.
+    kept = [q for _e, _d0, q, deep in top if deep <= 0.0]
+    if not kept:                                          # cannot happen after the all-deep
+      kept = [scored[0][2]]                               # ... reject above, but stay safe
+    return False, kept
 
   def _reach_bound(self, robot):
     # SOUND kinematic max-reach for ANY arm (no analytic IK required): the tool centre can
@@ -1805,11 +1862,24 @@ class RobotIK:
     # set proves reachability -> skip the precheck and warm-start the collision solve below. Vacuum
     # / uncalibrated / no-ssik fall back to the relaxed precheck.
     seeds = self._analytic_seeds(C, robot, ee_target, part_name)
+    self._ctx_seeds = ("pick", bool(seeds), self.tool_kind[robot])   # ana-refutation study
+    if (self.empty_seed_refutes and self._pin_joints is None
+        and self._analytic_reject_ok(robot) and not seeds):
+      # --empty-seed-refutes: the calibrated closed-form solver enumerated EVERY joint branch
+      # at the EXACT grasp pose and found none within limits. This is a sound unreachability
+      # proof (q1..q5 are roll-independent; q6 spans >= 2pi, so no other vacuum roll helps
+      # either) -- skip relaxed precheck and KOMO entirely.
+      self.analytic_rejects += 1
+      self.ana_stats[f"pick/{self.tool_kind[robot]}/empty_refuted"] = \
+          self.ana_stats.get(f"pick/{self.tool_kind[robot]}/empty_refuted", 0) + 1
+      return False, None
     if self._analytic_reject_ok(robot) and seeds:
       reject, ranked = self._probe_branch_combos(C, {robot: seeds})
       if reject:
         return False, None                                # every exact branch deeply colliding
       seeds = ranked or seeds                             # shallowest-collision branches first
+      if self.analytic_seed_cap is not None:              # --analytic-seed-cap: warm-start
+        seeds = seeds[:self.analytic_seed_cap]            # only the K best-ranked branches
     elif (self.reach_precheck and self._pin_joints is None
           and self._reach_precheck_reject(action, C, build(False))):
       # includes the EMPTY-analytic-set case: an empty EXACT set does NOT prove the SOFT
@@ -1987,15 +2057,28 @@ class RobotIK:
       arm_targets = {}                                     # ablation: braced -> old precheck path
     arm_seeds = {}
     all_calibrated = bool(arm_targets)
+    _empty_exact = _uncalibrated = False                  # ana-refutation study trackers
     for rr, ee in arm_targets.items():
       if self._analytic_reject_ok(rr):
         sl = self._analytic_seeds(C, rr, ee, None)
         if not sl:
           all_calibrated = False                          # EMPTY exact set: borderline, not a
-          continue                                        # proof -- precheck decides (see pick)
+          _empty_exact = True                             # proof -- precheck decides (see pick)
+          continue
         arm_seeds[rr] = sl
       else:
         all_calibrated = False
+        _uncalibrated = True
+    if (self.empty_seed_refutes and _empty_exact and not _uncalibrated
+        and self._pin_joints is None):
+      # every calibrated attached arm proved its fixed pose unreachable (sound, see pick);
+      # no uncalibrated arm is present whose reachability would remain unknown.
+      self.analytic_rejects += 1
+      self.ana_stats[f"place/{self.tool_kind[robot]}/empty_refuted"] = \
+          self.ana_stats.get(f"place/{self.tool_kind[robot]}/empty_refuted", 0) + 1
+      return False, None
+    self._ctx_seeds = ("place", all_calibrated and bool(arm_seeds),
+                       self.tool_kind[robot])            # ana-refutation study
     if all_calibrated:
       # probe the FULL branch product: single -> the placer's branches (other arms frozen AND
       # contact-stripped in the restricted scene, so nothing to exclude); braced -> all combos
@@ -2161,15 +2244,28 @@ class RobotIK:
         arm_targets = {robot: arm_targets[robot]}          # ablation: mover-only reject, no proof
       reachable_proven = self.braced_analytic or not braced
       arm_seeds = {}
+      _empty_exact = _uncalibrated = False                # ana-refutation study trackers
       for rr, ee in arm_targets.items():
         if not self._analytic_reject_ok(rr):
           reachable_proven = False                        # uncalibrated arm: precheck decides
+          _uncalibrated = True
           continue
         sl = self._analytic_seeds(C, rr, ee, None)
         if not sl:
           reachable_proven = False                        # EMPTY exact set: borderline, not a
-          continue                                        # proof -- precheck decides (see pick)
+          _empty_exact = True                             # proof -- precheck decides (see pick)
+          continue
         arm_seeds[rr] = sl
+      if (self.empty_seed_refutes and _empty_exact and not _uncalibrated
+          and self._pin_joints is None):
+        # all calibrated attached arms proved their (rigid-group determined) pose
+        # unreachable -- sound refutation of the whole multi-arm bind (see pick).
+        self.analytic_rejects += 1
+        self.ana_stats[f"assemble/{self.tool_kind[robot]}/empty_refuted"] = \
+            self.ana_stats.get(f"assemble/{self.tool_kind[robot]}/empty_refuted", 0) + 1
+        return False, None
+      self._ctx_seeds = ("assemble", reachable_proven and bool(arm_seeds),
+                         self.tool_kind[robot])           # ana-refutation study
       # collision probe on the exact branches (assemble KOMO is multi-arm: uninvolved arms can
       # dodge -> excluded). All attached arms calibrated -> full combo product incl. ARM-ARM;
       # otherwise mover-only (the uncalibrated arms will co-move, their pairs excluded).
@@ -6772,12 +6868,27 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
     # between effort epochs.  Nothing below (the measured permanent-blacklist path) changes.
     from open_witness import run_open_lazy_fill
 
+    # Cheap-gate refutations are DEAD FOREVER by legacy semantics ("cheap-infeasible: dead
+    # forever"), but fairness epochs rebuild the engine with a FRESH suspended set. Without a
+    # persistent set, cheap-dead edges resurrect every epoch: they re-enter candidate plans and
+    # force a delete_edge repair cycle before being re-refuted. Solve-scoped on the RobotIK,
+    # mirroring _fill_bl (states are value-hashed, so pairs match across fills).
+    cheap_bl = getattr(robot_ik, "_open_cheap_bl", None)
+    if cheap_bl is None:
+      cheap_bl = robot_ik._open_cheap_bl = set()
+
+    def _open_cheap_gate(prev, act, ns):
+      ok = cheap_feasible(act, prev, ns, assembly, checker)
+      if not ok:
+        cheap_bl.add((prev, act))                         # dead forever (cheap layer is sound)
+      return ok
+
     def _make_open_engine(suspended):
+      suspended.update(cheap_bl)                          # dead edges stay dead across epochs
       return _IncrementalLazySearch(
           start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
           weight=weight, blacklist=suspended,
-          cheap_gate=lambda prev, act, ns: cheap_feasible(
-              act, prev, ns, assembly, checker))
+          cheap_gate=_open_cheap_gate)
 
     def _walk_open_plan(sub):
       s = start

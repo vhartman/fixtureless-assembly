@@ -46,7 +46,10 @@ def _zeroed(C):
 def arm_frames(C, prefix):
   """(root_frame, {parent: [children]}) for the sub-tree belonging to robot `prefix`.
   The root is the arm frame whose parent lies OUTSIDE the arm (rai mounts it on the table)."""
-  names = [n for n in C.getFrameNames() if n.startswith(prefix)]
+  # Malformed imported models can expose the same frame name more than once. MJCF requires
+  # unique body/asset names, so never walk a textual name twice (the FR3 source model is fixed
+  # as well, but keeping this boundary defensive gives a useful guarantee to every exporter).
+  names = list(dict.fromkeys(n for n in C.getFrameNames() if n.startswith(prefix)))
   owned = set(names)
   kids, root = {}, None
   for n in names:
@@ -171,7 +174,12 @@ def _geom_xml(kind, size, rgba, group, contype, conaffinity="1"):
   common = (f'rgba="{rgba}" group="{group}" contype="{contype}" '
             f'conaffinity="{conaffinity}"')
   if kind in ("capsule", "cylinder"):
-    return f'<geom type="{kind}" size="{s[1]} {s[0] / 2}" {common}/>'
+    # Native rai shapes use [length, radius]. Some imported ``.g`` models retain rai's
+    # older four-slot representation [0, 0, length, radius] instead (the FR3 mobile-base
+    # wheels are the first model here to exercise it). Treating that as [length, radius]
+    # emits a zero-radius MuJoCo geom and makes the base export unloadable.
+    length, radius = ((s[2], s[3]) if s.size >= 4 else (s[0], s[1]))
+    return f'<geom type="{kind}" size="{radius} {length / 2}" {common}/>'
   if kind == "sphere":
     return f'<geom type="sphere" size="{s[0]}" {common}/>'
   if kind in ("box", "ssBox"):
@@ -190,10 +198,39 @@ def collides_like_sim(name):
   return any(k in name for k in ("palm", "finger", "gripper_fill", "vacuum"))
 
 
+def _rgba_string(value, fallback):
+  """Normalize rai's optional 3/4-component color to an MJCF rgba string."""
+  try:
+    c = np.asarray(value, dtype=float).ravel()
+  except Exception:
+    return fallback
+  if c.size < 3:
+    return fallback
+  c = np.r_[c[:4], np.ones(max(0, 4 - c.size))][:4]
+  return " ".join(f"{float(v):g}" for v in c)
+
+
+def fr3_base_prefixes(C):
+  """Prefixes of static FR3 carrier/base subtrees present in ``C``.
+
+  FR3 arms intentionally use the ordinary ``aN_`` robot prefixes, while their shared TMR
+  carrier is loaded as ``fr3K_``. The articulated arm exporter therefore cannot discover the
+  carrier through the robot prefixes; expose it explicitly without baking a duo count into
+  the simulator.
+  """
+  out = []
+  for name in C.getFrameNames():
+    if name.startswith("fr3") and name.endswith("_base"):
+      index = name[3:-5]
+      if index.isdigit():
+        out.append(name[:-4])  # fr30_base -> fr30_
+  return sorted(set(out))
+
+
 def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, indent=4,
                    collide_fn=None, contype="2", conaffinity="1", link_mass=1e-3,
                    link_inertia=1e-6, armature=0.0, limits=True, static_mass=None,
-                   meshes=False, assets=None, mesh_group=1):
+                   meshes=False, assets=None, mesh_group=1, frame_colors=False):
   """MJCF <body> tree for one articulated arm, read out of rai at q=0.
 
   Returns (xml, joint_names) with joint_names in MuJoCo's own qpos order for this arm -- the
@@ -253,9 +290,10 @@ def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, inde
                f'diaginertia="{_i:g} {_i:g} {_i:g}"/>')
     info = f.info()
     kind = info.get("shape")
+    geom_rgba = (_rgba_string(info.get("color"), rgba) if frame_colors else rgba)
     if kind not in _NO_GEOM:
       on = collide and (collide_fn(name) if collide_fn else True)
-      g = _geom_xml(kind, info.get("size", []), rgba, group,
+      g = _geom_xml(kind, info.get("size", []), geom_rgba, group,
                     contype if on else "0", conaffinity if on else "0")
       if g:
         out.append(f'{pad}  {g}')
@@ -268,9 +306,14 @@ def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, inde
       # colors -- that split is what keeps the real UR look (blue caps / grey body / dark
       # joints) instead of one flat grey arm.
       for _k, (_obj, _mrgba) in enumerate(link_meshes(Z, name)):
+        if frame_colors:
+          _mrgba = _rgba_string(info.get("color"), _mrgba)
         _mn = f"vm_{name}__{_k}"
         if assets is not None:
-          assets.append(f'<mesh name="{_mn}" file="{_obj}"/>')
+          # inertia=shell: these are VISUAL display meshes (contype/conaffinity 0), often
+          # open shells whose computed volume is ~0 -- MuJoCo would reject the model with
+          # 'mesh volume is too small' otherwise.
+          assets.append(f'<mesh name="{_mn}" file="{_obj}" inertia="shell"/>')
         out.append(f'{pad}  <geom type="mesh" mesh="{_mn}" rgba="{_mrgba}" '
                    f'group="{mesh_group}" contype="0" conaffinity="0"/>')
     for c in sorted(kids.get(name, [])):

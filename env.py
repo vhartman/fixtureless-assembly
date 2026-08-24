@@ -203,8 +203,116 @@ def _robot_path(robot_type, floating_ee, vacuum):
     return os.path.join(HERE, "./src/rai/kuka_drake/kuka_two_finger.g")
 
 
+# --- FR3 duo (static humanoid-style pair) -----------------------------------------------
+# Two Franka FR3 arms mounted on the franka_spine tower of the static TMR base
+# (src/rai/fr3/static_mobile_fr3_base.g), exactly like mr_bench's make_static_fr3_duo_config:
+# base on the floor at the -y edge facing +y into the build area, shoulders at z~0.50,
+# arms tilted outward. Each arm carries the shared robotiq two-finger gripper at its
+# flange (link8), and ur_* ALIAS frames are added so every pipeline convention (RobotIK
+# tool-center/base discovery, get_robots a<i>_ prefixes, subtree joint restriction) works
+# unmodified. No analytic IK for fr3 yet (ssik has a franka prebuilt -- calibration is
+# future work); validation runs the relaxed-precheck + KOMO path. Pair with a CENTRAL
+# initial layout (--random-init R / --grid-init N): the standard scatter line at y=0 spans
+# beyond the FR3's ~0.85m reach from the -y edge.
+FR3_DUO_BASE_PATH = "./src/rai/fr3/static_mobile_fr3_base.g"
+FR3_ARM_PATHS = {"right": "./src/rai/fr3/right_fr3.g", "left": "./src/rai/fr3/left_fr3.g"}
+ROBOTIQ_TIGHT_PATH = "./src/rai/robotiq/robotiq_tight.g"
+
+
+def make_fr3_duo_env(num_duos=1):
+    """Humanoid-style static FR3 duos (robotiq two-finger) around a raised workbench.
+
+    Each duo = TMR torso on the floor + two FR3s on its spine tower (right then left
+    shoulder), exactly like mr_bench's make_static_fr3_duo_config. num_duos=2 places the
+    second duo rotated 180deg on the opposite table edge (robots a3/a4). The table is
+    raised to near-shoulder height ('human-like' bench) and sized so the torso hulls
+    (contact-disabled decoration) clear it.
+    """
+    C = make_world()
+    table_h = 0.06                                       # slim slab, top at 0.45
+    C.getFrame("table").setShape(
+        ry.ST.box, size=[1.2, 0.9, table_h, 0.005]).setPosition(
+        [0.0, 0.02, 0.45 - table_h / 2.0]).setContact(1)
+    duos = []
+    for k in range(num_duos):
+        y = -1.02 if k % 2 == 0 else 1.02
+        yaw = 0.70710678 if k % 2 == 0 else -0.70710678  # rotZ +-90: face the table
+        duos.append((k, y, [0.70710678, 0.0, 0.0, yaw]))
+    for k, by, quat in duos:
+        base = C.addFile(os.path.join(HERE, FR3_DUO_BASE_PATH),
+                         namePrefix=f"fr3{k}_").setParent(C.getFrame("floor"))
+        base.setPosition([0.0, by, 0.0]).setQuaternion(quat).setJoint(ry.JT.rigid)
+        for j, side in enumerate(("right", "left")):
+            r = f"a{2 * k + j + 1}"
+            prefix = f"{r}_"
+            sh_m = C.addFrame(f"{prefix}ur_base").setParent(
+                C.getFrame(f"fr3{k}_{side}_base_joint_origin"))
+            root = C.addFile(os.path.join(HERE, FR3_ARM_PATHS[side]), namePrefix=prefix)
+            root.setParent(sh_m)
+            root.setJoint(ry.JT.rigid)
+            # explicit link colors: the fr3v2 DAEs carry no rai-side color (color=None),
+            # so viser exports fall back to per-mesh defaults -> random-looking odd links.
+            # Uniform franka white keeps every view (rai, viser, sim meshes) consistent.
+            for li in range(8):
+                ln = C.getFrame(f"{prefix}{side}_fr3v2_link{li}_0")
+                if ln is not None:
+                    ln.setColor([0.93, 0.93, 0.95, 1.0])
+            link0 = C.getFrame(f"{prefix}{side}_fr3v2_link0")
+            C.addFrame(f"{prefix}ur_base_link").setParent(link0)
+            link8 = C.getFrame(f"{prefix}{side}_fr3v2_link8")
+            C.addFrame(f"{prefix}ur_ee_link").setParent(link8)
+            # gripper: robotiq_tight at the flange, rotated 90deg about the flange axis
+            # (FR3 flange convention differs from the UR one -- the straight mount points
+            # the fingers sideways)
+            rg = C.addFile(os.path.join(HERE, ROBOTIQ_TIGHT_PATH), namePrefix=prefix)
+            rg.setParent(link8).setRelativePosition([0.0, 0.0, 0.036]).setRelativeQuaternion(
+                [0, 0, 0, 1]).setJoint(ry.JT.rigid)
+            C.addFrame(f"{prefix}ur_gripper_center").setParent(
+                C.getFrame(f"{prefix}gripper_center")).setShape(
+                ry.ST.sphere, [0.004]).setContact(0)
+            maybe_tighten_fingers(C, prefix)
+            color_gripper(C, prefix, GRIPPER_COLORS[(k * 2 + j) % len(GRIPPER_COLORS)])
+        # home pose: FR3's all-zero joints fold the wrist into the forearm once a gripper
+        # is mounted -- pick the first candidate home config that is collision-free
+        # import re as _re
+        # homes = ([0.0, 0.55, 0.0, -1.15, 0.0, 0.45, 0.10],
+        #          [0.0, -0.25, 0.0, -2.10, 0.0, 1.90, -0.80],
+        #          [0.0, 0.30, 0.0, -2.20, 0.0, 1.60, -0.75],
+        #          [0.0, 0.70, 0.0, -1.00, 0.0, 0.20, 0.15],
+        #          [0.0, -0.10, 0.0, -1.80, 0.0, 1.50, -0.60])
+        # jn = C.getJointNames()
+        # pat = _re.compile(_re.escape(prefix) + side + r"_fr3v2_joint(\d)$")
+        # idx = {int(pat.match(n).group(1)) - 1: i
+        #        for i, n in enumerate(jn) if pat.match(n)}
+        # for hq in homes:
+        #     hq = list(hq)
+        #     if prefix == "a1_":
+        #         hq = [hq[0], -hq[1], hq[2], -hq[3], hq[4], -hq[5], -hq[6]]  # mirror
+        #     full = list(C.getJointState())
+        #     for bi, i in idx.items():
+        #         full[i] = hq[bi]
+        #     C.setJointState(full)
+        #     if C.getCollisionsTotalPenetration() < 1e-6:
+        #         break
+
+        full = C.getJointState()
+        full[5] = 1
+        full[5 + 1 * 7] = 1
+        if len(full) > 2 * 7:
+            full[5 + 2 * 7] = 1
+        if len(full) > 3 * 7:
+            full[5 + 3 * 7] = 1
+        C.setJointState(full)
+
+    # torso hulls are decoration: raised table clears them anyway, but keep them out of
+    # every collision query regardless (they overhang the table edge by design)
+    for n in list(C.getFrameNames()):
+        if n.endswith("base_coll") or n.endswith("tower_coll"):
+            C.getFrame(n).setContact(0)
+    return C
+
+
 def make_world():
-    # the static environment shared by every scene: floor + table. Single source of
     # truth, so the real-robot env and the floating-EE collision scene agree exactly.
     C = ry.Config()
 

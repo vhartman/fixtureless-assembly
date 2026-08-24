@@ -754,6 +754,89 @@ class CuboidTowerAssembly(Assembly):
     self.assembly_dependencies = {}       # the mate chain IS the precedence
 
 
+class FixtureRackAssembly(Assembly):
+  """Scalable modular fixture rack: a long BASE RAIL carries repeated UPRIGHT POSTS, and
+  every post carries one laterally inserted CANTILEVER BRACKET.
+
+  This is a synthetic benchmark rather than a replica of one product, but its structure is
+  deliberately closer to an assembly fixture, tool rack, or small shelving rail than the
+  cube families:
+
+  * parts are heterogeneous cuboids with realistic aspect ratios;
+  * posts are lowered top-down into the base;
+  * brackets are pressed horizontally onto the upper side of their own post;
+  * stations are independent branches, while each bracket depends on its post; and
+  * bracket sides alternate, so larger instances do not grow one unbalanced comb.
+
+  The horizontal bracket mate is the important wrench discriminator. With the default
+  frictionless table model, a rail merely resting on the table cannot react that lateral
+  insertion force; the forward planner must arrange a target holder or brace. The family
+  therefore scales both the precedence choices and the repeated support decisions without
+  introducing artificial cube-face symmetries.
+
+  Naming is station-major: obj_0 is the rail, then (obj_1 post, obj_2 bracket),
+  (obj_3 post, obj_4 bracket), ... . Truncation at any --parts value is valid; an odd final
+  part is simply a station whose bracket is not present. Up to six stations / 13 parts are
+  exposed through the CLI.
+  """
+
+  def __init__(self, n_parts=7, max_stations=6, station_pitch=0.075,
+               rail_depth=0.050, rail_height=0.025, post_width=0.025,
+               post_height=0.100, bracket_length=0.070, bracket_height=0.025,
+               corner_radius=0.002):
+    self.max_stations = int(max_stations)
+    self.n_parts = min(max(1, int(n_parts)), 1 + 2 * self.max_stations)
+    self.station_pitch = float(station_pitch)
+    self.rail_depth = float(rail_depth)
+    self.rail_height = float(rail_height)
+    self.post_width = float(post_width)
+    self.post_height = float(post_height)
+    self.bracket_length = float(bracket_length)
+    self.bracket_height = float(bracket_height)
+    self.cube_size = max(self.rail_depth, self.post_height)  # scatter/marker scale only
+    self.cube_radius = float(corner_radius)
+    super().__init__()
+
+  def define(self):
+    r = self.cube_radius
+    n_stations = (self.n_parts - 1 + 1) // 2
+    rail_length = max(0.12, self.station_pitch * max(0, n_stations - 1) + 0.08)
+    self.objects = [f"obj_{i}" for i in range(self.n_parts)]
+    self.base = "obj_0"
+    self.part_shapes["obj_0"] = (
+        "box", [rail_length, self.rail_depth, self.rail_height, r])
+    self.masses["obj_0"] = 0.45 + 0.12 * n_stations
+
+    x0 = -0.5 * self.station_pitch * max(0, n_stations - 1)
+    for station in range(n_stations):
+      post_i = 1 + 2 * station
+      bracket_i = post_i + 1
+      post = f"obj_{post_i}"
+      x = x0 + station * self.station_pitch
+      if post_i < self.n_parts:
+        self.part_shapes[post] = (
+            "box", [self.post_width, self.post_width, self.post_height, r])
+        self.masses[post] = 0.18
+        self.assembly_relative_poses[post] = [
+            "obj_0", np.array([x, 0.0, 0.5 * (self.rail_height + self.post_height)])]
+        self.mate_axes[post] = np.array([0.0, 0.0, -1.0])
+
+      if bracket_i < self.n_parts:
+        bracket = f"obj_{bracket_i}"
+        side = 1.0 if station % 2 == 0 else -1.0
+        self.part_shapes[bracket] = (
+            "box", [self.post_width, self.bracket_length, self.bracket_height, r])
+        self.masses[bracket] = 0.12
+        # Touch the post side and sit in its upper quarter. The mate axis points back toward
+        # the post, so this is a true lateral press rather than a diagonal bookkeeping mate.
+        self.assembly_relative_poses[bracket] = [
+            post,
+            np.array([0.0, side * 0.5 * (self.post_width + self.bracket_length),
+                      0.25 * self.post_height])]
+        self.mate_axes[bracket] = np.array([0.0, -side, 0.0])
+        self.assembly_dependencies[bracket] = [post]
+
+
 class CarAssembly(Assembly):
   """A toy car: a cuboid BODY and four CYLINDER WHEELS, two per side, axes sideways.
 
@@ -1295,6 +1378,7 @@ _ASSEMBLY_KINDS = {"cross": (CubeCrossAssembly, 7), "cube": (CubeGridAssembly, 8
                    "cube-plates": (CubePlatesAssembly, 8),
                    "cube-plates-2x2x3": (lambda n_parts: CubePlatesAssembly(2, 2, 3, n_parts=n_parts), 12),
                    "cuboid-tower": (CuboidTowerAssembly, 8),
+                   "fixture-rack": (FixtureRackAssembly, 13),
                    "car": (CarAssembly, 5),
                    # mini car: whole car scaled to width=0.03 -> wheels are discs of diameter
                    # 0.8w*2 = 0.048, comfortably inside the two-finger's ~0.078 inner gap, so the
@@ -1365,9 +1449,9 @@ def make_assembly(kind, n_parts):
   known-flawed star, see class doc), arch-seq (arch shape built as a sequential chain),
   cube-plates (2x2x2 as two stacked 2x2 plates), cube-plates-2x2x3 (three stacked 2x2
   plates, 12 cubes), cuboid-tower (laid-down 2:1:1 cuboids stacked along z -- the first
-  non-cube assembly), peg-stool / peg-stool-cuboid (three-legged stool with round or square
-  legs into real blind sockets). The plates family generalizes to any WxDxH via
-  CubePlatesAssembly."""
+  non-cube assembly), fixture-rack (a scalable rail with post/bracket station branches),
+  peg-stool / peg-stool-cuboid (three-legged stool with round or square legs into real blind
+  sockets). The plates family generalizes to any WxDxH via CubePlatesAssembly."""
   cls, max_n = _ASSEMBLY_KINDS[kind]
   return cls(n_parts=min(n_parts, max_n))
 

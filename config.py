@@ -130,6 +130,8 @@ class RunConfig:
   ik_restarts: int = 12
   precheck_restarts: int = 12
   fail_order: bool = False
+  analytic_seed_cap: Optional[int] = None
+  empty_seed_refutes: bool = False
   ik_collision_gate: float = 0.015
   full_ik: bool = False
   strict_collisions: Optional[float] = 1e-6

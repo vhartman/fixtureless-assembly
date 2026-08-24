@@ -21,6 +21,7 @@ so IK is:  q_rai = SIGN * (ssik.solve(T_target @ B_TOOL^-1).q - OFFSET).
 
 `ssik` is an optional dependency -- import failures degrade gracefully to "no seeds".
 """
+import importlib
 import importlib.util
 import os
 
@@ -81,7 +82,30 @@ _CAL = {
         },
         "load": lambda: _artifact("ur10_ik"),
     },
+    "fr3": {
+        # built via: ssik build franka_description/robots/fr3/fr3.urdf.xacro
+        #   (--xacro-arg hand:=false --base fr3_link0 --ee fr3_link8)
+        # Validated: ssik fk == rai fr3v2 FK to 0.0 over random configs (identity joint
+        # mapping). NOTE: FR3 is 7-DOF/redundant -- solve(T) returns discrete samples of
+        # the solution MANIFOLD (nearest ~mrad from any true config), ideal as KOMO
+        # seeds; empty set is strong unreachability evidence but see
+        # --empty-seed-refutes caveats.
+        "sign": np.ones(7),
+        "offset": np.zeros(7),
+        "tools": {
+            # ssik EE frame == flange; tool0 -> EE centre == flange -> gripper centre of
+            # robotiq_tight.g mounted straight at the flange (measured)
+            "two_finger": np.array([[0.0, 0.0, 1.0, 0.13],
+                                    [0.0, 1.0, 0.0, 0.0],
+                                    [-1.0, 0.0, 0.0, 0.036],
+                                    [0.0, 0.0, 0.0, 1.0]]),
+        },
+        "load": lambda: _artifact("fr3_ik"),
+    },
 }
+# NOTE on the ssik franka prebuilt (ssik.prebuilt.franka.fr3_ik): it models DIFFERENT
+# geometry than our rai fr3v2 asset -- offset/sign/permutation voting over 15k solution
+# pairs found no mapping (calibrate_fr3.py). Use the locally built artifact above instead.
 # ur10_limited is a ur10 with a tighter shoulder-lift/elbow workspace. The KINEMATICS are
 # identical, so the analytic solver is the same; the caller applies the joint limits to the
 # returned branches (seed_configs returns all branches, limit filtering happens downstream).
