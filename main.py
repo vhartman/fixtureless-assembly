@@ -14,6 +14,115 @@ from env import *
 from assembly import *
 from config import RunConfig
 
+# Named CLI profiles are deliberately a thin layer over the ordinary flags.  RunConfig stays
+# the fully-resolved configuration (there is no profile magic in the solver/library API), and
+# every value below can be overridden by an explicit CLI flag. Selecting a profile is itself
+# an explicit request, so its named fields override a loaded config while unnamed scene fields
+# still come from that file.
+_STANDARD_SEARCH_PROFILE = {
+    "weight": 100.0,
+    "milestones": True,
+    "sig_collapsed_h": True,
+    "sig_components": "press",
+    "real_ik": True,
+    "wrench": True,
+    "grasp_model": "asymmetric",
+    "optimize_witnesses": "floor",
+    "witness_margin": 0.005,
+    "witness_branch_budget": 5,
+    "witness_sets": 4,
+    "tight_fingers": True,
+    "strict_collisions": 1e-6,
+    # Search witnesses must expose the same scene downstream planning validates. These fixed
+    # distinct silent-invalid-plan classes: idle-arm intersections, hidden touched-part
+    # contact, and millimetre-scale place/mate residuals.
+    "witness_robot_collisions": True,
+    "always_contact": True,
+    "mate_eq_weight": 100.0,
+    "place_eq_weight": 100.0,
+    "ik_seeding": True,
+    # Search/action semantics used by the current hands-off assembly artifacts.
+    "bracing": True,
+    "handovers": True,
+    "allow_place": True,
+    "goal_on_table": True,
+    "lazy_fills": True,
+    "hoist_releases": True,
+    # Shared planner/simulator table datum. Keep this small: every millimetre is certified
+    # free space that the simulator turns into raised table geometry.
+    "part_float": 0.002,
+    # Selecting ``standard`` after experimenting with another profile must really return to
+    # the dependable legacy witness-scheduling baseline.
+    "open_witness": False,
+    "open_witness_batch": 7,
+    "open_witness_epochs": 2,
+    "analytic_seed_cap": None,
+    # Hybrid V2 grasp DB: conventional primitive grasps remain a stable prefix and mesh-
+    # sampled candidates add off-centre/wrap alternatives. Exact state gates stay authoritative.
+    "grasp_sampler": True,
+    "grasp_sampler_version": 2,
+    "grasp_sampler_keep": 20,
+    "grasp_sampler_candidates": 96,
+    "grasp_sampler_scenes": True,
+    # The compliant two-finger pads can wrap ordinary curved surfaces. Besides admitting
+    # those contacts, this emits the complementary side-approach roll that tight insertions
+    # often need. Vacuum curvature remains governed separately by --allow-curved-grasps.
+    "grasp_sampler_wrap": 0.015,
+    "grasp_refine": True,
+    # A standard search is a batch artifact-producing run.  Both remain explicitly
+    # reversible on the CLI via --view and --no-quiet-rai.
+    "quiet_rai": True,
+    "view": False,
+}
+
+_SEARCH_PROFILES = {
+    "standard": dict(_STANDARD_SEARCH_PROFILE),
+    # Same feasibility contract and candidate set as standard; only failed-witness effort is
+    # scheduled fairly instead of permanently blacklisting an edge after its first budget.
+    "open": {**_STANDARD_SEARCH_PROFILE, "open_witness": True},
+    # Aggressive performance overlay.  The exact-seed cap is a warm-start budget, not a sound
+    # unreachability test, so keep it visibly separate from the recommended open profile.
+    "fast-open": {
+        **_STANDARD_SEARCH_PROFILE,
+        "open_witness": True,
+        "analytic_seed_cap": 3,
+    },
+}
+
+_STANDARD_MOTION_PROFILE = {
+    # Complete both sides of every contact skill and preserve the coupled endpoints. Tight
+    # socket scenes may explicitly disable individual auxiliary funnels after the profile.
+    "pre_pick": 0.05,
+    "pre_place": 0.05,
+    "pre_add_grasp": 0.05,
+    "pre_insertion": 0.05,
+    "post_release": 0.05,
+    "fuse_cograsp": True,
+    "fuse_pre_skill": True,
+    # The simulator consumes an ordered mode chain. First-solution BiRRT plus a bounded,
+    # certified shortcut pass is the current reproduction path; phase scheduling later handles
+    # visual timing, so spending the whole wall budget on RRT* cost is not the standard.
+    "mp_sequence": True,
+    "mp_optimize": False,
+    "mp_runtime": 90.0,
+    "mp_stall_timeout": 30.0,
+    "mp_no_shortcut": False,
+    "mp_shortcut_iters": 100,
+    "mp_shortcut_strategy": "native",
+    "mp_shortcut_res": None,
+    # Collision/clearance certificate shared by every current robust MP artifact. A positive
+    # table margin remains scene-specific: no successful general artifact has validated one.
+    "mp_collision_tolerance": 1e-4,
+    "mp_robot_margin": 0.1,
+    "mp_margin_ramp": 0.1,
+    "mp_table_margin": 0.0,
+    "mp_cograsp": True,
+    "quiet_rai": True,
+    "view": False,
+}
+
+_MOTION_PROFILES = {"standard": dict(_STANDARD_MOTION_PROFILE)}
+
 def _rss_mb():
   # A1/A6 instrumentation probe: peak RSS of THIS process in MB (ru_maxrss is KiB on Linux).
   import resource
@@ -28,6 +137,21 @@ def build_parser():
       help="Load a RunConfig JSON file as the BASE configuration; any explicit command-line "
            "flag overrides the file's value (CLI wins). Write one with config.RunConfig.save "
            "or by hand. Without --config nothing changes (byte-identical default path).",
+  )
+  parser.add_argument(
+      "--search-profile", choices=tuple(_SEARCH_PROFILES), default=None, metavar="NAME",
+      help="Named fresh-search defaults: standard = robust 5mm witness contract + weighted "
+           "milestones; open = standard plus the bounded fair open-witness scheduler; "
+           "fast-open = open plus --analytic-seed-cap 3 (aggressive/experimental). A profile "
+           "is opt-in. Precedence is explicit flag > profile > --config file > built-ins, and "
+           "--parts/grippers/forces/layout/seed/save remain scene-specific.",
+  )
+  parser.add_argument(
+      "--motion-profile", choices=tuple(_MOTION_PROFILES), default=None, metavar="NAME",
+      help="Named motion-export/planning defaults. standard pins skill funnels/fusion, "
+           "sequence export, 1e-4 collision tolerance, 0.1m robot margin+ramp, first-solution "
+           "BiRRT (90s/30s stall), and 100 certified shortcuts. It does not imply "
+           "--motion-plan or guess --mp-seed/output paths. Precedence matches search profiles.",
   )
   g_scene   = parser.add_argument_group("scene & problem", "assembly, parts, robots, grippers, initial layout, goal")
   g_solver  = parser.add_argument_group("solver / engine", "which search algorithm runs + suboptimality weight")
@@ -142,8 +266,8 @@ def build_parser():
            "The knob that trades off how much relocation the layout forces.",
   )
   g_viz.add_argument(
-      "--no-view", dest="view", action="store_false",
-      help="Do not open the interactive viewer.",
+      "--view", action=argparse.BooleanOptionalAction, default=True,
+      help="Open the interactive viewer (default on; --no-view for batch runs).",
   )
   g_viz.add_argument(
       "--disp-final", dest="disp_final", action="store_true",
@@ -354,10 +478,25 @@ def build_parser():
            "RNG seeded from (--grasp-sampler-seed, shape), never the global stream.",
   )
   g_ik.add_argument(
-      "--grasp-sampler-keep", type=int, default=12, metavar="N",
-      help="--grasp-sampler: grasps kept per part shape after downsampling (default 12 -- "
-           "matches the enumerator's 6 faces x 2 rolls search load). Split ~half suction-"
-           "style, ~half antipodal.",
+      "--grasp-sampler-keep", type=int, default=20, metavar="N",
+      help="--grasp-sampler: TOTAL grasps kept per part (default 20). Hybrid V2 reserves "
+           "the conventional primitive grasps first, then fills the remaining budget with "
+           "scene/fleet-diverse surface samples. Mesh/compound parts use the whole budget. "
+           "Legacy V1 splits the budget ~half suction / half antipodal.",
+  )
+  g_ik.add_argument(
+      "--grasp-sampler-version", type=int, choices=(1, 2), default=2, metavar="V",
+      help="Sampled grasp database format. V2 (default) is the versioned HYBRID DB with a "
+           "stable conventional-grasp prefix, refinement-stable sampled ordering, and per-"
+           "gripper scene labels. V1 reconstructs plans made by the old replacement sampler.",
+  )
+  g_ik.add_argument("--grasp-sampler-db-hash", default=None, help=argparse.SUPPRESS)
+  g_ik.add_argument(
+      "--grasp-refine", action=argparse.BooleanOptionalAction, default=False,
+      help="With hybrid V2 sampling, search primitives first with the exact conventional "
+           "grasp prefix (mesh/compound parts still use samples), then retry with sampled "
+           "primitive extras only if that compact search finds no plan. Off exposes the full "
+           "hybrid DB immediately. The standard search profile enables staged refinement.",
   )
   g_ik.add_argument(
       "--grasp-sampler-candidates", type=int, default=200, metavar="M",
@@ -393,7 +532,7 @@ def build_parser():
            "insertion. Saved with the plan -- it rebinds grasp ids.",
   )
   g_ik.add_argument(
-      "--grasp-sampler-scenes", action="store_true",
+      "--grasp-sampler-scenes", action=argparse.BooleanOptionalAction, default=False,
       help="--grasp-sampler: SCENE-AWARE sampling (opt-in). Every raw candidate is tagged "
            "with two floating-EE verdicts -- feasible at the part's INITIAL pose (the PICK "
            "set) and feasible at the part's ASSEMBLED pose (the ASSEMBLE set) -- and the "
@@ -437,6 +576,20 @@ def build_parser():
       help="Use the optimistic (Dogar-style) per-part search -- add one part at a time via "
            "its own small complete sub-search (reorient/hold/pick/mate/set-down), with exact "
            "fallback -- instead of the exact search. Much faster on the cases that blow up.",
+  )
+  g_solver.add_argument(
+      "--optimistic-fallback", action=argparse.BooleanOptionalAction, default=True,
+      help="With --optimistic, fall back to the global exact search when a local part fill "
+           "fails (default on). Use --no-optimistic-fallback on instances whose global "
+           "backward abstraction is already known to exceed its state guard; the local "
+           "failure is then reported directly instead of starting the intractable path.",
+  )
+  g_solver.add_argument(
+      "--optimistic-chain-h", action=argparse.BooleanOptionalAction, default=False,
+      help="With --optimistic, build one PROJECTED signature heuristic over only the fixed "
+           "assembly-order prefix chain. It retains future rest-face, holder, grasp-class, "
+           "bracing and wrench guidance while allowing only one next loose part, avoiding "
+           "the global order-ideal/loose-part cross product. Experimental and off by default.",
   )
   g_solver.add_argument(
       "--milestones", action=argparse.BooleanOptionalAction, default=True,
@@ -741,11 +894,12 @@ def build_parser():
            "improvement pass completes. Use --weight inf for greedy fills (fastest).",
   )
   g_search.add_argument(
-      "--no-lazy-fills", action="store_false", dest="lazy_fills",
-      help="Disable LAZY-VALIDATED milestone fills (default on): fills search with the "
+      "--lazy-fills", action=argparse.BooleanOptionalAction, default=True,
+      help="LAZY-VALIDATED milestone/optimistic local fills (default on): fills search with the "
            "cheap gate only and run real IK on candidate subplan edges (LazySP hybrid, "
            "IK failures blacklisted + rerun) -- the measured fix for module fills "
-           "spending minutes on failed IK binds at pop.",
+           "spending minutes on failed IK binds at pop. --no-lazy-fills restores eager IK "
+           "validation at expansion for ablations.",
   )
   g_search.add_argument(
       "--open-witness", action=argparse.BooleanOptionalAction, default=False,
@@ -782,6 +936,17 @@ def build_parser():
            "before backjumping -- covers interleaved-glue plans, the milestone "
            "commitment's completeness gap; K=n would be the flat exact search. "
            "1 disables windows.",
+  )
+  g_search.add_argument(
+      "--milestone-oracle", choices=("global", "chain", "structural"), default="global",
+      help="Milestone-ordering ablation (default global). 'global' builds the backward "
+           "signature database and uses its cost-to-go plus grasp/brace hints. "
+           "'chain' builds the smaller signature projection over assembly_order only "
+           "(sequence assemblies; detached modules are rejected). "
+           "'structural' skips that database completely: dependency/module eligibility "
+           "and canonical part order choose milestones, while each fill uses only its "
+           "cheap local counting heuristic. Backtracking, adaptive fill windows, lazy IK, "
+           "and final settling are unchanged.",
   )
   g_search.add_argument(
       "--corridor-h", action="store_true",
@@ -956,12 +1121,14 @@ def build_parser():
            "the table for every later mode and walled BiRRT's transition sampler.",
   )
   g_search.add_argument(
-      "--quiet-rai", action="store_true",
+      "--quiet-rai", action=argparse.BooleanOptionalAction, default=False,
       help="Drop rai's libccd/pairCollision WARNING spam ('called MPR penetration for non "
            "intersecting meshes', 'but GJK says intersection'). rai prints those from C++ "
            "straight to the file descriptor, so a Python redirect cannot see them -- this "
            "splices a filter onto fd 1/2. Matches the SOURCE FILE, never the word WARNING, so "
-           "real diagnostics survive. Equivalent: export RAI_QUIET=1.",
+           "real diagnostics survive. Equivalent: export RAI_QUIET=1. A profile-enabled "
+           "value can be undone with --no-quiet-rai (unless the environment variable already "
+           "installed the process-wide filter before argument parsing).",
   )
   g_search.add_argument(
       "--mate-eq-weight", type=float, default=100.0, metavar="W",
@@ -1533,17 +1700,23 @@ def _warn_duplicate_flags(parser, argv):
 
 
 def parse_args(argv=None):
-  # Two-pass layering for --config: parse once to see if a config FILE was named; if so, load
-  # it as the parser's DEFAULTS and re-parse so unspecified flags take the file's value while
-  # any explicit command-line flag still wins (CLI > file > built-in default). Without --config
-  # this is exactly `build_parser().parse_args(argv)` -- one pass, byte-identical to before.
+  # Layer --config and named profile values as parser defaults, then parse the raw argv last:
+  # explicit flag > explicitly selected profile > config file > built-in default. The first
+  # parse only discovers the config/profile meta options. With none of them this remains the
+  # historical one-pass path.
   parser = build_parser()
   _warn_duplicate_flags(parser, argv)
   args = parser.parse_args(argv)
   if getattr(args, "config", None):
     from config import RunConfig
     parser.set_defaults(**RunConfig.from_file(args.config).to_dict())
-    args = parser.parse_args(argv)                          # file defaults + CLI overrides
+  if getattr(args, "search_profile", None):
+    parser.set_defaults(**_SEARCH_PROFILES[args.search_profile])
+  if getattr(args, "motion_profile", None):
+    parser.set_defaults(**_MOTION_PROFILES[args.motion_profile])
+  if (getattr(args, "search_profile", None) or getattr(args, "motion_profile", None)
+      or getattr(args, "config", None)):
+    args = parser.parse_args(argv)                       # layered defaults + CLI overrides
   return args
 
 
@@ -1577,6 +1750,8 @@ _SAVE_CONFIG_FIELDS = (
     "grasp_translations",                                # grasp ids index the DB
     "grasp_sampler", "grasp_sampler_keep",               # --grasp-sampler: sampled ids only
     "grasp_sampler_candidates", "grasp_sampler_seed",    # replay under identical settings
+    "grasp_sampler_version", "grasp_sampler_db_hash",    # algorithm + content identity
+    "grasp_refine",                                      # search provenance; replay uses full DB
     "grasp_sampler_margin", "grasp_sampler_pad_support",
     "grasp_sampler_wrap",                                 # curvature-fair support metric (None = legacy)
     "grasp_sampler_scenes",                              # scene-aware set split (rebinds ids)
@@ -1644,6 +1819,7 @@ _WITNESS_FIELDS = (
     "tight_fingers", "part_float", "hoist_releases", "witness_margin", "witness_draw",
     "witness_sets", "witness_set_spread",
     "grasp_sampler", "grasp_sampler_keep", "grasp_sampler_candidates", "grasp_sampler_seed",
+    "grasp_sampler_version", "grasp_sampler_db_hash",
     "grasp_sampler_margin", "grasp_sampler_pad_support", "grasp_sampler_wrap",
     "grasp_sampler_scenes")
 
@@ -1657,7 +1833,8 @@ def _witnesses_reusable(saved_cfg, cfg):
   from config import RunConfig
   # These two defaults became non-zero after saved witness blocks already existed.  Missing
   # keys therefore mean the historical OFF values, not today's fresh-run defaults.
-  legacy = {"witness_margin": None, "witness_sets": 0}
+  legacy = {"witness_margin": None, "witness_sets": 0,
+            "grasp_sampler_version": 1, "grasp_sampler_db_hash": None}
   bad = [k for k in _WITNESS_FIELDS
          if saved_cfg.get(k, legacy.get(k, RunConfig.default_for(k))) != getattr(cfg, k, None)]
   if bad:
@@ -1679,7 +1856,8 @@ _WITNESS_OPTIMIZER_FIELDS = {
 def _witnesses_baseline_compatible(saved_cfg, cfg):
   """Whether saved feasible keyframes are safe inputs under the current scene/IK gates."""
   from config import RunConfig
-  legacy = {"witness_margin": None, "witness_sets": 0}
+  legacy = {"witness_margin": None, "witness_sets": 0,
+            "grasp_sampler_version": 1, "grasp_sampler_db_hash": None}
   fields = [k for k in _WITNESS_FIELDS if k not in _WITNESS_OPTIMIZER_FIELDS]
   bad = [k for k in fields
          if saved_cfg.get(k, legacy.get(k, RunConfig.default_for(k))) != getattr(cfg, k, None)]
@@ -1717,7 +1895,7 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         bracing=cfg.bracing, geo_facts=cfg.geo_facts,
         sig_collapsed_h=cfg.sig_collapsed_h, labeled_h=cfg.labeled_h,
         collapsed_h=cfg.collapsed_h, grasp_collapsed_h=cfg.grasp_collapsed_h,
-        fill_window=cfg.fill_window)
+        fill_window=cfg.fill_window, milestone_oracle=cfg.milestone_oracle)
   elif cfg.bounded or cfg.dfbnb:
     plan = solve_assembly_problem_bounded(
         C, assembly, robots=robots, robot_ik=robot_ik, weight=cfg.weight,
@@ -1746,6 +1924,9 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
                                              wrench=cfg.wrench, handovers=cfg.handovers,
                                              allow_place=cfg.allow_place,
                                              bracing=cfg.bracing,
+                                             fallback=cfg.optimistic_fallback,
+                                             lazy_fills=cfg.lazy_fills,
+                                             chain_h=cfg.optimistic_chain_h,
                                              grasp_collapsed_h=cfg.grasp_collapsed_h,
                                              collapsed_h=cfg.collapsed_h,
                                              labeled_h=cfg.labeled_h,
@@ -1768,7 +1949,7 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         wrench=cfg.wrench, handovers=cfg.handovers, allow_place=cfg.allow_place,
         bracing=cfg.bracing, geo_facts=cfg.geo_facts,
         sig_collapsed_h=cfg.sig_collapsed_h, fill_window=cfg.fill_window,
-        lazy_fills=cfg.lazy_fills)
+        lazy_fills=cfg.lazy_fills, milestone_oracle=cfg.milestone_oracle)
   else:
     plan = solve_assembly_problem(C, assembly, robots=robots, canonical=cfg.canonical,
                                   weight=cfg.weight, robot_ik=robot_ik, wrench=cfg.wrench,
@@ -1842,6 +2023,41 @@ def run(cfg, explicit=None):
   # library callers. The dead-flag warnings below fire only for explicit flags.
   if cfg.optimize_witnesses == "off":          # 'floor' is the default; 'off' is the escape
     cfg.optimize_witnesses = None
+  _profile = getattr(cfg, "_search_profile", None)
+  if _profile:
+    print(f"[profile] search '{_profile}' resolved: weight={cfg.weight:g}, "
+          f"witness-margin={float(cfg.witness_margin or 0.0)*1000:g}mm, "
+          f"open-witness={'on' if cfg.open_witness else 'off'}"
+          + (f" batch={cfg.open_witness_batch} epochs={cfg.open_witness_epochs}"
+             if cfg.open_witness else "")
+          + f", analytic-seed-cap={cfg.analytic_seed_cap or 'all'}. "
+          "Explicit individual flags remain authoritative.")
+  _mp_profile = getattr(cfg, "_motion_profile", None)
+  if _mp_profile:
+    # mr_bench lives outside this repository and Numba cannot derive a writable source-local
+    # cache locator for it in common venv installs.  A standard profile must not require two
+    # undocumented exports merely to reach the first planner sample. Respect caller-provided
+    # locations; otherwise install process-local, reusable caches under /tmp before the late
+    # planner/matplotlib imports below.
+    _cache_defaults = {
+        "NUMBA_CACHE_DIR": "/tmp/assembly-numba-cache",
+        "MPLCONFIGDIR": "/tmp/assembly-mpl-cache",
+    }
+    _cache_installed = []
+    for _env_name, _cache_path in _cache_defaults.items():
+      if not _os.environ.get(_env_name):
+        _os.makedirs(_cache_path, exist_ok=True)
+        _os.environ[_env_name] = _cache_path
+        _cache_installed.append(f"{_env_name}={_cache_path}")
+    if _cache_installed:
+      print("[profile] writable caches installed: " + ", ".join(_cache_installed))
+    _stall = "none" if cfg.mp_stall_timeout is None else f"{cfg.mp_stall_timeout:g}s"
+    print(f"[profile] motion '{_mp_profile}' resolved: collision-tolerance="
+          f"{cfg.mp_collision_tolerance:g}m, robot-margin={cfg.mp_robot_margin:g}m, "
+          f"ramp={cfg.mp_margin_ramp:g}m, table-margin={cfg.mp_table_margin:g}m, "
+          f"runtime={cfg.mp_runtime:g}s, stall={_stall}, "
+          f"RRT*-optimize={'on' if cfg.mp_optimize else 'off'}, "
+          f"shortcuts={cfg.mp_shortcut_iters}. Explicit individual flags remain authoritative.")
   set_seed(cfg.seed)                           # reproducible numpy + rai (KOMO) RNG
   # MIXED END EFFECTORS (--grippers): per-robot vacuum/two_finger list; overrides --vacuum.
   gripper_list = None
@@ -1886,12 +2102,15 @@ def run(cfg, explicit=None):
     set_sampled_grasps({"seed": cfg.grasp_sampler_seed,
                         "candidates": cfg.grasp_sampler_candidates,
                         "keep": cfg.grasp_sampler_keep,
+                        "version": cfg.grasp_sampler_version,
                         "margin": cfg.grasp_sampler_margin,
                         "pad_support": cfg.grasp_sampler_pad_support,
                         "wrap": cfg.grasp_sampler_wrap})
-    print(f"[flag] --grasp-sampler ACTIVE: mesh-sampled grasp DB (trimesh surface sampling; "
-          f"{cfg.grasp_sampler_candidates} candidates -> {cfg.grasp_sampler_keep} kept per "
-          f"shape via farthest-point downsampling; suction + antipodal blocks; seed "
+    print(f"[flag] --grasp-sampler ACTIVE: V{cfg.grasp_sampler_version} "
+          + ("HYBRID conventional + mesh-sampled" if cfg.grasp_sampler_version >= 2
+             else "legacy replacement mesh-sampled")
+          + f" grasp DB ({cfg.grasp_sampler_candidates} raw candidates -> "
+          f"{cfg.grasp_sampler_keep} total kept per part; suction + antipodal blocks; seed "
           f"{cfg.grasp_sampler_seed}). Grasp ids index the SAMPLED list -- plans/witnesses "
           f"only replay under the same sampler settings (saved with the plan).")
   else:
@@ -2143,11 +2362,19 @@ def run(cfg, explicit=None):
   if cfg.grasp_sampler_scenes:
     from problem import install_sampled_scene_ctx
     install_sampled_scene_ctx(C, assembly, robots=get_robots(C))
-    print("[flag] --grasp-sampler-scenes ACTIVE: every sampled candidate is tagged with "
-          "floating-EE verdicts at its INITIAL pose (PICK set) and ASSEMBLED pose "
-          "(ASSEMBLE set); the keep budget splits into per-set quotas, so the DB provably "
-          "contains pick-able, assemble-able and free-space (handover) grasps per part. "
-          "Grasp ids are per PART INSTANCE.")
+    print("[flag] --grasp-sampler-scenes ACTIVE: every candidate is tagged PER GRIPPER KIND "
+          "with floating-EE verdicts at its INITIAL pose (PICK) and fully ASSEMBLED pose; "
+          "the bounded DB reserves diverse proposals for those contexts. Exact intermediate-"
+          "state cheap/IK gates remain authoritative. Grasp ids are per PART INSTANCE.")
+  if cfg.grasp_sampler:
+    from problem import sampled_grasp_db_signature
+    _db_hash = sampled_grasp_db_signature(assembly)
+    if cfg.grasp_sampler_db_hash is not None and cfg.grasp_sampler_db_hash != _db_hash:
+      raise SystemExit(
+          "sampled grasp database hash differs from the saved plan "
+          f"({cfg.grasp_sampler_db_hash} != {_db_hash}); use its recorded sampler version "
+          "or regenerate the plan -- refusing to silently rebind grasp ids")
+    cfg.grasp_sampler_db_hash = _db_hash
 
   if cfg.check_init:
     chk_robots = get_robots(C)
@@ -2439,11 +2666,28 @@ def run(cfg, explicit=None):
     else:
       try:
         print(f"[rss] peak RSS before solve: {_rss_mb():.0f} MB")   # A1/A6 instrumentation
+        _staged_grasps = bool(cfg.grasp_sampler and cfg.grasp_sampler_version >= 2
+                              and cfg.grasp_refine)
+        if _staged_grasps:
+          from problem import set_sampled_canonical_only
+          set_sampled_canonical_only(True)
+          print("[grasp-refine] epoch 0: primitive parts use the exact conventional grasp "
+                "prefix; mesh/compound parts keep their sampled DB. Sampled primitive "
+                "extras reopen only if this compact search exhausts.")
         plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
+        if plan is None and _staged_grasps:
+          set_sampled_canonical_only(False)
+          print("[grasp-refine] compact grasp search found no plan -> epoch 1 re-search with "
+                "the full hybrid DB (stable existing ids/witness cache retained).")
+          plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
       except IKFailureLogDone:
         print(f"[ik-failures] window/cap reached -- search stopped for debugging "
               f"({len(fail_rec.steps)} failures collected).")
         plan = None
+      finally:
+        if cfg.grasp_sampler:
+          from problem import set_sampled_canonical_only
+          set_sampled_canonical_only(False)               # post-passes/replay see full DB
     if robot_ik is not None and cfg.strict_collisions is not None:
       print(f"[strict-collisions] vetoed {robot_ik.strict_rejects} dirty KOMO witnesses "
             f"(> {cfg.strict_collisions:g}m total penetration).")
@@ -2459,10 +2703,10 @@ def run(cfg, explicit=None):
               f"(> {cfg.grasp_accuracy:g}m tool residual).")
       print(f"[mate-accuracy] vetoed {robot_ik.mate_rejects} under-seated mates "
             f"(> {cfg.mate_accuracy:g}m residual).")
-    if robot_ik is not None and plan is not None:
+    if robot_ik is not None:
       # A1 INSTRUMENTATION: where the real-IK time went + a peak-RSS checkpoint (A6).
       robot_ik.prof_report()
-      print(f"[rss] peak RSS after solve: {_rss_mb():.0f} MB")
+      print(f"[rss] peak RSS after solve attempt: {_rss_mb():.0f} MB")
     if fail_rec is not None and fail_rec.steps:
       print(f"[ik-failures] {len(fail_rec.steps)} failed binds recorded -- serving in "
             f"viser (Stop in the GUI to continue to the plan replay).")
@@ -2639,6 +2883,7 @@ def run(cfg, explicit=None):
           _export_table_margin = cfg.mp_table_margin
           _export_table_float = cfg.part_float if cfg.mp_table_margin else 0.0
           mp_pre = None
+          _pre_pin_robots = {}
           _cograsp_pre = {}
           if cfg.mp_export_load:
             _loaded_export = MP.load_export_bundle(
@@ -2754,6 +2999,10 @@ def run(cfg, explicit=None):
             mp_pre, _prep = fuse_pre_skill_witnesses(
                 C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
                 handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing)
+            _pre_pin_robots = dict(_prep.get("pin_robots") or {})
+            if _pre_pin_robots:
+              print(f"[pre] preserving accepted idle-arm pins in "
+                    f"{len(_pre_pin_robots)} exported funnel task(s).")
           # The generic pre-skill pass knows how to pin an ordinary funnel, but the cograsp
           # pass solves the stronger three-arm rendezvous. Its accepted keyframes therefore
           # win for the paired assemble indices.
@@ -2792,7 +3041,8 @@ def run(cfg, explicit=None):
                                  saved_step_names=(None if _loaded_export is None else
                                                    _loaded_export["step_names"]),
                                  saved_sequence_names=(None if _loaded_export is None else
-                                                       _loaded_export["sequence_names"]))
+                                                       _loaded_export["sequence_names"]),
+                                 pre_pin_robots=_pre_pin_robots)
           print(f"[motion-plan] {'DEPGRAPH' if _export_depgraph else 'SEQUENCE'} problem, "
                 f"{len(prob.tasks)} tasks")
           if _loaded_export is not None:
@@ -2841,9 +3091,10 @@ def run(cfg, explicit=None):
             MP.report_problem_clearance(prob, plan=plan, ref_scene=_ref,
                                         problem_assembly=assembly)
           if cfg.mp_modes:
-            import os as _os, sys as _sys
+            import sys as _modes_sys
             MP._ensure_mrbench()
-            _sys.path.insert(0, _os.path.join(_os.path.dirname(MP._MRBENCH_SRC), "scripts"))
+            _modes_sys.path.insert(
+                0, _os.path.join(_os.path.dirname(MP._MRBENCH_SRC), "scripts"))
             from show_problems import visualize_modes
             print(f"[motion-plan] serving MODES on http://localhost:{cfg.viser_port}")
             visualize_modes(prob, use_viser=True)
@@ -2921,7 +3172,20 @@ def main(argv=None, args=None):
   if args is None:
     args = parse_args(argv)
     explicit = _scan_flags(build_parser(), argv)[1]
-  return run(RunConfig.from_namespace(args), explicit=explicit)
+    # A motion profile is an explicit request to retune these fields, including when loading
+    # an embedded final export. Mark its members explicit so the artifact-layer merge does not
+    # silently reclaim collision/margin values merely because they came from a bundle rather
+    # than individually spelled flags.
+    if getattr(args, "motion_profile", None):
+      explicit.update(_MOTION_PROFILES[args.motion_profile])
+  cfg = RunConfig.from_namespace(args)
+  # The label is diagnostic provenance only; RunConfig contains the resolved values and stays
+  # usable without the CLI/profile layer.
+  if getattr(args, "search_profile", None):
+    cfg._search_profile = args.search_profile
+  if getattr(args, "motion_profile", None):
+    cfg._motion_profile = args.motion_profile
+  return run(cfg, explicit=explicit)
 
 
 if __name__ == "__main__":

@@ -155,7 +155,8 @@ class _PairedGoal:
 
 def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
                 home_state, pre_witnesses=None, witness_sets=None,
-                resolved_pre_witnesses=None, resolve_missing_pre=True):
+                resolved_pre_witnesses=None, resolve_missing_pre=True,
+                pre_pin_robots=None):
   """Map the plan+witnesses to (tasks, sequence_names). robot_idx: {r: [joint indices]}
   in the problem config's joint order; witnesses[i] is the full-config keyframe for plan[i]
   (None for non-IK actions -> skipped, no motion goal needed).
@@ -164,6 +165,10 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
   keyframes ready-made, from solver.fuse_pre_skill_witnesses. None (the default) keeps the
   historical behaviour: each split solves its own pre keyframe here, inside the export. A
   missing SKILL witness, by contrast, is a hard error -- it cannot be substituted.
+
+  `pre_pin_robots` records the idle arms that an ACCEPTED fused pre-keyframe held fixed.  Those
+  arms participate in that GOTO only, so the mode switch uses the known-safe full keyframe
+  instead of randomizing joints whose safety was already established by the fused solve.
 
   `witness_sets` (--witness-sets, {plan index: [full vectors, member 0 == witnesses[i]]}):
   the covered task's goal becomes an mr_bench GoalSet over the members. Every member shares
@@ -395,8 +400,11 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       print(f"  [pre] {i:02d} {kind}: NO pre keyframe -- the goto goal equals the skill goal "
             f"(zero-length funnel)")
     if not members:
-      pre_goal = goal_for(involved, pre_wit if pre_wit is not None else wit) # cur := T_pre
-      return [(pan, Task(pan, involved, pre_goal, type="goto")),
+      pin_rs = list((pre_pin_robots or {}).get(i, ()))
+      pre_involved = list(dict.fromkeys(list(involved) + pin_rs))
+      pre_goal = goal_for(pre_involved,
+                          pre_wit if pre_wit is not None else wit)           # cur := T_pre
+      return [(pan, Task(pan, pre_involved, pre_goal, type="goto")),
               (name, mk_skill(goal_for(involved, wit)))]                     # cur := real witness
 
     # GoalSets used to be silently discarded by every pre-skill split. Solve one funnel mouth
@@ -1228,7 +1236,7 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
                  robot_robot_margin=0.0, robot_margin_ramp=0.0, table_margin=0.0,
                  table_float=0.0, witness_sets=None, resolved_pre_witnesses=None,
                  resolve_missing_pre=True, task_records=None, saved_step_names=None,
-                 saved_sequence_names=None):
+                 saved_sequence_names=None, pre_pin_robots=None):
   """Build a live mr_bench problem from our solved plan. depgraph=False -> SequenceMixin (a
   fixed total order); depgraph=True -> DependencyGraphMixin (the partial order, so the planner
   may reorder independent actions). Same tasks/frames/witnesses either way."""
@@ -1266,7 +1274,8 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
             assembly, plan, witnesses, states, self.robots, self.robot_idx, robot_ik, home,
             pre_witnesses=pre_witnesses, witness_sets=witness_sets,
             resolved_pre_witnesses=resolved_pre_witnesses,
-            resolve_missing_pre=resolve_missing_pre)
+            resolve_missing_pre=resolve_missing_pre,
+            pre_pin_robots=pre_pin_robots)
       else:
         # FINAL-EXPORT replay: task goals/effects are data, not something inferred again from
         # today's exporter. This closes the second drift channel after IK: a later change to

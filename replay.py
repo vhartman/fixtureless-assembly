@@ -125,6 +125,9 @@ def build_scene(cfg):
   set_sampled_grasps({"seed": int(_saved(cfg, "grasp_sampler_seed")),
                       "candidates": int(_saved(cfg, "grasp_sampler_candidates")),
                       "keep": int(_saved(cfg, "grasp_sampler_keep")),
+                      # Missing means the replacement V1 database used by every historical
+                      # sampled plan. Never rebuild an old positional grasp id as hybrid V2.
+                      "version": int(_saved(cfg, "grasp_sampler_version", legacy=1)),
                       # LEGACY-FAITHFUL: a plan saved BEFORE the edge margin existed carries
                       # no key and was built with NO margin -- reconstructing it at today's
                       # DEFAULT would rebind every saved grasp id. Missing => 0.0, not 0.008.
@@ -198,6 +201,14 @@ def build_scene(cfg):
     # replay scene must install the same filter context or every saved grasp id misreads.
     from problem import install_sampled_scene_ctx, get_robots as _get_robots
     install_sampled_scene_ctx(C, assembly, robots=_get_robots(C))
+  _expected_db = cfg.get("grasp_sampler_db_hash")
+  if _expected_db:
+    from problem import sampled_grasp_db_signature
+    _actual_db = sampled_grasp_db_signature(assembly)
+    if _actual_db != _expected_db:
+      raise ValueError(
+          "saved sampled-grasp database hash does not match this rebuild "
+          f"({_expected_db} != {_actual_db}); refusing to reinterpret positional grasp ids")
   return C, assembly
 
 

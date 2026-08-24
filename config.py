@@ -55,6 +55,8 @@ class RunConfig:
   # -- solver / engine --
   solve: bool = False
   optimistic: bool = False
+  optimistic_fallback: bool = True
+  optimistic_chain_h: bool = False
   milestones: bool = True
   lazy: bool = False
   anytime: Optional[float] = None
@@ -88,6 +90,7 @@ class RunConfig:
   place_cells: int = 0
   prefer_center: bool = False
   fill_window: int = 2
+  milestone_oracle: str = "global"
   lazy_fills: bool = True
   open_witness: bool = False
   open_witness_epochs: int = 2
@@ -145,9 +148,12 @@ class RunConfig:
   place_eq_weight: Optional[float] = 100.0
   grasp_translations: int = 0
   grasp_sampler: bool = False
-  grasp_sampler_keep: int = 12
+  grasp_sampler_keep: int = 20
   grasp_sampler_candidates: int = 200
   grasp_sampler_seed: int = 0
+  grasp_sampler_version: int = 2
+  grasp_sampler_db_hash: Optional[str] = None
+  grasp_refine: bool = False
   grasp_sampler_margin: float = 0.008
   grasp_sampler_pad_support: float = 0.75
   grasp_sampler_wrap: Optional[float] = None
@@ -302,6 +308,12 @@ class RunConfig:
       d.pop("_search_witness_margin", None)
       for key, value in legacy.items():
         d.setdefault(key, value)
+    # Before sampler V2 existed, every JSON carrying `grasp_sampler: true` meant the old
+    # replacement database. Treat an absent version as V1 for both saved plans and standalone
+    # historical config files; otherwise positional grasp ids silently change meaning.
+    if d.get("grasp_sampler") and "grasp_sampler_version" not in d:
+      d = dict(d)
+      d["grasp_sampler_version"] = 1
     return cls.from_dict(d)
 
 

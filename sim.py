@@ -4937,6 +4937,55 @@ def replay_recording(path, speed=1.0, loop=True):
 # that. The scene is rebuilt with replay.build_scene (the same reconstruction the rai replay
 # uses), so there is a single source of truth for the scene and zero solver duplication.
 # ---------------------------------------------------------------------------------------------
+_STANDARD_SIM_PROFILE = {
+    # Persisted real-arm path and the established collision-audited timing pipeline.
+    "v2": True,
+    "actuated": True,
+    "skill_servo": True,
+    "arm_arm_contacts": True,
+    "spline": True,
+    "phase_schedule": True,
+    "phase_servo_time": 0.15,
+    "phase_smooth": True,
+    "phase_smooth_time": 0.12,
+    "phase_batch": True,
+    "phase_batch_min_motion": 0.08,
+    "phase_batch_max_gap": 0.35,
+    "phase_audit_resolution": 0.01,
+    # Runtime convergence/contact guards. The normalized wrench guard is intentionally
+    # profile-owned: its historical global default is off for old artifact reproduction.
+    "settle_tol": 0.002,
+    "settle_max": 1.0,
+    "servo_force": 6.0,
+    "servo_max_dev": 0.010,
+    "servo_torque_guard": 0.6,
+    "servo_tol": 0.002,
+    # Wrench-aware rate tables remain a physical backstop even though phase scheduling uses
+    # the visual cruise directly. Corner impulses are part of that contract.
+    "force_limits": True,
+    "corner_limits": True,
+    "inertia_factor": 1.0,
+    "wrench_margin": 1.0,
+    # Fail closed on a saved diagonal that violates the MP geometry or joint limits.
+    "path_preflight": True,
+    "path_preflight_tolerance": PATH_PREFLIGHT_TOL,
+    "path_preflight_resolution": 0.01,
+    # Robot-independent visual/physics baseline. FR3 currently overrides these explicitly.
+    "joint_rate": 1.0,
+    "mass_scale": 1.0,
+    "coll_scale": 1.0,
+    # Make the selected algorithm unambiguous; these remain available as explicit ablations.
+    "corridor": False,
+    "corridor_online": False,
+    "pace": False,
+    "phase_intent": False,
+    "c2_spline": False,
+    "limit_rate": False,
+}
+
+_SIM_PROFILES = {"standard": dict(_STANDARD_SIM_PROFILE)}
+
+
 def _gripper_kinds_from_cfg(cfg, robots):
   ks = [k.strip() for k in (cfg.get("grippers") or "").split(",") if k.strip()]
   if ks:                                                    # mixed EEs (--grippers CSV)
@@ -4976,6 +5025,10 @@ def _states_from_plan(cfg, C, asm, robots, plan):
 
 def _cli_run(a):
   global JOINT_RATE, ARM_ARM_CONTACTS
+  if getattr(a, "sim_profile", None):
+    print("[profile] sim 'standard' resolved: saved real-arm path, actuated skill servo, "
+          "collision-audited phase schedule + smoothing/batching, strict preflight, and "
+          "0.6 normalized wrench guard. Explicit individual flags remain authoritative.")
   if a.phase_schedule and a.corridor_online:
     raise SystemExit("[sim] --phase-schedule and --corridor-online are mutually exclusive")
   if a.phase_servo_time < 0.0:
@@ -5358,6 +5411,12 @@ def _build_cli():
 
   r = sub.add_parser("run", help="execute a saved plan (main.py --save) in physics")
   r.add_argument("path", help="plan JSON written by `main.py ... --save plan.json`")
+  r.add_argument("--sim-profile", choices=tuple(_SIM_PROFILES), default=None, metavar="NAME",
+                 help="Named execution defaults. 'standard' selects the fail-closed saved-"
+                      "path reproduction pipeline: actuated skill servo, physical arm-arm "
+                      "contacts, spline + phase schedule/smoothing/batching, normalized wrench "
+                      "guard, and strict path preflight. Explicit individual flags win. "
+                      "--mp-path/--record and robot-specific calibrations remain per run.")
   r.add_argument("--v2", action=argparse.BooleanOptionalAction, default=True,
                  help="REAL-ARM motion-plan execution: load the saved final MP export/path (or "
                       "build them for a fresh plan), then FK-synced arms follow the path in "
@@ -5551,6 +5610,9 @@ def _build_cli():
                       "breakaway cap (e.g. 0.6). Uses the same weld wrench and caps as the "
                       "breakage monitor, but ignores gravity-only utilization so transport "
                       "cannot deadlock. Default off (byte-identical).")
+  r.add_argument("--no-servo-torque-guard", action="store_const", const=None,
+                 dest="servo_torque_guard", default=argparse.SUPPRESS,
+                 help="Disable the standard profile's normalized grasp-wrench guard.")
   r.add_argument("--servo-tol", type=float, default=0.002, metavar="M",
                  help="--skill-servo: seat-servo convergence tolerance (default 2mm).")
   r.add_argument("--corridor-online", action="store_true",
@@ -5798,8 +5860,22 @@ def _build_cli():
   return p
 
 
+def parse_args(argv=None):
+  """Parse sim CLI with explicit flag > named profile > built-in default precedence."""
+  parser = _build_cli()
+  args = parser.parse_args(argv)
+  if getattr(args, "cmd", None) == "run" and getattr(args, "sim_profile", None):
+    # Profile fields belong to the run subparser; root defaults would be overwritten by that
+    # subparser's action defaults. Layer them there, then let the raw CLI parse last.
+    sub = next(a for a in parser._actions if getattr(a, "choices", None)
+               and "run" in a.choices)
+    sub.choices["run"].set_defaults(**_SIM_PROFILES[args.sim_profile])
+    args = parser.parse_args(argv)
+  return args
+
+
 if __name__ == "__main__":
-  args = _build_cli().parse_args()
+  args = parse_args()
   if args.cmd == "run":
     try:
       _cli_run(args)

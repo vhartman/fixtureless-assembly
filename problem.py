@@ -73,6 +73,10 @@ class Assembly:
     # assembled orientation is axle-sideways; the anchor pose carries the rotation, and the
     # whole placement-face system composes on the anchor, so nothing else changes.
     self.scatter_orientations = {}
+    # Optional offsets for the nominal line layout. Long heterogeneous parts can overlap a
+    # neighbour even when their frame centres obey the generic pitch. Random/grid layouts
+    # deliberately ignore these offsets because they choose complete poses themselves.
+    self.scatter_offsets = {}
     # CONNECT (module-join) mates: parts whose mate onto their parent joins two independently
     # built MODULES rather than adding a part within one. Their mate edge is NOT traversed by
     # `_mate_closure` (so each module's internal build precedence excludes the join), which is
@@ -357,8 +361,16 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
           pos = np.array([(c - (cols - 1) / 2.0) * pitch,
                           (r - (rows - 1) / 2.0) * pitch, z])
       else:
-          row, col = divmod(i, per_row)
+          # The historic line spans [-0.5,+0.5]. With a larger explicit pitch, reduce the
+          # number of columns instead of placing late parts at x=0.7/0.9 beyond real-arm
+          # reach. Default 1/7m spacing still yields eight columns and stays byte-identical.
+          pitch = max(float(spacing), 1e-9)
+          reachable_cols = int(np.floor(1.0 / pitch + 1e-9)) + 1
+          row, col = divmod(i, max(1, min(int(per_row), reachable_cols)))
           pos = np.array([-0.5 + col * spacing, row * spacing, z])
+          if random_init is None:
+              pos = pos + np.asarray(assembly.scatter_offsets.get(name, np.zeros(3)),
+                                     dtype=float)
 
       sq = _shape_quat(spec) if spec[0] != "compound" else None
       obj = C.addFrame(name).setParent(C.getFrame("table"))
@@ -783,7 +795,7 @@ class FixtureRackAssembly(Assembly):
   def __init__(self, n_parts=7, max_stations=6, station_pitch=0.075,
                rail_depth=0.050, rail_height=0.025, post_width=0.025,
                post_height=0.100, bracket_length=0.070, bracket_height=0.025,
-               corner_radius=0.002):
+               corner_radius=0.002, mate_clearance=0.002):
     self.max_stations = int(max_stations)
     self.n_parts = min(max(1, int(n_parts)), 1 + 2 * self.max_stations)
     self.station_pitch = float(station_pitch)
@@ -793,6 +805,14 @@ class FixtureRackAssembly(Assembly):
     self.post_height = float(post_height)
     self.bracket_length = float(bracket_length)
     self.bracket_height = float(bracket_height)
+    # Keep nominally assembled parts outside one another's collision skin.  The fixture was
+    # originally authored with exactly coincident faces; unlike a socket, there is no free
+    # space around those faces, so tiny IK/interpolation residuals made an otherwise valid
+    # assembled group fail the motion planner's 0.1 mm penetration contract.  The symbolic
+    # mate still makes the parts one rigid group after the switch; this is only a small,
+    # visible seam in the benchmark geometry (the same role as fit clearance in peg scenes).
+    self.mate_clearance = float(mate_clearance)
+    assert self.mate_clearance >= 0.0
     self.cube_size = max(self.rail_depth, self.post_height)  # scatter/marker scale only
     self.cube_radius = float(corner_radius)
     super().__init__()
@@ -803,9 +823,18 @@ class FixtureRackAssembly(Assembly):
     rail_length = max(0.12, self.station_pitch * max(0, n_stations - 1) + 0.08)
     self.objects = [f"obj_{i}" for i in range(self.n_parts)]
     self.base = "obj_0"
+    # The rail grows to 0.38m while ordinary parts are only 25--70mm wide. Give it a separate
+    # initial lane so fixture-rack-10 at 0.2m pitch does not intersect obj_1 before search.
+    self.scatter_offsets["obj_0"] = np.array([0.0, -0.15, 0.0])
     self.part_shapes["obj_0"] = (
         "box", [rail_length, self.rail_depth, self.rail_height, r])
-    self.masses["obj_0"] = 0.45 + 0.12 * n_stations
+    # The fixture is a small wood/polymer rack, not a solid steel tooling block.  The old
+    # values implied roughly 3.2 t/m^3 for the rail and made a small five-part assembly weigh
+    # 1.29 kg.  That can pass the quasi-static LP only by sharing load perfectly across
+    # co-grasps, while MuJoCo's individual 0.4 Nm breakaway welds necessarily see transiently
+    # unequal load and fail.  The calibrated values correspond to a consistent ~500--700
+    # kg/m^3 wood/polymer material density.
+    self.masses["obj_0"] = 0.084375 + 0.0225 * n_stations
 
     x0 = -0.5 * self.station_pitch * max(0, n_stations - 1)
     for station in range(n_stations):
@@ -816,9 +845,11 @@ class FixtureRackAssembly(Assembly):
       if post_i < self.n_parts:
         self.part_shapes[post] = (
             "box", [self.post_width, self.post_width, self.post_height, r])
-        self.masses[post] = 0.18
+        self.masses[post] = 0.03375
         self.assembly_relative_poses[post] = [
-            "obj_0", np.array([x, 0.0, 0.5 * (self.rail_height + self.post_height)])]
+            "obj_0", np.array([x, 0.0,
+                               0.5 * (self.rail_height + self.post_height)
+                               + self.mate_clearance])]
         self.mate_axes[post] = np.array([0.0, 0.0, -1.0])
 
       if bracket_i < self.n_parts:
@@ -826,12 +857,14 @@ class FixtureRackAssembly(Assembly):
         side = 1.0 if station % 2 == 0 else -1.0
         self.part_shapes[bracket] = (
             "box", [self.post_width, self.bracket_length, self.bracket_height, r])
-        self.masses[bracket] = 0.12
-        # Touch the post side and sit in its upper quarter. The mate axis points back toward
-        # the post, so this is a true lateral press rather than a diagonal bookkeeping mate.
+        self.masses[bracket] = 0.0225
+        # Approach the post side and sit in its upper quarter.  The small final seam is the
+        # collision clearance above; the mate axis still points back toward the post, so this
+        # remains a true lateral press rather than a diagonal bookkeeping mate.
         self.assembly_relative_poses[bracket] = [
             post,
-            np.array([0.0, side * 0.5 * (self.post_width + self.bracket_length),
+            np.array([0.0, side * (0.5 * (self.post_width + self.bracket_length)
+                                  + self.mate_clearance),
                       0.25 * self.post_height])]
         self.mate_axes[bracket] = np.array([0.0, -side, 0.0])
         self.assembly_dependencies[bracket] = [post]
@@ -1928,10 +1961,11 @@ def set_dense_grasps(flag):
 # list, and part_grasp_poses / part_grasp_surfaces / part_grasp_face_min_dims all delegate
 # to ONE jointly-computed, memoized (poses, surfaces, min_dims) triple so the three
 # parallel views can never shear. OFF (default) = byte-identical to the enumerator.
-_SAMPLED_GRASPS = None         # None = off; else {"seed": int, "candidates": int, "keep": int}
+_SAMPLED_GRASPS = None         # None = off; else versioned sampler configuration
 _SAMPLED_VIEWS_CACHE = {}
 _SAMPLED_META_CACHE = {}          # same key: per-candidate gate diagnostics (not the DB)
 _SAMPLED_SCENE_CTX = None         # --grasp-sampler-scenes: pick/assembly filter context
+_SAMPLED_CANONICAL_ONLY = False   # staged search refinement; IDs/DB itself never changes
 _MAX_GRASP_WIDTH = 0.078       # two-finger max pinch width. The fixed-open robotiq pads
   # measure ~82mm inner gap (robotiq_tight.g capsules); 78mm keeps a seating margin. The EE
   # collision filter stays the final arbiter -- this only prunes hopeless candidates early.
@@ -1942,8 +1976,9 @@ def set_sampled_grasps(mode):
   seed / candidates / keep. Call once at startup, BEFORE any grasp precomputation, like
   set_rolls_per_face -- grasp ids index the per-shape candidate list, so flipping this
   mid-run rebinds every saved grasp id."""
-  global _SAMPLED_GRASPS
+  global _SAMPLED_GRASPS, _SAMPLED_CANONICAL_ONLY
   _SAMPLED_GRASPS = None if mode is None else {
+      "version": int(mode.get("version", 1)),
       "seed": int(mode.get("seed", 0)),
       "candidates": max(8, int(mode.get("candidates", 200))),
       "keep": max(2, int(mode.get("keep", 12))),
@@ -1952,6 +1987,18 @@ def set_sampled_grasps(mode):
       "wrap": (None if mode.get("wrap") is None else float(mode.get("wrap")))}
   _SAMPLED_VIEWS_CACHE.clear()
   _SAMPLED_META_CACHE.clear()
+  _SAMPLED_CANONICAL_ONLY = False
+
+
+def set_sampled_canonical_only(on=False):
+  """Restrict V2 PRIMITIVE grasp tables to their conventional prefix for a search epoch.
+
+  Mesh/compound parts have no conventional database and always retain their samples. This
+  changes only which already-stable ids enter precomputed grasp tables; the DB, hashes, saved
+  actions and replay meanings never change.
+  """
+  global _SAMPLED_CANONICAL_ONLY
+  _SAMPLED_CANONICAL_ONLY = bool(on)
 
 
 def install_sampled_scene_ctx(C, assembly, robots=None):
@@ -1966,7 +2013,13 @@ def install_sampled_scene_ctx(C, assembly, robots=None):
   from solver import _search_context            # deferred: solver imports us at module top
   if robots is None:
     robots = get_robots(C)
-  checker, _table = _search_context(C, assembly, robots)   # the search's own checker geometry
+  checker, _table = _search_context(C, assembly, robots, build_table=False)
+  # One representative robot per gripper KIND. Explicit sampler poses have no action/robot
+  # yet, so test each geometry separately and retain a per-kind verdict mask. The historical
+  # path passed a robot-less pose to a mixed checker, which silently used slot zero.
+  kind_robot = {}
+  for r in robots:
+    kind_robot.setdefault(checker._robot_kind[r], r)
   s0 = get_initial_state(C, assembly)
   s_full = _full_assembly_state(assembly, s0)
   poses_pick = tuple(sorted((p, tuple(np.round(np.asarray(s0.poses[p], dtype=float), 4)))
@@ -1975,7 +2028,8 @@ def install_sampled_scene_ctx(C, assembly, robots=None):
       _state_part_poses(s_full, assembly, lift=0.0)[p], dtype=float), 4)))
                             for p in assembly.objects))
   sig = ("scenes", poses_pick, poses_asm)
-  _SAMPLED_SCENE_CTX = {"checker": checker, "s0": s0, "s_full": s_full,
+  _SAMPLED_SCENE_CTX = {"checker": checker, "kind_robot": kind_robot,
+                        "s0": s0, "s_full": s_full,
                         "assembly": assembly, "sig": sig}
   _SAMPLED_VIEWS_CACHE.clear()
   _SAMPLED_META_CACHE.clear()
@@ -2363,15 +2417,209 @@ def _fps_downsample(feats, keep):
   return sorted(chosen)
 
 
+def _fps_row_order(rows):
+  """Deterministic farthest-first ORDER, independent of the final retained count.
+
+  Taking a longer prefix appends grasp ids instead of rebinding old ones, which makes V2 safe
+  for a later search-side grasp-refinement epoch.
+  """
+  if not rows:
+    return []
+  def feat(row):
+    pose = np.asarray(row[0], dtype=float)
+    R = _quat_to_R(pose[3:])
+    return np.concatenate([pose[:3], 0.02 * R[:, 0], 0.02 * R[:, 1], 0.02 * R[:, 2]])
+  F = np.asarray([feat(r) for r in rows], dtype=float)
+  chosen, left = [0], np.ones(len(rows), dtype=bool)
+  left[0] = False
+  d = np.linalg.norm(F - F[0], axis=1)
+  while np.any(left):
+    i = int(np.argmax(np.where(left, np.round(d, 12), -np.inf)))
+    chosen.append(i); left[i] = False
+    d = np.minimum(d, np.linalg.norm(F - F[i], axis=1))
+  return [rows[i] for i in chosen]
+
+
+def _canonical_sample_rows(spec, offset):
+  """Conventional primitive grasps in the sampled row representation.
+
+  The order is deliberately byte-for-byte the legacy enumerator order (face-major, then roll):
+  existing search tie-breaks and action ids remain unchanged. Mesh and compound shapes have no
+  honest six-face semantics and contribute no conventional prefix.
+  """
+  if spec[0] in ("mesh", "compound"):
+    return []
+  h = _shape_half_extents(spec)
+  rows = []
+  for normal in _CUBE_FACE_NORMALS:
+    for roll in range(_ROLLS_PER_FACE):
+      standoff = float(np.abs(normal) @ h) + offset
+      angle = roll * (np.pi / _ROLLS_PER_FACE)
+      roll_q = np.array([np.cos(angle / 2.0), 0.0, 0.0, np.sin(angle / 2.0)])
+      q = _quat_mul(_grasp_quat_for_normal(normal), roll_q)
+      pose = np.concatenate([standoff * normal, q])
+      surf, mind = _surface_class_and_min_dim(spec, normal)
+      contact = (standoff - offset) * normal
+      rows.append((pose, surf, float(mind), np.concatenate([contact, 0.02 * normal]),
+                   float("inf"), 1.0, "canonical", False))
+  return rows
+
+
+def _poses_near(a, b, pos_tol=1e-3, angle_tol=np.deg2rad(5.0)):
+  a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+  if float(np.linalg.norm(a[:3] - b[:3])) > pos_tol:
+    return False
+  dot = min(1.0, abs(float(np.dot(a[3:], b[3:]))))
+  return 2.0 * np.arccos(dot) <= angle_tol
+
+
+def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
+  """Select the bounded V2 DB and return ``[(row, metadata), ...]``.
+
+  Conventional primitive grasps are an immutable prefix. Sampled rows are ordered by a
+  round-robin over fleet/scene/family strata, with farthest-first order inside every stratum.
+  All rankings are independent of ``keep``; a larger budget therefore preserves every old id.
+  """
+  def part_pose(row):
+    pose = np.asarray(row[0], dtype=float)
+    if shape_quat is None:
+      return pose
+    return np.concatenate([_quat_to_R(shape_quat) @ pose[:3],
+                           _quat_mul(shape_quat, pose[3:])])
+
+  checker = None if ctx is None else ctx["checker"]
+  kind_robot = {} if ctx is None else ctx["kind_robot"]
+  asm = None if ctx is None else ctx["assembly"]
+  seal = float(wrench.PARAMS.get("vacuum_seal_diameter", 0.0))
+
+  def enrich(row, origin):
+    roles = {}
+    for kind, robot in sorted(kind_robot.items()):
+      # Pinch rows deliberately carry min_dim=0 and are not vacuum candidates. Canonical and
+      # suction rows still need a flat patch large enough to seal.
+      kind_ok = not (kind == "vacuum" and
+                     (row[6] == "pinch" or row[1] == "curved" or row[2] < seal))
+      hits = []
+      if kind_ok:
+        pose = part_pose(row)
+        if checker.pose_collision_free(ctx["s0"], part, pose, asm, robot=robot):
+          hits.append("pick")
+        if checker.pose_collision_free(ctx["s_full"], part, pose, asm, robot=robot):
+          hits.append("assemble")
+      roles[kind] = tuple(hits)
+    return (row, {"origin": origin, "scene_by_kind": roles,
+                  "sets": tuple(sorted({x for xs in roles.values() for x in xs}))})
+
+  canonical = [enrich(r, "canonical") for r in _canonical_sample_rows(spec, offset)]
+  if len(canonical) >= keep:
+    return canonical[:keep]
+
+  margin = float(_SAMPLED_GRASPS.get("margin", 0.0))
+  support = float(_SAMPLED_GRASPS.get("pad_support", 0.0))
+  raw = [r for r in list(suction) + list(antip)
+         if not any(_poses_near(part_pose(r), part_pose(c[0])) for c in canonical)]
+  raw_good = [r for r in raw if r[4] >= margin and r[5] >= support]
+  raw_good_ids = {id(r) for r in raw_good}
+  raw_bad = sorted((r for r in raw if id(r) not in raw_good_ids),
+                   key=lambda r: (-r[5], -r[4], tuple(np.round(r[0], 9))))
+
+  # Scene collision checks are much dearer than mesh sampling. Classifying all ~600 raw
+  # pinch-roll rows cost 60-80 seconds on car-mini before search even began. Probe a fixed,
+  # K-INDEPENDENT farthest-first master pool instead: enough diversity for any practical K,
+  # while preserving prefix identity when only `keep` grows during refinement.
+  probe_categories = []
+  for pred in (lambda r: r[6] == "suction",
+               lambda r: r[6] == "pinch" and not r[7],
+               lambda r: r[6] == "pinch" and r[7]):
+    block = [r for r in raw_good if pred(r)]
+    if block:
+      probe_categories.append(_fps_row_order(block))
+  if raw_bad:
+    probe_categories.append(_fps_row_order(raw_bad))
+  probe, probe_seen, cursors = [], set(), [0] * len(probe_categories)
+  probe_cap = min(len(raw), 64 if spec[0] in ("mesh", "compound") else 32)
+  while len(probe) < probe_cap:
+    progressed = False
+    for j, block in enumerate(probe_categories):
+      while cursors[j] < len(block) and id(block[cursors[j]]) in probe_seen:
+        cursors[j] += 1
+      if cursors[j] >= len(block):
+        continue
+      row = block[cursors[j]]; cursors[j] += 1
+      probe.append(row); probe_seen.add(id(row)); progressed = True
+      if len(probe) >= probe_cap:
+        break
+    if not progressed:
+      break
+  sampled = [enrich(r, "sampled") for r in probe]
+
+  good = [e for e in sampled if e[0][4] >= margin and e[0][5] >= support]
+  good_ids = {id(e[0]) for e in good}
+  bad = sorted((e for e in sampled if id(e[0]) not in good_ids),
+               key=lambda e: (-e[0][5], -e[0][4], tuple(np.round(e[0][0], 9))))
+
+  def ordered(entries):
+    by_id = {id(e[0]): e for e in entries}
+    return [by_id[id(r)] for r in _fps_row_order([e[0] for e in entries])]
+
+  categories = []
+  # Scene/fleet needs first. A row may appear in several categories; round-robin deduplication
+  # turns that into useful multi-purpose priority rather than duplicate ids.
+  for kind in sorted(kind_robot):
+    usable = [e for e in good if (kind != "vacuum" or
+              (e[0][6] != "pinch" and e[0][1] != "curved" and e[0][2] >= seal))]
+    for role in ("pick", "assemble"):
+      block = [e for e in usable if role in e[1]["scene_by_kind"].get(kind, ())]
+      if block:
+        categories.append(ordered(block))
+  for pred in (lambda e: e[0][6] == "suction",
+               lambda e: e[0][6] == "pinch" and not e[0][7],
+               lambda e: e[0][6] == "pinch" and e[0][7]):
+    block = [e for e in good if pred(e)]
+    if block:
+      categories.append(ordered(block))
+  if good:
+    categories.append(ordered(good))
+  if bad:                                                 # small/curved shapes may need fallback
+    categories.append(ordered(bad))
+
+  out, seen = list(canonical), {id(e[0]) for e in canonical}
+  cursors = [0] * len(categories)
+  while len(out) < keep:
+    progressed = False
+    for j, block in enumerate(categories):
+      while cursors[j] < len(block) and id(block[cursors[j]][0]) in seen:
+        cursors[j] += 1
+      if cursors[j] >= len(block):
+        continue
+      e = block[cursors[j]]; cursors[j] += 1
+      out.append(e); seen.add(id(e[0])); progressed = True
+      if len(out) >= keep:
+        break
+    if not progressed:
+      break
+  return out
+
+
 def _sampled_keys(spec, offset, part=None):
   """(base_key, cache_key) for the sampled DB. base_key seeds the RAW candidate cloud --
   identical parts share it, so their clouds match. The cache key adds the PART INSTANCE and
   the scene-filter signature (--grasp-sampler-scenes), so each part filters its own cloud."""
   cfgv = _SAMPLED_GRASPS
-  base = (_spec_key(spec), float(offset), cfgv["seed"], cfgv["candidates"], cfgv["keep"],
-          float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)), cfgv.get("wrap"))
+  version = int(cfgv.get("version", 1))
+  # V1 included K in its private RNG seed; preserve that byte-for-byte for old plans. V2's
+  # raw cloud and ranking are K-independent, so increasing K is an append-only refinement.
+  if version == 1:
+    base = (_spec_key(spec), float(offset), cfgv["seed"], cfgv["candidates"], cfgv["keep"],
+            float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)),
+            cfgv.get("wrap"))
+  else:
+    base = (_spec_key(spec), float(offset), version, cfgv["seed"], cfgv["candidates"],
+            float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)),
+            cfgv.get("wrap"))
   ctx = _SAMPLED_SCENE_CTX
-  return base, base + (part, (ctx["sig"] if ctx is not None else None))
+  cache = base + (() if version == 1 else (cfgv["keep"],))
+  return base, cache + (part, (ctx["sig"] if ctx is not None else None))
 
 
 def _sampled_grasp_views(spec, offset, part=None):
@@ -2503,6 +2751,25 @@ def _sampled_grasp_views(spec, offset, part=None):
                       _sup, "pinch", zi >= 2))             # zi >= 2: the wrap-roll pair
 
   keep = cfgv["keep"]
+  if int(cfgv.get("version", 1)) >= 2:
+    selected = _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, sq)
+    if not selected:
+      raise ValueError(f"--grasp-sampler: no feasible candidates for shape {spec!r}")
+    poses, surfs, mins, meta = [], [], [], []
+    for row, extra in selected:
+      pose, surf, mind, _f, _clr, _sup, _fam = row[:7]
+      pose = np.asarray(pose, dtype=float)
+      if sq is not None:
+        pose = np.concatenate([_quat_to_R(sq) @ pose[:3], _quat_mul(sq, pose[3:])])
+      pose.setflags(write=False)
+      poses.append(pose); surfs.append(surf); mins.append(float(mind))
+      m = {"edge_clearance": float(_clr), "pad_support": float(_sup),
+           "family": _fam, **extra}
+      meta.append(m)
+    _SAMPLED_META_CACHE[key] = tuple(meta)
+    hit = _SAMPLED_VIEWS_CACHE[key] = (tuple(poses), tuple(surfs), tuple(mins))
+    return hit
+
   k_suc = (keep + 1) // 2
   k_pinch = keep - k_suc
 
@@ -2603,6 +2870,36 @@ def sampled_grasp_meta(spec, offset=0.01, part=None):
     return ()
   _sampled_grasp_views(spec, offset, part)                  # fills both caches
   return _SAMPLED_META_CACHE.get(_sampled_keys(spec, offset, part)[1], ())
+
+
+def sampled_grasp_db_signature(assembly):
+  """Content hash of the actual positional grasp DB used by a plan.
+
+  Sampler flags and seeds are necessary but not sufficient provenance: changing generator code
+  under the same flags used to silently reinterpret every saved grasp id. New plans persist this
+  hash and replay refuses a mismatch. The per-part name is included because scene-aware V2 DBs
+  intentionally differ across geometrically identical instances.
+  """
+  import hashlib
+  if _SAMPLED_GRASPS is None:
+    return None
+  h = hashlib.sha256()
+  h.update(b"assembly-grasp-db\0")
+  for part in assembly.objects:
+    spec = assembly.part_shape(part)
+    poses, surfaces, mins = _sampled_grasp_views(spec, 0.01, part)
+    meta = sampled_grasp_meta(spec, 0.01, part)
+    h.update(part.encode() + b"\0")
+    h.update(np.asarray(poses, dtype="<f8").tobytes())
+    h.update(repr(tuple(surfaces)).encode())
+    h.update(np.asarray(mins, dtype="<f8").tobytes())
+    # Only identity-shaping metadata: diagnostic floats are already represented by poses and
+    # selection; roles/origin document why each positional member was retained.
+    identity = tuple((m.get("origin"), m.get("family"), m.get("sets"),
+                      tuple(sorted((k, tuple(v)) for k, v in
+                                   (m.get("scene_by_kind") or {}).items()))) for m in meta)
+    h.update(repr(identity).encode())
+  return h.hexdigest()
 
 
 def _horizontal_cylinder_scatter_with_top_suction(spec):
@@ -3440,7 +3737,7 @@ def compute_cube_grasps(assembly, subassembly, offset=0.01,
   maybe_tighten_fingers(base_scene, "ee_")       # SAME proxy the search and the sim collide with
   _, base_rel_tool, q_correction = _gripper_rest_transforms(base_scene, "ee_")
 
-  def grasp_is_collision_free(grasp_pose, grasped_obj):
+  def grasp_is_collision_free(grasp_pose, grasped_obj, conventional=False):
     # move the pre-loaded EE so its tool center hits the grasp, then check the EE against
     # every part except the one being grasped (touching it is allowed). ONLY EE-involving
     # pairs may reject: the subassembly's INTERNAL part-part contacts are the mates
@@ -3462,7 +3759,10 @@ def compute_cube_grasps(assembly, subassembly, offset=0.01,
     root = C_col.getFrame("ee_ur_base")
     root.setPosition(base_world[:3])
     root.setQuaternion(base_world[3:])
-    if _SAMPLED_GRASPS is None:
+    # Hybrid V2's conventional prefix must pass through the exact legacy filter too. Applying
+    # the sampled own-part capsule tolerance to those same poses changed which canonical ids
+    # survived, perturbing otherwise-unrelated searches before an added sample was even used.
+    if _SAMPLED_GRASPS is None or conventional:
       set_part_contact(C_col, grasped_obj, 0)
       return not any((a.startswith("ee_") or b.startswith("ee_")) and d < -1e-9
                      for a, b, d in C_col.getCollisions())
@@ -3497,15 +3797,21 @@ def compute_cube_grasps(assembly, subassembly, offset=0.01,
     # ref frame (parts are axis-aligned, so translation only).
     surfaces = part_grasp_surfaces(assembly.part_shape(obj), part=obj)
     face_dims = part_grasp_face_min_dims(assembly.part_shape(obj), part=obj)
+    sample_meta = sampled_grasp_meta(assembly.part_shape(obj), part=obj)
     seal = wrench.PARAMS.get("vacuum_seal_diameter", 0.0)
     for grasp_id, local in enumerate(part_grasp_poses(assembly.part_shape(obj),
                                                       offset=offset, part=obj)):
+      if (_SAMPLED_CANONICAL_ONLY and sample_meta
+          and assembly.part_shape(obj)[0] not in ("mesh", "compound")
+          and sample_meta[grasp_id].get("origin") != "canonical"):
+        continue                                          # staged V2 search: samples reopen later
       if vacuum and (surfaces[grasp_id] == "curved" or face_dims[grasp_id] < seal):
         continue                                          # no seal on curvature or on a face
                                                           # smaller than the cup (chair caps)
       grasp = np.concatenate([obj_in_ref + local[:3], local[3:]])
 
-      if grasp_is_collision_free(grasp, obj):
+      conventional = bool(sample_meta and sample_meta[grasp_id].get("origin") == "canonical")
+      if grasp_is_collision_free(grasp, obj, conventional=conventional):
         labeled.append((obj, grasp_id, grasp))
 
   return labeled if return_labeled else [g[2] for g in labeled]
