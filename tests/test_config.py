@@ -13,7 +13,8 @@ def _parser_defaults():
   # SUPPRESS-default actions are auxiliary switches sharing a primary flag's dest
   # (e.g. --no-strict-collisions); the primary action carries the real default.
   return {a.dest: a.default for a in p._actions
-          if a.dest not in ("help", "config") and a.default is not argparse.SUPPRESS}
+          if a.dest not in ("help", "config", "search_profile", "motion_profile")
+          and a.default is not argparse.SUPPRESS}
 
 
 def test_defaults_match_parser():
@@ -81,9 +82,170 @@ def test_config_cli_layering(tmp_path):
   assert (a.assembly, a.parts, a.num_robots, a.seed) == ("chair", 5, 3, 1)   # CLI wins
 
 
+def test_historical_sampler_config_defaults_to_v1(tmp_path):
+  """A pre-version positional sampled DB must never be silently rebuilt as hybrid V2."""
+  p = tmp_path / "old-sampler.json"
+  p.write_text('{"grasp_sampler": true, "grasp_sampler_keep": 12}')
+  cfg = RunConfig.from_file(str(p))
+  assert cfg.grasp_sampler and cfg.grasp_sampler_version == 1
+
+
+def test_standard_search_profile_resolves_robust_batch_defaults():
+  a = main.parse_args(["--search-profile", "standard"])
+  assert a.weight == 1.0
+  assert a.milestones and a.sig_collapsed_h and a.sig_components == "press"
+  assert a.milestone_oracle == "structural"
+  assert a.fill_local_h and a.fill_exact and not a.fill_skeleton_first
+  assert a.fill_scope_widening
+  assert not a.fill_touch_all
+  assert a.real_ik and a.wrench and a.wrench_aware_h
+  assert a.grasp_model == "asymmetric"
+  assert a.optimize_witnesses == "floor"
+  assert a.witness_margin == 0.005
+  assert a.witness_branch_budget == 5 and a.witness_sets == 4
+  assert a.tight_fingers and a.strict_collisions == 1e-6
+  assert a.open_witness and a.open_witness_batch == 7 and a.open_witness_epochs == 2
+  assert a.analytic_seed_cap is None
+  assert a.grasp_sampler and a.grasp_sampler_version == 2
+  assert a.grasp_sampler_scenes and a.grasp_sampler_keep == 20
+  assert a.grasp_sampler_candidates == 96
+  assert a.grasp_refine
+  assert a.grasp_sampler_wrap == 0.015
+  assert a.quiet_rai and not a.view
+
+
+def test_open_profile_is_a_compatibility_alias_and_fast_open_only_caps_seeds():
+  a = main.parse_args(["--search-profile", "open"])
+  standard = main.parse_args(["--search-profile", "standard"])
+  assert a.open_witness and a.open_witness_batch == 7 and a.open_witness_epochs == 2
+  assert a.weight == 1.0 and a.fill_local_h and a.fill_exact
+  assert {k: getattr(a, k) for k in main._STANDARD_SEARCH_PROFILE} == {
+      k: getattr(standard, k)
+      for k in main._STANDARD_SEARCH_PROFILE}
+  assert a.analytic_seed_cap is None
+  b = main.parse_args(["--search-profile", "fast-open"])
+  assert b.open_witness and b.analytic_seed_cap == 3
+
+
+def test_optimistic_dispatch_uses_the_shared_local_fill_settings(monkeypatch):
+  seen = {}
+
+  def fake(*_args, **kwargs):
+    seen.update(kwargs)
+    return []
+
+  monkeypatch.setattr(main, "solve_assembly_problem_optimistic", fake)
+  cfg = RunConfig(optimistic=True, lazy_fills=True, optimistic_fallback=False,
+                  optimistic_chain_h=True, wrench_aware_h=False)
+  assert main._dispatch_solve(cfg, None, None, [], None) == []
+  assert seen["lazy_fills"] is True
+  assert seen["fallback"] is False
+  assert seen["chain_h"] is True
+  assert seen["wrench_aware_h"] is False
+
+  assert main.parse_args(["--lazy-fills"]).lazy_fills is True
+  assert main.parse_args(["--no-lazy-fills"]).lazy_fills is False
+  assert main.parse_args(["--optimistic-chain-h"]).optimistic_chain_h is True
+  assert main.parse_args(["--no-optimistic-chain-h"]).optimistic_chain_h is False
+
+
+def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
+  seen = {}
+
+  def fake(*_args, **kwargs):
+    seen.update(kwargs)
+    return []
+
+  monkeypatch.setattr(main, "solve_assembly_problem_milestones", fake)
+  cfg = RunConfig(milestones=True, milestone_oracle="structural",
+                  fill_local_h=True, fill_exact=True, fill_skeleton_first=True,
+                  fill_scope_widening=True, wrench_aware_h=False)
+  assert main._dispatch_solve(cfg, None, None, [], None) == []
+  assert seen["milestone_oracle"] == "structural"
+  assert seen["fill_local_h"] is True and seen["fill_exact"] is True
+  assert seen["fill_skeleton_first"] is True
+  assert seen["fill_scope_widening"] is True
+  assert seen["wrench_aware_h"] is False
+  assert main.parse_args(["--milestone-oracle", "structural"]).milestone_oracle == "structural"
+  assert main.parse_args(["--milestone-oracle", "chain"]).milestone_oracle == "chain"
+  assert main.parse_args(["--fill-local-h", "--fill-exact"]).fill_local_h is True
+  assert main.parse_args(["--fill-local-h", "--fill-exact"]).fill_exact is True
+  assert main.parse_args(["--fill-skeleton-first"]).fill_skeleton_first is True
+  assert main.parse_args(["--fill-scope-widening"]).fill_scope_widening is True
+  assert main.parse_args(["--no-fill-scope-widening"]).fill_scope_widening is False
+  assert main.parse_args(["--fill-touch-all"]).fill_touch_all is True
+  assert main.parse_args(["--no-fill-touch-all"]).fill_touch_all is False
+  assert main.parse_args(["--mixed-wrench-h"]).mixed_wrench_h is True
+  assert main.parse_args(["--no-wrench-aware-h"]).wrench_aware_h is False
+
+
+def test_standard_motion_profile_pins_the_motion_contract():
+  a = main.parse_args(["--motion-profile", "standard"])
+  assert (a.pre_pick, a.pre_place, a.pre_add_grasp,
+          a.pre_insertion, a.post_release) == (0.05,) * 5
+  assert a.fuse_cograsp and a.fuse_pre_skill
+  assert a.mp_sequence and not a.mp_optimize
+  assert a.mp_runtime == 90.0 and a.mp_stall_timeout == 30.0
+  assert not a.mp_no_shortcut and a.mp_shortcut_iters == 100
+  assert a.mp_shortcut_strategy == "native" and a.mp_shortcut_res is None
+  assert a.mp_collision_tolerance == 1e-4
+  assert a.mp_robot_margin == 0.1 and a.mp_margin_ramp == 0.1
+  assert a.mp_table_margin == 0.0 and a.mp_cograsp
+  assert not a.motion_plan                         # profiles configure; verbs remain explicit
+
+
+def test_motion_profile_is_reversible_by_explicit_cli():
+  a = main.parse_args([
+      "--motion-profile", "standard", "--mp-collision-tolerance", "0.002",
+      "--mp-optimize", "--mp-runtime", "12", "--mp-stall-timeout", "3",
+      "--mp-shortcut-iters", "17", "--mp-table-margin", "0.004",
+      "--no-fuse-cograsp", "--no-fuse-pre-skill",
+  ])
+  assert a.mp_collision_tolerance == 0.002 and a.mp_optimize
+  assert a.mp_runtime == 12.0 and a.mp_stall_timeout == 3.0
+  assert a.mp_shortcut_iters == 17 and a.mp_table_margin == 0.004
+  assert not a.fuse_cograsp and not a.fuse_pre_skill
+
+
+def test_profile_values_are_reversible_by_explicit_cli():
+  a = main.parse_args([
+      "--search-profile", "fast-open", "--weight", "5", "--no-open-witness",
+      "--analytic-seed-cap", "9", "--witness-margin", "0.002", "--view",
+      "--no-quiet-rai", "--no-grasp-sampler", "--no-grasp-sampler-scenes",
+      "--no-grasp-refine",
+  ])
+  assert a.weight == 5.0 and not a.open_witness and a.analytic_seed_cap == 9
+  assert a.witness_margin == 0.002 and a.view and not a.quiet_rai
+  assert not a.grasp_sampler and not a.grasp_sampler_scenes and not a.grasp_refine
+
+
+def test_profile_wins_over_config_and_individual_cli_wins_over_both(tmp_path):
+  RunConfig(weight=7.0, open_witness=False, witness_margin=0.003).to_file(
+      str(tmp_path / "c.json"))
+  a = main.parse_args([
+      "--search-profile", "fast-open", "--config", str(tmp_path / "c.json")])
+  assert a.weight == 1.0 and a.open_witness and a.witness_margin == 0.005
+  assert a.analytic_seed_cap == 3
+  b = main.parse_args([
+      "--search-profile", "standard", "--config", str(tmp_path / "c.json"),
+      "--weight", "9", "--open-witness"])
+  assert b.weight == 9.0 and b.open_witness
+
+
+def test_motion_profile_overrides_loaded_mp_defaults(tmp_path):
+  RunConfig(mp_collision_tolerance=0.01, mp_robot_margin=0.0,
+            mp_margin_ramp=0.0, mp_runtime=3.0, mp_optimize=True).to_file(
+                str(tmp_path / "c.json"))
+  a = main.parse_args([
+      "--config", str(tmp_path / "c.json"), "--motion-profile", "standard"])
+  assert a.mp_collision_tolerance == 1e-4
+  assert a.mp_robot_margin == 0.1 and a.mp_margin_ramp == 0.1
+  assert a.mp_runtime == 90.0 and not a.mp_optimize
+
+
 def test_no_config_path_unchanged():
   """Without --config, parse_args is a single pass and every original dest keeps its built-in
-  default -- `config` is the only added namespace field."""
+  default -- only the inert config/profile meta fields are added."""
   a = vars(main.parse_args([]))
   for k, v in _parser_defaults().items():
     assert a[k] == v, f"{k} changed on the no-config path: {a[k]!r} != {v!r}"

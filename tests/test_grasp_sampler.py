@@ -160,11 +160,79 @@ def test_cli_defaults_and_guard():
   assert RunConfig().grasp_sampler is False
   assert RunConfig().grasp_sampler_scenes is False
   a = main.parse_args([])
-  assert a.grasp_sampler is False and a.grasp_sampler_keep == 12
+  assert a.grasp_sampler is False and a.grasp_sampler_keep == 20
+  assert a.grasp_sampler_version == 2
   with pytest.raises(SystemExit):
     main.run(RunConfig(grasp_sampler=True, dense_grasps=True, solve=False, view=False))
   with pytest.raises(SystemExit):
     main.run(RunConfig(grasp_sampler_scenes=True, solve=False, view=False))
+
+
+def test_v2_hybrid_contains_conventional_grasps_and_refines_by_prefix():
+  """Primitive V2 DBs keep every conventional grasp and increasing K appends ids."""
+  P.set_rolls_per_face(2)
+  P.set_sampled_grasps(None)
+  conventional = [np.asarray(q) for q in P.part_grasp_poses(CUBE)]
+  mode = {"version": 2, "seed": 3, "candidates": 96, "keep": 20,
+          "margin": 0.008, "pad_support": 0.75, "wrap": 0.015}
+  P.set_sampled_grasps(mode)
+  q20 = [np.asarray(q).copy() for q in P.part_grasp_poses(CUBE)]
+  m20 = P.sampled_grasp_meta(CUBE)
+  canonical = [q for q, m in zip(q20, m20) if m["origin"] == "canonical"]
+  assert len(q20) == 20 and len(canonical) == len(conventional) == 12
+  assert all(np.array_equal(q, c) for q, c in zip(canonical, conventional))
+
+  P.set_sampled_grasps(dict(mode, keep=24))
+  q24 = P.part_grasp_poses(CUBE)
+  assert len(q24) == 24
+  assert all(np.array_equal(a, b) for a, b in zip(q20, q24))
+
+
+def test_v2_scene_masks_are_per_gripper_kind():
+  """Mixed fleets must not classify every explicit pose through whichever EE slot is first."""
+  import env
+  from problem import add_disassembled_obj, get_robots, make_assembly
+  P.set_rolls_per_face(2)
+  P.set_sampled_grasps({"version": 2, "seed": 0, "candidates": 64, "keep": 20,
+                        "margin": 0.008, "pad_support": 0.75, "wrap": 0.015})
+  C = env.make_four_robot_env(num_robots=2, floating_ee=False, vacuum=[True, False])
+  asm = make_assembly("cross", 3)
+  C = add_disassembled_obj(C, asm, spacing=0.2)
+  robots = get_robots(C)
+  P.install_sampled_scene_ctx(C, asm, robots=robots)
+  spec = asm.part_shape("obj_1")
+  poses = P.part_grasp_poses(spec, part="obj_1")
+  meta = P.sampled_grasp_meta(spec, part="obj_1")
+  assert all(set(m["scene_by_kind"]) == {"vacuum", "two_finger"} for m in meta)
+  ctx = P._SAMPLED_SCENE_CTX
+  reps = ctx["kind_robot"]
+  for q, m in zip(poses, meta):
+    for kind, roles in m["scene_by_kind"].items():
+      for role in roles:
+        state = ctx["s0"] if role == "pick" else ctx["s_full"]
+        assert ctx["checker"].pose_collision_free(
+            state, "obj_1", q, asm, robot=reps[kind])
+
+
+def test_v2_canonical_epoch_reproduces_legacy_grasp_table():
+  """Staged epoch zero must be the old primitive action space, not merely similar poses."""
+  from problem import make_assembly
+  P.set_rolls_per_face(2)
+  asm = make_assembly("cross", 2)
+  P.set_sampled_grasps(None)
+  legacy = P.precompute_grasps(asm)
+  P.set_sampled_grasps({"version": 2, "seed": 0, "candidates": 32, "keep": 20,
+                        "margin": 0.008, "pad_support": 0.75, "wrap": 0.015})
+  P.set_sampled_canonical_only(True)
+  staged = P.precompute_grasps(asm)
+  P.set_sampled_canonical_only(False)
+  full = P.precompute_grasps(asm)
+  assert set(staged) == set(legacy)
+  for key in legacy:
+    assert [(p, g) for p, g, _q in staged[key]] == [(p, g) for p, g, _q in legacy[key]]
+    for (_p, _g, a), (_p2, _g2, b) in zip(staged[key], legacy[key]):
+      np.testing.assert_array_equal(a, b)
+  assert any(len(full[k]) > len(staged[k]) for k in staged)
 
 
 def test_wrap_emits_side_roll_for_long_boxes():

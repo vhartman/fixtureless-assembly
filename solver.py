@@ -4336,9 +4336,10 @@ class LabeledDisassemblyHeuristic:
     # MIXED EEs: gk is a {robot: kind} MAP. Wrench facts then evaluate over each grasp's
     # kind MASK (exists-a-feasible-assignment; see _stable_any_kind) -- admissible, and it
     # keeps the force/torque pruning the old topological fallback threw away.
-    self._mixed = isinstance(self._gk, dict) and _MIXED_WRENCH_H
-    if isinstance(self._gk, dict) and not _MIXED_WRENCH_H:
-      self._gk = None                                     # fast fallback: topological facts
+    # One wrench contract: a supplied per-robot kind map means the backward model uses it.
+    # Callers that deliberately want a topological ablation pass gripper_kind=None via
+    # --no-wrench-aware-h. Mixed-tool physics must not silently disappear from the heuristic.
+    self._mixed = isinstance(self._gk, dict)
     self._kinds_of = getattr(grasp_table, "kinds_of", None)
     self._all_kinds = tuple(sorted(set(getattr(grasp_table, "robot_kinds", {}).values())))
     objs = list(assembly.objects)
@@ -4694,17 +4695,11 @@ class LabeledDisassemblyHeuristic:
 _SIG_COMPONENTS = ("press", "pickface", "contact", "solohold", "braceside")
 
 
-_MIXED_WRENCH_H = False                                    # --mixed-wrench-h: per-kind wrench
-                                                          # facts under mixed EEs (precise but
-                                                          # SLOW build); default False = the
-                                                          # fast topological fallback.
-
-
-_FILL_TOUCH_ALL = False                                    # --fill-touch-all (debug): let a
-                                                          # fill act on ANY loose part, not
-                                                          # just ideal+{p} -- so it can move a
-                                                          # blocking scatter part aside. Big
-                                                          # search blow-up; a diagnosis knob.
+_FILL_TOUCH_ALL = False                                    # --fill-touch-all diagnostic: let a
+                                                          # fill manipulate ANY part, not just
+                                                          # ideal+{p}. Unrelated ASSEMBLE stays
+                                                          # forbidden: otherwise the concrete
+                                                          # state outruns milestone bookkeeping.
 
 
 _FILL_CAPTURE_DIR = None                                   # debug: dump failing fills' ENTRY
@@ -4734,9 +4729,42 @@ def set_fill_touch_all(on=True):
   _FILL_TOUCH_ALL = bool(on)
 
 
+def _fill_action_in_scope(action, relevant, requested_parts, touch_all=None):
+  """Whether a local fill may expose this ordinary successor.
+
+  Release is always admitted so an inherited holder cannot strand an arm. The touch-all
+  ablation additionally admits manipulation of future/blocking parts, but never their assembly:
+  the outer driver grows its ideal only by ``requested_parts`` and would otherwise lose agreement
+  with the concrete state. ``requested_parts`` is a singleton for the ordinary fill and a tuple
+  for the adaptive width-k completeness net.
+  """
+  kind, part = action[0], action[2]
+  if touch_all is None:
+    touch_all = _FILL_TOUCH_ALL
+  requested = ({requested_parts} if isinstance(requested_parts, str)
+               else set(requested_parts))
+  if kind == "assemble":
+    return part in requested
+  if kind == "release":
+    return True
+  return part in relevant or touch_all
+
+
+def _fill_scope_passes(force_all=False, widen=False):
+  """Narrow-to-broad action scopes for a fill.
+
+  The broad pass is a completeness widening, not a simultaneous branch multiplier: it is reached
+  only after every local-scope grasp/bracing phase fails. ``force_all`` retains the diagnostic
+  that skips the cheap pass entirely.
+  """
+  if force_all:
+    return (True,)
+  return (False, True) if widen else (False,)
+
+
 def set_mixed_wrench_h(on=True):
-  global _MIXED_WRENCH_H
-  _MIXED_WRENCH_H = bool(on)
+  """Deprecated compatibility hook; mixed wrench guidance follows gripper_kind directly."""
+  return None
 
 
 def set_sig_components(components):
@@ -4984,7 +5012,8 @@ class CollapsedLabeledHeuristic:
   def __init__(self, assembly, n_robots, grasp_table, gripper_path=None, verbose=False,
                max_states=2_000_000, clearance=0.02, gripper_kind=None, bracing=False,
                collapse_grasps=False, geo_checker=None, grasp_classes=None,
-               labeled_loose=False, dist_cap=None, ideal_chain=None):
+               labeled_loose=False, dist_cap=None, ideal_chain=None,
+               component_root=None, fill_goal=False, lazy_build=False):
     import heapq
     import time as _time
 
@@ -4995,14 +5024,19 @@ class CollapsedLabeledHeuristic:
     self._bracing = bracing                                # model the add_grasp (co-grasp) edge
     self._clearance = clearance
     self._gk = gripper_kind
-    self._mixed = isinstance(self._gk, dict) and _MIXED_WRENCH_H
-    if isinstance(self._gk, dict) and not _MIXED_WRENCH_H:
-      self._gk = None                                     # fast fallback: topological facts
+    # Same contract as the fine labeled heuristic: a supplied kind map activates mixed-tool
+    # wrench facts. The explicit wrench-aware-h ablation passes None at the caller.
+    self._mixed = isinstance(self._gk, dict)
     self._kinds_of = getattr(grasp_table, "kinds_of", None)
     self._all_kinds = tuple(sorted(set(getattr(grasp_table, "robot_kinds", {}).values())))
     self._collapse = bool(collapse_grasps)                 # see GraspCollapsedHeuristic
     objs = list(assembly.objects)
-    base = assembly.base
+    base = assembly.base if component_root is None else component_root
+    if base not in objs:
+      raise ValueError(f"component_root {base!r} is not an assembly object")
+    self._component_root = base
+    self._fill_goal = bool(fill_goal)
+    self._lazy_build = bool(lazy_build)
     # A chain projection retains the FULL remaining-order signal but restricts the abstract
     # ideals to one caller-selected prefix chain and permits only that prefix's NEXT part to
     # be loose. This removes the unrelated loose-part/order-ideal cross product while keeping
@@ -5012,11 +5046,13 @@ class CollapsedLabeledHeuristic:
       chain = None
     else:
       chain = [_subasm_key(s) for s in ideal_chain]
-      if not chain or chain[0] != (base,):
-        raise ValueError("ideal_chain must start with the singleton assembly base")
+      if not chain or base not in chain[0]:
+        raise ValueError("ideal_chain must start with an ideal containing component_root")
       if len(set(chain)) != len(chain):
         raise ValueError("ideal_chain contains a repeated prefix")
       all_parts = chain[-1]
+    self._tracked_loose = (None if chain is None else
+                           frozenset(all_parts) - frozenset(chain[0]))
     self._closure = {p: frozenset(_mate_closure(assembly, p)) for p in objs}
 
     def tadd(t, x):
@@ -5033,11 +5069,10 @@ class CollapsedLabeledHeuristic:
     if chain is not None:
       for before, after in zip(chain, chain[1:]):
         added = set(after) - set(before)
-        if len(added) != 1 or not set(before) < set(after):
-          raise ValueError("each ideal_chain prefix must add exactly one part")
-        q = next(iter(added))
-        chain_prev[after] = (before, q)
-        chain_next[before] = q
+        if not added or not set(before) < set(after):
+          raise ValueError("each ideal_chain prefix must add a non-empty component")
+        chain_prev[after] = (before, frozenset(added))
+        chain_next[before] = tuple(sorted(added))
     # OPTIONAL DENSE-GRASP LABEL COLLAPSE (collapse_grasps=True, the GraspCollapsedHeuristic):
     # with the wrist-tilt variants on, grasp ids come in three blocks [base|+45|-45]; raw ids
     # as ROBOT LABELS explode the coreachable product space ~3^R (measured 24x on cross-4/3R).
@@ -5152,7 +5187,7 @@ class CollapsedLabeledHeuristic:
       ideal_set = set(ideal_key)
       for q in assembly.objects:
         if q in ideal_set:
-          if q == assembly.base:
+          if q == base:
             parent[q] = ("gripper", "zz0") if face is Hf else ("table",)
             supports[q] = frozenset() if face is Hf else frozenset({("table",)})
             if face is not Hf:
@@ -5255,29 +5290,52 @@ class CollapsedLabeledHeuristic:
       if not geo_ok(ideal, G, face):
         return                                            # no concrete realization -> no relay
       cap_used = len(G) + len(L)
-      # inverse ASSEMBLE: some (q,gq) in G was the inserter's brace; q maximal in ideal.
-      # The predecessor holds q LOOSE -- as a bare name (its grasp identity is forgotten).
-      for q, gq in G:
-        if q == base:
+      # inverse ASSEMBLE/JOIN: one held grasp belongs to the component added by this chain
+      # edge. For the ordinary case that component is {q}; for a module join it may contain
+      # several already-mated parts and the held grasp may be on any member. The predecessor
+      # represents that entire mover optimistically by its one held grasp label in L.
+      for held_part, gq in G:
+        if held_part == base:
           continue
-        if any(q in self._closure[r] for r in ideal if r != q):
-          continue                                        # not maximal -> not last-added
+        if chain is not None:
+          edge = chain_prev.get(ideal)
+          if edge is None:
+            continue
+          prev_ideal, added = edge
+          if held_part not in added:
+            continue
+          seams = [q for q in added
+                   if assembly.relative_pose(q) is not None
+                   and assembly.relative_pose(q)[0] in prev_ideal]
+          if len(seams) != 1:
+            continue
+          q = seams[0]
+          # All grasps on the moving component disappear from target-side G2. Ignoring an
+          # additional mover brace is an admissible relaxation and frees capacity.
+          G2 = tuple(pg for pg in G if pg[0] not in added)
+        else:
+          q = held_part
+          if any(q in self._closure[r] for r in ideal if r != q):
+            continue                                      # not maximal -> not last-added
+          prev_ideal = tsub(ideal, q)
+          added = frozenset({q})
+          G2 = tsub(G, (q, gq))
         if face is not Hf and not _on_table_mateable_cached(self.assembly, q, face):
           continue
-        prev_ideal = tsub(ideal, q)
         if prev_ideal not in ideal_key_set:
           continue
-        if chain is not None and chain_prev.get(ideal) != (prev_ideal, q):
-          continue                                        # only the selected prefix edge
-        G2 = tsub(G, (q, gq))
-        if any(p == q for p, _ in G2):
-          continue                                        # q was loose then: single-held only
+        if any(p in added for p, _ in G2):
+          continue                                        # mover was represented by one holder
         if face is Hf and len(G2) < 1:
           continue                                        # target had to be supported
-        if not w_assemble_ok(tsub(ideal, q), G2, face, q, gq):
+        # The existing wrench fact is exact for a singleton mover grasped on its seam. A
+        # module grasped elsewhere needs a component-load fact not yet represented here;
+        # admitting it is the safe relaxed choice (concrete wrench gates remain authoritative).
+        if (len(added) == 1 and held_part == q
+            and not w_assemble_ok(prev_ideal, G2, face, q, gq)):
           continue                                        # wrench: press not transmittable
-        yield (prev_ideal, G2, face,
-               tadd(L, (q, gq) if self._labeled_loose else q)), 1.0
+        yield (prev_ideal, G2, face, tadd(
+            L, (held_part, gq) if self._labeled_loose else held_part)), 1.0
       if self._labeled_loose:
         # inverse PICK-LOOSE, labeled: the loose (part, class) must be pickable AS THAT
         # CLASS (exists-a-face, OR over class variants) -- the pick/press linkage at class
@@ -5355,8 +5413,7 @@ class CollapsedLabeledHeuristic:
                 yield (ideal, G, face, tadd(tsub(L, (q, gq)), (q, gq2))), 1.0
         # inverse PLACE-LOOSE, labeled: one edge per (part, class)
         if cap_used < self.R:
-          for q in (objs if chain is None else ((chain_next.get(ideal),)
-                                                 if ideal in chain_next else ())):
+          for q in (objs if chain is None else chain_next.get(ideal, ())):
             if q in ideal or any(q == p for p, _ in L):
               continue
             for qg in self.single[q]:
@@ -5364,8 +5421,7 @@ class CollapsedLabeledHeuristic:
       else:
         # inverse PLACE-LOOSE: ONE edge per part (any valid grasp; existence suffices)
         if cap_used < self.R:
-          for q in (objs if chain is None else ((chain_next.get(ideal),)
-                                                 if ideal in chain_next else ())):
+          for q in (objs if chain is None else chain_next.get(ideal, ())):
             if q in ideal or q in L:
               continue
             if self.single[q]:
@@ -5376,13 +5432,18 @@ class CollapsedLabeledHeuristic:
     pq = []
     from itertools import combinations
     vg_full = self.valid[all_parts]
-    # GOAL SPEC (set_goal): on_table restricts goal states to a resting FACE (not held-in-
-    # air Hf); hands_off restricts to ZERO holders. Seeding exactly the image of the real
-    # goals keeps h admissible AND tight (guides toward placing down). Default seeds all.
-    _gm = _problem._GOAL_MODE
-    _on_tab = _gm["on_table"] or _gm["pose"] is not None
-    _faces = list(rf(all_parts)) if _on_tab else [Hf] + list(rf(all_parts))
-    _kmax = 0 if _gm["hands_off"] else self.R
+    # A fill-local PDB has its OWN goal: the requested part is mated, no tracked loose part
+    # remains, and the component is either on a stable table face or held by exactly one
+    # carrier. This matches _add_one_part.goal_fn directly and removes the former shifted
+    # full-assembly heuristic. The ordinary constructor path retains the global set_goal spec.
+    if self._fill_goal:
+      _faces = [Hf] + list(rf(all_parts))
+      _kmax = 1
+    else:
+      _gm = _problem._GOAL_MODE
+      _on_tab = _gm["on_table"] or _gm["pose"] is not None
+      _faces = list(rf(all_parts)) if _on_tab else [Hf] + list(rf(all_parts))
+      _kmax = 0 if _gm["hands_off"] else self.R
     for k in range(_kmax + 1):
       for combo in combinations(vg_full, k):
         for face in _faces:
@@ -5393,39 +5454,72 @@ class CollapsedLabeledHeuristic:
           heapq.heappush(pq, (0.0, id(st), st))
 
     _staged_gate = _problem._STAGED_MATES and bool(assembly.staged_mates)
-    popped = 0
-    while pq:
-      d, _, t = heapq.heappop(pq)
-      if d > self.dist.get(t, float("inf")):
-        continue
-      popped += 1
-      if len(self.dist) > max_states:
-        raise RuntimeError(f"collapsed labeled abstraction exceeded {max_states} states")
-      for s, c in preds(t):
-        nd = d + c
-        if dist_cap is not None and nd > dist_cap:
-          continue                                        # CORRIDOR cap: miss => dist > cap,
-        if _staged_gate and not _staged_valid_labeled(assembly, s[0], s[1], s[2], Hf):
-          continue                                        # staged-mate invariant (admissible)
-        if self._kind_counts is not None and not _kind_budget_ok(
-            self._label_kinds, self._kind_counts, s[1], s[3]):
-          continue                                        # mixed-EE arm budget (admissible)
-        if nd < self.dist.get(s, float("inf")):           # h=inf sound under cost_bound<=cap
-          self.dist[s] = nd
-          heapq.heappush(pq, (nd, id(s), s))
+    self._settled = set()
+    self._reverse_pops = 0
+    self._reverse_time = 0.0
+    self._reverse_exhausted = False
+
+    def advance(target=None):
+      """Resume reverse Dijkstra until ``target`` is settled, or exhaust the graph.
+
+      ``dist`` contains tentative labels as usual; callers may consume a value only after
+      its state has been popped/settled. The closure owns the predecessor/fact caches built
+      above, so a later query continues byte-for-byte from the retained frontier.
+      """
+      ta = _time.perf_counter()
+      try:
+        while pq:
+          d, _, t = heapq.heappop(pq)
+          if d > self.dist.get(t, float("inf")) or t in self._settled:
+            continue
+          self._settled.add(t)
+          self._reverse_pops += 1
+          if len(self.dist) > max_states:
+            raise RuntimeError(f"collapsed labeled abstraction exceeded {max_states} states")
+          for s, c in preds(t):
+            nd = d + c
+            if dist_cap is not None and nd > dist_cap:
+              continue                                    # CORRIDOR cap: miss => dist > cap,
+            if _staged_gate and not _staged_valid_labeled(assembly, s[0], s[1], s[2], Hf):
+              continue                                    # staged-mate invariant (admissible)
+            if self._kind_counts is not None and not _kind_budget_ok(
+                self._label_kinds, self._kind_counts, s[1], s[3]):
+              continue                                    # mixed-EE arm budget (admissible)
+            if nd < self.dist.get(s, float("inf")):
+              self.dist[s] = nd
+              heapq.heappush(pq, (nd, id(s), s))
+          # Expand the queried state before pausing.  A later query may reach one of its
+          # predecessors only through this edge; returning immediately after POP would lose
+          # that part of the retained frontier and make the oracle order-dependent.
+          if target is not None and t == target:
+            return True
+        self._reverse_exhausted = True
+        return target is None or target in self._settled
+      finally:
+        self._reverse_time += _time.perf_counter() - ta
+        self.n_states = len(self.dist)
+
+    self._advance_reverse = advance
+    if not self._lazy_build:
+      advance()
 
     self.n_states = len(self.dist)
     self.n_pick_facts = len(self._pick_cache)
     self.build_time = _time.perf_counter() - t0
     if verbose:
-      tag = "sig-h" if grasp_classes is not None else "collapsed-h"
-      if chain is not None:
+      tag = ("sig-h" if grasp_classes is not None else
+             "raw-h" if self._labeled_loose else "collapsed-h")
+      if self._fill_goal:
+        tag = f"fill-{tag}"
+      elif chain is not None:
         tag = f"chain-{tag}"
-      print(f"[{tag}] {self.n_states} coreachable states, {self.n_pick_facts} pick "
-            f"facts, built in {self.build_time:.2f}s")
+      mode = (f"lazy reverse oracle seeded with {self.n_states} goal states"
+              if self._lazy_build else f"{self.n_states} coreachable states")
+      print(f"[{tag}] {mode}, {self.n_pick_facts} pick facts, "
+            f"built in {self.build_time:.2f}s")
 
   def abstract(self, state):
-    main = next(g for g in state.subassemblies() if self.assembly.base in g)
+    main = next(g for g in state.subassemblies() if self._component_root in g)
     ideal = _subasm_key(main)
     if self._collapse:
       # grasp ids collapsed to their BASE variant; set-dedup so two variants of the same
@@ -5442,19 +5536,40 @@ class CollapsedLabeledHeuristic:
       # discrimination at class resolution (the 2026-07-17 plateau finding).
       L = tuple(sorted({(c[2], self._gcollapse(c[2], c[3])) for p in state.parent
                         if p not in main
+                        and (self._tracked_loose is None or p in self._tracked_loose)
                         for c in state.supports.get(p, ()) if c[0] == "grasp"}))
     else:
-      L = tuple(sorted({c[2] for p in state.parent if p not in main
+      L = tuple(sorted({c[2] for p in state.parent
+                        if p not in main
+                        and (self._tracked_loose is None or p in self._tracked_loose)
                         for c in state.supports.get(p, ()) if c[0] == "grasp"}))
     return (ideal, G, face, L)
 
   def value(self, state):
-    # inf is still a PROOF (the collapse only coarsens the relaxation) -- see class doc.
-    v = self.dist.get(self.abstract(state))
+    key = self.abstract(state)
+    if self._lazy_build and key not in self._settled and not self._reverse_exhausted:
+      self._advance_reverse(key)
+      self.n_pick_facts = len(self._pick_cache)
+      self.build_time = self._reverse_time
+    # inf is still a PROOF after eager exhaustion. Fill-local callers deliberately treat a
+    # miss as UNKNOWN, preserving their counting lower bound if a crafted projection is absent.
+    v = self.dist.get(key) if key in self._settled else None
     if v is None:
       self.misses += 1
       return float("inf")
     return v
+
+  def reverse_stats(self):
+    """Small, stable instrumentation surface for eager and query-driven PDB builds."""
+    return {
+        "settled": len(self._settled),
+        "discovered": len(self.dist),
+        "pops": self._reverse_pops,
+        "reverse_time": self._reverse_time,
+        "pick_facts": len(self._pick_cache),
+        "wrench_facts": len(self._wfacts),
+        "exhausted": self._reverse_exhausted,
+    }
 
 
 class GraspCollapsedHeuristic(CollapsedLabeledHeuristic):
@@ -5488,8 +5603,7 @@ class SignatureCollapsedHeuristic(CollapsedLabeledHeuristic):
     # per-kind wrench facts (see CollapsedLabeledHeuristic) hang off those classes.
     classes = compute_grasp_signatures(
         assembly, grasp_table,
-        gripper_kind=(None if (isinstance(kwargs.get("gripper_kind"), dict)
-                               and not _MIXED_WRENCH_H) else kwargs.get("gripper_kind")),
+        gripper_kind=kwargs.get("gripper_kind"),
         gripper_path=kwargs.get("gripper_path"),
         clearance=kwargs.get("clearance", 0.02))
     if kwargs.get("verbose"):
@@ -6605,7 +6719,8 @@ def solve_assembly_problem_bounded(C, assembly, robots=None, verbose=True, robot
                                    grasp_collapsed_h=True, stats_every=None,
                                    geo_facts=False, sig_collapsed_h=False,
                                    beam_width=None, dfbnb=False, pea=False,
-                                   pathmax=False, corridor_h=False):
+                                   pathmax=False, corridor_h=False,
+                                   wrench_aware_h=True):
   """INCUMBENT-BOUNDED exact search -- the principled wrapper around the fast decomposed
   solvers. Phase 1: the MILESTONE planner produces an incumbent plan fast (its greedy
   commitments carry no bound). Phase 2: the exact search runs with cost_bound = U (the
@@ -6621,7 +6736,8 @@ def solve_assembly_problem_bounded(C, assembly, robots=None, verbose=True, robot
   t0 = time.perf_counter()
   inc = solve_assembly_problem_milestones(
       C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik,
-      weight=max(weight, 5.0), wrench=wrench, handovers=handovers,
+      weight=max(weight, 5.0), wrench=wrench, wrench_aware_h=wrench_aware_h,
+      handovers=handovers,
       allow_place=allow_place, bracing=bracing, geo_facts=geo_facts,
       sig_collapsed_h=sig_collapsed_h)
   if inc is None:
@@ -6634,7 +6750,7 @@ def solve_assembly_problem_bounded(C, assembly, robots=None, verbose=True, robot
     inc = solve_assembly_problem(
         C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik,
         weight=float("inf"), max_nodes=max_nodes, wrench=wrench, handovers=handovers,
-        allow_place=allow_place, bracing=bracing)
+        allow_place=allow_place, bracing=bracing, wrench_aware_h=wrench_aware_h)
   if inc is None and beam_width is not None:
     # BEAM last-resort incumbent (measured 2x2x3: greedy beats beam -- its global
     # best-first frontier can back up where a fixed-width beam must commit; beam only
@@ -6646,7 +6762,8 @@ def solve_assembly_problem_bounded(C, assembly, robots=None, verbose=True, robot
         weight=float("inf"), max_nodes=max_nodes, wrench=wrench, handovers=handovers,
         allow_place=allow_place, bracing=bracing, labeled_h=labeled_h,
         collapsed_h=collapsed_h, grasp_collapsed_h=grasp_collapsed_h,
-        geo_facts=geo_facts, sig_collapsed_h=sig_collapsed_h, beam_width=beam_width)
+        geo_facts=geo_facts, sig_collapsed_h=sig_collapsed_h, beam_width=beam_width,
+        wrench_aware_h=wrench_aware_h)
   U = sum(action_cost(a) for a in inc) if inc else None
   if verbose:
     print(f"[bounded] incumbent: {'cost %g (%d actions)' % (U, len(inc)) if inc else 'NONE'} "
@@ -6658,7 +6775,8 @@ def solve_assembly_problem_bounded(C, assembly, robots=None, verbose=True, robot
       bracing=bracing, labeled_h=labeled_h, collapsed_h=collapsed_h,
       grasp_collapsed_h=grasp_collapsed_h, cost_bound=U, stats_every=stats_every,
       geo_facts=geo_facts, sig_collapsed_h=sig_collapsed_h, dfbnb=dfbnb, pea=pea,
-      pathmax=pathmax, h_dist_cap=(U if corridor_h else None))
+      pathmax=pathmax, h_dist_cap=(U if corridor_h else None),
+      wrench_aware_h=wrench_aware_h)
   if best is not None and (U is None or sum(action_cost(a) for a in best) < U):
     if verbose:
       print(f"[bounded] exact search IMPROVED the incumbent "
@@ -6746,12 +6864,53 @@ def _part_mated(state, p):
   return any(c[0] == "mate" for c in state.supports.get(p, ()))
 
 
+def _make_fill_local_pdb(start, assembly, robots, checker, grasp_table, p,
+                         grasp_classes, gripper_kind=None, bracing=False,
+                         component_root=None, geo_facts=False, verbose=False,
+                         lazy_build=True):
+  """Build the backward pattern database for one settled fill goal.
+
+  Every grasp label uses the same shared fact-signature projection. This uniform abstraction
+  avoids a role-specific exception for the interface/end grasp and prevents raw holder ids on a
+  detached moving module from creating a Cartesian product. It is an admissible relaxation: the
+  concrete forward search still considers and validates every raw grasp on every part. The same
+  projection applies to a singleton, detached module, chain, or dependency graph.
+  """
+  root = assembly.base if component_root is None else component_root
+  comps = tuple(start.subassemblies())
+  before = next((frozenset(g) for g in comps if root in g), None)
+  mover = next((frozenset(g) for g in comps if p in g), None)
+  if before is None or mover is None:
+    raise ValueError(f"fill-local PDB cannot find target root {root!r} or mover {p!r}")
+  if before == mover:
+    raise ValueError(f"fill-local PDB requested for already-joined mover {p!r}")
+  after = before | mover
+  try:
+    return CollapsedLabeledHeuristic(
+        assembly, len(robots), grasp_table,
+        gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
+        verbose=verbose, max_states=200_000, gripper_kind=gripper_kind,
+        bracing=bracing, geo_checker=checker if geo_facts else None,
+        grasp_classes=grasp_classes, labeled_loose=True,
+        ideal_chain=(before, after), component_root=root, fill_goal=True,
+        lazy_build=lazy_build)
+  except RuntimeError as exc:
+    if "exceeded 200000 states" not in str(exc):
+      raise
+    raise RuntimeError(
+        f"fill-local PDB for interface {p!r}, target {sorted(before)}, mover "
+        f"{sorted(mover)} exceeded its 200000-state guard; rerun with "
+        "--no-fill-local-h (or use --milestone-oracle global/chain). No heuristic "
+        "fallback was applied.") from exc
+
+
 def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot_ik,
                   weight, max_nodes, verbose, gripper_kind=None, handovers=True,
                   allow_place=True, bracing=False, grasp_cap=None, h_extra=None,
                   part_grasp_allow=None, brace_allow=None, deadline=None,
                   lazy_fill=False, cost_bound=None, forbid_assemble=None, settle_ref=None,
-                  h_extra_shift=None):
+                  h_extra_shift=None, fill_h=None, exact_fill=False,
+                  skeleton_only=False, touch_all=None):
   # a small COMPLETE search that adds part `p` to the assembly `ideal` and leaves it SETTLED:
   # p mated, no loose part left in a gripper, and the assembly ending held by at most one
   # carrier OR resting on the table -- WHICHEVER the search finds. It forces neither a
@@ -6773,7 +6932,15 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
             {k: list(v) for k, v in robot_ik.prof["by_action"].items()})
 
   def _fill_prof(tag):
-    if robot_ik is None or not verbose or _fp0 is None:
+    if not verbose:
+      return
+    pdb = getattr(fill_h, "__self__", None)
+    if pdb is not None and hasattr(pdb, "reverse_stats"):
+      ps = pdb.reverse_stats()
+      print(f"[fill-pdb {tag}] settled={ps['settled']} discovered={ps['discovered']} "
+            f"reverse={ps['reverse_time']:.2f}s pick={ps['pick_facts']} "
+            f"wrench={ps['wrench_facts']} exhausted={ps['exhausted']}")
+    if robot_ik is None or _fp0 is None:
       return
     pr, (f0, fba) = robot_ik.prof, _fp0
     db = pr["bind_solves"] - f0["bind_solves"]
@@ -6790,6 +6957,7 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
     print(f"[fill-prof {tag}] binds={db} failed={df} bind_time={dt:.1f}s"
           + (f": {tops}" if tops else ""))
   settle = settle_ref if settle_ref is not None else assembly.base
+  search_weight = 1.0 if exact_fill else weight
 
   def _comps(s):
     # (main, settle) components; identical when settle_ref is None/base (byte-identical
@@ -6835,7 +7003,13 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
       left = 2
     loose, holders = _loose_and_holders(s, exclude=p)
     hv = left + loose + max(0, holders - 1)
-    if h_extra is not None:
+    if fill_h is not None:
+      # Goal-conditioned local PDB. A miss is UNKNOWN, never a pruning certificate: retain
+      # the counting lower bound so an imperfect relaxation cannot remove a concrete route.
+      fh = fill_h(s)
+      if fh != float("inf") and fh > hv:
+        hv = fh
+    elif h_extra is not None:
       # The labeled abstraction (FULL-assembly cost-to-go) keeps exactly two roles here:
       #   * h=inf PRUNES states the full assembly cannot be finished from (sound);
       #   * its VARIATION prices resting-FACE and hold/brace choices the counting h is
@@ -6883,15 +7057,11 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
     for a, ns in successors(s, assembly, robots, grasp_table=grasp_table,
                             gripper_kind=gripper_kind, handovers=handovers,
                             allow_place=allow_place, bracing=bracing):
-      if a[2] not in relevant and not _FILL_TOUCH_ALL:   # a[2] is the part each action acts on
-        # RELEASE of an INHERITED grasp is always legal: the previous fill may end holding
-        # the assembly by any part (<=1 holder persists), and the grasped part is then
-        # outside this fill's `relevant` -- without this exemption the inherited holder
-        # STRANDS an arm for the whole fill (module fills with 2 usable arms died on
-        # exactly this; found via captured-state replay, 2026-07-24). Releasing frees a
-        # resource and manipulates nothing.
-        if a[0] != "release":
-          continue
+      # RELEASE of an inherited grasp is always legal. The broad scope pass additionally admits
+      # ordinary manipulation of future/blocking parts, but _fill_action_in_scope prevents an
+      # unrelated assembly join from making the concrete state disagree with outer `ideal`.
+      if not _fill_action_in_scope(a, relevant, p, touch_all=touch_all):
+        continue
       if (grasp_cap is not None and a[0] in ("pick", "add_grasp", "handover")
           and a[3] >= grasp_cap):
         continue                                          # grasp-WIDENING: only ids < cap this pass
@@ -6933,6 +7103,156 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
                if act == a)
     return s
 
+  def _direct_skeleton_fill():
+    """Probe the deliberately tiny reviewer-baseline manipulation family.
+
+    This is a restriction of ``succ_fn``, not a new action model: every edge still comes from
+    the ordinary successor generator and passes the ordinary wrench/cheap/IK gates.  The
+    augmented counters prevent pick/place/regrasp cycles while representing the four intended
+    schemas: direct insert, target hold, one fused handover, and one retained target brace.
+    At most 3R candidate role assignments are validated (mover, target holder, target brace,
+    each drawn from R robots). Failure is only failure of this probe; the caller explicitly
+    runs the complete fill next.
+    """
+    import time as _time
+
+    if robot_ik is not None and getattr(robot_ik, "open_witness", False):
+      if verbose:
+        print(f"[fill-skeleton {p}] skipped under --open-witness: a bounded stochastic "
+              "failure must remain reopenable; running the ordinary open fill")
+      return None, None
+    if cost_bound is not None:
+      if verbose:
+        print(f"[fill-skeleton {p}] skipped under incumbent cost bound {cost_bound:g}: "
+              "the complete bounded fill remains authoritative")
+      return None, None
+
+    # mover-picks, target-picks, handovers, retained braces, target placements, releases,
+    # steps. The step limit is the sum of the structural action caps plus one assemble.
+    zero = (0, 0, 0, 0, 0, 0, 0)
+    limits = (1, 1, 1, 1, 1, 3, 9)
+    sk_start = (start, zero)
+
+    def step(node, a, ns):
+      s, counts = node
+      vals = list(counts)
+      kind, part = a[0], a[2]
+      group = next((g for g in s.subassemblies() if part in g), frozenset())
+      if kind == "pick":
+        if p in group and settle in group:                # do not lift the completed fill again
+          return None
+        if p in group:
+          vals[0] += 1                                    # pick incoming component once
+        elif settle in group:
+          vals[1] += 1                                    # optionally lift target once
+        else:
+          return None
+      elif kind == "handover":
+        if p not in group and settle not in group:
+          return None
+        vals[2] += 1                                      # one fused regrasp total
+      elif kind == "add_grasp":
+        # A genuine brace belongs on the pre-assembly target. Regrasping the mover with an
+        # add+release sequence duplicates the fused handover schema and restores its plateau.
+        if settle not in group or p in group:
+          return None
+        vals[3] += 1
+      elif kind == "place":
+        if settle not in group:
+          return None                                    # no mover set-down/re-pick reorientation
+        vals[4] += 1
+      elif kind == "release":
+        if p not in group and settle not in group:
+          return None
+        vals[5] += 1
+      elif kind == "assemble":
+        if part != p or settle in group:
+          return None
+      else:
+        return None                                      # e.g. in-hand reorientation is an extension
+      vals[6] += 1
+      if any(v > cap for v, cap in zip(vals, limits)):
+        return None
+      return (ns, tuple(vals))
+
+    def sk_succ(node):
+      s, _counts = node
+      for a, ns in succ_fn(s):
+        nxt = step(node, a, ns)
+        if nxt is not None:
+          yield a, nxt
+
+    def transition(node, action):
+      return next(nxt for a, nxt in sk_succ(node) if a == action)
+
+    blacklist = set()
+    engine = _IncrementalLazySearch(
+        sk_start, goal_fn=lambda n: goal_fn(n[0]), succ_fn=sk_succ,
+        # This is a feasibility probe, not the complete/optimal fill. Greedy ordering avoids
+        # exhaustively enumerating the equal-f grasp-assignment shell before the first obvious
+        # schema (measured Cross obj_2: 12.6 s at weight one despite zero failed IK edges).
+        # Exhaustion and the ordinary fallback preserve coverage independently of this order.
+        cost_fn=action_cost, h_fn=lambda n: h_fn(n[0]), weight=float("inf"),
+        blacklist=blacklist,
+        cheap_gate=lambda prev, act, nxt: cheap_feasible(
+            act, prev[0], nxt[0], assembly, checker))
+    shared_bl = shared_ok = None
+    if robot_ik is not None:
+      shared_bl = getattr(robot_ik, "_fill_bl", None)
+      if shared_bl is None:
+        shared_bl = robot_ik._fill_bl = set()
+        shared_ok = robot_ik._fill_ok = set()
+      else:
+        shared_ok = robot_ik._fill_ok
+
+    t_sk = _time.perf_counter()
+    candidates = failed = 0
+    candidate_cap = max(1, 3 * len(robots))
+    while True:
+      sub = engine.search(max_nodes, deadline=deadline)
+      if sub is None:
+        if verbose:
+          why = "node/deadline budget" if engine.budget_hit else "family exhausted"
+          print(f"[fill-skeleton {p}] {why} after {candidates} candidate path(s), "
+                f"{failed} failed IK edge(s), {_time.perf_counter() - t_sk:.2f}s -> "
+                "complete local fallback")
+        return None, None
+      candidates += 1
+      node = sk_start
+      valid = True
+      for a in sub:
+        nxt = transition(node, a)
+        s0, s1 = node[0], nxt[0]
+        if robot_ik is not None and a[0] in _IK_ACTIONS:
+          if (s0, a) in shared_bl:
+            okb = False
+          elif (s0, a) in shared_ok:
+            okb = True
+          else:
+            okb, _w = robot_ik.bind(a, s0, s1, assembly)
+            (shared_ok if okb else shared_bl).add((s0, a))
+          if not okb:
+            blacklist.add((node, a))
+            engine.delete_edge(node, a, nxt)
+            failed += 1
+            valid = False
+        node = nxt
+      if valid:
+        if verbose:
+          print(f"[fill-skeleton {p}] VALIDATED {len(sub)}-action direct schema after "
+                f"{candidates} candidate path(s), {failed} failed IK edge(s), "
+                f"{_time.perf_counter() - t_sk:.2f}s")
+        return sub, node[0]
+      if candidates >= candidate_cap:
+        if verbose:
+          print(f"[fill-skeleton {p}] assignment probe budget {candidate_cap} reached, "
+                f"{failed} failed IK edge(s), {_time.perf_counter() - t_sk:.2f}s -> "
+                "complete local fallback")
+        return None, None
+
+  if skeleton_only:
+    return _direct_skeleton_fill()
+
   if lazy_fill and robot_ik is not None and getattr(robot_ik, "open_witness", False):
     # OPT-IN fair witness validation lives in its own module and rebuilds this SMALL engine
     # between effort epochs.  Nothing below (the measured permanent-blacklist path) changes.
@@ -6957,7 +7277,7 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
       suspended.update(cheap_bl)                          # dead edges stay dead across epochs
       return _IncrementalLazySearch(
           start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
-          weight=weight, blacklist=suspended,
+          weight=search_weight, blacklist=suspended,
           cheap_gate=_open_cheap_gate)
 
     def _walk_open_plan(sub):
@@ -7005,10 +7325,15 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
 
     engine = _IncrementalLazySearch(
         start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
-        weight=weight, blacklist=bl,
+        weight=search_weight, blacklist=bl,
         cheap_gate=lambda prev, act, ns: cheap_feasible(act, prev, ns, assembly, checker))
 
-    for _round in range(200):
+    # The established fast path caps LazySP repairs at 200 candidate plans. Exact local
+    # mode removes that arbitrary retry cutoff: every invalid candidate deletes at least
+    # one new edge, so repair continues until a valid optimum is popped, the finite
+    # frontier is exhausted, or the existing node/deadline budget is reached.
+    _round = 0
+    while exact_fill or _round < 200:
       # INCREMENTAL repair (the global lazy search's engine, LPA*-style): the heap and the
       # claimed tree PERSIST across rounds; a blacklisted edge only un-claims its own
       # search-tree subtree and re-injects the recorded alternate entries. The old
@@ -7050,12 +7375,13 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
                 f"by (kind, robot, arg): {top}")
         _fill_prof(f"{p}:ok")
         return subplan, s
+      _round += 1
     _fill_prof(f"{p}:rounds-out")
     return None, None
 
   subplan = _astar(start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
                    cheap_fn=None, edge_check_fn=edge_check_fn,
-                   weight=weight, max_nodes=max_nodes, verbose=False,
+                   weight=search_weight, max_nodes=max_nodes, verbose=False,
                    tag=f"add {p}", deadline=deadline, cost_bound=cost_bound)
   if subplan is None:
     _fill_prof(f"{p}:astar-fail")
@@ -7120,7 +7446,7 @@ def _settle_to_goal(start, assembly, robots, checker, grasp_table, robot_ik, wei
 def _add_parts(start, ps, ideal, assembly, robots, checker, grasp_table, robot_ik,
                weight, max_nodes, gripper_kind=None, handovers=True,
                allow_place=True, bracing=False, deadline=None,
-               lazy_fill=False, cost_bound=None):
+               lazy_fill=False, cost_bound=None, touch_all=None):
   # WIDTH-k milestone fill (adaptive-width completeness net): add ALL parts in `ps` in ONE
   # joint mini-search -- for plans that must INTERLEAVE several parts' glue, which the
   # width-1 fill cannot express (the milestone commitment's documented gap). Invoked with
@@ -7143,8 +7469,9 @@ def _add_parts(start, ps, ideal, assembly, robots, checker, grasp_table, robot_i
     for a, ns in successors(s, assembly, robots, grasp_table=grasp_table,
                             gripper_kind=gripper_kind, handovers=handovers,
                             allow_place=allow_place, bracing=bracing):
-      if a[2] in relevant or a[0] == "release":           # inherited-grasp release always
-        yield a, ns                                       # legal (see _add_one_part)
+      if _fill_action_in_scope(a, relevant, ps, touch_all=touch_all):
+                                                           # inherited release always legal;
+        yield a, ns                                       # touch-all may move future blockers
 
   def edge_check_fn(prev, act, ns):
     if not cheap_feasible(act, prev, ns, assembly, checker):
@@ -7211,7 +7538,8 @@ def solve_assembly_problem_optimistic(C, assembly, robots=None, verbose=True,
                                       robot_ik=None, fallback=True, weight=float("inf"),
                                       max_nodes=20000, wrench=False, handovers=True,
                                       allow_place=True, bracing=False, lazy_fills=False,
-                                      chain_h=False,
+                                      chain_h=False, fill_local_h=False, fill_exact=False,
+                                      wrench_aware_h=True, fill_skeleton_first=False,
                                       **exact_kw):
   """OPTIMISTIC (Dogar-style) planner (see the section header): add the parts one at a time,
   each via its own small complete search that reorients/holds/picks/mates/sets-down, chained
@@ -7242,6 +7570,7 @@ def solve_assembly_problem_optimistic(C, assembly, robots=None, verbose=True,
     )
   checker, grasp_table = _search_context(C, assembly, robots)
   gk = wrench_kind_arg(C, robots) if wrench else None
+  hgk = gk if wrench_aware_h else None
   if gk is not None:
     reset_wrench_cache()
 
@@ -7250,9 +7579,8 @@ def solve_assembly_problem_optimistic(C, assembly, robots=None, verbose=True,
   if chain_h:
     # One backward solve over the fixed optimistic prefix chain: future-aware like milestones,
     # but without alternative order ideals or combinations of unrelated loose parts.
-    sig_gk = (None if (isinstance(gk, dict) and not _MIXED_WRENCH_H) else gk)
     classes = compute_grasp_signatures(
-        assembly, grasp_table, gripper_kind=sig_gk,
+        assembly, grasp_table, gripper_kind=hgk,
         gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
         clearance=0.02)
     if verbose:
@@ -7267,8 +7595,19 @@ def solve_assembly_problem_optimistic(C, assembly, robots=None, verbose=True,
     ch = CollapsedLabeledHeuristic(
         assembly, len(robots), grasp_table,
         gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
-        verbose=verbose, gripper_kind=gk, bracing=bracing,
+        verbose=verbose, gripper_kind=hgk, bracing=bracing,
         grasp_classes=classes, labeled_loose=True, ideal_chain=pref)
+
+  fill_classes, fill_pdb_cache = None, {}
+  if fill_local_h:
+    fill_classes = compute_grasp_signatures(
+        assembly, grasp_table, gripper_kind=hgk,
+        gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
+        clearance=0.02)
+    if verbose:
+      print("[fill-local-h] ACTIVE: one goal-conditioned PDB per fill "
+            "(all grasps fact-signature projected); "
+            + f"concrete fill search weight={'1 (exact)' if fill_exact else weight}")
 
   s = get_initial_state(C, assembly)
   plan = []
@@ -7311,14 +7650,41 @@ def solve_assembly_problem_optimistic(C, assembly, robots=None, verbose=True,
       if shift == float("inf"):
         shift = 0.0                                      # retain finite-search fallback phases
 
+    lpdb = None
+    if fill_local_h:
+      comps = tuple(s.subassemblies())
+      target = next(frozenset(g) for g in comps if assembly.base in g)
+      mover = next(frozenset(g) for g in comps if p in g)
+      key = (_subasm_key(target), _subasm_key(mover), p, assembly.base)
+      lpdb = fill_pdb_cache.get(key)
+      if lpdb is None:
+        lpdb = _make_fill_local_pdb(
+            s, assembly, robots, checker, grasp_table, p, fill_classes,
+            gripper_kind=hgk, bracing=bracing, component_root=assembly.base,
+            verbose=verbose)
+        fill_pdb_cache[key] = lpdb
+
     sub, s2 = None, None
+    if fill_skeleton_first:
+      sub, s2 = _add_one_part(
+          s, p, ideal, assembly, robots, checker, grasp_table, robot_ik,
+          weight, max_nodes, verbose, gripper_kind=gk, handovers=handovers,
+          allow_place=allow_place, bracing=bracing, lazy_fill=lazy_fills,
+          h_extra=(None if lpdb is not None or ch is None else ch.value),
+          h_extra_shift=shift,
+          fill_h=(lpdb.value if lpdb is not None else None),
+          exact_fill=fill_exact, skeleton_only=True)
     for br, ma, ba in phases:
+      if sub is not None:
+        break
       sub, s2 = _add_one_part(s, p, ideal, assembly, robots, checker, grasp_table, robot_ik,
                               weight, max_nodes, verbose, gripper_kind=gk, handovers=handovers,
                               allow_place=allow_place, bracing=br, lazy_fill=lazy_fills,
                               part_grasp_allow=ma, brace_allow=ba,
-                              h_extra=None if ch is None else ch.value,
-                              h_extra_shift=shift)
+                              h_extra=(None if lpdb is not None or ch is None else ch.value),
+                              h_extra_shift=shift,
+                              fill_h=(lpdb.value if lpdb is not None else None),
+                              exact_fill=fill_exact)
       if sub is not None:
         break
     if sub is None:
@@ -7331,6 +7697,7 @@ def solve_assembly_problem_optimistic(C, assembly, robots=None, verbose=True,
       return solve_assembly_problem(C, assembly, robots=robots, verbose=verbose,
                                     robot_ik=robot_ik, weight=weight, max_nodes=max_nodes,
                                     wrench=wrench, handovers=handovers,
+                                    wrench_aware_h=wrench_aware_h,
                                     allow_place=allow_place, bracing=bracing, **exact_kw)
     plan += sub
     s = s2
@@ -7354,6 +7721,7 @@ def solve_assembly_problem_optimistic(C, assembly, robots=None, verbose=True,
       return solve_assembly_problem(C, assembly, robots=robots, verbose=verbose,
                                     robot_ik=robot_ik, weight=weight, max_nodes=max_nodes,
                                     wrench=wrench, handovers=handovers,
+                                    wrench_aware_h=wrench_aware_h,
                                     allow_place=allow_place, bracing=bracing, **exact_kw)
     plan += sub
     s = s2
@@ -7553,11 +7921,15 @@ def _add_one_part_declutter(start, p, ideal, assembly, robots, checker, grasp_ta
 
 def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, robot_ik=None,
                                       weight=5.0, max_nodes=20000, wrench=False,
+                                      wrench_aware_h=True,
                                       handovers=True, allow_place=True, bracing=False,
                                       max_repairs=100, geo_facts=False,
                                       sig_collapsed_h=False, deadline=None,
                                       fill_window=2, lazy_fills=True,
-                                      cost_bound=None, milestone_oracle="global"):
+                                      cost_bound=None, milestone_oracle="global",
+                                      fill_local_h=False, fill_exact=False,
+                                      fill_skeleton_first=False,
+                                      fill_scope_widening=False):
   """MILESTONE (Dogar-style, abstraction-guided) planner. Two levels:
 
     LEVEL 1: the assembly SEQUENCE. The labeled abstraction's backward Dijkstra (the same
@@ -7573,8 +7945,9 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
       granularity (dozens of nodes) instead of the exact search's per-edge flooding.
 
   ``milestone_oracle='structural'`` is a controlled ablation: it skips the global backward
-  signature database, orders dependency-valid milestones canonically, and gives each fill
-  only its local counting heuristic. All other machinery is identical.
+  signature database and orders dependency-valid milestones canonically. The fill heuristic
+  remains independently selectable: counting by default, or one goal-conditioned local PDB
+  with ``fill_local_h=True``. All other machinery is identical.
 
   Separate from the exact search by design (shares only _add_one_part + the heuristic
   class). Complete up to milestone commitment (like the optimistic solver, an interleaving
@@ -7591,6 +7964,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
     robots = get_robots(C)
   checker, grasp_table = _search_context(C, assembly, robots)
   gk = wrench_kind_arg(C, robots) if wrench else None
+  hgk = gk if wrench_aware_h else None
   if _problem._USEFUL_FLAG:
     _problem.set_useful_grasps(compute_useful_grasps(assembly, grasp_table, gk))
     if verbose:
@@ -7606,7 +7980,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
     h_cls = SignatureCollapsedHeuristic if sig_collapsed_h else GraspCollapsedHeuristic
     h_lab = h_cls(assembly, len(robots), grasp_table,
                   gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
-                  verbose=verbose, gripper_kind=gk, bracing=bracing,
+                  verbose=verbose, gripper_kind=hgk, bracing=bracing,
                   geo_checker=checker if geo_facts else None)
   elif milestone_oracle == "chain":
     roots = getattr(assembly, "connect_parts", set())
@@ -7620,7 +7994,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
     # backtracking, width windows, lazy fills and final settling remain in the ablation.
     classes = compute_grasp_signatures(
         assembly, grasp_table,
-        gripper_kind=(None if (isinstance(gk, dict) and not _MIXED_WRENCH_H) else gk),
+        gripper_kind=hgk,
         gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
         clearance=0.02)
     if verbose:
@@ -7637,13 +8011,47 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
     h_lab = CollapsedLabeledHeuristic(
         assembly, len(robots), grasp_table,
         gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
-        verbose=verbose, gripper_kind=gk, bracing=bracing,
+        verbose=verbose, gripper_kind=hgk, bracing=bracing,
         geo_checker=checker if geo_facts else None,
         grasp_classes=classes, labeled_loose=True, ideal_chain=pref)
   elif verbose:
     print("[milestones] structural oracle: backward signature database SKIPPED; "
-          "dependency/module eligibility + canonical order choose milestones, and fills "
-          "use only their local counting heuristic")
+          "dependency/module eligibility + canonical order choose milestones; the local "
+          "fill heuristic is selected independently")
+
+  # ONE goal-conditioned pattern database per distinct fill. Every grasp uses the same
+  # fact-signature projection; there is no role-specific exception for the interface grasp.
+  # Each PDB contains
+  # only ideal -> ideal+p, so it is independent of whether the surrounding assembly is a
+  # chain, DAG, or detached module. The cache also prevents the hinted/full/braced widening
+  # phases from rebuilding the same local backward solve.
+  fill_classes, fill_pdb_cache = None, {}
+  if fill_local_h:
+    fill_classes = compute_grasp_signatures(
+        assembly, grasp_table, gripper_kind=hgk,
+        gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
+        clearance=0.02)
+    if verbose:
+      print("[fill-local-h] ACTIVE: one goal-conditioned PDB per fill "
+            "(all grasps fact-signature projected); "
+            + f"concrete fill search weight={'1 (exact)' if fill_exact else weight}")
+
+  def fill_pdb(s, q, settle):
+    if not fill_local_h:
+      return None
+    root = assembly.base if settle is None else settle
+    comps = tuple(s.subassemblies())
+    target = next(frozenset(g) for g in comps if root in g)
+    mover = next(frozenset(g) for g in comps if q in g)
+    key = (_subasm_key(target), _subasm_key(mover), q, root)
+    hit = fill_pdb_cache.get(key)
+    if hit is None:
+      hit = _make_fill_local_pdb(
+          s, assembly, robots, checker, grasp_table, q, fill_classes,
+          gripper_kind=hgk, bracing=bracing, component_root=root,
+          geo_facts=geo_facts, verbose=verbose)
+      fill_pdb_cache[key] = hit
+    return hit
 
   def oracle(ideal_set, q):
     # abstract cost-to-go once `q` is mated and the grown assembly rests SETTLED on some
@@ -7703,6 +8111,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
     if settle is None:
       shift = oracle(set(ideal), q)
     dense = _problem._DENSE_GRASPS
+    lpdb = fill_pdb(s, q, settle)
     # phases, narrowest first: (grasp_cap, bracing, mate_allow, brace_allow). A FULL phase (all
     # grasps, no brace restriction) always precedes escalation -- the completeness net when a
     # relaxed hint misses the concrete-viable grasp/brace.
@@ -7719,18 +8128,42 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
           phases.append((nb if dense else None, True, allow, ballow))  # hinted mate + brace
         phases.append((None, True, None, ballow))                    # any mate + hinted brace
       phases.append((None, True, None, None))                        # full braced (net)
-    for cap, br, ma, ba in phases:
-      sub, s2 = _add_one_part(s, q, ideal, assembly, robots, checker, grasp_table, robot_ik,
-                              weight, max_nodes, verbose, gripper_kind=gk,
-                              handovers=handovers, allow_place=allow_place, bracing=br,
-                              grasp_cap=cap,
-                              h_extra=(h_lab.value if h_lab is not None else None),
-                              part_grasp_allow=ma,
-                              brace_allow=ba, deadline=deadline, lazy_fill=lazy_fills,
-                              cost_bound=fb, forbid_assemble=forbid, settle_ref=settle,
-                              h_extra_shift=shift)
+    scope_passes = _fill_scope_passes(_FILL_TOUCH_ALL, fill_scope_widening)
+    if fill_skeleton_first:
+      sub, s2 = _add_one_part(
+          s, q, ideal, assembly, robots, checker, grasp_table, robot_ik,
+          weight, max_nodes, verbose, gripper_kind=gk,
+          handovers=handovers, allow_place=allow_place, bracing=bracing,
+          deadline=deadline, lazy_fill=lazy_fills, cost_bound=fb,
+          forbid_assemble=forbid, settle_ref=settle,
+          h_extra=(None if lpdb is not None else
+                   h_lab.value if h_lab is not None else None),
+          h_extra_shift=shift,
+          fill_h=(lpdb.value if lpdb is not None else None),
+          exact_fill=fill_exact, skeleton_only=True,
+          touch_all=scope_passes[0])
       if sub is not None:
         return sub, s2
+    for touch_all in scope_passes:
+      if touch_all and not _FILL_TOUCH_ALL and verbose:
+        print(f"[fill-scope {q}] local grasp/bracing phases exhausted -> widening to "
+              "all-part manipulation", flush=True)
+      for cap, br, ma, ba in phases:
+        sub, s2 = _add_one_part(
+            s, q, ideal, assembly, robots, checker, grasp_table, robot_ik,
+            weight, max_nodes, verbose, gripper_kind=gk,
+            handovers=handovers, allow_place=allow_place, bracing=br,
+            grasp_cap=cap,
+            h_extra=(None if lpdb is not None else
+                     h_lab.value if h_lab is not None else None),
+            part_grasp_allow=ma,
+            brace_allow=ba, deadline=deadline, lazy_fill=lazy_fills,
+            cost_bound=fb, forbid_assemble=forbid, settle_ref=settle,
+            h_extra_shift=shift,
+            fill_h=(lpdb.value if lpdb is not None else None),
+            exact_fill=fill_exact, touch_all=touch_all)
+        if sub is not None:
+          return sub, s2
     return None, None
 
   objs = frozenset(assembly.objects)
@@ -7880,11 +8313,19 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
           uniq = uniq[:100]
         for t in uniq:
           tq = time.perf_counter()
-          sub, s2 = _add_parts(s, t, ideal, assembly, robots, checker, grasp_table,
-                               robot_ik, weight, max_nodes, gripper_kind=gk,
-                               handovers=handovers, allow_place=allow_place,
-                               bracing=bracing, deadline=deadline,
-                               lazy_fill=lazy_fills, cost_bound=fb)
+          sub, s2 = None, None
+          for touch_all in _fill_scope_passes(_FILL_TOUCH_ALL, fill_scope_widening):
+            if touch_all and not _FILL_TOUCH_ALL and verbose:
+              print(f"[fill-scope window {t}] local scope exhausted -> widening to "
+                    "all-part manipulation", flush=True)
+            sub, s2 = _add_parts(
+                s, t, ideal, assembly, robots, checker, grasp_table,
+                robot_ik, weight, max_nodes, gripper_kind=gk,
+                handovers=handovers, allow_place=allow_place,
+                bracing=bracing, deadline=deadline,
+                lazy_fill=lazy_fills, cost_bound=fb, touch_all=touch_all)
+            if sub is not None:
+              break
           if sub is not None:
             del plan[plen:]
             plan.extend(sub)
@@ -7923,12 +8364,15 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
 
 def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_budget=300.0,
                                               verbose=True, robot_ik=None, weight=5.0,
-                                              wrench=False, handovers=True,
+                                              wrench=False, wrench_aware_h=True, handovers=True,
                                               allow_place=True, bracing=False,
                                               geo_facts=False, sig_collapsed_h=False,
                                               labeled_h=False, collapsed_h=False,
                                               grasp_collapsed_h=False, fill_window=2,
-                                              milestone_oracle="global"):
+                                              milestone_oracle="global",
+                                              fill_local_h=False, fill_exact=False,
+                                              fill_skeleton_first=False,
+                                              fill_scope_widening=False):
   """THE SINGLE RECIPE (--milestones-anytime SEC): adaptive-width milestones under a hard
   deadline, then spend whatever budget remains on principled add-ons -- one algorithm plus
   its own refinements, not a solver lottery:
@@ -7953,10 +8397,13 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
   t_mile = t_end - min(60.0, 0.25 * time_budget)
   inc = solve_assembly_problem_milestones(
       C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik,
-      weight=max(weight, 5.0), wrench=wrench, handovers=handovers,
+      weight=max(weight, 5.0), wrench=wrench, wrench_aware_h=wrench_aware_h,
+      handovers=handovers,
       allow_place=allow_place, bracing=bracing, geo_facts=geo_facts,
       sig_collapsed_h=sig_collapsed_h, deadline=t_mile, fill_window=fill_window,
-      milestone_oracle=milestone_oracle)
+      milestone_oracle=milestone_oracle, fill_local_h=fill_local_h,
+      fill_exact=fill_exact, fill_skeleton_first=fill_skeleton_first,
+      fill_scope_widening=fill_scope_widening)
   remaining = t_end - time.perf_counter()
   if inc is None:
     if remaining > 5.0:
@@ -8208,7 +8655,8 @@ def solve_assembly_problem_ladder(C, assembly, robots=None, time_budget=900.0,
                                   handovers=True, allow_place=True, bracing=False,
                                   geo_facts=False, sig_collapsed_h=False, labeled_h=False,
                                   collapsed_h=False, grasp_collapsed_h=False,
-                                  lns=False, rwa_proof=False, lns_object=True):
+                                  lns=False, rwa_proof=False, lns_object=True,
+                                  wrench_aware_h=True):
   """THE LADDER (--ladder SEC): the unified anytime solver -- ONE commitment axis (fill
   window k), ONE monotone thread (the incumbent bound U). Rungs:
 
@@ -8238,7 +8686,8 @@ def solve_assembly_problem_ladder(C, assembly, robots=None, time_budget=900.0,
             + (f" under bound {U:g}" if U is not None else "") , flush=True)
     plan = solve_assembly_problem_milestones(
         C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik,
-        weight=max(weight, 5.0), wrench=wrench, handovers=handovers,
+        weight=max(weight, 5.0), wrench=wrench, wrench_aware_h=wrench_aware_h,
+        handovers=handovers,
         allow_place=allow_place, bracing=bracing, geo_facts=geo_facts,
         sig_collapsed_h=sig_collapsed_h, deadline=slices[k], fill_window=k,
         lazy_fills=True, cost_bound=U)
@@ -8256,7 +8705,8 @@ def solve_assembly_problem_ladder(C, assembly, robots=None, time_budget=900.0,
       print("[ladder] no incumbent -> k=2 feasibility rung", flush=True)
     plan = solve_assembly_problem_milestones(
         C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik,
-        weight=max(weight, 5.0), wrench=wrench, handovers=handovers,
+        weight=max(weight, 5.0), wrench=wrench, wrench_aware_h=wrench_aware_h,
+        handovers=handovers,
         allow_place=allow_place, bracing=bracing, geo_facts=geo_facts,
         sig_collapsed_h=sig_collapsed_h, deadline=slices[2], fill_window=2,
         lazy_fills=True)
@@ -8277,7 +8727,8 @@ def solve_assembly_problem_ladder(C, assembly, robots=None, time_budget=900.0,
              else GraspCollapsedHeuristic)
     h_lab = h_cls(assembly, len(robots), grasp_table,
                   gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
-                  verbose=False, gripper_kind=gk, bracing=bracing)
+                  verbose=False, gripper_kind=(gk if wrench_aware_h else None),
+                  bracing=bracing)
     h0 = h_lab.value(get_initial_state(C, assembly))
     if U <= h0:
       if verbose:
@@ -8318,6 +8769,7 @@ def solve_assembly_problem_ladder(C, assembly, robots=None, time_budget=900.0,
       res = solve_assembly_problem(
           C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik, weight=5.0,
           wrench=wrench, handovers=handovers, allow_place=allow_place, bracing=bracing,
+          wrench_aware_h=wrench_aware_h,
           labeled_h=labeled_h, collapsed_h=collapsed_h,
           grasp_collapsed_h=grasp_collapsed_h, sig_collapsed_h=sig_collapsed_h,
           geo_facts=geo_facts, cost_bound=U, pea=True, deadline=t_end)
@@ -8346,6 +8798,7 @@ def solve_assembly_problem_ladder(C, assembly, robots=None, time_budget=900.0,
     res = solve_assembly_problem(
         C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik, weight=1.0,
         wrench=wrench, handovers=handovers, allow_place=allow_place, bracing=bracing,
+        wrench_aware_h=wrench_aware_h,
         labeled_h=labeled_h, collapsed_h=collapsed_h,
         grasp_collapsed_h=grasp_collapsed_h, sig_collapsed_h=sig_collapsed_h,
         geo_facts=geo_facts, cost_bound=U, pea=True, deadline=t_end)

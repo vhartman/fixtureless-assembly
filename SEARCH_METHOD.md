@@ -1,654 +1,675 @@
-# Abstraction-Guided Milestone Search for Multi-Robot Assembly
+# Structure-First Milestone Search with Local Reverse Abstractions
 
-This document describes the search implemented by the current `--milestones` and
-`--milestones-anytime` paths. It is deliberately presented twice. Part I gives an intuitive
-account of what the planner is doing and why. Part II gives an implementation-faithful methods
-description suitable as the basis of a paper section.
+This document describes the search selected by `--search-profile standard` as of 2026-08-25.
+It is presented twice: Part I is an intuitive explanation, while Part II is an
+implementation-faithful methods description suitable as the basis of a paper section.
 
-The description reflects the code as of 2026-08-22. In particular, it includes signature-
-collapsed backward search, wrench and geometry facts, adaptive-width milestone fills, lazy and
-open IK validation, chronological repair, DAG modules, the anytime wrapper, and exact witness
-persistence.
+The standard search is:
+
+```text
+--weight 1
+--milestones --milestone-oracle structural
+--fill-local-h --fill-exact --no-fill-skeleton-first
+--open-witness --open-witness-batch 7 --open-witness-epochs 2
+```
+
+The profile additionally enables the established physical and geometric contract: real IK,
+wrench checking, asymmetric grasps, uniform `press` signatures, bracing, handovers, placement,
+hybrid scene-aware grasp sampling, collision/clearance gates, witness persistence, and the
+hands-off on-table goal. Those feasibility settings are described in the repository README; this
+document focuses on the discrete and continuous search policy.
+
+The central claim is deliberately limited. The method searches a supplied assembly dependency
+graph through settled milestones, uses a small reverse abstraction to guide each concrete join,
+and fairly reallocates finite IK effort among competing candidate paths. It supports dependency
+graphs and detached modules and chronologically backtracks over high-level choices. It is not a
+globally complete planner over every concrete boundary realization.
+
+---
 
 ## Part I: intuitive explanation
 
-### The central idea: plan backward, execute forward
+### 1. The basic decomposition
 
-Assembly planning is difficult because a forward planner must make many choices before it knows
-whether they were good:
+A flat assembly search must choose part order, robot assignments, grasps, placements, braces,
+handovers, and robot configurations simultaneously. The cross-product is large, while real-arm
+IK is much more expensive than generating a discrete manipulation action.
 
-- which part to assemble next;
-- which robot should carry it;
-- which grasp should be used;
-- whether the growing assembly should remain on the table or be held;
-- whether another robot must brace it;
-- whether a handover or temporary placement is needed; and
-- whether all of those choices have collision-free robot IK.
+The standard planner separates three levels:
 
-A flat search mixes all of these decisions. Its frontier becomes the cross-product of part order,
-grasp, robot assignment, placement face, support state, and manipulation history.
-
-The milestone planner separates the problem into two questions:
-
-1. **What should the assembly look like at the next clean checkpoint?**
-2. **How do the robots get from the current checkpoint to that one?**
-
-The first question is answered by a small model solved backward from the finished assembly. The
-second is answered forward, using the real manipulation actions, collision checks, wrench checks,
-and robot IK.
-
-The backward model can be understood as taking apart an idealized finished product. Starting at
-the goal, it asks:
-
-- which part could have been the last one inserted?
-- which grasp could have carried it?
-- did the target need to be held or braced?
-- could the remaining support resist gravity and the insertion force?
-- could the relevant grippers fit around the assembly?
-- could the part have been picked from a stable table face, or would it need a regrasp?
-
-Solving all such disassembly possibilities once produces a distance-to-go table. The forward
-planner then uses that table as an assembly manual: among the currently legal next parts, prefer
-the one whose completion leaves the cheapest abstract route to the goal.
+1. **Dependency milestones:** choose a dependency-valid part or detached module to add next.
+2. **Local manipulation search:** find the concrete pick, carry, handover, brace, insertion,
+   release, and placement actions that realize that one addition.
+3. **Continuous validation:** spend collision-aware IK effort only on edges of promising local
+   paths and retain the successful joint configurations.
 
 ```text
-assembly + grasp models
-          |
-          v
-  grasp signatures and cached feasibility facts
-          |
-          v
- backward disassembly Dijkstra  ---->  distance-to-go table
-                                          |
-current concrete checkpoint  ------------+
-          |
-          v
- rank next parts -> forward local fill -> validate IK witnesses
-                           | success              | failure
-                           v                      v
-                    new checkpoint       try another part / backtrack
-                           |
-                           v
-                  optional global anytime improvement
+supplied sequence or dependency graph
+                  |
+                  v
+   choose a dependency-valid part/module
+                  |
+                  v
+ build a small reverse PDB for this one join
+                  |
+                  v
+ weight-one concrete local search over raw grasps
+                  |
+                  v
+ lazily validate candidate-path IK with fair reopening
+          | success                     | local failure
+          v                             v
+ retain settled checkpoint       try another milestone
+          |                             |
+          +---------- suffix failure ---+
+                         |
+                         v
+             chronological backtracking
 ```
 
-### What the backward state remembers
+The outer planner is therefore structure-first, not a second attempt to infer a part order that
+the assembly model already provides. Dependencies decide what is legal. The search is still free
+to choose among simultaneously eligible branches and to revisit an earlier choice when its
+suffix fails.
 
-The abstract backward state is
+### 2. Structural milestones
+
+A checkpoint records:
+
+- the concrete support, grasp, placement, and mate state;
+- the dependency-closed set of parts already joined to the main assembly;
+- the validated plan prefix; and
+- the high-level decision that produced the checkpoint.
+
+With `--milestone-oracle structural`, no global order-ideal database is built. Eligible parts are
+ordered canonically after dependency filtering. This is intentionally simple: the supplied task
+structure chooses the assembly opportunities, while the local PDB handles manipulation guidance.
+
+For each eligible part, the planner attempts a local fill. A successful fill produces a new
+settled checkpoint. A local failure blacklists the pair
 
 ```text
-(assembled parts, grasps on the main assembly, table face or held-in-air, held loose parts)
+(current assembled set, attempted part or module)
 ```
 
-It intentionally forgets exact arm configurations and usually forgets robot identities. Those
-details are expensive and are checked later by the forward fills. It retains the information that
-changes the qualitative feasibility of future assembly:
+and tries another eligible choice. If a later checkpoint has no continuation, the planner pops
+it, blacklists the decision that led there, and resumes at its parent. This is chronological
+backtracking, or backjumping with milestone-level conflict records.
 
-- which dependencies are already assembled;
-- how many grippers are occupied;
-- where the main assembly is supported;
-- which kinds of grasps are holding or bracing it; and
-- which kinds of grasps are carrying loose parts.
+Milestones do not force the assembly to be placed on the table after every join. A local endpoint
+may be on a stable table face or held by at most one robot. This permits intentional hold-through
+plans while preventing braces and loose carried parts from accumulating indefinitely.
 
-This is a relaxation: if a real manipulation is possible, its projection should also be possible
-in the abstract model. The abstract distance is therefore a lower bound on the real remaining
-action cost. Conversely, if the fully constructed abstract model cannot reach the goal from a
-projected state, then the real state cannot reach it either under the modeled actions and facts.
+### 3. The local reverse pattern database
 
-### Why grasp signatures are needed
-
-Keeping every raw grasp ID makes the backward table too large. Forgetting grasps entirely makes it
-too weak: a grasp that can pick a part from the table may be unable to transmit its insertion
-force, while another grasp has the opposite properties.
-
-The current compromise groups grasps into **fact signatures**. Two grasps are interchangeable in
-the backward model when they agree on the selected facts. The available components are:
-
-- `press`: can the grasp transmit the part's insertion load?
-- `pickface`: from which stable table faces can the gripper reach the grasp without colliding
-  with the table or part?
-- `contact`: what contact point and closing-axis class does the grasp use?
-- `solohold`: can this grasp support the complete assembly alone in the air?
-- `braceside`: on which side of the assembly can the grasp act as a useful brace?
-
-Intuitively, the signature is a short list of a grasp's “qualifications,” not its geometric
-identity. `press` asks whether it can do the insertion job; `pickface` asks whether it can be
-acquired from the part's present pose; `contact` retains where and along which axis it acts;
-`solohold` asks whether it can be the only carrier; and `braceside` asks which insertion loads it
-can oppose. Grasps with the same selected qualifications share one backward label, while the
-forward search still chooses and validates an actual raw grasp.
-
-The default is `--sig-components press`, because force transmission is the most useful
-discriminator in the tested wrench-heavy assemblies. With mixed gripper types, the gripper-kind
-usability mask is always part of the signature. The expensive per-kind wrench facts—including
-mixed-gripper `press` and `solohold` evaluations—are enabled by `--mixed-wrench-h`; without that
-flag the mixed-gripper abstraction uses its faster topological fallback.
-
-When a class contains several raw grasps, a fact is accepted if any member realizes it. This OR
-rule is important: collapsing labels may make the abstraction optimistic, but cannot make it more
-restrictive than the raw-grasp abstraction.
-
-### What happens in the forward pass
-
-Suppose the current checkpoint contains the base plus some assembled parts. The planner lists all
-precedence-addable parts and sorts them using the backward distance after hypothetically adding
-each part and settling the grown assembly.
-
-For the best candidate, a local fill search is run. It may:
-
-- pick the new part;
-- pick or continue holding the target assembly;
-- hand over or reorient the new part;
-- add a brace;
-- insert the part;
-- release unnecessary grasps; and
-- place a loose part or the growing assembly when placement is enabled.
-
-The fill ends at a clean checkpoint: the requested part is assembled, no unrelated loose part is
-left in a gripper, and the relevant assembly is either on the table or held by at most one robot.
-Milestones therefore do **not** require placement to be disabled and do not force the assembly to
-stop on the table after every insertion. A hold-through solution and a set-down solution are both
-available.
-
-The fill first tries narrow hints from the abstraction, but those hints are never trusted as a
-complete description of concrete reachability. The widening order is approximately:
-
-1. hinted insertion grasps, unbraced;
-2. all insertion grasps, unbraced;
-3. hinted insertion and brace grasps;
-4. all grasps, with bracing.
-
-Thus a useful abstract hint saves work, while a wrong hint is followed by a full local phase.
-
-### Lazy IK and open witnesses
-
-Robot IK is much more expensive than discrete successor generation. A fill therefore searches
-the discrete graph first and spends IK primarily on edges of a candidate path.
-
-The established lazy path treats a failed IK query as a permanent edge refutation within the
-solve. It incrementally repairs the local search tree after deleting failed edges.
-
-`--open-witness` changes the interpretation of a failed stochastic IK attempt. Failure means
-“not found with this effort yet,” rather than “this edge is impossible.” Each blocking edge gets
-a bounded batch:
-
-- ordinary skills receive 2 attempts, then 4, then up to `--open-witness-batch` on later visits;
-- assembly receives one atomic structural batch, normally six orientation-biased solves plus one
-  unbiased solve;
-- a failure suspends the edge for the rest of the fairness epoch;
-- the invalid candidate plan is abandoned immediately, without probing its suffix; and
-- a later epoch reopens suspended edges with additional effort.
-
-Successful witnesses are retained exactly. Once a final discrete plan is selected, its successful
-joint vectors are aligned with the final action order and serialized. Witness optimization may
-improve them, but may not erase them. Replay therefore does not have to rediscover a stochastic IK
-solution.
-
-The current epoch limit is still an effort limit. If it is reached, the local fill reports failure
-to the milestone layer even though the individual IK query remains logically open. Consequently,
-the current open-witness policy is an incomplete resource-bounded search policy, not an
-infeasibility proof.
-
-### What repair means
-
-If a candidate part cannot be filled, the high-level decision
+For a candidate join, let `B` be the current target component, `M` the incoming part or already
+built module, and `q` the interface part. Instead of solving backward over the complete assembly,
+the planner constructs only the local transition
 
 ```text
-(current assembled set, chosen next part)
+B  ->  B union M.
 ```
 
-is blacklisted. The planner tries the next part suggested by the backward table. If every choice
-at the current checkpoint fails, it pops the previous checkpoint, blames the decision that led to
-the dead end, and tries another branch. This is chronological backtracking with conflict records at
-milestone granularity.
+The abstract state remembers:
 
-This is much cheaper than flooding the entire concrete manipulation graph, but the conflict is
-coarse. Two concrete checkpoints can share the same assembled set while differing in holder,
-placement, or robot configuration. Blacklisting only by assembled set and next part assumes those
-differences do not rescue the transition. That is one reason the milestone algorithm is not a
-globally complete search at its default width.
+```text
+(local assembled component, holder/brace grasp labels,
+ table face or held-in-air, held incoming parts)
+```
 
-When every one-part fill fails, the planner can widen the checkpoint. With the default
-`--fill-window 2`, it jointly searches for two new parts before backtracking. Such a joint fill can
-express manipulation glue that must overlap across two nominal assembly steps. In the conceptual
-limit where the window contains every remaining part, the decomposition becomes the flat search;
-the current implementation normally stops at width two and also caps the number of windows tried.
+It omits joint configurations and normally omits robot identities, but retains total and
+per-tool gripper capacity. It also retains the enabled support, table-pick, insertion-load, and
+grasp-capability facts.
 
-Assemblies with explicit module joins receive an additional decomposition: a detached module is
-built internally and then joined to the main component as one milestone.
+The database is computed backward from every abstract state representing a valid local endpoint.
+Because handovers cost two and ordinary actions cost one, the implementation uses multi-source
+Dijkstra. Construction is resumable: reverse search advances only until the abstract state
+requested by forward A* is settled, then pauses with its queue and cached facts intact.
 
-### The anytime version
+The local PDB is a heuristic only. A missing local-PDB value is treated as unknown rather than as
+a concrete infeasibility certificate. The concrete search retains its counting lower bound and
+continues. A 200,000-state PDB guard fails explicitly instead of silently selecting another
+heuristic.
 
-`--milestones-anytime T` uses the milestone plan as a fast incumbent and then spends remaining
-time trying to improve it in the full concrete state space.
+### 4. Uniform grasp projection
 
-The budget is used as follows:
+Raw grasp IDs are too numerous for a useful reverse state space, but collapsing all grasps into
+one label loses the difference between a grasp that can transmit an insertion force and one that
+cannot.
 
-1. Reserve `min(60 s, 0.25 T)` for a fallback or improvement phase.
-2. Run adaptive-width milestones until the earlier milestone deadline.
-3. If milestones found a plan of cost `U`, run memory-reduced partial-expansion weighted search
-   while pruning every state with `g + h >= U`. Only a strictly cheaper plan can replace the
-   incumbent.
-4. If milestones did not find a plan and more than five seconds remain, run a greedy
-   partial-expansion search in the full concrete state space as a feasibility net.
-5. Return the best validated plan found so far.
+Every raw grasp is therefore mapped through the same fact-signature equivalence relation. The
+available signature components are:
 
-This prioritizes “find something reliable first, improve it second.” The incumbent cannot be lost
-when the improvement pass times out.
+- `press`: whether the grasp can transmit the part's insertion load;
+- `pickface`: the stable table faces from which the grasp is geometrically pickable;
+- `contact`: contact location and closing-axis class;
+- `solohold`: whether it can hold the relevant assembly alone; and
+- `braceside`: whether its closing direction supplies a useful brace direction.
 
-The repository also contains `--anytime`, a different algorithm: restarting weighted search with
-weights `infinity, 5, 2, 1.5, 1`. It does not use milestone decomposition. The method described in
-this document is the milestone-specific anytime wrapper.
+The standard uses `--sig-components press`. In mixed-tool scenes, the usable gripper-kind mask is
+always included, even if it was not named as a signature component.
+
+There is no special treatment for the active, interface, or final grasp. Every grasp in every
+role uses the same projection. Facts for a projected class are existentially lifted over its raw
+members. This may make the abstraction optimistic, but it cannot delete a concrete raw-grasp
+route. The forward search still enumerates and validates the raw grasp IDs.
+
+### 5. Concrete local fill search
+
+The local forward graph uses the ordinary actions:
+
+```text
+pick, place, assemble, release, add_grasp, handover,
+and inhand_reorient when enabled.
+```
+
+The first pass may manipulate the incoming component and the target component. Releasing an
+inherited grasp is also permitted so a holder retained by a previous milestone cannot strand a
+robot. If every local-scope phase fails, the standard repeats the fill with all-part manipulation:
+future loose parts may be picked, relocated, handed over, reoriented, regrasped, placed, and
+released. They may not be assembled early, and the endpoint must settle every temporarily moved
+blocker. This preserves the outer dependency bookkeeping while preventing local-scope failure
+from being mistaken for milestone infeasibility.
+
+The local goal requires:
+
+1. the requested mate or module join is complete;
+2. no unrelated loose component remains in a gripper; and
+3. the component being built is resting or has at most one holder.
+
+The heuristic is the maximum of a cheap local counting bound and the finite local-PDB value. The
+`--fill-exact` flag sets the concrete candidate search to weight one and removes the historical
+200-candidate LazySP repair cutoff. Within a fixed action phase, search continues until it finds a
+validated path, exhausts the finite frontier, or reaches a node/deadline guard.
+
+The selected structural standard has **no grasp or brace action hints**. Its widening order is:
+
+1. local parts, all insertion grasps, without bracing;
+2. local parts, all insertion grasps and all braces;
+3. all parts, all insertion grasps, without bracing; and
+4. all parts, all insertion grasps and all braces.
+
+The optional `global` and `chain` milestone oracles can prepend narrower phases using their
+relaxed-model insertion-grasp and brace hints. Those modes always retain the unrestricted phases
+above. The all-part passes are entered only after the cheap local graph exhausts. This distinction
+matters for ablations: disabling hints in the selected structural method
+would be a no-op, whereas disabling `--fill-local-h` would remove the reverse heuristic itself and
+is a different comparison. Since the planner returns the first successful phase, `fill-exact`
+does not imply global optimality over optional phased unions or over the full assembly problem.
+
+### 6. Lazy IK and open witnesses
+
+Searching the entire local graph with nonlinear IK at every expansion is wasteful. The planner
+first searches using the sound cheap gates, obtains a candidate path, and then validates that
+path's IK edges.
+
+Under the standard open-witness policy, a stochastic IK failure means
+
+```text
+not found with this effort yet
+```
+
+rather than
+
+```text
+this edge is geometrically impossible.
+```
+
+During one fairness epoch:
+
+- the first unresolved edge on a candidate path receives a bounded IK batch;
+- success stores the exact joint vector and validation continues;
+- failure suspends the edge for the remainder of the epoch;
+- the candidate suffix is not probed after the first blocking failure; and
+- local search immediately explores another candidate path.
+
+At the next epoch, suspended edges reopen with greater effort. With the standard two epochs,
+ordinary skills receive two fresh attempts on their first visit and four on their second.
+Assembly uses an atomic seven-slot bundle per visit: six canonical orientation biases and one
+unbiased initialization. The configured batch value of seven is the cap used by later ordinary
+visits, although a two-epoch standard fill normally reaches only the 2-then-4 tiers.
+
+Successful witnesses persist across local fills when their scene-action signature matches. Failed
+queries are not entered into the legacy permanent IK cache. If both epochs finish without a
+validated fill, however, the local fill returns failure to the milestone layer. The milestone
+transition is then blacklisted even though its unresolved IK edges were not proven infeasible.
+This is an operational effort policy, not a decision procedure for continuous feasibility.
+
+### 7. Dependency graphs, Chair, and backtracking
+
+For an ordinary dependency graph, a part becomes eligible when its mate closure is already
+present. Independent branches may be attempted in different orders through chronological
+backtracking.
+
+Chair additionally contains a detached back/post module. The milestone solver recognizes its
+connect root and:
+
+1. builds the required module parts as a separate component;
+2. permits that module to remain held between internal fills;
+3. performs the module-to-chair join as one composite milestone; and
+4. resumes the outer dependency search with the complete module added.
+
+If that composite milestone fails, or if its resulting suffix dead-ends, the outer checkpoint
+stack is popped and another eligible high-level choice is attempted. The selected method therefore
+does support Chair's dependency graph and does backtrack.
+
+It is nevertheless not globally complete for Chair or for a general dependency graph:
+
+- only one concrete settled boundary state is retained for a successful milestone;
+- a later failure does not enumerate every alternate grasp, holder, placement, or robot
+  realization of that same successful milestone;
+- the internal order of parts within a detached module is currently fixed;
+- open-witness effort stops after two epochs;
+- the default joint-fill width is two; and
+- node, repair, candidate-window, and PDB-size guards are finite.
+
+The local PDB does not create these completeness gaps: it is guidance and does not remove raw
+actions. The gaps come from milestone commitment, finite continuous effort, and finite resource
+limits.
+
+### 8. Why this is the standard
+
+The standard was selected by a seven-method screen followed by a three-seed finalist comparison
+on Cross-7, mixed-tool Chair-8, and Fixture-rack-9, all with four robots. The physics columns were
+geometry-only and a wrench-aware 5 N insertion with 5% lateral uncertainty.
+
+Three-seed means are shown as wall time / plan cost:
+
+| Scene | Counting + open | Local reverse exact + open |
+|---|---:|---:|
+| Cross-7 geometry | 7.8 s / 28 | **5.4 s / 28** |
+| Cross-7 noisy 5 N | 12.0 s / 28 | **6.6 s / 28** |
+| Chair-8 geometry | **22.7 s / 35** | 26.4 s / **31** |
+| Chair-8 noisy 5 N | **26.9 s / 31** | 30.7 s / 31 |
+| Fixture-9 geometry | **38.1 s / 24** | 46.6 s / 24 |
+| Fixture-9 noisy 5 N | 125.9 s / 40 | **75.7 s / 40** |
+
+Summed over the six equally weighted cells, the selected method took 191.4 s versus 233.3 s for
+counting plus open witnesses, an 18% reduction. On the difficult noisy Fixture, peak RSS fell
+from approximately 4.22 GiB to 0.91 GiB. Weight 100 was rejected as the default because it
+repeatedly returned worse plans and sometimes increased runtime; direct-skeleton probing was a
+useful baseline but degraded strongly on wrench-heavy Chair and Fixture.
+
+The result is a deliberately uniform policy rather than a scene classifier. Its known overhead is
+the construction of local reverse facts on easy geometric fills. Its benefit is avoiding much
+larger IK and memory growth when force-constrained branching becomes difficult.
+
+---
 
 ## Part II: paper-style methods description
 
 ### 1. Problem formulation
 
-Let an assembly instance contain parts \(P\), robots \(R\), a designated base part
-\(p_0\), a mate dependency graph, stable placement faces, a grasp database, and optionally a
-quasi-static wrench model. A discrete state \(s\in\mathcal S\) records:
-
-- the kinematic parent of every part;
-- mate, table, and grasp support contacts;
-- the table placement face and anchor of every resting component; and
-- robot-to-part grasp ownership.
+Let an assembly instance contain parts `P`, robots `R`, a designated base `p0`, a mate dependency
+graph, stable placements, a grasp database, and optionally a quasi-static wrench model. A concrete
+state `s` records kinematic parents, mate/table/grasp supports, component placements, and robot
+grasp ownership.
 
 The action set is
 
-\[
-\mathcal A=\{\texttt{pick},\texttt{place},\texttt{assemble},\texttt{release},
-\texttt{add\_grasp},\texttt{handover},\texttt{inhand\_reorient}\},
-\]
+```text
+A = {pick, place, assemble, release, add_grasp, handover, inhand_reorient}.
+```
 
-with `set_down` and `stow` in configurations that enable them. All actions have unit cost except
-`handover`, which has cost two because it represents a grasp addition followed by release:
+Ordinary actions have unit cost and handover has cost two because it represents a grasp addition
+followed by a release. A feasible transition satisfies discrete preconditions, wrench/support
+constraints, cheap geometric gates, and a real-arm IK predicate that returns a joint-space
+witness. The goal contains all required mates and satisfies the configured support condition,
+which is hands-off and on-table in the standard profile.
 
-\[
-c(a)=\begin{cases}2,&a=\texttt{handover},\\1,&\text{otherwise.}\end{cases}
-\]
+### 2. High-level structural search
 
-A transition must satisfy the discrete preconditions, support and wrench gates, cheap geometric
-collision gates, and—when real IK is enabled—a robot-level feasibility predicate returning a
-configuration witness \(q_a\). The objective is to find a feasible action sequence from the
-initial scattered state to a goal in which all required mates are present and the requested goal
-support conditions, such as on-table and hands-off, hold.
-
-### 2. Signature-collapsed disassembly abstraction
-
-We define a projection \(\pi:\mathcal S\rightarrow\bar{\mathcal S}\). An abstract state is
-
-\[
-\bar s=(I,G,\phi,L),
-\]
-
-where:
-
-- \(I\subseteq P\) is the dependency-closed, base-containing assembled component;
-- \(G\) is a tuple of grasp labels currently supporting or bracing \(I\);
-- \(\phi\in\Phi(I)\cup\{H\}\) is a stable table face or the held-in-air symbol \(H\); and
-- \(L\) is the tuple of held loose parts together with their grasp labels.
-
-Robot identities are removed, while total and per-tool-kind gripper capacities are retained. In
-mixed-tool scenes, each grasp label has a tool-kind mask. The optional mixed-wrench model adds
-the more expensive per-tool wrench facts; it is not required for the capacity constraints.
-
-#### 2.1 Grasp-label construction
-
-For each part \(p\), raw grasps \(g\in\mathcal G_p\) are partitioned by a signature
-
-\[
-\sigma(p,g)=\big(\sigma_{\mathrm{tool}},\sigma_{\mathrm{press}},
-\sigma_{\mathrm{pick}},\sigma_{\mathrm{contact}},
-\sigma_{\mathrm{hold}},\sigma_{\mathrm{brace}}\big),
-\]
-
-restricted to the enabled components. The components are:
-
-| Component | Meaning | Primary role in backward search |
-|---|---|---|
-| tool mask | gripper kinds able to use the grasp | prevents vacuum-only and finger-only grasps from being merged |
-| `press` | feasibility of transmitting the part's own insertion wrench | separates pickable grasps from insertion-capable grasps |
-| `pickface` | table-aware pickability vector over stable rest faces and tool types | prices reorientation and rejects finger-through-table picks |
-| `contact` | quantized contact center and sign-symmetric closing axis | preserves force lever and brace-contact class while merging irrelevant wrist tilts |
-| `solohold` | ability to hold the completed assembly alone | identifies viable terminal carriers and handover recipients |
-| `braceside` | closing-axis alignment with mate directions | distinguishes grasps that can react forces on different sides |
-
-For a class \([g]\), every context-dependent fact is evaluated by existential lifting,
-
-\[
-F([g])=\bigvee_{g'\in[g]}F(g').
-\]
-
-This can introduce abstract transitions that no single raw grasp realizes consistently across all
-contexts, but it cannot delete the projection of a real transition. Signature collapse is thus an
-additional relaxation.
-
-#### 2.2 Cached abstract facts
-
-The backward model uses five fact families.
-
-1. **Dependency and mate facts.** A part can be removed backward only if it is maximal in the
-   current ideal. A forward on-table mate must be compatible with the selected rest face.
-2. **Contextual grasp validity.** A grasp must occur in the precomputed grasp table for the
-   relevant subassembly. Removing parts is treated monotonically as removing obstacles.
-3. **Table-aware pick facts.** For each subassembly, rest face, grasp, and tool geometry, a
-   floating end effector is placed at the grasp and checked against the table and subassembly.
-4. **Wrench facts.** Crafted states are evaluated with the same equilibrium LP used by forward
-   support gates. These test ordinary holding, release stability, insertion-force transmission by
-   the moving part, and reaction-force support by the target and its braces.
-5. **Optional geometric coexistence facts.** With `--geo-facts`, a labeled state relays backward
-   only if all abstract grippers can coexist around the assembly and table. Class-level facts use
-   an existential assignment of raw variants.
-
-The abstraction also mirrors staged-mate support constraints, stable face sets, bracing, in-hand
-reorientation, and tool-kind capacity when those features are active.
-
-### 3. Backward shortest-path construction
-
-All abstract states satisfying the concrete goal projection are inserted into a multi-source
-priority queue at distance zero. The table is expanded by inverse actions using Dijkstra's
-algorithm because handovers cost two.
-
-The principal inverse transitions are:
-
-| Forward action | Backward predecessor operation | Cost and gate |
-|---|---|---|
-| assemble part \(p\) | remove maximal \(p\) from \(I\); move its insertion grasp from \(G\) to \(L\) | 1; dependency, rest-face, target-support, insertion and tool-budget facts |
-| pick loose part | remove its labeled entry from \(L\) | 1; pickable from at least one stable face |
-| lift main assembly | change \(H\) with one holder to a stable face with no holder | 1; table-aware pick fact |
-| place main assembly | change a stable face to \(H\) and add the placing holder | 1; free gripper capacity |
-| release | add backward the grasp that existed before release | 1; the forward post-state must remain wrench-stable |
-| add brace | remove one grasp from \(G\) while retaining at least one holder | 1; predecessor remains support-feasible |
-| handover | swap the sole assembly or loose-part grasp label | 2; transient gripper capacity |
-| in-hand reorient | swap the loose-part grasp label | 1; only when the skill is enabled |
-| place loose part | add a held loose-part label | 1; free gripper capacity |
-
-Only states co-reachable from an abstract goal are generated. Let \(d(\bar s)\) be the resulting
-distance. The heuristic used by concrete search is
-
-\[
-h(s)=\max\{h_{\mathrm{count}}(s),d(\pi(s))\},
-\]
-
-where \(h_{\mathrm{count}}\) charges one remaining assembly action for every unmated part and
-one pick for every such part not already held.
-
-#### Proposition 1: admissibility of the abstraction
-
-Assume that every concrete transition has an abstract counterpart of no greater cost and that
-all enabled fact gates are necessary conditions for the corresponding concrete transition. Then
-
-\[
-d(\pi(s))\leq J^*(s)
-\]
-
-for every concrete state \(s\), where \(J^*\) is the optimal remaining concrete action cost.
-
-**Argument.** Project any feasible concrete suffix into the abstract graph. By assumption, each
-concrete edge maps to an abstract edge of no larger cost, so the projected suffix upper-bounds the
-abstract shortest-path distance. Signature OR-lifting, anonymous robots, existential rest faces,
-and omitted arm configurations only add possibilities and therefore preserve the inequality.
-
-An absent table entry is consequently a sound dead-end certificate only when the backward table
-was built without an incompatible distance cap or state-limit failure and the fact gates satisfy
-the necessity assumption.
-
-### 4. Abstraction-guided milestone search
-
-The forward search maintains a stack of settled checkpoints
-
-\[
-(s_k,I_k,n_k,\delta_k),
-\]
-
-where \(s_k\) is the concrete state, \(I_k\) is its assembled ideal, \(n_k\) is the current
-plan length, and \(\delta_k\) is the high-level decision that reached it.
-
-For a precedence-addable part \(p\), the high-level oracle is
-
-\[
-O(I,p)=\min_{\phi\in\Phi(I\cup\{p\})}
-d(I\cup\{p\},\emptyset,\phi,\emptyset).
-\]
-
-Candidates are tried in ascending \((O(I,p),\mathrm{partIndex}(p))\) order. The empty grasp sets
-in this oracle represent an idealized settled checkpoint; they are used for ranking and do not
-constrain the concrete fill endpoint.
-
-#### Algorithm 1: milestone search
+The milestone search maintains a stack
 
 ```text
-BACKWARD-MILESTONE-SEARCH(instance, width K, repair budget B)
-    D <- backward Dijkstra table over signature-collapsed states
-    stack <- [(initial state, {base}, plan length 0, no parent decision)]
+(s_k, I_k, n_k, delta_k),
+```
+
+where `s_k` is a concrete settled checkpoint, `I_k` is its assembled ideal, `n_k` is the plan
+prefix length, and `delta_k` is the milestone decision that produced it.
+
+A non-module part `p` is eligible when its mate closure is contained in `I_k`. A connect-root
+module is eligible when all dependencies external to the module are contained in `I_k`. Under the
+structural oracle, candidates are sorted by deterministic part index after eligibility filtering;
+no global order-ideal heuristic is constructed.
+
+#### Algorithm 1: standard milestone search
+
+```text
+STANDARD-MILESTONES(instance, width K, repair budget B)
+    stack <- [(initial concrete state, {base}, 0, none)]
     blacklist <- empty set
     plan <- empty sequence
 
-    while stack is not empty and budget remains:
+    while stack is not empty and budgets remain:
         (s, I, n, via) <- top(stack)
 
-        if I contains all parts:
-            if s is not a goal:
-                try a final place/release fill
-                if it fails: pop and blacklist via; continue
-            return validated plan
+        if I contains every part:
+            if s is not hands-off and on-table:
+                attempt a final settle-and-release fill
+                if it fails: pop; blacklist via; continue
+            return plan prefix through n plus final fill
 
-        Q <- precedence-addable parts not blacklisted at I
-        sort Q by the backward oracle O(I, p)
+        Q <- dependency-valid parts/modules not blacklisted at I
+        sort Q canonically
 
-        for p in Q:
-            subplan <- FILL-ONE(s, I, p, D)
-            if subplan succeeds:
-                truncate plan to n; append subplan
-                push its settled endpoint and enlarged ideal
-                continue outer loop
-            blacklist (I, p)
+        for q in Q:
+            if q is a connect root:
+                result <- BUILD-AND-JOIN-MODULE(s, I, q)
+            else:
+                result <- FILL-ONE(s, I, q)
 
-        if every one-part fill failed and K >= 2:
-            for widths k = 2, ..., K:
-                enumerate precedence-valid k-part windows
-                try one joint local fill for each window
-                on success push the enlarged checkpoint and continue outer loop
+            if result succeeds:
+                truncate plan to n; append result actions
+                push the resulting settled checkpoint
+                continue the outer loop
 
-        pop the dead checkpoint
-        blacklist the decision via that created it
+            blacklist (I, q)
 
-    return failure
+        if no singleton succeeded:
+            try dependency-valid joint windows of widths 2 through K
+            push the first successful joint endpoint
+
+        if no window succeeded:
+            pop the checkpoint
+            blacklist the parent decision via
+
+    return failure within the configured resources
 ```
 
-#### 4.1 Local fill search
+The stack implements depth-first chronological backtracking. Conflicts are keyed by assembled set
+and next milestone, rather than by the full concrete checkpoint. This coarse key is economical
+but is also a source of incompleteness.
 
-`FILL-ONE` searches only actions touching \(I\cup\{p\}\), except that release of an inherited
-holder is always permitted. Its goal requires:
+### 3. Goal-conditioned local abstraction
 
-1. \(p\) is mated;
-2. no unrelated loose component remains held; and
-3. the component being built has at most one holder.
-
-The local counting heuristic is
-
-\[
-h_{\mathrm{fill}}(s)=h_p(s)+N_{\mathrm{loose}}(s)+
-\max(0,N_{\mathrm{holders}}(s)-1),
-\]
-
-where \(h_p\) is 0 when \(p\) is mated, 1 when it is held in a mate-capable grasp, and 2 when it
-still requires a pick or a forced regrasp. For ordinary non-module fills, the full-assembly
-abstraction is shifted by the expected post-milestone distance,
-
-\[
-\tilde h_D(s)=d(\pi(s))-O(I,p),
-\]
-
-and joined with the local heuristic to provide a gradient toward this fill rather than merely
-toward the final assembly. This shifted term is an ordering device inside the decomposed fill;
-the code explicitly does not rely on it for a global optimality guarantee.
-
-Cached backward wrench facts additionally provide candidate insertion grasps and brace contacts.
-The fill searches hinted unbraced, full unbraced, hinted braced, and full braced phases in that
-order, subject to cases where the relaxed wrench model proves an unbraced insertion unavailable.
-
-#### 4.2 Lazy continuous validation
-
-Let \(\hat{\mathcal G}\) be the local discrete graph after cheap geometric filtering and let
-\(V(e)\) be expensive IK validation. The established fill repeatedly finds a shortest weighted
-candidate path in \(\hat{\mathcal G}\), evaluates \(V\) only along that path, deletes failed
-edges, and incrementally repairs the affected search-tree subtree. Successful and failed queries
-are shared across fills through scene-signature caches.
-
-The open-witness variant replaces terminal stochastic failure with a solve-scoped effort state
-\((n_e,v_e)\) per scene-action query. During each fairness epoch, an unresolved edge receives its
-next bounded effort batch and is suspended after failure. The discrete planner then seeks an
-alternative candidate. At the next epoch, suspended edges reopen. Successful queries store both
-the verdict and exact configuration witness.
-
-This is related to lazy shortest-path search, but its resource-bounded IK oracle is not a binary
-edge oracle: `unknown after this effort` is distinct from `geometrically refuted`. The current
-implementation preserves that distinction in the IK pool but collapses an exhausted local epoch
-budget to a failed milestone fill at the high level.
-
-#### 4.3 Modules and adaptive-width fills
-
-For a connect-root part, the planner first builds its dependency module as a detached component,
-allowing it to remain held between module-internal fills, and then performs the joining fill.
-
-If all one-part fills at a checkpoint fail, width-\(k\) search jointly adds a precedence-valid
-tuple of \(k\) parts. Increasing \(k\) weakens the decomposition commitment by permitting their
-manipulation actions to interleave. The default \(K=2\) addresses common two-part couplings;
-\(K=|P\setminus I|\) is conceptually the undecomposed limit, subject to implementation budgets.
-
-#### 4.4 Chronological repair
-
-Failures produce conflicts keyed by \((I,p)\), or \((I,W)\) for a joint window. When a node has
-no remaining candidate, the stack is popped and the parent decision is blacklisted. This repair
-is coarse but inexpensive: it changes assembly order rather than exploring all manipulation
-interleavings below a failed commitment.
-
-### 5. Anytime milestone search
-
-Given total nominal budget \(T\), define
-
-\[
-T_r=\min(60,0.25T),\qquad T_m=T-T_r.
-\]
-
-The first phase runs milestone search until \(T_m\). If it returns an incumbent \(\xi\) with
-cost \(U\), the remaining time is passed to partial-expansion weighted graph search over the full
-concrete state space with the strict improvement bound
-
-\[
-g(s)+h(s)<U.
-\]
-
-Partial expansion retains only the current \(f\)-band of an expanded state's successors and
-requeues the parent at the smallest deferred band. It trades successor regeneration for a smaller
-OPEN list. If the improvement search returns a plan of cost below \(U\), it becomes the new
-incumbent; otherwise the milestone plan is returned unchanged.
-
-If milestone search fails or reaches its deadline without an incumbent, the reserved budget is
-used for greedy partial-expansion search in the full concrete graph, provided more than five
-seconds remain.
-
-#### Algorithm 2: anytime wrapper
+For target component `B`, incoming component `M`, and interface part `q`, the pattern database is
+restricted to the two assembly ideals
 
 ```text
-ANYTIME-MILESTONES(instance, total time T, weight w)
-    reserve <- min(60 seconds, 0.25 T)
-    incumbent <- MILESTONES(deadline = now + T - reserve)
-
-    if incumbent is absent:
-        if more than 5 seconds remain:
-            return PEA-GREEDY(full concrete graph, final deadline)
-        return failure
-
-    U <- cost(incumbent)
-    if more than 10 seconds remain:
-        candidate <- PEA-WEIGHTED-A*(full graph,
-                                     prune when g + h >= U,
-                                     final deadline)
-        if candidate exists and cost(candidate) < U:
-            incumbent <- candidate
-
-    return incumbent
+B and B union M.
 ```
 
-The timeout is cooperative: deadlines are checked between search operations, not by interrupting
-an individual nonlinear IK solve.
+An abstract state is
 
-### 6. Feasibility certificates and witness persistence
+```text
+x = (I, G, phi, L),
+```
 
-Every IK-validated action produces a full joint-space witness. Successful open-witness queries
-retain the exact vector in addition to the boolean verdict. After optional release hoisting, the
-planner aligns cached witnesses against the final state-action trajectory. Any affected edge whose
-predecessor scene changed is certified once before serialization.
+where `I` is the local ideal, `G` is the tuple of holder/brace labels, `phi` is a stable table
+face or the held-in-air symbol, and `L` is the tuple of held incoming parts and grasp labels.
+Robot identities and configurations are omitted; total and per-kind gripper capacities remain.
 
-The plan JSON records one witness entry per action and labels the block as either `search` or
-`optimized`. A required IK action with a missing witness causes export to fail. Subsequent witness
-optimization always includes the search witness as an immutable feasible fallback. Thus search,
-optimization, motion planning, and replay consume the same continuous certificates rather than
-independently sampling IK.
+#### 3.1 Fact-signature labels
 
-### 7. Guarantees and current limitations
+For part `p`, raw grasp `g` is mapped to a label by
 
-The following statements are supported by the present construction:
+```text
+sigma(p,g) = (tool mask, enabled fact components).
+```
 
-- Returned plans are checked against the enabled discrete, wrench, cheap-collision, and IK gates.
-- Under the relaxation assumptions in Proposition 1, the backward distance is admissible.
-- Signature collapse preserves admissibility because class facts are existentially lifted.
-- A complete, uncapped backward table can soundly identify abstract dead ends.
-- Incumbent pruning by the unweighted test \(g+h\geq U\) is sound when \(h\) is admissible.
-- The anytime wrapper always retains its incumbent when a later search times out.
+The enabled components may encode insertion-load transmission, table-face pickability, contact
+geometry, solo holding, and brace direction. The standard component set is `press`, augmented
+unconditionally by the tool-kind mask in mixed fleets.
 
-The following should **not** currently be stated as unconditional theorems:
+For a projected class `gamma`, a fact is existentially lifted:
 
-- Default milestone search is not globally complete. It commits to settled checkpoints, uses a
-  finite fill width and repair budget, and stores coarse milestone conflicts.
-- A bounded open-witness failure is not an IK infeasibility proof.
-- “Hard” wall-clock compliance is not guaranteed across one long nonlinear solve.
-- The current weighted A*/PEA* engines claim a concrete state on its first feasible pop and do not
-  reopen it for a lower-cost path. The implementation also documents inconsistency in the labeled
-  heuristic. Standard weighted-suboptimality and weight-one optimality claims therefore require
-  either a consistency proof, a reopening implementation, or an independent argument specific to
-  these state transitions. `--pathmax` repairs local heuristic drops but is not by itself a
-  general replacement for reopenings.
-- Partial expansion substantially reduces frontier memory but cannot literally guarantee that an
-  arbitrary instance will never exhaust memory.
+```text
+F(p,gamma) = OR over raw g in gamma of F(p,g).
+```
 
-These qualifications affect quality and completeness claims, not the feasibility of a returned
-and fully witnessed plan.
+Consequently, label collapse may add abstract behavior but does not delete the projection of a
+raw transition. The same map is used for interface, holder, brace, and loose-part grasps.
 
-### 8. Current command mapping
+#### 3.2 Reverse transitions and facts
 
-| Command | Role |
+The reverse graph contains inverse assemble, pick, lift, place, release, add-grasp, handover,
+in-hand reorientation, and loose-placement transitions. It uses necessary abstract facts for:
+
+- dependency and mate legality;
+- stable rest faces;
+- table-aware floating-gripper pickability;
+- gripper-kind capacity and grasp usability;
+- release and holding stability;
+- insertion-force transmission and target reaction support; and
+- optional gripper coexistence geometry.
+
+All abstract fill-goal states are inserted at distance zero. Multi-source Dijkstra computes
+distance `d(x)` because action costs are nonnegative and handover costs two. The queue and fact
+caches persist between queries; forward search advances reverse Dijkstra only until its queried
+abstract state is settled.
+
+The concrete fill heuristic is
+
+```text
+h(s) = max(h_count(s), d(pi(s)))
+```
+
+when the PDB query is finite. A missing value contributes no pruning and leaves `h_count` in
+place.
+
+#### Proposition 1: relaxation admissibility
+
+Assume every concrete local transition projects to an abstract transition of no greater cost and
+every enabled fact gate is necessary for its concrete counterpart. Then the local reverse
+distance lower-bounds the optimal local concrete cost:
+
+```text
+d(pi(s)) <= J_local*(s).
+```
+
+To see this, project any feasible concrete suffix into the abstract graph. Each projected edge
+has no greater cost, while anonymous robots, omitted configurations, and existential class facts
+can only add alternatives. The abstract shortest path can therefore be no more expensive than
+the projected concrete suffix.
+
+This proposition describes the abstraction. It does not establish global optimality of the
+implemented fill driver because phased action-set widening, finite search guards, and bounded
+stochastic validation remain outside the idealized shortest-path statement.
+
+### 4. Concrete fill and lazy continuous validation
+
+For one milestone, the concrete successor function is restricted to the target and incoming
+components, except for release of inherited holders. Its goal is the requested join with no
+unrelated loose-held part and no more than one holder on the settling component.
+
+Within each widening phase, weight-one A* searches the raw discrete state graph using the local
+heuristic and cheap feasibility gates. The lazy validator evaluates expensive IK only on the
+current candidate path.
+
+#### Algorithm 2: bounded fair open-witness fill
+
+```text
+OPEN-FILL(start, local goal, maximum epochs E)
+    preserve solve-wide successful witness pool
+
+    for epoch = 1 through E:
+        suspended <- cheap-refuted edges plus empty open set
+        engine <- weight-one local A* excluding suspended edges
+
+        while engine has a candidate path:
+            for each edge e on the path in order:
+                if e has a successful cached witness: continue
+                validate e with its next effort batch
+
+                if validation succeeds:
+                    retain the exact joint vector
+                else:
+                    suspend e for this epoch
+                    delete e from the current search tree
+                    restart candidate extraction immediately
+
+            if every edge is validated:
+                return path and endpoint
+
+    return unresolved failure to the milestone layer
+```
+
+Ordinary skills receive fresh effort tiers of 2, 4, and then at most `B`; assembly receives an
+atomic `B=7` structural bundle on every visit. The standard uses `E=2`, so ordinary edges normally
+receive the first two tiers. A zero epoch limit means unlimited reopening but is accepted only
+with a finite solver deadline.
+
+Cheap refutations remain permanently dead because they are treated as sound. Stochastic IK
+failures remain open in the witness pool but become a failed local milestone after the epoch
+budget. This separation avoids claiming that finite optimization failure proves infeasibility.
+
+### 5. Modules, width, and repair
+
+A connect-root module is built as a detached component. Module-internal fills use the connect root
+as their settling reference, so the module may remain carried rather than being forced onto the
+table. After its currently fixed internal order is complete, a final local fill joins the module
+to the main assembly.
+
+When every singleton candidate at an outer checkpoint fails, the planner tries joint windows up
+to `--fill-window K`, with standard `K=2`. A joint window permits manipulation actions for two
+nominal milestones to interleave. This is a limited relaxation of the settled-boundary
+commitment, not a complete widening schedule.
+
+On suffix failure, the checkpoint stack is popped and its parent decision is blacklisted. This
+does search different dependency-valid outer orders. It does not retain multiple endpoints for a
+successful milestone, nor does it revisit a blacklisted `(I,q)` with a different boundary
+realization.
+
+### 6. Witness certificates
+
+Every validated IK action returns a joint vector. Successful open-witness queries retain that
+vector, not merely a Boolean verdict. After release hoisting, the vectors are aligned with the
+final action sequence; any edge whose predecessor scene changed is certified again.
+
+The saved plan records one search or optimized witness per IK action. Missing required witnesses
+cause export to fail. Optional witness optimization may improve a configuration but retains the
+search witness as a feasible fallback. Motion planning and replay therefore consume persisted
+certificates instead of rerunning stochastic IK.
+
+### 7. Guarantees and limitations
+
+The current implementation supports the following claims:
+
+- Every returned plan passes the enabled discrete, wrench, collision/clearance, and IK gates.
+- Successful IK actions carry persisted joint-space witnesses.
+- Under Proposition 1's assumptions, the uniform local-PDB value is an admissible local
+  abstraction heuristic.
+- Uniform grasp projection does not remove raw concrete actions.
+- The outer solver respects the supplied dependencies, handles connect modules, and
+  chronologically backtracks among high-level milestone choices.
+- Weight-one search and removal of the 200-candidate cutoff give exhaustive local repair within a
+  fixed phase, provided its finite graph, edge oracle, and implementation guards are exhausted.
+- Before a singleton fill is blacklisted, the standard exhausts both the local action scope and
+  the all-part manipulation scope across its unbraced/braced phases. Thus locality alone is no
+  longer a reason to reject the milestone; finite continuous effort and the remaining guards
+  still prevent this from being an unconditional infeasibility proof.
+
+The following are not valid unconditional claims:
+
+- The complete milestone planner is not globally complete.
+- `fill-exact` does not make the assembly plan globally optimal, and phased widening means it is
+  not necessarily optimal over the union of local phases.
+- Two open-witness epochs are not an IK infeasibility proof.
+- Chair support and backtracking do not imply enumeration of every Chair boundary state or every
+  module-internal order.
+- Width two cannot express all manipulation interleavings across three or more milestones.
+- Finite node, repair, window, PDB, and wall-time guards can terminate a feasible instance.
+- A nonlinear IK call may exceed a cooperative deadline before returning.
+
+Even with unlimited open-witness epochs, the one-boundary milestone commitment and fixed
+module-internal order remain. A plausible probabilistic-completeness path would require fair
+unbounded IK effort, multiple or nondominated concrete endpoints per milestone, search over module
+internal orders, unbounded width/resource limits, and a reopening concrete graph search. That is
+future work, not a property of the current standard.
+
+### 8. Optional extensions and ablations
+
+The following mechanisms remain available but are not part of the selected standard search:
+
+- `--milestone-oracle global`: build a full signature-collapsed order-ideal database and use it
+  for outer part ordering and fill hints;
+- `--milestone-oracle chain`: restrict that global abstraction to a declared sequence; detached
+  modules are rejected;
+- counting-only fills: disable `--fill-local-h`;
+- terminal IK failure: disable `--open-witness`;
+- weighted local search: disable `--fill-exact` and select `--weight W`;
+- direct skill skeletons: enable `--fill-skeleton-first`; and
+- `--milestones-anytime T`: use milestones for an incumbent and spend reserved time on a bounded
+  full-state partial-expansion improvement/fallback search.
+
+The direct-skeleton probe searches a bounded family of ordinary manipulation paths—direct carry
+and insert, target hold, one handover, one retained brace, and one target placement—before falling
+back to the ordinary local graph. It is a baseline and diagnostic, not the standard.
+
+### 9. Standard command and flag mapping
+
+The ordinary fresh-search command is:
+
+```bash
+python3 main.py --solve --search-profile standard \
+    --assembly ASSEMBLY --parts N --num-robots R --robot ROBOT \
+    --seed SEED --save experiments/PLAN.json
+```
+
+Scene-specific grippers, insertion force/noise, layout, and special grasp compliance remain
+explicit arguments.
+
+| Standard flag | Function |
 |---|---|
-| `--milestones` | default abstraction-guided milestone search |
-| `--milestones-anytime T` | milestone incumbent plus bounded PEA improvement/fallback |
-| `--sig-collapsed-h` | signature-class backward abstraction; default on |
-| `--sig-components press` | default signature ablation |
-| `--mixed-wrench-h` | expensive per-tool wrench facts for mixed grippers |
-| `--geo-facts` | optional floating-gripper coexistence facts |
-| `--fill-window K` | maximum adaptive milestone width; default 2 |
-| `--no-lazy-fills` | disable candidate-path-only IK validation |
-| `--open-witness` | non-terminal, effort-tiered stochastic IK validation |
-| `--open-witness-batch B` | maximum effort batch; default 7 |
-| `--open-witness-epochs E` | fairness epochs per fill; default 2 |
-| `--bounded` | milestone incumbent followed by an un-timed incumbent-bounded global search |
-| `--anytime T` | separate restarting weighted global search, without milestone decomposition |
+| `--milestones` | settled-checkpoint decomposition with chronological repair |
+| `--milestone-oracle structural` | dependency/module eligibility without a global PDB |
+| `--fill-local-h` | resumable goal-conditioned reverse PDB for each join |
+| `--fill-exact` | weight-one local candidate search and no 200-repair cutoff |
+| `--no-fill-skeleton-first` | use the general local graph directly |
+| `--fill-scope-widening` | after local exhaustion, retry with all-part manipulation |
+| `--sig-components press` | force-transmission grasp signature, plus mandatory tool mask |
+| `--open-witness` | suspend and fairly reopen finite stochastic IK failures |
+| `--open-witness-batch 7` | maximum ordinary tier and atomic assembly bundle |
+| `--open-witness-epochs 2` | measured finite operational effort per local fill |
+| `--fill-window 2` | built-in joint-fill widening limit |
 
-### 9. Suggested experimental reporting
+`--search-profile open` is retained as a compatibility alias for `standard`.
+`--search-profile fast-open` changes only the analytic warm-start cap and remains an aggressive
+ablation.
 
-For a paper evaluation, search quality should be separated into four layers:
+### 10. Experimental reporting
 
-1. **Backward construction:** build time, number of co-reachable abstract states, number of fact
-   queries, raw grasps versus signature classes, and initial abstract distance.
-2. **Milestone decisions:** chosen part order, failed one-part fills, window escalations, module
-   fills, backtracks, and conflict count.
-3. **Continuous validation:** IK effort slots, successful witnesses, open failures, time per skill,
-   and the fraction of candidate paths invalidated at each edge position.
-4. **Anytime behavior:** first-solution time and cost, incumbent cost over time, PEA frontier size,
-   improvement-pass outcome, and final certificate completeness.
+A paper evaluation should report four layers separately:
 
-Ablations should independently vary the backward representation (`press`, all signature
-components, raw labels, and identity collapse), milestone width, lazy versus eager IK, terminal
-versus open witness failure, and the bounded global improvement phase. This separates better
-high-level ordering from cheaper continuous validation and from global cost refinement.
+1. **Structure:** dependency width, module count, chosen order, failed milestones, windows, and
+   backtracks.
+2. **Local abstraction:** PDB states settled/discovered, reverse time, fact counts, and raw grasps
+   versus signature classes.
+3. **Continuous validation:** IK calls, effort slots, failures by gate and skill, successful
+   witnesses, and IK wall time.
+4. **End-to-end outcome:** first-plan time, action cost, peak memory, witness completeness, motion
+   planning success, and simulation or real execution.
+
+The principal ablations should be counting versus local PDB, terminal versus open IK failure,
+weight one versus weighted search, geometry-only versus wrench/noisy insertion, and one versus
+multiple retained boundary states. The last comparison targets the primary remaining algorithmic
+limitation rather than adding another part-order heuristic.
+
+There is no “without hints” row for the selected standard: `--milestone-oracle structural`
+constructs no global oracle, so it supplies no insertion-grasp or brace hints in the first place.
+`--no-fill-local-h` is instead a much larger counting-versus-reverse-heuristic ablation and should
+not be mislabeled as hint removal.
+
+The manipulation-locality ablation keeps reverse-PDB guidance, weight-one exact fill search, and
+open witnesses fixed. It compares the standard narrow-to-broad policy
+(`--fill-scope-widening --no-fill-touch-all`) against an eager all-part policy
+(`--no-fill-scope-widening --fill-touch-all`). Both ultimately expose the same broad concrete
+action graph; only the scheduling differs. The broad graph permits picking, placing, handing over,
+reorienting, regrasping, or releasing any future part. It still forbids assembling a part other
+than the requested join, keeping the concrete state aligned with milestone bookkeeping, and
+requires moved blockers to be settled at the endpoint.
+
+The reproducible manifests are:
+
+```text
+benchmarks/manifests/paper_search_matrix.json
+benchmarks/manifests/paper_search_stress_4r.json
+benchmarks/manifests/search_finalists_4r.json
+benchmarks/manifests/search_manipulation_scope_ablation.json
+```
+
+The honest summary is: the method is a structure-aware, locally abstraction-guided, lazily
+validated milestone planner with chronological backtracking and persisted witnesses. It is robust
+on the tested sequence and dependency-graph assemblies, including Chair's detached module, but it
+is not yet a globally complete search over alternative concrete milestone boundaries.

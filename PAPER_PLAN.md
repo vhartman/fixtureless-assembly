@@ -359,9 +359,13 @@ hardware measurements of the relevant grasp or support limit.
 1. Freeze the algorithmic claim and explicitly keep phase smoothing outside the main search
    contribution.
 2. Build a reproducible benchmark runner that emits aggregate search statistics and complete run
-   metadata.
+   metadata. **Initial version implemented:** `benchmarks/search_runner.py` runs every sample in
+   a fresh process and writes raw logs, replayable plans, JSON/CSV metrics, aggregates, and source
+   provenance.
 3. Add scalable synthetic assembly families so the evidence is not limited to handcrafted
-   demonstrations.
+   demonstrations. **First family implemented:** `fixture-rack` scales from one rail to six
+   post/bracket stations (13 parts), with branching precedence, heterogeneous cuboids, vertical
+   post insertion, and lateral bracket loads that exercise target holding and bracing.
 4. Establish the single strict, unscaled simulation configuration.
 5. Run primitive hardware calibration and freeze the physical parameters.
 6. Execute Cross first as the hardware integration and repeatability test.

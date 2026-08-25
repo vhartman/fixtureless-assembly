@@ -119,6 +119,8 @@ GEOMETRIC = [
     ("cuboid-tower", 3, 2, 3.0, 4),                        # NON-CUBE: jenga tower (2:1:1 boxes,
     ("cuboid-tower", 4, 2, 3.0, 8),                        # 2/level, levels rotated 90 deg)
     ("cuboid-tower", 6, 2, 3.0, 13),
+    ("fixture-rack", 3, 2, 3.0, 6),                       # rail + top-down post + lateral arm
+    ("fixture-rack", 5, 3, float("inf"), 13),             # two independent station branches
     ("car", 3, 2, 3.0, 8),                                 # ROTATED shapes: sideways wheels
     ("car", 5, 2, float("inf"), 15),                       # full car (wA* too slow for the suite)
     ("cube-plates", 4, 2, 3.0, 7),
@@ -161,6 +163,26 @@ def test_wrench(kind, n, robots, weight, model, insert, exp_len):
   assert _replay_ok(plan, asm, C, robots_list, gk), "wrench plan does not reach the goal"
   assert len(plan) <= exp_len + SLACK, \
       f"plan length {len(plan)} >> baseline {exp_len} (regression?)"
+
+
+def test_fixture_rack_lateral_press_is_solved_with_support_actions():
+  """Unlike the small unbraced WRENCH table above, the rack intentionally needs the target
+  actively supported during its horizontal bracket press. With bracing/support successors
+  enabled, the geometric+wrench solver must find and replay that manipulation sequence."""
+  A.set_seed(0)
+  A.set_rolls_per_face(1)
+  W.PARAMS["grasp_model"] = "asymmetric"
+  W.PARAMS["insert_force"]["_default"] = 10.0
+  asm = A.make_assembly("fixture-rack", 3)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  gk = A.gripper_kind(C)
+  plan = A.solve_assembly_problem(C, asm, robots=robots, weight=3.0, verbose=False,
+                                  wrench=True, robot_ik=None, bracing=True)
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots, gk, bracing=True)
+  assert len(plan) <= 8 + SLACK
 
 
 def _two_module_state(asm, C, robots, held_top):
@@ -708,3 +730,195 @@ def test_milestone_module_fill():
       "plan never performs the module join -- the module path was not exercised"
   assert len(plan) <= 21 + SLACK, f"milestone plan length {len(plan)} >> baseline 21 (regression?)"
   assert time.time() - t0 < 40.0, "milestone module fill got unexpectedly slow (repair cascade?)"
+
+
+def test_structural_milestones_skip_the_global_database(monkeypatch):
+  """The ablation must not quietly build a differently-shaped global abstraction."""
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 3)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+
+  def forbidden(*_args, **_kwargs):
+    raise AssertionError("structural milestone mode constructed a global heuristic")
+
+  monkeypatch.setattr(A, "SignatureCollapsedHeuristic", forbidden)
+  monkeypatch.setattr(A, "GraspCollapsedHeuristic", forbidden)
+  plan = A.solve_assembly_problem_milestones(
+      C, asm, robots=robots, weight=5.0, verbose=False,
+      milestone_oracle="structural")
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+
+
+def test_chain_milestone_oracle_plans_a_sequence():
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 3)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  plan = A.solve_assembly_problem_milestones(
+      C, asm, robots=robots, weight=5.0, verbose=False,
+      milestone_oracle="chain")
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+
+
+def test_fill_local_exact_plans_a_sequence_without_global_oracle():
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 3)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  plan = A.solve_assembly_problem_milestones(
+      C, asm, robots=robots, weight=100.0, verbose=False,
+      milestone_oracle="structural", fill_local_h=True, fill_exact=True)
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+
+
+def test_fill_touch_all_expands_manipulation_scope_but_not_milestone_assembly_scope():
+  """The locality ablation may move blockers without silently growing the outer ideal."""
+  import solver as S
+
+  relevant = {"obj_0", "obj_1"}
+  S.set_fill_touch_all(False)
+  try:
+    assert S._fill_action_in_scope(("pick", "a1", "obj_1", 0), relevant, "obj_1")
+    assert not S._fill_action_in_scope(("pick", "a1", "obj_2", 0), relevant, "obj_1")
+    assert S._fill_action_in_scope(("release", "a1", "obj_2", 0), relevant, "obj_1")
+
+    S.set_fill_touch_all(True)
+    assert S._fill_action_in_scope(("pick", "a1", "obj_2", 0), relevant, "obj_1")
+    assert S._fill_action_in_scope(("place", "a1", "obj_2", 0), relevant, "obj_1")
+    assert S._fill_action_in_scope(("handover", "a1", "obj_2", 0), relevant, "obj_1")
+    assert not S._fill_action_in_scope(
+        ("assemble", "a1", "obj_2", "obj_0"), relevant, "obj_1")
+    assert S._fill_action_in_scope(
+        ("assemble", "a1", "obj_1", "obj_0"), relevant, "obj_1")
+  finally:
+    S.set_fill_touch_all(False)
+
+
+def test_fill_scope_widening_is_local_first_and_force_all_skips_the_fast_pass():
+  import solver as S
+
+  assert S._fill_scope_passes(False, False) == (False,)
+  assert S._fill_scope_passes(False, True) == (False, True)
+  assert S._fill_scope_passes(True, False) == (True,)
+  assert S._fill_scope_passes(True, True) == (True,)
+
+
+def test_direct_fill_skeleton_plans_a_simple_join():
+  """The reviewer baseline uses ordinary actions and returns a replayable direct schema."""
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 2)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  plan = A.solve_assembly_problem_milestones(
+      C, asm, robots=robots, weight=1.0, verbose=False,
+      milestone_oracle="structural", fill_skeleton_first=True)
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+  assert sum(a[0] == "handover" for a in plan) <= 1
+  assert sum(a[0] == "add_grasp" for a in plan) <= 1
+
+
+def test_direct_fill_skeleton_failure_explicitly_uses_complete_fallback(monkeypatch, capsys):
+  """Exhausting the restricted family must not become a new infeasibility declaration."""
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 2)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  original = A._IncrementalLazySearch.search
+  calls = {"n": 0}
+
+  def exhaust_first(self, *args, **kwargs):
+    calls["n"] += 1
+    if calls["n"] == 1:
+      return None
+    return original(self, *args, **kwargs)
+
+  monkeypatch.setattr(A._IncrementalLazySearch, "search", exhaust_first)
+  plan = A.solve_assembly_problem_milestones(
+      C, asm, robots=robots, weight=1.0, verbose=True,
+      milestone_oracle="structural", fill_skeleton_first=True)
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+  assert "complete local fallback" in capsys.readouterr().out
+
+
+def test_fill_local_reverse_oracle_is_lazy_and_mixed_wrench_aware():
+  """A local PDB starts from goal seeds and retains mixed-tool physics without an opt-in."""
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 3)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=[True, False])
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  checker, grasp_table = A._search_context(C, asm, robots)
+  kinds = {"a1": "vacuum", "a2": "two_finger"}
+  classes = A.compute_grasp_signatures(
+      asm, grasp_table, gripper_kind=kinds,
+      gripper_path=checker.fact_gripper_path, clearance=0.02)
+  start = A.get_initial_state(C, asm)
+  pdb = A._make_fill_local_pdb(
+      start, asm, robots, checker, grasp_table, "obj_1", classes,
+      gripper_kind=kinds, component_root=asm.base, verbose=False)
+  gids = sorted(classes["obj_1"])
+  assert gids
+  assert all(pdb._gcollapse("obj_1", g) == classes["obj_1"][g] for g in gids)
+  assert set(pdb._svgroups["obj_1"]) == set(classes["obj_1"].values())
+  assert pdb._lazy_build and pdb._mixed and pdb._gk == kinds
+  assert not pdb._settled and not pdb._reverse_exhausted
+  seeded = len(pdb.dist)
+  queried = pdb.value(start)
+  assert queried < float("inf")
+  assert pdb._settled and pdb._reverse_pops > 0
+  assert len(pdb.dist) >= seeded
+  assert pdb._wfacts, "mixed-tool --wrench oracle never evaluated a per-kind wrench fact"
+  blind = A._make_fill_local_pdb(
+      start, asm, robots, checker, grasp_table, "obj_1", classes,
+      gripper_kind=None, component_root=asm.base, verbose=False)
+  assert blind.value(start) < float("inf")
+  assert not blind._mixed and not blind._wfacts
+  # Exhausting a paused oracle must reproduce eager Dijkstra exactly. This specifically
+  # catches pausing after settling a query without first expanding its predecessors.
+  eager = A._make_fill_local_pdb(
+      start, asm, robots, checker, grasp_table, "obj_1", classes,
+      gripper_kind=kinds, component_root=asm.base, verbose=False, lazy_build=False)
+  pdb._advance_reverse()
+  assert pdb._reverse_exhausted
+  assert pdb.dist == eager.dist
+  assert queried == eager.value(start)
+
+
+def test_fill_local_exact_handles_a_detached_module():
+  """The local projection follows the requested component root; it is not a chain hotfix."""
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cube-plates", 8)
+  C = make_four_robot_env(num_robots=3, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  plan = A.solve_assembly_problem_milestones(
+      C, asm, robots=robots, weight=100.0, verbose=False,
+      milestone_oracle="structural", fill_local_h=True, fill_exact=True)
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+  assert any(a[0] == "assemble" and a[2] == "obj_4" for a in plan)
+
+
+def test_optimistic_chain_heuristic_plans_a_non_module_assembly():
+  """The fixed-order chain projection must remain a usable heuristic, not only a small DB."""
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 3)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  plan = A.solve_assembly_problem_optimistic(
+      C, asm, robots=robots, weight=5.0, verbose=False, fallback=False,
+      wrench=False, bracing=False, chain_h=True)
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)

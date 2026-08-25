@@ -280,7 +280,7 @@ class _State:
 
 
 def _tasks(pre_witnesses, delta=0.05, ik=None, resolve_missing_pre=True,
-           witness_sets=None):
+           witness_sets=None, pre_pin_robots=None):
   MP._ensure_mrbench()
   robots = ["a1", "a2"]
   plan = [("pick", "a1", "obj_0", 0), ("pick", "a2", "obj_1", 0)]
@@ -291,7 +291,8 @@ def _tasks(pre_witnesses, delta=0.05, ik=None, resolve_missing_pre=True,
   return MP.build_tasks(None, plan, wit, states, robots, idx, rik, np.zeros(12),
                         pre_witnesses=pre_witnesses,
                         witness_sets=witness_sets,
-                        resolve_missing_pre=resolve_missing_pre), rik
+                        resolve_missing_pre=resolve_missing_pre,
+                        pre_pin_robots=pre_pin_robots), rik
 
 
 def test_build_tasks_consumes_supplied_keyframes_and_solves_nothing():
@@ -302,6 +303,20 @@ def test_build_tasks_consumes_supplied_keyframes_and_solves_nothing():
                  "01_pre_pick_a2_obj_1_0", "01_pick_a2_obj_1_0", "terminal"]
   assert tasks[0].goal.goal[:6] == pytest.approx(np.full(6, 0.7))   # T_pre, from `pre`
   assert tasks[1].goal.goal[:6] == pytest.approx(np.full(6, 0.1))   # the skill witness
+
+
+def test_accepted_pre_pin_is_exported_only_on_the_funnel_task():
+  qpre = np.concatenate([np.full(6, 0.7), np.full(6, 0.9)])
+  (tasks, _seq, _names), rik = _tasks(
+      {0: qpre, 1: np.full(12, 0.8)}, pre_pin_robots={0: ["a2"]})
+  assert rik.solved == 0
+  assert tasks[0].robots == ["a1", "a2"]
+  assert tasks[0].goal.goal == pytest.approx(qpre)
+  # The actual pick still moves only its actor; the idle-arm pin is a rendezvous condition,
+  # not a permanent lock through all subsequent motion.
+  assert tasks[1].robots == ["a1"]
+  assert tasks[1].goal.goal == pytest.approx(np.full(6, 0.1))
+  assert tasks[2].robots == ["a2"]                         # unrelated split unchanged
 
 
 def test_build_tasks_without_the_argument_keeps_solving_them_itself():

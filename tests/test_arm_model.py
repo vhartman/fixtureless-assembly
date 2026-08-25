@@ -13,7 +13,7 @@ mujoco = pytest.importorskip("mujoco")
 
 import arm_model
 import fk_compare
-from env import make_four_robot_env
+from env import make_four_robot_env, make_fr3_duo_env
 import assembly as A
 
 
@@ -82,3 +82,18 @@ def test_per_arm_contact_masks_exclude_self_and_include_other_arm():
     assert (int(m.geom_contype[gi]), int(m.geom_conaffinity[gi])) == expected
     seen[owner] += 1
   assert all(seen.values())
+
+
+def test_fr3_static_carrier_is_discoverable_and_exportable():
+  """The shared TMR carrier is outside both ``aN_`` arm subtrees but must be in sim XML."""
+  C = make_fr3_duo_env()
+  assert arm_model.fr3_base_prefixes(C) == ["fr30_"]
+  assets = []
+  body, joints = arm_model.build_arm_mjcf(
+      C, "fr30_", collide=False, meshes=True, assets=assets, frame_colors=True,
+      static_mass=1e-4)
+  xml = f'''<mujoco><asset>{"".join(assets)}</asset><worldbody>{body}</worldbody></mujoco>'''
+  model = mujoco.MjModel.from_xml_string(xml)
+  assert joints == []
+  assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "fr30_base_link") >= 0
+  assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "fr30_franka_spine") >= 0

@@ -91,6 +91,9 @@ class RunConfig:
   prefer_center: bool = False
   fill_window: int = 2
   milestone_oracle: str = "global"
+  fill_local_h: bool = False
+  fill_exact: bool = False
+  fill_skeleton_first: bool = False
   lazy_fills: bool = True
   open_witness: bool = False
   open_witness_epochs: int = 2
@@ -231,6 +234,7 @@ class RunConfig:
   test_place_ik: Optional[str] = None
   search_stats: Optional[float] = None
   log_ik_failures: Optional[float] = None
+  fill_scope_widening: bool = False
   fill_touch_all: bool = False
 
   # -- output & persistence --

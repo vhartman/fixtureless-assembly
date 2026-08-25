@@ -1,5 +1,11 @@
 # Collision-certified phase scheduling for multi-robot assembly
 
+The canonical operational command, including the common UR profile and the temporary FR3
+calibration overlay, is maintained in
+[Standard simulation reproduction](README.md#standard-simulation-reproduction). This document
+describes the scheduling algorithm and its certification contract rather than defining a second
+set of CLI defaults.
+
 ## Method overview
 
 We assume that a task-and-motion planner has already produced a collision-free multi-robot

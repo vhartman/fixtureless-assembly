@@ -20,8 +20,17 @@ from config import RunConfig
 # an explicit request, so its named fields override a loaded config while unnamed scene fields
 # still come from that file.
 _STANDARD_SEARCH_PROFILE = {
-    "weight": 100.0,
+    # Three-seed four-robot stress result (Cross-7, mixed Chair-8, Fixture-rack-9): the
+    # principled weight-one local PDB + fair witness policy was 18% faster in aggregate,
+    # preserved/improved plan cost, and cut noisy Fixture peak RSS from 4.22 to 0.91 GiB.
+    "weight": 1.0,
     "milestones": True,
+    "milestone_oracle": "structural",
+    "fill_local_h": True,
+    "fill_exact": True,
+    "fill_skeleton_first": False,
+    "fill_scope_widening": True,
+    "fill_touch_all": False,
     "sig_collapsed_h": True,
     "sig_components": "press",
     "real_ik": True,
@@ -51,9 +60,9 @@ _STANDARD_SEARCH_PROFILE = {
     # Shared planner/simulator table datum. Keep this small: every millimetre is certified
     # free space that the simulator turns into raised table geometry.
     "part_float": 0.002,
-    # Selecting ``standard`` after experimenting with another profile must really return to
-    # the dependable legacy witness-scheduling baseline.
-    "open_witness": False,
+    # A finite IK miss remains reopenable instead of becoming a false infeasibility verdict.
+    # Two epochs are the measured operational budget, not a continuous completeness proof.
+    "open_witness": True,
     "open_witness_batch": 7,
     "open_witness_epochs": 2,
     "analytic_seed_cap": None,
@@ -77,9 +86,9 @@ _STANDARD_SEARCH_PROFILE = {
 
 _SEARCH_PROFILES = {
     "standard": dict(_STANDARD_SEARCH_PROFILE),
-    # Same feasibility contract and candidate set as standard; only failed-witness effort is
-    # scheduled fairly instead of permanently blacklisting an edge after its first budget.
-    "open": {**_STANDARD_SEARCH_PROFILE, "open_witness": True},
+    # Compatibility alias: open-witness scheduling is now part of standard. Keep historical
+    # commands reproducible at the profile-name level rather than deleting the public spelling.
+    "open": dict(_STANDARD_SEARCH_PROFILE),
     # Aggressive performance overlay.  The exact-seed cap is a warm-start budget, not a sound
     # unreachability test, so keep it visibly separate from the recommended open profile.
     "fast-open": {
@@ -140,9 +149,10 @@ def build_parser():
   )
   parser.add_argument(
       "--search-profile", choices=tuple(_SEARCH_PROFILES), default=None, metavar="NAME",
-      help="Named fresh-search defaults: standard = robust 5mm witness contract + weighted "
-           "milestones; open = standard plus the bounded fair open-witness scheduler; "
-           "fast-open = open plus --analytic-seed-cap 3 (aggressive/experimental). A profile "
+      help="Named fresh-search defaults: standard = robust 5mm witness contract + weight-one "
+           "structural milestones + exact uniform local-PDB fills + bounded fair open witnesses; "
+           "open = compatibility alias for standard; fast-open = standard plus "
+           "--analytic-seed-cap 3 (aggressive/experimental). A profile "
            "is opt-in. Precedence is explicit flag > profile > --config file > built-ins, and "
            "--parts/grippers/forces/layout/seed/save remain scene-specific.",
   )
@@ -903,11 +913,11 @@ def build_parser():
   )
   g_search.add_argument(
       "--open-witness", action=argparse.BooleanOptionalAction, default=False,
-      help="EXPERIMENTAL opt-in for lazy milestone fills: give each blocking IK edge one "
+      help="Fair witness policy for lazy milestone fills: give each blocking IK edge one "
            "small batch, temporarily suspend it, and explore alternatives before revisiting "
            "it in the next fairness epoch. Failed probes remain OPEN and are not stored in "
-           "the legacy permanent IK/edge blacklist. Default off: the measured legacy path "
-           "is unchanged.",
+           "the legacy permanent IK/edge blacklist. Enabled by --search-profile standard; "
+           "the no-profile built-in remains off for historical command compatibility.",
   )
   g_search.add_argument(
       "--open-witness-epochs", type=int, default=2, metavar="N",
@@ -944,9 +954,35 @@ def build_parser():
            "'chain' builds the smaller signature projection over assembly_order only "
            "(sequence assemblies; detached modules are rejected). "
            "'structural' skips that database completely: dependency/module eligibility "
-           "and canonical part order choose milestones, while each fill uses only its "
-           "cheap local counting heuristic. Backtracking, adaptive fill windows, lazy IK, "
-           "and final settling are unchanged.",
+           "and canonical part order choose milestones. Its fill heuristic is selected "
+           "independently (--fill-local-h in the standard profile). Backtracking, adaptive "
+           "fill windows, lazy IK, and final settling are unchanged.",
+  )
+  g_search.add_argument(
+      "--fill-local-h", action=argparse.BooleanOptionalAction, default=False,
+      help="Guide every one-part fill with a small backward pattern database whose goal is "
+           "that fill's own settled endpoint. Every grasp role uses the same fact-signature "
+           "projection while the abstraction tracks "
+           "support face/holders, free tool capacity and wrench facts, but ignores robot "
+           "joint configurations. Independent of sequence/DAG/module structure. Standard "
+           "on; --no-fill-local-h is the counting-only guidance ablation.",
+  )
+  g_search.add_argument(
+      "--fill-exact", action=argparse.BooleanOptionalAction, default=False,
+      help="Run one-part concrete fill searches at weight 1, irrespective of the global "
+           "--weight. Intended with --fill-local-h to test whether the small subproblems "
+           "are cheap enough for exact symbolic A*. Also removes the ordinary 200-plan "
+           "lazy-repair cutoff; node/deadline limits still apply. IK remains lazy and fully "
+           "validated.",
+  )
+  g_search.add_argument(
+      "--fill-skeleton-first", action=argparse.BooleanOptionalAction, default=False,
+      help="EXPERIMENTAL reviewer baseline: before each ordinary local fill, probe a "
+           "small direct manipulation family (one mover pick, one target lift, one handover, "
+           "one target brace, one target placement). Candidate paths use the same wrench, "
+           "cheap-collision and lazy real-IK gates. At most three role assignments per robot "
+           "are tried before falling through explicitly to the existing complete local graph; "
+           "the probe never declares infeasibility.",
   )
   g_search.add_argument(
       "--corridor-h", action="store_true",
@@ -1212,20 +1248,25 @@ def build_parser():
            "non-U grasp at +1 in the milestone fill h (the forced regrasp, admissible). "
            "Ordering + pricing only; nothing is removed -- completeness untouched. Default off.",
   )
-  g_diag.add_argument(
-      "--fill-touch-all", action="store_true",
-      help="DEBUG: let a milestone fill act on ANY loose part (move a blocking scatter part "
-           "aside), not just the ideal+the one being added. Big fill-search blow-up; use only "
-           "to test whether the ideal-only restriction is what makes a fill fail.",
+  g_search.add_argument(
+      "--fill-scope-widening", action=argparse.BooleanOptionalAction, default=False,
+      help="After every target/current-assembly fill phase is exhausted, retry the same "
+           "grasp/bracing widening with manipulation of any loose part. Standard on: a local-"
+           "scope failure is not treated as milestone infeasibility until this completeness "
+           "widening also fails. --no-fill-scope-widening is the locality ablation.",
+  )
+  g_search.add_argument(
+      "--fill-touch-all", action=argparse.BooleanOptionalAction, default=False,
+      help="Diagnostic: start every fill with all-part manipulation instead of first trying "
+           "the cheap local scope. Unrelated future parts may move but may not assemble, and "
+           "must be settled at the endpoint. Standard off; ordinary completeness widening is "
+           "controlled by --fill-scope-widening.",
   )
   g_phys.add_argument(
       "--mixed-wrench-h", action="store_true",
-      help="With mixed --grippers + --wrench: build the PER-KIND wrench heuristic (facts + "
-           "signature components evaluate each grasp's kind mask -- admissible, force-aware). "
-           "PRECISE but SLOW (class split + kind LPs: ~35k->340k abstract states, ~2s->75s+ "
-           "build on chair-8) and measured NOT to help the pathological weak-vacuum config. "
-           "Default OFF = the fast topological fallback (wrench facts skipped under mixed). "
-           "Turn on only when the search backtracks on force-feasibility the h can't see.",
+      help="DEPRECATED compatibility flag: mixed-tool backward wrench facts are now implied "
+           "by --wrench, matching concrete search semantics. Use --no-wrench-aware-h only "
+           "for an explicit heuristic ablation.",
   )
   g_search.add_argument(
       "--dominance", action="store_true",
@@ -1873,7 +1914,8 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
   if cfg.ladder_lns is not None:
     plan = solve_assembly_problem_ladder(
         C, assembly, robots=robots, time_budget=cfg.ladder_lns, robot_ik=robot_ik,
-        weight=cfg.weight, wrench=cfg.wrench, handovers=cfg.handovers,
+        weight=cfg.weight, wrench=cfg.wrench, wrench_aware_h=cfg.wrench_aware_h,
+        handovers=cfg.handovers,
         allow_place=cfg.allow_place, bracing=cfg.bracing,
         geo_facts=cfg.geo_facts, sig_collapsed_h=cfg.sig_collapsed_h,
         labeled_h=cfg.labeled_h, collapsed_h=cfg.collapsed_h,
@@ -1882,7 +1924,8 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
   elif cfg.ladder is not None:
     plan = solve_assembly_problem_ladder(
         C, assembly, robots=robots, time_budget=cfg.ladder, robot_ik=robot_ik,
-        weight=cfg.weight, wrench=cfg.wrench, handovers=cfg.handovers,
+        weight=cfg.weight, wrench=cfg.wrench, wrench_aware_h=cfg.wrench_aware_h,
+        handovers=cfg.handovers,
         allow_place=cfg.allow_place, bracing=cfg.bracing,
         geo_facts=cfg.geo_facts, sig_collapsed_h=cfg.sig_collapsed_h,
         labeled_h=cfg.labeled_h, collapsed_h=cfg.collapsed_h,
@@ -1891,15 +1934,20 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
     plan = solve_assembly_problem_milestones_anytime(
         C, assembly, robots=robots, time_budget=cfg.milestones_anytime,
         robot_ik=robot_ik, weight=cfg.weight, wrench=cfg.wrench,
+        wrench_aware_h=cfg.wrench_aware_h,
         handovers=cfg.handovers, allow_place=cfg.allow_place,
         bracing=cfg.bracing, geo_facts=cfg.geo_facts,
         sig_collapsed_h=cfg.sig_collapsed_h, labeled_h=cfg.labeled_h,
         collapsed_h=cfg.collapsed_h, grasp_collapsed_h=cfg.grasp_collapsed_h,
-        fill_window=cfg.fill_window, milestone_oracle=cfg.milestone_oracle)
+        fill_window=cfg.fill_window, milestone_oracle=cfg.milestone_oracle,
+        fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
+        fill_skeleton_first=cfg.fill_skeleton_first,
+        fill_scope_widening=cfg.fill_scope_widening)
   elif cfg.bounded or cfg.dfbnb:
     plan = solve_assembly_problem_bounded(
         C, assembly, robots=robots, robot_ik=robot_ik, weight=cfg.weight,
-        wrench=cfg.wrench, handovers=cfg.handovers, allow_place=cfg.allow_place,
+        wrench=cfg.wrench, wrench_aware_h=cfg.wrench_aware_h,
+        handovers=cfg.handovers, allow_place=cfg.allow_place,
         bracing=cfg.bracing, labeled_h=cfg.labeled_h, collapsed_h=cfg.collapsed_h,
         grasp_collapsed_h=cfg.grasp_collapsed_h or not (cfg.labeled_h or cfg.collapsed_h),
         stats_every=cfg.search_stats, geo_facts=cfg.geo_facts,
@@ -1921,11 +1969,16 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
   elif cfg.optimistic:
     plan = solve_assembly_problem_optimistic(C, assembly, robots=robots,
                                              robot_ik=robot_ik, weight=cfg.weight,
-                                             wrench=cfg.wrench, handovers=cfg.handovers,
+                                             wrench=cfg.wrench,
+                                             wrench_aware_h=cfg.wrench_aware_h,
+                                             handovers=cfg.handovers,
                                              allow_place=cfg.allow_place,
                                              bracing=cfg.bracing,
                                              fallback=cfg.optimistic_fallback,
                                              lazy_fills=cfg.lazy_fills,
+                                             fill_local_h=cfg.fill_local_h,
+                                             fill_exact=cfg.fill_exact,
+                                             fill_skeleton_first=cfg.fill_skeleton_first,
                                              chain_h=cfg.optimistic_chain_h,
                                              grasp_collapsed_h=cfg.grasp_collapsed_h,
                                              collapsed_h=cfg.collapsed_h,
@@ -1946,10 +1999,14 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
     # over a default. --no-milestones falls through to the exact search below.
     plan = solve_assembly_problem_milestones(
         C, assembly, robots=robots, robot_ik=robot_ik, weight=cfg.weight,
-        wrench=cfg.wrench, handovers=cfg.handovers, allow_place=cfg.allow_place,
+        wrench=cfg.wrench, wrench_aware_h=cfg.wrench_aware_h,
+        handovers=cfg.handovers, allow_place=cfg.allow_place,
         bracing=cfg.bracing, geo_facts=cfg.geo_facts,
         sig_collapsed_h=cfg.sig_collapsed_h, fill_window=cfg.fill_window,
-        lazy_fills=cfg.lazy_fills, milestone_oracle=cfg.milestone_oracle)
+        lazy_fills=cfg.lazy_fills, milestone_oracle=cfg.milestone_oracle,
+        fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
+        fill_skeleton_first=cfg.fill_skeleton_first,
+        fill_scope_widening=cfg.fill_scope_widening)
   else:
     plan = solve_assembly_problem(C, assembly, robots=robots, canonical=cfg.canonical,
                                   weight=cfg.weight, robot_ik=robot_ik, wrench=cfg.wrench,
@@ -2026,6 +2083,9 @@ def run(cfg, explicit=None):
   _profile = getattr(cfg, "_search_profile", None)
   if _profile:
     print(f"[profile] search '{_profile}' resolved: weight={cfg.weight:g}, "
+          f"milestone-oracle={cfg.milestone_oracle}, "
+          f"local-PDB={'exact' if cfg.fill_local_h and cfg.fill_exact else ('weighted' if cfg.fill_local_h else 'off')}, "
+          f"fill-scope={'all' if cfg.fill_touch_all else ('local->all' if cfg.fill_scope_widening else 'local-only')}, "
           f"witness-margin={float(cfg.witness_margin or 0.0)*1000:g}mm, "
           f"open-witness={'on' if cfg.open_witness else 'off'}"
           + (f" batch={cfg.open_witness_batch} epochs={cfg.open_witness_epochs}"
@@ -2170,14 +2230,18 @@ def run(cfg, explicit=None):
     set_useful_grasps_enabled(True)
     print("[flag] --useful-grasps ACTIVE: mate-viable grasp sets ordered first + fill-h "
           "regrasp pricing (spec 6.2).")
+  from solver import set_fill_touch_all
+  set_fill_touch_all(cfg.fill_touch_all)                 # reset for repeated in-process runs
+  if cfg.fill_scope_widening:
+    print("[flag] --fill-scope-widening ACTIVE: a failed local-scope fill is retried with "
+          "all-part manipulation before the milestone is rejected.")
   if cfg.fill_touch_all:
-    from solver import set_fill_touch_all
-    set_fill_touch_all(True)
-    print("[flag] --fill-touch-all: fills may move any loose part (debug; slow).")
+    print("[flag] --fill-touch-all ACTIVE: fills skip the cheap local-scope pass and may "
+          "manipulate any part immediately; only their requested join may assemble and "
+          "temporarily moved blockers must be settled. Local search may be much larger.")
   if cfg.mixed_wrench_h:
-    from solver import set_mixed_wrench_h
-    set_mixed_wrench_h(True)
-    print("[flag] --mixed-wrench-h ACTIVE: per-kind wrench heuristic (precise, slower build).")
+    print("[flag] --mixed-wrench-h is DEPRECATED and now a no-op: --wrench already enables "
+          "per-kind backward wrench facts. Use --no-wrench-aware-h for the ablation.")
   if cfg.dominance:
     from problem import set_dominance
     set_dominance(True)
@@ -2684,6 +2748,16 @@ def run(cfg, explicit=None):
         print(f"[ik-failures] window/cap reached -- search stopped for debugging "
               f"({len(fail_rec.steps)} failures collected).")
         plan = None
+      except MemoryError:
+        # Do not turn resource exhaustion into an apparent geometric infeasibility or a
+        # silent heuristic fallback.  In local/milestone search the immediately preceding
+        # [fill-prof ...] line identifies the skill boundary that caused the expansion.
+        print("[search-failure] process memory exhausted during search; no infeasibility "
+              "certificate was produced.", flush=True)
+        print("[search-failure] inspect the last [fill-prof ...] block. For a bounded "
+              "diagnostic rerun use --log-ik-failures 60; if sampled grasps are active, "
+              "try --grasp-refine before increasing the node or memory limit.", flush=True)
+        raise
       finally:
         if cfg.grasp_sampler:
           from problem import set_sampled_canonical_only

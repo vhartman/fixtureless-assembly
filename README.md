@@ -61,6 +61,194 @@ The current defaults make the robustness settings explicit in every fresh search
   reuses them. `--fuse-cograsp` may still re-solve eligible paired keyframes before the final
   export.
 
+### Named search profiles
+
+Use `--search-profile standard` for the recommended fresh-search baseline. It expands to the
+robust settings above plus the measured weight-one local search, and makes the run
+non-interactive:
+
+```text
+--weight 1 --milestones --milestone-oracle structural
+--fill-local-h --fill-exact --no-fill-skeleton-first
+--sig-collapsed-h --sig-components press
+--real-ik --wrench --grasp-model asymmetric
+--optimize-witnesses floor
+--witness-margin 0.005 --witness-branch-budget 5 --witness-sets 4
+--tight-fingers --strict-collisions 1e-6 --witness-robot-collisions --always-contact
+--mate-eq-weight 100 --place-eq-weight 100 --part-float 0.002
+--grasp-sampler --grasp-sampler-version 2
+--grasp-sampler-keep 20 --grasp-sampler-candidates 96 --grasp-sampler-scenes
+--grasp-sampler-wrap 0.015
+--grasp-refine
+--open-witness --open-witness-batch 7 --open-witness-epochs 2
+--quiet-rai --no-view
+```
+
+The profile also pins analytic IK seeding, lazy milestone fills, bracing, handovers, placement,
+the hands-off goal, and release hoisting. These are not decorative defaults: they respectively
+avoid repeated stochastic IK work, retain the scalable fill path, preserve wrench-feasible
+support actions, keep regrasp routes available, require a physically completed result, and free
+arms before later motion. `--witness-robot-collisions` and `--always-contact` ensure the search
+does not certify keyframes against geometry that the motion planner will later restore.
+`--wrench` also makes every backward heuristic wrench-aware, including per-tool facts for a
+mixed vacuum/two-finger fleet. There is no separate mixed-wrench opt-in; use
+`--no-wrench-aware-h` only for an explicit heuristic ablation. The historical
+`--mixed-wrench-h` spelling is accepted as a deprecated no-op.
+
+Thus the ordinary command is now:
+
+```bash
+python3 main.py --solve --search-profile standard \
+    --assembly ASSEMBLY --parts N --num-robots R --robot ROBOT \
+    --seed SEED --save experiments/PLAN.json
+```
+
+The profile deliberately does **not** guess assembly-specific grippers, insertion force/noise,
+layout, special bracing restrictions, or part count. Put those after the profile in the command.
+It also does not run the motion-only `--fuse-cograsp` pass; request that when exporting a motion
+plan.
+
+The standard profile uses the versioned hybrid grasp database. For box/cylinder primitives,
+the exact conventional grasps form a stable prefix and sampled poses only add alternatives;
+mesh and compound parts use sampled poses because they have no meaningful six-face database.
+Scene labels are computed separately for each gripper kind in a mixed fleet, while the exact
+IK/collision/wrench checks remain authoritative. The database content hash is saved with the
+plan, and replay fails closed if positional grasp ids would be interpreted against different
+content. Historical sampled plans without a version are rebuilt as V1.
+
+`--grasp-refine` keeps this larger action space from penalizing easy scenes: epoch 0 searches
+primitive parts using only their conventional prefix (mesh/compound samples remain available),
+and only a no-plan result opens sampled primitive alternatives for a second search. This is
+search-side candidate refinement, independent of motion planning. Use `--no-grasp-refine` to
+expose the complete hybrid database immediately, or `--no-grasp-sampler` for the original
+primitive-only database. Assembly-specific compliant grasps still require an explicit
+`--grasp-sampler-wrap W` override when the standard 15 mm two-finger pad-deformation allowance
+is inappropriate. This wrap flag does not claim that a vacuum cup seals on curved geometry;
+the separate `--allow-curved-grasps` switch remains an explicit idealized override.
+
+The profile names now share exactly the same geometry and witness-clearance contract:
+
+- `--search-profile open` is retained as a compatibility alias for `standard`; bounded fair
+  open-witness scheduling is now part of the standard method. Exhausting its two epochs means
+  “not found within this effort,” not geometric infeasibility.
+- `--search-profile fast-open` additionally caps calibrated analytic warm starts at the best
+  three branches. This is the aggressive A/B profile: it can be faster, but may miss a useful
+  KOMO basin that `standard` or `open` tries.
+
+Profiles are opt-in so old experiment commands retain their exact behavior. Resolution order
+is `explicit individual flag > explicitly selected profile > --config file > built-in
+defaults`; both profile UI choices can be reversed explicitly with `--view` and
+`--no-quiet-rai`. A plain `--config` invocation therefore remains an exact reproduction, while
+adding a profile deliberately retunes only that profile's named fields. Unnamed scene-specific
+values still come from the file.
+
+The standard search has three nested levels. Structural milestones enumerate dependency-valid
+part or module additions and chronologically backjump when a chosen addition makes the suffix
+fail. Each addition builds a goal-conditioned backward PDB in the uniformly projected grasp
+space, then weight-one A* searches the full raw action states for the least-cost local glue.
+Candidate paths are validated lazily with real IK; a failed stochastic query is suspended and
+revisited with increasing bounded effort instead of being permanently rejected immediately.
+
+Chair's dependency graph and detached back/post module are supported: the milestone driver builds
+the module internally, joins it as one composite milestone, and can backtrack among outer
+dependency-valid milestone choices. This is nevertheless not a global completeness theorem.
+Only one concrete settled boundary state is retained for a successful milestone, module-internal
+part order is currently fixed, open-witness effort is capped at two epochs, and node/repair/PDB
+guards are finite. A downstream dead end therefore backtracks the milestone decision, but does
+not enumerate every alternative witness that could realize the same successful boundary.
+
+### Named motion-planning profile
+
+Motion planning has its own profile because its settings do nothing during search and should not
+be confused with search feasibility:
+
+```bash
+python3 main.py \
+    --config experiments/PLAN.json --load-plan experiments/PLAN.json \
+    --motion-plan --motion-profile standard --mp-seed SEED \
+    --mp-export-save experiments/FINAL_EXPORT.json \
+    --mp-save experiments/MP.json
+```
+
+`--motion-profile standard` expands to:
+
+```text
+--pre-pick 0.05 --pre-place 0.05 --pre-add-grasp 0.05
+--pre-insertion 0.05 --post-release 0.05
+--fuse-cograsp --fuse-pre-skill
+--mp-sequence --no-mp-optimize
+--mp-runtime 90 --mp-stall-timeout 30
+--mp-shortcut-iters 100 --mp-shortcut-strategy native
+--mp-collision-tolerance 1e-4
+--mp-robot-margin 0.1 --mp-margin-ramp 0.1 --mp-table-margin 0
+--mp-cograsp --quiet-rai --no-view
+```
+
+The `1e-4` motion tolerance is therefore now pinned rather than inherited accidentally. The
+profile intentionally leaves `--mp-seed`, `--mp-save`, and `--mp-export-save/load` to the
+caller. A final export remains important: it makes retries zero-IK and records the effective
+collision/margin certificate. A positive carried-part `--mp-table-margin` is not standard yet:
+all current robust exports use zero, and a margin must be validated against each scene's
+pick/place endpoint neighborhoods. Tight peg/stool exports should continue overriding the
+auxiliary funnels explicitly while retaining the 5 cm insertion funnel.
+
+When the caller has not set them, the motion profile creates and selects
+`NUMBA_CACHE_DIR=/tmp/assembly-numba-cache` and
+`MPLCONFIGDIR=/tmp/assembly-mpl-cache` before importing the planner. This prevents the external
+`mr_bench` Numba functions from failing with “no locator available” and avoids Matplotlib trying
+to write under an unwritable home directory. Explicit environment values are preserved.
+
+Pre-retuning profile audit (2026-08-24): fresh searches under the then-current `standard`
+completed on Cross-7 (27 actions),
+Car-mini (24 actions), mixed-gripper Chair-8 (38 actions), and sampled-mesh Peg-hole (3 actions),
+each with complete persisted witnesses and floor optimization; the larger three also exported
+witness sets. The freshly generated Cross plan completed all 50 motion modes under
+`--motion-profile standard`; its 100-shortcut result had 683 serialized states and the
+final-export retry performed zero IK solves. Cube-8 vacuum was a failure of those former
+profiles: both grew repeated 500--1500-bind milestone fills and were killed under memory
+pressure before the sixth/seventh addition. Do not describe the profile as universal until that
+fill-state growth regression is fixed; changing collision tolerance or silently falling back to
+an older plan would not address it.
+
+Hybrid-sampler audit (2026-08-24, also preceding the search-policy retuning and with post-passes
+disabled to isolate search): staged `standard`
+completed Car-mini in 16.6 s (25 actions), Cross-7 in 6.3 s (27 actions), and mixed-gripper
+Chair-8 in 74.4 s (37 actions). The assembly-specific `open` peg-stool command completed in
+60.0 s (20 actions); its chamfered compound parts correctly retained sampled grasps in epoch 0.
+None required the larger primitive fallback. By contrast, exposing all sampled primitive
+alternatives immediately made Car-mini take 50--67 s, which is why refinement is the standard.
+
+### Experimental fixed-order chain heuristic
+
+`--optimistic-chain-h` is the scalable middle ground between plain optimistic fills and the
+global milestone abstraction. It runs one backward signature solve over only
+`base -> prefix 1 -> ... -> complete` in `assembly_order`, and permits only the next part to be
+loose at each prefix. Rest faces, grasp classes, holders/braces, wrench facts and the entire
+remaining fixed order are retained; alternative order ideals and combinations of unrelated
+loose parts are not. The narrow fact-guided phases are only tried first: unrestricted local
+fill phases remain the completeness fallback.
+
+```bash
+python3 main.py --config experiments/PLAN.json --search-profile standard --solve \
+    --optimistic --optimistic-chain-h --no-optimistic-fallback \
+    --optimize-witnesses off --witness-sets 1 --no-fuse-cograsp \
+    --no-hoist-releases --quiet-rai --no-view
+```
+
+Single guarded measurements on noisy Car-mini (three limited UR10s, 20 N insertion force,
+10 mm insertion noise) gave 2,485 chain states in 0.64 s and a complete hands-off 25-action plan
+in 22.76 s search / 30.73 s process time. Milestones built 9,076 states in 4.40 s and found a
+25-action plan in 30.57 s / 44.85 s. Plain optimistic exceeded three minutes and exhausted its
+compact grasp epoch. On the mixed-gripper 10-part fixture the chain abstraction built 25,627
+states in 1.38 s; the global signature heuristic exceeds its 2,000,000-state guard.
+
+This flag does **not** support detached connect modules. Full Chair-8 contains the back-plus-posts
+module, so the chain path now fails immediately with an instruction to use `--milestones`
+instead of expanding the impossible main-component order to a memory failure. Chair-8 milestones
+completed the current standard comparison in 38 actions and 101.70 s search. The optimistic
+solver also now runs `_settle_to_goal` after its last fill; it no longer reports a still-held
+complete assembly as a successful hands-off plan.
+
 For reproducible experiments, spell those defaults out in the search command:
 
 ```bash
@@ -94,6 +282,98 @@ python3 main.py \
     --mp-seed 11023 --mp-shortcut-iters 100 --mp-cograsp \
     --quiet-rai --no-view --mp-save experiments/MP_RETRY.json
 ```
+
+## Standard simulation reproduction
+
+Use one common, fail-closed execution profile for current saved motion paths, independent of
+assembly and robot family:
+
+```bash
+python3 sim.py run experiments/PLAN.json \
+    --sim-profile standard --mp-path experiments/MP.json \
+    --record experiments/REPLAY.npz
+
+python3 sim.py replay experiments/REPLAY.npz
+```
+
+`--sim-profile standard` pins the following contract, so a reproduction does not change when
+individual built-in defaults do:
+
+```text
+--v2 --actuated --skill-servo --arm-arm-contacts --spline
+--phase-schedule --phase-servo-time 0.15
+--phase-smooth --phase-smooth-time 0.12
+--phase-batch --phase-batch-min-motion 0.08 --phase-batch-max-gap 0.35
+--phase-audit-resolution 0.01
+--settle-tol 0.002 --settle-max 1.0
+--servo-force 6 --servo-max-dev 0.01 --servo-torque-guard 0.6 --servo-tol 0.002
+--force-limits --inertia-factor 1 --wrench-margin 1
+--path-preflight --path-preflight-tolerance 1e-4 --path-preflight-resolution 0.01
+--joint-rate 1 --mass-scale 1 --coll-scale 1
+--no-corridor --no-phase-intent --no-c2-spline
+```
+
+The profile means:
+
+- when paired with `--mp-path`, execute the persisted real-arm path without resolving IK or
+  rerunning BiRRT;
+- reject an invalid saved path during strict collision/joint-limit preflight;
+- use the collision-audited offline phase scheduler, intrinsic phase-rate smoothing, and
+  certified short-island batching;
+- run actuated MuJoCo execution with compliant skill/seat servos, settling gates, normalized
+  grasp force/torque guarding, and physical cross-arm contacts;
+- embed the generated robot, carrier, table, result list, and recorded states in the NPZ.
+
+The current UR scenes use the profile exactly as written: the visual cruise remains the
+profile-pinned `--joint-rate 1.0` and parts retain `--mass-scale 1.0`. The current FR3 calibration
+adds exactly two visible overrides:
+
+```bash
+--joint-rate 0.5 --mass-scale 0.25
+```
+
+These FR3 flags are an execution-model calibration, not part of the robot-independent safety
+contract. Half-rate motion prevents inertial grasp overloads in the current FR3 servo model;
+quarter-mass parts compensate for placeholder grasp/load parameters. Do not silently apply
+quarter mass to UR experiments or present it as full-physics validation. The target is to
+remove the FR3 overlay after its actuator, grasp-capability, and mass calibration supports
+`--mass-scale 1.0`.
+
+A verified four-FR3 reproduction is:
+
+```bash
+python3 sim.py run experiments/fr3-cross-4r.json \
+    --sim-profile standard --mp-path experiments/fr3-cross-4r-mp.json \
+    --joint-rate 0.5 --mass-scale 0.25 \
+    --record experiments/fr3-cross-4r-phase-batched.npz
+
+python3 sim.py replay experiments/fr3-cross-4r-phase-batched.npz
+```
+
+This completed 26/26 actions. The initial 10 ms phase grid exposed a cross-arm collision and
+automatically retried at 4 ms; the exact final audit then passed. The NPZ contains both FR3
+carrier bases and the RAI-derived 1.2 x 0.9 x 0.06 m workbench.
+
+Do not add the following to the standard profile:
+
+- `--limit-rate`: phase scheduling deliberately ignores this speed boost and uses
+  `--joint-rate` as the visual cruise;
+- `--c2-spline`: an independent, opt-in geometric smoothing experiment;
+- `--phase-intent`: an experimental alternative to the established `--phase-batch` stage;
+- `--corridor`, `--corridor-online`, or `--pace`: older scheduling paths, retained for
+  ablations and artifact forensics;
+- a non-unit `--coll-scale` or `--no-path-preflight`: geometry/certificate debugging overrides,
+  never a standard validation. The profile pins the certificate-preserving no-op
+  `--coll-scale 1` so a future global default cannot silently shrink geometry.
+
+As with the search and motion profiles, an explicit flag wins over the sim profile. For example,
+the FR3 rate/mass calibration above overrides the two neutral standard values. Use
+`--no-servo-torque-guard` to disable that profile-owned guard explicitly. `--mp-path`,
+`--record`, and `--gui` are outputs/inputs rather than algorithm defaults and are never guessed.
+
+Artifact-specific commands later in this README reproduce the historical artifact named next
+to them. They are not the current baseline when they contain one of these old or experimental
+flags.
 
 ### 2026-08-14 robust evaluation
 
@@ -155,8 +435,8 @@ The 995-state saved path was compacted to 322 geometric waypoints, splined to 2,
 then rate/force/corridor retiming produced the recording samples. `--coll-scale 0.8` remains a
 debug geometry override, so this rollout is not a certificate for the unscaled robot geometry.
 
-The dated artifact discussions later in this README describe older plans and are retained for
-forensics. The robust artifacts and commands above are the current reproducible results.
+This Cube rollout is retained as a dated artifact result. Its corridor scheduler and
+`--coll-scale 0.8` debug geometry do not define the standard simulation profile above.
 
 ### Experimental C2 geometric smoothing
 
@@ -449,8 +729,9 @@ Those diagnostic recordings predate the strict contract and the intrinsic-arc fi
 used the synchronized fallback. The C2 file smoothed the composite arc, failed the quality guard,
 then applied short-motion batching to the raw schedule. Neither is phase-smoothed.
 
-Chair validates the same defaults on a longer mixed-EE UR5 plan (the historical filenames say
-"no-vacuum", but the saved config contains two vacuum and two two-finger grippers):
+This artifact-specific Chair run validates phase scheduling and intrinsic smoothing on a longer
+mixed-EE UR5 plan. It predates the canonical batching command above (the historical filenames
+say "no-vacuum", but the saved config contains two vacuum and two two-finger grippers):
 
 ```bash
 python3 sim.py run experiments/chair-no-vacuum-assemble.json --v2 \
@@ -1002,6 +1283,133 @@ signature-collapsed backward pass, fact components, milestone fills and repair, 
 validation, and `--milestones-anytime`—is in [SEARCH_METHOD.md](SEARCH_METHOD.md).
 The proposed paper scope, evaluation matrix, simulation-realism work, and real-robot experiment
 plan are collected in [PAPER_PLAN.md](PAPER_PLAN.md).
+A manifest-driven, fresh-process search benchmark runner and the scalable synthetic fixture-rack
+family are documented in [benchmarks/README.md](benchmarks/README.md).
+
+### Milestone-oracle ablation
+
+`--milestone-oracle` isolates how much backward reasoning a milestone run uses without changing
+its concrete action model, IK gates, module handling, backtracking, adaptive fill windows, lazy
+validation, or final settling:
+
+- `global` (default) builds the full signature-collapsed order-ideal database and uses its part
+  ordering, insertion/brace hints, and shifted fill heuristic.
+- `chain` keeps those grasp/force/rest-face signals but projects the database onto
+  `assembly_order` prefixes and their one incoming loose part. It is intended for declared
+  sequence assemblies and rejects detached connect modules explicitly.
+- `structural` builds no *global* signature database. Dependencies/modules and canonical part
+  order pick the next milestone. Without `--fill-local-h`, fills use the cheap counting
+  heuristic; the current standard instead constructs one small goal-conditioned local PDB per
+  fill. The standard receives no insertion-grasp or brace action hints: it runs the unrestricted
+  unbraced phase followed, when enabled, by the unrestricted braced phase. If both fail in the
+  local action scope, `--fill-scope-widening` repeats them while allowing temporary relocation of
+  any loose part before rejecting the milestone. The local PDB supplies scalar cost-to-go
+  guidance only.
+
+Matched single-run real-IK measurements on 2026-08-24 used the saved robust scene configs,
+disabled post-search witness optimization/fusion, and imposed a 6 GB address-space guard. The
+saved configs omit solver-only knobs, so this table uses the current local-fill default
+`--weight 1` on both sides:
+
+| assembly | global | chain | structural | interpretation |
+|---|---:|---:|---:|---|
+| Car-mini, 3 UR10 | 20.95 s / 475 MB / 25 actions | **15.33 s / 441 MB / 25** | 74.22 s / 1.74 GB / 25 | projected future guidance is valuable; pure counting floods place/regrasp plateaus |
+| Cross-7, 4 UR10 | 12.88 s / 737 MB / 28 | 13.05 s / 737 MB / 28 | 13.16 s / **620 MB** / 27 | effectively tied; its dependencies already make the global space chain-like |
+| Chair-8, mixed 4 UR10 | 119.73 s / 1.86 GB / 35 | unsupported (detached module) | **93.32 s / 1.47 GB / 35** | module structure supplies the useful order; skipping the 637,747-state DB wins |
+| Cube-8, 4 vacuum UR10 | >180 s | >180 s (6/7 additions reached) | failed at 96.44 s during width-2 rescue / 4.61 GB | the remaining bottleneck is the concrete local fill, not only global backward construction |
+
+The Cube chain control was also repeated with the standard command's `--weight 100`; it reached
+only five of seven additions by 180 s. Thus the failure is not simply caused by an overly optimal
+local A*. Hundreds of infeasible pick/place/handover alternatives on already-built parts share
+the same local score. The next performance change should be a short manipulation-skeleton pass
+(direct carry-and-insert, target hold, handover, brace) before the existing complete local graph
+search. Keeping the latter as fallback preserves coverage; replacing it with a greedy cutoff
+would not.
+
+#### Experimental goal-conditioned exact fills
+
+`--fill-local-h --fill-exact` tests a simpler alternative to full-assembly backward guidance.
+For every one-part fill it builds a backward database whose goal is exactly “join this incoming
+component and settle it.” Every grasp label uses the same fact-signature projection as the
+standard heuristic; there is no special interface/end-grasp label. This avoids the raw-label
+Cartesian product on detached modules. It is not tied to a chain: the current target and mover
+components are read from the concrete checkpoint state.
+
+`--fill-exact` uses weight-one A* for each concrete fill and lets lazy IK repair continue past the
+ordinary 200-candidate cutoff. Node/deadline budgets still apply. This is **not** end-to-end
+optimal search: locally cheapest settled checkpoints can make later fills more expensive, and
+the milestone order, fill-width limit, and phased action-set widening remain in effect. No
+reachability/action-order tie-breaker is part of this experiment.
+
+The reverse PDB is now query-driven. It seeds all abstract fill goals once, then resumes
+multi-source Dijkstra only until the state requested by forward A* has been settled and expanded;
+the frontier and lazily computed pick/wrench facts survive the pause. It returns exactly the same
+finite distance as an eager table, and prints settled/discovered counts per fill. This is a
+work-avoidance mechanism, not a promise that every PDB stays small: Car-mini's tested exact fills
+eventually requested their entire 378--3,541-state graphs, while several Chair fills stopped with
+unexpanded frontier states. The hard state guard still fails closed.
+
+`--fill-skeleton-first` is the deliberately simpler reviewer baseline. Before an ordinary fill it
+probes direct pick/insert, target-hold, one-handover, and one-brace paths using the same successor,
+wrench, collision, and IK code. It validates at most `3 * num_robots` candidate assignments and
+then prints an explicit transition to the unchanged complete local fallback; failure of the probe
+is never reported as assembly infeasibility. It is skipped for incumbent-bounded and open-witness
+fills so it cannot weaken those semantics.
+
+Single guarded runs found 25-action Car-mini in 25.49 s / 470 MB and 27-action Cross-7 in
+8.06 s / 386 MB. Mixed Chair-8 required complete fallback for its module and took 99.44 s /
+1.57 GB, so this is not a universal replacement for reverse guidance. Use the repeated matched
+manifest in `benchmarks/manifests/local_fill_reviewer.json` before making a paper claim.
+
+The fresh three-seed manifest confirms that split: direct skeleton averages 28.26 s versus
+76.69 s counting on Car-mini and 12.92 s versus 17.64 s on Cross, with equal cost on both. On
+Chair it is slower (111.00 s versus 93.90 s) and falls back on all three module fills. Fixture-rack
+is the current negative generalization case: all wrench-enabled variants reach the second lateral
+bracket and then fail under the resource guard, while the matched no-wrench direct run completes
+in 1.14 s. The four-part prefix commits its one retained milestone boundary to a settled rest pose
+that loses the useful target hold. This is evidence for retaining a small, diverse set of boundary
+states—not for adding another part-order heuristic. Full numbers and the guarantee boundary are in
+`SEARCH_METHOD.md`.
+
+Guarded real-IK runs on 2026-08-24 after the resumable-oracle and unified mixed-wrench change
+(6 GB address-space limit, `PYTHONHASHSEED=0`, no witness post-optimization) gave:
+
+| assembly | structural + local exact | result |
+|---|---:|---|
+| Car-mini, 3 UR10 | 47.31 s / 754 MB | 26 actions; every local PDB eventually exhausted (378--3,541 states) |
+| Cross-7, 4 UR10 | 7.42 s / 411 MB | 31 actions; five of six fills left reverse frontier unexpanded |
+| Chair-8, mixed 4 UR10 | 96.41 s / 1.65 GB | 35 actions; detached module supported; early PDBs partial, hard module fills exhausted (largest 88,136 states) |
+| Cube-8, 4 vacuum UR10 | not rerun | earlier exact-local run found no plan within 180 s; sixth fill was dominated by failed concrete binds |
+
+Cross demonstrates useful avoided reverse work. Car demonstrates the limiting case where the
+query-driven oracle degenerates to the eager table. Chair's wall time is still dominated by 471
+continuous binds (269 failures), not its partial PDB construction; automatic mixed-tool wrench
+facts also make this a stricter and more expensive comparison than the former topological
+mixed-tool fallback. The method remains substantially better than counting-only structural
+search on Car, but it is not uniformly faster on Chair. Cube remains a continuous-realization
+bottleneck rather than merely a backward-table bottleneck.
+
+Example (replace the saved config/output as needed):
+
+```bash
+PYTHONHASHSEED=0 NUMBA_CACHE_DIR=/tmp/assembly-numba-cache \
+MPLCONFIGDIR=/tmp/assembly-mpl-cache \
+python3 main.py --config experiments/car-mini-3r-robust-seed11023-plan.json --solve \
+  --weight 1 --milestone-oracle structural --fill-local-h --fill-exact \
+  --no-open-witness --optimize-witnesses off --witness-sets 0 --no-fuse-cograsp \
+  --quiet-rai --no-view --save experiments/car-mini-fill-local-exact.json
+```
+
+Example matched ablation command:
+
+```bash
+PYTHONHASHSEED=0 NUMBA_CACHE_DIR=/tmp/assembly-numba-cache \
+MPLCONFIGDIR=/tmp/assembly-mpl-cache \
+python3 main.py --config experiments/car-mini-3r-robust-seed11023-plan.json --solve \
+  --milestone-oracle chain --no-open-witness \
+  --optimize-witnesses off --witness-sets 0 --no-fuse-cograsp \
+  --quiet-rai --no-view --save experiments/ablation-car-chain.json
+```
 
 Analytic IK seeding is on by default with `--real-ik`. It is calibrated separately for the
 UR5/UR10 two-finger and vacuum tool frames; vacuum uses the grasp target's canonical aligned EE
