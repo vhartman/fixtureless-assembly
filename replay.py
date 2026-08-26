@@ -180,6 +180,9 @@ def build_scene(cfg):
   if (_saved(cfg, "robot_types") or _saved(cfg, "robot")) == "fr3":
     from env import make_fr3_duo_env
     C = make_fr3_duo_env(num_duos=max(1, cfg["num_robots"] // 2))
+  elif (_saved(cfg, "robot_types") or _saved(cfg, "robot")) == "openarm":
+    from env import make_openarm_duo_env
+    C = make_openarm_duo_env(num_duos=max(1, cfg["num_robots"] // 2))
   else:
     C = make_four_robot_env(num_robots=cfg["num_robots"], floating_ee=cfg["floating_ee"],
                             vacuum=gripper_list if gripper_list is not None else _saved(cfg, "vacuum"),

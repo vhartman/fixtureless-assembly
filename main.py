@@ -29,6 +29,7 @@ _STANDARD_SEARCH_PROFILE = {
     "fill_local_h": True,
     "fill_exact": True,
     "fill_skeleton_first": False,
+    "milestone_boundaries": 4,
     "fill_scope_widening": True,
     "fill_touch_all": False,
     "sig_collapsed_h": True,
@@ -108,13 +109,20 @@ _STANDARD_MOTION_PROFILE = {
     "post_release": 0.05,
     "fuse_cograsp": True,
     "fuse_pre_skill": True,
-    # The simulator consumes an ordered mode chain. First-solution BiRRT plus a bounded,
-    # certified shortcut pass is the current reproduction path; phase scheduling later handles
-    # visual timing, so spending the whole wall budget on RRT* cost is not the standard.
+    # The simulator consumes an ordered mode chain. A production artifact is always optimized:
+    # after the first BiRRT solution, RRT* keeps improving it for the rest of the consultation
+    # budget, then the certified shortcut pass runs. The 300 s cap covers the historically hard
+    # Chair transit; no 30 s frontier-stall shortcut may silently truncate that budget.
     "mp_sequence": True,
-    "mp_optimize": False,
-    "mp_runtime": 90.0,
-    "mp_stall_timeout": 30.0,
+    "mp_optimize": True,
+    "mp_runtime": 300.0,
+    "mp_stall_timeout": None,
+    # Fair complete-plan loop: four alternatives match the search's retained milestone
+    # boundaries. 15,30,60,120,240,300 s gives every suspended plan both quick probes and the
+    # full historically sufficient consultation without one plan monopolizing the beginning.
+    "mp_plan_candidates": 4,
+    "mp_plan_epochs": 6,
+    "mp_plan_initial_runtime": 15.0,
     "mp_no_shortcut": False,
     "mp_shortcut_iters": 100,
     "mp_shortcut_strategy": "native",
@@ -159,8 +167,9 @@ def build_parser():
   parser.add_argument(
       "--motion-profile", choices=tuple(_MOTION_PROFILES), default=None, metavar="NAME",
       help="Named motion-export/planning defaults. standard pins skill funnels/fusion, "
-           "sequence export, 1e-4 collision tolerance, 0.1m robot margin+ramp, first-solution "
-           "BiRRT (90s/30s stall), and 100 certified shortcuts. It does not imply "
+           "sequence export, 1e-4 collision tolerance, 0.1m robot margin+ramp, RRT* "
+           "optimization over a full 300s budget (no frontier-stall cutoff), a 4-plan/6-tier "
+           "open-loop budget, and 100 certified shortcuts. It does not imply "
            "--motion-plan or guess --mp-seed/output paths. Precedence matches search profiles.",
   )
   g_scene   = parser.add_argument_group("scene & problem", "assembly, parts, robots, grippers, initial layout, goal")
@@ -198,13 +207,14 @@ def build_parser():
            "topological under mixed). Incompatible with --anon-robots (identity matters).",
   )
   g_scene.add_argument(
-      "--robot", choices=["ur10", "ur10_limited", "ur5", "ur5_limited", "fr3"], default="ur10",
+      "--robot", choices=["ur10", "ur10_limited", "ur5", "ur5_limited", "fr3", "openarm"], default="ur10",
       help="Robot arm for all robots: ur10 (default), ur10_limited (ur10 with a tighter "
            "shoulder-lift/elbow workspace), ur5, ur5_limited (ur5 with the same "
-           "restricted workspace), or fr3 -- TWO static Franka FR3 arms with robotiq "
+           "restricted workspace), fr3 -- TWO static Franka FR3 arms with robotiq "
            "two-finger grippers on the table's -y edge (--num-robots is forced to 2; "
            "EXPERIMENTAL: no analytic IK yet, validation runs the precheck+KOMO path). "
-           "With --floating-ee the arm is "
+           "or openarm -- static OpenArm v2 humanoid duo(s) with pinch grippers "
+           "(fingers deactivated open; --num-robots 2 or 4). With --floating-ee the arm is "
            "irrelevant (a generic floating gripper); it matters for the real arm (no --floating-ee "
            "/ --real-ik) -- note the ur5 has a much shorter reach (~0.85 m vs ~1.3 m).",
   )
@@ -949,7 +959,8 @@ def build_parser():
   )
   g_search.add_argument(
       "--milestone-oracle", choices=("global", "chain", "structural"), default="global",
-      help="Milestone-ordering ablation (default global). 'global' builds the backward "
+      help="Milestone-ordering ablation (flag default global; --search-profile standard "
+           "selects structural). 'global' builds the backward "
            "signature database and uses its cost-to-go plus grasp/brace hints. "
            "'chain' builds the smaller signature projection over assembly_order only "
            "(sequence assemblies; detached modules are rejected). "
@@ -970,10 +981,9 @@ def build_parser():
   g_search.add_argument(
       "--fill-exact", action=argparse.BooleanOptionalAction, default=False,
       help="Run one-part concrete fill searches at weight 1, irrespective of the global "
-           "--weight. Intended with --fill-local-h to test whether the small subproblems "
-           "are cheap enough for exact symbolic A*. Also removes the ordinary 200-plan "
-           "lazy-repair cutoff; node/deadline limits still apply. IK remains lazy and fully "
-           "validated.",
+           "--weight. Also removes the ordinary 200-plan lazy-repair cutoff; node/deadline "
+           "limits still apply. IK remains lazy and fully validated. Enabled together with "
+           "--fill-local-h by --search-profile standard.",
   )
   g_search.add_argument(
       "--fill-skeleton-first", action=argparse.BooleanOptionalAction, default=False,
@@ -983,6 +993,14 @@ def build_parser():
            "cheap-collision and lazy real-IK gates. At most three role assignments per robot "
            "are tried before falling through explicitly to the existing complete local graph; "
            "the probe never declares infeasibility.",
+  )
+  g_search.add_argument(
+      "--milestone-boundaries", type=int, default=1, metavar="K",
+      help="Retain up to K distinct settled concrete endpoints per milestone transition "
+           "(default 1; standard profile 4). Alternatives are generated lazily only when a "
+           "later suffix fails: the rejected endpoint is excluded and the same exact fill is "
+           "resumed/re-solved for its next-cheapest boundary. Applies recursively inside "
+           "detached modules. K=1 is the historical claim-once ablation.",
   )
   g_search.add_argument(
       "--corridor-h", action="store_true",
@@ -1534,8 +1552,32 @@ def build_parser():
            "None = run the full --mp-runtime.",
   )
   g_mp.add_argument(
+      "--mp-open-plans", action=argparse.BooleanOptionalAction, default=False,
+      help="With --solve --motion-plan --milestones: fairly interleave complete assembly-plan "
+           "enumeration with finite motion-planner pulls. A failed pull suspends that complete "
+           "plan, tries another, then reopens suspended plans at increasing runtime tiers. "
+           "No MP timeout becomes an action/boundary blacklist. Production loop outputs are "
+           "always RRT*-optimized (--mp-optimize required).",
+  )
+  g_mp.add_argument(
+      "--mp-plan-candidates", type=int, default=4, metavar="N",
+      help="--mp-open-plans: number of distinct complete assembly plans to probe before only "
+           "reopening the suspended pool (default 4).",
+  )
+  g_mp.add_argument(
+      "--mp-plan-epochs", type=int, default=6, metavar="N",
+      help="--mp-open-plans: fair MP effort tiers per candidate (default 6: with the default "
+           "15s initial pull and standard 300s cap this is 15,30,60,120,240,300s).",
+  )
+  g_mp.add_argument(
+      "--mp-plan-initial-runtime", type=float, default=15.0, metavar="SEC",
+      help="--mp-open-plans: first BiRRT pull per complete plan (default 15s). Later tiers "
+           "double this up to --mp-runtime.",
+  )
+  g_mp.add_argument(
       "--mp-runtime", type=float, default=30.0, metavar="SEC",
-      help="With --motion-plan: BiRRT search budget in seconds (default 30 since 2026-07-29). "
+      help="With --motion-plan: BiRRT search budget in seconds (flag default 30 since 2026-07-29; the "
+           "standard motion profile uses 300). "
            "Bounds ONLY the tree search, NOT shortcutting.",
   )
   g_mp.add_argument(
@@ -1815,18 +1857,35 @@ _SAVE_CONFIG_FIELDS = (
     "hoist_releases",                                    # rewrites the PLAN (before --save, so
     # the saved actions are already hoisted) -- recorded so a rebuild can tell what it is replaying
     "witness_clearance", "handovers", "allow_place",
+    "fuse_cograsp", "fuse_pre_skill",                   # motion-only witness/keyframe passes
     "mp_sequence",                                       # depgraph vs sequence = a different
     # task GRAPH; the sim rebuilt SEQUENCE unconditionally while main defaults to depgraph
+    "mp_optimize", "mp_runtime", "mp_stall_timeout",   # RRT* consultation contract
+    "mp_no_shortcut", "mp_shortcut_iters", "mp_shortcut_res",
+    "mp_shortcut_strategy", "mp_shortcut_pair_checks", # certified path post-processing
+    "mp_collision_tolerance",                            # base predicate certificate
     "mp_robot_margin", "mp_margin_ramp",                 # clearance the path was planned with
     "mp_table_margin",                                   # carried-part-vs-table transit clearance
+    "mp_cograsp",                                        # closed-chain path diagnostic
     "mp_seed",                                           # reproducible BiRRT draw (None = unseeded)
     "mp_fake_clock",                                     # fake deterministic clock: runtime becomes
+    "mp_open_plans", "mp_plan_candidates", "mp_plan_epochs",
+    "mp_plan_initial_runtime",                           # outer MP fairness provenance
     # a CONSULTATION budget (bit-exact seeded replay)
     "min_sep", "place_cells", "prefer_center", "brace_for_assembly_only", "lru_robots",
     "anon_robots", "declutter", "por",
     # LAYOUT: these feed add_disassembled_obj, so without them the replay/sim rebuilds a
     # DIFFERENT initial scatter than the plan was solved in (FRAGILITY 1.8).
     "grid_init", "grid_gap",
+    # SEARCH PROVENANCE. A saved plan is replayable from its certificates without these, but
+    # `--config PLAN.json --solve` must also reproduce the search that selected it. Persist the
+    # resolved values rather than only a named-profile label: profiles may evolve, whereas a
+    # paper artifact must keep the semantics it was actually solved under.
+    "weight", "milestones", "goal_on_table", "milestone_oracle", "fill_local_h", "fill_exact",
+    "fill_skeleton_first", "milestone_boundaries", "fill_scope_widening", "fill_touch_all",
+    "fill_window", "lazy_fills", "open_witness", "open_witness_batch",
+    "open_witness_epochs", "analytic_seed_cap", "fail_order", "empty_seed_refutes",
+    "wrench_aware_h", "sig_collapsed_h", "sig_components",
 )
 
 
@@ -1942,7 +2001,8 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         fill_window=cfg.fill_window, milestone_oracle=cfg.milestone_oracle,
         fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
         fill_skeleton_first=cfg.fill_skeleton_first,
-        fill_scope_widening=cfg.fill_scope_widening)
+        fill_scope_widening=cfg.fill_scope_widening,
+        milestone_boundaries=cfg.milestone_boundaries)
   elif cfg.bounded or cfg.dfbnb:
     plan = solve_assembly_problem_bounded(
         C, assembly, robots=robots, robot_ik=robot_ik, weight=cfg.weight,
@@ -2006,7 +2066,8 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         lazy_fills=cfg.lazy_fills, milestone_oracle=cfg.milestone_oracle,
         fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
         fill_skeleton_first=cfg.fill_skeleton_first,
-        fill_scope_widening=cfg.fill_scope_widening)
+        fill_scope_widening=cfg.fill_scope_widening,
+        milestone_boundaries=cfg.milestone_boundaries)
   else:
     plan = solve_assembly_problem(C, assembly, robots=robots, canonical=cfg.canonical,
                                   weight=cfg.weight, robot_ik=robot_ik, wrench=cfg.wrench,
@@ -2023,6 +2084,295 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
                                   iter_bound=cfg.iter_bound,
                                   pathmax=cfg.pathmax)
   return plan
+
+
+def _milestone_candidate_session(cfg, C, assembly, robots, robot_ik):
+  """The standard milestone search as a resumable stream of complete plans."""
+  from solver import iter_assembly_problem_milestones
+  return iter_assembly_problem_milestones(
+      C, assembly, robots=robots, robot_ik=robot_ik, weight=cfg.weight,
+      wrench=cfg.wrench, wrench_aware_h=cfg.wrench_aware_h,
+      handovers=cfg.handovers, allow_place=cfg.allow_place,
+      bracing=cfg.bracing, geo_facts=cfg.geo_facts,
+      sig_collapsed_h=cfg.sig_collapsed_h, fill_window=cfg.fill_window,
+      lazy_fills=cfg.lazy_fills, milestone_oracle=cfg.milestone_oracle,
+      fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
+      fill_skeleton_first=cfg.fill_skeleton_first,
+      fill_scope_widening=cfg.fill_scope_widening,
+      milestone_boundaries=cfg.milestone_boundaries)
+
+
+def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
+  """Fairly interleave resumable assembly-plan enumeration and finite MP pulls.
+
+  Motion planning runs in isolated, memory-guarded child processes.  This is important beyond
+  fault containment: rebuilding/exporting a candidate resets several global RNG/model knobs;
+  doing it in the search process would corrupt the paused milestone session we are preserving.
+  """
+  import hashlib
+  import json
+  import shutil
+  import subprocess
+  import time
+  from solver import collect_plan_witnesses, hoist_releases
+  from plan_io import require_complete_witnesses, witness_block
+
+  if not cfg.motion_plan or not cfg.solve or cfg.load_plan:
+    raise SystemExit("--mp-open-plans requires a fresh --solve --motion-plan run")
+  if not cfg.milestones or any((cfg.optimistic, cfg.lazy, cfg.anytime is not None,
+                                cfg.milestones_anytime is not None, cfg.ladder is not None,
+                                cfg.ladder_lns is not None, cfg.bounded, cfg.dfbnb)):
+    raise SystemExit("--mp-open-plans currently requires the ordinary milestone solver")
+  if robot_ik is None:
+    raise SystemExit("--mp-open-plans requires --real-ik")
+  if not cfg.save or not cfg.mp_save:
+    raise SystemExit("--mp-open-plans requires --save PLAN.json and --mp-save MP.json so the "
+                     "winning pair can be promoted atomically")
+  if cfg.mp_plan_candidates < 1 or cfg.mp_plan_epochs < 1:
+    raise SystemExit("--mp-plan-candidates/--mp-plan-epochs must be >= 1")
+  if cfg.mp_plan_initial_runtime <= 0.0 or cfg.mp_runtime <= 0.0:
+    raise SystemExit("--mp-plan-initial-runtime/--mp-runtime must be positive")
+  if not cfg.mp_optimize:
+    raise SystemExit("--mp-open-plans requires --mp-optimize: a promoted production path must "
+                     "spend the remainder of its successful pull on RRT* optimization. Use the "
+                     "ordinary one-shot planner for a first-solution-only diagnostic.")
+
+  # Bound the search process too, not only its MP children. This is a soft RLIMIT_AS installed
+  # before milestone expansion; it prevents a hard Chair/fixture candidate from taking the
+  # laptop with it while still leaving enough headroom for the measured ~3.9 GiB Chair export.
+  import resource
+  parent_limit = int(_os.environ.get("MP_OPEN_PARENT_AS", str(6 * 1024**3)))
+  old_soft, old_hard = resource.getrlimit(resource.RLIMIT_AS)
+  effective_parent_limit = min(parent_limit, old_hard) if old_hard >= 0 else parent_limit
+  parent_limit_changed = old_soft < 0 or old_soft > effective_parent_limit
+  if parent_limit_changed:
+    resource.setrlimit(resource.RLIMIT_AS, (effective_parent_limit, old_hard))
+
+  def restore_parent_limit():
+    if parent_limit_changed:
+      resource.setrlimit(resource.RLIMIT_AS, (old_soft, old_hard))
+
+  stem, _ext = _os.path.splitext(_os.path.abspath(cfg.mp_save))
+  run_tag = time.strftime("%Y%m%d-%H%M%S") + f"-{_os.getpid()}"
+  work = f"{stem}-open/{run_tag}"
+  _os.makedirs(work, exist_ok=False)
+  manifest_path = _os.path.join(work, "manifest.json")
+  base_seed = int(cfg.mp_seed if cfg.mp_seed is not None else cfg.seed)
+  cap = float(cfg.mp_runtime)
+  first = min(cap, float(cfg.mp_plan_initial_runtime))
+  runtimes = [min(cap, first * (2 ** e)) for e in range(cfg.mp_plan_epochs)]
+  records = []
+  manifest = {
+      "version": 1, "status": "running", "workdir": work,
+      "policy": "complete-plan suspension + fair MP reopening",
+      "candidate_limit": int(cfg.mp_plan_candidates), "runtimes": runtimes,
+      "base_seed": base_seed, "candidates": records,
+      "parent_memory_limit_bytes": effective_parent_limit,
+      "grasp_refinement": bool(cfg.grasp_sampler and cfg.grasp_sampler_version >= 2
+                                and cfg.grasp_refine),
+  }
+  seen_plan_ids = set()
+
+  def write_manifest():
+    tmp = manifest_path + ".tmp"
+    with open(tmp, "w") as f:
+      json.dump(manifest, f, indent=2, sort_keys=True)
+      f.write("\n")
+    _os.replace(tmp, manifest_path)
+
+  def plan_id(plan):
+    raw = json.dumps([list(a) for a in plan], separators=(",", ":"), sort_keys=False)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+  def prepare(raw_plan, index):
+    plan = list(raw_plan)
+    if cfg.hoist_releases:
+      plan = hoist_releases(
+          C, assembly, plan, robots,
+          gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
+          handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing)
+    pid = plan_id(plan)
+    if pid in seen_plan_ids:
+      print(f"[mp-open] duplicate complete plan {pid} skipped while widening search.")
+      return None
+    seen_plan_ids.add(pid)
+    prefix = _os.path.join(work, f"candidate-{index:03d}-{pid}")
+    pfile, efile = prefix + "-plan.json", prefix + "-export.json"
+    witnesses = collect_plan_witnesses(
+        C, assembly, plan, robots, robot_ik,
+        gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
+        handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
+        resolve_missing=True)
+    require_complete_witnesses(plan, witnesses, who="open-plan search certificate")
+    save_plan(pfile, cfg, plan,
+              witnesses=witness_block(list(robot_ik.C.getJointNames()), witnesses,
+                                      stage="search"))
+    rec = {"index": index, "plan_id": pid, "actions": len(plan),
+           "plan_path": pfile, "export_path": efile, "attempts": [],
+           "status": "suspended"}
+    records.append(rec)
+    write_manifest()
+    return rec
+
+  def flag(name, value):
+    return f"--{name}" if value else f"--no-{name}"
+
+  def pull(rec, tier):
+    runtime = runtimes[tier]
+    seed = base_seed + rec["index"] - 1 + tier * 100003
+    mpfile = (_os.path.splitext(rec["plan_path"])[0]
+              + f"-tier{tier:02d}-seed{seed}-mp.json")
+    cmd = [_sys.executable, _os.path.abspath(__file__),
+           "--config", rec["plan_path"], "--load-plan", rec["plan_path"],
+           "--motion-plan", flag("mp-sequence", cfg.mp_sequence),
+           flag("mp-optimize", cfg.mp_optimize),
+           "--mp-runtime", f"{runtime:g}", "--mp-seed", str(seed),
+           "--mp-shortcut-iters", str(cfg.mp_shortcut_iters),
+           "--mp-shortcut-strategy", cfg.mp_shortcut_strategy,
+           "--mp-shortcut-pair-checks", str(cfg.mp_shortcut_pair_checks),
+           "--mp-collision-tolerance", f"{cfg.mp_collision_tolerance:g}",
+           "--mp-robot-margin", f"{cfg.mp_robot_margin:g}",
+           "--mp-margin-ramp", f"{cfg.mp_margin_ramp:g}",
+           "--mp-table-margin", f"{cfg.mp_table_margin:g}",
+           "--mp-save", mpfile, "--quiet-rai", "--no-view"]
+    if getattr(cfg, "_motion_profile", None):
+      cmd.extend(["--motion-profile", cfg._motion_profile])
+    if cfg.mp_stall_timeout is not None:
+      cmd.extend(["--mp-stall-timeout", f"{min(runtime, cfg.mp_stall_timeout):g}"])
+    if cfg.mp_no_shortcut:
+      cmd.append("--mp-no-shortcut")
+    if cfg.mp_shortcut_res is not None:
+      cmd.extend(["--mp-shortcut-res", f"{cfg.mp_shortcut_res:g}"])
+    if cfg.mp_fake_clock:
+      cmd.append("--mp-fake-clock")
+    # A killed/crashed first child may not have reached export despite being recorded as a
+    # failed pull. Rebuild in that case; never feed a missing artifact to every later tier.
+    if tier == 0 or not _os.path.exists(rec["export_path"]):
+      cmd.extend(["--mp-export-save", rec["export_path"], "--save", rec["plan_path"]])
+    else:
+      cmd.extend(["--mp-export-load", rec["export_path"]])
+
+    # Keep a failed candidate planner from taking the laptop with it.  Override only through
+    # an explicit environment variable. Chair's current 4-robot witness-set export measured
+    # ~3.87 GiB RSS, so 4 GiB is not viable once RRT* allocates its next tree; retain a bounded
+    # 6 GiB default instead.
+    limit = int(_os.environ.get("MP_OPEN_CHILD_AS", str(6 * 1024**3)))
+    prlimit = shutil.which("prlimit")
+    guarded = ([prlimit, f"--as={limit}", "--"] + cmd) if prlimit else cmd
+    att = {"tier": tier, "runtime": runtime, "seed": seed, "mp_path": mpfile,
+           "status": "running", "memory_limit_bytes": limit if prlimit else None}
+    rec["attempts"].append(att)
+    write_manifest()
+    print(f"[mp-open] candidate {rec['index']}/{cfg.mp_plan_candidates} "
+          f"{rec['plan_id']} tier {tier + 1}/{cfg.mp_plan_epochs}: "
+          f"runtime={runtime:g}s seed={seed} (failed pull => suspend, never blacklist)",
+          flush=True)
+    try:
+      cp = subprocess.run(guarded, cwd=_os.path.dirname(_os.path.abspath(__file__)),
+                          timeout=max(600.0, runtime + 600.0))
+      att["returncode"] = int(cp.returncode)
+      has_path = _os.path.exists(mpfile) and _os.path.getsize(mpfile) > 0
+      success = cp.returncode == 0 and has_path
+      att["status"] = ("success" if success else
+                       ("child_error" if cp.returncode != 0 else "no_path"))
+    except subprocess.TimeoutExpired:
+      success = False
+      att["status"] = "child_timeout"
+    write_manifest()
+    return success, mpfile
+
+  def promote(rec, mpfile):
+    # Tier-0 certification intentionally re-saves the candidate with optimized witnesses, but
+    # that child is invoked with its *pull* runtime (e.g. 15 s). Restore the parent's full
+    # scheduling contract before promotion. The manifest remains the source of truth for the
+    # selected attempt's exact tier/runtime/seed; the plan config reproduces the outer loop.
+    with open(rec["plan_path"]) as f:
+      selected_doc = json.load(f)
+    selected_cfg = selected_doc.setdefault("config", {})
+    for key in ("fuse_cograsp", "fuse_pre_skill", "mp_sequence", "mp_optimize",
+                "mp_runtime", "mp_stall_timeout", "mp_no_shortcut", "mp_shortcut_iters",
+                "mp_shortcut_res", "mp_shortcut_strategy", "mp_shortcut_pair_checks",
+                "mp_collision_tolerance", "mp_robot_margin", "mp_margin_ramp",
+                "mp_table_margin", "mp_cograsp", "mp_seed", "mp_open_plans",
+                "mp_plan_candidates", "mp_plan_epochs", "mp_plan_initial_runtime"):
+      selected_cfg[key] = getattr(cfg, key)
+    selected_tmp = rec["plan_path"] + ".outer-config.tmp"
+    with open(selected_tmp, "w") as f:
+      json.dump(selected_doc, f, indent=2)
+      f.write("\n")
+    _os.replace(selected_tmp, rec["plan_path"])
+    for src, dst in ((rec["plan_path"], cfg.save), (mpfile, cfg.mp_save),
+                     (rec["export_path"], cfg.mp_export_save)):
+      if dst:
+        _os.makedirs(_os.path.dirname(_os.path.abspath(dst)), exist_ok=True)
+        shutil.copy2(src, dst)
+    rec["status"] = "selected"
+    manifest.update({"status": "success", "selected_plan_id": rec["plan_id"],
+                     "selected_candidate": rec["index"], "selected_mp_path": cfg.mp_save,
+                     "selected_attempt": dict(rec["attempts"][-1])})
+    write_manifest()
+    print(f"[mp-open] SELECTED candidate {rec['index']} {rec['plan_id']}; promoted plan -> "
+          f"{cfg.save}, motion path -> {cfg.mp_save}. Manifest: {manifest_path}")
+    restore_parent_limit()
+    return {"plan": cfg.save, "motion_path": cfg.mp_save,
+            "manifest": manifest_path, "plan_id": rec["plan_id"]}
+
+  session = _milestone_candidate_session(cfg, C, assembly, robots, robot_ik)
+  widened_grasps = False
+  staged_grasps = bool(cfg.grasp_sampler and cfg.grasp_sampler_version >= 2
+                       and cfg.grasp_refine)
+  # Epoch 0: move on quickly -- one small pull for each newly generated complete plan. If
+  # the conventional primitive-grasp prefix is exhausted, preserve the ordinary standard
+  # profile's staged refinement: reopen with the full hybrid sampled DB and skip duplicates.
+  while len(records) < cfg.mp_plan_candidates:
+    try:
+      raw = next(session)
+    except StopIteration:
+      if staged_grasps and not widened_grasps:
+        from problem import set_sampled_canonical_only
+        widened_grasps = True
+        set_sampled_canonical_only(False)
+        manifest["grasp_refinement_widened"] = True
+        write_manifest()
+        print("[grasp-refine/mp-open] compact complete-plan stream exhausted -> reopening "
+              "search with the full hybrid grasp DB; duplicate plans are skipped.")
+        session = _milestone_candidate_session(cfg, C, assembly, robots, robot_ik)
+        continue
+      print(f"[mp-open] assembly-plan session exhausted after {len(records)} candidate(s).")
+      break
+    i = len(records) + 1
+    rec = prepare(raw, i)
+    if rec is None:
+      continue
+    ok, mpfile = pull(rec, 0)
+    if ok:
+      return promote(rec, mpfile)
+    att = rec["attempts"][-1]
+    rc = f", returncode={att['returncode']}" if "returncode" in att else ""
+    print(f"[mp-open] candidate {i} suspended after tier 1: {att['status']}{rc}; "
+          "requesting another complete plan.")
+
+  # Later epochs: fairly reopen every suspended plan before increasing any one again.
+  for tier in range(1, cfg.mp_plan_epochs):
+    for rec in records:
+      if rec["status"] == "selected":
+        continue
+      print(f"[mp-open] reopening candidate {rec['index']} at effort tier {tier + 1}.")
+      ok, mpfile = pull(rec, tier)
+      if ok:
+        return promote(rec, mpfile)
+      att = rec["attempts"][-1]
+      rc = f", returncode={att['returncode']}" if "returncode" in att else ""
+      print(f"[mp-open] candidate {rec['index']} remains suspended after tier {tier + 1}: "
+            f"{att['status']}{rc}.")
+
+  manifest["status"] = "exhausted_finite_budget"
+  write_manifest()
+  restore_parent_limit()
+  raise SystemExit(
+      f"[mp-open] no motion path within the configured FAIR finite effort. Nothing was "
+      f"declared infeasible or blacklisted; {len(records)} suspended plan(s) and all evidence "
+      f"remain in {manifest_path}. Increase --mp-plan-epochs/--mp-runtime to reopen them.")
 
 
 def _should_hoist_plan(cfg, explicit=None):
@@ -2086,6 +2436,7 @@ def run(cfg, explicit=None):
           f"milestone-oracle={cfg.milestone_oracle}, "
           f"local-PDB={'exact' if cfg.fill_local_h and cfg.fill_exact else ('weighted' if cfg.fill_local_h else 'off')}, "
           f"fill-scope={'all' if cfg.fill_touch_all else ('local->all' if cfg.fill_scope_widening else 'local-only')}, "
+          f"milestone-boundaries={cfg.milestone_boundaries}, "
           f"witness-margin={float(cfg.witness_margin or 0.0)*1000:g}mm, "
           f"open-witness={'on' if cfg.open_witness else 'off'}"
           + (f" batch={cfg.open_witness_batch} epochs={cfg.open_witness_epochs}"
@@ -2350,6 +2701,12 @@ def run(cfg, explicit=None):
       print(f"[flag] fr3 duos: --num-robots {cfg.num_robots} -> {2 * num_duos} "
             f"({num_duos} duo(s))")
     C = make_fr3_duo_env(num_duos=num_duos)
+  elif cfg.robot == "openarm":
+    num_duos = max(1, cfg.num_robots // 2)
+    if cfg.num_robots != 2 * num_duos:
+      print(f"[flag] openarm duos: --num-robots {cfg.num_robots} -> {2 * num_duos} "
+            f"({num_duos} duo(s))")
+    C = make_openarm_duo_env(num_duos=num_duos)
   else:
     C = make_four_robot_env(
         num_robots=cfg.num_robots,
@@ -2738,6 +3095,12 @@ def run(cfg, explicit=None):
           print("[grasp-refine] epoch 0: primitive parts use the exact conventional grasp "
                 "prefix; mesh/compound parts keep their sampled DB. Sampled primitive "
                 "extras reopen only if this compact search exhausts.")
+        if cfg.mp_open_plans:
+          print("[flag] --mp-open-plans ACTIVE: complete assembly plans are generated from "
+                "one resumable milestone session; finite MP failures suspend a plan, probe "
+                "another, then fairly reopen every suspended plan at higher effort. No MP "
+                "timeout becomes a symbolic or boundary no-good.")
+          return _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=explicit)
         plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
         if plan is None and _staged_grasps:
           set_sampled_canonical_only(False)

@@ -217,6 +217,9 @@ def _robot_path(robot_type, floating_ee, vacuum):
 FR3_DUO_BASE_PATH = "./src/rai/fr3/static_mobile_fr3_base.g"
 FR3_ARM_PATHS = {"right": "./src/rai/fr3/right_fr3.g", "left": "./src/rai/fr3/left_fr3.g"}
 ROBOTIQ_TIGHT_PATH = "./src/rai/robotiq/robotiq_tight.g"
+OPENARM_TORSO_PATH = "./src/rai/openarm/openarm_torso.g"
+OPENARM_ARM_PATHS = {"right": "./src/rai/openarm/right_openarm.g",
+                     "left": "./src/rai/openarm/left_openarm.g"}
 
 
 def make_fr3_duo_env(num_duos=1):
@@ -229,13 +232,16 @@ def make_fr3_duo_env(num_duos=1):
     (contact-disabled decoration) clear it.
     """
     C = make_world()
-    table_h = 0.06                                       # slim slab, top at 0.45
+    # OpenArm reach is only ~0.64m (vs FR3 0.85): the workbench sits IN the reach
+    # envelope -- narrow (0.5m deep) slab close to the torso, top at 0.52 so top-down
+    # grasps keep wrist headroom under the 0.72m shoulders.
+    table_h = 0.06                                       # slim slab, top at 0.52
     C.getFrame("table").setShape(
-        ry.ST.box, size=[1.2, 0.9, table_h, 0.005]).setPosition(
-        [0.0, 0.02, 0.45 - table_h / 2.0]).setContact(1)
+        ry.ST.box, size=[1.6, 1.2, table_h, 0.005]).setPosition(
+        [0.0, -0.10, 0.52 - table_h / 2.0]).setContact(1)
     duos = []
     for k in range(num_duos):
-        y = -1.02 if k % 2 == 0 else 1.02
+        y = -0.66 if k % 2 == 0 else 0.66
         yaw = 0.70710678 if k % 2 == 0 else -0.70710678  # rotZ +-90: face the table
         duos.append((k, y, [0.70710678, 0.0, 0.0, yaw]))
     for k, by, quat in duos:
@@ -294,7 +300,6 @@ def make_fr3_duo_env(num_duos=1):
         #     C.setJointState(full)
         #     if C.getCollisionsTotalPenetration() < 1e-6:
         #         break
-
         full = C.getJointState()
         full[5] = 1
         full[5 + 1 * 7] = 1
@@ -309,6 +314,76 @@ def make_fr3_duo_env(num_duos=1):
     for n in list(C.getFrameNames()):
         if n.endswith("base_coll") or n.endswith("tower_coll"):
             C.getFrame(n).setContact(0)
+    return C
+
+
+def make_openarm_duo_env(num_duos=1):
+    """Humanoid-style static OpenArm v2 duos (pinch gripper, fingers deactivated open).
+
+    Mirrors make_fr3_duo_env: OpenArm's own torso (body_link0) on the floor at the
+    table edge facing the build area, both 7-DOF arms bolted at its shoulder mounts
+    (z=0.698). Fingers are rigid at the open pose -- closing proxies come later via
+    the same mechanism as tighten_fingers. num_duos=2 places the second duo rotated
+    180deg on the opposite table edge (robots a3/a4).
+    """
+    C = make_world()
+    # OpenArm reach is only ~0.64m (vs FR3 0.85): the workbench sits IN the reach
+    # envelope -- narrow (0.5m deep) slab close to the torso, top at 0.52 so top-down
+    # grasps keep wrist headroom under the 0.72m shoulders.
+    table_h = 0.06                                       # slim slab, top at 0.52
+    C.getFrame("table").setShape(
+        ry.ST.box, size=[1.2, 0.8, table_h, 0.005]).setPosition(
+        [0.0, -0.2, 0.37 - table_h / 2.0]).setContact(1)
+    duos = []
+    for k in range(num_duos):
+        y = -0.66 if k % 2 == 0 else 0.26
+        yaw = 0.70710678 if k % 2 == 0 else -0.70710678  # rotZ +-90: face the table
+        duos.append((k, y, [0.70710678, 0.0, 0.0, yaw]))
+    for k, by, quat in duos:
+        torso = C.addFile(os.path.join(HERE, OPENARM_TORSO_PATH),
+                          namePrefix=f"oa{k}_").setParent(C.getFrame("floor"))
+        torso.setPosition([0.0, by, 0.02]).setQuaternion(quat).setJoint(ry.JT.rigid)
+        # torso boxes are decoration (the arms bolt on right next to them):
+        # exclude from every collision query, like the fr3 torso hulls
+        for tn in list(C.getFrameNames()):
+            if tn.startswith(f"oa{k}_torso_"):
+                C.getFrame(tn).setContact(0)
+        for j, side in enumerate(("right", "left")):
+            r = f"a{2 * k + j + 1}"
+            prefix = f"{r}_"
+            mount = C.getFrame(f"oa{k}_{side}_mount_origin")
+            # {r}_ur_base marks the single-arm IK subtree root (solver.py robot_base)
+            sh_m = C.addFrame(f"{prefix}ur_base").setParent(mount)
+            root = C.addFile(os.path.join(HERE, OPENARM_ARM_PATHS[side]),
+                             namePrefix=prefix)
+            root.setParent(sh_m)
+            root.setJoint(ry.JT.rigid)
+            base_body = C.getFrame(f"{prefix}openarm_{side}_base_link")
+            C.addFrame(f"{prefix}ur_base_link").setParent(base_body)
+            ee_flange = C.getFrame(f"{prefix}openarm_{side}_ee_base_link")
+            C.addFrame(f"{prefix}ur_ee_link").setParent(ee_flange)
+            # tool-center between the fingertips (approach = ee_base -z); tiny sphere
+            # so mr_bench's delete_visual_only pass cannot prune it (shapeless frames
+            # get deleted there and set_t then dereferences NULL -- FR3 lesson).
+            gc = C.addFrame(f"{prefix}ur_gripper_center").setParent(
+                C.getFrame(f"{prefix}gripper_center"))
+            gc.setShape(ry.ST.sphere, [0.004]).setContact(0)
+            color_gripper(C, prefix, GRIPPER_COLORS[(k * 2 + j) % len(GRIPPER_COLORS)])
+            # home pose: sampled collision-free ready config (hands above table height);
+            # applied per side HERE so every duo's arms map correctly (a hardcoded a1/a2
+            # broke num_duos=2 -- a3/a4 silently kept file-default q).
+            HOMES = {"right": [0, -0.2, 0, -1.2, 0., -0.5, 0.],
+                     "left": [0, 0.2, 0, -1.2, 0., -0.5, 0.]}
+            import re as _re
+            jn = C.getJointNames()
+            pat = _re.compile(_re.escape(prefix) + r"openarm_" + side + r"_joint(\d)$")
+            idx = {int(pat.match(n).group(1)) - 1: i
+                   for i, n in enumerate(jn) if pat.match(n)}
+            full = list(C.getJointState())
+            for bi, i in idx.items():
+                full[i] = HOMES[side][bi]
+            C.setJointState(full)
+
     return C
 
 

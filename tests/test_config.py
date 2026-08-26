@@ -98,6 +98,7 @@ def test_standard_search_profile_resolves_robust_batch_defaults():
   assert a.fill_local_h and a.fill_exact and not a.fill_skeleton_first
   assert a.fill_scope_widening
   assert not a.fill_touch_all
+  assert a.milestone_boundaries == 4
   assert a.real_ik and a.wrench and a.wrench_aware_h
   assert a.grasp_model == "asymmetric"
   assert a.optimize_witnesses == "floor"
@@ -159,12 +160,14 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
   monkeypatch.setattr(main, "solve_assembly_problem_milestones", fake)
   cfg = RunConfig(milestones=True, milestone_oracle="structural",
                   fill_local_h=True, fill_exact=True, fill_skeleton_first=True,
-                  fill_scope_widening=True, wrench_aware_h=False)
+                  fill_scope_widening=True, milestone_boundaries=3,
+                  wrench_aware_h=False)
   assert main._dispatch_solve(cfg, None, None, [], None) == []
   assert seen["milestone_oracle"] == "structural"
   assert seen["fill_local_h"] is True and seen["fill_exact"] is True
   assert seen["fill_skeleton_first"] is True
   assert seen["fill_scope_widening"] is True
+  assert seen["milestone_boundaries"] == 3
   assert seen["wrench_aware_h"] is False
   assert main.parse_args(["--milestone-oracle", "structural"]).milestone_oracle == "structural"
   assert main.parse_args(["--milestone-oracle", "chain"]).milestone_oracle == "chain"
@@ -179,19 +182,148 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
   assert main.parse_args(["--no-wrench-aware-h"]).wrench_aware_h is False
 
 
+def test_saved_plan_persists_resolved_search_semantics(tmp_path):
+  """A named-profile result must remain reproducible after the profile itself evolves."""
+  import json
+
+  a = main.parse_args(["--search-profile", "standard"])
+  cfg = RunConfig.from_namespace(a)
+  out = tmp_path / "plan.json"
+  main.save_plan(str(out), cfg, [])
+  saved = json.loads(out.read_text())["config"]
+  for key in ("weight", "milestones", "goal_on_table", "milestone_oracle", "fill_local_h", "fill_exact",
+              "milestone_boundaries", "fill_scope_widening", "open_witness",
+              "open_witness_batch", "open_witness_epochs", "analytic_seed_cap",
+              "fail_order", "empty_seed_refutes"):
+    assert saved[key] == getattr(cfg, key)
+  loaded = RunConfig.from_file(str(out))
+  assert loaded.milestone_boundaries == 4
+  assert loaded.milestone_oracle == "structural" and loaded.open_witness
+
+
 def test_standard_motion_profile_pins_the_motion_contract():
   a = main.parse_args(["--motion-profile", "standard"])
   assert (a.pre_pick, a.pre_place, a.pre_add_grasp,
           a.pre_insertion, a.post_release) == (0.05,) * 5
   assert a.fuse_cograsp and a.fuse_pre_skill
-  assert a.mp_sequence and not a.mp_optimize
-  assert a.mp_runtime == 90.0 and a.mp_stall_timeout == 30.0
+  assert a.mp_sequence and a.mp_optimize
+  assert a.mp_runtime == 300.0 and a.mp_stall_timeout is None
+  assert a.mp_plan_candidates == 4 and a.mp_plan_epochs == 6
+  assert a.mp_plan_initial_runtime == 15.0
   assert not a.mp_no_shortcut and a.mp_shortcut_iters == 100
   assert a.mp_shortcut_strategy == "native" and a.mp_shortcut_res is None
   assert a.mp_collision_tolerance == 1e-4
   assert a.mp_robot_margin == 0.1 and a.mp_margin_ramp == 0.1
   assert a.mp_table_margin == 0.0 and a.mp_cograsp
   assert not a.motion_plan                         # profiles configure; verbs remain explicit
+
+
+def test_saved_plan_persists_resolved_motion_profile_semantics(tmp_path):
+  import json
+
+  cfg = RunConfig.from_namespace(main.parse_args(["--motion-profile", "standard"]))
+  out = tmp_path / "motion-profile-plan.json"
+  main.save_plan(str(out), cfg, [])
+  saved = json.loads(out.read_text())["config"]
+  for key in ("fuse_cograsp", "fuse_pre_skill", "mp_sequence", "mp_optimize", "mp_runtime",
+              "mp_stall_timeout", "mp_no_shortcut", "mp_shortcut_iters",
+              "mp_shortcut_strategy", "mp_shortcut_res", "mp_shortcut_pair_checks",
+              "mp_collision_tolerance", "mp_robot_margin", "mp_margin_ramp",
+              "mp_table_margin", "mp_cograsp", "mp_plan_candidates", "mp_plan_epochs",
+              "mp_plan_initial_runtime"):
+    assert saved[key] == getattr(cfg, key)
+  loaded = RunConfig.from_file(str(out))
+  assert loaded.mp_optimize and loaded.mp_runtime == 300.0
+  assert loaded.mp_stall_timeout is None
+  assert loaded.mp_plan_candidates == 4 and loaded.mp_plan_epochs == 6
+
+
+def test_open_plan_motion_loop_cli_and_config_roundtrip():
+  a = main.parse_args([
+      "--mp-open-plans", "--mp-plan-candidates", "5",
+      "--mp-plan-epochs", "6", "--mp-plan-initial-runtime", "2.5",
+  ])
+  assert a.mp_open_plans
+  assert a.mp_plan_candidates == 5 and a.mp_plan_epochs == 6
+  assert a.mp_plan_initial_runtime == 2.5
+  cfg = RunConfig.from_namespace(a)
+  assert RunConfig.from_dict(cfg.to_dict()) == cfg
+
+
+def test_open_plan_loop_suspends_then_fairly_reopens(tmp_path, monkeypatch):
+  """Two failed small pulls must precede either plan's second, larger pull."""
+  import json
+  import subprocess
+  import plan_io
+  import solver
+
+  plan_a = [("pick", "a1", "obj_1", 0)]
+  plan_b = [("pick", "a2", "obj_1", 1)]
+  monkeypatch.setattr(main, "_milestone_candidate_session",
+                      lambda *_args, **_kwargs: iter((plan_a, plan_b)))
+  monkeypatch.setattr(solver, "hoist_releases", lambda *_args, **_kwargs: list(_args[2]))
+  monkeypatch.setattr(solver, "collect_plan_witnesses", lambda *_args, **_kwargs: {})
+  monkeypatch.setattr(plan_io, "require_complete_witnesses", lambda *_args, **_kwargs: None)
+  monkeypatch.setattr(plan_io, "witness_block", lambda *_args, **_kwargs: {})
+
+  def fake_save(path, _cfg, plan, witnesses=None):
+    with open(path, "w") as f:
+      json.dump({"config": {}, "plan": [list(a) for a in plan],
+                 "witnesses": witnesses}, f)
+
+  monkeypatch.setattr(main, "save_plan", fake_save)
+
+  calls = []
+
+  def fake_run(cmd, **_kwargs):
+    cmd = list(cmd)
+    calls.append(cmd)
+    mp_path = cmd[cmd.index("--mp-save") + 1]
+    if "--mp-export-save" in cmd:
+      export_path = cmd[cmd.index("--mp-export-save") + 1]
+      with open(export_path, "w") as f:
+        f.write("{}")
+    # candidate A's reopened pull succeeds; both initial pulls fail.
+    if len(calls) == 3:
+      with open(mp_path, "w") as f:
+        f.write("[]")
+    return subprocess.CompletedProcess(cmd, 0)
+
+  monkeypatch.setattr(subprocess, "run", fake_run)
+
+  class DummyConfig:
+    def getJointNames(self):
+      return []
+
+  class DummyIK:
+    C = DummyConfig()
+
+  cfg = RunConfig(
+      solve=True, motion_plan=True, milestones=True, real_ik=True,
+      wrench=False,
+      save=str(tmp_path / "selected-plan.json"),
+      mp_save=str(tmp_path / "selected-mp.json"),
+      mp_export_save=str(tmp_path / "selected-export.json"),
+      mp_open_plans=True, mp_plan_candidates=2, mp_plan_epochs=2,
+      mp_plan_initial_runtime=1.0, mp_runtime=2.0, mp_seed=17,
+      hoist_releases=False, view=False, quiet_rai=True,
+  )
+  result = main._run_open_plan_loop(cfg, object(), object(), ["a1", "a2"], DummyIK())
+  assert result["plan_id"]
+  assert len(calls) == 3
+  seeds = [int(c[c.index("--mp-seed") + 1]) for c in calls]
+  assert seeds == [17, 18, 100020]
+  runtimes = [float(c[c.index("--mp-runtime") + 1]) for c in calls]
+  assert runtimes == [1.0, 1.0, 2.0]
+  assert (tmp_path / "selected-plan.json").exists()
+  assert (tmp_path / "selected-mp.json").exists()
+  manifests = list(tmp_path.glob("selected-mp-open/*/manifest.json"))
+  assert len(manifests) == 1
+  manifest = json.loads(manifests[0].read_text())
+  assert manifest["status"] == "success" and manifest["selected_candidate"] == 1
+  assert [a["status"] for a in manifest["candidates"][0]["attempts"]] == [
+      "no_path", "success"]
+  assert [a["status"] for a in manifest["candidates"][1]["attempts"]] == ["no_path"]
 
 
 def test_motion_profile_is_reversible_by_explicit_cli():
@@ -240,7 +372,9 @@ def test_motion_profile_overrides_loaded_mp_defaults(tmp_path):
       "--config", str(tmp_path / "c.json"), "--motion-profile", "standard"])
   assert a.mp_collision_tolerance == 1e-4
   assert a.mp_robot_margin == 0.1 and a.mp_margin_ramp == 0.1
-  assert a.mp_runtime == 90.0 and not a.mp_optimize
+  assert a.mp_runtime == 300.0 and a.mp_optimize
+  assert a.mp_stall_timeout is None
+  assert a.mp_plan_candidates == 4 and a.mp_plan_epochs == 6
 
 
 def test_no_config_path_unchanged():

@@ -94,6 +94,7 @@ class RunConfig:
   fill_local_h: bool = False
   fill_exact: bool = False
   fill_skeleton_first: bool = False
+  milestone_boundaries: int = 1
   lazy_fills: bool = True
   open_witness: bool = False
   open_witness_epochs: int = 2
@@ -211,6 +212,10 @@ class RunConfig:
   mp_table_margin: float = 0.0
   mp_seed: Optional[int] = None
   mp_fake_clock: bool = False
+  mp_open_plans: bool = False
+  mp_plan_candidates: int = 4
+  mp_plan_epochs: int = 6
+  mp_plan_initial_runtime: float = 15.0
   mp_viser: bool = False
   mp_collision_view: bool = False
   mp_modes: bool = False

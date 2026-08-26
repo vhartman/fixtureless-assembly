@@ -393,7 +393,16 @@ class RobotIK:
       self.robot_base[r] = r + "_ur_base"              # UR base frame; parented to the table
       # a FLOATING EE has no arm at all: no base_link frame, no kinematic chain -> analytic
       # IK / reach bounds are meaningless for it (robot_arm=None disables every ssik path).
-      if (r + "_right_fr3v2_link0") in names or (r + "_left_fr3v2_link0") in names:
+      if (r + "_openarm_right_base_link") in names or (r + "_openarm_left_base_link") in names:
+        # OpenArm duo: per-SIDE calibrations (the two arms have different joint-sign
+        # conventions vs the ssik artifact); ur_base_link alias exists here too, so this
+        # branch MUST come before the generic UR check below.
+        self.robot_arm[r] = ("openarm_right" if (r + "_openarm_right_base_link") in names
+                             else "openarm_left")
+        self.base_link[r] = r + ("_openarm_right_base_link" if
+                                 (r + "_openarm_right_base_link") in names
+                                 else "_openarm_left_base_link")
+      elif (r + "_right_fr3v2_link0") in names or (r + "_left_fr3v2_link0") in names:
         # FR3 duo: the env's ur_base_link alias marks the arm, but there is NO ssik
         # calibration for franka yet -> robot_arm="fr3" keeps every analytic path disabled
         # while base_link still anchors the reach-sphere bound.
@@ -2182,6 +2191,7 @@ class RobotIK:
 
   def _ik_assemble(self, action, s0, s1, assembly, seed, bias_axes=None, backoff=0.0, warm=None):
     self._cur_action = action                             # for PEN_VIEW_ACTION debug
+    arm_seeds = {}                                        # per-arm ssik insertion seeds
     # solve for the added part's mate pose: the SEAM (`part`) must reach its mate pose
     # relative to the target subassembly. `part` may be a single cube OR the seam of a whole
     # held MODULE (a plate) -- in the latter case the module is rigid in the scene, so the
@@ -2255,7 +2265,6 @@ class RobotIK:
       if not self.braced_analytic and braced:
         arm_targets = {robot: arm_targets[robot]}          # ablation: mover-only reject, no proof
       reachable_proven = self.braced_analytic or not braced
-      arm_seeds = {}
       _empty_exact = _uncalibrated = False                # ana-refutation study trackers
       for rr, ee in arm_targets.items():
         if not self._analytic_reject_ok(rr):
@@ -2330,8 +2339,9 @@ class RobotIK:
       self._add_grasp_maintenance(komo, s0, assembly)     # braces pinned at their grasps
       feasible, witness = self._solve_ik(              # `warm` (e.g. the mated witness for a
           komo, restarts=0,                            # pre-insertion goto) warm-starts the solve
-          seeds=([warm] if warm is not None else None),  # so it settles in the SAME IK basin
-          C=C)
+          seeds=((([warm] if warm is not None else [])
+                  + list(arm_seeds.get(robot) or [])) or None),  # warm basin first, then the
+          C=C)                                       # analytic insertion seeds (calibrated arms)
       if feasible and witness is not None and self.mate_residual_reject is not None:
         _mr = self.mate_residual(C, witness, part_name, onto, rel_pos)
         if _mr > self.mate_residual_reject:
@@ -2614,6 +2624,13 @@ def cheap_feasible(action, s0, s1, assembly, checker):
   if action[0] in _GRASP_ACTIONS and not checker.pick_collision_free(
       s0, action[2], action[3], assembly, note=f"grasp candidate of {action}",
       robot=action[1]):
+    import os as _os
+    if _os.environ.get("MILESTONE_DEBUG"):
+      try:
+        pr = checker.penetrating_pairs(s0, assembly)
+        print(f"[cheap-debug] {action}: {pr[:4]}", flush=True)
+      except Exception as _e:
+        print(f"[cheap-debug] {action}: report failed {_e}", flush=True)
     return False
   if action[0] == "inhand_reorient":
     # v1 gate: the RESULT state (part held at its NEW grasp, everything else unchanged) must
@@ -6523,12 +6540,22 @@ class _IncrementalLazySearch:
     # run until a goal state is claimed (returns the Plan) or the frontier empties (None).
     import heapq
     import time
+    import os as _os
+    _dbg = _os.environ.get("MILESTONE_DEBUG")
+    _pops = 0
     while self.pq:
       entry = heapq.heappop(self.pq)
       _f, _h, g, _, s, prev, action = entry
       if s in self.claimed:
         self.alts.setdefault(s, []).append(entry)         # keep as an alternate route
         continue
+      if _dbg and _pops < 12:
+        try:
+          gate = self.cheap_gate(prev, action, s) if self.cheap_gate is not None else None
+        except Exception as _e:
+          gate = f"ERR {_e}"
+        print(f"[fill-debug] pop{_pops} act={action} gate={gate} h_env={_h:.2f}", flush=True)
+      _pops += 1
       if prev is not None:
         if prev not in self.claimed or (prev, action) in self.blacklist:
           continue                                        # stale: parent gone / edge deleted
@@ -6659,9 +6686,11 @@ def solve_assembly_problem_lazy(C, assembly, robots=None, max_nodes=200000, verb
 
   start = get_initial_state(C, assembly)
   if h_lab is not None and h_lab.value(start) == float("inf"):
-    if verbose:
+    if verbose or __import__("os").environ.get("MILESTONE_DEBUG"):
+      import collections
+      detail = getattr(h_lab, "last_infeasible_reason", None)
       print("[lazy] initial state provably cannot reach the goal (abstraction facts) -> "
-            "instance INFEASIBLE as configured.")
+            f"instance INFEASIBLE as configured. reason={detail}")
     return None
 
   engine = _IncrementalLazySearch(
@@ -6910,7 +6939,9 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
                   part_grasp_allow=None, brace_allow=None, deadline=None,
                   lazy_fill=False, cost_bound=None, forbid_assemble=None, settle_ref=None,
                   h_extra_shift=None, fill_h=None, exact_fill=False,
-                  skeleton_only=False, touch_all=None):
+                  skeleton_only=False, touch_all=None, excluded_end_states=None):
+  import os as _os
+  verbose = verbose or bool(_os.environ.get("MILESTONE_DEBUG"))
   # a small COMPLETE search that adds part `p` to the assembly `ideal` and leaves it SETTLED:
   # p mated, no loose part left in a gripper, and the assembly ending held by at most one
   # carrier OR resting on the table -- WHICHEVER the search finds. It forces neither a
@@ -6924,6 +6955,7 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
   # "loose held" and the goal FORCED a table set-down -- fine for the floating-EE checks,
   # IK-infeasible for real arms on the chair's back+posts module: every module fill died.
   relevant = set(ideal) | {p}
+  excluded_end_states = frozenset(excluded_end_states or ())
 
   # A1 INSTRUMENTATION: per-fill bind deltas -- which fill burns the bind wall time, on what.
   _fp0 = None
@@ -6978,7 +7010,8 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
     # p joined, nothing loose left in hand, and the settling component down to <=1 holder
     # (a clean rest point for the next step -- prevents inserter grasps / braces piling up).
     loose, holders = _loose_and_holders(s)
-    return _part_mated(s, p) and loose == 0 and holders <= 1
+    return (_part_mated(s, p) and loose == 0 and holders <= 1
+            and s not in excluded_end_states)
 
   def h_fn(s):
     # LOCAL lower bound with a MONOTONE gradient along the intended fill (found via the
@@ -7446,7 +7479,8 @@ def _settle_to_goal(start, assembly, robots, checker, grasp_table, robot_ik, wei
 def _add_parts(start, ps, ideal, assembly, robots, checker, grasp_table, robot_ik,
                weight, max_nodes, gripper_kind=None, handovers=True,
                allow_place=True, bracing=False, deadline=None,
-               lazy_fill=False, cost_bound=None, touch_all=None):
+               lazy_fill=False, cost_bound=None, touch_all=None,
+               excluded_end_states=None):
   # WIDTH-k milestone fill (adaptive-width completeness net): add ALL parts in `ps` in ONE
   # joint mini-search -- for plans that must INTERLEAVE several parts' glue, which the
   # width-1 fill cannot express (the milestone commitment's documented gap). Invoked with
@@ -7455,11 +7489,13 @@ def _add_parts(start, ps, ideal, assembly, robots, checker, grasp_table, robot_i
   # is recovered in the limit. No hint phases (hints are per-part); one full phase.
   ps = tuple(ps)
   relevant = set(ideal) | set(ps)
+  excluded_end_states = frozenset(excluded_end_states or ())
 
   def goal_fn(s):
     return (all(_part_mated(s, p) for p in ps)
             and _num_loose_held(s, assembly) == 0
-            and _assembly_holders(s, assembly) <= 1)
+            and _assembly_holders(s, assembly) <= 1
+            and s not in excluded_end_states)
 
   def h_fn(s):
     left = sum(0 if _part_mated(s, p) else 2 for p in ps)
@@ -7919,17 +7955,18 @@ def _add_one_part_declutter(start, p, ideal, assembly, robots, checker, grasp_ta
       print(f"    [declutter] {p}: blocked by {sorted(new)} -> relocating and re-planning")
 
 
-def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, robot_ik=None,
-                                      weight=5.0, max_nodes=20000, wrench=False,
-                                      wrench_aware_h=True,
-                                      handovers=True, allow_place=True, bracing=False,
-                                      max_repairs=100, geo_facts=False,
-                                      sig_collapsed_h=False, deadline=None,
-                                      fill_window=2, lazy_fills=True,
-                                      cost_bound=None, milestone_oracle="global",
-                                      fill_local_h=False, fill_exact=False,
-                                      fill_skeleton_first=False,
-                                      fill_scope_widening=False):
+def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, robot_ik=None,
+                                     weight=5.0, max_nodes=20000, wrench=False,
+                                     wrench_aware_h=True,
+                                     handovers=True, allow_place=True, bracing=False,
+                                     max_repairs=100, geo_facts=False,
+                                     sig_collapsed_h=False, deadline=None,
+                                     fill_window=2, lazy_fills=True,
+                                     cost_bound=None, milestone_oracle="global",
+                                     fill_local_h=False, fill_exact=False,
+                                     fill_skeleton_first=False,
+                                     fill_scope_widening=False,
+                                     milestone_boundaries=1):
   """MILESTONE (Dogar-style, abstraction-guided) planner. Two levels:
 
     LEVEL 1: the assembly SEQUENCE. The labeled abstraction's backward Dijkstra (the same
@@ -7940,9 +7977,10 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
     LEVEL 2: the manipulation glue. Each chosen milestone is filled in by _add_one_part's
       small complete search (pick/handover/brace/mate/set-down), from the previous
       milestone's settled state.
-    REPAIR: if a milestone's fill-in fails, that (assembled-set, part) transition is
-      BLACKLISTED and the next-best candidate is tried -- repair happens at milestone
-      granularity (dozens of nodes) instead of the exact search's per-edge flooding.
+    REPAIR: a fill exhaustion blacklists the exact (parent-state, assembled-set, part)
+      transition. If its suffix fails, only that settled endpoint is rejected and the fill
+      lazily generates another, up to ``milestone_boundaries``. Repair therefore happens at
+      milestone granularity without the former claim-once boundary assumption.
 
   ``milestone_oracle='structural'`` is a controlled ablation: it skips the global backward
   signature database and orders dependency-valid milestones canonically. The fill heuristic
@@ -7950,14 +7988,17 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
   with ``fill_local_h=True``. All other machinery is identical.
 
   Separate from the exact search by design (shares only _add_one_part + the heuristic
-  class). Complete up to milestone commitment (like the optimistic solver, an interleaving
-  that must overlap two parts' glue is out of scope); vs the optimistic solver it SEARCHES
-  the part order (wrench-informed) instead of committing to assembly_order, and supports
-  bracing in the fill-in. Returns the action list, or None (no silent exact fallback)."""
+  class). Bounded settled-boundary commitment remains (an interleaving wider than
+  ``fill_window`` is out of scope); vs the optimistic solver it SEARCHES the part order
+  instead of committing to assembly_order, and supports bracing in the fill-in. Returns the
+  action list, or None (no silent exact fallback)."""
   import time
 
   if milestone_oracle not in ("global", "chain", "structural"):
     raise ValueError("milestone_oracle must be 'global', 'chain', or 'structural'")
+  if int(milestone_boundaries) < 1:
+    raise ValueError("milestone_boundaries must be >= 1")
+  milestone_boundaries = int(milestone_boundaries)
 
   t0 = time.perf_counter()
   if robots is None:
@@ -8103,7 +8144,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
             braces.add((bp, rg))
     return (gqs or None), unbraced_ok, (braces or None)
 
-  def fill(s, q, ideal, fb=None, forbid=None, settle=None):
+  def fill(s, q, ideal, fb=None, forbid=None, settle=None, excluded_end_states=None):
     allow, unbraced_ok, ballow = hints(_subasm_key(ideal), q)
     # h-shift for NON-module fills: the settled {ideal+q} abstraction value (see
     # _add_one_part.h_fn). Module fills (settle is not None) keep the epsilon join.
@@ -8141,7 +8182,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
           h_extra_shift=shift,
           fill_h=(lpdb.value if lpdb is not None else None),
           exact_fill=fill_exact, skeleton_only=True,
-          touch_all=scope_passes[0])
+          touch_all=scope_passes[0], excluded_end_states=excluded_end_states)
       if sub is not None:
         return sub, s2
     for touch_all in scope_passes:
@@ -8161,7 +8202,8 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
             cost_bound=fb, forbid_assemble=forbid, settle_ref=settle,
             h_extra_shift=shift,
             fill_h=(lpdb.value if lpdb is not None else None),
-            exact_fill=fill_exact, touch_all=touch_all)
+            exact_fill=fill_exact, touch_all=touch_all,
+            excluded_end_states=excluded_end_states)
         if sub is not None:
           return sub, s2
     return None, None
@@ -8183,33 +8225,74 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
   modules = {r: frozenset(p for p in objs if r in _mate_closure(assembly, p)) | {r}
              for r in connect}
 
-  def fill_module(s, root, ideal, fb=None):
+  def fill_module(s, root, ideal, fb=None, excluded_end_states=None):
     seq = sorted(modules[root] - {root},
                  key=lambda m: (len(_mate_closure(assembly, m)), _part_index(m)))
-    parts_plan, s_cur, built = [], s, {root}
-    for m in seq:
-      # settle=root: the module may end each sub-fill HELD by one carrier (built in the
-      # air); the base-centric default would count the held module as loose and force a
-      # table set-down -- IK-infeasible for real arms on e.g. the chair's back+posts module.
-      sub, s_cur = fill(s_cur, m, built, fb=fb, forbid={root}, settle=root)
-      if sub is None:
-        return None, None
-      parts_plan.extend(sub)
-      if fb is not None:
-        fb -= sum(action_cost(a) for a in sub)            # global bound: spend as we go
-      built.add(m)
-    sub, s_end = fill(s_cur, root, set(ideal) | set(modules[root]), fb=fb)   # the JOIN
-    if sub is None:
+    # A detached module used to commit to ONE endpoint after every internal part. If a later
+    # module part or the final join failed, the whole outer transition was rejected even when
+    # another holder/rest-face endpoint existed. Recurse over the fixed dependency-valid module
+    # order and lazily ask each fill for another exact settled endpoint only after its suffix
+    # fails. This is the same boundary policy as the outer checkpoint stack, not a Chair patch.
+    def rec(i, s_cur, built, budget):
+      if i == len(seq):
+        return fill(s_cur, root, set(ideal) | set(modules[root]), fb=budget,
+                    excluded_end_states=excluded_end_states)       # final module JOIN
+      m = seq[i]
+      rejected = set()
+      for k in range(milestone_boundaries):
+        # settle=root: the module may end each sub-fill HELD by one carrier (built in the
+        # air); the base-centric default would count it as loose and force a table set-down.
+        sub, s_next = fill(s_cur, m, built, fb=budget, forbid={root}, settle=root,
+                           excluded_end_states=rejected)
+        if sub is None:
+          return None, None
+        next_budget = (None if budget is None else
+                       budget - sum(action_cost(a) for a in sub))
+        tail, s_end = rec(i + 1, s_next, set(built) | {m}, next_budget)
+        if tail is not None:
+          return sub + tail, s_end
+        rejected.add(s_next)
+        if verbose:
+          print(f"[boundaries module {root}/{m}] suffix rejected endpoint "
+                f"{k + 1}/{milestone_boundaries}; requesting another", flush=True)
       return None, None
-    return parts_plan + sub, s_end
 
-  # chronological BACKJUMPING over milestones: each stack entry is a settled checkpoint
-  # (state, assembled set, plan length so far, and the (parent_key, part) decision that led
-  # here). A node with no workable candidate pops -- blacklisting the decision that led to it
-  # -- and the search reroutes from the parent.
+    return rec(0, s, {root}, fb)
+
+  # Chronological BACKJUMPING over milestones. ``via`` is
+  # ((exact parent State, parent_ideal_key, part-or-window), exact settled endpoint). A suffix
+  # failure rejects only that concrete endpoint; the parent transition stays open until K
+  # distinct endpoints fail. The parent State is essential: the same next part may fail from
+  # boundary A and succeed from boundary B.
+  # This is lazy K-boundary retention: ordinary successful runs still pay for one fill.
   stack = [(get_initial_state(C, assembly), frozenset({assembly.base}), 0, None)]
-  blacklist = set()                                       # (ideal_key, part) fill-ins that failed
+  blacklist = set()                                       # transitions exhausted in every endpoint
+  boundary_rejects = {}                                   # transition -> {settled State endpoints}
   repairs = 0
+
+  def rejected_for(decision):
+    return boundary_rejects.setdefault(decision, set())
+
+  def decision_for(state, ideal_key, choice):
+    return (state, ideal_key, choice)
+
+  def decision_label(decision):
+    return decision[1:]
+
+  def reject_via(via, reason):
+    if via is None:
+      return
+    decision, endpoint = via
+    rejected = rejected_for(decision)
+    rejected.add(endpoint)
+    exhausted = len(rejected) >= milestone_boundaries
+    if exhausted:
+      blacklist.add(decision)
+    if verbose:
+      print(f"[boundaries] {reason}: rejected endpoint {len(rejected)}/"
+            f"{milestone_boundaries} for {decision_label(decision)}"
+            + (" -> transition exhausted" if exhausted else " -> transition remains open"),
+            flush=True)
   while stack:
     if deadline is not None and time.perf_counter() > deadline:
       if verbose:
@@ -8233,7 +8316,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
             print(f"[milestones] final settle-to-table FAILED -> backjump", flush=True)
           _s, _i, _p, via = stack.pop()
           if via is not None:
-            blacklist.add(via)
+            reject_via(via, "final settle failure")
             repairs += 1
           continue
         final = final + sub
@@ -8241,10 +8324,21 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
       if verbose:
         print(f"[milestones] complete: {len(final)} actions in "
               f"{time.perf_counter() - t0:.2f}s ({repairs} repairs)")
-      return final
+      # Stopping iteration here is the historical first-plan behavior. Resuming means an
+      # EXTERNAL consumer suspended this complete realization (normally after finite MP
+      # failure): keep all search/IK/PDB state, exclude this incumbent's final checkpoint for
+      # the current enumeration, and continue. The outer loop retains `final` and may reopen
+      # it later with greater MP effort; this rejection is not an infeasibility certificate.
+      yield final
+      _s, _i, _p, via = stack.pop()
+      if via is not None:
+        reject_via(via, "external complete-plan suspension")
+        repairs += 1
+      continue
     ideal_key = _subasm_key(ideal)
     cands = [q for q in objs - ideal
-             if (ideal_key, q) not in blacklist
+             if decision_for(s, ideal_key, q) not in blacklist
+             and len(rejected_for(decision_for(s, ideal_key, q))) < milestone_boundaries
              and ((q in connect and (assembly.connect_requires.get(q, set())
                                      - modules[q]) <= ideal)
                   if q in connect
@@ -8255,27 +8349,37 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
     if cost_bound is not None:
       fb = cost_bound - sum(action_cost(a) for a in plan[:plen])
       if fb <= 0:
-        stack.pop()                                       # prefix already >= bound
+        _s, _i, _p, via = stack.pop()                    # prefix already >= bound
+        if via is not None:
+          reject_via(via, "incumbent cost bound")
+          repairs += 1
         continue
+    import os as _os
+    if _os.environ.get("MILESTONE_DEBUG"):
+      print(f"[mile-debug] ideal={sorted(ideal)} cands={cands} "
+            f"connect={sorted(connect)} modules_keys={sorted(modules)}", flush=True)
     for q in cands:
       tq = time.perf_counter()
+      decision = decision_for(s, ideal_key, q)
+      excluded = rejected_for(decision)
       if q in connect:
-        sub, s2 = fill_module(s, q, ideal, fb=fb)
+        sub, s2 = fill_module(s, q, ideal, fb=fb, excluded_end_states=excluded)
       else:
-        sub, s2 = fill(s, q, ideal, fb=fb)
+        sub, s2 = fill(s, q, ideal, fb=fb, excluded_end_states=excluded)
       grown = (ideal | modules[q]) if q in connect else (ideal | {q})
       if sub is not None:
         del plan[plen:]
         plan.extend(sub)
-        stack.append((s2, grown, len(plan), (ideal_key, q)))
+        stack.append((s2, grown, len(plan), (decision, s2)))
         progressed = True
         if verbose:
           what = (f"module {q} ({len(modules[q])} parts, incl. join)"
                   if q in connect else q)
           print(f"[milestones] added {what} in {len(sub)} actions "
-                f"({time.perf_counter() - tq:.1f}s, {len(plan)} total)")
+                f"({time.perf_counter() - tq:.1f}s, {len(plan)} total; boundary "
+                f"{len(excluded) + 1}/{milestone_boundaries})")
         break
-      blacklist.add((ideal_key, q))
+      blacklist.add(decision)
       repairs += 1
       _capture_fill_failure(s, q, ideal, f"repair{repairs}")
       if verbose:
@@ -8302,7 +8406,9 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
         uniq, seen_sets = [], set()
         for t in wins:                                    # one canonical ORDER per part-set
           fs = frozenset(t)
-          if fs not in seen_sets and (ideal_key, tuple(sorted(t))) not in blacklist:
+          decision = decision_for(s, ideal_key, tuple(sorted(t)))
+          if (fs not in seen_sets and decision not in blacklist
+              and len(rejected_for(decision)) < milestone_boundaries):
             seen_sets.add(fs)
             uniq.append(t)
         uniq.sort(key=lambda t: (oracle(set(ideal) | set(t[:-1]), t[-1]),
@@ -8313,6 +8419,8 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
           uniq = uniq[:100]
         for t in uniq:
           tq = time.perf_counter()
+          decision = decision_for(s, ideal_key, tuple(sorted(t)))
+          excluded = rejected_for(decision)
           sub, s2 = None, None
           for touch_all in _fill_scope_passes(_FILL_TOUCH_ALL, fill_scope_widening):
             if touch_all and not _FILL_TOUCH_ALL and verbose:
@@ -8323,19 +8431,21 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
                 robot_ik, weight, max_nodes, gripper_kind=gk,
                 handovers=handovers, allow_place=allow_place,
                 bracing=bracing, deadline=deadline,
-                lazy_fill=lazy_fills, cost_bound=fb, touch_all=touch_all)
+                lazy_fill=lazy_fills, cost_bound=fb, touch_all=touch_all,
+                excluded_end_states=excluded)
             if sub is not None:
               break
           if sub is not None:
             del plan[plen:]
             plan.extend(sub)
-            stack.append((s2, ideal | set(t), len(plan), (ideal_key, tuple(sorted(t)))))
+            stack.append((s2, ideal | set(t), len(plan), (decision, s2)))
             progressed = True
             if verbose:
               print(f"[milestones] added WINDOW {t} in {len(sub)} actions "
-                    f"({time.perf_counter() - tq:.1f}s, {len(plan)} total)")
+                    f"({time.perf_counter() - tq:.1f}s, {len(plan)} total; boundary "
+                    f"{len(excluded) + 1}/{milestone_boundaries})")
             break
-          blacklist.add((ideal_key, tuple(sorted(t))))
+          blacklist.add(decision)
           repairs += 1
           if verbose:
             print(f"[milestones] window {t} failed ({time.perf_counter() - tq:.1f}s) "
@@ -8347,10 +8457,10 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
     if not progressed:
       _s, _i, _p, via = stack.pop()                       # dead end: backjump + blame the
       if via is not None:                                 # decision that created this node
-        blacklist.add(via)
+        reject_via(via, f"dead end at {sorted(_i)}")
         repairs += 1
         if verbose:
-          print(f"[milestones] dead end at {sorted(_i)} -> backjump, blacklist {via} "
+          print(f"[milestones] dead end at {sorted(_i)} -> backjump "
                 f"({repairs} repairs)")
         if repairs > max_repairs:
           if verbose:
@@ -8360,6 +8470,32 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
     print(f"[milestones] search space exhausted with no plan "
           f"in {time.perf_counter() - t0:.2f}s ({repairs} repairs)")
   return None
+
+
+def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, robot_ik=None,
+                                      weight=5.0, max_nodes=20000, wrench=False,
+                                      wrench_aware_h=True,
+                                      handovers=True, allow_place=True, bracing=False,
+                                      max_repairs=100, geo_facts=False,
+                                      sig_collapsed_h=False, deadline=None,
+                                      fill_window=2, lazy_fills=True,
+                                      cost_bound=None, milestone_oracle="global",
+                                      fill_local_h=False, fill_exact=False,
+                                      fill_skeleton_first=False,
+                                      fill_scope_widening=False,
+                                      milestone_boundaries=1):
+  """Compatibility wrapper returning only the resumable session's first candidate."""
+  return next(iter_assembly_problem_milestones(
+      C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik,
+      weight=weight, max_nodes=max_nodes, wrench=wrench, wrench_aware_h=wrench_aware_h,
+      handovers=handovers, allow_place=allow_place, bracing=bracing,
+      max_repairs=max_repairs, geo_facts=geo_facts, sig_collapsed_h=sig_collapsed_h,
+      deadline=deadline, fill_window=fill_window, lazy_fills=lazy_fills,
+      cost_bound=cost_bound, milestone_oracle=milestone_oracle,
+      fill_local_h=fill_local_h, fill_exact=fill_exact,
+      fill_skeleton_first=fill_skeleton_first,
+      fill_scope_widening=fill_scope_widening,
+      milestone_boundaries=milestone_boundaries), None)
 
 
 def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_budget=300.0,
@@ -8372,7 +8508,8 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
                                               milestone_oracle="global",
                                               fill_local_h=False, fill_exact=False,
                                               fill_skeleton_first=False,
-                                              fill_scope_widening=False):
+                                              fill_scope_widening=False,
+                                              milestone_boundaries=1):
   """THE SINGLE RECIPE (--milestones-anytime SEC): adaptive-width milestones under a hard
   deadline, then spend whatever budget remains on principled add-ons -- one algorithm plus
   its own refinements, not a solver lottery:
@@ -8403,7 +8540,8 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
       sig_collapsed_h=sig_collapsed_h, deadline=t_mile, fill_window=fill_window,
       milestone_oracle=milestone_oracle, fill_local_h=fill_local_h,
       fill_exact=fill_exact, fill_skeleton_first=fill_skeleton_first,
-      fill_scope_widening=fill_scope_widening)
+      fill_scope_widening=fill_scope_widening,
+      milestone_boundaries=milestone_boundaries)
   remaining = t_end - time.perf_counter()
   if inc is None:
     if remaining > 5.0:

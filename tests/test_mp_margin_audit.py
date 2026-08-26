@@ -76,6 +76,24 @@ class _Env:
     return self.base_ok
 
 
+class _Goal:
+  def sample(self, _mode):
+    return np.ones(2)
+
+
+class _MovingConfig(_Config):
+  def setJointState(self, q):
+    super().setJointState(q)
+    self.frames["a1_ee"]._pos = np.array([self.q[0], 0.0, 0.0])
+    self.frames["a2_ee"]._pos = np.array([self.q[1], 0.0, 0.0])
+
+
+class _CoupledTask:
+  name = "coupled_motion"
+  robots = ["a1", "a2"]
+  goal = _Goal()
+
+
 def test_margin_wrapper_records_and_prints_concrete_gate_reason(capsys):
   env = _Env()
   MP._install_robot_margin(
@@ -99,6 +117,27 @@ def test_margin_wrapper_records_and_prints_concrete_gate_reason(capsys):
   assert "gate=robot-full-margin" in out
   assert "a1_link~a2_link" in out
   assert "d=20.00mm required=100.00mm" in out
+
+
+def test_participant_margin_ramp_relaxes_at_both_segment_anchors():
+  env = _Env()
+  env.C = _MovingConfig()
+  env.task = _CoupledTask()
+  env.tasks = [env.task]
+  env.robot_idx = {"a1": np.array([0]), "a2": np.array([1])}
+  env.C.collisions = [("a1_link", "a2_link", 0.02)]
+  mode = _Mode()
+  mode.task_ids = [0, 0]
+  MP._install_robot_margin(
+      env, 0.1, ["a1", "a2"], {"a1": "a1_ee", "a2": "a2_ee"}, ramp=0.1)
+
+  # Intended proximity is admissible at both keyframes, but not in the transit interior.
+  env.C.setJointState([0.0, 0.0])
+  assert env.is_collision_free_np(None, mode)
+  env.C.setJointState([0.5, 0.5])
+  assert not env.is_collision_free_np(None, mode)
+  env.C.setJointState([1.0, 1.0])
+  assert env.is_collision_free_np(None, mode)
 
 
 def test_margin_audit_distinguishes_base_rejection_from_our_gate(capsys):

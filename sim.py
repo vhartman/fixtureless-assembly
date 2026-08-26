@@ -15,11 +15,10 @@ are representable (pybullet's maxForce was isotropic-force-only). The model is b
 MJCF XML STRING (schema-stable across MuJoCo versions; mjSpec would also do).
 
 DESIGN DECISIONS (modeling side):
-  * KINEMATIC ROBOTS / DYNAMIC PARTS. Each gripper is a MOCAP body dragged along the planned
-    EE trajectory (weld from mocap to a small gripper body); parts are free bodies. The LP's
-    claims are about PART statics under imposed contacts/loads -- the robot is a boundary
-    condition. v2 (real arms): UR10 MJCF + joint position actuators along mr_bench
-    trajectories (TODO).
+  * ACTUATED REAL ARMS / DYNAMIC PARTS (v2, primary). The RAI arm model is exported to MuJoCo,
+    joint position actuators track the persisted mr_bench trajectory, cross-arm contacts are
+    physical, and parts are free bodies. The legacy v1 executor instead drags mocap grippers
+    between symbolic keyframes and remains only for old artifact forensics.
   * MATE == WELD-ON-SEAT (assumption, validated in REAL). Proper pin/hole contact at real
     clearances is hostile to any rigid-body engine (thin features, solver softness, timestep
     blow-up exactly in the phase of interest) -- in BOTH pybullet and mujoco. So: the seating
@@ -38,12 +37,13 @@ DESIGN DECISIONS (modeling side):
     solver, seeded => deterministic (the PYTHONHASHSEED discipline, for physics).
 
 TRAJECTORY SOURCES (transfer side):
-  v1 (implemented): STATE KEYFRAMES. Plans carry `.states` (per-step State.poses); the EE pose
+  v1 (legacy): STATE KEYFRAMES. Plans carry `.states` (per-step State.poses); the EE pose
      for a held part is part_pose (+) grasp_pose(assembly, part, gid). Quasi-static mocap
      interpolation + a GUARDED INSERT for assemble (funnel-mouth approach along the mate axis,
      slow contact segment; the press force emerges from dragging the mocap into contact).
-  v2 (TODO): mr_bench BiRRT joint trajectories (real arms, depgraph order) -- full-pipeline
-     validation; map mode-transition attach events onto the same weld managers.
+  v2 (primary): persisted mr_bench BiRRT joint trajectories. Mode-transition task frames drive
+     the same grasp/release/mate managers; strict preflight and phase scheduling use the motion
+     planner's collision predicate before actuated execution.
 
 USAGE (intended):
     from sim import SimExecutor
@@ -58,9 +58,9 @@ core validation result in miniature. All executor bugs en route were found by tr
 by guess: symbolic State.poses (-> _state_part_poses everywhere), carry lift, WORLD-frame
 mate axis after rotated places, slerp rotation-rate cap, vertical DEPART before reorienting,
 and datum welds (weld at the manual's exact relpose after the seat check -- funnel
-semantics; welding at the ACHIEVED pose accumulated 9.7deg over 3 mates). Remaining stubs:
-real finger-contact two-finger (breakaway-weld stand-in for now); v2 mr_bench joint
-trajectories; start-perturbation trials; --sim-validate flag in main.py.
+semantics; welding at the ACHIEVED pose accumulated 9.7deg over 3 mates). Remaining modeling
+work: calibrated real finger-contact or a validated breakaway-weld surrogate, directional grasp
+cap calibration, finite mate-strength policy, and systematic perturbation trials.
 Recordings: sim_recordings/*.npz -- replay with `python3 sim.py replay <file> [speed]`.
 
 V2 STATUS (2026-07-24, later same day): execute_motion_plan VERIFIED end-to-end WITH the
@@ -325,14 +325,17 @@ def _geom_xml(spec, mu):
   raise ValueError(f"unknown shape kind {kind}")
 
 
-def _save_recording(path, scene, rec, report):
+def _save_recording(path, scene, rec, report, metadata=None):
   import json
   np.savez_compressed(
       path, xml=scene.xml, qpos=np.asarray(rec["qpos"]),
       mpos=np.asarray(rec["mpos"]), mquat=np.asarray(rec["mquat"]),
       forces=np.asarray(rec["forces"]), robots=np.array(scene.robots),
       parts=np.array(scene.assembly.objects), marks=json.dumps(rec["marks"]),
-      results=json.dumps([repr(r) for r in report.results]))
+      results=json.dumps([repr(r) for r in report.results]),
+      success=np.asarray(bool(report.success)),
+      final_pose_err=json.dumps(report.final_pose_err or {}),
+      metadata=json.dumps(metadata or {}, sort_keys=True))
   print(f"[sim] recording ({len(rec['qpos'])} frames) -> {path}")
 
 
@@ -2423,6 +2426,7 @@ class _SkillServo:
 
 def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kinds=None,
                         record=None, verbose=True, gui=False, visual=True,
+                        record_metadata=None,
                         rate_boost=False,
                         corridor=False, corridor_ds=1.0, corridor_ds_lead=0.25,
                         corridor_lead_max=4.0, corridor_verify=0, corridor_refine=0,
@@ -2980,6 +2984,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             _conf(fq), mode, collision_tolerance=_ptol))
         if ok:
           return True, None
+        rejection = (problem.last_margin_rejection()
+                     if callable(getattr(problem, "last_margin_rejection", None)) else None)
         try:
           pen = float(problem.C.getCollisionsTotalPenetration())
           pairs = sorted(
@@ -2988,7 +2994,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
               key=lambda x: x[2])[:5]
         except Exception:
           pen, pairs = float("nan"), []
-        return False, {"penetration": pen, "pairs": pairs}
+        return False, {"penetration": pen, "pairs": pairs, "rejection": rejection}
 
       _limits = getattr(problem, "limits", None)
       if _limits is None:
@@ -3009,15 +3015,25 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
               f"violation(s): {'; '.join(rows)}. Spline/corridor construction was not "
               f"started; regenerate the motion path.")
         detail = _audit.get("detail") or {}
+        rejection = detail.get("rejection") or {}
         pairs = detail.get("pairs") or []
         pair_msg = (", ".join(f"{a}~{b} {-d*1000:.2f}mm" for a, b, d in pairs)
                     if pairs else "no concrete penetrating pair reported")
+        if rejection.get("layer") == "gate":
+          reason = rejection.get("reason") or {}
+          why = (f"planning gate {reason.get('gate', 'unknown')} rejected "
+                 f"{reason.get('frames', ('?', '?'))[0]}~"
+                 f"{reason.get('frames', ('?', '?'))[1]}: observed "
+                 f"{float(reason.get('observed', float('nan')))*1000:.3f}mm, required "
+                 f"{float(reason.get('required', float('nan')))*1000:.3f}mm")
+        else:
+          why = (f"total penetration {detail.get('penetration', float('nan'))*1000:.3f}mm "
+                 f"exceeds {_ptol*1000:.3f}mm; {pair_msg}")
         raise PathPreflightError(
-            f"[sim/mp] strict base-path preflight FAILED at {_where}: total penetration "
-            f"{detail.get('penetration', float('nan'))*1000:.3f}mm exceeds "
-            f"{_ptol*1000:.3f}mm; {pair_msg}. Checked {_audit['samples']} sample(s) at "
-            f"{_pres:g}rad resolution. Spline/corridor construction was not started; "
-            f"re-plan this edge instead of retiming or relaxing it.")
+            f"[sim/mp] strict base-path preflight FAILED at {_where}: {why}. Checked "
+            f"{_audit['samples']} sample(s) at {_pres:g}rad resolution. Spline/corridor "
+            f"construction was not started; re-plan this edge instead of retiming or "
+            f"relaxing it.")
       print(f"[sim/mp] strict base-path preflight: {_audit['samples']} sample(s) at "
             f"{_pres:g}rad resolution, collision tolerance {_ptol:g}, joint limits OK.")
 
@@ -4776,7 +4792,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                     for p, (f, t) in sorted(scene._mate_max.items()))
     print(f"[sim/mate] per-mate max weld load over the run: {_mm}")
   if rec is not None:
-    _save_recording(record, scene, rec, report)
+    _save_recording(record, scene, rec, report, metadata=record_metadata)
   return report
 
 
@@ -4981,6 +4997,10 @@ _STANDARD_SIM_PROFILE = {
     "phase_intent": False,
     "c2_spline": False,
     "limit_rate": False,
+    # A paper reproduction consumes a persisted path and returns a failing process status for
+    # any physical failure. Historical ad-hoc runs retain their permissive defaults.
+    "require_mp_path": True,
+    "require_success": True,
 }
 
 _SIM_PROFILES = {"standard": dict(_STANDARD_SIM_PROFILE)}
@@ -5023,12 +5043,68 @@ def _states_from_plan(cfg, C, asm, robots, plan):
   return states
 
 
+def _restore_saved_wrench_config(cfg):
+  """Restore the successor/physics wrench model before replaying a saved plan.
+
+  ``sim.py`` historically imported ``wrench.PARAMS`` at module defaults.  A plan carrying a
+  non-default grasp model, insertion load, gravity policy, or calibrated cap was therefore
+  re-derived and executed under different mechanics (car-mini persisted T_close=0.5 Nm while
+  MuJoCo still broke it at the 0.4 Nm default).  Keep this small mirror next to the replay call;
+  search-only printing remains in main.py.
+  """
+  import wrench as W
+  W.PARAMS["grasp_model"] = _saved(cfg, "grasp_model")
+  W.PARAMS["vacuum_engage_force"] = float(_saved(cfg, "vacuum_engage_force") or 0.0)
+  W.PARAMS["vacuum_engage_friction"] = float(
+      _saved(cfg, "vacuum_engage_friction") or 0.0)
+  if _saved(cfg, "table_mu") is not None:
+    W.PARAMS["table_model"] = "friction"
+    W.PARAMS["table_mu"] = float(_saved(cfg, "table_mu"))
+  for field, kind in (("vacuum_scale", "vacuum"),
+                      ("two_finger_scale", "two_finger")):
+    scale = _saved(cfg, field)
+    if scale is None:
+      continue
+    for model in W.PARAMS["grasp"].values():
+      caps = model.get(kind)
+      if caps:
+        for name in caps:
+          if name != "mu":
+            caps[name] *= float(scale)
+  close = _saved(cfg, "tf_close_torque")
+  if close is not None:
+    W.PARAMS["grasp"]["asymmetric"]["two_finger"]["T_close"] = float(close)
+  compliance = _saved(cfg, "grasp_compliance")
+  if compliance is not None:
+    W.PARAMS["grasp_compliance"] = {
+        "two_finger": 1.0, "vacuum": float(compliance)}
+  W.PARAMS["check_inserter"] = _saved(cfg, "inserter_check")
+  W.PARAMS["insert_force"]["_default"] = float(_saved(cfg, "insert_force") or 0.0)
+  W.PARAMS["curved_grasp_torque_scale"] = _saved(cfg, "curved_torque_scale")
+  noise = _saved(cfg, "insertion_noise")
+  W.PARAMS["insertion_uncertainty"] = (
+      None if noise is None else {
+          "lateral": float(noise), "offset": _saved(cfg, "insertion_offset")})
+  W.PARAMS["robust_mode"] = _saved(cfg, "robust_mode")
+  W.PARAMS["ignore_gravity"] = bool(_saved(cfg, "ignore_gravity"))
+
+  print(f"[sim] restored saved wrench model: {_saved(cfg, 'grasp_model')}, "
+        f"two-finger T_close={W.PARAMS['grasp']['asymmetric']['two_finger']['T_close']:g}Nm, "
+        f"insert-force={W.PARAMS['insert_force']['_default']:g}N, "
+        f"ignore-gravity={bool(W.PARAMS['ignore_gravity'])}.")
+
+
 def _cli_run(a):
   global JOINT_RATE, ARM_ARM_CONTACTS
   if getattr(a, "sim_profile", None):
     print("[profile] sim 'standard' resolved: saved real-arm path, actuated skill servo, "
           "collision-audited phase schedule + smoothing/batching, strict preflight, and "
           "0.6 normalized wrench guard. Explicit individual flags remain authoritative.")
+  if a.require_mp_path and not a.mp_path:
+    raise SystemExit(
+        "[sim] --require-mp-path: this reproduction profile will not run a fresh stochastic "
+        "motion planner. Supply --mp-path MP.json, or explicitly pass --no-require-mp-path "
+        "for an exploratory run.")
   if a.phase_schedule and a.corridor_online:
     raise SystemExit("[sim] --phase-schedule and --corridor-online are mutually exclusive")
   if a.phase_servo_time < 0.0:
@@ -5078,6 +5154,7 @@ def _cli_run(a):
   cfg, plan = read_plan(a.path)
   C, asm = R.build_scene(cfg)                               # exact reconstruction (shared)
   robots = A.get_robots(C)
+  _restore_saved_wrench_config(cfg)                         # before successor replay + physics
   # debug knob: shrink arm collision geometry BEFORE witnesses/problem/sim so IK, the
   # collision oracle and the MuJoCo capsules stay mutually consistent. 1.0 = no-op.
   scale_arm_collision_shapes(C, robots, getattr(a, "coll_scale", 1.0))
@@ -5114,9 +5191,9 @@ def _cli_run(a):
 
   if a.v2:
     if cfg.get("floating_ee"):
-      print("[sim] --v2 needs a REAL-ARM plan: save from a run WITHOUT --floating-ee (and "
-            "with --real-ik). This plan is floating-EE.")
-      return
+      raise SystemExit(
+          "[sim] --v2 needs a REAL-ARM plan: save from a run WITHOUT --floating-ee (and "
+          "with --real-ik). This plan is floating-EE.")
     from solver import RobotIK, optimize_witnesses
     import mp_export as MP
     gk = A.wrench_kind_arg(C, robots) if cfg.get("wrench") else None   # mixed-EE aware
@@ -5187,13 +5264,12 @@ def _cli_run(a):
         _final_export = MP.load_export_bundle(
             a.mp_path, plan, list(rik.C.getJointNames()), required=False)
       except ValueError as e:
-        print(f"[sim/mp] invalid final export: {e}")
-        return
+        raise SystemExit(f"[sim/mp] invalid final export: {e}")
       if _final_export is None and not getattr(a, "refresh_witnesses", False):
-        print("[sim/mp] saved motion path has no final post-fusion export block. Refusing to "
-              "re-solve IK during replay. Re-export the path with current --mp-save, or pass "
-              "--refresh-witnesses to explicitly authorize the legacy rebuild.")
-        return
+        raise SystemExit(
+            "[sim/mp] saved motion path has no final post-fusion export block. Refusing to "
+            "re-solve IK during replay. Re-export the path with current --mp-save, or pass "
+            "--refresh-witnesses to explicitly authorize the legacy rebuild.")
       if _final_export is not None and getattr(a, "refresh_witnesses", False):
         print("[sim/mp] --refresh-witnesses explicitly requested: ignoring the embedded final "
               "export and running the legacy witness/pre-skill rebuild.")
@@ -5225,17 +5301,17 @@ def _cli_run(a):
               f"{a.path} -- witness re-solve SKIPPED (--refresh-witnesses to re-solve).")
     if not getattr(a, "refresh_witnesses", False):
       if wit is None:
-        print("[sim/mp] plan has no compatible persisted search-witness certificate. "
-              "Refusing to resolve IK implicitly; regenerate the plan with current main.py, "
-              "or pass --refresh-witnesses for the explicit legacy repair path.")
-        return
+        raise SystemExit(
+            "[sim/mp] plan has no compatible persisted search-witness certificate. "
+            "Refusing to resolve IK implicitly; regenerate the plan with current main.py, "
+            "or pass --refresh-witnesses for the explicit legacy repair path.")
       from plan_io import require_complete_witnesses
       try:
         require_complete_witnesses(plan, wit, who="sim replay")
       except ValueError as e:
-        print(f"[sim/mp] {e}. Refusing an incomplete artifact; regenerate it or pass "
-              "--refresh-witnesses explicitly.")
-        return
+        raise SystemExit(
+            f"[sim/mp] {e}. Refusing an incomplete artifact; regenerate it or pass "
+            "--refresh-witnesses explicitly.")
     # WHICH witness optimizer ran at export time, reproduced here. build_tasks SKIPS a task
     # whose witness is None, so a different optimizer -> a different None-pattern -> a task
     # chain that no longer matches the saved --mp-path ("mode alignment failed: N unmatched").
@@ -5301,20 +5377,20 @@ def _cli_run(a):
       if _want is not None:
         _have = MP.task_signature(prob)
         if _have != _want:
-          print(f"[sim] !!! TASK-SIGNATURE MISMATCH: the path was planned against task structure "
-                f"{_want}, the rebuild produced {_have}. Same task COUNT can still mean different "
-                f"tasks (a moved --pre-* split, a different bracing/handovers flag), and the path "
-                f"indexes tasks by integer id -- so every attach would fire at the wrong moment. "
-                f"Aborting. Re-export the path from this plan, or use the plan the path came from.")
-          return
+          raise SystemExit(
+              f"[sim] !!! TASK-SIGNATURE MISMATCH: the path was planned against task structure "
+              f"{_want}, the rebuild produced {_have}. Same task COUNT can still mean different "
+              f"tasks (a moved --pre-* split, a different bracing/handovers flag), and the path "
+              f"indexes tasks by integer id -- so every attach would fire at the wrong moment. "
+              f"Aborting. Re-export the path from this plan, or use the plan the path came from.")
       max_tid = max(int(t) for st in path for t in np.atleast_1d(st.mode.task_ids))
       if max_tid + 1 != len(prob.tasks):
-        print(f"[sim] !!! TASK-STRUCTURE MISMATCH: saved path references {max_tid + 1} tasks, "
-              f"rebuilt problem has {len(prob.tasks)}. The plan.json/mp.json pair does not "
-              f"match this rebuild (usually a pre-insertion/--skill difference: saved config "
-              f"has pre_insertion={cfg.get('pre_insertion')}). Aborting -- executing would "
-              f"relink at the wrong times.")
-        return
+        raise SystemExit(
+            f"[sim] !!! TASK-STRUCTURE MISMATCH: saved path references {max_tid + 1} tasks, "
+            f"rebuilt problem has {len(prob.tasks)}. The plan.json/mp.json pair does not "
+            f"match this rebuild (usually a pre-insertion/--skill difference: saved config "
+            f"has pre_insertion={cfg.get('pre_insertion')}). Aborting -- executing would "
+            f"relink at the wrong times.")
       # HEAL DROPPED ZERO-MOTION MODES: shortcutting can erase a zero-motion task's whole
       # mode stretch from a saved path (see MP.repair_mode_chain), and the fire extraction
       # derives events from mode transitions -- on chair-8 the holder-release never fired and
@@ -5330,13 +5406,21 @@ def _cli_run(a):
                              optimize=a.mp_optimize,
                              fake_clock=bool(_saved(cfg, "mp_fake_clock")))
     if not path:
-      print("[sim] motion planner found no path.")
-      return
+      raise SystemExit("[sim] motion planner found no path.")
     if a.mp_cograsp:
       print("[flag] --mp-cograsp ACTIVE: checking co-grasp rigidity along the loaded path.")
       MP.report_cograsp_drift(C, prob, path, rik)
     rep = execute_motion_plan(C, asm, plan, states, prob, path, gripper_kinds=gripper_kinds,
                               record=a.record, gui=a.gui, visual=_want_meshes,
+                              record_metadata={
+                                  "profile": a.sim_profile,
+                                  "plan_path": a.path,
+                                  "motion_path": a.mp_path,
+                                  "dt": DT,
+                                  "record_every": RECORD_EVERY,
+                                  "resolved_profile": {
+                                      k: getattr(a, k) for k in _STANDARD_SIM_PROFILE},
+                              },
                               verbose=a.verbose,
                               rate_boost=a.arm_rate,
                               corridor=(a.corridor or a.phase_schedule),
@@ -5398,6 +5482,8 @@ def _cli_run(a):
     rep = SimExecutor(asm, gripper_kinds=gripper_kinds, gui=a.gui).execute(
         plan, states, record=a.record)
   print(rep.summary())
+  if a.require_success and not rep.success:
+    raise SystemExit(3)
 
 
 def _build_cli():
@@ -5417,6 +5503,13 @@ def _build_cli():
                       "contacts, spline + phase schedule/smoothing/batching, normalized wrench "
                       "guard, and strict path preflight. Explicit individual flags win. "
                       "--mp-path/--record and robot-specific calibrations remain per run.")
+  r.add_argument("--require-mp-path", action=argparse.BooleanOptionalAction, default=False,
+                 help="Fail unless --mp-path supplies a persisted path; prevents a reproduction "
+                      "command from silently running a fresh stochastic BiRRT. Enabled by the "
+                      "standard profile.")
+  r.add_argument("--require-success", action=argparse.BooleanOptionalAction, default=False,
+                 help="Return process status 3 when physics reports any failed action. The NPZ "
+                      "and summary are still written first. Enabled by the standard profile.")
   r.add_argument("--v2", action=argparse.BooleanOptionalAction, default=True,
                  help="REAL-ARM motion-plan execution: load the saved final MP export/path (or "
                       "build them for a fresh plan), then FK-synced arms follow the path in "

@@ -102,6 +102,34 @@ _CAL = {
         },
         "load": lambda: _artifact("fr3_ik"),
     },
+    "openarm_left": {
+        # built via: ssik build openarm_v2.0/urdf/example/v2.urdf
+        #   (--base openarm_left_base_link --ee openarm_left_ee_base_link)
+        # Validated: ssik fk == rai left_openarm.g FK to 0.0 over random configs with the
+        # per-joint SIGN map below (rai joint_scale/-axis conventions flip joints 2,3,4;
+        # j5/j6 happen to re-flip). Tool: ee_base_link -> gripper_center measured constant.
+        "sign": np.array([1.0, -1.0, -1.0, -1.0, -1.0, -1.0, 1.0]),   # rescaled .g (no joint_scale) -- re-derived empirically
+        "offset": np.zeros(7),
+        "tools": {
+            "two_finger": np.array([[1.0, 0.0, 0.0, -0.0014],
+                                     [0.0, 1.0, 0.0, 0.0],
+                                     [0.0, 0.0, 1.0, -0.155],
+                                     [0.0, 0.0, 0.0, 1.0]]),
+        },
+        "load": lambda: _artifact("openarm_left_ik"),
+    },
+    "openarm_right": {
+        # same source URDF, right chain; sign map differs only in j1 (mirrored shoulder)
+        "sign": np.array([-1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0]),   # rescaled .g -- re-derived empirically
+        "offset": np.zeros(7),
+        "tools": {
+            "two_finger": np.array([[1.0, 0.0, 0.0, -0.0014],
+                                     [0.0, 1.0, 0.0, 0.0],
+                                     [0.0, 0.0, 1.0, -0.155],
+                                     [0.0, 0.0, 0.0, 1.0]]),
+        },
+        "load": lambda: _artifact("openarm_right_ik"),
+    },
 }
 # NOTE on the ssik franka prebuilt (ssik.prebuilt.franka.fr3_ik): it models DIFFERENT
 # geometry than our rai fr3v2 asset -- offset/sign/permutation voting over 15k solution

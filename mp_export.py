@@ -713,15 +713,17 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
      current mode's task -- everyone else keeps the full margin for the whole segment. The mode
      already carries this (`task.robots`), so nothing has to be inferred.
 
-  2. BY EE DISTANCE TO THE GOAL, for that involved pair: required = margin * min(1, d_ee/ramp),
-     where d_ee is how far the arms' END EFFECTORS still are from their goal poses. Full margin
-     in transit, relaxing to zero exactly at the keyframe where contact is intended.
+  2. BY EE DISTANCE TO BOTH SEGMENT ANCHORS, for that involved pair: required =
+     margin * min(1, d_from_start/ramp, d_to_goal/ramp).  Full margin applies in transit and
+     relaxes to zero at either keyframe where contact may be intended.  Relaxing only at the
+     destination makes the predicate discontinuous at a mode switch: a pair allowed to touch
+     at the preceding handover/release would suddenly owe the full margin before it had moved.
 
      Keyed on EE distance rather than path position ON PURPOSE. "The last 10% of the path" is
      history-dependent and a sampling planner has no such notion -- its predicate must be a pure
-     function of (q, mode) or edge checks and rewiring become inconsistent. Distance-to-goal is
-     that pure function and expresses the same intent, so the ramp works INSIDE planning rather
-     than as post-processing.
+     function of (q, mode) or edge checks and rewiring become inconsistent. Distances to the
+     mode's two anchors are that pure function, so the ramp works INSIDE planning rather than as
+     post-processing.
 
   Frames are classified by KINEMATIC ROOT, so a carried part counts as its holder; recomputed per
   call because attaches rewrite the parents. Goal EE poses are cached per mode (posing C to read
@@ -843,6 +845,12 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
     return _home_ee.get(r)
 
   qmargin = max(margin, table_margin)
+  # The base predicate cannot distinguish distances inside its accepted penetration budget.
+  # Starting a positive clearance ramp inside that same band creates a fictitious, arbitrarily
+  # thin violation next to an otherwise-valid keyframe (and makes feasibility depend on the
+  # audit sampling rate).  Treat the base tolerance as the anchor's contact neighbourhood;
+  # outside it, the requested margin still grows with exactly the configured slope.
+  _anchor_deadband = max(0.0, float(getattr(env, "collision_tolerance", 0.0) or 0.0))
 
   # STRUCTURED REJECTION AUDIT.  MP_MARGIN_DEBUG used to print every veto, which turns a
   # moderately hard run into hundreds of thousands of indistinguishable lines and still does
@@ -1100,10 +1108,17 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
           if goals is None:
             goals = _goals(m)
           try:
-            d_ee = max(float(_np.linalg.norm(
+            pair = (ra, rb)
+            d_goal = max(float(_np.linalg.norm(
                 _np.asarray(env.C.getFrame(gripper_frame[r]).getPosition(), dtype=float)
-                - goals[r])) for r in (ra, rb) if r in goals)
-            factor = min(1.0, d_ee / ramp)
+                - goals[r])) for r in pair if r in goals)
+            d_prev = max(float(_np.linalg.norm(
+                _np.asarray(env.C.getFrame(gripper_frame[r]).getPosition(), dtype=float)
+                - _prev_ee(r, m))) for r in pair if _prev_ee(r, m) is not None)
+            # Exact FK re-evaluation of a persisted anchor can differ by roundoff.  Without
+            # this clamp, observed==0 and required~=1e-15 spuriously rejects the anchor.
+            d_anchor = max(0.0, min(d_goal, d_prev) - _anchor_deadband)
+            factor = 0.0 if d_anchor <= 1e-9 else min(1.0, d_anchor / ramp)
             req = margin * factor
           except Exception:
             req = 0.0
@@ -1115,8 +1130,8 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
         # task 28_assemble_a1_obj_7_obj_5, a1's pinned wrist 7.7mm from a2's base link at
         # HOME -> every transition sample invalid -> "Failed to sample after 10000
         # attempts"). Ramp the pair's requirement on the INVOLVED arm's own distance to its
-        # goal: full margin while it transits, relaxed to the base predicate exactly where
-        # the task pins it -- the same contact-allowed-at-anchors philosophy as the
+        # two anchors: full margin while it transits, relaxed to the base predicate exactly
+        # where either adjacent task pins it -- the same contact-allowed-at-anchors philosophy as the
         # involved-pair and table ramps. Fail OPEN like the branch above: a missing goal
         # must not veto a state the base predicate accepts.
         rinv = ra if ra in involved else rb
@@ -1124,10 +1139,13 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
         if goals is None:
           goals = _goals(m)
         try:
-          d_ee = float(_np.linalg.norm(
-              _np.asarray(env.C.getFrame(gripper_frame[rinv]).getPosition(), dtype=float)
-              - goals[rinv]))
-          factor = min(1.0, d_ee / ramp)
+          ee = _np.asarray(env.C.getFrame(gripper_frame[rinv]).getPosition(), dtype=float)
+          d_goal = float(_np.linalg.norm(
+              ee - goals[rinv]))
+          prev = _prev_ee(rinv, m)
+          d_prev = float(_np.linalg.norm(ee - prev)) if prev is not None else d_goal
+          d_anchor = max(0.0, min(d_goal, d_prev) - _anchor_deadband)
+          factor = 0.0 if d_anchor <= 1e-9 else min(1.0, d_anchor / ramp)
           req = margin * factor
         except Exception:
           req = 0.0
@@ -1312,8 +1330,8 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
       print(f"[mp] --mp-robot-margin {robot_robot_margin:g}m: robot-robot clearance enforced by a "
             f"wrapper around mr_bench's predicate (that module stays unmodified). Planning will be "
             f"slower -- its early-out on 'nothing penetrates' no longer applies."
-            + (f" Relaxed to 0 between the TASK'S OWN robots, ramped over the last "
-               f"{robot_margin_ramp:g}m of EE travel to the goal." if robot_margin_ramp > 0
+            + (f" Relaxed to 0 between the TASK'S OWN robots, ramped over "
+               f"{robot_margin_ramp:g}m of EE travel from/to each segment anchor." if robot_margin_ramp > 0
                else " Dropped entirely between the TASK'S OWN robots (no ramp)."))
     if table_margin and table_margin > 0.0:
       print(f"[mp] --mp-table-margin {table_margin:g}m: CARRIED parts keep this clearance to the "

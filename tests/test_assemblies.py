@@ -747,9 +747,120 @@ def test_structural_milestones_skip_the_global_database(monkeypatch):
   monkeypatch.setattr(A, "GraspCollapsedHeuristic", forbidden)
   plan = A.solve_assembly_problem_milestones(
       C, asm, robots=robots, weight=5.0, verbose=False,
-      milestone_oracle="structural")
+      milestone_oracle="structural", milestone_boundaries=4)
   assert plan is not None
   assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+
+
+def test_milestones_lazily_retry_a_distinct_boundary_after_suffix_failure(monkeypatch):
+  """A suffix failure rejects an exact checkpoint, not the whole part-order decision.
+
+  This deliberately tiny symbolic harness isolates the outer milestone control policy.  The
+  first settled endpoint for obj_1 makes obj_2 impossible, while the next endpoint admits it.
+  K=1 therefore reproduces the historical claim-once failure and K=2 must recover without
+  changing the dependency-valid part order.
+  """
+  import solver as S
+
+  class DummyState:
+    def __init__(self, label, goal=False):
+      self.label = label
+      self.goal = goal
+
+    def __hash__(self):
+      return hash((self.label, self.goal))
+
+    def __eq__(self, other):
+      return (isinstance(other, DummyState)
+              and (self.label, self.goal) == (other.label, other.goal))
+
+    def is_goal(self, _assembly):
+      return self.goal
+
+  initial = DummyState("initial")
+  bad = DummyState("obj1-bad")
+  good = DummyState("obj1-good")
+  final = DummyState("final", goal=True)
+  asm = A.make_assembly("cross", 3)
+  calls = []
+
+  monkeypatch.setattr(S, "get_initial_state", lambda *_args: initial)
+  monkeypatch.setattr(S, "_search_context", lambda *_args, **_kwargs: (object(), {}))
+  monkeypatch.setattr(S, "_capture_fill_failure", lambda *_args, **_kwargs: None)
+
+  def fake_fill(start, part, *_args, excluded_end_states=None, **_kwargs):
+    excluded = set(excluded_end_states or ())
+    calls.append((start.label, part, frozenset(s.label for s in excluded)))
+    if part == "obj_1":
+      endpoint = good if bad in excluded else bad
+      return [("pick", "a1", part, endpoint.label)], endpoint
+    if part == "obj_2" and start == bad:
+      return None, None
+    if part == "obj_2" and start == good:
+      return [("pick", "a1", part, "final")], final
+    raise AssertionError((start.label, part))
+
+  monkeypatch.setattr(S, "_add_one_part", fake_fill)
+  common = dict(C=None, assembly=asm, robots=["a1"], verbose=False, robot_ik=None,
+                milestone_oracle="structural", fill_window=1, max_repairs=10)
+  assert S.solve_assembly_problem_milestones(**common, milestone_boundaries=1) is None
+
+  calls.clear()
+  plan = S.solve_assembly_problem_milestones(**common, milestone_boundaries=2)
+  assert plan is not None
+  assert ("initial", "obj_1", frozenset({"obj1-bad"})) in calls
+
+
+def test_milestone_session_resumes_after_external_complete_plan_suspension(monkeypatch):
+  """A consumer can request the next exact boundary without restarting symbolic/IK search."""
+  import solver as S
+
+  class DummyState:
+    def __init__(self, label, goal=False):
+      self.label = label
+      self.goal = goal
+
+    def __hash__(self):
+      return hash((self.label, self.goal))
+
+    def __eq__(self, other):
+      return (isinstance(other, DummyState)
+              and (self.label, self.goal) == (other.label, other.goal))
+
+    def is_goal(self, _assembly):
+      return self.goal
+
+  initial = DummyState("initial")
+  middle = DummyState("middle")
+  final_a = DummyState("final-a", goal=True)
+  final_b = DummyState("final-b", goal=True)
+  asm = A.make_assembly("cross", 3)
+  calls = []
+
+  monkeypatch.setattr(S, "get_initial_state", lambda *_args: initial)
+  monkeypatch.setattr(S, "_search_context", lambda *_args, **_kwargs: (object(), {}))
+  monkeypatch.setattr(S, "_capture_fill_failure", lambda *_args, **_kwargs: None)
+
+  def fake_fill(start, part, *_args, excluded_end_states=None, **_kwargs):
+    excluded = set(excluded_end_states or ())
+    calls.append((start.label, part, frozenset(s.label for s in excluded)))
+    if part == "obj_1":
+      return [("pick", "a1", part, "middle")], middle
+    if part == "obj_2" and start == middle:
+      endpoint = final_b if final_a in excluded else final_a
+      return [("pick", "a1", part, endpoint.label)], endpoint
+    raise AssertionError((start.label, part))
+
+  monkeypatch.setattr(S, "_add_one_part", fake_fill)
+  session = S.iter_assembly_problem_milestones(
+      None, asm, robots=["a1"], verbose=False, robot_ik=None,
+      milestone_oracle="structural", fill_window=1, max_repairs=10,
+      milestone_boundaries=2)
+  first = next(session)
+  second = next(session)
+  assert first != second
+  assert first[-1][-1] == "final-a" and second[-1][-1] == "final-b"
+  assert ("middle", "obj_2", frozenset({"final-a"})) in calls
 
 
 def test_chain_milestone_oracle_plans_a_sequence():
