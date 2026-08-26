@@ -25,6 +25,13 @@ class OpenWitnessReport:
   exhausted: bool = False
   deadline: bool = False
   budget_hits: int = 0
+  max_frontier: int = 0
+  max_heap_entries: int = 0
+  max_alternates: int = 0
+  max_unique_states: int = 0
+  max_successor_states: int = 0
+  max_successor_edges: int = 0
+  max_tree_edges: int = 0
 
 
 class OpenWitnessPool:
@@ -103,6 +110,27 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
   if pool is None:
     pool = robot_ik._open_witness_pool = OpenWitnessPool(robot_ik)
   report = OpenWitnessReport()
+
+  def sample(engine):
+    if not hasattr(engine, "footprint"):
+      return
+    f = engine.footprint()
+    report.max_frontier = max(report.max_frontier, f["frontier"])
+    report.max_heap_entries = max(report.max_heap_entries, f["heap_entries"])
+    report.max_alternates = max(report.max_alternates, f["alternates"])
+    report.max_unique_states = max(report.max_unique_states, f["unique_states"])
+    report.max_successor_states = max(report.max_successor_states, f["successor_states"])
+    report.max_successor_edges = max(report.max_successor_edges, f["successor_edges"])
+    report.max_tree_edges = max(report.max_tree_edges, f["tree_edges"])
+
+  def storage_tail():
+    if not report.max_successor_states:
+      return ""
+    return (f"; search peak pending/heap={report.max_frontier}/{report.max_heap_entries}, "
+            f"alts={report.max_alternates}, unique={report.max_unique_states}, "
+            f"succ={report.max_successor_states}/{report.max_successor_edges}, "
+            f"tree={report.max_tree_edges}")
+
   epoch = 0
   while max_epochs == 0 or epoch < max_epochs:
     if deadline is not None and time.perf_counter() >= deadline:
@@ -117,6 +145,7 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
         report.deadline = True
         return None, None, report
       subplan = engine.search(max_nodes, deadline=deadline)
+      sample(engine)
       if subplan is None:
         if getattr(engine, "budget_hit", False):
           if deadline is not None and time.perf_counter() >= deadline:
@@ -152,11 +181,13 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
       if valid:
         if verbose:
           print(f"[open-witness {tag}] solved in {epoch} epoch(s), {report.probes} effort slots "
-                f"({report.open_failures} open failures, {report.successes} successes)")
+                f"({report.open_failures} open failures, {report.successes} successes)"
+                f"{storage_tail()}")
         return subplan, end_state, report
   report.exhausted = True
   if verbose:
     tail = (f", {report.budget_hits} node-budget epoch(s)" if report.budget_hits else "")
     print(f"[open-witness {tag}] effort limit after {report.epochs} epoch(s), "
-          f"{report.probes} effort slots{tail}; failures remain OPEN (not blacklisted)")
+          f"{report.probes} effort slots{tail}; failures remain OPEN (not blacklisted)"
+          f"{storage_tail()}")
   return None, None, report

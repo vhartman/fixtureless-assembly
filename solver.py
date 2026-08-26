@@ -2351,6 +2351,10 @@ class RobotIK:
       self._add_pull(komo, C, robot)                    # witness-opt pull (no-op in search)
       self._add_pin(komo, C)                            # pre-skill pin (no-op in search)
       self._add_grasp_maintenance(komo, s0, assembly)     # braces pinned at their grasps
+      if __import__("os").environ.get("MILESTONE_DEBUG"):
+        _sk = arm_seeds.get(robot)
+        print(f"[assm-seed] {robot} analytic_ok={self._analytic_reject_ok(robot)} "
+              f"arm_seeds[{robot}]={0 if _sk is None else len(_sk)}", flush=True)
       feasible, witness = self._solve_ik(              # `warm` (e.g. the mated witness for a
           komo, restarts=0,                            # pre-insertion goto) warm-starts the solve
           seeds=((([warm] if warm is not None else [])
@@ -6539,16 +6543,71 @@ class _IncrementalLazySearch:
     # 200k+ expansions on dense floating scenes), while ~100ms IK binds stay plan-lazy.
     self._succ_raw = succ_fn                              # UNfiltered (blacklist at use time)
     self._succ_cache = {}
+    # Successor generation allocates a fresh State for every edge, although many edges reach
+    # value-equal states (different robot/grasp histories collapse to the same discrete state).
+    # The cache otherwise retains all of those full pose/support dictionaries. Intern states
+    # and actions by value so O(edges) references point at O(unique states/actions) payloads.
+    self._state_intern = {start: start}
+    self._action_intern = {}
     self.tie = itertools.count()
     self.pq = []
+    self._pending = {}                                    # (state,parent,action) -> best entry
     self.claimed = {}
     self.came_from = {start: (None, None)}
-    self.children = {}
-    self.alts = {}
+    # A node can be unclaimed/reclaimed hundreds of times while lazy IK deletes candidate
+    # edges.  Lists made both structures grow once PER REPAIR, even when the same tree child
+    # or same incoming (parent, action) route was being re-recorded.  Cross-7/OpenArm reached
+    # >1 GiB in a finite local graph this way.  Preserve every DISTINCT recovery route only.
+    self.children = {}                                    # parent -> set(child state)
+    self.alts = {}                                        # state -> {(parent, action): entry}
     self.expanded = 0
     self.budget_hit = False
     h0 = h_fn(start)
-    self.pq.append((self._f(0.0, h0), h0, 0.0, next(self.tie), start, None, None))
+    self._queue((self._f(0.0, h0), h0, 0.0, next(self.tie), start, None, None))
+
+  def _queue(self, entry):
+    """Queue at most one best pending entry per distinct incoming graph edge.
+
+    Repairs regenerate edges whose old copies are already waiting in the heap. The old code
+    appended every copy, so the heap grew to 210k entries for a ~1k-state OpenArm fill. A
+    changed parent cost may replace an entry; the superseded heap tuple is discarded lazily.
+    """
+    import heapq
+    key = (entry[4], entry[5], entry[6])
+    old = self._pending.get(key)
+    if old is not None and old[:3] <= entry[:3]:
+      return False                                        # identical or dominated regeneration
+    self._pending[key] = entry
+    heapq.heappush(self.pq, entry)
+    return True
+
+  def _remember_alt(self, state, entry):
+    """Remember one best heap entry per distinct incoming edge to ``state``.
+
+    Re-expanding a repaired parent regenerates the identical edge. Keeping all copies has no
+    search meaning: if the parent cost changes, search() recomputes the entry when it is popped;
+    if the edge is deleted, every copy is invalid. Distinct parent/action edges remain available
+    for later repairs, preserving the incremental search's coverage.
+    """
+    edge = (entry[5], entry[6])
+    bucket = self.alts.setdefault(state, {})
+    old = bucket.get(edge)
+    if old is None or entry[:4] < old[:4]:
+      bucket[edge] = entry
+
+  def footprint(self):
+    """Compact search-storage counters for profiling lazy-fill scaling."""
+    return {
+        "frontier": len(self._pending),
+        "heap_entries": len(self.pq),
+        "claimed": len(self.claimed),
+        "alternates": sum(len(v) for v in self.alts.values()),
+        "unique_states": len(self._state_intern),
+        "unique_actions": len(self._action_intern),
+        "successor_states": len(self._succ_cache),
+        "successor_edges": sum(len(v) for v in self._succ_cache.values()),
+        "tree_edges": sum(len(v) for v in self.children.values()),
+    }
 
   def _f(self, g, hval):
     import math
@@ -6557,7 +6616,12 @@ class _IncrementalLazySearch:
   def _succ(self, s):
     hit = self._succ_cache.get(s)
     if hit is None:
-      hit = self._succ_cache[s] = list(self._succ_raw(s))
+      hit = []
+      for action, state in self._succ_raw(s):
+        action = self._action_intern.setdefault(action, action)
+        state = self._state_intern.setdefault(state, state)
+        hit.append((action, state))
+      self._succ_cache[s] = hit
     return hit
 
   def search(self, max_nodes, deadline=None):
@@ -6570,8 +6634,13 @@ class _IncrementalLazySearch:
     while self.pq:
       entry = heapq.heappop(self.pq)
       _f, _h, g, _, s, prev, action = entry
+      pkey = (s, prev, action)
+      pending = self._pending.get(pkey)
+      if pending is None or pending[3] != entry[3]:
+        continue                                          # superseded pending entry
+      del self._pending[pkey]
       if s in self.claimed:
-        self.alts.setdefault(s, []).append(entry)         # keep as an alternate route
+        self._remember_alt(s, entry)                      # keep each incoming route once
         continue
       if _dbg and _pops < 12:
         try:
@@ -6586,8 +6655,8 @@ class _IncrementalLazySearch:
         g_true = self.claimed[prev] + self.cost_fn(action)
         if g_true != g:                                   # parent re-claimed at another g
           hs = self.h_fn(s)
-          heapq.heappush(self.pq, (self._f(g_true, hs), hs, g_true, next(self.tie),
-                                   s, prev, action))
+          self._queue((self._f(g_true, hs), hs, g_true, next(self.tie),
+                       s, prev, action))
           continue
         if self.cheap_gate is not None and not self.cheap_gate(prev, action, s):
           self.blacklist.add((prev, action))              # cheap-infeasible: dead forever
@@ -6595,7 +6664,7 @@ class _IncrementalLazySearch:
       self.claimed[s] = g
       if prev is not None:
         self.came_from[s] = (prev, action)
-        self.children.setdefault(prev, []).append(s)
+        self.children.setdefault(prev, set()).add(s)
       if self.goal_fn(s):
         self._goal = s
         return _reconstruct_plan(self.came_from, s)
@@ -6615,9 +6684,9 @@ class _IncrementalLazySearch:
           continue
         entry = (self._f(ng, hns), hns, ng, next(self.tie), ns, s, a)
         if ns in self.claimed:
-          self.alts.setdefault(ns, []).append(entry)      # alternate for a future repair
+          self._remember_alt(ns, entry)                   # alternate for a future repair
         else:
-          heapq.heappush(self.pq, entry)
+          self._queue(entry)
     return None
 
   def delete_edge(self, s, a, ns):
@@ -6628,6 +6697,7 @@ class _IncrementalLazySearch:
     import heapq
     if self.came_from.get(ns, (None, None)) != (s, a):
       return                                              # not a tree edge: nothing to repair
+    self._pending.pop((ns, s, a), None)                   # queued copy is now invalid
     stack = [ns]
     while stack:
       x = stack.pop()
@@ -6636,8 +6706,8 @@ class _IncrementalLazySearch:
       del self.claimed[x]
       self.came_from.pop(x, None)
       stack.extend(self.children.pop(x, ()))
-      for alt in self.alts.pop(x, ()):
-        heapq.heappush(self.pq, alt)
+      for alt in self.alts.pop(x, {}).values():
+        self._queue(alt)
 
 
 def solve_assembly_problem_lazy(C, assembly, robots=None, max_nodes=200000, verbose=True,
