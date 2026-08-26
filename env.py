@@ -220,6 +220,7 @@ ROBOTIQ_TIGHT_PATH = "./src/rai/robotiq/robotiq_tight.g"
 OPENARM_TORSO_PATH = "./src/rai/openarm/openarm_torso.g"
 OPENARM_ARM_PATHS = {"right": "./src/rai/openarm/right_openarm.g",
                      "left": "./src/rai/openarm/left_openarm.g"}
+OPENARM_FLOATING_EE_PATH = "./src/rai/openarm/openarm_pinch_floating.g"
 
 
 def make_fr3_duo_env(num_duos=1):
@@ -332,11 +333,17 @@ def make_openarm_duo_env(num_duos=1):
     # grasps keep wrist headroom under the 0.72m shoulders.
     table_h = 0.06                                       # slim slab, top at 0.52
     C.getFrame("table").setShape(
-        ry.ST.box, size=[1.2, 0.8, table_h, 0.005]).setPosition(
+        ry.ST.box, size=[1.2, 0.6, table_h, 0.005]).setPosition(
         [0.0, -0.2, 0.37 - table_h / 2.0]).setContact(1)
     duos = []
     for k in range(num_duos):
-        y = -0.66 if k % 2 == 0 else 0.26
+        # The FR3 placement (-0.66 / +0.26 about the table centre at -0.20) leaves an
+        # OpenArm wrist roughly 0.43m from the parts.  Its shoulder-to-wrist chain is only
+        # ~0.37m: only a palm-forward side grasp can then reach, while top/down and most
+        # sampled pinch orientations are geometrically impossible even with limits ignored.
+        # Put each OpenArm 10cm closer, still at the table edge; this is a workcell-layout
+        # calibration, not a fictitious widening of the hardware joint limits.
+        y = -0.56 if k % 2 == 0 else 0.16
         yaw = 0.70710678 if k % 2 == 0 else -0.70710678  # rotZ +-90: face the table
         duos.append((k, y, [0.70710678, 0.0, 0.0, yaw]))
     for k, by, quat in duos:
@@ -372,8 +379,12 @@ def make_openarm_duo_env(num_duos=1):
             # home pose: sampled collision-free ready config (hands above table height);
             # applied per side HERE so every duo's arms map correctly (a hardcoded a1/a2
             # broke num_duos=2 -- a3/a4 silently kept file-default q).
-            HOMES = {"right": [0, -0.2, 0, -1.2, 0., -0.5, 0.],
-                     "left": [0, 0.2, 0, -1.2, 0., -0.5, 0.]}
+            # Fold the elbow/wrist upward at rest.  The old -1.2/-0.5 pose put the hands
+            # exactly nose-to-nose when two duos faced each other; once the real finger
+            # capsules were restored, a3/a4 started in collision with a1/a2.  This pose is
+            # collision-free for one and two duos and keeps the fingertips above the table.
+            HOMES = {"right": [0, -0.2, 0, -2.3, 0., 0.7, 0.],
+                     "left": [0, 0.2, 0, -2.3, 0., 0.7, 0.]}
             import re as _re
             jn = C.getJointNames()
             pat = _re.compile(_re.escape(prefix) + r"openarm_" + side + r"_joint(\d)$")

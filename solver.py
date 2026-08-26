@@ -1569,14 +1569,17 @@ class RobotIK:
 
   def _compose_full_seeds(self, C, arm_seeds, cap=8):
     # Full joint-vector warm starts for a MULTI-ARM KOMO from per-arm analytic solutions:
-    # each attached arm's 6 joints overwritten with one of its solutions (cartesian product,
+    # each attached arm's joints overwritten with one of its solutions (cartesian product,
     # closest-to-current-config first, capped -- the product is the complete enumeration of
-    # the exact pose branches when it fits under the cap).
+    # the exact pose branches when it fits under the cap).  Do not assume 6R here: OpenArm
+    # and FR3 are 7R, and silently dropping their exact seeds is especially expensive for a
+    # coupled place/assemble where the nonlinear solve otherwise has to discover every arm.
     import itertools
     q0 = np.asarray(C.getJointState(), dtype=float)
     names = C.getJointNames()
     idx = {r: [i for i, n in enumerate(names) if n.startswith(r + "_")] for r in arm_seeds}
-    if any(len(ix) != 6 for ix in idx.values()):
+    if any(not arm_seeds[r] or len(ix) != len(np.asarray(arm_seeds[r][0]).ravel())
+           for r, ix in idx.items()):
       return []
     robots = sorted(arm_seeds)
     combos = []
@@ -1613,8 +1616,9 @@ class RobotIK:
     q0 = np.asarray(C.getJointState(), dtype=float)
     names = C.getJointNames()
     idx = {r: [i for i, n in enumerate(names) if n.startswith(r + "_")] for r in arm_seeds}
-    if (not arm_seeds or any(len(ix) != 6 for ix in idx.values())
-        or any(not s for s in arm_seeds.values())):
+    if (not arm_seeds or any(not s for s in arm_seeds.values())
+        or any(len(ix) != len(np.asarray(arm_seeds[r][0]).ravel())
+               for r, ix in idx.items())):
       return False, []
     robots = sorted(arm_seeds)
     n_combos = int(np.prod([len(arm_seeds[r]) for r in robots]))
@@ -1716,7 +1720,8 @@ class RobotIK:
     # (a 7-pose relative to `target_frame`; target_frame=None => ee_target is already a WORLD
     # pose, e.g. a place's computed gripper pose at the group's landing spot), in RAI joint
     # order, filtered to rai's arm limits. Empty unless ik_seeding is on AND this arm is
-    # calibrated. Call AFTER _restrict_to_arm so C.getJointLimits() returns the 6 arm limits.
+    # calibrated. Call AFTER _restrict_to_arm when possible, so C.getJointLimits() already
+    # returns just this arm's limits (6R UR or 7R OpenArm/FR3).
     import analytic_ik
     tool_kind = self.tool_kind[robot]
     if not self.ik_seeding or not analytic_ik.available(self.robot_arm[robot], tool_kind):
@@ -1732,14 +1737,23 @@ class RobotIK:
     T[:3, 3] = rel[:3]
     T[:3, :3] = _quat_to_R(rel[3:])
     try:
+      # selectJointsBySubtree updates RAI's active-joint bookkeeping lazily.  Asking for
+      # limits first can therefore return shape (2, 0); names/state materializes the newly
+      # selected set.  This order matters in every restricted single-arm OpenArm solve.
+      joint_names = list(C.getJointNames())
       lo, hi = C.getJointLimits()
-      lo, hi = np.asarray(lo, float), np.asarray(hi, float)
-      if len(lo) != 6:
-        # UNRESTRICTED scene (e.g. an assemble reject probe): select this robot's 6 arm limits
-        # by joint-name prefix -- without this the length mismatch silently skipped the filter.
-        idx = [i for i, n in enumerate(C.getJointNames()) if n.startswith(robot + "_")]
-        if len(idx) == 6:
-          lo, hi = lo[idx], hi[idx]
+      # RAI exposes borrowed array views here; own them before crossing into the generated
+      # ssik solver.  Together with the materialization above this prevents all 128
+      # mathematical 7R branches from bypassing the physical-limit filter.
+      lo, hi = np.array(lo, dtype=float, copy=True), np.array(hi, dtype=float, copy=True)
+      robot_idx = [i for i, n in enumerate(joint_names) if n.startswith(robot + "_")]
+      # UNRESTRICTED scene (e.g. an assemble reject probe): select this robot's arm limits
+      # by joint-name prefix.  The old literal 6 made every OpenArm seed bypass its physical
+      # limits, only to be rejected later by KOMO, and made multi-arm analytic seeding appear
+      # unavailable for all 7R skills.
+      if len(lo) != len(robot_idx):
+        if robot_idx and max(robot_idx) < len(lo):
+          lo, hi = lo[robot_idx], hi[robot_idx]
         else:
           lo = hi = None
     except Exception:
@@ -6201,11 +6215,21 @@ def _search_context(C, assembly, robots, build_table=True):
   # not the ur10 one. See cheap_ee_path / UR5_CHEAP_EE_PATHS in env.py.
   floating = not any(n.endswith("_ur_wrist_3_joint") for n in names)
   is_ur5 = any(n.endswith("_ur_arm_ur5") for n in names)
+  is_openarm = any("_openarm_left_base_link" in n or "_openarm_right_base_link" in n
+                   for n in names)
   kinds = robot_gripper_kinds(C, robots)
   distinct = sorted(set(kinds.values()))
-  ee_path = {k: cheap_ee_path(is_ur5, floating, k == "vacuum") for k in distinct}
-  fact_path = {k: os.path.join(os.path.dirname(__file__), UR10_PATHS[(True, k == "vacuum")])
-               for k in distinct}
+  if is_openarm:
+    if distinct != ["two_finger"]:
+      raise ValueError("OpenArm currently exports its native pinch hand only")
+    oa_ee = os.path.join(os.path.dirname(__file__), OPENARM_FLOATING_EE_PATH)
+    ee_path = {"two_finger": oa_ee}
+    fact_path = {"two_finger": oa_ee}
+  else:
+    ee_path = {k: cheap_ee_path(is_ur5, floating, k == "vacuum") for k in distinct}
+    fact_path = {
+        k: os.path.join(os.path.dirname(__file__), UR10_PATHS[(True, k == "vacuum")])
+        for k in distinct}
   if len(distinct) == 1:                                   # UNIFORM: byte-identical to before
     k = distinct[0]
     checker = CollisionChecker(assembly, robots, gripper_path=ee_path[k])

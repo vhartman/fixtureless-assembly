@@ -865,11 +865,11 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
         # only DOF-carrying bodies get real mass when actuated: rai has ~69 frames per arm, so
         # massing all of them built a 276kg arm and the servos diverged (3.65 -> 0.020 rad).
         static_mass=(1e-4 if actuated else None))
-    # The two FR3 arms are mounted on one separately-prefixed TMR carrier. It is fixed world
-    # decoration (no contacts or actuators), but belongs in the visual model and consequently
-    # in recorded NPZ XML. Export each discovered carrier from the same rai tree as the arms.
+    # FR3 and OpenArm duos mount ordinary aN_ arm trees on separately-prefixed fixed carriers.
+    # They are decoration (no contacts or actuators), but belong in the visual model and in
+    # recorded NPZ XML. Export every discovered carrier from the same rai tree as the arms.
     _base_xml = []
-    for _prefix in arm_model.fr3_base_prefixes(articulated_C):
+    for _prefix in arm_model.carrier_base_prefixes(articulated_C):
       _xml, _ = arm_model.build_arm_mjcf(
           articulated_C, _prefix, collide=False, group=GROUP_VISUAL,
           meshes=_arm_meshes, assets=_arm_assets, mesh_group=GROUP_VISUAL,

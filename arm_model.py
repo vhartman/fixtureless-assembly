@@ -227,6 +227,27 @@ def fr3_base_prefixes(C):
   return sorted(set(out))
 
 
+def openarm_base_prefixes(C):
+  """Prefixes of static OpenArm torso subtrees present in ``C``.
+
+  As with the FR3 carrier, each OpenArm torso is outside its two ``aN_`` arm subtrees.  The
+  articulated exporter therefore has to add the ``oaK_`` tree explicitly or MuJoCo shows two
+  correctly moving arms floating at their shoulder mounts with the humanoid base missing.
+  """
+  out = []
+  for name in C.getFrameNames():
+    if name.startswith("oa") and name.endswith("_openarm_torso"):
+      index = name[2:-len("_openarm_torso")]
+      if index.isdigit():
+        out.append(f"oa{index}_")
+  return sorted(set(out))
+
+
+def carrier_base_prefixes(C):
+  """All separately-prefixed fixed carriers that accompany ordinary ``aN_`` arm trees."""
+  return sorted(set(fr3_base_prefixes(C) + openarm_base_prefixes(C)))
+
+
 def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, indent=4,
                    collide_fn=None, contype="2", conaffinity="1", link_mass=1e-3,
                    link_inertia=1e-6, armature=0.0, limits=True, static_mass=None,
