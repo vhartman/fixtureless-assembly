@@ -115,7 +115,7 @@ _STANDARD_MOTION_PROFILE = {
     # Chair transit; no 30 s frontier-stall shortcut may silently truncate that budget.
     "mp_sequence": True,
     "mp_optimize": True,
-    "mp_runtime": 100.0,
+    "mp_runtime": 300.0,
     "mp_stall_timeout": None,
     # Fair complete-plan loop: four alternatives match the search's retained milestone
     # boundaries. 15,30,60,120,240,300 s gives every suspended plan both quick probes and the

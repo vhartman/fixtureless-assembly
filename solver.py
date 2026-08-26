@@ -534,6 +534,11 @@ class RobotIK:
     self.post_release_delta = 0.0    # depart from a released grasp along the same -z_EE axis
     self.post_release_used_delta = None  # actual adaptive departure used by the last solve
     self.pre_insertion_pull = 1.0   # qItself pull weight tying T_pre to the skill witness (<1e1)
+    # A funnel is a short Cartesian approach, not permission to jump to another IK branch.
+    # This absolute actor-joint corridor is shared with fuse_pre_skill_witnesses' gate.  It is
+    # enforced in pre_skill_witness itself so it also covers single-arm pick/place scenes where
+    # every other arm has already been frozen out and the pin pass has no joint left to pin.
+    self.pre_skill_max_dq = 0.35
     # DEPTH-GATED collision reject on the exact analytic branches (None = off). The full
     # solve's tolerant pose eq can rescue a GRAZING branch (measured: rescues sat at <=10mm
     # penetration) but never a deep one (unrescued failures >=14mm, median 55mm) -- so if
@@ -2457,10 +2462,12 @@ class RobotIK:
     the search (whose witness is always the real skill pose).
 
     COUPLED to the skill witness: the pre-skill solve is WARM-STARTED from `skill_witness` and
-    given a full-config qItself pull toward it, so the goto config differs from the skill ONLY
-    by the actor's delta backoff. Without this, the two independent solves can land in different
-    IK basins (a whole wrist revolution measured for assemble) -> a long, possibly-colliding
-    'skill' motion between the two keyframes.
+    given a full-config qItself pull toward it.  A hard post-solve actor-joint corridor then
+    rejects a different IK branch (the pull alone is only a cost and cannot guarantee this).
+    Without both, the two independent solves can land in different IK basins (a whole wrist
+    revolution measured for assemble) -> a long, possibly-colliding 'skill' motion between the
+    two keyframes. If no non-zero backoff rung stays in the corridor, return None and let the
+    exporter use the skill witness itself: a zero-length funnel is safer than a branch jump.
 
     `pin` ({joint_name: value}, --fuse-pre-skill only) additionally FREEZES those joints by a
     hard eq. The pull alone cannot enforce "only the actor moves": the skill constraints are
@@ -2507,6 +2514,12 @@ class RobotIK:
         else:
           ok, w = self._ik_assemble(action, s0, s1, assembly, None, backoff=d, warm=warm)
         if ok and w is not None:
+          if warm is not None:
+            names = self.C.getJointNames()
+            actor_idx = [i for i, n in enumerate(names) if n.startswith(action[1] + "_")]
+            dq = float(np.linalg.norm(np.asarray(w, dtype=float)[actor_idx] - warm[actor_idx]))
+            if dq > self.pre_skill_max_dq:
+              continue                                  # feasible pose, wrong IK branch
           return w
       return None
     finally:

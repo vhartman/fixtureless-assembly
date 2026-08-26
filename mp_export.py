@@ -1370,6 +1370,23 @@ def run_motion_planner(problem, runtime=30.0, verbose=True):
   return path, info
 
 
+_BIRRT_INITIAL_TREE_CAPACITY = 1024
+
+
+def _init_compact_bidir_tree(tree, env):
+  """Initialize mr_bench's growable bidirectional arrays without its 100k-node reserve."""
+  tree.order = 1
+  robot_dims = sum(env.robot_dims.values())
+  tree.subtree = {}
+  tree.initial_capacity = _BIRRT_INITIAL_TREE_CAPACITY
+  tree.batch_subtree = np.empty((tree.initial_capacity, robot_dims), dtype=np.float64)
+  tree.node_ids_subtree = np.empty(tree.initial_capacity, dtype=np.int64)
+  tree.subtree_b = {}
+  tree.batch_subtree_b = np.empty((tree.initial_capacity, robot_dims), dtype=np.float64)
+  tree.node_ids_subtree_b = np.empty(tree.initial_capacity, dtype=np.int64)
+  tree.connected = False
+
+
 def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
               shortcut_resolution=None, shortcut_strategy="native",
               shortcut_pair_checks=200, optimize=False, verbose=True, seed=None,
@@ -1420,7 +1437,8 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
   if callable(_reset_margin_audit):
     _reset_margin_audit()                                  # report THIS planner pull, not setup
   from multi_robot_multi_goal_planning.planners.planner_birrtstar import BidirectionalRRTstar
-  from multi_robot_multi_goal_planning.planners.rrtstar_base import BaseRRTConfig
+  from multi_robot_multi_goal_planning.planners.rrtstar_base import (
+      BaseRRTConfig, BidirectionalTree)
   from multi_robot_multi_goal_planning.planners.shortcutting import robot_mode_shortcut
   from multi_robot_multi_goal_planning.planners.termination_conditions import (
       RuntimeTerminationCondition, PlannerTerminationCondition)
@@ -1452,7 +1470,27 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
     _time_mod.time = _fake_time
     print(f"[mp/birrt] fake clock ACTIVE: --mp-runtime {runtime:g} is a CONSULTATION budget "
           f"(not wall seconds)")
-  planner = BidirectionalRRTstar(problem, config=cfg)
+  # mr_bench gives EVERY mode tree two eagerly allocated 100000 x total-DOF arrays.  That is
+  # ~43 MiB per mode for four 7-DOF arms, although the great majority of long-horizon mode
+  # trees contain only a few nodes.  Cross-7 consequently used several GiB merely reaching
+  # its late modes.  Its BaseTree.ensure_capacity already doubles arrays losslessly, so use a
+  # compact initial allocation while this planner instance is being built.  This is strictly
+  # a storage-policy shim: node order, samples, distances and collision predicates are
+  # unchanged, and the upstream module remains unmodified.
+  _tree_init = BidirectionalTree.__init__
+  def _compact_tree_init(self, env):
+    _init_compact_bidir_tree(self, env)
+  BidirectionalTree.__init__ = _compact_tree_init
+  try:
+    planner = BidirectionalRRTstar(problem, config=cfg)
+  except Exception:
+    BidirectionalTree.__init__ = _tree_init
+    raise
+  # Constructing new trees happens throughout plan(), so restoring here would only compact
+  # the initial tree. Keep the class patched until the planner pull has finished below.
+  print(f"[mp/birrt] compact mode trees ACTIVE: initial capacity "
+        f"{_BIRRT_INITIAL_TREE_CAPACITY} "
+        "nodes per direction (grow-on-demand; planning semantics unchanged)")
   # PER-MODE PROGRESS BUDGET (stall_timeout, seconds): a wall shows up as the MODE FRONTIER
   # not growing while the tree burns transition attempts -- the "Failed to sample" stdout is
   # a debug print, not an interface, so scripts must not parse it. This ptc closes over the
@@ -1480,6 +1518,7 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
     path, info = planner.plan(ptc=ptc, optimize=optimize)
   finally:
     _time_mod.time = _real_time
+    BidirectionalTree.__init__ = _tree_init
   info = dict(info or {})
   _modes = list(getattr(planner, "modes", ()) or ())
   info["frontier_modes"] = len(_modes)

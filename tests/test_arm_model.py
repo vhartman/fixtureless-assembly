@@ -13,7 +13,7 @@ mujoco = pytest.importorskip("mujoco")
 
 import arm_model
 import fk_compare
-from env import make_four_robot_env, make_fr3_duo_env
+from env import make_four_robot_env, make_fr3_duo_env, make_openarm_duo_env
 import assembly as A
 
 
@@ -97,3 +97,26 @@ def test_fr3_static_carrier_is_discoverable_and_exportable():
   assert joints == []
   assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "fr30_base_link") >= 0
   assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "fr30_franka_spine") >= 0
+
+
+def test_openarm_duo_fk_and_static_torso_export():
+  """Seven-axis arms use the generic exporter; their separately-prefixed torso must join it."""
+  C = make_openarm_duo_env()
+  robots = A.get_robots(C)
+  rows, (wp, wa, wf) = fk_compare.compare(C, robots, n=4, seed=0)
+  assert len(rows) > 20
+  assert wp < 1e-6, f"OpenArm: {wf} position error {wp * 1000:.6f} mm"
+  assert wa < 1e-6, f"OpenArm: {wf} orientation error {np.degrees(wa):.6f} deg"
+  assert arm_model.openarm_base_prefixes(C) == ["oa0_"]
+  assert arm_model.carrier_base_prefixes(C) == ["oa0_"]
+  assets = []
+  body, joints = arm_model.build_arm_mjcf(
+      C, "oa0_", collide=False, meshes=True, assets=assets, frame_colors=True,
+      static_mass=1e-4)
+  xml = f'''<mujoco><asset>{"".join(assets)}</asset><worldbody>{body}</worldbody></mujoco>'''
+  model = mujoco.MjModel.from_xml_string(xml)
+  assert joints == []
+  assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,
+                           "oa0_openarm_body_link0_0") >= 0
+  assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "oa0_torso_base") >= 0
+  assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "oa0_torso_column") >= 0

@@ -218,6 +218,36 @@ def test_pre_skill_witness_always_clears_the_pin(arms):
   assert rik._pin_joints is None and rik._opt_pull is None
 
 
+def test_pre_pick_never_returns_a_different_actor_ik_branch():
+  """Single-arm pick scenes have no idle joint left for fuse-pre-skill to pin.  Branch
+  continuity therefore belongs in the common pre-skill generator, before export fallback."""
+  rik = object.__new__(S.RobotIK)
+  rik.pre_pick_delta = 0.05
+  rik.pre_place_delta = rik.pre_add_grasp_delta = rik.pre_insertion_delta = 0.0
+  rik.pre_insertion_pull = 1.0
+  rik.pre_skill_max_dq = 0.35
+  rik.C = type("C", (), {"getJointNames": lambda _self: ["a1_j0", "a2_j0"]})()
+  far = np.array([1.0, 0.0])
+  calls = []
+
+  def solve(*_args, **kwargs):
+    calls.append(kwargs["backoff"])
+    return True, far.copy()
+
+  rik._ik_pick = solve
+  warm = np.zeros(2)
+  got = rik.pre_skill_witness(("pick", "a1", "obj_0", 0), None, None, None,
+                              skill_witness=warm)
+  assert got is None                                    # exporter will use the skill endpoint
+  assert len(calls) == 6                                # every shorter rung was considered
+  assert rik._pin_joints is None and rik._opt_pull is None
+
+  rik._ik_pick = lambda *_a, **_k: (True, np.array([0.1, 0.0]))
+  got = rik.pre_skill_witness(("pick", "a1", "obj_0", 0), None, None, None,
+                              skill_witness=warm)
+  np.testing.assert_allclose(got, [0.1, 0.0])
+
+
 def test_a_pinned_arms_grasp_maintenance_is_dropped(arms):
   """A frozen brace holding a frozen object cannot drive its own eq residual to zero, so keeping
   the objective makes the WHOLE solve infeasible -- measured, 2 of 4 assembles died that way and
