@@ -174,6 +174,7 @@ class RunConfig:
   witness_set_spread: float = 0.05
   ban_actions: Optional[str] = None
   witness_margin: Optional[float] = 0.005
+  witness_joint_margin: Optional[float] = None
   witness_branch_budget: int = 5
   witness_branch_metric: str = "sign"
   witness_reconfig_thresh: float = 1.5707963267948966

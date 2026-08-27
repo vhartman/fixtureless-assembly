@@ -33,8 +33,11 @@ openarm_left_joint4 (openarm_left_joint4_origin openarm_left_link4): { joint: hi
 openarm_left_joint5_origin (openarm_left_link4): { Q: [0 0 -0.0955000000000005] }
 openarm_left_joint5 (openarm_left_joint5_origin openarm_left_link5): { joint: hingeZ, limits: [-1.5708 1.5708], ctrl_limits: [20.944 -1 7],}
 openarm_left_joint6_origin (openarm_left_link5): { Q: [0 0 -0.120499999999998] }
-openarm_left_joint6 (openarm_left_joint6_origin openarm_left_link6): { joint: hingeY, limits: [-0.7854 0.7854], ctrl_limits: [20.944 -1 7],}
-openarm_left_joint7 (openarm_left_link6 openarm_left_ee_base_link): { joint: hingeX, limits: [-1.5708 1.5708], ctrl_limits: [20.944 -1 7],}
+# Planning-model workaround: the calibrated wrist limits (j6 +/-0.7854, j7 +/-1.5708)
+# leave car-mini assembly endpoints on a zero-width boundary. Keep the final two wrist axes
+# relaxed until the physical OpenArm workspace/calibration is validated end-to-end.
+openarm_left_joint6 (openarm_left_joint6_origin openarm_left_link6): { joint: hingeY, limits: [-3.1416 3.1416], ctrl_limits: [20.944 -1 7],}
+openarm_left_joint7 (openarm_left_link6 openarm_left_ee_base_link): { joint: hingeX, limits: [-3.1416 3.1416], ctrl_limits: [20.944 -1 7],}
 openarm_left_finger_joint1_origin (openarm_left_ee_base_link): { Q: "t(-0.0014300000000005003 -0.0180000000000009 -0.0680000000000174) E(0.0 -0.0 0.0)" }
 openarm_left_finger_joint1 (openarm_left_finger_joint1_origin openarm_left_ee_link1): { joint: rigid, q: -0.5 }
 openarm_left_finger_joint2_origin (openarm_left_ee_base_link): { Q: "t(-0.0014300000000005003 0.0180000000000012 -0.0680000000000215) E(0.0 -0.0 0.0)" }

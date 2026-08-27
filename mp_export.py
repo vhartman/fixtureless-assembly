@@ -166,9 +166,11 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
   historical behaviour: each split solves its own pre keyframe here, inside the export. A
   missing SKILL witness, by contrast, is a hard error -- it cannot be substituted.
 
-  `pre_pin_robots` records the idle arms that an ACCEPTED fused pre-keyframe held fixed.  Those
-  arms participate in that GOTO only, so the mode switch uses the known-safe full keyframe
-  instead of randomizing joints whose safety was already established by the fused solve.
+  `pre_pin_robots` is retained as a compatibility argument, but idle IK pins are deliberately
+  NOT task participants. They are an internal device for solving a consistent funnel, not a
+  physical synchronization requirement. ``make_problem`` exposes each full pre-keyframe as a
+  one-shot transition-sampling hint instead, preserving the known-safe configuration without
+  constraining unrelated robots at the mode switch.
 
   `witness_sets` (--witness-sets, {plan index: [full vectors, member 0 == witnesses[i]]}):
   the covered task's goal becomes an mr_bench GoalSet over the members. Every member shares
@@ -400,8 +402,7 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       print(f"  [pre] {i:02d} {kind}: NO pre keyframe -- the goto goal equals the skill goal "
             f"(zero-length funnel)")
     if not members:
-      pin_rs = list((pre_pin_robots or {}).get(i, ()))
-      pre_involved = list(dict.fromkeys(list(involved) + pin_rs))
+      pre_involved = list(involved)
       pre_goal = goal_for(pre_involved,
                           pre_wit if pre_wit is not None else wit)           # cur := T_pre
       return [(pan, Task(pan, pre_involved, pre_goal, type="goto")),
@@ -1316,6 +1317,21 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
       else:
         self.sequence = self._make_sequence_from_names(seq)   # flat order (incl. terminal)
       self.sequence_names = list(seq)
+      # FULL PRE-KEYFRAME HINTS, NOT GOAL CONSTRAINTS. The pre-skill consistency solve pins
+      # idle arms only to prove one safe full configuration. Exporting those pins as task
+      # participants made a two-arm assemble rendezvous a four-arm synchronization task
+      # (OpenArm car-mini task 22) and created a joint-limit bottleneck. BiRRT may use this full
+      # vector once when seeding the transition; if it is invalid in the accumulated mode it
+      # simply falls back to ordinary sampling, while the task itself still names only the
+      # robots physically involved.
+      _pre_src = resolved_pre_witnesses if resolved_pre_witnesses is not None else pre_witnesses
+      self.transition_hints = {}
+      for _i, _nms in enumerate(step_names):
+        if not _nms or not str(_nms[0]).startswith(f"{_i:02d}_pre_"):
+          continue
+        _q = (_pre_src or {}).get(_i)
+        if _q is not None:
+          self.transition_hints[str(_nms[0])] = np.asarray(_q, dtype=float).ravel().copy()
       # total allowed PENETRATION at validated configs (mr_bench semantics). 0.01 is the
       # historical default; pass ~0 (with --strict-collisions witnesses) for a plan whose
       # validated configs contain no tolerated penetration at all. Must be set BEFORE
@@ -1486,6 +1502,36 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
   except Exception:
     BidirectionalTree.__init__ = _tree_init
     raise
+  # Seed a pre-skill transition once with the full configuration already certified by the
+  # funnel IK. Crucially, this is a HINT: only task.robots remain constrained, and a hint that
+  # is stale in the accumulated attachment scene is discarded after one ordinary predicate
+  # call. mr_bench stays untouched on disk.
+  _transition_hints = dict(getattr(problem, "transition_hints", {}) or {})
+  if _transition_hints:
+    _sample_transition0 = planner.sample_transition_configuration
+    _hint_attempted = set()
+
+    def _sample_transition_with_hint(mode):
+      try:
+        _ids = planner.mode_validation.get_valid_next_ids(mode)
+        _task = problem.get_active_task(mode, _ids)
+        _key = (id(mode), str(_task.name))
+        _flat = _transition_hints.get(str(_task.name))
+        if _flat is not None and _key not in _hint_attempted:
+          _hint_attempted.add(_key)
+          _parts = [np.asarray(_flat, dtype=float)[problem.robot_idx[_r]].copy()
+                    for _r in problem.robots]
+          _q = type(problem.get_start_pos()).from_list(_parts)
+          if problem.is_collision_free(_q, mode):
+            return _q
+      except Exception:
+        pass
+      return _sample_transition0(mode)
+
+    planner.sample_transition_configuration = _sample_transition_with_hint
+    planner._sample_transition_config_fn = _sample_transition_with_hint
+    print(f"[mp/birrt] {len(_transition_hints)} full pre-keyframe transition hint(s) ACTIVE; "
+          "idle IK pins do not become task participants.")
   # Constructing new trees happens throughout plan(), so restoring here would only compact
   # the initial tree. Keep the class patched until the planner pull has finished below.
   print(f"[mp/birrt] compact mode trees ACTIVE: initial capacity "
@@ -1522,11 +1568,17 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
   info = dict(info or {})
   _modes = list(getattr(planner, "modes", ()) or ())
   info["frontier_modes"] = len(_modes)
+  info["frontier_leaves"] = sum(not getattr(_m, "next_modes", ()) for _m in _modes)
+  info["initial_solution_flag"] = bool(getattr(planner.operation, "init_sol", False))
+  info["mode_sampling_policy"] = str(getattr(cfg, "init_mode_sampling_type", "unknown"))
   info["frontier_task_ids"] = (
       [int(t) for t in np.atleast_1d(_modes[-1].task_ids)] if _modes else None)
   info["stalled"] = bool(getattr(ptc, "stalled", False))
   if verbose or stall_timeout is not None:
-    print(f"[mp/birrt] frontier: {info['frontier_modes']} modes, deepest task_ids "
+    print(f"[mp/birrt] frontier: {info['frontier_modes']} reached modes, "
+          f"{info['frontier_leaves']} leaf frontier(s), policy="
+          f"{info['mode_sampling_policy']}, init_sol={info['initial_solution_flag']}; "
+          "deepest task_ids "
           f"{info['frontier_task_ids']}"
           + (f" -- STALLED (no frontier growth for {stall_timeout:g}s)"
              if info["stalled"] else ""))
@@ -1882,6 +1934,92 @@ def mode_sequence(problem):
     combos = env.get_valid_next_task_combinations(m)
     task = env.get_active_task(m, combos[0] if combos else None)
     m = env.get_next_modes(goal_config(m, task), m)[0]
+
+
+def validate_nominal_keyframes(problem, tolerance=None, verbose=True):
+  """Validate the canonical task goals in the *accumulated exported attachment scene*.
+
+  Isolated RobotIK scenes rebuild every held object at its canonical grasp and every mate at
+  its ideal relative pose. mr_bench intentionally does something more physical: each pick,
+  handover, place, and assemble freezes the relation actually achieved at that mode switch.
+  Millimetre IK residuals can therefore accumulate until a later, individually-clean witness
+  puts a carried part through the table.  That was observed on OpenArm car-mini at
+  ``21_handover_a1_obj_0_13``: the isolated scene was clean, while the exported wheel was
+  1.22mm inside the table.
+
+  Walk the exact task/attachment chain, retaining every idle robot at its previous canonical
+  goal (unlike the diagnostic clearance report's deliberately conservative HOME pinning).
+  Only *intrinsic* pairs are charged: static geometry and bodies owned by robots constrained by
+  this task. A collision with an idle robot is not an invalid endpoint because simultaneous
+  multi-robot planning may move that robot away; naively carrying its preceding goal produced
+  exactly that false diagnosis. The check uses the planner's base penetration budget, not our
+  optional clearance-margin wrapper, so it is never stricter than motion planning itself.
+  Returns ``[(task_index, name, penetration, pairs), ...]`` for invalid goals.
+  """
+  env = problem
+  if tolerance is None:
+    tolerance = float(getattr(env, "collision_tolerance", 0.0) or 0.0)
+  q0 = env.get_start_pos()
+  conf_type = type(q0)
+  cur = [np.asarray(q0.robot_state(j), dtype=float).copy()
+         for j in range(len(env.robots))]
+  bad, m = [], env.start_mode
+  task_index = 0
+  def owner(frame):
+    """Robot whose kinematic subtree contains frame, including a carried part."""
+    try:
+      f, seen = env.C.getFrame(str(frame)), set()
+      while f is not None and f.name not in seen:
+        seen.add(f.name)
+        for r in env.robots:
+          if f.name == r or f.name.startswith(r + "_"):
+            return r
+        f = f.getParent()
+    except Exception:
+      pass
+    return None
+
+  while not env.is_terminal_mode(m):
+    combos = env.get_valid_next_task_combinations(m)
+    task = env.get_active_task(m, combos[0] if combos else None)
+    goal = np.asarray(_goal_q(task.goal, m), dtype=float).ravel()
+    off = 0
+    for r in task.robots:
+      j = env.robots.index(r)
+      n = int(env.robot_dims[r])
+      cur[j] = goal[off:off + n].copy()
+      off += n
+    q = conf_type.from_list([x.copy() for x in cur])
+    # Pose the exact accumulated mode and joints. Ignore the wrapper verdict here: positive
+    # robot/table margins are a path-shaping policy and may legitimately relax at a keyframe.
+    # The underlying total penetration is the shared hard geometric fact.
+    env.is_collision_free(q, m)
+    active = set(task.robots)
+    all_pairs = [(str(c[0]), str(c[1]), float(c[2])) for c in env.C.getCollisions()
+                 if float(c[2]) < 0.0]
+    pairs = sorted((p for p in all_pairs
+                    if owner(p[0]) in active | {None} and owner(p[1]) in active | {None}),
+                   key=lambda x: x[2])
+    pen = sum(-d for _fa, _fb, d in pairs)
+    if pen > float(tolerance):
+      bad.append((task_index, str(task.name), pen, pairs))
+      if verbose:
+        print(f"[export-chain-gate] task {task_index:02d} {task.name}: "
+              f"{pen * 1000:.2f}mm penetration exceeds the planner budget "
+              f"{float(tolerance) * 1000:.3f}mm")
+        for fa, fb, d in pairs[:6]:
+          print(f"    {fa} ~ {fb}: {d * 1000:+.2f}mm")
+    # get_next_modes is NOT a pure query: it appends the returned child to m.next_modes.
+    # This validator runs before BiRRT. Leaving the canonical chain installed made every
+    # subsequently reached mode look non-frontier, so mr_bench's 98%-frontier policy had an
+    # empty frontier set and degenerated to inverse-node-count sampling over all old modes.
+    # Preserve any caller-owned graph but detach the validation-only child immediately.
+    _saved_children = list(getattr(m, "next_modes", ()))
+    _next = env.get_next_modes(q, m)[0]
+    m.next_modes[:] = _saved_children
+    m = _next
+    task_index += 1
+  return bad
 
 
 def repair_mode_chain(path, chain, make_state, verbose=True):

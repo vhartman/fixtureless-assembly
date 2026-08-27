@@ -1,7 +1,9 @@
 # Floating collision proxy for the OpenArm v2 pinch hand.
 #
 # This has the same six free coordinates and frame API as the UR floating EEs, but its
-# approach is OpenArm's flange -z and its collision bodies mirror the real OpenArm .g files.
+# gripper_center follows the repository-wide convention (its +z is the grasp approach); the
+# 180deg tool rotation maps that convention onto OpenArm's physical flange -z.  Its collision
+# bodies mirror the real OpenArm .g files.
 # Grasp precomputation and the cheap scene gate must use this model: a Robotiq proxy has a
 # different palm length/finger sweep and admitted side grasps whose real OpenArm fingers pass
 # through the table.  The single-# collision candidates in left/right_openarm.g correspond to

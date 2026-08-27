@@ -45,7 +45,7 @@ franka_spine_0 (franka_spine): { mesh: 'meshes/accessories/franka_spine/visual/f
 franka_spine_support: { mass: 0.01, inertia: [0.0001 0.0 0.0 0.0001 0.0 0.0001],}
 mount_link: { mass: 4.093846, inertia: [0.0224318121 1.38076e-06 -0.0015719371 0.0164193182 -1.442621e-06 0.0217407036],}
 mount_link_0 (mount_link): { mesh: 'meshes/accessories/fr3_duo_mount/visual/fr3_duo_mount.dae', visual: true }
-mount_link_0 (mount_link): { rel: [0 0 0.068], mesh: 'meshes/accessories/fr3_duo_mount/visual/fr3_duo_cover.dae', visual: true }
+mount_cover_0 (mount_link): { rel: [0 0 0.068], mesh: 'meshes/accessories/fr3_duo_mount/visual/fr3_duo_cover.dae', visual: true }
 head_link: { mass: 1.0, inertia: [0.01 0.0 0.0 0.01 0.0 0.01],}
 head_link_0 (head_link): { mesh: 'meshes/accessories/fr3_duo_head/visual/fr3_duo_head.dae', visual: true }
 head_camera_mounting_point: { mass: 0.001, inertia: [0.001 0.0 0.0 0.001 0.0 0.001],}
@@ -88,7 +88,7 @@ lidar_rear_mounting_point_joint_origin (base_link): { Q: "t(-0.3275 -0.2175 0.19
 lidar_rear_mounting_point_joint (lidar_rear_mounting_point_joint_origin lidar_rear_mounting_point): { joint: rigid,}
 franka_spine_fixed_joint_origin (base_link): { Q: [0.138289 0.0 0.350] }
 franka_spine_fixed_joint (franka_spine_fixed_joint_origin franka_spine): { joint: rigid,}
-franka_spine_vertical_joint_origin (franka_spine): { Q: [0.266711 0.0 0.1] }
+franka_spine_vertical_joint_origin (franka_spine): { Q: [0.266711 0.0 0.3] }
 franka_spine_vertical_joint (franka_spine_vertical_joint_origin franka_spine_support): { joint: rigid}
 # franka_spine_vertical_joint (franka_spine_vertical_joint_origin franka_spine_support): { joint: rigid, limits: [0.0 0.85], ctrl_limits: [0.1 -1 100],}
 mount_joint (franka_spine_support mount_link): { joint: rigid,}

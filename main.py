@@ -39,6 +39,9 @@ _STANDARD_SEARCH_PROFILE = {
     "grasp_model": "asymmetric",
     "optimize_witnesses": "floor",
     "witness_margin": 0.005,
+    # A collision-free endpoint exactly on a hardware stop has no open neighbourhood for a
+    # sampling planner. OpenArm car-mini hit joint 7 with 3e-9 rad slack at its four-arm seat.
+    "witness_joint_margin": 0.02,
     "witness_branch_budget": 5,
     "witness_sets": 4,
     "tight_fingers": True,
@@ -115,7 +118,7 @@ _STANDARD_MOTION_PROFILE = {
     # Chair transit; no 30 s frontier-stall shortcut may silently truncate that budget.
     "mp_sequence": True,
     "mp_optimize": True,
-    "mp_runtime": 300.0,
+    "mp_runtime": 100.0,
     "mp_stall_timeout": None,
     # Fair complete-plan loop: four alternatives match the search's retained milestone
     # boundaries. 15,30,60,120,240,300 s gives every suspended plan both quick probes and the
@@ -1117,10 +1120,19 @@ def build_parser():
       "--witness-margin", type=float, default=0.005, metavar="M",
       help="SHARED SEARCH+WITNESS hard clearance: reject every IK whose posed scene has a "
            "non-intended arm/part, inter-robot, or non-adjacent self-collision pair closer "
-           "than M. Only the acting hand/target and each holder's own payload are exempt "
-           "(plus part/part and table pairs). The SAME gate runs during search and every "
+           "than M, plus payload/table clearance at free-pose handover/add_grasp skills. "
+           "Only the acting hand/target and each holder's own payload are exempt (plus other "
+           "part/part and table pairs). The SAME gate runs during search and every "
            "later witness/fusion/funnel solve, so post-processing is never stricter than "
            "search. Default 0.005m; 0 disables.",
+  )
+  g_witness.add_argument(
+      "--witness-joint-margin", type=float, default=None, metavar="RAD",
+      help="SHARED SEARCH+WITNESS joint-limit interior margin for coupled handover, add_grasp, "
+           "and assemble endpoints. Reject a selected joint closer than RAD to a hardware "
+           "limit, so the motion planner receives an open local neighbourhood instead of a "
+           "zero-measure boundary goal. Ordinary pick/place IK is unchanged. The standard "
+           "profile uses 0.02 rad; unset/0 disables.",
   )
   g_witness.add_argument(
       "--witness-branch-budget", type=int, default=5, metavar="N",
@@ -1844,7 +1856,7 @@ _SAVE_CONFIG_FIELDS = (
     "pre_pick", "pre_place", "pre_add_grasp", "post_release", # each SPLITS an action into tasks:
     # unsaved, a replay/sim rebuild has fewer tasks than the --mp-path it loads, and the path
     # indexes tasks by integer id. pre_insertion was already saved; these three were not.
-    "witness_margin", "witness_draw",                    # robust-keyframe gate + ladder
+    "witness_margin", "witness_joint_margin", "witness_draw", # robust-keyframe gates + ladder
     "witness_sets", "witness_set_spread",                # multi-witness goal sets
     # draw: both change which witnesses ship, so replays/reuse must match
     "ban_actions",                                       # shapes the PLAN (provenance +
@@ -1916,7 +1928,8 @@ _WITNESS_FIELDS = (
     "strict_collisions", "mate_eq_weight", "place_eq_weight", "mate_accuracy",
     "grasp_accuracy", "grasp_eq_weight",
     "ik_accuracy", "ik_seeding", "seed", "bracing", "handovers", "allow_place",
-    "tight_fingers", "part_float", "hoist_releases", "witness_margin", "witness_draw",
+    "tight_fingers", "part_float", "hoist_releases", "witness_margin",
+    "witness_joint_margin", "witness_draw",
     "witness_sets", "witness_set_spread",
     "grasp_sampler", "grasp_sampler_keep", "grasp_sampler_candidates", "grasp_sampler_seed",
     "grasp_sampler_version", "grasp_sampler_db_hash",
@@ -2938,8 +2951,15 @@ def run(cfg, explicit=None):
       robot_ik.clearance_reject = float(cfg.witness_margin)
       print(f"[flag] --witness-margin {cfg.witness_margin*1000:.0f}mm ACTIVE IN SEARCH + "
             "WITNESS PASSES: every accepted IK clears the same hard non-intended-pair gate "
-            "(arm/part, inter-robot and non-adjacent self-collision); later passes may rank "
-            "or diversify but cannot strengthen search feasibility.")
+            "(arm/part, inter-robot, non-adjacent self-collision, and free-pose "
+            "payload/table); later passes may rank or diversify but cannot strengthen search "
+            "feasibility.")
+    if cfg.witness_joint_margin is not None and robot_ik is not None:
+      robot_ik.joint_margin_reject = float(cfg.witness_joint_margin)
+      print(f"[flag] --witness-joint-margin {cfg.witness_joint_margin:g}rad ACTIVE IN SEARCH "
+            "+ WITNESS PASSES for coupled handover/add_grasp/assemble endpoints: IK keyframes "
+            "on/near a hardware stop are rejected before they become zero-neighbourhood "
+            "motion-planning goals; ordinary picks/places are unchanged.")
     if robot_ik is not None and cfg.mate_eq_weight is not None:
       robot_ik.mate_eq_weight = float(cfg.mate_eq_weight)
       print(f"[flag] --mate-eq-weight {cfg.mate_eq_weight:g}: assemble mate eq constraints "
@@ -3383,28 +3403,40 @@ def run(cfg, explicit=None):
               _cograsp_pre = dict(_frep.get("pre_witnesses") or {})
           require_complete_witnesses(plan, mp_wit,
                                      who="motion-plan witness export")
-          # LAST GATE: re-check the witnesses we are about to SHIP. Every earlier gate ran at
-          # SOLVE time, and the object that leaves here is not the object that was solved --
-          # optimize_witnesses* emits a splice and fuse_cograsp re-solves the pair again. A
-          # dirty mate keyframe must fail HERE, named, not surface as an unexplained motion-
-          # planner rejection three stages later.
-          if (_loaded_export is None and cfg.strict_mate_collisions
-              and robot_ik.penetration_reject is not None):
+          # LAST GATE: re-check EVERY IK keyframe we are about to SHIP. Every earlier gate ran
+          # at SOLVE time, and the object that leaves here is not necessarily the object that
+          # was solved -- optimize_witnesses* emits a splice and fuse_cograsp re-solves pairs.
+          # This used to inspect only assemble, allowing a handover to put its freely-held
+          # subassembly through the table and fail later as an unexplained "no path".
+          if robot_ik.penetration_reject is not None:
             from solver import validate_export_witnesses
             mp_wit, _bad = validate_export_witnesses(
                 C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
                 handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
-                baseline_witnesses=baseline_witnesses)
+                baseline_witnesses=(baseline_witnesses if _loaded_export is None else mp_wit))
             if _bad:
-              print(f"[export-gate] {len(_bad)} assemble witness(es) STILL penetrate after "
-                    f"falling back to the search's own witness -- the motion planner will "
-                    f"reject these keyframes:")
-              for _i, _act, _p, _ in _bad:
-                print(f"    step {_i} {_act[:4]}: {_p * 1000:.2f}mm "
-                      f"(gate {robot_ik.penetration_reject * 1000:.3f}mm)")
+              print(f"[export-gate] FAILURE: {len(_bad)} IK keyframe(s) exceed the search "
+                    f"collision gate; motion planning was NOT started:")
+              for _i, _act, _p, _, _why in _bad:
+                if _why is not None and _why[3] == "joint-limit":
+                  print(f"    step {_i} {_act[:4]}: {_why[0]} has only "
+                        f"{_why[2]:.6f}rad limit slack "
+                        f"(gate {robot_ik.joint_margin_reject:g}rad)")
+                elif _why is not None:
+                  print(f"    step {_i} {_act[:4]}: {_why[3]} pair {_why[0]} ~ {_why[1]} "
+                        f"has {_why[2] * 1000:.2f}mm clearance "
+                        f"(gate {robot_ik.clearance_reject * 1000:.1f}mm)")
+                else:
+                  print(f"    step {_i} {_act[:4]}: {_p * 1000:.2f}mm penetration "
+                        f"(gate {robot_ik.penetration_reject * 1000:.3f}mm)")
+              _hint = ("Regenerate the final motion export with this version; the loaded "
+                       "artifact is invalid." if _loaded_export is not None else
+                       "The persisted search witness is also invalid; retry the search so "
+                       "the action receives a clean witness.")
+              raise ValueError(f"motion export contains invalid IK keyframes. {_hint}")
             else:
-              print("[export-gate] every exported assemble keyframe is collision-free "
-                    "(only the intended mate contact exempt).")
+              print("[export-gate] every exported IK keyframe is collision-free "
+                    "(only intended skill contacts exempt).")
           # AFTER fusing: this pass never re-solves a SKILL witness, so a fused pair survives
           # untouched -- it only replaces the pre-* GOTO keyframes the exporter would solve.
           if _loaded_export is None:
@@ -3438,8 +3470,8 @@ def run(cfg, explicit=None):
                 handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing)
             _pre_pin_robots = dict(_prep.get("pin_robots") or {})
             if _pre_pin_robots:
-              print(f"[pre] preserving accepted idle-arm pins in "
-                    f"{len(_pre_pin_robots)} exported funnel task(s).")
+              print(f"[pre] {len(_pre_pin_robots)} accepted funnel solve(s) used idle-arm IK "
+                    "pins. They remain transition hints; idle arms are not task participants.")
           # The generic pre-skill pass knows how to pin an ordinary funnel, but the cograsp
           # pass solves the stronger three-arm rendezvous. Its accepted keyframes therefore
           # win for the paired assemble indices.
@@ -3489,6 +3521,20 @@ def run(cfg, explicit=None):
               raise ValueError(
                   f"final motion export task signature changed: saved {_want_sig}, rebuilt "
                   f"{_have_sig}; refusing to replay against different task semantics")
+          # The isolated witness gate above cannot see error accumulated by mr_bench's real
+          # attach semantics. Walk the canonical exported chain once before saving or planning:
+          # every idle arm retains its preceding goal, and every pick/mate/handover side effect
+          # is applied. A bad endpoint is not a narrow passage and no RRT budget can repair it.
+          _chain_bad = MP.validate_nominal_keyframes(
+              prob, tolerance=_export_collision_tolerance, verbose=True)
+          if _chain_bad:
+            _i, _nm, _p, _pairs = _chain_bad[0]
+            raise ValueError(
+                f"exported attachment chain has {len(_chain_bad)} collision-invalid "
+                f"keyframe(s); first is task {_i} {_nm} ({_p * 1000:.2f}mm). "
+                "The motion planner was not started. Retry the search/witness set; increasing "
+                "BiRRT runtime or collision tolerance does not repair an invalid endpoint.")
+          print("[export-chain-gate] canonical accumulated attachment chain is collision-free.")
           _export_settings = {
               "bracing": bool(_export_bracing), "depgraph": bool(_export_depgraph),
               "collision_tolerance": float(_export_collision_tolerance),

@@ -571,11 +571,17 @@ class RobotIK:
     # accepted search IK and every later witness re-solve uses this SAME predicate; a post-pass
     # is never allowed to invent a stricter notion of feasibility than the discrete search.
     # The gate covers every non-intended arm/part, inter-arm and non-adjacent self-collision
-    # pair reported by rai. Only pair-specific grasp contacts are exempt (a hand touching the
-    # payload attached to THAT hand, or the acting hand touching THIS action's grasp target),
-    # plus part/part and table pairs. This hard minimum complements witness_floor's summed
-    # robot/table score: many far pairs can no longer hide one measure-near-zero pair.
+    # pair reported by rai. It also keeps a payload clear of the table at handover/add_grasp:
+    # those skills choose a free world pose, so table-skimming is never necessary and leaves
+    # no robustness to accumulated attach residuals. Pick/place table contact stays intended.
+    # Only pair-specific grasp contacts are exempt (a hand touching the payload attached to
+    # THAT hand, or the acting hand touching THIS action's grasp target), plus other part/part
+    # and table pairs. This hard minimum complements witness_floor's summed robot/table score.
     self.clearance_reject = None
+    # Joint-space sibling of --witness-margin. A feasible IK exactly on a hardware stop is a
+    # zero-measure goal for BiRRT (OpenArm car-mini: 3e-9 rad slack on joint 7); reject it in
+    # search so another branch/witness/plan is tried, rather than diagnosing it after export.
+    self.joint_margin_reject = None
     self.margin_rejects = 0
     self.margin_reject_pairs = {}
     self.last_margin_reject = None
@@ -1374,6 +1380,16 @@ class RobotIK:
     ra, rb = self._arm_of_frame(fa), self._arm_of_frame(fb)
     pa, pb = self._part_of_frame(fa), self._part_of_frame(fb)
 
+    # A handover/add_grasp has a free object world pose. Require the same nominal margin the
+    # search already applies elsewhere rather than accepting a table-skimming keyframe. On
+    # OpenArm car-mini the nominal wheel gap was 0.10mm; accumulated achieved-grasp residuals
+    # turned it into 1.22mm penetration in mr_bench's real attachment chain.
+    action = tuple(self._cur_action or ())
+    if action and action[0] in ("handover", "add_grasp"):
+      part = pb if fa == "table" else pa if fb == "table" else None
+      if part is not None and any(self._part_is_payload_of(C, part, r) for r in self.robots):
+        return "payload-table"
+
     if ra is not None and rb is not None:
       if ra != rb:
         return "inter-robot"
@@ -1395,21 +1411,45 @@ class RobotIK:
     return None
 
   def _clearance_ok(self, C, q):
-    """Shared search/witness hard clearance gate (see ``clearance_reject`` above)."""
+    """Shared search/witness workspace + joint-interior gate."""
     M = self.clearance_reject
-    if M is None or M <= 0.0 or C is None or q is None:
+    # A joint-interior neighbourhood matters for coupled endpoints, where a boundary
+    # realization can turn the following multi-arm motion-planning goal into a
+    # zero-measure target.  Applying this to ordinary single-arm picks needlessly throws
+    # away otherwise useful grasps (and made the first OpenArm car-mini pick dominate the
+    # search).  Pre-assembly funnel witnesses retain the underlying ``assemble`` action,
+    # so the endpoint that exposed the OpenArm wrist-limit problem is still covered.
+    action = tuple(self._cur_action or ())
+    J = (getattr(self, "joint_margin_reject", None)
+         if action and action[0] in ("handover", "add_grasp", "assemble") else None)
+    if ((M is None or M <= 0.0) and (J is None or J <= 0.0)) or C is None or q is None:
       return True
     saved = C.getJointState()
-    C.setJointState(np.asarray(q, dtype=float))
+    qv = np.asarray(q, dtype=float)
+    C.setJointState(qv)
     bad = None
-    for c in C.getCollisions(M):
-      fa, fb, d = c[0], c[1], float(c[2])
-      if d >= M:
-        continue
-      reason = self._clearance_pair_reason(C, fa, fb)
-      if reason is not None:
-        bad = (str(fa), str(fb), d, reason)
-        break
+    if J is not None and J > 0.0:
+      try:
+        lo, hi = (np.asarray(x, dtype=float).ravel() for x in C.getJointLimits())
+        qflat = qv.ravel()
+        if lo.size == hi.size == qflat.size:
+          slack = np.minimum(qflat - lo, hi - qflat)
+          k = int(np.argmin(slack))
+          if slack[k] < J:
+            names = list(C.getJointNames())
+            bad = (names[k] if k < len(names) else f"joint[{k}]", "hardware-limit",
+                   float(slack[k]), "joint-limit")
+      except Exception:
+        pass
+    if bad is None and M is not None and M > 0.0:
+      for c in C.getCollisions(M):
+        fa, fb, d = c[0], c[1], float(c[2])
+        if d >= M:
+          continue
+        reason = self._clearance_pair_reason(C, fa, fb)
+        if reason is not None:
+          bad = (str(fa), str(fb), d, reason)
+          break
     C.setJointState(saved)
     if bad is not None:
       self.margin_rejects += 1
@@ -3451,7 +3491,7 @@ def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
                               gripper_kind=None, handovers=True, allow_place=True,
                               bracing=False, grasp_table=None, tol=None, verbose=True,
                               baseline_witnesses=None):
-  """LAST GATE before mp_export: is the witness we are about to SHIP collision-free?
+  """LAST GATE before mp_export: is every IK keyframe we are about to SHIP collision-free?
 
   Every earlier gate checks a witness at the moment it is SOLVED. Nothing checked the one that
   actually leaves the pipeline -- and it is rarely the same object: `optimize_witnesses*` emits
@@ -3459,11 +3499,18 @@ def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
   re-solves the pair again afterwards. Measured on cross-12: mate keyframes reached mp_export
   with a part 4.7mm inside an arm while the search reported zero dirty witnesses.
 
-  For each assemble, measures the mate scene pair-wise (only the intended moving<->target
-  contact is exempt). If the shipped witness is dirty but the SEARCH's own witness is clean,
-  swaps it back. Whatever is still dirty is returned as a violation list so the caller can fail
-  loudly at the boundary instead of handing the motion planner a keyframe it will reject.
-  Returns (witnesses, [(step, action, penetration_m, swapped_bool), ...])."""
+  Rebuilds the exact predecessor scene for every IK-bearing action.  Assemble is measured
+  pair-wise (only the intended moving<->target contact is exempt); the other skills use the
+  same total-penetration test and intended-contact settings as their IK solve.  This matters for
+  handovers in particular: their held object has a free world pose, so witness optimisation can
+  otherwise lower it through the table while keeping both end-effectors at a valid grasp.
+
+  If the shipped witness is dirty but the SEARCH's own witness is clean, swaps it back.  This
+  function never re-solves IK: replay/export must remain deterministic, and a loaded artifact
+  with no clean persisted baseline fails closed. Whatever is still dirty is returned as a
+  violation list so the caller can reject it at the boundary instead of handing the motion
+  planner a keyframe it will reject.
+  Returns (witnesses, [(step, action, penetration_m, swapped_bool, reason), ...])."""
   if tol is None:
     tol = robot_ik.penetration_reject
   if tol is None:
@@ -3476,25 +3523,49 @@ def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
   bad = []
   for i, a in enumerate(plan):
     act = tuple(a)
-    if act[0] != "assemble" or out[i] is None:
+    if act[0] not in _IK_ACTIONS or out[i] is None:
       continue
-    part, onto = act[2], act[3]
-    moving = frozenset(next((g for g in states[i].subassemblies() if part in g), (part,)))
-    target = frozenset(next((g for g in states[i].subassemblies() if onto in g), (onto,)))
     Ci = robot_ik.scene_for(states[i], assembly)
-    if not robot_ik.keep_contacts:
-      for mp in moving:
-        set_part_contact(Ci, mp, 0)                       # same exclusion the solve used
+    moving = target = None
+    if act[0] == "assemble":
+      part, onto = act[2], act[3]
+      moving = frozenset(next((g for g in states[i].subassemblies() if part in g), (part,)))
+      target = frozenset(next((g for g in states[i].subassemblies() if onto in g), (onto,)))
+      if not robot_ik.keep_contacts:
+        for mp in moving:
+          set_part_contact(Ci, mp, 0)                     # same exclusion the solve used
+    elif not robot_ik.keep_contacts and act[0] in ("pick", "add_grasp", "handover"):
+      set_part_contact(Ci, act[2], 0)                     # intended gripper<->part contact
 
     def pen_of(q):
       Ci.setJointState(np.asarray(q, dtype=float).ravel())
-      return robot_ik.mate_penetration(Ci, moving, target)
+      if act[0] == "assemble":
+        return robot_ik.mate_penetration(Ci, moving, target)
+      return float(Ci.getCollisionsTotalPenetration())
+
+    def verdict(q):
+      p = pen_of(q)
+      clear = True
+      reason = None
+      gate = getattr(robot_ik, "_clearance_ok", None)
+      if gate is not None:
+        old_action = getattr(robot_ik, "_cur_action", None)
+        robot_ik._cur_action = act
+        try:
+          clear = bool(gate(Ci, np.asarray(q, dtype=float).ravel()))
+          if not clear:
+            reason = getattr(robot_ik, "last_margin_reject", None)
+        finally:
+          robot_ik._cur_action = old_action
+      return p, clear, reason
 
     # MATE RESIDUAL: what the witness ACTUALLY achieves for positionRel(part, onto). This is
     # the number mr_bench bakes in -- C.attach preserves the current WORLD pose at the mode
     # switch, so the exported assembly inherits exactly this error and then disagrees with our
     # scene (which re-seats at the ideal). Measured cross-12: a constant 3.08mm.
     try:
+      if act[0] != "assemble":
+        raise LookupError                                  # mate residual has no meaning here
       Ci.setJointState(np.asarray(out[i], dtype=float).ravel())
       _v, _ = Ci.eval(ry.FS.positionRel, [part, onto])
       _ideal = np.asarray(assembly.relative_pose(part)[1], dtype=float)
@@ -3514,7 +3585,7 @@ def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
             _w2 = baseline_witnesses[i]
             _ok2 = _w2 is not None
           else:
-            _ok2, _w2 = robot_ik.bind(act, states[i], states[i + 1], assembly)
+            _ok2, _w2 = False, None                    # validation never re-solves IK
           if _ok2 and _w2 is not None:
             Ci.setJointState(np.asarray(_w2, dtype=float).ravel())
             _v2, _ = Ci.eval(ry.FS.positionRel, [part, onto])
@@ -3526,20 +3597,23 @@ def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
               f"(dx={_dv[0]:+.2f} dy={_dv[1]:+.2f} dz={_dv[2]:+.2f}) vs BIND {_bres:.2f}mm")
     except Exception:
       pass
-    p = pen_of(out[i])
-    if p <= tol:
+    p, clear, reason = verdict(out[i])
+    if p <= tol and clear:
       continue
     swapped = False
     if baseline_witnesses is not None:
       w0 = baseline_witnesses[i]
       ok = w0 is not None
     else:
-      ok, w0 = robot_ik.bind(act, states[i], states[i + 1], assembly)
-    if ok and w0 is not None and pen_of(w0) <= tol:
+      # Do not turn replay/export into another stochastic IK solve. A loaded final export has
+      # no baseline by design; if it is dirty the caller must regenerate it with the fixed gate.
+      ok, w0 = False, None
+    p0, clear0, _reason0 = verdict(w0) if ok and w0 is not None else (float("inf"), False, None)
+    if ok and w0 is not None and p0 <= tol and clear0:
       out[i] = np.asarray(w0, dtype=float).ravel().copy()  # the search's own clean witness
-      swapped, p = True, pen_of(out[i])
+      swapped, p, reason = True, p0, None
     else:
-      bad.append((i, act, p, swapped))
+      bad.append((i, act, p, swapped, reason))
       continue
     if verbose:
       print(f"  [export-gate] step {i} {act[:4]}: shipped witness was dirty -- "

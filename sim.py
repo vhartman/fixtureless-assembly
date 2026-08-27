@@ -5243,6 +5243,9 @@ def _cli_run(a):
     _wm = _saved(cfg, "witness_margin")
     if _wm is not None:
       rik.clearance_reject = float(_wm)   # robust-keyframe gate, as exported
+    _wjm = _saved(cfg, "witness_joint_margin")
+    if _wjm is not None:
+      rik.joint_margin_reject = float(_wjm)
     if _saved(cfg, "witness_robot_collisions", legacy=False):
       rik.strip_inactive_collision = False
     _sc = _saved(cfg, "strict_collisions", legacy=None)
