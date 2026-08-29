@@ -28,12 +28,21 @@ _STANDARD_SEARCH_PROFILE = {
     "milestone_oracle": "structural",
     "fill_local_h": True,
     "fill_exact": True,
+    # Experimental CEGAR precursor: a strict shortest-PDB policy is often spurious under
+    # fixed-base IK (OpenArm Car-mini needs an abstract-cost +5 presentation detour).  Keep
+    # the probe available, but do not make a failed strict concretization part of standard
+    # until abstract counterexamples can be repaired instead of merely falling through.
+    "fill_policy_first": False,
     "fill_skeleton_first": False,
     "milestone_boundaries": 4,
     "fill_scope_widening": True,
     "fill_touch_all": False,
     "sig_collapsed_h": True,
     "sig_components": "press",
+    # Raw-grasp guidance complementary to the uniformly projected local PDB: prefer grasps
+    # that are both present at the mate geometry and can transmit this part's insertion load.
+    # It is ordering plus an admissible forced-regrasp cost only; no action is removed.
+    "useful_grasps": True,
     "real_ik": True,
     "wrench": True,
     "grasp_model": "asymmetric",
@@ -69,6 +78,10 @@ _STANDARD_SEARCH_PROFILE = {
     "open_witness": True,
     "open_witness_batch": 7,
     "open_witness_epochs": 2,
+    # LazySP edge selection only. Keep the measured prefix-first baseline in standard:
+    # suffix-first reduced validation count on UR5 but made OpenArm's costly mate bundles
+    # dominate (5537 vs 3490 binds on Car-mini obj_1). Alternatives remain explicit ablations.
+    "lazy_edge_selector": "forward",
     "analytic_seed_cap": None,
     # Hybrid V2 grasp DB: conventional primitive grasps remain a stable prefix and mesh-
     # sampled candidates add off-centre/wrap alternatives. Exact state gates stay authoritative.
@@ -161,7 +174,8 @@ def build_parser():
   parser.add_argument(
       "--search-profile", choices=tuple(_SEARCH_PROFILES), default=None, metavar="NAME",
       help="Named fresh-search defaults: standard = robust 5mm witness contract + weight-one "
-           "structural milestones + exact uniform local-PDB fills + bounded fair open witnesses; "
+           "structural milestones + exact uniform local-PDB fills + non-pruning useful-grasp "
+           "guidance + bounded fair open witnesses; "
            "open = compatibility alias for standard; fast-open = standard plus "
            "--analytic-seed-cap 3 (aggressive/experimental). A profile "
            "is opt-in. Precedence is explicit flag > profile > --config file > built-ins, and "
@@ -217,14 +231,23 @@ def build_parser():
            "two-finger grippers on the table's -y edge (--num-robots is forced to 2; "
            "EXPERIMENTAL: no analytic IK yet, validation runs the precheck+KOMO path). "
            "or openarm -- static OpenArm v2 humanoid duo(s) with pinch grippers "
-           "(fingers deactivated open; --num-robots 2 or 4). With --floating-ee the arm is "
-           "irrelevant (a generic floating gripper); it matters for the real arm (no --floating-ee "
+           "(fingers deactivated open; --num-robots 2 or 4). With --floating-ee this keeps "
+           "the native OpenArm pinch/tool geometry but replaces each arm by six free joints; "
+           "the arm choice matters for the real arm (no --floating-ee "
            "/ --real-ik) -- note the ur5 has a much shorter reach (~0.85 m vs ~1.3 m).",
   )
   g_scene.add_argument(
       "--robot-types", default=None,
       help="Advanced: comma-free per-slot override of the robot type (defaults to --robot for "
            "every slot). Rarely needed.",
+  )
+  g_scene.add_argument(
+      "--openarm-real-finger-radius-scale", type=float, default=1.0, metavar="S",
+      help="DIAGNOSTIC for --robot openarm: multiply only the REAL arm's 15mm finger-"
+           "collision capsule radii by S in (0,1]. The floating grasp/closure proxy stays "
+           "nominal, so fixed-plan A/B tests keep identical grasp ids. Not enabled by any "
+           "profile; if a smaller value is accepted as model calibration, update the real "
+           "and floating geometries together instead.",
   )
   g_scene.add_argument(
       "--perturb-start-pose", action="store_true",
@@ -307,6 +330,21 @@ def build_parser():
       help="GRASP CATALOG in viser (add --viser): one scrubbable step per part showing every "
            "candidate grasp as a floating EE (green=flat / orange=curved surface; with "
            "--wrench, green=mate-viable / grey=not). No search. Prints per-part counts.",
+  )
+  g_viz.add_argument(
+      "--viz-initial-grasps", nargs="?", const="all", default=None, metavar="PART",
+      help="INITIAL-SCENE CHEAP-GATE CATALOG in viser (add --viser): one scrubbable step "
+           "per grasp that passes both the floating-EE pick collision check and virtual jaw "
+           "closure, with the actual table, clutter and gripper geometry at the inferred "
+           "closed aperture. Optionally name one PART; omitting PART shows all. SSIK and "
+           "KOMO are not run.",
+  )
+  g_viz.add_argument(
+      "--viz-grasp-closure", metavar="ROBOT:PART:GRASP", default=None,
+      help="Visualize the virtual two-finger closure certificate for one grasp in the "
+           "INITIAL scene. Records the fixed-open receiver through its inferred bilateral-"
+           "contact aperture, including per-step target distances and any sweep blocker. "
+           "Use with --viser for a scrubbable web view. No search.",
   )
   g_viz.add_argument(
       "--viz-rest-poses", action="store_true",
@@ -478,6 +516,19 @@ def build_parser():
            "best-ranked exact branches (shallowest collision first) instead of all of "
            "them. Cuts the seeded-solve cost on binds whose branch set is large and "
            "mostly colliding; None = legacy behaviour (all branches).",
+  )
+  g_ik.add_argument(
+      "--ssik-seed-neighborhood", type=float, default=0.0, metavar="M",
+      help="With --real-ik and calibrated SSIK: when the exact target has no physical-limit "
+           "branch, or all exact branches lie inside the required witness joint margin, "
+           "also seed KOMO from deterministic Cartesian neighbours up to M metres away. "
+           "These are initialization hints only: KOMO still solves and validates the original "
+           "target, and an empty neighbourhood never rejects an action. 0 disables.",
+  )
+  g_ik.add_argument(
+      "--ssik-neighborhood-cap", type=int, default=6, metavar="K",
+      help="Maximum number of additional near-target SSIK configurations supplied to one "
+           "KOMO bind by --ssik-seed-neighborhood (default 6).",
   )
   g_phys.add_argument(
       "--dense-grasps", action="store_true",
@@ -866,6 +917,15 @@ def build_parser():
            "stops after SECONDS (default 60, measured from the first failure) or 300 "
            "entries, whichever first.",
   )
+  g_diag.add_argument(
+      "--diagnose-plan-rank", default=None, metavar="PLAN.json",
+      help="Replay a known feasible symbolic plan under the current successor model and, "
+           "inside each matching milestone fill, report when every demonstrated state is "
+           "popped by the actual optimistic local A*: g/h/f, pop rank, lower/equal-f "
+           "states ahead of it, and the demonstrated successor's local rank. IK is not "
+           "re-solved by the diagnostic. The ordinary search still runs; this is an "
+           "explicit, potentially expensive search-order diagnostic.",
+  )
   g_search.add_argument(
       "--collapsed-h", action="store_true",
       help="Use the IDENTITY-COLLAPSED labeled disassembly heuristic (loose held parts "
@@ -947,6 +1007,17 @@ def build_parser():
            "immediately; later edges are not speculatively probed.",
   )
   g_search.add_argument(
+      "--lazy-edge-selector", choices=("forward", "terminal-first", "reverse", "fail-first"),
+      default="forward", metavar="POLICY",
+      help="IK-edge selection inside an optimistic lazy-fill candidate: forward preserves "
+           "the historical prefix-first order; terminal-first certifies the candidate's "
+           "last concrete assemble mode, then validates its prefix forward; reverse validates "
+           "the whole path suffix-first; "
+           "fail-first validates previously failed exact (action, scene) queries first and "
+           "otherwise falls back to reverse. This changes validation order only, never "
+           "successors, costs, or failure semantics. Standard keeps measured forward order.",
+  )
+  g_search.add_argument(
       "--lns-segments", action="store_true",
       help="LNS neighborhood unit = SETTLED segments instead of the default OBJECT unit "
            "(k = consecutive mated parts). Baseline/ablation; segments coarsen unevenly "
@@ -987,6 +1058,15 @@ def build_parser():
            "--weight. Also removes the ordinary 200-plan lazy-repair cutoff; node/deadline "
            "limits still apply. IK remains lazy and fully validated. Enabled together with "
            "--fill-local-h by --search-profile standard.",
+  )
+  g_search.add_argument(
+      "--fill-policy-first", action=argparse.BooleanOptionalAction, default=False,
+      help="Before an unrestricted local fill, refine the shortest paths of its exact "
+           "goal-conditioned PDB using ordinary concrete successors and the ordinary "
+           "cheap/IK/open-witness gates. Only quotient-changing Bellman-optimal abstract "
+           "transitions are admitted; there is no hand-written action or length bound. A "
+           "failed/spurious abstract policy falls through to the complete local fill. "
+           "Requires --fill-local-h. Experimental and not enabled by a profile.",
   )
   g_search.add_argument(
       "--fill-skeleton-first", action=argparse.BooleanOptionalAction, default=False,
@@ -1122,7 +1202,9 @@ def build_parser():
            "non-intended arm/part, inter-robot, or non-adjacent self-collision pair closer "
            "than M, plus payload/table clearance at free-pose handover/add_grasp skills. "
            "Only the acting hand/target and each holder's own payload are exempt (plus other "
-           "part/part and table pairs). The SAME gate runs during search and every "
+           "part/part and table pairs). At coupled endpoints, task-participant hands and the "
+           "acting hand versus the rigid mate-target group retain strict collision but not "
+           "the free-space margin. The SAME gate runs during search and every "
            "later witness/fusion/funnel solve, so post-processing is never stricter than "
            "search. Default 0.005m; 0 disables.",
   )
@@ -1132,7 +1214,8 @@ def build_parser():
            "and assemble endpoints. Reject a selected joint closer than RAD to a hardware "
            "limit, so the motion planner receives an open local neighbourhood instead of a "
            "zero-measure boundary goal. Ordinary pick/place IK is unchanged. The standard "
-           "profile uses 0.02 rad; unset/0 disables.",
+           "profile uses 0.02 rad; unset/0 disables. Arm-less --floating-ee pose coordinates "
+           "are not hardware joints and are exempt.",
   )
   g_witness.add_argument(
       "--witness-branch-budget", type=int, default=5, metavar="N",
@@ -1171,6 +1254,14 @@ def build_parser():
            "the tool centre, so it pokes out the far side of small parts and is what forces "
            "--part-float. Applied to the real scene, the cheap-EE scenes and the grasp "
            "precompute alike (they must agree). Changes which grasps survive the DB filter.",
+  )
+  g_search.add_argument(
+      "--grasp-closure-check", action=argparse.BooleanOptionalAction, default=False,
+      help="Collision-only virtual close certificate for two-finger pick/handover/add_grasp. "
+           "Finger joints stay DISABLED: a temporary proxy sweeps from the fixed-open model "
+           "to the object-dependent bilateral-contact aperture and rejects a sweep through "
+           "another gripper, part, table, or arm. Vacuum is unchanged. Saved with plans; "
+           "--no-grasp-closure-check reproduces legacy fixed-open semantics.",
   )
   g_search.add_argument(
       "--place-eq-weight", type=float, default=100.0, metavar="W",
@@ -1271,12 +1362,13 @@ def build_parser():
            "press-heavy configs. Default off.",
   )
   g_search.add_argument(
-      "--useful-grasps", action="store_true",
+      "--useful-grasps", action=argparse.BooleanOptionalAction, default=False,
       help="SPEC 6.2 (reduced): compute each part's MATE-VIABLE grasp set U[p] (collision-"
            "free at the op x press-transmitting per kind, wrench-aware) and (a) ORDER every "
            "pick/handover candidate U-first -- the transit gradient -- and (b) price a held "
            "non-U grasp at +1 in the milestone fill h (the forced regrasp, admissible). "
-           "Ordering + pricing only; nothing is removed -- completeness untouched. Default off.",
+           "Ordering + pricing only; nothing is removed -- completeness untouched. Enabled "
+           "by --search-profile standard; --no-useful-grasps is the matched ablation.",
   )
   g_search.add_argument(
       "--fill-scope-widening", action=argparse.BooleanOptionalAction, default=False,
@@ -1423,7 +1515,8 @@ def build_parser():
       help="Default ON (2026-07-29). During --optimize-witnesses, keep the OTHER robots' collision geometry ON (the "
            "search strips it on solo steps for speed). Re-solved witnesses then AVOID the idle "
            "arms instead of passing through them -- important before motion planning, where "
-           "mr_bench validates every arm. Note idle arms are at HOME in the witness scene.",
+           "mr_bench validates every arm. Note idle arms are at the manipulation EXIT pose "
+           "in the witness scene.",
   )
   g_witness.add_argument(
       "--fuse-cograsp", action=argparse.BooleanOptionalAction, default=True,
@@ -1851,6 +1944,8 @@ _SAVE_CONFIG_FIELDS = (
     "grasp_sampler_wrap",                                 # curvature-fair support metric (None = legacy)
     "grasp_sampler_scenes",                              # scene-aware set split (rebinds ids)
     "tight_fingers",                                     # changes what the grasp DB filters out
+    "openarm_real_finger_radius_scale",                  # diagnostic real-arm IK geometry
+    "grasp_closure_check",                               # virtual close changes grasp-edge feasibility
     "ik_seeding",                                        # off => witness IK fails on re-picks/
     # reorienting places, and mp_export then exports the arm's PREVIOUS config as the goal
     "pre_pick", "pre_place", "pre_add_grasp", "post_release", # each SPLITS an action into tasks:
@@ -1894,9 +1989,11 @@ _SAVE_CONFIG_FIELDS = (
     # resolved values rather than only a named-profile label: profiles may evolve, whereas a
     # paper artifact must keep the semantics it was actually solved under.
     "weight", "milestones", "goal_on_table", "milestone_oracle", "fill_local_h", "fill_exact",
-    "fill_skeleton_first", "milestone_boundaries", "fill_scope_widening", "fill_touch_all",
+    "fill_policy_first", "fill_skeleton_first", "milestone_boundaries",
+    "fill_scope_widening", "fill_touch_all",
     "fill_window", "lazy_fills", "open_witness", "open_witness_batch",
-    "open_witness_epochs", "analytic_seed_cap", "fail_order", "empty_seed_refutes",
+    "open_witness_epochs", "lazy_edge_selector", "analytic_seed_cap", "ssik_seed_neighborhood",
+    "ssik_neighborhood_cap", "fail_order", "empty_seed_refutes",
     "wrench_aware_h", "sig_collapsed_h", "sig_components",
 )
 
@@ -1927,8 +2024,9 @@ _WITNESS_FIELDS = (
     "witness_reconfig_thresh", "witness_clearance", "witness_robot_collisions",
     "strict_collisions", "mate_eq_weight", "place_eq_weight", "mate_accuracy",
     "grasp_accuracy", "grasp_eq_weight",
-    "ik_accuracy", "ik_seeding", "seed", "bracing", "handovers", "allow_place",
-    "tight_fingers", "part_float", "hoist_releases", "witness_margin",
+    "ik_accuracy", "ik_seeding", "ssik_seed_neighborhood", "ssik_neighborhood_cap",
+    "seed", "bracing", "handovers", "allow_place",
+    "tight_fingers", "openarm_real_finger_radius_scale", "part_float", "hoist_releases", "witness_margin",
     "witness_joint_margin", "witness_draw",
     "witness_sets", "witness_set_spread",
     "grasp_sampler", "grasp_sampler_keep", "grasp_sampler_candidates", "grasp_sampler_seed",
@@ -2013,6 +2111,7 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         collapsed_h=cfg.collapsed_h, grasp_collapsed_h=cfg.grasp_collapsed_h,
         fill_window=cfg.fill_window, milestone_oracle=cfg.milestone_oracle,
         fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
+        fill_policy_first=cfg.fill_policy_first,
         fill_skeleton_first=cfg.fill_skeleton_first,
         fill_scope_widening=cfg.fill_scope_widening,
         milestone_boundaries=cfg.milestone_boundaries)
@@ -2051,6 +2150,7 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
                                              lazy_fills=cfg.lazy_fills,
                                              fill_local_h=cfg.fill_local_h,
                                              fill_exact=cfg.fill_exact,
+                                             fill_policy_first=cfg.fill_policy_first,
                                              fill_skeleton_first=cfg.fill_skeleton_first,
                                              chain_h=cfg.optimistic_chain_h,
                                              grasp_collapsed_h=cfg.grasp_collapsed_h,
@@ -2078,6 +2178,7 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         sig_collapsed_h=cfg.sig_collapsed_h, fill_window=cfg.fill_window,
         lazy_fills=cfg.lazy_fills, milestone_oracle=cfg.milestone_oracle,
         fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
+        fill_policy_first=cfg.fill_policy_first,
         fill_skeleton_first=cfg.fill_skeleton_first,
         fill_scope_widening=cfg.fill_scope_widening,
         milestone_boundaries=cfg.milestone_boundaries)
@@ -2110,6 +2211,7 @@ def _milestone_candidate_session(cfg, C, assembly, robots, robot_ik):
       sig_collapsed_h=cfg.sig_collapsed_h, fill_window=cfg.fill_window,
       lazy_fills=cfg.lazy_fills, milestone_oracle=cfg.milestone_oracle,
       fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
+      fill_policy_first=cfg.fill_policy_first,
       fill_skeleton_first=cfg.fill_skeleton_first,
       fill_scope_widening=cfg.fill_scope_widening,
       milestone_boundaries=cfg.milestone_boundaries)
@@ -2453,6 +2555,7 @@ def run(cfg, explicit=None):
           f"witness-margin={float(cfg.witness_margin or 0.0)*1000:g}mm, "
           f"open-witness={'on' if cfg.open_witness else 'off'}"
           + (f" batch={cfg.open_witness_batch} epochs={cfg.open_witness_epochs}"
+             f" selector={cfg.lazy_edge_selector}"
              if cfg.open_witness else "")
           + f", analytic-seed-cap={cfg.analytic_seed_cap or 'all'}. "
           "Explicit individual flags remain authoritative.")
@@ -2564,10 +2667,33 @@ def run(cfg, explicit=None):
   if cfg.tight_fingers:
     from env import set_tight_fingers
     set_tight_fingers(True)
-    print("[flag] --tight-fingers ACTIVE: finger COLLISION capsules shrunk to "
-          "robotiq_tight.g's radius (20mm -> 10mm, shifted 8mm so the grip surface holds). "
-          "The fat proxy reaches 32.9mm past the tool centre -- it is what pokes out the far "
-          "side of small parts and what forces --part-float.")
+    if cfg.robot == "openarm":
+      print("[flag] --tight-fingers requested: OpenArm keeps its native calibrated pinch "
+            "capsules (the Robotiq-only tightening transform does not apply).")
+    else:
+      print("[flag] --tight-fingers ACTIVE: finger COLLISION capsules shrunk to "
+            "robotiq_tight.g's radius (20mm -> 10mm, shifted 8mm so the grip surface holds). "
+            "The fat proxy reaches 32.9mm past the tool centre -- it is what pokes out the far "
+            "side of small parts and what forces --part-float.")
+  from env import set_openarm_real_finger_radius_scale
+  set_openarm_real_finger_radius_scale(cfg.openarm_real_finger_radius_scale)
+  if cfg.openarm_real_finger_radius_scale != 1.0:
+    if cfg.robot != "openarm":
+      raise ValueError("--openarm-real-finger-radius-scale only applies to --robot openarm")
+    print(f"[diag] --openarm-real-finger-radius-scale "
+          f"{cfg.openarm_real_finger_radius_scale:g}: REAL OpenArm finger capsule radius "
+          f"15mm -> {15.0 * cfg.openarm_real_finger_radius_scale:g}mm; sampled grasps and "
+          "the floating closure proxy remain nominal for a controlled A/B test.")
+  from solver import set_grasp_closure_check
+  _closure_active = bool(cfg.grasp_closure_check or cfg.viz_initial_grasps is not None)
+  set_grasp_closure_check(_closure_active)
+  if cfg.grasp_closure_check:
+    print("[flag] --grasp-closure-check ACTIVE: two-finger pick/handover/add_grasp use a "
+          "collision-only virtual jaw sweep to their object-dependent common aperture; "
+          "finger joints remain disabled.")
+  elif cfg.viz_initial_grasps is not None:
+    print("[initial-grasp-viz] closure enabled during scene-aware DB construction so the "
+          "catalog uses the same candidate IDs/ranking as a closure-enabled search.")
   set_brace_for_assembly_only(cfg.brace_for_assembly_only)
   set_extra_place_cells(cfg.place_cells)
   set_prefer_center(cfg.prefer_center)
@@ -2589,9 +2715,13 @@ def run(cfg, explicit=None):
     set_brace_resting(True)
     print("[flag] --brace-resting ACTIVE: resting assemblies may be braced (add_grasp), "
           "matching the abstraction's resting+braced states.")
+  # Reset both switches on every in-process run. A standard-profile run must not leak this
+  # ordering into a later --no-useful-grasps ablation in the same benchmark worker.
+  from problem import set_useful_grasps_enabled, set_useful_grasps
+  set_useful_grasps_enabled(cfg.useful_grasps)
+  if not cfg.useful_grasps:
+    set_useful_grasps(None)
   if cfg.useful_grasps:
-    from problem import set_useful_grasps_enabled
-    set_useful_grasps_enabled(True)
     print("[flag] --useful-grasps ACTIVE: mate-viable grasp sets ordered first + fill-h "
           "regrasp pricing (spec 6.2).")
   from solver import set_fill_touch_all
@@ -2603,6 +2733,8 @@ def run(cfg, explicit=None):
     print("[flag] --fill-touch-all ACTIVE: fills skip the cheap local-scope pass and may "
           "manipulate any part immediately; only their requested join may assemble and "
           "temporarily moved blockers must be settled. Local search may be much larger.")
+  if cfg.lazy_edge_selector == "terminal-first" and not cfg.open_witness:
+    raise SystemExit("--lazy-edge-selector terminal-first requires --open-witness")
   if cfg.mixed_wrench_h:
     print("[flag] --mixed-wrench-h is DEPRECATED and now a no-op: --wrench already enables "
           "per-kind backward wrench facts. Use --no-wrench-aware-h for the ablation.")
@@ -2715,11 +2847,16 @@ def run(cfg, explicit=None):
             f"({num_duos} duo(s))")
     C = make_fr3_duo_env(num_duos=num_duos)
   elif cfg.robot == "openarm":
-    num_duos = max(1, cfg.num_robots // 2)
-    if cfg.num_robots != 2 * num_duos:
-      print(f"[flag] openarm duos: --num-robots {cfg.num_robots} -> {2 * num_duos} "
-            f"({num_duos} duo(s))")
-    C = make_openarm_duo_env(num_duos=num_duos)
+    if cfg.floating_ee:
+      C = make_openarm_floating_env(num_robots=cfg.num_robots)
+      print(f"[flag] --robot openarm --floating-ee ACTIVE: {cfg.num_robots} free 6-DOF "
+            "native OpenArm pinch hand(s); no fixed arms, reach limits, or SSIK.")
+    else:
+      num_duos = max(1, cfg.num_robots // 2)
+      if cfg.num_robots != 2 * num_duos:
+        print(f"[flag] openarm duos: --num-robots {cfg.num_robots} -> {2 * num_duos} "
+              f"({num_duos} duo(s))")
+      C = make_openarm_duo_env(num_duos=num_duos)
   else:
     C = make_four_robot_env(
         num_robots=cfg.num_robots,
@@ -2800,14 +2937,27 @@ def run(cfg, explicit=None):
           "with floating-EE verdicts at its INITIAL pose (PICK) and fully ASSEMBLED pose; "
           "the bounded DB reserves diverse proposals for those contexts. Exact intermediate-"
           "state cheap/IK gates remain authoritative. Grasp ids are per PART INSTANCE.")
+    if _closure_active:
+      print("[grasp-sampler-scenes] strict closure generation ACTIVE: a two-finger source "
+            "whose fingers intersect the table may emit a distinct minimum approach-retracted "
+            "candidate, retained only after open-hand + full closure re-certification. "
+            "Clutter/other-hand collisions are never projected.")
   if cfg.grasp_sampler:
     from problem import sampled_grasp_db_signature
     _db_hash = sampled_grasp_db_signature(assembly)
     if cfg.grasp_sampler_db_hash is not None and cfg.grasp_sampler_db_hash != _db_hash:
-      raise SystemExit(
-          "sampled grasp database hash differs from the saved plan "
-          f"({cfg.grasp_sampler_db_hash} != {_db_hash}); use its recorded sampler version "
-          "or regenerate the plan -- refusing to silently rebind grasp ids")
+      if cfg.load_plan and cfg.refresh_witnesses:
+        print("[grasp-db-refresh] sampled grasp database differs from the saved plan "
+              f"({cfg.grasp_sampler_db_hash} != {_db_hash}). Explicit --refresh-witnesses "
+              "treats its actions as a symbolic skeleton: every successor and every IK "
+              "witness will be recertified under today's database; persisted witnesses are "
+              "not reused.", flush=True)
+      else:
+        raise SystemExit(
+            "sampled grasp database hash differs from the saved plan "
+            f"({cfg.grasp_sampler_db_hash} != {_db_hash}); use its recorded sampler version, "
+            "regenerate the plan, or explicitly pass --refresh-witnesses to recertify its "
+            "symbolic skeleton -- refusing to silently rebind grasp ids")
     cfg.grasp_sampler_db_hash = _db_hash
 
   if cfg.check_init:
@@ -2824,7 +2974,8 @@ def run(cfg, explicit=None):
   # --floating-ee the "arm" is the free-floating gripper itself.
   if cfg.test_pick_ik is not None:
     robot, part, grasp = cfg.test_pick_ik.split(":")
-    visualize_pick_ik(part=part, grasp_id=int(grasp), robot=robot, C=C, assembly=assembly)
+    visualize_pick_ik(part=part, grasp_id=int(grasp), robot=robot, C=C, assembly=assembly,
+                      view=cfg.view)
     return
 
   if cfg.test_assemble_ik is not None:
@@ -2850,6 +3001,72 @@ def run(cfg, explicit=None):
 
   if cfg.disp_final:
     display_final_assembly(C, assembly, [0, 0, 0.5])
+
+  if cfg.viz_initial_grasps is not None:
+    chosen = None if cfg.viz_initial_grasps == "all" else cfg.viz_initial_grasps
+    if chosen is not None and chosen not in assembly.objects:
+      raise SystemExit(f"--viz-initial-grasps: unknown part {chosen!r}; choose from "
+                       f"{list(assembly.objects)}")
+    from solver import _search_context
+    checker, grasp_table = _search_context(C, assembly, get_robots(C))
+    rec = None
+    if cfg.viser:
+      from viser_view import ViserRecorder
+      rec = ViserRecorder()
+    visualize_initial_grasps_viser(
+        C, assembly, checker, grasp_table, get_robots(C), recorder=rec,
+        view=cfg.view, part=chosen)
+    if rec is not None:
+      rec.serve(port=cfg.viser_port)
+    elif not cfg.view:
+      print("[initial-grasp-viz] add --viser (recommended) or --view to display candidates")
+    return
+
+  if cfg.viz_grasp_closure is not None:
+    try:
+      robot, part, gid_s = cfg.viz_grasp_closure.split(":")
+      gid = int(gid_s)
+    except Exception:
+      raise SystemExit("--viz-grasp-closure expects ROBOT:PART:GRASP, e.g. a1:obj_3:0")
+    robots = get_robots(C)
+    if robot not in robots:
+      raise SystemExit(f"--viz-grasp-closure: unknown robot {robot!r}; choose from {robots}")
+    if part not in assembly.objects:
+      raise SystemExit(f"--viz-grasp-closure: unknown part {part!r}; choose from "
+                       f"{list(assembly.objects)}")
+    # Build exactly the floating-EE scene used by the cheap action gate. The pose-valued
+    # sampler and id-valued search paths both reduce to this same receiver/part geometry.
+    from solver import _search_context
+    from problem import get_initial_state
+    from gripper_closure import closure_sweep_configs
+    checker, _table = _search_context(C, assembly, robots)
+    s0 = get_initial_state(C, assembly)
+    try:
+      Cc, owners = checker._scene_for(
+          s0, assembly, extra_grasps=[(robot, part, gid)], return_assignments=True)
+    except Exception as exc:
+      raise SystemExit(f"--viz-grasp-closure: cannot build {robot}:{part}:{gid}: {exc}")
+    if robot not in owners:
+      raise SystemExit(f"--viz-grasp-closure: no floating receiver slot for {robot}")
+    prefix, _held_part = owners[robot]
+    result, frames = closure_sweep_configs(Cc, prefix, part, steps=21)
+    print(f"[closure-viz] {robot}:{part}:g{gid}: feasible={result.feasible} "
+          f"model={result.model} aperture={result.aperture} reason={result.reason} "
+          f"detail={result.detail}")
+    if cfg.viser:
+      from viser_view import ViserRecorder
+      rec = ViserRecorder()
+      for Ci, label in frames:
+        rec.record(Ci, label)
+      print(f"[closure-viz] serving {len(frames)} sweep samples on "
+            f"http://localhost:{cfg.viser_port}")
+      rec.serve(port=cfg.viser_port)
+    elif cfg.view:
+      for Ci, label in frames:
+        Ci.view(True, label + " (close for next sample)")
+    else:
+      print("[closure-viz] add --viser (recommended) or --view to display the sweep")
+    return
 
   if cfg.viz_grasps or cfg.viz_rest_poses:
     rec = None
@@ -2908,15 +3125,44 @@ def run(cfg, explicit=None):
   if cfg.solve or cfg.load_plan:
     robots = get_robots(C)
     robot_ik = RobotIK(C, robots) if cfg.real_ik else None
+    if (robot_ik is not None and not np.allclose(
+        robot_ik.home, robot_ik.exit_configuration, atol=1e-12, rtol=0.0)):
+      print("[robot] distinct HOME/EXIT poses ACTIVE: the physical trajectory starts/ends "
+            "at HOME; inactive arms park at EXIT during manipulation, and motion planning "
+            "connects HOME directly to each arm's first useful task.")
+    from solver import set_fill_reference_diagnostic
+    set_fill_reference_diagnostic()                    # reset across repeated library runs
+    if cfg.diagnose_plan_rank is not None:
+      if not cfg.solve or cfg.load_plan or not cfg.milestones:
+        raise SystemExit("--diagnose-plan-rank requires --solve with the milestone solver "
+                         "(and cannot be combined with --load-plan)")
+      from plan_io import read_plan as _read_rank_plan
+      _rank_cfg, _rank_actions = _read_rank_plan(cfg.diagnose_plan_rank)
+      set_fill_reference_diagnostic(_rank_actions, cfg.diagnose_plan_rank)
+      print(f"[fill-rank] ACTIVE: {len(_rank_actions)} demonstrated actions loaded "
+            f"from {cfg.diagnose_plan_rank}; diagnostic queues run without IK and do not "
+            "alter the ordinary search.")
     if robot_ik is not None:
+      robot_ik.closure_check = bool(cfg.grasp_closure_check)
       robot_ik.restarts_full = cfg.ik_restarts
       robot_ik.restarts_precheck = cfg.precheck_restarts
       robot_ik.fail_order = cfg.fail_order
       robot_ik.analytic_seed_cap = cfg.analytic_seed_cap
+      robot_ik.ssik_seed_neighborhood = float(cfg.ssik_seed_neighborhood)
+      robot_ik.ssik_neighborhood_cap = int(cfg.ssik_neighborhood_cap)
       robot_ik.empty_seed_refutes = cfg.empty_seed_refutes
+      if cfg.ssik_seed_neighborhood < 0.0:
+        raise SystemExit("main.py: --ssik-seed-neighborhood must be >= 0")
+      if cfg.ssik_neighborhood_cap < 1:
+        raise SystemExit("main.py: --ssik-neighborhood-cap must be >= 1")
+      if cfg.ssik_seed_neighborhood > 0.0:
+        print(f"[flag] --ssik-seed-neighborhood {cfg.ssik_seed_neighborhood:g}m ACTIVE: "
+              f"up to {cfg.ssik_neighborhood_cap} deterministic near-target SSIK branches "
+              "warm-start boundary/empty-exact KOMO binds; hints only, never rejection.")
       robot_ik.open_witness = cfg.open_witness
       robot_ik.open_witness_epochs = cfg.open_witness_epochs
       robot_ik.open_witness_batch = cfg.open_witness_batch
+      robot_ik.lazy_edge_selector = cfg.lazy_edge_selector
       if cfg.open_witness:
         if cfg.open_witness_batch < 1:
           raise SystemExit("main.py: --open-witness-batch must be >= 1")
@@ -2924,8 +3170,9 @@ def run(cfg, explicit=None):
               f"ordinary effort escalates {min(cfg.open_witness_batch, 2)} -> "
               f"{min(cfg.open_witness_batch, 4)} -> {cfg.open_witness_batch}, assemble uses "
               f"an atomic {cfg.open_witness_batch}-slot structural batch; up to "
-              f"{cfg.open_witness_epochs or 'unlimited'} epoch(s). First unresolved edge "
-              "abandons the incumbent immediately. "
+              f"{cfg.open_witness_epochs or 'unlimited'} epoch(s). Candidate IK selector "
+              f"is {cfg.lazy_edge_selector}; its first failed edge abandons the incumbent "
+              "immediately. "
               "Legacy bind and fill paths remain unchanged when this flag is off.")
     if robot_ik is not None and cfg.full_ik:
       robot_ik.single_arm_ik = False
@@ -2941,7 +3188,7 @@ def run(cfg, explicit=None):
       # robot_collisions too; with this already set, that toggle is a consistent no-op.)
       robot_ik.strip_inactive_collision = False
       print("[flag] --witness-robot-collisions ACTIVE: other robots' collision kept ON in IK "
-            "(search + witness opt); idle arms are at HOME in the IK scene.")
+            "(search + witness opt); idle arms are at EXIT in the IK scene.")
     if cfg.witness_margin is not None and robot_ik is not None:
       # ONE clearance contract, installed BEFORE search. The old implementation enabled this
       # only after a discrete plan existed, so witness optimization could reject every IK the
@@ -2950,16 +3197,24 @@ def run(cfg, explicit=None):
       # RobotIK._clearance_ok with the same value and pair classification.
       robot_ik.clearance_reject = float(cfg.witness_margin)
       print(f"[flag] --witness-margin {cfg.witness_margin*1000:.0f}mm ACTIVE IN SEARCH + "
-            "WITNESS PASSES: every accepted IK clears the same hard non-intended-pair gate "
+            "WITNESS PASSES: every accepted IK clears the same hard non-intended-pair gate; "
+            "KOMO receives lazy pair-specific margin cuts whenever its nominal optimum "
+            "fails that certificate "
             "(arm/part, inter-robot, non-adjacent self-collision, and free-pose "
-            "payload/table); later passes may rank or diversify but cannot strengthen search "
-            "feasibility.")
+            "payload/table); coupled task hands/mate-target groups use strict collision "
+            "without this free-space buffer. Later passes may rank or diversify but cannot "
+            "strengthen search feasibility.")
     if cfg.witness_joint_margin is not None and robot_ik is not None:
       robot_ik.joint_margin_reject = float(cfg.witness_joint_margin)
-      print(f"[flag] --witness-joint-margin {cfg.witness_joint_margin:g}rad ACTIVE IN SEARCH "
-            "+ WITNESS PASSES for coupled handover/add_grasp/assemble endpoints: IK keyframes "
-            "on/near a hardware stop are rejected before they become zero-neighbourhood "
-            "motion-planning goals; ordinary picks/places are unchanged.")
+      if not any(v is not None for v in robot_ik.robot_arm.values()):
+        print(f"[flag] --witness-joint-margin {cfg.witness_joint_margin:g}rad requested but "
+              "NOT APPLIED: --floating-ee coordinates are pose parameters, not hardware "
+              "joints.")
+      else:
+        print(f"[flag] --witness-joint-margin {cfg.witness_joint_margin:g}rad ACTIVE IN SEARCH "
+              "+ WITNESS PASSES for coupled handover/add_grasp/assemble endpoints: IK keyframes "
+              "on/near a hardware stop are rejected before they become zero-neighbourhood "
+              "motion-planning goals; ordinary picks/places are unchanged.")
     if robot_ik is not None and cfg.mate_eq_weight is not None:
       robot_ik.mate_eq_weight = float(cfg.mate_eq_weight)
       print(f"[flag] --mate-eq-weight {cfg.mate_eq_weight:g}: assemble mate eq constraints "
@@ -3105,6 +3360,23 @@ def run(cfg, explicit=None):
                 f"current {getattr(cfg, _k, None)!r} -- witnesses will be solved in the WRONG "
                 f"scene. Pass --config {cfg.load_plan} (its config block) to match.")
     else:
+      # Necessary-condition preflight on the COMPLETE grasp DB, before staged refinement or
+      # symbolic search. A part that cannot be picked even with every other part removed can
+      # never be recovered by decluttering, IK restarts, widening, or additional search nodes.
+      from solver import _search_context, isolated_graspability_report
+      _pre_checker, _pre_table = _search_context(C, assembly, robots)
+      _pre = isolated_graspability_report(
+          C, assembly, robots, _pre_checker, _pre_table,
+          require_closure=bool(cfg.grasp_closure_check), verbose=True)
+      _unpickable = [p for p, result in _pre.items() if not result["ok"]]
+      if _unpickable:
+        layer = "open-hand collision + virtual closure" if cfg.grasp_closure_check \
+            else "open-hand collision"
+        raise SystemExit(
+            f"[grasp-preflight] ABORT: no isolated feasible pick for {_unpickable} under "
+            f"{layer}. Other parts were removed, so search/IK cannot repair this. Inspect "
+            f"with --viz-initial-grasps {_unpickable[0]} --viser, increase the grasp "
+            "database, or correct the gripper/part geometry.")
       try:
         print(f"[rss] peak RSS before solve: {_rss_mb():.0f} MB")   # A1/A6 instrumentation
         _staged_grasps = bool(cfg.grasp_sampler and cfg.grasp_sampler_version >= 2
@@ -3141,6 +3413,19 @@ def run(cfg, explicit=None):
               "diagnostic rerun use --log-ik-failures 60; if sampled grasps are active, "
               "try --grasp-refine before increasing the node or memory limit.", flush=True)
         raise
+      except SystemError as exc:
+        # Some native RAI/FCL allocation paths return a null C-API result without installing
+        # a Python exception after the address-space guard is reached. CPython exposes that
+        # as this otherwise opaque SystemError. Do not label arbitrary SystemErrors as OOM,
+        # but make this exact native-allocation signature as explicit as MemoryError above.
+        if str(exc) != "error return without exception set":
+          raise
+        print("[search-failure] native allocation failed under the process memory guard; "
+              "no infeasibility certificate was produced.", flush=True)
+        print("[search-failure] the live local-fill frontier did not fit. Reduce the sampled "
+              "grasp alphabet or use a compact/regenerating frontier before raising the "
+              "memory limit.", flush=True)
+        raise MemoryError("native search allocation failed under memory guard") from exc
       finally:
         if cfg.grasp_sampler:
           from problem import set_sampled_canonical_only
@@ -3192,22 +3477,27 @@ def run(cfg, explicit=None):
       # have changed a predecessor scene, in which case only those changed edges are certified
       # here, before anything is written. A loaded plan is read-only unless the user explicitly
       # asks for --refresh-witnesses.
-      from plan_io import missing_required_witnesses, read_witnesses, read_witness_stage, \
-          require_complete_witnesses, witness_block
+      from plan_io import (read_witnesses, read_witness_stage, require_complete_witnesses,
+                           witness_block)
       joint_names = list(robot_ik.C.getJointNames()) if robot_ik is not None else []
       baseline_witnesses = None
       _saved_witness_stage = None
       _need_witnesses = bool(robot_ik is not None and not (
           cfg.motion_plan and cfg.mp_export_load))
       if _need_witnesses and cfg.load_plan:
-        if _witnesses_baseline_compatible(_saved_cfg, cfg):
+        # --refresh-witnesses is an explicit request to recertify the fixed discrete plan
+        # against TODAY'S geometry.  Do not read a complete persisted block first and then
+        # retain it merely because it has no missing entries: that silently reused witnesses
+        # produced before model fixes (the OpenArm mount used to be contact-disabled), in
+        # direct contradiction to the CLI contract that refresh means IGNORE.  With refresh,
+        # every IK action is rebuilt below; without it the normal fail-closed reuse guards
+        # remain unchanged.
+        if cfg.refresh_witnesses:
+          print("[witness-refresh] ignoring the persisted witness block and recertifying every "
+                "IK action against the current scene/model.")
+        elif _witnesses_baseline_compatible(_saved_cfg, cfg):
           baseline_witnesses = read_witnesses(cfg.load_plan, joint_names, len(plan))
           _saved_witness_stage = read_witness_stage(cfg.load_plan)
-        if (baseline_witnesses is not None and cfg.refresh_witnesses
-            and missing_required_witnesses(plan, baseline_witnesses)):
-          print("[witness-refresh] persisted block is incomplete; explicitly rebuilding the "
-                "legacy baseline because --refresh-witnesses was given.")
-          baseline_witnesses = None
         if baseline_witnesses is None and cfg.refresh_witnesses:
           from solver import collect_plan_witnesses
           baseline_witnesses = collect_plan_witnesses(

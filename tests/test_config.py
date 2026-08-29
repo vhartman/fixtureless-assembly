@@ -95,7 +95,11 @@ def test_standard_search_profile_resolves_robust_batch_defaults():
   assert a.weight == 1.0
   assert a.milestones and a.sig_collapsed_h and a.sig_components == "press"
   assert a.milestone_oracle == "structural"
-  assert a.fill_local_h and a.fill_exact and not a.fill_skeleton_first
+  assert a.fill_local_h and a.fill_exact and not a.fill_policy_first
+  assert a.useful_grasps
+  assert not main.parse_args(
+      ["--search-profile", "standard", "--no-useful-grasps"]).useful_grasps
+  assert not a.fill_skeleton_first
   assert a.fill_scope_widening
   assert not a.fill_touch_all
   assert a.milestone_boundaries == 4
@@ -103,10 +107,13 @@ def test_standard_search_profile_resolves_robust_batch_defaults():
   assert a.grasp_model == "asymmetric"
   assert a.optimize_witnesses == "floor"
   assert a.witness_margin == 0.005
+  assert a.witness_joint_margin == 0.02
   assert a.witness_branch_budget == 5 and a.witness_sets == 4
-  assert a.tight_fingers and a.strict_collisions == 1e-6
+  assert a.tight_fingers and not a.grasp_closure_check and a.strict_collisions == 1e-6
   assert a.open_witness and a.open_witness_batch == 7 and a.open_witness_epochs == 2
+  assert a.lazy_edge_selector == "forward"
   assert a.analytic_seed_cap is None
+  assert a.ssik_seed_neighborhood == 0.0 and a.ssik_neighborhood_cap == 6
   assert a.grasp_sampler and a.grasp_sampler_version == 2
   assert a.grasp_sampler_scenes and a.grasp_sampler_keep == 20
   assert a.grasp_sampler_candidates == 96
@@ -159,12 +166,14 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
 
   monkeypatch.setattr(main, "solve_assembly_problem_milestones", fake)
   cfg = RunConfig(milestones=True, milestone_oracle="structural",
-                  fill_local_h=True, fill_exact=True, fill_skeleton_first=True,
+                  fill_local_h=True, fill_exact=True, fill_policy_first=True,
+                  fill_skeleton_first=True,
                   fill_scope_widening=True, milestone_boundaries=3,
                   wrench_aware_h=False)
   assert main._dispatch_solve(cfg, None, None, [], None) == []
   assert seen["milestone_oracle"] == "structural"
   assert seen["fill_local_h"] is True and seen["fill_exact"] is True
+  assert seen["fill_policy_first"] is True
   assert seen["fill_skeleton_first"] is True
   assert seen["fill_scope_widening"] is True
   assert seen["milestone_boundaries"] == 3
@@ -174,12 +183,17 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
   assert main.parse_args(["--fill-local-h", "--fill-exact"]).fill_local_h is True
   assert main.parse_args(["--fill-local-h", "--fill-exact"]).fill_exact is True
   assert main.parse_args(["--fill-skeleton-first"]).fill_skeleton_first is True
+  assert main.parse_args(["--fill-policy-first"]).fill_policy_first is True
+  assert main.parse_args(["--no-fill-policy-first"]).fill_policy_first is False
   assert main.parse_args(["--fill-scope-widening"]).fill_scope_widening is True
   assert main.parse_args(["--no-fill-scope-widening"]).fill_scope_widening is False
   assert main.parse_args(["--fill-touch-all"]).fill_touch_all is True
   assert main.parse_args(["--no-fill-touch-all"]).fill_touch_all is False
   assert main.parse_args(["--mixed-wrench-h"]).mixed_wrench_h is True
   assert main.parse_args(["--no-wrench-aware-h"]).wrench_aware_h is False
+  assert main.parse_args([
+      "--diagnose-plan-rank", "known.json"
+  ]).diagnose_plan_rank == "known.json"
 
 
 def test_saved_plan_persists_resolved_search_semantics(tmp_path):
@@ -193,12 +207,20 @@ def test_saved_plan_persists_resolved_search_semantics(tmp_path):
   saved = json.loads(out.read_text())["config"]
   for key in ("weight", "milestones", "goal_on_table", "milestone_oracle", "fill_local_h", "fill_exact",
               "milestone_boundaries", "fill_scope_widening", "open_witness",
-              "open_witness_batch", "open_witness_epochs", "analytic_seed_cap",
+              "open_witness_batch", "open_witness_epochs", "lazy_edge_selector", "analytic_seed_cap",
+              "ssik_seed_neighborhood", "ssik_neighborhood_cap",
               "fail_order", "empty_seed_refutes"):
     assert saved[key] == getattr(cfg, key)
   loaded = RunConfig.from_file(str(out))
   assert loaded.milestone_boundaries == 4
   assert loaded.milestone_oracle == "structural" and loaded.open_witness
+  assert loaded.lazy_edge_selector == "forward"
+  assert main.parse_args([
+      "--search-profile", "standard", "--lazy-edge-selector", "fail-first"
+  ]).lazy_edge_selector == "fail-first"
+  assert main.parse_args([
+      "--search-profile", "standard", "--lazy-edge-selector", "terminal-first"
+  ]).lazy_edge_selector == "terminal-first"
 
 
 def test_standard_motion_profile_pins_the_motion_contract():

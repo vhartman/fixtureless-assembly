@@ -482,6 +482,7 @@ def check_initial_scene(C, assembly, robots=None, robot_ik=None, verbose=True):
 
   collision_free = bool(C.getCollisionFree())
   graspable = {p: [] for p in assembly.objects}
+  winners = {p: [] for p in assembly.objects}
   for a, ns in picks(s0, assembly, robots, grasp_table=grasp_table):
     part, robot = a[2], a[1]
     if robot in graspable[part]:                                    # this robot already qualifies
@@ -489,6 +490,7 @@ def check_initial_scene(C, assembly, robots=None, robot_ik=None, verbose=True):
     # feasible = cheap floating-EE collision, plus real-arm IK reachability when robot_ik given.
     if feasible(a, s0, ns, assembly, checker, robot_ik=robot_ik):
       graspable[part].append(robot)
+      winners[part].append((robot, a[3]))
 
   ungraspable = [p for p in assembly.objects if not graspable[p]]
   ok = collision_free and not ungraspable
@@ -496,11 +498,13 @@ def check_initial_scene(C, assembly, robots=None, robot_ik=None, verbose=True):
     tag = "real-IK" if robot_ik is not None else "cheap"
     print(f"[scene-check] collision-free: {collision_free} | graspable ({tag}) by >=1 robot: "
           f"{len(assembly.objects) - len(ungraspable)}/{len(assembly.objects)} parts")
+    print("[scene-check] first reachable grasp per robot: "
+          + ", ".join(f"{p}={winners[p]}" for p in assembly.objects))
     if ungraspable:
       print(f"[scene-check] UNGRASPABLE parts (no robot can pick them here): {ungraspable}")
     print(f"[scene-check] => scene {'OK' if ok else 'NOT USABLE'}")
   return ok, {"collision_free": collision_free, "graspable": graspable,
-              "ungraspable": ungraspable}
+              "grasp_winners": winners, "ungraspable": ungraspable}
 
 
 class CubeCrossAssembly(Assembly):
@@ -2473,12 +2477,42 @@ def _poses_near(a, b, pos_tol=1e-3, angle_tol=np.deg2rad(5.0)):
   return 2.0 * np.arccos(dot) <= angle_tol
 
 
+def _closure_ranked_canonical(entries):
+  """Deterministic, K-independent ordering of conventional grasps by scene utility.
+
+  Primitive parts contribute 24 conventional face/roll rows, so a practical ``keep`` of
+  16 or 20 otherwise truncates the list *before* the sampled-row scene ranking below is ever
+  reached.  Under the explicit virtual-close flag, rank those conventional rows by the number
+  of (gripper kind, pick/assemble role) certificates they satisfy.  Farthest-first ordering
+  within each equal-coverage tier preserves geometric diversity.  Zero-certificate rows stay
+  at the end as a fallback: this is prioritisation, not a new hard sampler rejection.
+
+  The complete order is independent of ``keep``, so increasing K still only appends ids.
+  Without the closure flag the caller retains the byte-for-byte legacy canonical order.
+  """
+  tiers = {}
+  for entry in entries:
+    meta = entry[1]
+    coverage = sum(len(roles) for roles in
+                   (meta.get("closure_by_kind") or {}).values())
+    tiers.setdefault(coverage, []).append(entry)
+  out = []
+  for coverage in sorted(tiers, reverse=True):
+    block = tiers[coverage]
+    by_id = {id(e[0]): e for e in block}
+    out.extend(by_id[id(row)] for row in _fps_row_order([e[0] for e in block]))
+  return out
+
+
 def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
   """Select the bounded V2 DB and return ``[(row, metadata), ...]``.
 
-  Conventional primitive grasps are an immutable prefix. Sampled rows are ordered by a
-  round-robin over fleet/scene/family strata, with farthest-first order inside every stratum.
-  All rankings are independent of ``keep``; a larger budget therefore preserves every old id.
+  Conventional primitive grasps are the stable source prefix. Under the explicit closure
+  model, a source whose fingers graze the table may additionally emit a deterministic,
+  contact-preserving approach-retracted pose; the colliding source remains eligible as a
+  free-space fallback if the bounded set has room. Sampled rows are ordered by a round-robin over fleet/scene/family strata,
+  with farthest-first order inside every stratum. All rankings are independent of ``keep``;
+  a larger budget therefore preserves every old id for a fixed scene/configuration.
   """
   def part_pose(row):
     pose = np.asarray(row[0], dtype=float)
@@ -2492,27 +2526,146 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
   asm = None if ctx is None else ctx["assembly"]
   seal = float(wrench.PARAMS.get("vacuum_seal_diameter", 0.0))
 
-  def enrich(row, origin):
+  # Physical generation policy, not a collision relaxation. A candidate already places the
+  # pads at a valid antipodal contact; translating the hand OUTWARD along its approach slides
+  # those long pads over the same target. At most half a pad length is available for this
+  # adjustment, and the strict bilateral-contact closure certificate remains authoritative.
+  # The 0.2mm positive clearance avoids handing a numerical tangent to strict real-IK.
+  retract_max = 0.5 * _PAD_HALF_ALONG
+  retract_clearance = 2.0e-4
+
+  def row_at_part_pose(row, pose):
+    """Replace a row pose supplied in PART coordinates (rows precede shape rotation)."""
+    pose = np.asarray(pose, dtype=float)
+    if shape_quat is None:
+      raw = pose
+    else:
+      qi = _quat_conj(shape_quat)
+      raw = np.concatenate([_quat_to_R(shape_quat).T @ pose[:3],
+                            _quat_mul(qi, pose[3:])])
+    return (raw,) + tuple(row[1:])
+
+  def repaired_table_pose(row, kind, robot, role, state):
+    """Smallest analytic approach retraction that clears a finger/table overlap.
+
+    Only the table case is projected: clutter and another hand are discrete obstacles, not
+    permission to silently change the grasp. The returned pose is re-certified against the
+    complete open hand and closure sweep, so this never converts collision into tolerance.
+    """
+    if checker is None or not checker.closure_check or kind != "two_finger":
+      return None
+    pose = part_pose(row)
+    res = checker.pose_grasp_closure_result(state, part, pose, asm, robot)
+    if res is None or res.feasible or res.reason != "sweep-collision" or res.detail is None:
+      return None
+    a, b, depth = res.detail
+    if "table" not in (str(a), str(b)) or float(depth) >= 0.0:
+      return None
+
+    # Retraction direction in the part frame is -tool-z (the same convention as _backoff_ee).
+    # Project it into world z to turn the measured table penetration into the minimum travel.
+    retract_part = -_quat_to_R(pose[3:]) @ np.array([0.0, 0.0, 1.0])
+    part_world = _state_part_poses(state, asm, lift=0.0)[part]
+    lift_per_m = float((_quat_to_R(part_world[3:]) @ retract_part)[2])
+    if lift_per_m <= 1e-6:
+      return None                                          # this approach cannot leave the table
+    delta = (-float(depth) + retract_clearance) / lift_per_m
+    if delta <= 0.0 or delta > retract_max:
+      return None
+
+    # One analytic step normally suffices. The two bounded cushions handle rounded-box/FCL
+    # distance noise without introducing an assembly-specific search grid.
+    for cushion in (0.0, 2.5e-4, 5.0e-4):
+      d = delta + cushion
+      if d > retract_max:
+        continue
+      candidate = pose.copy()
+      candidate[:3] += d * retract_part
+      if not checker.pose_collision_free(state, part, candidate, asm, robot=robot):
+        continue
+      cert = checker.pose_grasp_closure_result(state, part, candidate, asm, robot)
+      if cert is not None and cert.feasible:
+        return candidate, float(d), ("approach-retract", kind, role)
+    return None
+
+  def enrich(row, origin, refinement=None):
     roles = {}
+    closure_roles = {}
     for kind, robot in sorted(kind_robot.items()):
       # Pinch rows deliberately carry min_dim=0 and are not vacuum candidates. Canonical and
       # suction rows still need a flat patch large enough to seal.
       kind_ok = not (kind == "vacuum" and
                      (row[6] == "pinch" or row[1] == "curved" or row[2] < seal))
       hits = []
+      close_hits = []
       if kind_ok:
         pose = part_pose(row)
-        if checker.pose_collision_free(ctx["s0"], part, pose, asm, robot=robot):
-          hits.append("pick")
-        if checker.pose_collision_free(ctx["s_full"], part, pose, asm, robot=robot):
-          hits.append("assemble")
+        for role, state in (("pick", ctx["s0"]), ("assemble", ctx["s_full"])):
+          if not checker.pose_collision_free(state, part, pose, asm, robot=robot):
+            continue
+          # With --grasp-closure-check, a scene label means OPEN geometry clears and the
+          # receiver can actually close in that scene.  Failed closes are not thrown away:
+          # they remain in the family/FPS fallback pools below, but no longer consume the
+          # scarce pick/assemble-reserved slots ahead of closure-capable candidates.
+          close_ok = checker.pose_grasp_closure_free(
+              state, part, pose, asm, robot) if checker.closure_check else True
+          if close_ok:
+            hits.append(role)
+            close_hits.append(role)
       roles[kind] = tuple(hits)
-    return (row, {"origin": origin, "scene_by_kind": roles,
-                  "sets": tuple(sorted({x for xs in roles.values() for x in xs}))})
+      closure_roles[kind] = tuple(close_hits)
+    meta = {"origin": origin, "scene_by_kind": roles,
+            "closure_by_kind": closure_roles,
+            "sets": tuple(sorted({x for xs in roles.values() for x in xs}))}
+    if refinement is not None:
+      tag, delta, source = refinement
+      meta["refinement"] = (tag[0], tag[1], tag[2], round(float(delta), 6), source)
+    return (row, meta)
 
-  canonical = [enrich(r, "canonical") for r in _canonical_sample_rows(spec, offset)]
-  if len(canonical) >= keep:
+  def enrich_variants(row, origin):
+    """Original free-space pose plus unique strict scene-repaired poses."""
+    out = [enrich(row, origin)]
+    if checker is None or not checker.closure_check:
+      return out
+    poses = [part_pose(row)]
+    for kind, robot in sorted(kind_robot.items()):
+      kind_ok = not (kind == "vacuum" and
+                     (row[6] == "pinch" or row[1] == "curved" or row[2] < seal))
+      if not kind_ok:
+        continue
+      for role, state in (("pick", ctx["s0"]), ("assemble", ctx["s_full"])):
+        repaired = repaired_table_pose(row, kind, robot, role, state)
+        if repaired is None:
+          continue
+        pose, delta, tag = repaired
+        if any(_poses_near(pose, old, pos_tol=1e-4, angle_tol=1e-6) for old in poses):
+          continue
+        poses.append(pose)
+        refined_row = row_at_part_pose(row, pose)
+        out.append(enrich(refined_row, origin + "-refined",
+                          refinement=(tag, delta, origin)))
+    return out
+
+  canonical = [entry for r in _canonical_sample_rows(spec, offset)
+               for entry in enrich_variants(r, "canonical")]
+  # Conventional primitive grasps usually fill the entire K budget.  Let the explicit closure
+  # model influence that prefix too; otherwise closure-aware ranking would only affect meshes
+  # or unusually large K and be a no-op for the cuboid assemblies that motivated the check.
+  if checker is not None and checker.closure_check:
+    canonical = _closure_ranked_canonical(canonical)
+  closure_select = bool(checker is not None and checker.closure_check)
+  if len(canonical) >= keep and not closure_select:
     return canonical[:keep]
+
+  # A strict repaired pose is useless if the immutable source prefix still consumes the whole
+  # bounded K before sampled scene-valid rows are considered. Under closure semantics reserve
+  # the prefix only for candidates that actually serve PICK/ASSEMBLE; zero-role originals stay
+  # available as the LAST fallback below. Off = the historical immutable-prefix path exactly.
+  if closure_select:
+    canonical_seed = [e for e in canonical if any(e[1]["scene_by_kind"].values())][:keep]
+    canonical_fallback = [e for e in canonical if not any(e[1]["scene_by_kind"].values())]
+  else:
+    canonical_seed, canonical_fallback = list(canonical), []
 
   margin = float(_SAMPLED_GRASPS.get("margin", 0.0))
   support = float(_SAMPLED_GRASPS.get("pad_support", 0.0))
@@ -2551,7 +2704,7 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
         break
     if not progressed:
       break
-  sampled = [enrich(r, "sampled") for r in probe]
+  sampled = [entry for r in probe for entry in enrich_variants(r, "sampled")]
 
   good = [e for e in sampled if e[0][4] >= margin and e[0][5] >= support]
   good_ids = {id(e[0]) for e in good}
@@ -2583,7 +2736,7 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
   if bad:                                                 # small/curved shapes may need fallback
     categories.append(ordered(bad))
 
-  out, seen = list(canonical), {id(e[0]) for e in canonical}
+  out, seen = list(canonical_seed), {id(e[0]) for e in canonical_seed}
   cursors = [0] * len(categories)
   while len(out) < keep:
     progressed = False
@@ -2598,6 +2751,13 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
         break
     if not progressed:
       break
+  if len(out) < keep:                                     # free-space source poses: last resort
+    for e in canonical_fallback:
+      if id(e[0]) in seen:
+        continue
+      out.append(e); seen.add(id(e[0]))
+      if len(out) >= keep:
+        break
   return out
 
 
@@ -4111,9 +4271,29 @@ class Node:
 # right here once reachability/wrench give handovers/bracing something to be forced by.
 
 
-def _copy_edit_support(state):
-  # helper: a fresh State copy whose dicts can be edited in place
-  return State(state.parent, state.grasp, state.place, state.supports, state.poses)
+def _copy_edit_support(state, *, copy_poses=False):
+  # helper: a fresh State copy whose dicts can be edited in place.
+  # `poses` is a non-identity payload (State.key() ignores it) and is
+  # read-only in the standard milestone search (place_cells=0,
+  # declutter/stow off). Copying it per successor is pure overhead: the
+  # scatter anchors are identical for every WIP state, so the dict and
+  # its ndarray values can be shared copy-on-write. Only the narrow
+  # stow/declutter edge mutates a single entry and must request a
+  # private copy (`copy_poses=True`); the two `places` helpers already
+  # do `ns.poses = dict(ns.poses)` before writing, so sharing there is
+  # safe. This cuts ~25% of the successor-state allocation and avoids
+  # a dict copy per edge (20k states * 7 poses ~= 20 MB per fill).
+  if copy_poses:
+    return State(state.parent, state.grasp, state.place, state.supports, state.poses)
+  # fast path: bypass State.__init__'s `dict(poses)` for the common case
+  ns = State.__new__(State)
+  ns.parent = dict(state.parent)
+  ns.grasp = dict(state.grasp)
+  ns.place = dict(state.place)
+  # `supports` values are already frozensets
+  ns.supports = dict(state.supports)
+  ns.poses = state.poses  # share reference — CoW; caller must copy before mutating
+  return ns
 
 
 def _group_is_on_table(state, group):

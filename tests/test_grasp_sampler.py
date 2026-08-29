@@ -12,6 +12,7 @@ import pytest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import problem as P
+import solver as S
 from config import RunConfig
 import main
 
@@ -24,6 +25,7 @@ MODE = {"seed": 3, "candidates": 64, "keep": 8}
 @pytest.fixture(autouse=True)
 def _clean_sampler_state():
   yield
+  S.set_grasp_closure_check(False)
   P.clear_sampled_scene_ctx()
   P.set_sampled_grasps(None)
   P.reset_grasp_pose_cache()
@@ -188,6 +190,21 @@ def test_v2_hybrid_contains_conventional_grasps_and_refines_by_prefix():
   assert all(np.array_equal(a, b) for a, b in zip(q20, q24))
 
 
+def test_closure_ranking_prioritizes_certified_canonical_rows_without_deleting_fallbacks():
+  """A cuboid's conventional prefix must not bypass closure-aware sampler ranking."""
+  entries = []
+  for i, coverage in enumerate((0, 2, 1, 0)):
+    # Distinct valid pose rows; only the metadata coverage matters to the tier ordering.
+    row = (np.array([0.01 * i, 0.0, 0.06, 1.0, 0.0, 0.0, 0.0]),
+           "flat", 0.05, np.zeros(6), float("inf"), 1.0, "canonical", False)
+    roles = tuple(("pick", "assemble")[:coverage])
+    entries.append((row, {"closure_by_kind": {"two_finger": roles}}))
+  ranked = P._closure_ranked_canonical(entries)
+  coverages = [sum(len(v) for v in e[1]["closure_by_kind"].values()) for e in ranked]
+  assert coverages == [2, 1, 0, 0]
+  assert {id(e[0]) for e in ranked} == {id(e[0]) for e in entries}
+
+
 def test_v2_scene_masks_are_per_gripper_kind():
   """Mixed fleets must not classify every explicit pose through whichever EE slot is first."""
   import env
@@ -212,6 +229,42 @@ def test_v2_scene_masks_are_per_gripper_kind():
         state = ctx["s0"] if role == "pick" else ctx["s_full"]
         assert ctx["checker"].pose_collision_free(
             state, "obj_1", q, asm, robot=reps[kind])
+
+
+def test_openarm_car_wheel_sampler_generates_strict_table_clear_grasp():
+  """A flat 12mm wheel needs a small approach retraction for the 15mm OpenArm fingers.
+
+  The source pose remains useful away from the table, but the PICK-labelled database member
+  must be a distinct generated pose that passes the strict full closure certificate—not the
+  historical 5mm open-hand tolerance.
+  """
+  import env
+  from problem import add_disassembled_obj, get_robots, make_assembly
+
+  P.set_rolls_per_face(2)
+  P.set_sampled_grasps({"version": 2, "seed": 0, "candidates": 96, "keep": 16,
+                        "margin": 0.008, "pad_support": 0.75, "wrap": 0.015})
+  S.set_grasp_closure_check(True)
+  C = env.make_openarm_duo_env(2)
+  asm = make_assembly("car-mini", 5)
+  C = add_disassembled_obj(C, asm, grid=4, grid_gap=2.0, float_height=0.002)
+  robots = get_robots(C)
+  P.install_sampled_scene_ctx(C, asm, robots=robots)
+
+  poses = P.part_grasp_poses(asm.part_shape("obj_1"), part="obj_1")
+  meta = P.sampled_grasp_meta(asm.part_shape("obj_1"), part="obj_1")
+  refined = [(q, m) for q, m in zip(poses, meta)
+             if m.get("refinement", (None,))[0] == "approach-retract"
+             and "pick" in m.get("scene_by_kind", {}).get("two_finger", ())]
+  assert refined, "no strictly table-clear generated wheel pick"
+
+  ctx = P._SAMPLED_SCENE_CTX
+  checker, robot, s0 = ctx["checker"], ctx["kind_robot"]["two_finger"], ctx["s0"]
+  for pose, md in refined:
+    assert 0.0015 < md["refinement"][3] < 0.010
+    assert checker.pose_collision_free(s0, "obj_1", pose, asm, robot=robot)
+    cert = checker.pose_grasp_closure_result(s0, "obj_1", pose, asm, robot)
+    assert cert is not None and cert.feasible
 
 
 def test_v2_canonical_epoch_reproduces_legacy_grasp_table():

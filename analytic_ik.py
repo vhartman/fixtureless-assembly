@@ -113,11 +113,11 @@ _CAL = {
         "offset": np.zeros(7),
         "tools": {
             # tool0 -> EE centre == pose of gripper_center in the flange frame.
-            # left_openarm.g: Q "t(-.0014 0 -.155) d(180 1 0 0)" -- translation then
+            # left_openarm.g: Q "t(-.0014 0 -.14) d(180 1 0 0)" -- translation then
             # 180deg about x, so the tool centre's +z is the approach axis (like ur5).
             "two_finger": np.array([[1.0, 0.0, 0.0, -0.0014],
                                      [0.0, -1.0, 0.0, 0.0],
-                                     [0.0, 0.0, -1.0, -0.155],
+                                     [0.0, 0.0, -1.0, -0.14],
                                      [0.0, 0.0, 0.0, 1.0]]),
         },
         "load": lambda: _artifact("openarm_left_ik"),
@@ -127,10 +127,10 @@ _CAL = {
         "sign": np.array([-1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0]),   # rescaled .g -- re-derived empirically
         "offset": np.zeros(7),
         "tools": {
-            # right_openarm.g: same Q "t(-.0014 0 -.155) d(180 1 0 0)" as the left arm.
+            # right_openarm.g: same Q "t(-.0014 0 -.14) d(180 1 0 0)" as the left arm.
             "two_finger": np.array([[1.0, 0.0, 0.0, -0.0014],
                                      [0.0, -1.0, 0.0, 0.0],
-                                     [0.0, 0.0, -1.0, -0.155],
+                                     [0.0, 0.0, -1.0, -0.14],
                                      [0.0, 0.0, 0.0, 1.0]]),
         },
         "load": lambda: _artifact("openarm_right_ik"),

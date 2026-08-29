@@ -974,9 +974,23 @@ def plan_schedule(stretches, arm_dims, acting, dt,
         wedge = 0                                            # only static blocks: wait/stall
       if stall > stall_steps:
         state = ", ".join(f"arm{r}@{s[r]:.3f}" for r in range(n))
+        _bar = bar_s[fired] if fired < K else D
+        _caps = [min(cap_of(r, fired), entry.get(r, D)) for r in range(n)]
+        _comp_steps = []
+        for _comp in comps:
+          _ccap = min(_caps[r] for r in _comp)
+          _base = max(s[r] for r in _comp)
+          _comp_steps.append((_comp, _base, _ccap,
+                              [step_to(r, _base, _ccap) for r in _comp]))
         raise RuntimeError(
             f"[retiming] coordination DEADLOCK: no progress for {stall_steps} steps, "
-            f"fired {fired}/{K}, D={D:.2f}, {state}, couplings="
+            f"fired {fired}/{K}, next_bar={_bar:.9f}, acting="
+            f"{sorted(act[fired]) if fired < K else []}, "
+            f"progress={[float(x) for x in s]}, caps={_caps}, entry={entry}, "
+            f"components={comps}, ready_since={ready_since}, "
+            f"component_steps={_comp_steps}, hold_until={hold_until}, "
+            f"collision_pairs={getattr(collide, 'last_pairs', None)}, "
+            f"D={D:.2f}, {state}, couplings="
             f"{ {tuple(sorted(G)): [[round(a, 1), round(b, 1)] for a, b in ws] for G, ws in couplings.items()} }")
 
   q = phase = fires = prog = None

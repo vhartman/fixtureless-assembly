@@ -42,3 +42,70 @@ def test_distinct_alternates_survive_successive_edge_deletions():
   assert e.search(100) == [('s-c', 1), ('c-x', 1), ('x-g', 10)]
   # Reclaims do not append the same child to its parent's tree bookkeeping indefinitely.
   assert all(isinstance(v, set) for v in e.children.values())
+
+
+def test_regenerated_successors_preserve_incremental_repair_result():
+  graph = {
+      "S": [(('s-a', 1), "A"), (('s-b', 1), "B")],
+      "A": [(('a-x', 1), "X")],
+      "B": [(('b-x', 1), "X")],
+      "X": [(('x-g', 5), "G")],
+      "G": [],
+  }
+
+  def run(memoize):
+    blacklist = set()
+    e = _IncrementalLazySearch(
+        "S", goal_fn=lambda s: s == "G", succ_fn=lambda s: graph[s],
+        cost_fn=lambda a: a[1], h_fn=lambda _s: 0, weight=1, blacklist=blacklist,
+        memoize_successors=memoize)
+    first = e.search(100)
+    blacklist.add(("A", ('a-x', 1)))
+    e.delete_edge("A", ('a-x', 1), "X")
+    return first, e.search(100), e.footprint()
+
+  cached = run(True)
+  regenerated = run(False)
+  assert cached[:2] == regenerated[:2]
+  assert cached[2]["successor_edges"] > 0
+  assert regenerated[2]["successor_edges"] == 0
+
+
+def test_compact_frontier_regenerates_and_recovers_an_alternate_route():
+  graph = {
+      "S": [(('s-a', 1), "A"), (('s-b', 2), "B")],
+      "A": [(('a-x', 1), "X")],
+      "B": [(('b-x', 1), "X")],
+      "X": [(('x-g', 1), "G")],
+      "G": [],
+  }
+  blacklist = set()
+  e = _IncrementalLazySearch(
+      "S", goal_fn=lambda s: s == "G", succ_fn=lambda s: graph[s],
+      cost_fn=lambda a: a[1], h_fn=lambda _s: 0, weight=1, blacklist=blacklist,
+      memoize_successors=False, compact_frontier=True)
+  assert e.search(100) == [('s-a', 1), ('a-x', 1), ('x-g', 1)]
+
+  blacklist.add(("A", ('a-x', 1)))
+  e.delete_edge("A", ('a-x', 1), "X")
+  assert e.search(100) == [('s-b', 2), ('b-x', 1), ('x-g', 1)]
+  footprint = e.footprint()
+  assert footprint["alternates"] <= footprint["unique_states"]
+  assert footprint["successor_edges"] == 0
+  assert footprint["compact_frontier"] is True
+
+
+def test_compact_frontier_regenerates_after_a_cheap_edge_refutation():
+  graph = {
+      "S": [(('bad', 1), "X"), (('good', 2), "X")],
+      "X": [(('finish', 1), "G")],
+      "G": [],
+  }
+  blacklist = set()
+  e = _IncrementalLazySearch(
+      "S", goal_fn=lambda s: s == "G", succ_fn=lambda s: graph[s],
+      cost_fn=lambda a: a[1], h_fn=lambda _s: 0, weight=1, blacklist=blacklist,
+      cheap_gate=lambda _s, a, _ns: a[0] != "bad",
+      memoize_successors=False, compact_frontier=True)
+  assert e.search(100) == [('good', 2), ('finish', 1)]
+  assert ("S", ('bad', 1)) in blacklist

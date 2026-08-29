@@ -99,6 +99,11 @@ def apply_wrench_params(cfg):
 def build_scene(cfg):
   # reconstruct the exact environment the plan was solved in (same seed => same scatter/perturb)
   set_seed(cfg["seed"])
+  # Closure-aware V2 sampling changes the ranked, bounded grasp database. Restore it BEFORE
+  # make_assembly/install_sampled_scene_ctx so a saved grasp id cannot silently rebind (and so
+  # the database-hash check below compares like with like).
+  from solver import set_grasp_closure_check
+  set_grasp_closure_check(bool(_saved(cfg, "grasp_closure_check", legacy=False)))
   # mixed EEs: cfg["grippers"] = per-robot CSV (see main --grippers); rolls follow the
   # two-finger whenever any two-finger arm exists, exactly like the solve.
   ks = [k.strip() for k in (cfg.get("grippers") or "").split(",") if k.strip()]
@@ -181,8 +186,10 @@ def build_scene(cfg):
     from env import make_fr3_duo_env
     C = make_fr3_duo_env(num_duos=max(1, cfg["num_robots"] // 2))
   elif (_saved(cfg, "robot_types") or _saved(cfg, "robot")) == "openarm":
-    from env import make_openarm_duo_env
-    C = make_openarm_duo_env(num_duos=max(1, cfg["num_robots"] // 2))
+    from env import make_openarm_duo_env, make_openarm_floating_env
+    C = (make_openarm_floating_env(num_robots=cfg["num_robots"])
+         if _saved(cfg, "floating_ee") else
+         make_openarm_duo_env(num_duos=max(1, cfg["num_robots"] // 2)))
   else:
     C = make_four_robot_env(num_robots=cfg["num_robots"], floating_ee=cfg["floating_ee"],
                             vacuum=gripper_list if gripper_list is not None else _saved(cfg, "vacuum"),
@@ -235,6 +242,7 @@ def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=T
   brace = bool(_saved(cfg, "bracing", legacy=False))         # match the search that made the plan
   if use_ik:
     rik = RobotIK(C, robots)
+    rik.closure_check = bool(_saved(cfg, "grasp_closure_check", legacy=False))
     rik.pre_insertion_delta = float(_saved(cfg, "pre_insertion", legacy=0.0))  # pre-skill split (export/replay)
     # These funnels now default ON for fresh runs.  A missing key in an old plan means they
     # were OFF; silently adding split tasks would invalidate every saved task id.

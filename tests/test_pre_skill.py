@@ -335,15 +335,32 @@ def test_build_tasks_consumes_supplied_keyframes_and_solves_nothing():
   assert tasks[1].goal.goal[:6] == pytest.approx(np.full(6, 0.1))   # the skill witness
 
 
-def test_accepted_pre_pin_is_exported_only_on_the_funnel_task():
+def test_build_tasks_keeps_search_exit_out_of_the_physical_task_sequence():
+  MP._ensure_mrbench()
+  robots = ["a1", "a2"]
+  idx = {"a1": list(range(6)), "a2": list(range(6, 12))}
+  home = np.zeros(12)
+  exit_q = np.concatenate([np.full(6, -0.3), np.full(6, 0.3)])
+  rik = _StubIK(robots, 0.0)
+  tasks, seq, names = MP.build_tasks(
+      None, [], [], [_State()], robots, idx, rik, home, exit_state=exit_q)
+  assert names == []
+  assert seq == ["terminal"]
+  assert len(tasks) == 1
+  assert tasks[0].robots == robots
+  assert tasks[0].goal.goal == pytest.approx(home)
+
+
+def test_accepted_pre_pin_does_not_turn_an_idle_arm_into_a_task_participant():
   qpre = np.concatenate([np.full(6, 0.7), np.full(6, 0.9)])
   (tasks, _seq, _names), rik = _tasks(
       {0: qpre, 1: np.full(12, 0.8)}, pre_pin_robots={0: ["a2"]})
   assert rik.solved == 0
-  assert tasks[0].robots == ["a1", "a2"]
-  assert tasks[0].goal.goal == pytest.approx(qpre)
-  # The actual pick still moves only its actor; the idle-arm pin is a rendezvous condition,
-  # not a permanent lock through all subsequent motion.
+  # The pin proved one safe full IK configuration, but a2 is not physically part of a1's pick.
+  # make_problem supplies qpre separately as a transition hint; build_tasks must not turn an
+  # internal solver pin into a multi-robot rendezvous constraint.
+  assert tasks[0].robots == ["a1"]
+  assert tasks[0].goal.goal == pytest.approx(qpre[:6])
   assert tasks[1].robots == ["a1"]
   assert tasks[1].goal.goal == pytest.approx(np.full(6, 0.1))
   assert tasks[2].robots == ["a2"]                         # unrelated split unchanged
@@ -612,6 +629,59 @@ def test_cograsp_rendezvous_shares_an_intervening_place_mode_switch():
     assert _task_goal_by_robot(pre)[r] == pytest.approx(q_pre[idx[r]])
     assert _task_goal_by_robot(seat)[r] == pytest.approx(q_seat[idx[r]])
   assert "a2" not in pre.robots                         # released holder may retract
+
+
+def test_cograsp_bridge_does_not_replace_an_intervening_pick_witness():
+  """The former target holder may place the target and then pick the insertion part.
+
+  Only the persistent brace is stationary across that bridge.  Treating the former holder as
+  persistent because it later reappears as the *inserter* replaces the pick goal by the mate
+  rendezvous: mr_bench then freezes a completely unrelated gripper/object transform at the
+  pick side effect (the OpenArm car-mini wheel-through-table regression).
+  """
+  MP._ensure_mrbench()
+  robots = ["a1", "a2"]
+  idx = {r: list(range(6 * k, 6 * (k + 1))) for k, r in enumerate(robots)}
+  plan = [("add_grasp", "a1", "obj_0", 0),
+          ("place", "a2", "obj_0", 7),
+          ("pick", "a2", "obj_1", 2),
+          ("assemble", "a2", "obj_1", "obj_0")]
+  s0 = _ChainState([{"obj_0"}, {"obj_1"}], [("a2", "obj_0", 1)],
+                   {"obj_0": ("gripper", "a2"), "obj_1": ("table",)})
+  s1 = _ChainState([{"obj_0"}, {"obj_1"}],
+                   [("a1", "obj_0", 0), ("a2", "obj_0", 1)],
+                   {"obj_0": ("gripper", "a2"), "obj_1": ("table",)})
+  s2 = _ChainState([{"obj_0"}, {"obj_1"}], [("a1", "obj_0", 0)],
+                   {"obj_0": ("table",), "obj_1": ("table",)})
+  s3 = _ChainState([{"obj_0"}, {"obj_1"}],
+                   [("a1", "obj_0", 0), ("a2", "obj_1", 2)],
+                   {"obj_0": ("table",), "obj_1": ("gripper", "a2")})
+  s4 = _ChainState([{"obj_0", "obj_1"}],
+                   [("a1", "obj_0", 0), ("a2", "obj_1", 2)],
+                   {"obj_0": ("table",), "obj_1": ("part", "obj_0")})
+  q_add = np.concatenate([np.full(6, 1.0), np.full(6, 2.0)])
+  q_place = np.concatenate([np.full(6, 4.0), np.full(6, 5.0)])
+  q_pick = np.concatenate([np.full(6, 7.0), np.full(6, 8.0)])
+  q_pre = np.concatenate([np.full(6, 10.0), np.full(6, 20.0)])
+  q_seat = np.concatenate([np.full(6, 11.0), np.full(6, 21.0)])
+  rik = _ChainIK(robots)
+  tasks, seq, _names = MP.build_tasks(
+      None, plan, [q_add, q_place, q_pick, q_seat], [s0, s1, s2, s3, s4],
+      robots, idx, rik, np.zeros(12), pre_witnesses={3: q_pre})
+
+  assert seq[:5] == ["00_add_grasp_a1_obj_0_0", "01_place_a2_obj_0_7",
+                     "02_pick_a2_obj_1_2", "03_pre_assemble_a2_obj_1_obj_0",
+                     "03_assemble_a2_obj_1_obj_0"]
+  add, place, pick, pre, seat = tasks[:5]
+  assert _task_goal_by_robot(add)["a1"] == pytest.approx(q_pre[idx["a1"]])
+  assert _task_goal_by_robot(add)["a2"] == pytest.approx(q_place[idx["a2"]])
+  assert _task_goal_by_robot(place)["a1"] == pytest.approx(q_pre[idx["a1"]])
+  assert _task_goal_by_robot(place)["a2"] == pytest.approx(q_place[idx["a2"]])
+  # This is the safety-critical assertion: the pick actor keeps the actual pick witness.
+  assert _task_goal_by_robot(pick)["a1"] == pytest.approx(q_pre[idx["a1"]])
+  assert _task_goal_by_robot(pick)["a2"] == pytest.approx(q_pick[idx["a2"]])
+  assert _task_goal_by_robot(pre)["a2"] == pytest.approx(q_pre[idx["a2"]])
+  assert _task_goal_by_robot(seat)["a2"] == pytest.approx(q_seat[idx["a2"]])
 
 
 def test_the_pass_declines_cleanly_when_no_pre_split_is_active(arms):

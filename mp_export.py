@@ -156,7 +156,7 @@ class _PairedGoal:
 def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
                 home_state, pre_witnesses=None, witness_sets=None,
                 resolved_pre_witnesses=None, resolve_missing_pre=True,
-                pre_pin_robots=None):
+                pre_pin_robots=None, exit_state=None):
   """Map the plan+witnesses to (tasks, sequence_names). robot_idx: {r: [joint indices]}
   in the problem config's joint order; witnesses[i] is the full-config keyframe for plan[i]
   (None for non-IK actions -> skipped, no motion goal needed).
@@ -185,11 +185,19 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
   from multi_robot_multi_goal_planning.problems.planning_env import Task
   from multi_robot_multi_goal_planning.problems.core.goals import SingleGoal, GoalSet
 
-  # cur[r] = robot r's CURRENT joint sub-vector (start: home). A witness updates the
+  home_state = np.asarray(home_state, dtype=float)
+  if exit_state is None:
+    exit_state = home_state
+  exit_state = np.asarray(exit_state, dtype=float)
+  if exit_state.shape != home_state.shape:
+    raise ValueError("exit_state and home_state must have the same full-joint shape")
+  has_exit = not np.allclose(exit_state, home_state, atol=1e-12, rtol=0.0)
+
+  # cur[r] = robot r's CURRENT joint sub-vector (start of manipulation: exit). A witness updates the
   # ACTIVE arm(s); a no-witness / release action leaves the arm where it was -- so its goal
   # keeps it AT ITS GRASP, which is what makes a release's re-parent capture the object at
   # its true (held) pose rather than at home.
-  cur = {r: np.asarray(home_state)[robot_idx[r]].copy() for r in robots}
+  cur = {r: exit_state[robot_idx[r]].copy() for r in robots}
   # cur_alt[r] = (source plan index, [per-member sub-vectors]) when r was last moved by a
   # set-bearing task; reset whenever a set-less task moves r. Consumed by the mirroring below.
   cur_alt = {r: None for r in robots}
@@ -314,6 +322,7 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
   # approach -- pinning the union of both sides made Cross's a1/a2 overlap by 106mm.
   cograsp_bridge = {}
   add_robots = {}
+  brace_robots = {}
   assembly_robots = {}
   coupled_release_robots = {}
   for _i, j, _r, _p, _g in cograsp_pairs:
@@ -321,6 +330,7 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
     _add_rs = _active_robots(plan[_i], states[_i], robot_ik) or [plan[_i][1]]
     _asm_rs = _active_robots(ca, states[j], robot_ik) or [ca[1]]
     add_robots[j] = list(dict.fromkeys(add_robots.get(j, []) + _add_rs))
+    brace_robots[j] = list(dict.fromkeys(brace_robots.get(j, []) + [_r]))
     assembly_robots[j] = list(dict.fromkeys(assembly_robots.get(j, []) + _asm_rs))
     for k in range(_i + 1, j):
       old = cograsp_bridge.setdefault(k, j)
@@ -329,11 +339,18 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
             f"overlapping add_grasp chains assign plan step {k} to assemblies {old} and {j}")
   bridged = set(cograsp_bridge.values())
   rendezvous_robots = {
-      j: (list(add_robots[j]) if j in bridged else
+      # Across an intervening support switch, ONLY the newly-added brace can stay at one
+      # configuration.  The incumbent holder may subsequently place the target, leave it,
+      # pick the insertion part, and become the inserter.  Coupling that robot merely because
+      # it appears in both endpoint tasks overwrites those skills' own witnesses: measured on
+      # OpenArm car-mini, the pick side effect then attached the last wheel at its insertion
+      # pose (214mm from the grasp), 24mm through the table.  A direct chain still rendezvous-
+      # couples all physical participants as before.
+      j: (list(brace_robots[j]) if j in bridged else
           list(dict.fromkeys(add_robots[j] + assembly_robots[j])))
       for j in assembly_robots}
   persistent_robots = {
-      j: [r for r in add_robots[j] if r in assembly_robots[j]] for j in assembly_robots}
+      j: [r for r in brace_robots[j] if r in assembly_robots[j]] for j in assembly_robots}
   for j in assembly_robots:
     # Every immediately-following release is part of the atomic choreography. In particular,
     # the SECOND release must still pin the already-released inserter: otherwise mr_bench can
@@ -366,15 +383,31 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       chain_goal_cache[j] = None
       return None
     q = np.asarray(qpre, dtype=float).copy()
-    former = set(rendezvous_robots[j]) - set(persistent_robots[j]) if j in bridged else set()
+    # Incumbent holders that leave at the support switch should already be at that switch's
+    # own witness when the new brace arrives.  This makes add_grasp -> place one continuous
+    # rendezvous without pretending that the incumbent can also stay fixed through a later
+    # pick/insertion performed by that same robot.
+    former = set(add_robots[j]) - set(rendezvous_robots[j]) if j in bridged else set()
     if former:
-      for k in sorted(k for k, jj in cograsp_bridge.items() if jj == j):
-        wk = witnesses[k]
-        if wk is None:
-          continue
-        step_robots = set(_active_robots(plan[k], states[k], robot_ik) or [plan[k][1]])
-        for rr in former & step_robots:
-          q[robot_idx[rr]] = np.asarray(wk, dtype=float)[robot_idx[rr]]
+      for rr in former:
+        for k in sorted(k for k, jj in cograsp_bridge.items() if jj == j):
+          wk = witnesses[k]
+          if wk is None:
+            continue
+          # Use the exact support-switch witness where this incumbent stops holding the
+          # target.  Do not keep overwriting it with later actions by the same robot (most
+          # importantly, its subsequent pick of the insertion part).
+          hb = robot_ik.holders(states[k]).get(rr)
+          ha = robot_ik.holders(states[k + 1]).get(rr)
+          target_before = next((g for g in states[k].subassemblies()
+                                if plan[j][3] in g), ())
+          target_after = next((g for g in states[k + 1].subassemblies()
+                               if plan[j][3] in g), ())
+          held_before = hb is not None and hb[0] in target_before
+          held_after = ha is not None and ha[0] in target_after
+          if held_before and not held_after:
+            q[robot_idx[rr]] = np.asarray(wk, dtype=float)[robot_idx[rr]]
+            break
     chain_goal_cache[j] = q
     return q
 
@@ -446,6 +479,13 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
             (name, mk_skill(skill_goal))]
 
   tasks, seq, step_names = [], [], []                             # step_names[i] = names of plan step i
+  # HOME and EXIT deliberately belong to different layers. RobotIK parks otherwise-idle arms
+  # at EXIT while finding robust manipulation witnesses; the physical motion problem starts at
+  # HOME and connects each robot directly to its first required task. Exporting EXIT as an
+  # all-robot task inserted a pointless global rendezvous (and a 3rad detour for OpenArm) before
+  # any useful motion. The ordinary collision-checked planner is exactly the right mechanism
+  # for bridging HOME to those first task goals. `cur` still starts at EXIT above because saved
+  # witnesses/no-motion bookkeeping use the IK convention, not because execution must visit it.
   _NEEDS_WITNESS = ("pick", "place", "stow", "assemble", "add_grasp", "handover")
   for i, a in enumerate(plan):
     kind, r = a[0], a[1]
@@ -485,7 +525,11 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       involved = list(dict.fromkeys(list(involved) + list(shared_robots)))
       rendezvous = chain_goal(shared_j)
       if rendezvous is not None:
-        if bridge_j is None:
+        # A bridged chain's add_grasp endpoint is hybrid too: the arriving brace takes its
+        # assembly-rendezvous slice, while the incumbent holder retains the actual add_grasp
+        # witness.  `bridge_j is None` for the add_grasp action itself, so testing only that
+        # variable accidentally replaced the incumbent as well.
+        if bridge_j is None and shared_j not in bridged:
           goal_wit = rendezvous
         else:
           # Hybrid full witness: chain participants take the shared rendezvous slices; any
@@ -494,8 +538,11 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
           # branch consume the pinned goal without duplicating the action-specific exporter.
           goal_wit = np.asarray(rendezvous, dtype=float).copy()
           source = None if wit is None else np.asarray(wit, dtype=float)
+          coupled = set(shared_robots)
+          if chain_j is not None and shared_j in bridged:
+            coupled.update(add_robots[shared_j])
           for rr in robots:
-            if rr not in shared_robots:
+            if rr not in coupled:
               goal_wit[robot_idx[rr]] = cur[rr] if source is None else source[robot_idx[rr]]
           wit = goal_wit
     # --witness-sets: members for THIS step, validated against the shipped canonical witness.
@@ -647,7 +694,7 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
 # ---------------------------------------------------------------------------
 # problem instance
 # ---------------------------------------------------------------------------
-def _dependency_graph(plan, states, step_names, robots, robot_ik):
+def _dependency_graph(plan, states, step_names, robots, robot_ik, initial_task=None):
   """Build a mr_bench DependencyGraph = the PARTIAL order our linear plan is one linearization
   of. Sound-by-construction: for every action we chain it AFTER the last action that touched
   any RESOURCE it shares -- (a) each robot in the task (per-arm order), and (b) every part in
@@ -662,7 +709,10 @@ def _dependency_graph(plan, states, step_names, robots, robot_ik):
     for nm in nms:
       g.add_node(nm)
   g.add_node("terminal")
-  last = {}                                                  # resource -> most-recent task name
+  if initial_task is not None:
+    g.add_node(initial_task)
+  last = ({r: initial_task for r in robots} if initial_task is not None else {})
+                                                               # resource -> most-recent task name
   for i, a in enumerate(plan):
     nms = step_names[i]
     if not nms:
@@ -680,7 +730,8 @@ def _dependency_graph(plan, states, step_names, robots, robot_ik):
         g.add_dependency(first, last[r])                     # step's FIRST task waits on r's last writer
       last[r] = leaf                                         # step's LAST task becomes r's new writer
   for nm in set(last.values()):                              # terminal after every leaf
-    g.add_dependency("terminal", nm)
+    if nm is not None:
+      g.add_dependency("terminal", nm)
   return g
 
 
@@ -1265,7 +1316,9 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
       SequenceMixin, DependencyGraphMixin, BaseModeLogic)
 
   states = _states_along_plan(C_start, assembly, plan, robots, gk, bracing)
-  home = np.asarray(C_start.getJointState())               # the initial home pose (== start)
+  home = np.asarray(C_start.getJointState())               # physical initial/final HOME
+  exit_state = np.asarray(getattr(robot_ik, "exit_configuration", home))
+  _distinct_exit = not np.allclose(home, exit_state, atol=1e-12, rtol=0.0)
   Mixin = DependencyGraphMixin if depgraph else SequenceMixin
 
   class AssemblyEnv(Mixin, rai_env):
@@ -1294,7 +1347,7 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
             pre_witnesses=pre_witnesses, witness_sets=witness_sets,
             resolved_pre_witnesses=resolved_pre_witnesses,
             resolve_missing_pre=resolve_missing_pre,
-            pre_pin_robots=pre_pin_robots)
+            pre_pin_robots=pre_pin_robots, exit_state=exit_state)
       else:
         # FINAL-EXPORT replay: task goals/effects are data, not something inferred again from
         # today's exporter. This closes the second drift channel after IK: a later change to
@@ -1312,8 +1365,15 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
       self.states = states                                 # discrete state trajectory -- the
                                                            # only place report_cograsp_drift can
                                                            # read WHO holds WHAT per mode
+      self.home_configuration = home.copy()
+      self.exit_configuration = exit_state.copy()
       if depgraph:
-        self.graph = _dependency_graph(plan, states, step_names, self.robots, robot_ik)
+        # Backward compatibility for already-persisted exports made during the short-lived
+        # explicit-rendezvous implementation. Fresh exports have no initial EXIT task.
+        _initial = "exit" if "exit" in seq else None
+        self.graph = _dependency_graph(
+            plan, states, step_names, self.robots, robot_ik,
+            initial_task=_initial)
       else:
         self.sequence = self._make_sequence_from_names(seq)   # flat order (incl. terminal)
       self.sequence_names = list(seq)
@@ -1341,6 +1401,10 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
       self.prev_mode = self.start_mode
 
   env = AssemblyEnv()
+  if _distinct_exit:
+    print("[mp] distinct HOME/EXIT poses: IK parks idle arms at EXIT, while execution starts "
+          "at HOME and connects each robot directly to its first task (no global EXIT "
+          "rendezvous); terminal returns directly to HOME.")
   if (robot_robot_margin and robot_robot_margin > 0.0) or (table_margin and table_margin > 0.0):
     if robot_robot_margin and robot_robot_margin > 0.0:
       print(f"[mp] --mp-robot-margin {robot_robot_margin:g}m: robot-robot clearance enforced by a "
@@ -1910,6 +1974,8 @@ def mode_sequence(problem):
   env = problem
   q_home = env.get_start_pos()
   conf_type = type(q_home)
+  q_exit_full = np.asarray(getattr(env, "exit_configuration", env.C.getJointState()),
+                           dtype=float)
 
   def goal_config(m, task):                                  # as report_problem_clearance
     goal = _goal_q(task.goal, m)
@@ -1923,7 +1989,7 @@ def mode_sequence(problem):
             break
           off += env.robot_dims[tr]
       else:
-        q.append(q_home.robot_state(j))
+        q.append(q_exit_full[np.asarray(env.robot_idx[r], dtype=int)])
     return conf_type.from_list(q)
 
   chain, m = [], env.start_mode
@@ -2073,11 +2139,15 @@ def report_problem_clearance(problem, plan=None, margin=0.02, verbose=True,
   belongs to, total penetration, and the closest/penetrating FRAME PAIRS within `margin` m.
   This makes 'looks fine in viser but the planner rejects it' concrete: the offending pair
   (arm-vs-part, part-vs-part rounding, arm-vs-arm) is named with its signed distance. Idle
-  (non-switching) robots sit at HOME here, exactly as mr_bench's mode validation poses them.
+  (non-switching) robots sit at the manipulation EXIT pose here. This is the canonical idle
+  configuration inside manipulation modes; the physical path still starts at HOME and has no
+  mandatory EXIT rendezvous.
   Returns [(mode_index, task_name, action, penetration, [(f1,f2,dist), ...]), ...]."""
   env = problem
   q_home = env.get_start_pos()
   conf_type = type(q_home)
+  q_exit_full = np.asarray(getattr(env, "exit_configuration", env.C.getJointState()),
+                           dtype=float)
   name_to_act = {}
   step_names = getattr(env, "step_names", None)
   if step_names is not None and plan is not None:
@@ -2097,7 +2167,7 @@ def report_problem_clearance(problem, plan=None, margin=0.02, verbose=True,
             break
           off += env.robot_dims[tr]
       else:
-        q.append(q_home.robot_state(j))
+        q.append(q_exit_full[np.asarray(env.robot_idx[r], dtype=int)])
     return conf_type.from_list(q)
 
   name_to_idx_ref = {}
@@ -2223,7 +2293,7 @@ def report_problem_clearance(problem, plan=None, margin=0.02, verbose=True,
   if verbose:
     ncol = sum(1 for r in rows if r[3] > 1e-6)
     print(f"[clearance] {ncol}/{len(rows)} task-goals collide (margin {margin*1000:.0f}mm, "
-          f"mr_bench check, idle arms at HOME). '[obj_X on a?_ur_vacuum]' = obj_X is ATTACHED "
+          f"mr_bench check, idle arms at EXIT). '[obj_X on a?_ur_vacuum]' = obj_X is ATTACHED "
           f"to that gripper at this keyframe -- a part that should REST but is welded to an arm "
           f"is a re-rooting bug, not a geometry clash.")
   return rows

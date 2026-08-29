@@ -124,6 +124,7 @@ _GRIPPER_BODY_KEYS = ("vacuum", "finger", "palm", "gripper_fill", "gripper_cente
 
 
 _TIGHT_FINGERS = False         # shrink the finger COLLISION proxy (see tighten_fingers)
+_OPENARM_REAL_FINGER_RADIUS_SCALE = 1.0
 
 # robotiq.g's finger proxy vs robotiq_tight.g's: the tight one halves the capsule RADIUS and
 # shifts the capsule laterally by the difference, so the gripping SURFACE stays put (measured:
@@ -138,6 +139,46 @@ def set_tight_fingers(on):
     scene is built -- the geometry is baked into every C the run creates."""
     global _TIGHT_FINGERS
     _TIGHT_FINGERS = bool(on)
+
+
+def set_openarm_real_finger_radius_scale(scale):
+    """Set a diagnostic radius multiplier for the REAL OpenArm finger capsules.
+
+    This intentionally does not alter the floating grasp/closure proxy. Keeping the cheap
+    proxy nominal makes fixed-plan comparisons causal: grasp ids and cheap feasibility stay
+    identical, while only the expensive arm IK collision model changes.
+    """
+    scale = float(scale)
+    if not (0.0 < scale <= 1.0):
+        raise ValueError("OpenArm real finger radius scale must be in (0, 1]")
+    global _OPENARM_REAL_FINGER_RADIUS_SCALE
+    _OPENARM_REAL_FINGER_RADIUS_SCALE = scale
+
+
+def scale_openarm_real_finger_capsules(C, prefix=""):
+    """Apply the configured multiplier to native real-arm OpenArm finger capsules."""
+    if _OPENARM_REAL_FINGER_RADIUS_SCALE == 1.0:
+        return 0
+    n = 0
+    for name in C.getFrameNames():
+        if prefix and not name.startswith(prefix):
+            continue
+        if "_finger" not in name or "_coll" not in name:
+            continue
+        frame = C.getFrame(name)
+        try:
+            size = list(frame.getSize())
+        except Exception:
+            continue
+        # Assign from the 15mm nominal radius, rather than multiplying the current
+        # value, so an accidental second call cannot compound the transform.
+        if len(size) != 2 or abs(float(size[0]) - 0.06) > 1e-9:
+            continue
+        frame.setShape(ry.ST.capsule,
+                       [float(size[0]), 0.015 * _OPENARM_REAL_FINGER_RADIUS_SCALE])
+        frame.setContact(-2)             # setShape clears the .g collision flag
+        n += 1
+    return n
 
 
 def tighten_fingers(C, prefix=""):
@@ -221,6 +262,91 @@ OPENARM_TORSO_PATH = "./src/rai/openarm/openarm_torso.g"
 OPENARM_ARM_PATHS = {"right": "./src/rai/openarm/right_openarm.g",
                      "left": "./src/rai/openarm/left_openarm.g"}
 OPENARM_FLOATING_EE_PATH = "./src/rai/openarm/openarm_pinch_floating.g"
+
+# The physical trajectory starts and ends at HOME.  Manipulation witnesses park every
+# currently-uninvolved arm at EXIT instead: with four OpenArms the visually natural home pose
+# occupies too much of the shared workspace and turns the idle arms into obstacles for nearly
+# every IK query.  Keeping the two concepts explicit avoids "fixing" search by changing the
+# robot's user-facing initial pose.  Other robot families currently have no distinct exit pose
+# and therefore use their scene's initial joint state for both.
+OPENARM_HOME_CONFIGS = {
+    "right": (0.0, -0.2, 0.0, -2.3, 0.0, 0.7, 0.0),
+    "left": (0.0, 0.2, 0.0, -2.3, 0.0, 0.7, 0.0),
+}
+OPENARM_EXIT_CONFIGS = {
+    "right": (-3.0, -0.2, 0.0, -2.3, 0.0, 0.7, 0.0),
+    "left": (-3.0, 0.2, 0.0, -2.3, 0.0, 0.7, 0.0),
+}
+
+
+def robot_exit_configuration(C, robots):
+    """Return the full joint vector used to park inactive arms during manipulation.
+
+    The returned vector starts as the scene's actual (home) state.  Only fixed OpenArm arm
+    joints are replaced, so UR/FR3/floating-EE scenes remain byte-for-byte unchanged and any
+    non-arm joints retain their configured values.
+    """
+    import re as _re
+    q = list(C.getJointState())
+    names = list(C.getJointNames())
+    frame_names = set(C.getFrameNames())
+    for r in robots:
+        side = ("right" if f"{r}_openarm_right_base_link" in frame_names else
+                "left" if f"{r}_openarm_left_base_link" in frame_names else None)
+        if side is None:
+            continue
+        pat = _re.compile(_re.escape(r + "_openarm_" + side + "_joint") + r"(\d)$")
+        for i, name in enumerate(names):
+            m = pat.match(name)
+            if m:
+                q[i] = OPENARM_EXIT_CONFIGS[side][int(m.group(1)) - 1]
+    return q
+
+
+def is_openarm_scene(C):
+    """Whether ``C`` contains either real OpenArm arms or their native floating pinch EEs.
+
+    Do not infer this from "non-vacuum": UR/FR3 use a Robotiq hand with materially different
+    tool and finger geometry.  The explicit floating marker also avoids pretending the proxy
+    has an OpenArm arm/base link (RobotIK must still recognize that it has no fixed arm).
+    """
+    names = C.getFrameNames()
+    return any("_openarm_left_base_link" in n or "_openarm_right_base_link" in n
+               or n.endswith("_openarm_floating_marker") for n in names)
+
+
+def _configure_openarm_table(C):
+    """Apply the shared compact OpenArm workbench to a real- or floating-arm scene."""
+    table_h = 0.06
+    C.getFrame("table").setShape(
+        ry.ST.box, size=[1.2, 0.6, table_h, 0.005]).setPosition(
+        [0.0, -0.2, 0.37 - table_h / 2.0]).setContact(1)
+    return C
+
+
+def make_openarm_floating_env(num_robots=4):
+    """Free 6-DOF OpenArm pinch hands in the OpenArm workcell, with no arm kinematics.
+
+    This is the literal ``--robot openarm --floating-ee`` model.  It deliberately loads the
+    same native pinch proxy used by OpenArm's cheap grasp/closure gates rather than falling
+    through to the generic Robotiq floating model.  Roots start separated above the bench;
+    their six joints remain free and RobotIK correctly detects that no fixed arm/SSIK model
+    exists.
+    """
+    assert 1 <= num_robots <= 6, "OpenArm floating EEs support between 1 and 6 robots"
+    C = _configure_openarm_table(make_world())
+    # Relative to the table frame.  These are only collision-free home locations for the
+    # free hands, not fictitious robot bases or reach constraints.
+    homes = [(-0.30, -0.20), (0.30, -0.20), (0.30, 0.20), (-0.30, 0.20),
+             (-0.45, 0.0), (0.45, 0.0)]
+    for i in range(num_robots):
+        prefix = f"a{i + 1}_"
+        root = C.addFile(os.path.join(HERE, OPENARM_FLOATING_EE_PATH), namePrefix=prefix)
+        root.setParent(C.getFrame("table")).setRelativePosition(
+            [homes[i][0], homes[i][1], 0.0]).setJoint(ry.JT.rigid)
+        C.addFrame(prefix + "openarm_floating_marker").setParent(root)
+        color_gripper(C, prefix, GRIPPER_COLORS[i % len(GRIPPER_COLORS)])
+    return C
 
 
 def make_fr3_duo_env(num_duos=1):
@@ -327,14 +453,10 @@ def make_openarm_duo_env(num_duos=1):
     the same mechanism as tighten_fingers. num_duos=2 places the second duo rotated
     180deg on the opposite table edge (robots a3/a4).
     """
-    C = make_world()
+    C = _configure_openarm_table(make_world())
     # OpenArm reach is only ~0.64m (vs FR3 0.85): the workbench sits IN the reach
     # envelope -- narrow (0.5m deep) slab close to the torso, top at 0.52 so top-down
     # grasps keep wrist headroom under the 0.72m shoulders.
-    table_h = 0.06                                       # slim slab, top at 0.52
-    C.getFrame("table").setShape(
-        ry.ST.box, size=[1.2, 0.6, table_h, 0.005]).setPosition(
-        [0.0, -0.2, 0.37 - table_h / 2.0]).setContact(1)
     duos = []
     for k in range(num_duos):
         # The FR3 placement (-0.66 / +0.26 about the table centre at -0.20) leaves an
@@ -350,11 +472,12 @@ def make_openarm_duo_env(num_duos=1):
         torso = C.addFile(os.path.join(HERE, OPENARM_TORSO_PATH),
                           namePrefix=f"oa{k}_").setParent(C.getFrame("floor"))
         torso.setPosition([0.0, by, 0.02]).setQuaternion(quat).setJoint(ry.JT.rigid)
-        # torso boxes are decoration (the arms bolt on right next to them):
-        # exclude from every collision query, like the fr3 torso hulls
-        for tn in list(C.getFrameNames()):
-            if tn.startswith(f"oa{k}_torso_"):
-                C.getFrame(tn).setContact(0)
+        # The declared torso_base / torso_column boxes are the OpenArm mount's collision
+        # proxies and deliberately stay contact-enabled.  The detailed body mesh remains
+        # visual-only and the shoulder plate is absent in openarm_torso.g, so neither enters
+        # IK or motion-planning collision queries.  Do not copy the FR3 carrier policy here:
+        # disabling every oa*_torso_* frame made both RobotIK and mr_bench plan straight
+        # through the physical OpenArm mount.
         for j, side in enumerate(("right", "left")):
             r = f"a{2 * k + j + 1}"
             prefix = f"{r}_"
@@ -375,6 +498,7 @@ def make_openarm_duo_env(num_duos=1):
             gc = C.addFrame(f"{prefix}ur_gripper_center").setParent(
                 C.getFrame(f"{prefix}gripper_center"))
             gc.setShape(ry.ST.sphere, [0.004]).setContact(0)
+            scale_openarm_real_finger_capsules(C, prefix)
             color_gripper(C, prefix, GRIPPER_COLORS[(k * 2 + j) % len(GRIPPER_COLORS)])
             # home pose: sampled collision-free ready config (hands above table height);
             # applied per side HERE so every duo's arms map correctly (a hardcoded a1/a2
@@ -383,8 +507,7 @@ def make_openarm_duo_env(num_duos=1):
             # exactly nose-to-nose when two duos faced each other; once the real finger
             # capsules were restored, a3/a4 started in collision with a1/a2.  This pose is
             # collision-free for one and two duos and keeps the fingertips above the table.
-            HOMES = {"right": [0, -0.2, 0, -2.3, 0., 0.7, 0.],
-                     "left": [0, 0.2, 0, -2.3, 0., 0.7, 0.]}
+            HOMES = OPENARM_HOME_CONFIGS
             import re as _re
             jn = C.getJointNames()
             pat = _re.compile(_re.escape(prefix) + r"openarm_" + side + r"_joint(\d)$")

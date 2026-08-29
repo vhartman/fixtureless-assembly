@@ -32,6 +32,9 @@ class OpenWitnessReport:
   max_successor_states: int = 0
   max_successor_edges: int = 0
   max_tree_edges: int = 0
+  max_node_budget: int = 0
+  reordered_paths: int = 0
+  prior_failure_first: int = 0
 
 
 class OpenWitnessPool:
@@ -53,6 +56,17 @@ class OpenWitnessPool:
 
   def witness_for(self, state, action):
     return self.success.get(self.key(state, action))
+
+  def failed_effort(self, state, action):
+    """Exact-query evidence available before another stochastic probe.
+
+    A key absent from ``success`` has failed every completed visit recorded here.  Keep this
+    deliberately narrower than RobotIK's action-level statistics: fixed-base reachability and
+    collision depend on the complete support scene, so evidence from another scene must not
+    reorder this query.
+    """
+    key = self.key(state, action)
+    return self.visits.get(key, 0), self.attempts.get(key, 0)
 
   def _batch_for(self, action, key):
     """Skill-aware geometric effort ladder, capped by ``--open-witness-batch``.
@@ -110,6 +124,50 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
   if pool is None:
     pool = robot_ik._open_witness_pool = OpenWitnessPool(robot_ik)
   report = OpenWitnessReport()
+  selector = getattr(robot_ik, "lazy_edge_selector", "forward")
+  if selector not in ("forward", "terminal-first", "reverse", "fail-first"):
+    raise ValueError("lazy edge selector must be 'forward', 'terminal-first', 'reverse', "
+                     "or 'fail-first'")
+
+  def validation_order(walked):
+    """Return unresolved IK edges in the requested LazySP validation order.
+
+    Witnesses certify individual endpoints in a fully known symbolic scene, so their solve
+    order need not follow execution order.  ``fail-first`` uses only failures of the EXACT
+    ``(action, scene signature)`` query.  An unseen tie falls back to reverse path order,
+    putting the contact-critical suffix in front without inventing cross-scene evidence.
+    """
+    unresolved = [(i, edge) for i, edge in enumerate(walked)
+                  if is_ik(edge[1]) and not pool.known(edge[0], edge[1])]
+    if selector == "forward":
+      return [edge for _i, edge in unresolved]
+    if selector == "terminal-first":
+      # Concrete disassembly proposal without a duplicate inverse action model: a complete
+      # symbolic candidate already exposes its exact pre-assembly scene. Certify the LAST mate
+      # first, then validate its causal prefix in execution order. A failed terminal mode is a
+      # direct candidate refutation; a successful witness persists in the ordinary exact-scene
+      # pool. No edge is pruned merely because another terminal mode failed.
+      terminal = next((item for item in reversed(unresolved)
+                       if item[1][1][0] == "assemble"), None)
+      if terminal is None:
+        return [edge for _i, edge in unresolved]
+      terminal_i, terminal_edge = terminal
+      return [terminal_edge] + [edge for i, edge in unresolved if i != terminal_i]
+    if selector == "reverse":
+      return [edge for _i, edge in reversed(unresolved)]
+
+    def priority(item):
+      i, (state, action, _successor) = item
+      visits, slots = pool.failed_effort(state, action)
+      # A previously failed exact query is the strongest candidate-path refutation.  Among
+      # such queries, prefer more accumulated evidence/effort; otherwise use the deterministic
+      # reverse-path fallback.  ``max`` therefore selects the desired edge first.
+      return (visits > 0, visits, slots, i)
+
+    ranked = sorted(unresolved, key=priority, reverse=True)
+    if ranked and pool.failed_effort(ranked[0][1][0], ranked[0][1][1])[0] > 0:
+      report.prior_failure_first += 1
+    return [edge for _i, edge in ranked]
 
   def sample(engine):
     if not hasattr(engine, "footprint"):
@@ -124,12 +182,14 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
     report.max_tree_edges = max(report.max_tree_edges, f["tree_edges"])
 
   def storage_tail():
-    if not report.max_successor_states:
-      return ""
+    select = (f"; selector={selector}, reordered={report.reordered_paths}, "
+              f"prior-failure-first={report.prior_failure_first}")
+    succ = (f"{report.max_successor_states}/{report.max_successor_edges}"
+            if report.max_successor_states else "regenerated")
     return (f"; search peak pending/heap={report.max_frontier}/{report.max_heap_entries}, "
             f"alts={report.max_alternates}, unique={report.max_unique_states}, "
-            f"succ={report.max_successor_states}/{report.max_successor_edges}, "
-            f"tree={report.max_tree_edges}")
+            f"succ={succ}, "
+            f"tree={report.max_tree_edges}, node-cap={report.max_node_budget}" + select)
 
   epoch = 0
   while max_epochs == 0 or epoch < max_epochs:
@@ -138,13 +198,20 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
       return None, None, report
     epoch += 1
     report.epochs = epoch
+    # A node-budget stop is search incompleteness, not new IK evidence.  The old scheduler
+    # restarted every epoch with the identical cap, so a large equal-f shell could be replayed
+    # forever while only the per-edge IK batch grew.  Geometric widening is the standard
+    # anytime remedy: finite profiles get a predictable 1x,2x,... ladder; unlimited epochs
+    # remain complete in the limit under their required wall-clock deadline.
+    epoch_nodes = int(max_nodes) * (1 << (epoch - 1))
+    report.max_node_budget = max(report.max_node_budget, epoch_nodes)
     suspended = set()                                    # cleared at the next fairness epoch
     engine = make_engine(suspended)
     while True:
       if deadline is not None and time.perf_counter() >= deadline:
         report.deadline = True
         return None, None, report
-      subplan = engine.search(max_nodes, deadline=deadline)
+      subplan = engine.search(epoch_nodes, deadline=deadline)
       sample(engine)
       if subplan is None:
         if getattr(engine, "budget_hit", False):
@@ -158,16 +225,19 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
           report.budget_hits += 1
           if verbose:
             print(f"[open-witness {tag}] epoch {epoch} ended on the node budget "
-                  f"(not exhaustion); reopening with escalated effort")
+                  f"{epoch_nodes} (not exhaustion); reopening with IK + node effort"
+                  + (f" (next cap {epoch_nodes * 2})"
+                     if max_epochs == 0 or epoch < max_epochs else ""))
         break                                             # reopen all and increase effort
       valid = True
-      end_state = None
-      for state, action, successor in walk_plan(subplan):
-        end_state = successor
-        if not is_ik(action):
-          continue
-        if pool.known(state, action):
-          continue
+      walked = list(walk_plan(subplan))
+      end_state = walked[-1][2] if walked else None
+      ordered = validation_order(walked)
+      forward_unresolved = [edge for edge in walked
+                            if is_ik(edge[1]) and not pool.known(edge[0], edge[1])]
+      if ordered != forward_unresolved:
+        report.reordered_paths += 1
+      for state, action, successor in ordered:
         ok, _witness, spent = pool.probe(action, state, successor, assembly)
         report.probes += spent
         if ok:

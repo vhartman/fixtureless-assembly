@@ -889,6 +889,55 @@ def test_fill_local_exact_plans_a_sequence_without_global_oracle():
   assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
 
 
+def test_fill_policy_edge_uses_bellman_equality_and_rejects_hidden_stutters():
+  import solver as S
+
+  class PDB:
+    def abstract(self, state):
+      return state[0]
+
+    def value(self, state):
+      return {"s": 3.0, "good": 2.0, "detour": 3.0}[state[0]]
+
+  pdb = PDB()
+  action = ("pick", "a1", "obj_1", 0)                  # unit action cost
+  assert S._fill_policy_edge(pdb, ("s", 0), action, ("good", 0))
+  assert not S._fill_policy_edge(pdb, ("s", 0), action, ("detour", 0))
+  assert not S._fill_policy_edge(pdb, ("s", 0), action, ("s", 1))
+
+
+def test_fill_policy_first_refines_a_replayable_sequence():
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 3)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  plan = A.solve_assembly_problem_milestones(
+      C, asm, robots=robots, weight=1.0, verbose=False,
+      milestone_oracle="structural", fill_local_h=True, fill_exact=True,
+      fill_policy_first=True)
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+
+
+def test_fill_policy_failure_falls_through_to_unrestricted_fill(monkeypatch, capsys):
+  import solver as S
+
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 2)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  monkeypatch.setattr(S, "_fill_policy_edge", lambda *_args: False)
+  plan = A.solve_assembly_problem_milestones(
+      C, asm, robots=robots, weight=1.0, verbose=True,
+      milestone_oracle="structural", fill_local_h=True, fill_exact=True,
+      fill_policy_first=True)
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+  assert "no concrete refinement -> unrestricted exact fill" in capsys.readouterr().out
+
+
 def test_fill_touch_all_expands_manipulation_scope_but_not_milestone_assembly_scope():
   """The locality ablation may move blockers without silently growing the outer ideal."""
   import solver as S

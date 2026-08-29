@@ -93,12 +93,14 @@ class RunConfig:
   milestone_oracle: str = "global"
   fill_local_h: bool = False
   fill_exact: bool = False
+  fill_policy_first: bool = False
   fill_skeleton_first: bool = False
   milestone_boundaries: int = 1
   lazy_fills: bool = True
   open_witness: bool = False
   open_witness_epochs: int = 2
   open_witness_batch: int = 7
+  lazy_edge_selector: str = "forward"
   lns_segments: bool = False
   handovers: bool = True
   allow_place: bool = True
@@ -138,6 +140,8 @@ class RunConfig:
   precheck_restarts: int = 12
   fail_order: bool = False
   analytic_seed_cap: Optional[int] = None
+  ssik_seed_neighborhood: float = 0.0
+  ssik_neighborhood_cap: int = 6
   empty_seed_refutes: bool = False
   ik_collision_gate: float = 0.015
   full_ik: bool = False
@@ -164,6 +168,8 @@ class RunConfig:
   grasp_sampler_scenes: bool = False
   stable_rest_poses: bool = False
   tight_fingers: bool = True
+  openarm_real_finger_radius_scale: float = 1.0
+  grasp_closure_check: bool = False
   quiet_rai: bool = False
 
   # -- witness optimization --
@@ -226,6 +232,8 @@ class RunConfig:
   disp_final: bool = False
   show_init: bool = False
   viz_grasps: bool = False
+  viz_initial_grasps: Optional[str] = None
+  viz_grasp_closure: Optional[str] = None
   viz_rest_poses: bool = False
   mate_sequence_viz: bool = False
   show_successors: bool = False
@@ -240,6 +248,7 @@ class RunConfig:
   test_place_ik: Optional[str] = None
   search_stats: Optional[float] = None
   log_ik_failures: Optional[float] = None
+  diagnose_plan_rank: Optional[str] = None
   fill_scope_widening: bool = False
   fill_touch_all: bool = False
 

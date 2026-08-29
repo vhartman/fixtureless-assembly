@@ -6,6 +6,8 @@ import os
 import robotic as ry
 import numpy as np
 
+from gripper_closure import VERSION as _CLOSURE_MODEL_VERSION, certify as _certify_closure
+
 from env import *
 from problem import *
 import problem as _problem
@@ -38,6 +40,57 @@ _ASSEMBLE_BIAS_ORIENTATIONS = [
 ]
 
 
+# Search-scoped setting, installed by main before any CollisionChecker is constructed.  Like
+# tight-fingers it changes feasibility/action semantics and is persisted with a plan.
+_GRASP_CLOSURE_CHECK = False
+
+
+def _current_rss_mib():
+  """Best-effort current RSS for allocator diagnostics (Linux; None elsewhere)."""
+  try:
+    with open("/proc/self/statm", "r", encoding="ascii") as f:
+      resident_pages = int(f.read().split()[1])
+    return resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024.0 * 1024.0)
+  except (OSError, ValueError, IndexError):
+    return None
+
+
+def _release_fill_scratch(tag=None, verbose=False):
+  """Release a completed local search engine before constructing the next one.
+
+  Incremental LazySP deliberately caches a fill's generated successor graph. On wide fills
+  that graph can contain hundreds of thousands of Python objects. Refcounts make it dead as
+  soon as ``_add_one_part`` returns, but CPython/glibc may retain the empty arenas; under an
+  address-space guard the following fill then fails a native allocation even though the old
+  graph is no longer useful. Collection plus Linux ``malloc_trim`` changes no live search
+  state or ordering—it only returns dead allocator pages. Both operations are best-effort so
+  non-glibc platforms retain their previous behaviour.
+  """
+  import gc
+
+  before = _current_rss_mib()
+  gc.collect()
+  try:
+    import ctypes
+    trim = getattr(ctypes.CDLL(None), "malloc_trim", None)
+    if trim is not None:
+      trim.argtypes = [ctypes.c_size_t]
+      trim.restype = ctypes.c_int
+      trim(0)
+  except (ImportError, OSError, AttributeError):
+    pass
+  after = _current_rss_mib()
+  if (verbose and before is not None and after is not None
+      and (before - after >= 32.0 or before >= 1024.0)):
+    print(f"[fill-memory{(' ' + str(tag)) if tag else ''}] released completed search "
+          f"scratch: RSS {before:.0f} -> {after:.0f} MiB", flush=True)
+
+
+def set_grasp_closure_check(on=False):
+  global _GRASP_CLOSURE_CHECK
+  _GRASP_CLOSURE_CHECK = bool(on)
+
+
 def _park_pos(i):
   # a distinct far-away spot per gripper slot, so parked (unused) grippers neither touch
   # the scene nor each other.
@@ -56,7 +109,8 @@ class CollisionChecker:
   collision implies an arm collision), but it does NOT see the arms or reachability --
   that is the RobotIK (L3) layer."""
 
-  def __init__(self, assembly, robots, gripper_path=None, robot_gripper_paths=None):
+  def __init__(self, assembly, robots, gripper_path=None, robot_gripper_paths=None,
+               scene_config=None):
     self.gripper_path = gripper_path or os.path.join(os.path.dirname(__file__), DEFAULT_FLOATING_EE)
     # MIXED END EFFECTORS: robot_gripper_paths = {robot: cheap-EE path} loads each robot's
     # slot with ITS OWN gripper stand-in (vacuum pen vs two-finger palm differ a lot); None
@@ -72,7 +126,27 @@ class CollisionChecker:
                         for r, p in zip(robots, paths)}
     self._slot_kind = [self._robot_kind[r] for r in robots]
 
-    template = make_world()                                # floor + table, same as the real env
+    template = make_world()
+    # The generic cheap world predates robot-specific workcells. OpenArm's real table is
+    # smaller, shifted and 170mm higher than make_world()'s table; leaving the generic datum
+    # here made its initial parts float far above the collision table and admitted impossible
+    # under-table finger approaches. When constructed by _search_context, mirror the actual
+    # configured floor/table geometry. Direct standalone CollisionChecker users retain the
+    # historical generic fallback by omitting scene_config.
+    if scene_config is not None:
+      for world_frame in ("floor", "table"):
+        src = scene_config.getFrame(world_frame)
+        dst = template.getFrame(world_frame)
+        if src is None or dst is None:
+          continue
+        dst.setShape(src.getShapeType(), list(np.asarray(src.getSize(), dtype=float)))
+        pose = np.asarray(src.getPose(), dtype=float)
+        dst.setPosition(list(pose[:3]))
+        dst.setQuaternion(list(pose[3:]))
+        info = src.info()
+        if "color" in info:
+          dst.setColor(info["color"])
+        dst.setContact(int(info.get("contact", 1)))
     for obj in assembly.objects:                           # the parts (posed per query)
       add_part_frame(template, obj, assembly.part_shape(obj))
 
@@ -91,6 +165,13 @@ class CollisionChecker:
       template.getFrame(prefix + "ur_base").setPosition(_park_pos(i))
     self.template = template
     self._verdicts = {}                                    # discrete scene signature -> bool
+    # A collision-only, object-dependent jaw-closing certificate.  Kept off until the caller
+    # explicitly asks for it so old saved plans remain replayable under their original action
+    # semantics; the standard profile enables it after its calibration smoke tests.
+    self.closure_check = _GRASP_CLOSURE_CHECK
+    self._closure_verdicts = {}
+    self._closure_results = {}                            # pose-valued sampler diagnostics
+    self.closure_rejects = {}
     # PERSISTENT scene reuse (2026-07-17): rai's stale-broadphase problem is solved by a
     # global C.setJointState(C.getJointState()) round-trip before computeCollisions -- it
     # refreshes ALL frame writes (even plain setPosition on jointless frames; measured
@@ -141,7 +222,7 @@ class CollisionChecker:
         else tuple(sorted(tuple(g) for g in _g))
     return (tuple(sorted(parts)), ex)
 
-  def _scene_for(self, state, assembly, extra_grasps=()):
+  def _scene_for(self, state, assembly, extra_grasps=(), return_assignments=False):
     # build the floating-EE collision config for a state: parts posed per the state's scene
     # graph, a floating EE at every active grasp of the state, plus `extra_grasps`
     # [(gpart, grasp_id), ...] as additional EEs. Returns the ry.Config.
@@ -178,7 +259,7 @@ class CollisionChecker:
     # ("pose", gpart, pose7); robot-less extras take any free slot (callers pass the robot
     # when it matters), and a pose extra never calls grasp_pose (the DB may not exist yet).
     used = set()
-    assigns = []                                           # (slot_idx, gpart, gid-or-pose)
+    assigns = []                                           # (slot_idx, robot, gpart, gid-or-pose)
     robot_grasps = [(c[1], c[2], c[3]) for p in state.bodies()
                     for c in state.supports.get(p, ()) if c[0] == "grasp"]
     extras = []
@@ -202,8 +283,8 @@ class CollisionChecker:
     for r, gpart, gid in robot_grasps + extras:
       i = _slot_for(r)
       used.add(i)
-      assigns.append((i, gpart, gid))
-    for i, gpart, grasp_id in assigns:
+      assigns.append((i, r, gpart, gid))
+    for i, _r, gpart, grasp_id in assigns:
       if isinstance(grasp_id, np.ndarray):                 # ("pose", part, pose7) extra
         gpose = np.asarray(grasp_id, dtype=float)
       else:
@@ -227,6 +308,12 @@ class CollisionChecker:
       C_col.setJointState(C_col.getJointState())
       C_col.computeCollisions()
     # (fresh-copy path: remaining slots stay parked from the template.)
+    if return_assignments:
+      # Exact robot -> floating-slot mapping for auxiliary geometric certificates.  Do not
+      # infer this from slot index: a mixed scene assigns the first free slot of matching
+      # geometry, so the robot roster and slot order need not coincide once holders exist.
+      owners = {r: (self.slots[i], p) for i, r, p, _g in assigns if r is not None}
+      return C_col, owners
     return C_col
 
   def _check(self, state, assembly, extra_grasps=(), note=""):
@@ -274,6 +361,46 @@ class CollisionChecker:
     extra = [(robot, gpart, grasp_id)] if robot is not None else [(gpart, grasp_id)]
     return self._check(s0, assembly, extra_grasps=extra, note=note)
 
+  def grasp_closure_free(self, s0, action, assembly):
+    """Cheap, independent virtual-jaw certificate for a new fingered grasp.
+
+    The ordinary floating-EE check above sees only the deliberately fixed-open proxy.  Here
+    we make a throw-away copy of the same scene and sweep just the receiver's collision
+    fingers to their object-determined common aperture.  No main-config frame or joint state
+    is mutated.  The key includes the full discrete state because current holders/assembled
+    neighbours are collision obstacles during a handover/add_grasp.
+    """
+    if not self.closure_check:
+      return True
+    kind, robot, part, gid = tuple(action[:4])
+    if kind not in _GRASP_ACTIONS:
+      return True
+    key = ("closure", _CLOSURE_MODEL_VERSION, tuple(action), self._sig(s0, ()))
+    hit = self._closure_verdicts.get(key)
+    if hit is not None:
+      return hit
+    C_col, owners = self._scene_for(
+        s0, assembly, extra_grasps=[(robot, part, gid)], return_assignments=True)
+    receiver = owners.get(robot)
+    if receiver is None:
+      # A receiver without a slot is an internal bookkeeping error, not evidence that a
+      # physically impossible grasp is acceptable.  Fail closed and leave a useful reason.
+      res = None
+      ok = False
+      reason = "receiver-slot-missing"
+    else:
+      prefix, _ = receiver
+      res = _certify_closure(C_col, prefix, part)
+      ok = bool(res.feasible)
+      reason = res.reason
+    self._closure_verdicts[key] = ok
+    if not ok:
+      self.closure_rejects[reason or "unknown"] = self.closure_rejects.get(reason or "unknown", 0) + 1
+      if _CHEAP_DEBUG_VIEW:
+        detail = "" if res is None or res.detail is None else f" {res.detail!r}"
+        print(f"[closure] reject {tuple(action)!r}: {reason}{detail}", flush=True)
+    return ok
+
   def pose_collision_free(self, state, gpart, grasp_pose_7, assembly, note="", robot=None):
     """The same floating-EE gate for an EXPLICIT grasp pose (part frame) instead of a grasp
     id. Used by the scene-aware grasp sampler: it filters candidates while the DB is still
@@ -283,6 +410,54 @@ class CollisionChecker:
     extra = (("pose", gpart, grasp_pose_7) if robot is None
              else ("pose", robot, gpart, grasp_pose_7))
     return self._check(state, assembly, extra_grasps=[extra], note=note)
+
+  def pose_grasp_closure_free(self, state, gpart, grasp_pose_7, assembly, robot):
+    """Virtual-close certificate for a sampler candidate before grasp ids exist.
+
+    This is the pose-valued counterpart of :meth:`grasp_closure_free`.  The hybrid sampler
+    already asks this checker whether an explicit pose is clear in its pick/assembly scenes;
+    when closure checking is enabled it should also know whether the jaws can reach the part
+    through that same scene.  The result is a ranking/scene label in the sampler, not a global
+    hard deletion: candidates remain in the sampler's fallback diversity pool.
+    """
+    if not self.closure_check:
+      return True
+    res = self.pose_grasp_closure_result(state, gpart, grasp_pose_7, assembly, robot)
+    ok = bool(res is not None and res.feasible)
+    reason = "receiver-slot-missing" if res is None else res.reason
+    if not ok:
+      self.closure_rejects[reason or "unknown"] = \
+          self.closure_rejects.get(reason or "unknown", 0) + 1
+    return ok
+
+  def pose_grasp_closure_result(self, state, gpart, grasp_pose_7, assembly, robot):
+    """Return the strict closure certificate for an explicit sampler pose.
+
+    The boolean wrapper above is sufficient for search ranking, but scene-aware grasp
+    *generation* also needs the blocking pair and signed depth: a shallow finger/table
+    overlap can often be repaired by moving the hand outward along its approach while
+    retaining bilateral target contact.  Exposing the certificate keeps that refinement
+    geometric and deterministic instead of weakening the closure threshold.
+    """
+    if not self.closure_check:
+      return None
+    extra = ("pose", robot, gpart, np.asarray(grasp_pose_7, dtype=float))
+    key = ("pose-closure-result", _CLOSURE_MODEL_VERSION,
+           self._robot_kind.get(robot, robot), gpart,
+           tuple(np.round(np.asarray(grasp_pose_7, dtype=float), 4)),
+           self._sig(state, ()))
+    if key in self._closure_results:
+      return self._closure_results[key]
+    C_col, owners = self._scene_for(
+        state, assembly, extra_grasps=[extra], return_assignments=True)
+    receiver = owners.get(robot)
+    if receiver is None:
+      res = None
+    else:
+      prefix, _ = receiver
+      res = _certify_closure(C_col, prefix, gpart)
+    self._closure_results[key] = res
+    return res
 
 
 def _wrist_table_pair(a, b):
@@ -351,11 +526,11 @@ class RobotIK:
 
     - robots HOLDING a subassembly: their arm config AND the held subassembly's world
       pose are solved together, so the carry / assemble pose is optimized (not fixed);
-    - robots NOT holding anything: pinned at their home config;
+    - robots NOT holding anything: pinned at their manipulation exit config;
     - the whole thing must be collision-free (real arms + grippers + parts + table).
 
   Returns (feasible, witness) where witness is a joint state (or None). Stateless per node
-  (free robots deterministically at home); `seed` may warm-start from the parent.
+  (free robots deterministically at exit); `seed` may warm-start from the parent.
 
   Implemented per skill: pick (6-DOF EE-at-grasp) and assemble (cube-mate constraint with
   structured orientation restarts + centre bias) are done; place is still a stub.
@@ -366,7 +541,14 @@ class RobotIK:
     self.debug_view = debug_view                      # pop up each IK solution (visual check)
     self.C = ry.Config()
     self.C.addConfigurationCopy(C)                    # real arms + grippers + parts + world
-    self.home = self.C.getJointState()                # home config = the env's default pose
+    # HOME is the physical trajectory's true start/end. EXIT is the collision-free parking
+    # pose used throughout manipulation.  The RobotIK template itself lives at EXIT, so every
+    # scene_for() copy and every non-active slice of an expanded witness uses that pose.  The
+    # motion exporter explicitly plans HOME -> EXIT and EXIT -> HOME; nothing teleports.
+    self.home = np.asarray(self.C.getJointState(), dtype=float).copy()
+    self.exit_configuration = np.asarray(
+        robot_exit_configuration(self.C, self.robots), dtype=float)
+    self.C.setJointState(self.exit_configuration)
 
     # tool-center frame + approach-axis correction per robot, from the SAME helper the
     # floating EE uses -- so gripper-frame handling lives in one place. The correction is
@@ -414,6 +596,10 @@ class RobotIK:
       else:
         self.robot_arm[r] = None
         self.base_link[r] = None
+    # Robot onboarding contracts.  These run once, before search, so a malformed model fails
+    # with an actionable error instead of looking like thousands of unrelated IK failures.
+    self._discover_hand_subtrees()
+    self._validate_exit_contract()
     # SINGLE-ACTIVE-ARM IK optimisations (pick/place move only one arm). Both default ON;
     # flip either OFF for debugging (they change the IK scene, not the plan semantics):
     #   single_arm_ik           : restrict the KOMO to the active arm's joints (others frozen)
@@ -448,12 +634,17 @@ class RobotIK:
         "restart_solves": 0, "restart_time": 0.0,
         "post_calls": 0, "post_time": 0.0,                # _pen_ok + _clearance_ok gates
         "getpath_calls": 0,                               # is getPath() worth hoisting?
-        "by_action": {},                                  # (kind, part, gid) -> [n, fails, s]
+        "by_action": {},                                  # (kind, robot, part, gid) -> [n, fails, s]
         "calls_with_seeds": 0, "calls_without_seeds": 0,  # why so few analytic solves?
         "wins": {},                                       # winning attempt histogram
     }
     self.mate_eq_weight = None                            # None = 1e1 (rai default here)
     self.place_eq_weight = None                           # same, for _ik_place's object-pose eq
+    # Virtual jaw close: an independent collision certificate, never an active joint or
+    # KOMO objective. Main mirrors this flag on the floating cheap checker.
+    self.closure_check = False
+    self.closure_rejects = {}
+    self.last_closure_reject = None
     self.mate_residual_reject = None                      # None = off; metres (--mate-accuracy)
       # THE acceptance criterion for an assemble. rai's `feasible` verdict accepts an eq
       # constraint that is still MILLIMETRES out, and tightening stopTolerance does NOT change
@@ -493,6 +684,13 @@ class RobotIK:
     # (None = legacy: every branch). Caps the seeded-solve cost when a bind's exact branch
     # set is large and mostly colliding.
     self.analytic_seed_cap = None
+    # Exact SSIK is much faster than KOMO, but its target is stricter: KOMO's pose equality
+    # can converge from (and occasionally accept) a nearby interior configuration when every
+    # exact branch is just outside a limit or on the witness joint-margin boundary. This
+    # optional deterministic shell supplies those nearby configurations as SEEDS ONLY. It is
+    # deliberately off globally until enabled by a profile/CLI and never changes refutation.
+    self.ssik_seed_neighborhood = 0.0
+    self.ssik_neighborhood_cap = 6
     self.action_stats = {}
     # --empty-seed-refutes: treat an EMPTY calibrated analytic seed set as a sound
     # unreachability proof (skip relaxed precheck + KOMO). Sound because q1..q5 are
@@ -514,6 +712,7 @@ class RobotIK:
     self.open_witness = False
     self.open_witness_epochs = 2
     self.open_witness_batch = 7
+    self.lazy_edge_selector = "forward"                 # candidate-path IK check order only
     self._open_probe_attempt = None
     self._open_probe_budget = 1
     self._open_probe_random_only = False
@@ -559,6 +758,7 @@ class RobotIK:
     self.penetration_reject = None
     self.col_weight = 1e1
     self.strict_rejects = 0
+    self.last_strict_reject = None                       # (total penetration, deepest pairs)
     self.mate_rejects = 0                               # diagnostics: dirty witnesses vetoed
     self.grasp_pose_reject = None                       # None = off; metres (--grasp-accuracy)
     self.grasp_rejects = 0                              # diagnostics: off-pose grasps vetoed
@@ -628,6 +828,111 @@ class RobotIK:
     self.fail_log_stop = False                            # abort the search when done?
     self._fail_log_t0 = None
 
+  def _discover_hand_subtrees(self):
+    """Derive hand geometry from kinematic ancestry, never collision-frame spelling.
+
+    A tool centre is either below a frame marked ``logical: {gripper: true}``, or below the
+    final actuated joint of the arm.  The rigid subtree rooted there is the hand.  This makes
+    a new robot's ``ee_coll17`` just as unambiguously a hand as ``palm`` or ``finger`` and
+    removes model-specific string guessing from intended-contact margin exemptions.
+    """
+    self.hand_root = {}
+    self.hand_frames = set()
+    frame_names = list(self.C.getFrameNames())
+
+    def descendants(root):
+      out = set()
+      for name in frame_names:
+        f, seen = self.C.getFrame(name), set()
+        while f is not None and f.name not in seen:
+          if f.name == root:
+            out.add(name)
+            break
+          seen.add(f.name)
+          f = f.getParent()
+      return out
+
+    for robot in self.robots:
+      center = self.C.getFrame(self.gripper_frame[robot])
+      if center is None:
+        raise RuntimeError(
+            f"robot model contract: {robot} tool centre {self.gripper_frame[robot]!r} missing")
+      chain, f = [], center
+      while f is not None and f.name not in {x.name for x in chain}:
+        chain.append(f)
+        f = f.getParent()
+
+      logical = next((x for x in chain
+                      if bool((x.info().get("logical") or {}).get("gripper"))), None)
+      if logical is not None:
+        root_frame = logical.getParent() or logical
+      else:
+        root_frame = center
+        for x in chain:
+          joint = x.info().get("joint")
+          if joint is not None and joint != "rigid":
+            root_frame = x
+            break
+          parent = x.getParent()
+          if parent is not None:
+            pjoint = parent.info().get("joint")
+            if pjoint is not None and pjoint != "rigid":
+              # A floating EE puts the last pose DOF ON its EE-root frame; a fixed arm puts
+              # the last wrist DOF immediately ABOVE the rigid hand root.
+              root_frame = parent if self.robot_arm.get(robot) is None else x
+              break
+            root_frame = parent
+
+      members = descendants(root_frame.name)
+      collidable = [n for n in members
+                    if self.C.getFrame(n).info().get("contact") not in (None, 0)]
+      if not collidable:
+        raise RuntimeError(
+            f"robot model contract: {robot} hand subtree rooted at {root_frame.name!r} has "
+            "no collidable geometry; check the tool-centre parent and gripper contact shapes")
+      self.hand_root[robot] = root_frame.name
+      self.hand_frames.update(members)
+
+  def _validate_exit_contract(self):
+    """Fail early on a malformed manipulation parking configuration.
+
+    Joint bounds/interior are universal necessary conditions.  OpenArm additionally declares
+    a distinct HOME/EXIT contract, so reverting to the old obstructing HOME pose or introducing
+    a collectively colliding EXIT is a model error rather than an IK-search mystery.
+    """
+    q = np.asarray(self.exit_configuration, dtype=float).ravel()
+    names = list(self.C.getJointNames())
+    if q.size != len(names) or not np.all(np.isfinite(q)):
+      raise RuntimeError(
+          f"robot model contract: EXIT has {q.size} values for {len(names)} joints or is non-finite")
+    lo, hi = (np.asarray(v, dtype=float).ravel() for v in self.C.getJointLimits())
+    if lo.size != q.size or hi.size != q.size:
+      raise RuntimeError("robot model contract: EXIT and joint-limit dimensions disagree")
+    slack = np.minimum(q - lo, hi - q)
+    if np.any(slack < 1e-3):
+      k = int(np.argmin(slack))
+      raise RuntimeError(
+          f"robot model contract: EXIT joint {names[k]} has only {slack[k]:.6g}rad/m limit "
+          "slack; provide an interior manipulation exit pose")
+
+    openarms = [r for r in self.robots if str(self.robot_arm.get(r, "")).startswith("openarm_")]
+    for robot in openarms:
+      idx = [i for i, n in enumerate(names) if n.startswith(robot + "_")]
+      if idx and np.allclose(q[idx], np.asarray(self.home)[idx], atol=1e-12, rtol=0.0):
+        raise RuntimeError(
+            f"robot model contract: {robot} OpenArm EXIT equals HOME; declare a workspace-"
+            "clearing manipulation exit pose in env.OPENARM_EXIT_CONFIGS")
+    if openarms:
+      self.C.setJointState(q)
+      self.C.computeCollisions()
+      pen = float(self.C.getCollisionsTotalPenetration())
+      if pen > 1e-6:
+        pairs = sorted((str(a), str(b), float(d)) for a, b, d in self.C.getCollisions()
+                       if float(d) < 0.0)[:3]
+        raise RuntimeError(
+            f"robot model contract: OpenArm EXIT has {pen*1000:.3f}mm accumulated "
+            f"penetration ({pairs}); provide a collision-free collective exit pose")
+
   def holders(self, state):
     # {robot: (grasped_part, grasp_id)} -- who holds what, at which grasp, in this state.
     # Contacts are frozensets, whose iteration order changes with Python's hash seed.  Keep
@@ -649,7 +954,7 @@ class RobotIK:
     # GRASP MAINTENANCE: every grasp that scene_for does NOT enforce kinematically (i.e.
     # every BRACE: a holder of a table-parented group, or a secondary holder of a held
     # group) becomes an explicit objective -- the gripper pinned at its grasp, the arm a
-    # co-optimized DOF. Without this, brace arms sit at HOME in the IK scene (obstacles in
+    # co-optimized DOF. Without this, brace arms sit at EXIT in the IK scene (obstacles in
     # the wrong place) and a moved group slides out of its braces' grippers.
     # `phase` exists only so fuse_cograsp_witnesses can ground the SAME objectives on the
     # second keyframe of a 2-phase KOMO; every single-phase caller keeps the default.
@@ -705,7 +1010,7 @@ class RobotIK:
 
   def _restrict_to_arm(self, C, robot):
     # SINGLE-ARM IK: restrict the config's active joints to just `robot`'s subtree, so the
-    # KOMO only optimizes that one arm and every other robot is a FROZEN obstacle (at home).
+    # KOMO only optimizes that one arm and every other robot is a FROZEN obstacle (at exit).
     # Cuts the IK from R*6 DOFs to 6 -> much faster; valid where exactly one arm moves (pick).
     # Returns the FULL joint-name list so the restricted solution can be re-expanded to the
     # full witness vector the replay expects (see _expand_witness). NOTE: brace grasp-
@@ -729,7 +1034,7 @@ class RobotIK:
     if w is None:
       return None
     idx = {nm: i for i, nm in enumerate(full_names)}
-    full = np.array(self.home, dtype=float).copy()
+    full = np.array(self.exit_configuration, dtype=float).copy()
     for j, nm in enumerate(C_restricted.getJointNames()):
       full[idx[nm]] = w[j]
     return full
@@ -739,7 +1044,7 @@ class RobotIK:
   #   * on-table subassemblies posed at their table pose (fixed obstacles),
   #   * each held subassembly rigidly built and attached to its (primary) holder's gripper
   #     at the grasp transform, so it moves with that arm,
-  #   * all robots at home (the per-skill IK then frees only the ACTIVE arms).
+  #   * all robots at the manipulation exit pose (the per-skill IK then frees only ACTIVE arms).
   # ------------------------------------------------------------------------------------
   def scene_for(self, state, assembly):
     C = ry.Config()
@@ -828,6 +1133,9 @@ class RobotIK:
     self.prof["bind_calls"] += 1                          # A1: real IK binds only
     self._ctx_seeds = None                                # set by the skill's seed computation
     self._last_win = ""
+    self.last_strict_reject = None
+    self.last_margin_reject = None
+    self.last_closure_reject = None
     _bt0 = _time.perf_counter()
     # VERDICT + WITNESS CACHE on a discrete scene signature: the search re-probes the SAME
     # (action, scene) from many parent states, and a FAILED solve costs ~135ms (initial +
@@ -854,8 +1162,11 @@ class RobotIK:
     self.prof["bind_success" if res[0] else "bind_fail"] += 1
     _dt = _time.perf_counter() - _bt0
     self.prof["bind_time"] += _dt
-    # A1: per-(kind, part, grasp) attribution -- which actions burn the bind wall time.
-    _ak = (kind, action[2] if len(action) > 2 else None,
+    # A1: include the acting robot. Fixed bases make nominally identical grasp ids very
+    # different reachability queries; aggregating all arms hid exactly that distinction in
+    # the OpenArm car-mini obj_3 bottleneck.
+    _ak = (kind, action[1] if len(action) > 1 else None,
+           action[2] if len(action) > 2 else None,
            action[3] if len(action) > 3 else None)
     _e = self.prof["by_action"].setdefault(_ak, [0, 0, 0.0])
     _e[0] += 1
@@ -971,13 +1282,20 @@ class RobotIK:
       print(f"[ik-prof] winning attempt distribution: {wins}")
     ba = p["by_action"]
     if ba:
-      print("[ik-prof] top actions by bind time (kind/part/grasp: n (failed) time):")
-      for (kind, part, gid), (n, nf, t) in sorted(ba.items(), key=lambda kv: -kv[1][2])[:12]:
-        print(f"[ik-prof]   {kind:9s} {part} g{gid}: {n}x ({nf} failed) {t:.1f}s")
+      print("[ik-prof] top actions by bind time (kind/robot/part/grasp: n (failed) time):")
+      for (kind, robot, part, gid), (n, nf, t) in sorted(
+          ba.items(), key=lambda kv: -kv[1][2])[:12]:
+        print(f"[ik-prof]   {kind:9s} {robot}/{part} g{gid}: "
+              f"{n}x ({nf} failed) {t:.1f}s")
     if self.ana_stats:
       print("[ik-prof] analytic-coverage outcomes (decides ssik-refutation viability):")
       for k in sorted(self.ana_stats):
         print(f"[ik-prof]   {k}: {self.ana_stats[k]}")
+    if self.closure_check:
+      total = sum(self.closure_rejects.values())
+      detail = ", ".join(f"{k}={v}" for k, v in sorted(self.closure_rejects.items()))
+      print(f"[closure] achieved-witness virtual-close rejects: {total}"
+            + (f" ({detail})" if detail else ""))
 
   def _holders_of_group(self, state, group):
     # robots grasping any part of `group`
@@ -1257,6 +1575,27 @@ class RobotIK:
     finally:
       C.setJointState(saved)
 
+  def _closure_ok(self, C, q, action, state, backoff=0.0):
+    """Achieved-witness counterpart of the cheap virtual finger-close certificate."""
+    if (not self.closure_check or backoff > 0.0 or C is None or q is None
+        or action[0] not in _GRASP_ACTIONS):
+      return True
+    saved = C.getJointState()
+    try:
+      C.setJointState(np.asarray(q, dtype=float).ravel())
+      res = _certify_closure(C, action[1] + "_", action[2])
+    finally:
+      C.setJointState(saved)
+    if res.feasible:
+      return True
+    reason = res.reason or "unknown"
+    self.closure_rejects[reason] = self.closure_rejects.get(reason, 0) + 1
+    self.last_closure_reject = (tuple(action), reason, res.detail)
+    if os.environ.get("CLOSURE_DEBUG"):
+      print(f"[closure] achieved reject {tuple(action)!r}: {reason} {res.detail!r}",
+            flush=True)
+    return False
+
   def mate_residual(self, C, q, part_name, onto, rel_pos):
     """|achieved positionRel(part, onto) - target|, in metres. This is what mr_bench bakes in at
     attach (C.attach keeps the WORLD pose at the mode switch), so an under-seated mate makes the
@@ -1317,13 +1656,22 @@ class RobotIK:
       C.view(True, f"pen check {tuple(self._cur_action)}: {pen*1000:.1f}mm "
                    f"{'REJECT' if reject else 'ok'} (close to continue)")
 
+    if reject:
+      pairs = sorted(((str(a), str(b), float(d)) for a, b, d in C.getCollisions()
+                      if float(d) < 0.0), key=lambda x: x[2])[:5]
+      self.last_strict_reject = (float(pen), pairs)
     C.setJointState(saved)
     if reject:
       self.strict_rejects += 1
       return False
     return True
 
-  _HAND_TOKENS = ("gripper", "palm", "finger", "robotiq", "vacuum")
+  # Collision-shape naming differs across robot exports.  OpenArm's rigid gripper base uses
+  # ``*_ee_coll{,1,2}`` rather than palm/gripper; omitting it made the positive witness margin
+  # reject every close-fitting assemble endpoint even though strict binary collision was clear.
+  # This classifier controls intended-contact MARGIN exemptions only -- accumulated/strict
+  # collision remains active for these shapes.
+  _HAND_TOKENS = ("gripper", "palm", "finger", "robotiq", "vacuum", "ee_coll")
 
   def _arm_of_frame(self, frame):
     for r in self.robots:
@@ -1340,6 +1688,12 @@ class RobotIK:
     return f.split("__", 1)[0]
 
   def _is_hand_frame(self, frame):
+    # Real RobotIK instances derive this set from the tool-centre ancestry at startup.  Keep
+    # the token fallback only for small classifier unit-test doubles and old serialized/debug
+    # helpers constructed via ``object.__new__``.
+    hand_frames = getattr(self, "hand_frames", None)
+    if hand_frames is not None:
+      return str(frame) in hand_frames
     return any(t in str(frame) for t in self._HAND_TOKENS)
 
   def _part_is_payload_of(self, C, part, robot):
@@ -1374,6 +1728,35 @@ class RobotIK:
     return (len(action) >= 3 and action[0] in ("pick", "add_grasp", "handover")
             and action[1] == robot and action[2] == part)
 
+  def _coupled_task_robots(self, C, action):
+    """Robots that intentionally rendezvous at this coupled skill endpoint."""
+    action = tuple(action or ())
+    if len(action) < 3 or action[0] not in ("handover", "add_grasp", "assemble"):
+      return set()
+    out = {action[1]}                                      # receiver/inserter
+    touched = [p for p in action[2:] if isinstance(p, str) and p.startswith("obj_")]
+    for robot in self.robots:
+      if any(self._part_is_payload_of(C, part, robot) for part in touched):
+        out.add(robot)                                     # giver / target holder / brace
+    return out
+
+  def _same_part_group(self, C, part_a, part_b):
+    """Whether two logical parts share rigid part ancestry in this IK scene."""
+    def ancestors(part):
+      out, seen = set(), set()
+      try:
+        f = C.getFrame(part)
+        while f is not None and f.name not in seen:
+          seen.add(f.name)
+          logical = self._part_of_frame(f.name)
+          if logical is not None:
+            out.add(logical)
+          f = f.getParent()
+      except Exception:
+        pass
+      return out
+    return bool(part_a and part_b and ancestors(part_a) & ancestors(part_b))
+
   def _clearance_pair_reason(self, C, fa, fb):
     """Return the hard-gate class for a pair, or None when it is out of scope/intended."""
     fa, fb = str(fa), str(fb)
@@ -1392,6 +1775,14 @@ class RobotIK:
 
     if ra is not None and rb is not None:
       if ra != rb:
+        # These hands intentionally converge on one rigid object/assembly. Motion planning
+        # uses the same contract: robot margin ramps to zero between the task's own robots at
+        # the endpoint, while binary collision remains forbidden. A fixed 5mm endpoint margin
+        # made close cograsps impossible despite +0.18mm positive separation on Car Mini.
+        participants = self._coupled_task_robots(C, action)
+        if ra in participants and rb in participants \
+            and self._is_hand_frame(fa) and self._is_hand_frame(fb):
+          return None
         return "inter-robot"
       # rai's collidable-pair set already removes adjacent kinematic geometry. Keep the
       # gripper's own internal mechanics exempt, but gate every other reported same-arm pair
@@ -1400,12 +1791,28 @@ class RobotIK:
         return None
       return "self"
 
+    # At an assembly endpoint the acting hand holds the inserted part immediately beside the
+    # mate-target subassembly. Requiring the ordinary free-space margin between that hand and
+    # the target group makes close-fitting assemblies impossible even when the strict collision
+    # gate reports positive separation (OpenArm Car Mini wheel: 0.01--0.38mm).  This is only
+    # a margin exemption: accumulated/strict collisions stay active, and arm links, other
+    # unrelated parts, clutter, and all non-acting hands retain the full margin.
+    mate_target = (action[3] if len(action) >= 4 and action[0] == "assemble" else None)
+
     if ra is not None and pb is not None:
       if self._intended_hand_part(C, fa, fb, ra):
+        return None
+      if ra == (action[1] if len(action) >= 2 else None) \
+          and self._same_part_group(C, pb, mate_target) \
+          and self._is_hand_frame(fa):
         return None
       return "arm-part"
     if rb is not None and pa is not None:
       if self._intended_hand_part(C, fb, fa, rb):
+        return None
+      if rb == (action[1] if len(action) >= 2 else None) \
+          and self._same_part_group(C, pa, mate_target) \
+          and self._is_hand_frame(fb):
         return None
       return "arm-part"
     return None
@@ -1422,6 +1829,14 @@ class RobotIK:
     action = tuple(self._cur_action or ())
     J = (getattr(self, "joint_margin_reject", None)
          if action and action[0] in ("handover", "add_grasp", "assemble") else None)
+    # A floating EE's six coordinates are a pose parameterization, not robot hardware.
+    # In particular, an otherwise ordinary orientation may be represented at hingeZ=+/-pi;
+    # rejecting it as a zero-neighbourhood hardware-stop witness defeats the floating-arm
+    # ablation. RobotIK records ``robot_arm=None`` for every such chain. Real UR/OpenArm/FR3
+    # scenes retain the joint-interior gate unchanged.
+    arm_models = getattr(self, "robot_arm", None)
+    if arm_models is not None and not any(v is not None for v in arm_models.values()):
+      J = None
     if ((M is None or M <= 0.0) and (J is None or J <= 0.0)) or C is None or q is None:
       return True
     saved = C.getJointState()
@@ -1433,10 +1848,17 @@ class RobotIK:
         lo, hi = (np.asarray(x, dtype=float).ravel() for x in C.getJointLimits())
         qflat = qv.ravel()
         if lo.size == hi.size == qflat.size:
+          names = list(C.getJointNames())
+          # Only task participants need an open neighbourhood for THIS coupled endpoint.
+          # Looking at every joint made an uninvolved OpenArm at its home stop veto another
+          # pair's otherwise valid rendezvous. The actor is always included; giver/target
+          # holder/brace robots are recovered from the attached parts in this skill scene.
+          participants = self._coupled_task_robots(C, action)
+          eligible = [i for i, name in enumerate(names)
+                      if any(name.startswith(r + "_") for r in participants)]
           slack = np.minimum(qflat - lo, hi - qflat)
-          k = int(np.argmin(slack))
-          if slack[k] < J:
-            names = list(C.getJointNames())
+          k = min(eligible, key=lambda i: slack[i]) if eligible else None
+          if k is not None and slack[k] < J:
             bad = (names[k] if k < len(names) else f"joint[{k}]", "hardware-limit",
                    float(slack[k]), "joint-limit")
       except Exception:
@@ -1459,7 +1881,54 @@ class RobotIK:
       return False
     return True
 
-  def _solve_ik(self, komo, restarts=None, seeds=None, C=None):
+  def _add_margin_cut(self, komo, C, violation, phase=1):
+    """Add one exact post-certificate violation to an existing IK KOMO.
+
+    ``_clearance_ok`` remains the authoritative exact certificate.  Historically it was the
+    *only* place ``--witness-margin`` and ``--witness-joint-margin`` appeared: KOMO optimized
+    merely to zero penetration / ordinary hardware limits, and random restarts were expected
+    to stumble into the stricter interior afterwards.  Dense real-arm scenes therefore spent
+    most of their IK budget rejecting perfectly good optima of the problem we had actually
+    asked KOMO to solve.
+
+    Adding every possible pair eagerly is prohibitively expensive in four-arm scenes.  Instead
+    the solve/certify loop calls this as a cutting-plane step for the *actual* violating pair,
+    warm-reoptimizes, and repeats if a different pair becomes active.  No collision pair is
+    newly forbidden: ``violation`` came from the shared certificate and therefore already
+    passed all intended-contact exemptions.
+    """
+    times = [phase, phase]
+    fa, fb, _value, kind = violation
+    if kind != "joint-limit":
+      M = float(self.clearance_reject or 0.0)
+      if M <= 0.0:
+        return None
+      # RAI's FS.distance is negative in free space: distance <= -M means gap >= M.
+      target = M + 1e-4                              # 0.1mm interior for NLP feasibility tol
+      komo.addObjective(times, ry.FS.distance, [fa, fb], ry.OT.ineq,
+                        [self.col_weight], [-target])
+      return (kind, str(fa), str(fb))
+
+    J = float(self.joint_margin_reject or 0.0)
+    if J <= 0.0:
+      return None
+    names = list(C.getJointNames())
+    if fa not in names:
+      return None
+    k = names.index(fa)
+    lo, hi = (np.asarray(x, dtype=float).ravel() for x in C.getJointLimits())
+    if k >= lo.size or k >= hi.size:
+      return None
+    # Add both sides once; the certificate reports the nearest stop but the reoptimized
+    # solution must remain in the same contracted hardware box.
+    target = J + 1e-4                                  # 0.1mrad interior for NLP tolerance
+    komo.addObjective(times, ry.FS.qItself, [fa], ry.OT.ineq,
+                      [self.col_weight], [float(hi[k] - target)])
+    komo.addObjective(times, ry.FS.qItself, [fa], ry.OT.ineq,
+                      [-self.col_weight], [float(lo[k] + target)])
+    return (kind, str(fa))
+
+  def _solve_ik(self, komo, restarts=None, seeds=None, C=None, deferred_seeds=None):
     # solve a skill KOMO, retrying from fresh inits until one converges. KOMO seeds its guess
     # with a little noise, so a borderline-reachable target flips feasible/infeasible run-to-
     # run; restarts make bind reliable -- a genuinely feasible action returns a witness (instead
@@ -1483,7 +1952,7 @@ class RobotIK:
     if _open_random_only:
       seeds = None
       restarts = max(1, int(self._open_probe_budget))
-    if seeds:
+    if seeds or deferred_seeds:
       self.prof["calls_with_seeds"] += 1
     else:
       self.prof["calls_without_seeds"] += 1
@@ -1494,47 +1963,85 @@ class RobotIK:
       self.prof["wins"][k] = self.prof["wins"].get(k, 0) + 1
       self._last_win = k
 
-    for _si, seed in enumerate(seeds or []):
-      seed = np.asarray(seed, dtype=float)
-      skey = (self._cur_action,
-              tuple(C.getJointNames()) if C is not None else (), int(seed.size))
-      if skey in self.seed_init_incompatible:
-        break
-      # KOMO's path exposes its INTERNAL q width.  It can be one larger than both
-      # C.getJointState() and C.getJointNames() after the stable-joint reparenting described
-      # above. Detect that before calling into rai: catching its setDofState exception is too
-      # late because the C++ LogToken may subsequently abort while unwinding.
-      path0 = np.asarray(komo.getPath())
-      expected = int(path0.shape[-1]) if path0.ndim >= 2 and path0.size else seed.size
-      if expected != seed.size:
-        self.seed_init_incompatible.add(skey)
-        self.seed_init_skips += 1
-        break
-      komo.initWithConstant(seed)
-      import time as _time
-      _t0 = _time.perf_counter()
-      r = self._nlp(komo).solve().dict()
-      self.prof["seeded_solves"] += 1
-      self.prof["seeded_time"] += _time.perf_counter() - _t0
-      if r["feasible"]:
+    margin_cuts = set()                                   # shared by every init of this KOMO
+
+    def _certify_with_margin_cuts(result):
+      """Exact post-check, lazily feeding failed margin inequalities back to KOMO."""
+      nonlocal margin_cuts
+      current = result
+      while current.get("feasible", False):
         self.prof["getpath_calls"] += 1
+        q = np.asarray(komo.getPath()[-1], dtype=float)
         _t0 = _time.perf_counter()
-        _okp = self._pen_ok(C, komo.getPath()[-1])
-        _ok = _okp and self._clearance_ok(C, komo.getPath()[-1])
+        pen_ok = self._pen_ok(C, q)
+        clear_ok = pen_ok and self._clearance_ok(C, q)
         self.prof["post_calls"] += 1
         self.prof["post_time"] += _time.perf_counter() - _t0
-        if _ok:
-          _win(f"seed{_si}")
-          self._last_res = r
-          if self.harvest_branches is not None:
-            # CANDIDATE HARVEST: keep going. The analytic seed set ENUMERATES the arm's exact
-            # pose branches (up to 8), but returning the FIRST feasible one is what makes the
-            # witness-ladder's pool thin -- measured, solo picks yielded ~3 candidates all in one
-            # basin, so the DP had nothing to choose between. Collect them all and let the ladder
-            # pick; None (the default) restores the early return exactly.
-            self.harvest_branches.append(komo.getPath()[-1])
-            continue
-          return True, komo.getPath()[-1]
+        if clear_ok:
+          return q, current
+        if not pen_ok:
+          return None, current                            # margin cuts cannot repair penetration
+        violation = self.last_margin_reject
+        if violation is None:
+          return None, current
+        # The target receives a small numerical interior below. Once the same constraint is
+        # already present, another solve has no new information; let the next seed/restart try.
+        key = ((violation[3], str(violation[0])) if violation[3] == "joint-limit"
+               else (violation[3], str(violation[0]), str(violation[1])))
+        if key in margin_cuts or len(margin_cuts) >= 32:
+          return None, current
+        added = self._add_margin_cut(komo, C, violation)
+        if added is None:
+          return None, current
+        margin_cuts.add(key)
+        komo.initWithConstant(q)
+        _t0 = _time.perf_counter()
+        current = self._nlp(komo).solve().dict()
+        self.prof["margin_refine_solves"] = self.prof.get("margin_refine_solves", 0) + 1
+        self.prof["margin_refine_time"] = self.prof.get("margin_refine_time", 0.0) \
+            + (_time.perf_counter() - _t0)
+      return None, current
+
+    def _try_seed_list(bundle, label):
+      if callable(bundle):
+        bundle = bundle()
+      for _si, seed in enumerate(bundle or []):
+        seed = np.asarray(seed, dtype=float)
+        skey = (self._cur_action,
+                tuple(C.getJointNames()) if C is not None else (), int(seed.size))
+        if skey in self.seed_init_incompatible:
+          break
+        # KOMO's path exposes its INTERNAL q width.  It can be one larger than both
+        # C.getJointState() and C.getJointNames() after stable-joint reparenting. Detect that
+        # before calling into rai: catching its setDofState exception is too late because the
+        # C++ LogToken may subsequently abort while unwinding.
+        path0 = np.asarray(komo.getPath())
+        expected = int(path0.shape[-1]) if path0.ndim >= 2 and path0.size else seed.size
+        if expected != seed.size:
+          self.seed_init_incompatible.add(skey)
+          self.seed_init_skips += 1
+          break
+        komo.initWithConstant(seed)
+        _t0 = _time.perf_counter()
+        r_seed = self._nlp(komo).solve().dict()
+        self.prof["seeded_solves"] += 1
+        self.prof["seeded_time"] += _time.perf_counter() - _t0
+        if r_seed["feasible"]:
+          q_seed, r_seed = _certify_with_margin_cuts(r_seed)
+          if q_seed is not None:
+            _win(f"{label}{_si}")
+            self._last_res = r_seed
+            if self.harvest_branches is not None:
+              # Exact branch harvesting remains primary-only below. Near-target hints are a
+              # convergence fallback, not distinct exact witness branches for the ladder.
+              self.harvest_branches.append(q_seed)
+              continue
+            return q_seed
+      return None
+
+    _seed_witness = _try_seed_list(seeds, "seed")
+    if _seed_witness is not None:
+      return True, _seed_witness
     if self.harvest_branches:
       return True, self.harvest_branches[0]
     if seeds:
@@ -1551,16 +2058,22 @@ class RobotIK:
       self.prof["unseeded_solves"] += 1
       self.prof["unseeded_time"] += _time.perf_counter() - _t0
       if r["feasible"]:
-        self.prof["getpath_calls"] += 1
-        _t0 = _time.perf_counter()
-        _okp = self._pen_ok(C, komo.getPath()[-1])
-        _ok = _okp and self._clearance_ok(C, komo.getPath()[-1])
-        self.prof["post_calls"] += 1
-        self.prof["post_time"] += _time.perf_counter() - _t0
-        if _ok:
+        q_unseeded, r = _certify_with_margin_cuts(r)
+        if q_unseeded is not None:
           _win("unseeded")
           self._last_res = r
-          return True, komo.getPath()[-1]
+          return True, q_unseeded
+    # On a FAIR open-witness revisit, the historical exact/unseeded attempts were already
+    # spent. Share this visit's fixed budget between finite near-target evidence and fresh
+    # random basins; neighbours must REPLACE effort slots, not silently multiply them.
+    if _open_random_only:
+      _near_bundle = deferred_seeds() if callable(deferred_seeds) else list(deferred_seeds or [])
+      _near_n = min(len(_near_bundle), max(1, int(self._open_probe_budget) // 2)) \
+          if _near_bundle else 0
+      _near_witness = _try_seed_list(_near_bundle[:_near_n], "nearseed")
+      if _near_witness is not None:
+        return True, _near_witness
+      restarts = max(0, restarts - _near_n)
     for _ri in range(restarts):
       komo.initRandom()
       _t0 = _time.perf_counter()
@@ -1568,23 +2081,28 @@ class RobotIK:
       self.prof["restart_solves"] += 1
       self.prof["restart_time"] += _time.perf_counter() - _t0
       if r["feasible"]:
-        self.prof["getpath_calls"] += 1
-        _t0 = _time.perf_counter()
-        _okp = self._pen_ok(C, komo.getPath()[-1])
-        _ok = _okp and self._clearance_ok(C, komo.getPath()[-1])
-        self.prof["post_calls"] += 1
-        self.prof["post_time"] += _time.perf_counter() - _t0
-        if _ok:
+        q_restart, r = _certify_with_margin_cuts(r)
+        if q_restart is not None:
           _win(f"restart{_ri}")
           self._last_res = r
-          return True, komo.getPath()[-1]
+          return True, q_restart
+    # Legacy/first-visit path: preserve its successful ordering and entire restart budget.
+    # Only a bind that would otherwise fail pays for the deterministic neighbourhood. Open-
+    # witness runs normally reach this bundle on their later fairness visit (branch above).
+    if not _open_random_only and self._open_probe_attempt is None:
+      _near_witness = _try_seed_list(deferred_seeds, "nearseed")
+      if _near_witness is not None:
+        return True, _near_witness
+    if self.harvest_branches:
+      return True, self.harvest_branches[0]
     _win("none")
     if _os.environ.get("SOLVER_IK_DEBUG"):
       res_d = r or {}
       print(f"[ik-debug] FAIL {getattr(self, '_cur_action', '?')} "
             f"eq={res_d.get('eq', float('nan')):.3f} "
             f"ineq={res_d.get('ineq', float('nan')):.3f} "
-            f"restarts={restarts} n_seeds={len(seeds or [])}")
+            f"restarts={restarts} n_seeds={len(seeds or [])} "
+            f"n_near={'lazy' if callable(deferred_seeds) else len(deferred_seeds or [])}")
     self._last_res = r or {}
     return False, None
 
@@ -1810,6 +2328,97 @@ class RobotIK:
       out.append(q)
     return out
 
+  def _analytic_near_seeds(self, C, robot, ee_target, target_frame, exact=None):
+    """Build a bounded deterministic near-target seed shell, or ``[]`` when unnecessary.
+
+    Callers normally pass this as a callable to ``_solve_ik`` so even the fast SSIK shell is
+    not enumerated until the historical exact/unseeded/restart path has actually failed.
+    """
+    exact = list(exact or [])
+    radius = float(getattr(self, "ssik_seed_neighborhood", 0.0) or 0.0)
+    cap = max(0, int(getattr(self, "ssik_neighborhood_cap", 0) or 0))
+    if radius <= 0.0 or cap <= 0 or not self._analytic_reject_ok(robot):
+      return []
+
+    # Do not multiply ordinary well-interior branch bundles. At coupled endpoints the hard
+    # joint-margin is the relevant notion of interior; for an ordinary single-arm pick J is
+    # inactive, so exact nonempty seeds keep their historical path unchanged.
+    need_near = not exact
+    J = float(getattr(self, "joint_margin_reject", 0.0) or 0.0)
+    if exact and J > 0.0 and tuple(getattr(self, "_cur_action", ()) or ())[:1] in \
+        (("handover",), ("add_grasp",), ("assemble",)):
+      try:
+        names = list(C.getJointNames())
+        lo, hi = (np.asarray(x, dtype=float).ravel() for x in C.getJointLimits())
+        ridx = [i for i, n in enumerate(names) if n.startswith(robot + "_")]
+        if len(lo) != len(exact[0]) and ridx and max(ridx) < len(lo):
+          lo, hi = lo[ridx], hi[ridx]
+        if len(lo) == len(exact[0]):
+          need_near = all(float(np.min(np.minimum(q - lo, hi - q))) < J
+                          for q in map(np.asarray, exact))
+      except Exception:
+        pass
+    if not need_near:
+      return []
+
+    target = np.asarray(ee_target, dtype=float)
+    # Two radii avoid betting on one arbitrary shell. Axis directions are expressed in the
+    # target's parent/world coordinates; together they span the local first-order workspace.
+    offsets = []
+    for scale in (0.5, 1.0):
+      for axis in range(3):
+        for sign in (-1.0, 1.0):
+          d = np.zeros(3)
+          d[axis] = sign * scale * radius
+          offsets.append(d)
+    near = []
+    for d in offsets:
+      t = target.copy()
+      t[:3] += d
+      near.extend(self._analytic_seeds(C, robot, t, target_frame))
+
+    # Deduplicate the highly redundant 7R samples, then prefer configurations with the most
+    # limit slack and least displacement from the current arm pose. This ordering is only a
+    # compute budget; every retained candidate still goes through the original KOMO/gates.
+    unique = []
+    for q in near:
+      q = np.asarray(q, dtype=float)
+      if not any(np.linalg.norm(q - p) < 1e-4 for p in unique):
+        unique.append(q)
+    try:
+      names = list(C.getJointNames())
+      q0 = np.asarray(C.getJointState(), dtype=float).ravel()
+      lo, hi = (np.asarray(x, dtype=float).ravel() for x in C.getJointLimits())
+      ridx = [i for i, n in enumerate(names) if n.startswith(robot + "_")]
+      if len(q0) != len(unique[0]) and ridx and max(ridx) < len(q0):
+        q0, lo, hi = q0[ridx], lo[ridx], hi[ridx]
+      def rank(q):
+        slack = float(np.min(np.minimum(q - lo, hi - q))) if len(lo) == len(q) else 0.0
+        dist = float(np.linalg.norm(q - q0)) if len(q0) == len(q) else 0.0
+        return (-slack, dist)
+      unique.sort(key=rank)
+    except Exception:
+      pass
+    return unique[:cap]
+
+  def _analytic_seed_bundle(self, C, robot, ee_target, target_frame):
+    """Eager convenience wrapper used by diagnostics/tests; search uses lazy near seeds."""
+    exact = self._analytic_seeds(C, robot, ee_target, target_frame)
+    near = self._analytic_near_seeds(C, robot, ee_target, target_frame, exact=exact)
+    return exact + near, len(exact)
+
+  def _analytic_near_factory(self, C, robot, ee_target, target_frame, exact):
+    """Memoized lazy shell shared by repeated assemble orientation basins."""
+    cache = []
+    target = np.asarray(ee_target, dtype=float).copy()
+    exact = list(exact)
+    def get():
+      if not cache:
+        cache.append(self._analytic_near_seeds(
+            C, robot, target, target_frame, exact=exact))
+      return cache[0]
+    return get
+
   def _reach_precheck_reject(self, action, C, komo_nc):
     # run the RELAXED (collision-free) solve; True => clear reach failure, reject the bind
     # without running the full solve. Residual-gated (see the reach_precheck comment in
@@ -1865,7 +2474,7 @@ class RobotIK:
   def _ik_pick(self, action, s0, s1, assembly, seed, backoff=0.0, warm=None):
     self._cur_action = action                             # for PEN_VIEW_ACTION debug
     # simple IK: ONE robot (the picker) reaches a fixed grasp pose on an on-table part.
-    # Every other robot -- free or holding something else -- stays at home (an obstacle).
+    # Every other robot -- free or holding something else -- stays at exit (an obstacle).
     #
     # SINGLE ACTIVE ARM: a pick moves ONLY the picker, so we restrict the IK to the picker's
     # subtree (selectJointsBySubtree) -- the other arms become frozen obstacles instead of
@@ -1942,9 +2551,12 @@ class RobotIK:
     # set proves reachability -> skip the precheck and warm-start the collision solve below. Vacuum
     # / uncalibrated / no-ssik fall back to the relaxed precheck.
     seeds = self._analytic_seeds(C, robot, ee_target, part_name)
-    self._ctx_seeds = ("pick", bool(seeds), self.tool_kind[robot])   # ana-refutation study
+    exact_count = len(seeds)
+    near_seeds = (self._analytic_near_factory(C, robot, ee_target, part_name, seeds)
+                  if self.ssik_seed_neighborhood > 0.0 else None)
+    self._ctx_seeds = ("pick", bool(exact_count), self.tool_kind[robot])  # exact coverage
     if (self.empty_seed_refutes and self._pin_joints is None
-        and self._analytic_reject_ok(robot) and not seeds):
+        and self._analytic_reject_ok(robot) and not exact_count):
       # --empty-seed-refutes: the calibrated closed-form solver enumerated EVERY joint branch
       # at the EXACT grasp pose and found none within limits. This is a sound unreachability
       # proof (q1..q5 are roll-independent; q6 spans >= 2pi, so no other vacuum roll helps
@@ -1953,11 +2565,17 @@ class RobotIK:
       self.ana_stats[f"pick/{self.tool_kind[robot]}/empty_refuted"] = \
           self.ana_stats.get(f"pick/{self.tool_kind[robot]}/empty_refuted", 0) + 1
       return False, None
-    if self._analytic_reject_ok(robot) and seeds:
+    if self._analytic_reject_ok(robot) and exact_count:
       reject, ranked = self._probe_branch_combos(C, {robot: seeds})
       if reject:
-        return False, None                                # every exact branch deeply colliding
-      seeds = ranked or seeds                             # shallowest-collision branches first
+        _near_now = near_seeds() if callable(near_seeds) else []
+        if _near_now:
+          seeds = []                                      # nearby interior basin remains unknown
+          near_seeds = _near_now
+        else:
+          return False, None                              # every exact branch deeply colliding
+      else:
+        seeds = ranked or seeds                           # shallowest-collision branches first
       if self.analytic_seed_cap is not None:              # --analytic-seed-cap: warm-start
         seeds = seeds[:self.analytic_seed_cap]            # only the K best-ranked branches
     elif (self.reach_precheck and self._pin_joints is None
@@ -1966,7 +2584,7 @@ class RobotIK:
       # solve fails -- the tolerant pose eq settles within tolerance of exactly-unreachable
       # poses (measured: the chair posts' thin-cylinder side pinch). Only the residual-gated
       # relaxed precheck may reject there (clear misses only); borderline falls to the solve.
-      if not seeds:
+      if not exact_count:
         self.analytic_rejects += 1
       return False, None                                  # clear reach failure (relaxed solve)
 
@@ -1975,7 +2593,8 @@ class RobotIK:
       wseed = self._restrict_seed(warm, C, full_names) if full_names is not None \
           else np.asarray(warm, dtype=float)
       seeds = [wseed] + list(seeds or [])
-    feasible, witness = self._solve_ik(komo, seeds=seeds, C=C)
+    feasible, witness = self._solve_ik(
+        komo, seeds=seeds, deferred_seeds=near_seeds, C=C)
     _w_raw = witness                                       # C-dimensioned (restricted under
     if self.single_arm_ik:                                 # single_arm_ik) -- for the gate
       witness = self._expand_witness(C, witness, full_names)  # restricted -> full joint vector
@@ -1992,6 +2611,8 @@ class RobotIK:
           > self.grasp_pose_reject:
         self.grasp_rejects += 1                           # off the DB pose: candidate dies,
         feasible, witness = False, None                   # bind tries the next grasp id
+    if feasible and _w_raw is not None and not self._closure_ok(C, _w_raw, action, s0, backoff):
+      feasible, witness = False, None
     if not feasible:
       self._log_failure(action, C, komo)
 
@@ -2045,6 +2666,8 @@ class RobotIK:
           > self.grasp_pose_reject:                       # brace attach keeps the ACHIEVED pose
         self.grasp_rejects += 1
         feasible, witness = False, None
+    if feasible and witness is not None and not self._closure_ok(C, witness, action, s0, backoff):
+      feasible, witness = False, None
     if not feasible:
       self._log_failure(action, C, komo)
 
@@ -2136,16 +2759,20 @@ class RobotIK:
     if not self.braced_analytic and not single:
       arm_targets = {}                                     # ablation: braced -> old precheck path
     arm_seeds = {}
+    exact_arms = set()
     all_calibrated = bool(arm_targets)
     _empty_exact = _uncalibrated = False                  # ana-refutation study trackers
     for rr, ee in arm_targets.items():
       if self._analytic_reject_ok(rr):
         sl = self._analytic_seeds(C, rr, ee, None)
-        if not sl:
+        exact_count = len(sl)
+        if not exact_count:
           all_calibrated = False                          # EMPTY exact set: borderline, not a
           _empty_exact = True                             # proof -- precheck decides (see pick)
-          continue
-        arm_seeds[rr] = sl
+        if exact_count:
+          exact_arms.add(rr)
+        if sl:
+          arm_seeds[rr] = sl
       else:
         all_calibrated = False
         _uncalibrated = True
@@ -2170,7 +2797,7 @@ class RobotIK:
       if reject:
         return False, None                                # every exact combo deeply colliding
     else:
-      if arm_seeds.get(robot):                            # mover-only probe (others will move)
+      if robot in exact_arms and arm_seeds.get(robot):    # mover-only exact probe
         reject, ranked = self._probe_branch_combos(
             C, {robot: arm_seeds[robot]},
             exclude=[] if single else [rr for rr in self.robots if rr != robot])
@@ -2250,7 +2877,9 @@ class RobotIK:
 
   def _ik_assemble(self, action, s0, s1, assembly, seed, bias_axes=None, backoff=0.0, warm=None):
     self._cur_action = action                             # for PEN_VIEW_ACTION debug
-    arm_seeds = {}                                        # per-arm ssik insertion seeds
+    arm_seeds = {}                                        # exact per-arm ssik insertion seeds
+    near_arm_seeds = {}                                   # deferred near-target factories
+    exact_arms = set()
     # solve for the added part's mate pose: the SEAM (`part`) must reach its mate pose
     # relative to the target subassembly. `part` may be a single cube OR the seam of a whole
     # held MODULE (a plate) -- in the latter case the module is rigid in the scene, so the
@@ -2331,11 +2960,16 @@ class RobotIK:
           _uncalibrated = True
           continue
         sl = self._analytic_seeds(C, rr, ee, None)
-        if not sl:
+        exact_count = len(sl)
+        if not exact_count:
           reachable_proven = False                        # EMPTY exact set: borderline, not a
           _empty_exact = True                             # proof -- precheck decides (see pick)
-          continue
-        arm_seeds[rr] = sl
+        if exact_count:
+          exact_arms.add(rr)
+        if sl:
+          arm_seeds[rr] = sl
+        if self.ssik_seed_neighborhood > 0.0:
+          near_arm_seeds[rr] = self._analytic_near_factory(C, rr, ee, None, sl)
       if (self.empty_seed_refutes and _empty_exact and not _uncalibrated
           and self._pin_joints is None):
         # all calibrated attached arms proved their (rigid-group determined) pose
@@ -2349,8 +2983,9 @@ class RobotIK:
       # collision probe on the exact branches (assemble KOMO is multi-arm: uninvolved arms can
       # dodge -> excluded). All attached arms calibrated -> full combo product incl. ARM-ARM;
       # otherwise mover-only (the uncalibrated arms will co-move, their pairs excluded).
-      probe = arm_seeds if len(arm_seeds) == len(arm_targets) else (
-          {robot: arm_seeds[robot]} if robot in arm_seeds else {})
+      exact_seed_map = {rr: arm_seeds[rr] for rr in exact_arms if rr in arm_seeds}
+      probe = exact_seed_map if len(exact_seed_map) == len(arm_targets) else (
+          {robot: arm_seeds[robot]} if robot in exact_arms and robot in arm_seeds else {})
       if probe:
         reject, _ = self._probe_branch_combos(
             C, probe, exclude=[rr for rr in self.robots if rr not in probe])
@@ -2404,6 +3039,7 @@ class RobotIK:
           komo, restarts=0,                            # pre-insertion goto) warm-starts the solve
           seeds=((([warm] if warm is not None else [])
                   + list(arm_seeds.get(robot) or [])) or None),  # warm basin first, then the
+          deferred_seeds=(near_arm_seeds.get(robot) or None),
           C=C)                                       # analytic insertion seeds (calibrated arms)
       if feasible and witness is not None and self.mate_residual_reject is not None:
         _mr = self.mate_residual(C, witness, part_name, onto, rel_pos)
@@ -2702,6 +3338,11 @@ def cheap_feasible(action, s0, s1, assembly, checker):
         print(f"[cheap-debug] {action}: {pr[:4]}", flush=True)
       except Exception as _e:
         print(f"[cheap-debug] {action}: report failed {_e}", flush=True)
+    return False
+  if action[0] in _GRASP_ACTIONS and not checker.grasp_closure_free(s0, action, assembly):
+    # This is deliberately a separate cheap layer: the fixed-open proxy can be clear while a
+    # receiver's fingers would have to sweep through the current holder during a handover.
+    # Reject before RobotIK/KOMO so another grasp/action can be considered normally.
     return False
   if action[0] == "inhand_reorient":
     # v1 gate: the RESULT state (part held at its NEW grasp, everything else unchanged) must
@@ -3160,13 +3801,13 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
     robot_ik.strip_inactive_collision = False
   if grasp_table is None:
     _checker, grasp_table = _search_context(C, assembly, robots)
-  # PRIVATE FK config: robot_ik.C is the base every scene_for/bind copies ("arms at home")
+  # PRIVATE FK config: robot_ik.C is the base every scene_for/bind copies ("arms at exit")
   # and the replay's start view -- mutating it corrupts both (measured: weird start pose,
   # shifted collision context for pulled re-solves). All FK probes run on this copy.
   fkC = ry.Config()
   fkC.addConfigurationCopy(robot_ik.C)
   names = list(fkC.getJointNames())
-  home_map = dict(zip(names, robot_ik.home))
+  home_map = dict(zip(names, robot_ik.exit_configuration))
   arm_joints = {r: [n for n in names if n.startswith(r + "_")] for r in robots}
 
   def fk_ee(qmap, r):
@@ -3184,7 +3825,7 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
 
   def clearance(witness, r):
     # PER-STEP CLEARANCE of the ACTIVE arm `r` (posed at `witness`) from the OTHER robots
-    # (at home) AND the table. C.eval(FS.distance) per frame pair = a TRUE signed gap valid
+    # (at exit) AND the table. C.eval(FS.distance) per frame pair = a TRUE signed gap valid
     # when separated. SUM over pairs (not min): the gripper is pinned near the grasped
     # object so it is almost always the closest thing -- min would fixate on that
     # un-improvable distance; summing optimizes the ARM-BODY separation, which has real DOF
@@ -3475,9 +4116,40 @@ def collect_plan_witnesses(C, assembly, plan, robots, robot_ik, *, gripper_kind=
       # Hoisting has selected this edge, so give it one normal full-budget certification.
       if hit is not None and not hit[0]:
         robot_ik._ik_cache.pop(key, None)
+      _gate_names = ("reach_rejects", "analytic_rejects", "collision_rejects",
+                     "precheck_rejects", "strict_rejects", "margin_rejects")
+      _before = {n: int(getattr(robot_ik, n, 0)) for n in _gate_names}
+      _closure_before = sum(getattr(robot_ik, "closure_rejects", {}).values())
       ok, w2 = robot_ik.bind(a, states[i], states[i + 1], assembly)
       w = w2 if ok else None
       rebuilt.append((i, a, ok))
+      if verbose and not ok:
+        labels = {"reach_rejects": "reach-sphere", "analytic_rejects": "empty-ssik",
+                  "collision_rejects": "deep-exact-collision",
+                  "precheck_rejects": "relaxed-precheck",
+                  "strict_rejects": "strict-collision",
+                  "margin_rejects": "clearance/joint-margin"}
+        gates = [f"{labels[n]}={int(getattr(robot_ik, n, 0)) - _before[n]}"
+                 for n in _gate_names if int(getattr(robot_ik, n, 0)) > _before[n]]
+        _cd = sum(getattr(robot_ik, "closure_rejects", {}).values()) - _closure_before
+        if _cd:
+          gates.append(f"closure={_cd}")
+        res = getattr(robot_ik, "_last_res", {}) or {}
+        tail = (f"last={getattr(robot_ik, '_last_win', 'none') or 'none'} "
+                f"eq={float(res.get('eq', float('nan'))):.3g} "
+                f"ineq={float(res.get('ineq', float('nan'))):.3g}")
+        extra = ""
+        if getattr(robot_ik, "last_margin_reject", None) is not None:
+          extra += f" margin={robot_ik.last_margin_reject!r}"
+        if getattr(robot_ik, "last_closure_reject", None) is not None:
+          extra += f" closure={robot_ik.last_closure_reject!r}"
+        strict = getattr(robot_ik, "last_strict_reject", None)
+        if strict is not None:
+          pen, pairs = strict
+          pair_s = ", ".join(f"{x}~{y}:{d*1000:+.2f}mm" for x, y, d in pairs[:3])
+          extra += f" strict={pen*1000:.2f}mm [{pair_s}]"
+        print(f"[wit-cert] FAIL step {i} {a}: "
+              f"{', '.join(gates) if gates else 'no hard-gate counter'}; {tail}{extra}")
     if w is not None:
       out[i] = np.asarray(w, dtype=float).copy()
   if verbose and rebuilt:
@@ -4822,6 +5494,52 @@ _FILL_TOUCH_ALL = False                                    # --fill-touch-all di
                                                           # ideal+{p}. Unrelated ASSEMBLE stays
                                                           # forbidden: otherwise the concrete
                                                           # state outruns milestone bookkeeping.
+
+
+# Opt-in demonstrated-path search-order diagnostic.  The saved plan contributes ACTIONS only;
+# its symbolic states are rebuilt under the CURRENT successor settings before search.  This is
+# deliberately not a planner hint and never changes a queue, gate, cost, or witness cache.
+_FILL_REFERENCE_ACTIONS = None
+_FILL_REFERENCE_LABEL = None
+_FILL_REFERENCE_TRACE = None
+_FILL_REFERENCE_DONE = set()
+
+
+def set_fill_reference_diagnostic(actions=None, label=None):
+  """Install/reset the plan used by ``--diagnose-plan-rank``."""
+  global _FILL_REFERENCE_ACTIONS, _FILL_REFERENCE_LABEL, _FILL_REFERENCE_TRACE
+  global _FILL_REFERENCE_DONE
+  _FILL_REFERENCE_ACTIONS = (None if actions is None
+                             else tuple(tuple(a) for a in actions))
+  _FILL_REFERENCE_LABEL = label
+  _FILL_REFERENCE_TRACE = None
+  _FILL_REFERENCE_DONE = set()
+
+
+def _prepare_fill_reference_trace(start, assembly, robots, grasp_table,
+                                  gripper_kind, handovers, allow_place, bracing):
+  """Rebuild a reference plan's symbolic states with this run's exact action model."""
+  global _FILL_REFERENCE_TRACE
+  if _FILL_REFERENCE_ACTIONS is None or _FILL_REFERENCE_TRACE is not None:
+    return
+  states = [start]
+  s = start
+  for i, action in enumerate(_FILL_REFERENCE_ACTIONS):
+    matches = [ns for a, ns in successors(
+        s, assembly, robots, grasp_table=grasp_table, gripper_kind=gripper_kind,
+        handovers=handovers, allow_place=allow_place, bracing=bracing) if a == action]
+    if not matches:
+      print(f"[fill-rank] reference {_FILL_REFERENCE_LABEL!r} is not reproducible under "
+            f"the current symbolic model: action {i} {action} is absent; diagnostic "
+            "disabled (ordinary search is unchanged).", flush=True)
+      _FILL_REFERENCE_TRACE = ()
+      return
+    s = matches[0]
+    states.append(s)
+  _FILL_REFERENCE_TRACE = tuple(states)
+  print(f"[fill-rank] rebuilt {len(_FILL_REFERENCE_ACTIONS)} reference actions under the "
+        "current successor model; ranking uses optimistic A* + the current cheap gate, "
+        "without IK solves.", flush=True)
 
 
 _FILL_CAPTURE_DIR = None                                   # debug: dump failing fills' ENTRY
@@ -6293,6 +7011,78 @@ def _dfbnb(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None, edge_check_
   return best_plan, proven and not stack
 
 
+def isolated_pick_state(initial_state, assembly, target):
+  """Initial singleton scene with every non-target part parked outside the workcell.
+
+  The target retains its exact configured initial table pose and orientation. This isolates
+  intrinsic gripper/object/table feasibility from removable clutter while still using the
+  ordinary CollisionChecker scene builder and table datum.
+  """
+  poses = {p: np.asarray(q, dtype=float).copy() for p, q in initial_state.poses.items()}
+  for i, p in enumerate(assembly.objects):
+    if p == target:
+      continue
+    poses[p][:3] = [1000.0 + 10.0 * i, 1000.0, poses[p][2]]
+  return State(initial_state.parent, initial_state.grasp, initial_state.place,
+               initial_state.supports, poses)
+
+
+def isolated_graspability_report(C, assembly, robots, checker, grasp_table,
+                                 require_closure=False, verbose=True):
+  """Necessary-condition preflight for picking every loose singleton in isolation.
+
+  Checks the exact singleton grasp table against the configured table and the acting gripper
+  geometry. Other parts are parked, so clutter cannot produce a false intrinsic failure.
+  When ``require_closure`` is true, the same virtual-close certificate as the action gate is
+  also required. No arm reachability, SSIK, KOMO, or wrench computation is performed.
+  """
+  from gripper_closure import certify
+
+  s0 = get_initial_state(C, assembly)
+  representatives = {}
+  for robot in robots:
+    representatives.setdefault(checker._robot_kind.get(robot, robot), robot)
+  report = {}
+  for part in assembly.objects:
+    iso = isolated_pick_state(s0, assembly, part)
+    rows = [(gp, gid, pose) for gp, gid, pose in grasp_table.get((part,), ()) if gp == part]
+    kinds = {}
+    accepted = []
+    for kind, robot in representatives.items():
+      tested = open_clear = closed = 0
+      reasons = {}
+      for _gp, gid, _pose in rows:
+        if hasattr(grasp_table, "usable") and not grasp_table.usable(
+            (part,), part, gid, robot):
+          continue
+        tested += 1
+        if not checker.pick_collision_free(iso, part, gid, assembly, robot=robot):
+          continue
+        open_clear += 1
+        if require_closure:
+          Cc, owners = checker._scene_for(
+              iso, assembly, extra_grasps=[(robot, part, gid)], return_assignments=True)
+          prefix = owners.get(robot, (None, None))[0]
+          result = certify(Cc, prefix, part) if prefix is not None else None
+          if result is None or not result.feasible:
+            reason = "receiver-slot-missing" if result is None else (result.reason or "unknown")
+            reasons[reason] = reasons.get(reason, 0) + 1
+            continue
+        closed += 1
+        accepted.append((kind, robot, gid))
+      kinds[kind] = {"tested": tested, "open_clear": open_clear,
+                     "feasible": closed, "closure_reasons": reasons}
+    report[part] = {"ok": bool(accepted), "accepted": accepted, "kinds": kinds}
+    if verbose:
+      detail = ", ".join(
+          f"{kind}: {v['feasible']}/{v['tested']} feasible "
+          f"({v['open_clear']} open-clear)"
+          + (f" closure-rejects={v['closure_reasons']}" if v["closure_reasons"] else "")
+          for kind, v in kinds.items())
+      print(f"[grasp-preflight] {part}: {detail}")
+  return report
+
+
 def _search_context(C, assembly, robots, build_table=True):
   """The shared, built-once machinery a domain search needs: the cheap collision checker
   and the precomputed grasp table, both keyed to the real gripper (auto-detected)."""
@@ -6306,8 +7096,8 @@ def _search_context(C, assembly, robots, build_table=True):
   # not the ur10 one. See cheap_ee_path / UR5_CHEAP_EE_PATHS in env.py.
   floating = not any(n.endswith("_ur_wrist_3_joint") for n in names)
   is_ur5 = any(n.endswith("_ur_arm_ur5") for n in names)
-  is_openarm = any("_openarm_left_base_link" in n or "_openarm_right_base_link" in n
-                   for n in names)
+  from env import is_openarm_scene
+  is_openarm = is_openarm_scene(C)
   kinds = robot_gripper_kinds(C, robots)
   distinct = sorted(set(kinds.values()))
   if is_openarm:
@@ -6323,7 +7113,7 @@ def _search_context(C, assembly, robots, build_table=True):
         for k in distinct}
   if len(distinct) == 1:                                   # UNIFORM: byte-identical to before
     k = distinct[0]
-    checker = CollisionChecker(assembly, robots, gripper_path=ee_path[k])
+    checker = CollisionChecker(assembly, robots, gripper_path=ee_path[k], scene_config=C)
     # plain-EE variant for the labeled-h pick facts (clutter-free scenes; see the h_lab
     # construction in solve_assembly_problem for why the wrist is excluded there).
     checker.fact_gripper_path = fact_path[k]
@@ -6334,7 +7124,8 @@ def _search_context(C, assembly, robots, build_table=True):
   # collision-free vs the subassembly). Successor generators gate (robot, grasp) pairs on
   # the mask; heuristic facts OR over a grasp's mask kinds (admissible).
   checker = CollisionChecker(assembly, robots, gripper_path=ee_path[distinct[0]],
-                             robot_gripper_paths={r: ee_path[kinds[r]] for r in robots})
+                             robot_gripper_paths={r: ee_path[kinds[r]] for r in robots},
+                             scene_config=C)
   checker.fact_gripper_path = fact_path                    # dict per kind (mixed)
   if not build_table:
     return checker, None
@@ -6615,21 +7406,33 @@ class _IncrementalLazySearch:
     * a popped entry is STALE-CHECKED against its parent: parent must be claimed, the edge
       not blacklisted, and the entry's g must equal claimed[parent] + cost (a repair may
       have re-claimed the parent at a different g -> re-push with corrected priority);
-    * successor lists are MEMOIZED per state (they depend only on the state), so
-      re-expanding a repaired region skips the wrench/support gates of `successors`."""
+    * successors may either be memoized or deterministically regenerated.  The compact mode
+      additionally keeps one pending + recovery route per value-state and reconstructs a
+      deleted subtree's remaining incoming cut on demand."""
 
   def __init__(self, start, goal_fn, succ_fn, cost_fn, h_fn, weight, blacklist,
-               cheap_gate=None):
+               cheap_gate=None, pop_observer=None, repairable=True,
+               memoize_successors=True, compact_frontier=False):
     import itertools
     self.goal_fn, self.cost_fn, self.h_fn = goal_fn, cost_fn, h_fn
     self.weight = weight
     self.blacklist = blacklist                            # shared, grows externally
     self.cheap_gate = cheap_gate                          # EAGER pop-time gate (cheap checks):
+    self.pop_observer = pop_observer                    # opt-in exact search-order diagnostic
+    self.repairable = bool(repairable)
+    self.compact_frontier = bool(compact_frontier)
     # laziness follows the COST HIERARCHY -- ~ms cheap-collision checks prune the optimistic
     # tree exactly like the eager search (deferring them was measured to blow the search up
     # 200k+ expansions on dense floating scenes), while ~100ms IK binds stay plan-lazy.
     self._succ_raw = succ_fn                              # UNfiltered (blacklist at use time)
-    self._succ_cache = {}
+    # Incremental repair originally retained every generated successor pair forever.  That is
+    # attractive when successor generation itself is expensive, but the milestone fills cache
+    # their expensive wrench/geometric facts below this layer already.  On the large OpenArm
+    # Cross fill this dict held ~430k edge tuples for only ~10k value-unique states and was the
+    # dominant live allocation.  ``False`` turns it into a regenerating graph: states/actions
+    # are still interned, and the deterministic successor function is replayed when a repaired
+    # node is expanded again.  Coverage, costs, edge deletion and search order are unchanged.
+    self._succ_cache = {} if memoize_successors else None
     # Successor generation allocates a fresh State for every edge, although many edges reach
     # value-equal states (different robot/grasp histories collapse to the same discrete state).
     # The cache otherwise retains all of those full pose/support dictionaries. Intern states
@@ -6638,7 +7441,12 @@ class _IncrementalLazySearch:
     self._action_intern = {}
     self.tie = itertools.count()
     self.pq = []
-    self._pending = {}                                    # (state,parent,action) -> best entry
+    # The original incremental-repair mode needs every distinct incoming route.  The compact
+    # mode is a conventional graph-search frontier: one best entry per value-state. When an
+    # edge is deleted it regenerates the invalidated subtree's incoming boundary instead of
+    # retaining O(edges) recovery routes. That trades recomputation for an O(states) live
+    # frontier without changing the graph, feasibility predicates, or eventual completeness.
+    self._pending = {}                                    # incoming edge, or state in compact mode
     self.claimed = {}
     self.came_from = {start: (None, None)}
     # A node can be unclaimed/reclaimed hundreds of times while lazy IK deletes candidate
@@ -6647,6 +7455,7 @@ class _IncrementalLazySearch:
     # >1 GiB in a finite local graph this way.  Preserve every DISTINCT recovery route only.
     self.children = {}                                    # parent -> set(child state)
     self.alts = {}                                        # state -> {(parent, action): entry}
+    self._compact_alts = {}                               # state -> one best recovery entry
     self.expanded = 0
     self.budget_hit = False
     h0 = h_fn(start)
@@ -6660,12 +7469,22 @@ class _IncrementalLazySearch:
     changed parent cost may replace an entry; the superseded heap tuple is discarded lazily.
     """
     import heapq
-    key = (entry[4], entry[5], entry[6])
+    key = entry[4] if self.compact_frontier else (entry[4], entry[5], entry[6])
     old = self._pending.get(key)
     if old is not None and old[:3] <= entry[:3]:
+      if self.compact_frontier:
+        self._remember_compact_alt(entry[4], entry)
       return False                                        # identical or dominated regeneration
+    if old is not None and self.compact_frontier:
+      self._remember_compact_alt(entry[4], old)
     self._pending[key] = entry
     heapq.heappush(self.pq, entry)
+    # Decrease-key uses lazy invalidation. Repairs can otherwise leave many superseded tuples
+    # in the heap even though `_pending` has only one authoritative entry per key. Rebuilding
+    # from those authoritative entries is exact (including their original tie ids).
+    if len(self.pq) > 2 * len(self._pending) + 1024:
+      self.pq[:] = self._pending.values()
+      heapq.heapify(self.pq)
     return True
 
   def _remember_alt(self, state, entry):
@@ -6676,11 +7495,43 @@ class _IncrementalLazySearch:
     if the edge is deleted, every copy is invalid. Distinct parent/action edges remain available
     for later repairs, preserving the incremental search's coverage.
     """
+    if not self.repairable:
+      return                                             # no deletion => alternates are dead weight
+    if self.compact_frontier:
+      self._remember_compact_alt(state, entry)
+      return
     edge = (entry[5], entry[6])
     bucket = self.alts.setdefault(state, {})
     old = bucket.get(edge)
     if old is None or entry[:4] < old[:4]:
       bucket[edge] = entry
+
+  def _remember_compact_alt(self, state, entry):
+    """Retain one best non-current incoming route for a value-state."""
+    # Successor regeneration revisits the edge that currently owns a claimed state.  It is
+    # not an alternate and must never evict the recovery route we will need if that tree edge
+    # is subsequently invalidated by IK.
+    if self.came_from.get(state, (None, None)) == (entry[5], entry[6]):
+      return
+    old = self._compact_alts.get(state)
+    # Do not replace a genuinely distinct backup with another heap copy of the same edge.
+    if old is not None and (old[5], old[6]) == (entry[5], entry[6]):
+      if entry[:4] < old[:4]:
+        self._compact_alts[state] = entry
+      return
+    if old is None or entry[:4] < old[:4]:
+      self._compact_alts[state] = entry
+
+  def _restore_compact_alt(self, state):
+    """Queue the retained route when its source is still valid; report success."""
+    entry = self._compact_alts.pop(state, None)
+    if entry is None:
+      return False
+    prev, action = entry[5], entry[6]
+    if prev not in self.claimed or (prev, action) in self.blacklist:
+      return False
+    self._queue(entry)
+    return True
 
   def footprint(self):
     """Compact search-storage counters for profiling lazy-fill scaling."""
@@ -6688,28 +7539,54 @@ class _IncrementalLazySearch:
         "frontier": len(self._pending),
         "heap_entries": len(self.pq),
         "claimed": len(self.claimed),
-        "alternates": sum(len(v) for v in self.alts.values()),
+        "alternates": (len(self._compact_alts) if self.compact_frontier
+                       else sum(len(v) for v in self.alts.values())),
         "unique_states": len(self._state_intern),
         "unique_actions": len(self._action_intern),
-        "successor_states": len(self._succ_cache),
-        "successor_edges": sum(len(v) for v in self._succ_cache.values()),
+        "successor_states": len(self._succ_cache) if self._succ_cache is not None else 0,
+        "successor_edges": (sum(len(v) for v in self._succ_cache.values())
+                            if self._succ_cache is not None else 0),
         "tree_edges": sum(len(v) for v in self.children.values()),
+        "compact_frontier": self.compact_frontier,
     }
+
+  def _regenerate_compact_boundary(self, targets):
+    """Regenerate incoming edges from the valid tree to invalidated ``targets``.
+
+    This is the memory-bounded counterpart of retaining ``alts[target]`` forever.  Every
+    possible recovery edge has a claimed source at the cut immediately after a subtree is
+    removed; successors are deterministic, so replaying those sources recovers exactly the
+    same boundary on demand.  Interior edges are generated normally as targets are reclaimed.
+    """
+    if not self.compact_frontier or not targets:
+      return
+    targets = set(targets)
+    for parent, pg in tuple(self.claimed.items()):
+      for action, state in self._succ(parent):
+        if state not in targets or (parent, action) in self.blacklist:
+          continue
+        ng = pg + self.cost_fn(action)
+        hs = self.h_fn(state)
+        if hs != float("inf"):
+          self._queue((self._f(ng, hs), hs, ng, next(self.tie),
+                       state, parent, action))
 
   def _f(self, g, hval):
     import math
     return hval if math.isinf(self.weight) else g + self.weight * hval
 
   def _succ(self, s):
-    hit = self._succ_cache.get(s)
-    if hit is None:
-      hit = []
-      for action, state in self._succ_raw(s):
-        action = self._action_intern.setdefault(action, action)
-        state = self._state_intern.setdefault(state, state)
-        hit.append((action, state))
-      self._succ_cache[s] = hit
-    return hit
+    hit = self._succ_cache.get(s) if self._succ_cache is not None else None
+    if hit is not None:
+      return hit
+    generated = []
+    for action, state in self._succ_raw(s):
+      action = self._action_intern.setdefault(action, action)
+      state = self._state_intern.setdefault(state, state)
+      generated.append((action, state))
+    if self._succ_cache is not None:
+      self._succ_cache[s] = generated
+    return generated
 
   def search(self, max_nodes, deadline=None):
     # run until a goal state is claimed (returns the Plan) or the frontier empties (None).
@@ -6721,12 +7598,12 @@ class _IncrementalLazySearch:
     while self.pq:
       entry = heapq.heappop(self.pq)
       _f, _h, g, _, s, prev, action = entry
-      pkey = (s, prev, action)
+      pkey = s if self.compact_frontier else (s, prev, action)
       pending = self._pending.get(pkey)
       if pending is None or pending[3] != entry[3]:
         continue                                          # superseded pending entry
       del self._pending[pkey]
-      if s in self.claimed:
+      if s in self.claimed and (not self.compact_frontier or self.claimed[s] <= g):
         self._remember_alt(s, entry)                      # keep each incoming route once
         continue
       if _dbg and _pops < 12:
@@ -6747,11 +7624,27 @@ class _IncrementalLazySearch:
           continue
         if self.cheap_gate is not None and not self.cheap_gate(prev, action, s):
           self.blacklist.add((prev, action))              # cheap-infeasible: dead forever
+          # A one-entry-per-state frontier may have discarded a more expensive route to the
+          # same state. Regenerate its incoming cut from claimed nodes; future parents will
+          # offer their routes when expanded. Ordinary mode reads the same routes from alts.
+          if self.compact_frontier:
+            if not self._restore_compact_alt(s):
+              self._regenerate_compact_boundary((s,))
           continue
       self.claimed[s] = g
       if prev is not None:
+        old_prev = self.came_from.get(s, (None, None))[0]
+        if old_prev is not None and old_prev != prev:
+          old_children = self.children.get(old_prev)
+          if old_children is not None:
+            old_children.discard(s)
+            if not old_children:
+              self.children.pop(old_prev, None)
         self.came_from[s] = (prev, action)
-        self.children.setdefault(prev, set()).add(s)
+        if self.repairable:
+          self.children.setdefault(prev, set()).add(s)
+      if self.pop_observer is not None:
+        self.pop_observer(self, s, _f, _h, g)
       if self.goal_fn(s):
         self._goal = s
         return _reconstruct_plan(self.came_from, s)
@@ -6770,7 +7663,8 @@ class _IncrementalLazySearch:
         if hns == float("inf"):
           continue
         entry = (self._f(ng, hns), hns, ng, next(self.tie), ns, s, a)
-        if ns in self.claimed:
+        if ns in self.claimed and not (
+            self.compact_frontier and ng < self.claimed[ns]):
           self._remember_alt(ns, entry)                   # alternate for a future repair
         else:
           self._queue(entry)
@@ -6782,6 +7676,28 @@ class _IncrementalLazySearch:
     # un-claimed node's alternates; everything else is untouched. Queued entries THROUGH the
     # subtree are invalidated lazily by the stale checks at pop.
     import heapq
+    if self.compact_frontier:
+      if self.came_from.get(ns, (None, None)) != (s, a):
+        return
+      removed = set()
+      stack = [ns]
+      while stack:
+        x = stack.pop()
+        if x not in self.claimed:
+          continue
+        removed.add(x)
+        del self.claimed[x]
+        self.came_from.pop(x, None)
+        stack.extend(self.children.pop(x, ()))
+      # Pending routes whose parents were just invalidated cannot form part of the boundary.
+      # Drop their authoritative dict entries; their heap copies become ordinary stale tuples.
+      for state, entry in tuple(self._pending.items()):
+        if entry[5] in removed:
+          del self._pending[state]
+      missing = {x for x in removed if not self._restore_compact_alt(x)}
+      if missing:
+        self._regenerate_compact_boundary(missing)
+      return
     if self.came_from.get(ns, (None, None)) != (s, a):
       return                                              # not a tree edge: nothing to repair
     self._pending.pop((ns, s, a), None)                   # queued copy is now invalid
@@ -7111,7 +8027,25 @@ def _make_fill_local_pdb(start, assembly, robots, checker, grasp_table, p,
         f"fill-local PDB for interface {p!r}, target {sorted(before)}, mover "
         f"{sorted(mover)} exceeded its 200000-state guard; rerun with "
         "--no-fill-local-h (or use --milestone-oracle global/chain). No heuristic "
-        "fallback was applied.") from exc
+      "fallback was applied.") from exc
+
+
+def _fill_policy_edge(pdb, state, action, successor):
+  """Whether a concrete edge refines the PDB's shortest abstract policy graph.
+
+  A strict concretization contains exactly the quotient-changing edges satisfying Bellman's
+  equality. Concrete transitions collapsed to a quotient self-loop (for example, swapping raw
+  grasps inside one fact-signature class) are deliberately not smuggled into this first proposal:
+  they are absent from the abstract skeleton and made its real-arm refinement explode. If a
+  shortest abstract skeleton is spurious because it needs such a hidden move, this probe fails
+  and the unrestricted concrete fill remains authoritative.
+  """
+  k0, k1 = pdb.abstract(state), pdb.abstract(successor)
+  if k0 == k1:
+    return False
+  d0, d1 = pdb.value(state), pdb.value(successor)
+  return (np.isfinite(d0) and np.isfinite(d1)
+          and abs(d0 - (action_cost(action) + d1)) <= 1e-9)
 
 
 def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot_ik,
@@ -7120,7 +8054,8 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
                   part_grasp_allow=None, brace_allow=None, deadline=None,
                   lazy_fill=False, cost_bound=None, forbid_assemble=None, settle_ref=None,
                   h_extra_shift=None, fill_h=None, exact_fill=False,
-                  skeleton_only=False, touch_all=None, excluded_end_states=None):
+                  skeleton_only=False, policy_pdb=None, touch_all=None,
+                  excluded_end_states=None, diagnostic_only=False):
   import os as _os
   verbose = verbose or bool(_os.environ.get("MILESTONE_DEBUG"))
   # a small COMPLETE search that adds part `p` to the assembly `ideal` and leaves it SETTLED:
@@ -7142,7 +8077,11 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
   _fp0 = None
   if robot_ik is not None:
     _fp0 = (dict(robot_ik.prof),
-            {k: list(v) for k, v in robot_ik.prof["by_action"].items()})
+            {k: list(v) for k, v in robot_ik.prof["by_action"].items()},
+            {k: int(getattr(robot_ik, k, 0)) for k in (
+                "reach_rejects", "analytic_rejects", "collision_rejects",
+                "precheck_rejects", "strict_rejects", "margin_rejects")},
+            dict(getattr(robot_ik, "margin_reject_pairs", {})))
 
   def _fill_prof(tag):
     if not verbose:
@@ -7155,20 +8094,41 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
             f"wrench={ps['wrench_facts']} exhausted={ps['exhausted']}")
     if robot_ik is None or _fp0 is None:
       return
-    pr, (f0, fba) = robot_ik.prof, _fp0
+    pr, (f0, fba, fgates, fpairs) = robot_ik.prof, _fp0
     db = pr["bind_solves"] - f0["bind_solves"]
     if not db:
       return
     df = pr["bind_fail"] - f0["bind_fail"]
     dt = pr["bind_time"] - f0["bind_time"]
+    dmr = int(pr.get("margin_refine_solves", 0)) - int(f0.get("margin_refine_solves", 0))
+    dmrt = float(pr.get("margin_refine_time", 0.0)) - float(f0.get("margin_refine_time", 0.0))
     dts = sorted(((k, v[0] - fba.get(k, [0, 0, 0.0])[0],
                    v[1] - fba.get(k, [0, 0, 0.0])[1],
                    v[2] - fba.get(k, [0, 0, 0.0])[2]) for k, v in pr["by_action"].items()),
                  key=lambda x: -x[3])
-    tops = "; ".join(f"{k[0]}/{k[1]}/g{k[2]} x{n} ({nf} fail, {t:.1f}s)"
+    tops = "; ".join(f"{k[0]}/{k[1]}/{k[2]}/g{k[3]} x{n} ({nf} fail, {t:.1f}s)"
                      for k, n, nf, t in dts[:4] if t > 0.01)
+    gates = []
+    for key, label in (("reach_rejects", "sphere"), ("analytic_rejects", "empty-ssik"),
+                       ("collision_rejects", "deep-branch-collision"),
+                       ("precheck_rejects", "relaxed-precheck"),
+                       ("strict_rejects", "strict-collision"),
+                       ("margin_rejects", "clearance")):
+      delta = int(getattr(robot_ik, key, 0)) - fgates[key]
+      if delta:
+        gates.append(f"{label}={delta}")
+    pair_deltas = sorted(
+        ((key, int(n) - int(fpairs.get(key, 0)))
+         for key, n in getattr(robot_ik, "margin_reject_pairs", {}).items()
+         if int(n) > int(fpairs.get(key, 0))),
+        key=lambda row: (-row[1], row[0]))
+    pair_summary = "; ".join(
+        f"{kind}:{fa}~{fb} x{n}" for (kind, fa, fb), n in pair_deltas[:4])
     print(f"[fill-prof {tag}] binds={db} failed={df} bind_time={dt:.1f}s"
-          + (f": {tops}" if tops else ""))
+          + (f": {tops}" if tops else "")
+          + (f"; gates: {', '.join(gates)}" if gates else "")
+          + (f"; margin-refine={dmr} ({dmrt:.1f}s)" if dmr else "")
+          + (f"; clearance-pairs: {pair_summary}" if pair_summary else ""))
   settle = settle_ref if settle_ref is not None else assembly.base
   search_weight = 1.0 if exact_fill else weight
 
@@ -7294,10 +8254,161 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
         continue                                          # only the abstraction's known G2 braces
       if forbid_assemble is not None and a[0] == "assemble" and a[2] in forbid_assemble:
         continue                                          # e.g. the module JOIN belongs to the
+      if policy_pdb is not None and not _fill_policy_edge(policy_pdb, s, a, ns):
+        continue                                          # proposal: Bellman-optimal PDB corridor
       yield a, ns                                         # dedicated join fill (tiny space =>
                                                           # cheap lazy rounds; measured 96 join
                                                           # refusals x full re-search inside the
                                                           # obj_11 fill = the 118s bottleneck)
+
+  def _diagnose_reference_rank():
+    """Run the real optimistic local queue against this fill's demonstrated segment.
+
+    This intentionally uses a separate engine: it observes ordering without consuming the
+    ordinary search's node budget, mutating its blacklist, or running stochastic IK.  It is
+    opt-in and bounded by the same local ``max_nodes`` guard.
+    """
+    if not _FILL_REFERENCE_TRACE:
+      return
+    ideal_key = frozenset(ideal)
+    done_key = (ideal_key, p)
+    if done_key in _FILL_REFERENCE_DONE:
+      return
+
+    # Locate the reference's settled boundary for this exact ideal, followed by the first
+    # settled state that has joined p.  This works even when the ordinary search reached a
+    # different concrete boundary: the diagnostic asks why the KNOWN boundary/path was ranked
+    # poorly, while reusing this fill's exact PDB and successor/gate definitions.
+    segment = None
+    acts = _FILL_REFERENCE_ACTIONS
+    for i, rs in enumerate(_FILL_REFERENCE_TRACE[:-1]):
+      main, _mod = _comps(rs)
+      loose, holders = _loose_and_holders(rs)
+      if frozenset(main) != ideal_key or loose or holders > 1 or _part_mated(rs, p):
+        continue
+      saw_join = False
+      for j in range(i, len(acts)):
+        saw_join |= acts[j][0] == "assemble" and acts[j][2] == p
+        if saw_join and goal_fn(_FILL_REFERENCE_TRACE[j + 1]):
+          segment = (i, j + 1)
+          break
+      if segment is not None:
+        break
+    if segment is None:
+      return
+
+    i0, i1 = segment
+    ref_states = list(_FILL_REFERENCE_TRACE[i0:i1 + 1])
+    ref_actions = list(acts[i0:i1])
+    ref_g = [0.0]
+    for a in ref_actions:
+      ref_g.append(ref_g[-1] + action_cost(a))
+
+    # A reference can require a later widening phase (most notably add_grasp in the braced
+    # phase). Do not label that as bad ranking: wait until a phase actually contains every
+    # demonstrated edge, then diagnose exactly once.
+    for k, (rs, ra, rn) in enumerate(zip(ref_states, ref_actions, ref_states[1:])):
+      if not any(a == ra and ns == rn for a, ns in succ_fn(rs)):
+        if verbose:
+          phase = f"{'all' if touch_all else 'local'}/{'braced' if bracing else 'unbraced'}"
+          print(f"[fill-rank {p}] reference waits for a wider phase: edge {i0 + k} "
+                f"{ra} is absent from {phase}", flush=True)
+        return
+    _FILL_REFERENCE_DONE.add(done_key)
+
+    phase = f"{'all' if touch_all else 'local'}/{'braced' if bracing else 'unbraced'}"
+    print(f"[fill-rank {p}] reference actions [{i0}:{i1}] ({len(ref_actions)} actions, "
+          f"cost {sum(action_cost(a) for a in ref_actions):g}) are representable in "
+          f"phase={phase}; tracing exact optimistic pop order (cap {max_nodes}).", flush=True)
+
+    # A symbolic state can occur more than once in a plan. Preserve every requested row even
+    # though the graph search claims the value-equal state once.
+    wanted = {}
+    for k, rs in enumerate(ref_states):
+      wanted.setdefault(rs, []).append(k)
+    reported = set()
+    popped_f = []
+
+    class _RanksComplete(Exception):
+      pass
+
+    def _grasp_useful(state, action):
+      U = _problem._USEFUL_GRASPS
+      if U is None:
+        return "off"
+      part, grasp = action[2], None
+      if action[0] in ("pick", "handover", "add_grasp"):
+        grasp = action[3]
+      elif action[0] == "assemble":
+        grasp = _held_grasp(state, part)
+      if grasp is None or part not in U:
+        return "n/a"
+      return "yes" if grasp in U[part] else "no"
+
+    def observe(engine, state, fval, hval, gval):
+      pop = len(popped_f) + 1
+      pending = len(engine._pending)
+      indices = wanted.get(state, ())
+      for k in indices:
+        if k in reported:
+          continue
+        lower = sum(v < fval - 1e-12 for v in popped_f)
+        equal = sum(abs(v - fval) <= 1e-12 for v in popped_f)
+        if k == len(ref_actions):
+          print(f"[fill-rank {p}] ref-step {i0 + k:02d} GOAL pop={pop} "
+                f"lower-f={lower} equal-f-before={equal} "
+                f"g/h/f={gval:g}/{hval:g}/{fval:g} ref-g={ref_g[k]:g} "
+                f"pending={pending}", flush=True)
+        else:
+          action, target = ref_actions[k], ref_states[k + 1]
+          ranked = []
+          for order, (a, ns) in enumerate(engine._succ(state)):
+            ng = gval + action_cost(a)
+            hn = h_fn(ns)
+            ranked.append(((engine._f(ng, hn), hn, ng, order), a, ns))
+          ranked.sort(key=lambda row: row[0])
+          rank = next((r + 1 for r, (_key, a, ns) in enumerate(ranked)
+                       if a == action and ns == target), None)
+          cheap = cheap_feasible(action, state, target, assembly, checker)
+          print(f"[fill-rank {p}] ref-step {i0 + k:02d} pop={pop} lower-f={lower} "
+                f"equal-f-before={equal} g/h/f={gval:g}/{hval:g}/{fval:g}; "
+                f"ref-g={ref_g[k]:g}; "
+                f"next={action} local-rank={rank}/{len(ranked)} cheap={cheap} "
+                f"useful={_grasp_useful(state, action)} pending={pending}", flush=True)
+        reported.add(k)
+      popped_f.append(fval)
+      if len(reported) == len(ref_states):
+        raise _RanksComplete
+
+    diag_blacklist = set()
+    diag = _IncrementalLazySearch(
+        ref_states[0], goal_fn=lambda _s: False, succ_fn=succ_fn,
+        cost_fn=action_cost, h_fn=h_fn, weight=search_weight,
+        blacklist=diag_blacklist,
+        cheap_gate=lambda prev, act, ns: cheap_feasible(
+            act, prev, ns, assembly, checker),
+        pop_observer=observe, repairable=False)
+    diag_error = None
+    try:
+      diag.search(max_nodes, deadline=None)
+    except _RanksComplete:
+      pass
+    except Exception as exc:
+      # This is deliberately observational. A large demonstrated f-shell may itself exceed a
+      # resource guard; report that as evidence, release the private queue, and NEVER abort the
+      # ordinary planner whose ordering is being diagnosed.
+      diag_error = f"{type(exc).__name__}: {exc}"
+    missing = [i0 + k for k in range(len(ref_states)) if k not in reported]
+    fp = diag.footprint()
+    print(f"[fill-rank {p}] trace {'complete' if not missing else 'INCOMPLETE'}: "
+          f"popped={len(popped_f)}, missing-reference-steps={missing}; "
+          f"frontier={fp['frontier']} unique={fp['unique_states']} "
+          f"successor-edges={fp['successor_edges']}"
+          + (f"; diagnostic-error={diag_error}" if diag_error else ""), flush=True)
+
+  _diagnose_reference_rank()
+  if diagnostic_only:
+    return None, None
 
   def edge_check_fn(prev, act, ns):
     # fully lazy (cheap geometry + IK at POP; see solve_assembly_problem)
@@ -7487,12 +8598,27 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
         cheap_bl.add((prev, act))                         # dead forever (cheap layer is sound)
       return ok
 
+    _open_compact = bool(touch_all or (bracing and brace_allow is None))
+    if _open_compact and verbose:
+      print(f"[fill-frontier {p}] compact regenerating mode: unrestricted "
+            "bracing/all-part phase stores one frontier + recovery route per value-state",
+            flush=True)
+
     def _make_open_engine(suspended):
       suspended.update(cheap_bl)                          # dead edges stay dead across epochs
       return _IncrementalLazySearch(
           start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
           weight=search_weight, blacklist=suspended,
-          cheap_gate=_open_cheap_gate)
+          cheap_gate=_open_cheap_gate,
+          # Open-witness repair can generate hundreds of thousands of graph edges while the
+          # value-state set remains small.  Regenerate deterministic successors on repair
+          # instead of retaining that entire edge graph for the lifetime of the epoch.
+          memoize_successors=False,
+          # Ordinary unbraced fills benefit from retaining every recovery route. The final
+          # unrestricted BRACING phase enables every add_grasp successor and is the actual
+          # combinatorial completeness net; bound it to O(value states) and regenerate its
+          # repair boundary. All-part scope is compact for the same reason.
+          compact_frontier=_open_compact)
 
     def _walk_open_plan(sub):
       s = start
@@ -7756,7 +8882,8 @@ def solve_assembly_problem_optimistic(C, assembly, robots=None, verbose=True,
                                       max_nodes=20000, wrench=False, handovers=True,
                                       allow_place=True, bracing=False, lazy_fills=False,
                                       chain_h=False, fill_local_h=False, fill_exact=False,
-                                      wrench_aware_h=True, fill_skeleton_first=False,
+                                      wrench_aware_h=True, fill_policy_first=False,
+                                      fill_skeleton_first=False,
                                       **exact_kw):
   """OPTIMISTIC (Dogar-style) planner (see the section header): add the parts one at a time,
   each via its own small complete search that reorients/holds/picks/mates/sets-down, chained
@@ -7785,6 +8912,8 @@ def solve_assembly_problem_optimistic(C, assembly, robots=None, verbose=True,
         "built with their internal parts before joining it. Re-run with --milestones "
         "(the module-aware solver); no optimistic fallback was attempted."
     )
+  if fill_policy_first and not fill_local_h:
+    raise ValueError("fill_policy_first requires fill_local_h")
   checker, grasp_table = _search_context(C, assembly, robots)
   gk = wrench_kind_arg(C, robots) if wrench else None
   hgk = gk if wrench_aware_h else None
@@ -7882,7 +9011,19 @@ def solve_assembly_problem_optimistic(C, assembly, robots=None, verbose=True,
         fill_pdb_cache[key] = lpdb
 
     sub, s2 = None, None
-    if fill_skeleton_first:
+    if fill_policy_first and lpdb is not None:
+      if verbose:
+        print(f"[fill-policy {p}] refining the exact shortest local-PDB policy graph")
+      sub, s2 = _add_one_part(
+          s, p, ideal, assembly, robots, checker, grasp_table, robot_ik,
+          weight, max_nodes, verbose, gripper_kind=gk, handovers=handovers,
+          allow_place=allow_place, bracing=bracing, lazy_fill=lazy_fills,
+          h_extra=None, fill_h=lpdb.value, exact_fill=fill_exact, policy_pdb=lpdb)
+      if verbose:
+        print(f"[fill-policy {p}] " +
+              (f"refined to {len(sub)} concrete action(s)" if sub is not None else
+               "no concrete refinement -> unrestricted fill"))
+    if sub is None and fill_skeleton_first:
       sub, s2 = _add_one_part(
           s, p, ideal, assembly, robots, checker, grasp_table, robot_ik,
           weight, max_nodes, verbose, gripper_kind=gk, handovers=handovers,
@@ -8009,13 +9150,13 @@ def _stow_moves(state, movable):
     if state.parent.get(q, (None,))[0] != "gripper":
       continue                                            # must be held to set it down
     r = state.parent[q][1]
-    ns = _copy_edit_support(state)
+    ns = _copy_edit_support(state, copy_poses=True)
     ns.supports[q] = frozenset(c for c in ns.supports[q]
                                if not (c[0] == "grasp" and c[1] == r))
     ns.grasp.pop(q, None)
     ns.parent[q] = ("table",)
     ns.place[q] = ("stow", _part_index(q), _IDENTITY_FACE)
-    ns.poses[q] = _stow_pose(state.poses[q])              # <-- moved aside
+    ns.poses[q] = _stow_pose(state.poses[q])              # <-- moved aside (poses CoW)
     ns.supports[q] = ns.supports[q] | {("table",)}
     yield ("stow", r, q, _IDENTITY_FACE), ns
 
@@ -8145,6 +9286,7 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
                                      fill_window=2, lazy_fills=True,
                                      cost_bound=None, milestone_oracle="global",
                                      fill_local_h=False, fill_exact=False,
+                                     fill_policy_first=False,
                                      fill_skeleton_first=False,
                                      fill_scope_widening=False,
                                      milestone_boundaries=1):
@@ -8180,6 +9322,8 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
   if int(milestone_boundaries) < 1:
     raise ValueError("milestone_boundaries must be >= 1")
   milestone_boundaries = int(milestone_boundaries)
+  if fill_policy_first and not fill_local_h:
+    raise ValueError("fill_policy_first requires fill_local_h")
 
   t0 = time.perf_counter()
   if robots is None:
@@ -8187,6 +9331,9 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
   checker, grasp_table = _search_context(C, assembly, robots)
   gk = wrench_kind_arg(C, robots) if wrench else None
   hgk = gk if wrench_aware_h else None
+  _prepare_fill_reference_trace(
+      get_initial_state(C, assembly), assembly, robots, grasp_table, gk,
+      handovers, allow_place, bracing)
   if _problem._USEFUL_FLAG:
     _problem.set_useful_grasps(compute_useful_grasps(assembly, grasp_table, gk))
     if verbose:
@@ -8351,6 +9498,53 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
         phases.append((None, True, None, ballow))                    # any mate + hinted brace
       phases.append((None, True, None, None))                        # full braced (net)
     scope_passes = _fill_scope_passes(_FILL_TOUCH_ALL, fill_scope_widening)
+    # A known-path ordering diagnostic must not depend on which easier phase the ORDINARY
+    # search happens to solve first (with IK disabled, OpenArm obj_4 has a direct unbraced
+    # optimistic path, while the known real-IK solution lives in the later braced phase).
+    # Probe phase representability/ranks up front; ``diagnostic_only`` returns before any IK,
+    # blacklist, witness, or actual fill search can run.
+    if _FILL_REFERENCE_TRACE:
+      rank_done = False
+      for rank_touch_all in scope_passes:
+        for rank_cap, rank_br, rank_ma, rank_ba in phases:
+          _add_one_part(
+              s, q, ideal, assembly, robots, checker, grasp_table, robot_ik,
+              weight, max_nodes, verbose, gripper_kind=gk,
+              handovers=handovers, allow_place=allow_place, bracing=rank_br,
+              grasp_cap=rank_cap,
+              h_extra=(None if lpdb is not None else
+                       h_lab.value if h_lab is not None else None),
+              part_grasp_allow=rank_ma, brace_allow=rank_ba,
+              deadline=deadline, lazy_fill=lazy_fills, cost_bound=fb,
+              forbid_assemble=forbid, settle_ref=settle,
+              h_extra_shift=shift,
+              fill_h=(lpdb.value if lpdb is not None else None),
+              exact_fill=fill_exact, touch_all=rank_touch_all,
+              excluded_end_states=excluded_end_states, diagnostic_only=True)
+          if (frozenset(ideal), q) in _FILL_REFERENCE_DONE:
+            rank_done = True
+            break
+        if rank_done:
+          break
+    if fill_policy_first and lpdb is not None:
+      if verbose:
+        print(f"[fill-policy {q}] refining the exact shortest local-PDB policy graph")
+      sub, s2 = _add_one_part(
+          s, q, ideal, assembly, robots, checker, grasp_table, robot_ik,
+          weight, max_nodes, verbose, gripper_kind=gk,
+          handovers=handovers, allow_place=allow_place, bracing=bracing,
+          deadline=deadline, lazy_fill=lazy_fills, cost_bound=fb,
+          forbid_assemble=forbid, settle_ref=settle,
+          h_extra=None, h_extra_shift=shift, fill_h=lpdb.value,
+          exact_fill=fill_exact, policy_pdb=lpdb,
+          touch_all=scope_passes[0], excluded_end_states=excluded_end_states)
+      _release_fill_scratch(f"{q}:policy", verbose)
+      if verbose:
+        print(f"[fill-policy {q}] " +
+              (f"refined to {len(sub)} concrete action(s)" if sub is not None else
+               "no concrete refinement -> unrestricted exact fill"))
+      if sub is not None:
+        return sub, s2
     if fill_skeleton_first:
       sub, s2 = _add_one_part(
           s, q, ideal, assembly, robots, checker, grasp_table, robot_ik,
@@ -8364,6 +9558,7 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
           fill_h=(lpdb.value if lpdb is not None else None),
           exact_fill=fill_exact, skeleton_only=True,
           touch_all=scope_passes[0], excluded_end_states=excluded_end_states)
+      _release_fill_scratch(f"{q}:skeleton", verbose)
       if sub is not None:
         return sub, s2
     for touch_all in scope_passes:
@@ -8385,6 +9580,7 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
             fill_h=(lpdb.value if lpdb is not None else None),
             exact_fill=fill_exact, touch_all=touch_all,
             excluded_end_states=excluded_end_states)
+        _release_fill_scratch(f"{q}:phase", verbose)
         if sub is not None:
           return sub, s2
     return None, None
@@ -8662,6 +9858,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
                                       fill_window=2, lazy_fills=True,
                                       cost_bound=None, milestone_oracle="global",
                                       fill_local_h=False, fill_exact=False,
+                                      fill_policy_first=False,
                                       fill_skeleton_first=False,
                                       fill_scope_widening=False,
                                       milestone_boundaries=1):
@@ -8674,6 +9871,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
       deadline=deadline, fill_window=fill_window, lazy_fills=lazy_fills,
       cost_bound=cost_bound, milestone_oracle=milestone_oracle,
       fill_local_h=fill_local_h, fill_exact=fill_exact,
+      fill_policy_first=fill_policy_first,
       fill_skeleton_first=fill_skeleton_first,
       fill_scope_widening=fill_scope_widening,
       milestone_boundaries=milestone_boundaries), None)
@@ -8688,6 +9886,7 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
                                               grasp_collapsed_h=False, fill_window=2,
                                               milestone_oracle="global",
                                               fill_local_h=False, fill_exact=False,
+                                              fill_policy_first=False,
                                               fill_skeleton_first=False,
                                               fill_scope_widening=False,
                                               milestone_boundaries=1):
@@ -8720,7 +9919,8 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
       allow_place=allow_place, bracing=bracing, geo_facts=geo_facts,
       sig_collapsed_h=sig_collapsed_h, deadline=t_mile, fill_window=fill_window,
       milestone_oracle=milestone_oracle, fill_local_h=fill_local_h,
-      fill_exact=fill_exact, fill_skeleton_first=fill_skeleton_first,
+      fill_exact=fill_exact, fill_policy_first=fill_policy_first,
+      fill_skeleton_first=fill_skeleton_first,
       fill_scope_widening=fill_scope_widening,
       milestone_boundaries=milestone_boundaries)
   remaining = t_end - time.perf_counter()

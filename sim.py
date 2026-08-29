@@ -3818,11 +3818,24 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             _strict_collide.last_pairs = []
             return False
           pairs, who = [], set()
+          _raw_penetrating = _legit_penetrating = 0
           for _c in problem.C.getCollisions(0.0):
             _d = float(_c[2])
             if _d >= 0.0:
               continue
             _pr = (str(_c[0]), str(_c[1]))
+            _raw_penetrating += 1
+            # The planner predicate normally removes current grasp/mate contacts through its
+            # mode. Some exported zero-actor transitions briefly select an adjacent task-mode
+            # encoding, however, and the raw accumulated depth then rejects the holder's own
+            # finger/payload contact (measured OpenArm car-mini: obj_1~a2 finger, 1.43mm).
+            # The discrete symbolic state is authoritative here, exactly as in the established
+            # corridor verifier below: exempt only a gripper touching the component that arm
+            # actually holds, or two already-mated parts. Arm links, other arms and unrelated
+            # parts remain ordinary blockers.
+            if _legit_pair(_pr, fired):
+              _legit_penetrating += 1
+              continue
             pairs.append((_pr, -_d))
             for _f in _pr:
               _ar = _arm_of(_f)
@@ -3843,6 +3856,10 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             for _owner in _reason.get("owners", ()):
               if _owner in robot_index:
                 who.add(robot_index[_owner])
+          if (not pairs and _reason is None and _raw_penetrating > 0
+              and _legit_penetrating == _raw_penetrating):
+            _strict_collide.last_pairs = []
+            return False                                  # only intended grasp/mate contacts
           _strict_collide.last_pairs = sorted(pairs, key=lambda x: -x[1])
           return who                                      # empty set means static-world block
 
@@ -3928,7 +3945,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             print(f"[sim/mp] --phase-schedule {_pdt:g}s search failed after "
                   f"{_time.perf_counter() - _search_t0:.2f}s; collision predicate "
                   f"{_strict_collide.calls - _search_calls0} calls/"
-                  f"{_strict_collide.seconds - _search_collision_s0:.2f}s.")
+                  f"{_strict_collide.seconds - _search_collision_s0:.2f}s: {_e}")
             continue
           print(f"[sim/mp] --phase-schedule {_pdt:g}s search: "
                 f"{_time.perf_counter() - _search_t0:.2f}s; collision predicate "

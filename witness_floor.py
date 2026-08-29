@@ -14,7 +14,7 @@ THREE THINGS THIS FIXES BEYOND THE OBJECTIVE SHAPE.
    non-acting joint at `home_map` (solver.py ~1972). An earlier draft of THIS module posed them
    at their CARRIED configs instead, reasoning that a handover's partner is emphatically not at
    home. That was WRONG and is reverted: every candidate is solved and verified feasible with
-   the other arms AT HOME, so scoring -- or worse, emitting -- arm A's candidate beside arm B's
+   the other arms AT EXIT, so scoring -- or worse, emitting -- arm A's candidate beside arm B's
    carried config is a combination nothing ever collision-checked, and it produced witnesses
    with arms visibly through each other. Home-pinning is also the convention the exported plan
    relies on (mp_export's cur[]/goal_for bookkeeping), so the emitted witness is home outside
@@ -87,7 +87,7 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
   fkC = ry.Config()
   fkC.addConfigurationCopy(robot_ik.C)
   names = list(fkC.getJointNames())
-  home_map = dict(zip(names, robot_ik.home))
+  home_map = dict(zip(names, robot_ik.exit_configuration))
   name_idx = {n: k for k, n in enumerate(names)}
   arm_joints = {r: [n for n in names if n.startswith(r + "_")] for r in robots}
   arm_idx = {r: [k for k, n in enumerate(names) if n.startswith(r + "_")] for r in robots}
@@ -100,8 +100,8 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
     SCORED ON THE SAME BASE THE EMISSION USES -- bind's own witness for the step, with the
     candidate's joints written over it. Two earlier bases were wrong. The DP's carried map
     paired arms from different steps, a combination nothing ever collision-checked. Posing the
-    non-movers at HOME is what `optimize_witnesses` does, but it disagrees with what this
-    ladder emits: a candidate is solved with the others at home, while the emitted vector puts
+    non-movers at EXIT is what `optimize_witnesses` does, but it disagrees with what this
+    ladder emits: a candidate is solved with the others at exit, while the emitted vector puts
     them at their HOLDING configs, so a candidate could score clear and still overlap a holder
     (measured on car-mini: the selected chain penetrated by 5.02mm). Scoring the emitted
     configuration is the only way the floor means anything.

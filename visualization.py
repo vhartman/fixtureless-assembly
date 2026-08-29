@@ -345,6 +345,118 @@ def visualize_grasps_viser(C, assembly, recorder=None, view=True, useful=None):
   return recorder
 
 
+def visualize_initial_grasps_viser(C, assembly, checker, grasp_table, robots,
+                                    recorder=None, view=True, part=None):
+  """Scrubbable catalog of the actual initial-scene floating-EE PICK gate.
+
+  Unlike :func:`visualize_grasps_viser`, this keeps every part at its configured initial
+  table pose and shows exactly one candidate hand per step. Candidates come from the same
+  singleton grasp table as search and pass through ``CollisionChecker.pick_collision_free``
+  followed by the same object-dependent virtual jaw-closure certificate. The rendered hand is
+  at the inferred closed aperture. No arm IK, SSIK, KOMO, or wrench test is invoked. Uniform
+  fleets are shown once per grasp; mixed fleets once per distinct gripper geometry.
+
+  Returns ``{part: {kind: (passing, tested)}}`` so tests and batch diagnostics can verify the
+  catalog without opening a viewer.
+  """
+  from problem import get_initial_state, sampled_grasp_meta, _CHEAP_PENETRATION_TOL
+  from gripper_closure import closure_sweep_configs
+
+  s0 = get_initial_state(C, assembly)
+  parts = [part] if part is not None else list(assembly.objects)
+  # The checker shares verdicts across equal geometry. Drawing four identical OpenArm hands
+  # at the same grasp would add no information, so retain one representative per kind.
+  representatives = {}
+  for robot in robots:
+    representatives.setdefault(checker._robot_kind.get(robot, robot), robot)
+
+  summary = {}
+  total_pass = total_tested = 0
+  for p in parts:
+    isolated = _solver.isolated_pick_state(s0, assembly, p)
+    rows = [(gp, gid, pose) for gp, gid, pose in grasp_table.get((p,), ()) if gp == p]
+    meta = sampled_grasp_meta(assembly.part_shape(p), part=p)
+    summary[p] = {}
+    part_pass = 0
+    for kind, robot in representatives.items():
+      tested = open_passed = passed = 0
+      passed_ids = []
+      closure_reasons = {}
+      for _gp, gid, _pose in rows:
+        if hasattr(grasp_table, "usable") and not grasp_table.usable((p,), p, gid, robot):
+          continue
+        tested += 1
+        if not checker.pick_collision_free(isolated, p, gid, assembly, robot=robot):
+          continue
+        open_passed += 1
+        # Rebuild the exact open-hand scene, then run the same closure implementation used by
+        # the cheap action gate. Keep only the terminal closed scene for this catalog; the
+        # separate --viz-grasp-closure viewer remains the full 21-sample sweep browser.
+        Copen, owners = checker._scene_for(
+            isolated, assembly, extra_grasps=[(robot, p, gid)], return_assignments=True)
+        prefix = owners.get(robot, ("", None))[0]
+        result, closure_frames = closure_sweep_configs(Copen, prefix, p, steps=21)
+        if not result.feasible:
+          reason = result.reason or "unknown"
+          closure_reasons[reason] = closure_reasons.get(reason, 0) + 1
+          continue
+        passed += 1
+        passed_ids.append(gid)
+        Cv = closure_frames[-1][0]
+        if prefix:
+          color_gripper(Cv, prefix, [0.2, 0.8, 0.3, 1.0])
+        collisions = [(a, b, float(d)) for a, b, d in Cv.getCollisions()
+                      if not _solver._wrist_table_pair(a, b)]
+        closest = min(collisions, key=lambda x: x[2]) if collisions else None
+        near = ("none" if closest is None else
+                f"{closest[0]} x {closest[1]}: {1000.0 * closest[2]:+.2f}mm")
+        md = meta[gid] if gid < len(meta) else {}
+        origin = md.get("origin", "enumerated")
+        family = md.get("family", "unknown")
+        refinement = md.get("refinement")
+        refined = ("none" if not refinement else
+                   f"{refinement[0]} {1000.0 * float(refinement[3]):.2f}mm "
+                   f"for {refinement[1]}/{refinement[2]}")
+        aperture = ("n/a" if result.aperture is None else
+                    f"{1000.0 * result.aperture:.2f}mm inward/finger")
+        label = (f"ISOLATED CHEAP PICK {p}:g{gid} | kind={kind} representative={robot} | "
+                 f"origin={origin} family={family} refinement={refined} | "
+                 f"closure={aperture} | closest={near} | "
+                 f"gate penetration tolerance={1000.0 * _CHEAP_PENETRATION_TOL:.1f}mm | "
+                 "open-scene+closure: PASS | SSIK/KOMO/wrench: NOT RUN")
+        if recorder is not None:
+          recorder.record(Cv, label)
+        elif view:
+          Cv.view(True, label + " (close for next grasp)")
+      summary[p][kind] = (passed, tested)
+      part_pass += passed
+      total_pass += passed
+      total_tested += tested
+      rejected = (f"; closure rejects={closure_reasons}" if closure_reasons else "")
+      passed_meta = [
+          (gid,
+           (meta[gid] or {}).get("family", "unknown") if gid < len(meta) else "unknown",
+           (meta[gid] or {}).get("sets", (meta[gid] or {}).get("set", "-"))
+           if gid < len(meta) else "-")
+          for gid in passed_ids]
+      print(f"[initial-grasp-viz] {p} {kind}: {passed}/{tested} pass open+closure "
+            f"({open_passed} open-clear), ids/family/set={passed_meta}{rejected}")
+    # Preserve an explicit diagnostic step for a part with no feasible grasp rather than
+    # silently omitting it from the timeline.
+    if part_pass == 0:
+      Cv = checker._scene_for(isolated, assembly)
+      label = (f"ISOLATED CHEAP PICK {p}: NO FEASIBLE GRASP | "
+               f"gate penetration tolerance={1000.0 * _CHEAP_PENETRATION_TOL:.1f}mm | "
+               "open-scene and closure checked | SSIK/KOMO/wrench: NOT RUN")
+      if recorder is not None:
+        recorder.record(Cv, label)
+      elif view:
+        Cv.view(True, label + " (close for next part)")
+  print(f"[initial-grasp-viz] total: {total_pass}/{total_tested} candidate-kind pairs pass; "
+        "open-scene collision + closure checked; SSIK/KOMO/wrench were not run")
+  return summary
+
+
 def visualize_rest_poses_viser(C, assembly, recorder=None, view=True, groups=None):
   """REST-POSE CATALOG (scrubbable): for each group, one step per STABLE rest face, the group
   laid out resting on the table in that pose (rest_faces + _rest_layout_poses -- exactly what
@@ -421,11 +533,20 @@ def visualize_grasps(C, grasps, assembly, subassembly_base_pose, gripper_path=No
 
 
 def _scene_floating_ee_path(C):
-  # the floating-EE model MATCHING the scene's real gripper (two-finger vs vacuum, detected
-  # from the frame names). Replays used to fall back to DEFAULT_FLOATING_EE (the vacuum
-  # file) and drew vacuum pens on two-finger runs.
+  # The floating-EE model MATCHING the scene's real hand.  OpenArm has a native pinch
+  # proxy; treating every non-vacuum hand as the UR/Robotiq model made --no-real-ik
+  # replays draw (and appear to manipulate with) the wrong gripper.  Keep this selection
+  # independent of RobotIK: this helper is specifically the fallback used when real IK is
+  # disabled.
   import os
-  vacuum = any(n.endswith("_ur_vacuum") for n in C.getFrameNames())
+  names = C.getFrameNames()
+  from env import is_openarm_scene
+  if is_openarm_scene(C):
+    return os.path.join(os.path.dirname(__file__), OPENARM_FLOATING_EE_PATH)
+  # UR and FR3 scenes continue to use their established floating models (FR3 carries the
+  # same Robotiq hand).  Mixed UR vacuum/two-finger schematic replay remains a separate
+  # limitation because visualize_state currently accepts one proxy path for all holders.
+  vacuum = any(n.endswith("_ur_vacuum") for n in names)
   return os.path.join(os.path.dirname(__file__), UR10_PATHS[(True, vacuum)])
 
 
@@ -625,7 +746,7 @@ def _active_robots(action, s, rik):
   #
   # Braces of UNRELATED groups are still excluded, by construction: only holders of the groups
   # this action TOUCHES are returned. That exclusion matters -- an unrelated brace's DOFs are
-  # solved against the stateless IK scene, which parks held groups at the holder's HOME pose,
+  # solved against the stateless IK scene, which parks held groups at the holder's EXIT pose,
   # so transplanting them into the replay (where that group sits elsewhere) tears the grasp.
   return involved_robots(action, s, None, rik)
 
@@ -668,7 +789,7 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
   if robot_ik is None:
     robot_ik = RobotIK(C, robots)
 
-  # the live config: real arms at home + parts at their initial table poses (attached to
+  # the live config: real arms at exit + parts at their initial table poses (attached to
   # the table). We mutate THIS as the plan unfolds instead of rebuilding per step.
   Cv = ry.Config()
   Cv.addConfigurationCopy(robot_ik.C)
@@ -809,7 +930,7 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
       if r in active:
         _write_robot_dofs(Cv, r, witness)
       elif _may_home(r):
-        _write_robot_dofs(Cv, r, robot_ik.home)
+        _write_robot_dofs(Cv, r, robot_ik.exit_configuration)
     if witness is not None:
       _apply_relink()
     # 3) per-action consistency snap:
@@ -898,7 +1019,7 @@ def _ik_test_scene(C, assembly, n_parts, num_robots, vacuum):
 
 
 def visualize_pick_ik(part="obj_3", grasp_id=0, robot=None, n_parts=7, num_robots=2,
-                      vacuum=False, C=None, assembly=None):
+                      vacuum=False, C=None, assembly=None, view=True):
   """Set up the real-robot env and pop up the pick IK for one (robot, part, grasp) so you
   can eyeball whether the grasp is sensible. Needs a display. Pass (C, assembly) to run on
   an existing configured scene (e.g. --random-init); the self-built cube-cross env with a
@@ -907,7 +1028,7 @@ def visualize_pick_ik(part="obj_3", grasp_id=0, robot=None, n_parts=7, num_robot
   robots = get_robots(C)
   if robot is None:
     robot = robots[0]
-  rik = RobotIK(C, robots, debug_view=True)
+  rik = RobotIK(C, robots, debug_view=view)
   s0 = get_initial_state(C, assembly)
   ok, _witness = rik.bind(("pick", robot, part, grasp_id), s0, None, assembly)
   print(f"pick IK ({robot} -> {part}, grasp {grasp_id}): feasible={ok}")
