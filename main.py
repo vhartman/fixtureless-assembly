@@ -37,6 +37,10 @@ _STANDARD_SEARCH_PROFILE = {
     "milestone_boundaries": 4,
     "fill_scope_widening": True,
     "fill_touch_all": False,
+    # The historical scatter is a fixed x=-0.5 one-row line. That made an otherwise valid
+    # benchmark depend on arm length (opposite car-mini parts had 0 exact OpenArm branches)
+    # rather than the declared density. The compact centred lattice changes only initialization.
+    "center_scatter": True,
     "sig_collapsed_h": True,
     "sig_components": "press",
     # Raw-grasp guidance complementary to the uniformly projected local PDB: prefer grasps
@@ -51,7 +55,11 @@ _STANDARD_SEARCH_PROFILE = {
     # A collision-free endpoint exactly on a hardware stop has no open neighbourhood for a
     # sampling planner. OpenArm car-mini hit joint 7 with 3e-9 rad slack at its four-arm seat.
     "witness_joint_margin": 0.02,
-    "witness_branch_budget": 5,
+    # Preserve the established clearance-floor epsilon-constraint, but do not buy clearance
+    # with additional physical reconfigurations. Count actual bounded-joint travel rather than
+    # the old UR-only elbow/wrist sign label (which missed OpenArm shoulder flips).
+    "witness_branch_budget": 0,
+    "witness_branch_metric": "motion",
     "witness_sets": 4,
     "tight_fingers": True,
     "strict_collisions": 1e-6,
@@ -86,6 +94,9 @@ _STANDARD_SEARCH_PROFILE = {
     # Hybrid V2 grasp DB: conventional primitive grasps remain a stable prefix and mesh-
     # sampled candidates add off-centre/wrap alternatives. Exact state gates stay authoritative.
     "grasp_sampler": True,
+    # V2's scene/family round-robin remains the measured selector. The task-coverage V3
+    # ablation over-prioritized one-per-fact coverage and cut mate-useful redundancy on the
+    # difficult OpenArm wheels (7 -> 4), so it stays explicit rather than becoming a default.
     "grasp_sampler_version": 2,
     "grasp_sampler_keep": 20,
     "grasp_sampler_candidates": 96,
@@ -94,7 +105,16 @@ _STANDARD_SEARCH_PROFILE = {
     # those contacts, this emits the complementary side-approach roll that tight insertions
     # often need. Vacuum curvature remains governed separately by --allow-curved-grasps.
     "grasp_sampler_wrap": 0.015,
-    "grasp_refine": True,
+    # Full hybrid grasps are the robust default. On centred OpenArm car-mini, compact-only
+    # obj_2 exhausted 6280 effort slots; the full DB solved the same fill in 13 slots/0.8s.
+    # The optional staged policy remains available as --grasp-refine for ablation/anytime use.
+    "grasp_refine": False,
+    # Keep the fast 20-grasp alphabet on ordinary instances. If a complete fill attempt
+    # fails, monotonically expose another stable V3 prefix instead of spending unlimited IK
+    # effort on a parameterization set that may simply omit the required contact.
+    "grasp_widen": True,
+    "grasp_widen_batch": 8,
+    "grasp_widen_max": 96,
     # A standard search is a batch artifact-producing run.  Both remain explicitly
     # reversible on the CLI via --view and --no-quiet-rai.
     "quiet_rai": True,
@@ -131,7 +151,7 @@ _STANDARD_MOTION_PROFILE = {
     # Chair transit; no 30 s frontier-stall shortcut may silently truncate that budget.
     "mp_sequence": True,
     "mp_optimize": True,
-    "mp_runtime": 100.0,
+    "mp_runtime": 300.0,
     "mp_stall_timeout": None,
     # Fair complete-plan loop: four alternatives match the search's retained milestone
     # boundaries. 15,30,60,120,240,300 s gives every suspended plan both quick probes and the
@@ -142,7 +162,10 @@ _STANDARD_MOTION_PROFILE = {
     "mp_no_shortcut": False,
     "mp_shortcut_iters": 100,
     "mp_shortcut_strategy": "native",
-    "mp_shortcut_res": None,
+    # OpenArm's thin finger/object passages exposed a real swept collision inside a 0.01-rad
+    # edge (the endpoint and neighbouring coarse samples were free).  Certify accepted
+    # shortcuts five times more finely; the simulator repeats the same scale fail-closed.
+    "mp_shortcut_res": 0.002,
     # Collision/clearance certificate shared by every current robust MP artifact. A positive
     # table margin remains scene-specific: no successful general artifact has validated one.
     "mp_collision_tolerance": 1e-4,
@@ -272,6 +295,14 @@ def build_parser():
       "--scatter-spacing", type=float, default=1.0 / 7.0, metavar="M",
       help="x-pitch of the scatter line in metres (default 1/7 ~ 0.143, the historical "
            "layout). For analysing how much search/IK cost is scene density.",
+  )
+  g_scene.add_argument(
+      "--center-scatter", action=argparse.BooleanOptionalAction, default=False,
+      help="Arrange the ordinary scatter as a compact, centred, roughly-square lattice at "
+           "the requested spacing instead of the historical fixed x=-0.5 one-row anchor. "
+           "This preserves density and part order while avoiding embodiment-dependent "
+           "reachability failures for short-arm robots. Enabled by --search-profile standard "
+           "and persisted with saved plans.",
   )
   g_scene.add_argument(
       "--grid-init", type=int, nargs="?", const=2, default=None, metavar="COLS",
@@ -553,16 +584,18 @@ def build_parser():
   )
   g_ik.add_argument(
       "--grasp-sampler-keep", type=int, default=20, metavar="N",
-      help="--grasp-sampler: TOTAL grasps kept per part (default 20). Hybrid V2 reserves "
-           "the conventional primitive grasps first, then fills the remaining budget with "
-           "scene/fleet-diverse surface samples. Mesh/compound parts use the whole budget. "
+      help="--grasp-sampler: initial TOTAL grasps kept per part (default 20). Hybrid V2 "
+           "reserves conventional primitive grasps first; V3 selects a task-conditioned "
+           "stable prefix over conventional and sampled candidates. Mesh/compound parts use "
+           "the whole budget. "
            "Legacy V1 splits the budget ~half suction / half antipodal.",
   )
   g_ik.add_argument(
-      "--grasp-sampler-version", type=int, choices=(1, 2), default=2, metavar="V",
-      help="Sampled grasp database format. V2 (default) is the versioned HYBRID DB with a "
-           "stable conventional-grasp prefix, refinement-stable sampled ordering, and per-"
-           "gripper scene labels. V1 reconstructs plans made by the old replacement sampler.",
+      "--grasp-sampler-version", type=int, choices=(1, 2, 3), default=2, metavar="V",
+      help="Sampled grasp database format. V3 balances task certificates (pick/assemble, "
+           "closure, fixed-arm initial reach, and grasp family) in a K-independent stable "
+           "order. V2 retains the conventional-prefix hybrid database for old plans; V1 "
+           "reconstructs the original replacement sampler.",
   )
   g_ik.add_argument("--grasp-sampler-db-hash", default=None, help=argparse.SUPPRESS)
   g_ik.add_argument(
@@ -570,8 +603,35 @@ def build_parser():
       help="With hybrid V2 sampling, search primitives first with the exact conventional "
            "grasp prefix (mesh/compound parts still use samples), then retry with sampled "
            "primitive extras only if that compact search finds no plan. Off exposes the full "
-           "hybrid DB immediately. The standard search profile enables staged refinement.",
+           "configured hybrid prefix immediately. This is an explicit ablation; standard uses "
+           "the full initial prefix plus failure-driven --grasp-widen.",
   )
+  g_ik.add_argument(
+      "--grasp-widen", action=argparse.BooleanOptionalAction, default=False,
+      help="If search returns no plan with the initial sampled-grasp prefix, retry with "
+           "monotonically larger stable prefixes. A finite IK/search miss never deletes an "
+           "old grasp; successful witnesses remain reusable. V2/V3 only.",
+  )
+  g_ik.add_argument(
+      "--grasp-widen-batch", type=int, default=8, metavar="N",
+      help="Number of additional grasp ids exposed per failure-driven widening epoch "
+           "(default 8).",
+  )
+  g_ik.add_argument(
+      "--grasp-widen-max", type=int, default=96, metavar="N",
+      help="Largest requested grasp prefix under --grasp-widen (default 96). Widening stops "
+           "earlier when the finite evaluated master pool is exhausted.",
+  )
+  g_ik.add_argument(
+      "--grasp-local-widen", action=argparse.BooleanOptionalAction, default=False,
+      help="Build one finite V2/V3 master database up to --grasp-widen-max, but expose "
+           "only --grasp-sampler-keep ids per part to a milestone fill. If the fill "
+           "stalls, enlarge the incoming part's prefix by --grasp-widen-batch before "
+           "opening the combinatorial bracing/all-part recovery spaces. The final phase "
+           "exposes the full finite master, so this is lazy column generation rather than "
+           "a grasp-pruning rule. Milestone solver only; incompatible with --grasp-widen.",
+  )
+  g_ik.add_argument("--grasp-local-caps", default=None, help=argparse.SUPPRESS)
   g_ik.add_argument(
       "--grasp-sampler-candidates", type=int, default=200, metavar="M",
       help="--grasp-sampler: raw surface samples per shape before downsampling (default 200).",
@@ -972,9 +1032,12 @@ def build_parser():
       help="THE SINGLE RECIPE: adaptive-width milestones (DAG modules + width-2 window "
            "fills on width-1 failure) under a hard deadline (default 300s), then bounded "
            "improvement (PEA*, memory-safe) with the remaining budget; PEA-greedy net if "
-           "milestones itself was cut. Always returns the best plan found within SEC; "
+           "milestones itself was cut. With --open-witness, stochastic IK failures are "
+           "fairly reopened until the milestone-phase deadline instead of inheriting its "
+           "finite operational epoch cap. Always returns the best plan found within SEC; "
            "never OOMs; result <= min(milestone cost, weight x optimal) when the "
-           "improvement pass completes. Use --weight inf for greedy fills (fastest).",
+           "improvement pass completes under a deterministic feasibility oracle. Use "
+           "--weight inf for greedy fills (fastest).",
   )
   g_search.add_argument(
       "--lazy-fills", action=argparse.BooleanOptionalAction, default=True,
@@ -1911,7 +1974,8 @@ def parse_args(argv=None):
 # fields persisted by --save so replay.py can reconstruct the EXACT scene (see plan_io.py).
 _SAVE_CONFIG_FIELDS = (
     "assembly", "parts", "num_robots", "vacuum", "floating_ee", "robot", "robot_types",
-    "scatter_spacing", "perturb_start_pose", "seed", "wrench", "grasp_model", "insert_force",
+    "scatter_spacing", "center_scatter", "perturb_start_pose", "seed", "wrench",
+    "grasp_model", "insert_force",
     "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
     "bracing", "robust_mode", "dense_grasps", "random_init", "part_float", "inhand_reorient",
     "pre_insertion", "pre_pick", "pre_place", "pre_add_grasp", "post_release", "staged_mates",
@@ -1939,7 +2003,9 @@ _SAVE_CONFIG_FIELDS = (
     "grasp_sampler", "grasp_sampler_keep",               # --grasp-sampler: sampled ids only
     "grasp_sampler_candidates", "grasp_sampler_seed",    # replay under identical settings
     "grasp_sampler_version", "grasp_sampler_db_hash",    # algorithm + content identity
-    "grasp_refine",                                      # search provenance; replay uses full DB
+    "grasp_refine", "grasp_widen", "grasp_widen_batch", "grasp_widen_max",
+    "grasp_local_widen", "grasp_local_caps",
+    # search provenance; replay reconstructs the final widened prefix recorded in `keep`
     "grasp_sampler_margin", "grasp_sampler_pad_support",
     "grasp_sampler_wrap",                                 # curvature-fair support metric (None = legacy)
     "grasp_sampler_scenes",                              # scene-aware set split (rebinds ids)
@@ -2181,7 +2247,11 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         fill_policy_first=cfg.fill_policy_first,
         fill_skeleton_first=cfg.fill_skeleton_first,
         fill_scope_widening=cfg.fill_scope_widening,
-        milestone_boundaries=cfg.milestone_boundaries)
+        milestone_boundaries=cfg.milestone_boundaries,
+        grasp_local_widen=cfg.grasp_local_widen,
+        grasp_initial_keep=cfg.grasp_sampler_keep,
+        grasp_widen_batch=cfg.grasp_widen_batch,
+        grasp_widen_max=cfg.grasp_widen_max)
   else:
     plan = solve_assembly_problem(C, assembly, robots=robots, canonical=cfg.canonical,
                                   weight=cfg.weight, robot_ik=robot_ik, wrench=cfg.wrench,
@@ -2214,7 +2284,11 @@ def _milestone_candidate_session(cfg, C, assembly, robots, robot_ik):
       fill_policy_first=cfg.fill_policy_first,
       fill_skeleton_first=cfg.fill_skeleton_first,
       fill_scope_widening=cfg.fill_scope_widening,
-      milestone_boundaries=cfg.milestone_boundaries)
+      milestone_boundaries=cfg.milestone_boundaries,
+      grasp_local_widen=cfg.grasp_local_widen,
+      grasp_initial_keep=cfg.grasp_sampler_keep,
+      grasp_widen_batch=cfg.grasp_widen_batch,
+      grasp_widen_max=cfg.grasp_widen_max)
 
 
 def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
@@ -2285,6 +2359,8 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
       "parent_memory_limit_bytes": effective_parent_limit,
       "grasp_refinement": bool(cfg.grasp_sampler and cfg.grasp_sampler_version >= 2
                                 and cfg.grasp_refine),
+      "grasp_widening": bool(cfg.grasp_sampler and cfg.grasp_sampler_version >= 2
+                              and cfg.grasp_widen),
   }
   seen_plan_ids = set()
 
@@ -2436,6 +2512,8 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
   widened_grasps = False
   staged_grasps = bool(cfg.grasp_sampler and cfg.grasp_sampler_version >= 2
                        and cfg.grasp_refine)
+  widen_keep = int(cfg.grasp_sampler_keep)
+  widen_hash = cfg.grasp_sampler_db_hash
   # Epoch 0: move on quickly -- one small pull for each newly generated complete plan. If
   # the conventional primitive-grasp prefix is exhausted, preserve the ordinary standard
   # profile's staged refinement: reopen with the full hybrid sampled DB and skip duplicates.
@@ -2453,6 +2531,32 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
               "search with the full hybrid grasp DB; duplicate plans are skipped.")
         session = _milestone_candidate_session(cfg, C, assembly, robots, robot_ik)
         continue
+      if (cfg.grasp_widen and cfg.grasp_sampler and cfg.grasp_sampler_version >= 2
+          and widen_keep < int(cfg.grasp_widen_max)):
+        if cfg.grasp_widen_batch < 1:
+          raise ValueError("--grasp-widen-batch must be >= 1")
+        from problem import set_sampled_grasp_keep, sampled_grasp_db_signature
+        requested = min(int(cfg.grasp_widen_max), widen_keep + int(cfg.grasp_widen_batch))
+        set_sampled_grasp_keep(requested)
+        cfg.grasp_sampler_keep = requested
+        new_hash = sampled_grasp_db_signature(assembly)
+        if new_hash == widen_hash:
+          set_sampled_grasp_keep(widen_keep)
+          cfg.grasp_sampler_keep = widen_keep
+          cfg.grasp_sampler_db_hash = widen_hash
+          print(f"[grasp-widen/mp-open] finite evaluated master pool exhausted at "
+                f"effective prefix {widen_keep}; requested {requested} added no candidate.")
+        else:
+          print(f"[grasp-widen/mp-open] complete-plan stream exhausted at prefix "
+                f"{widen_keep} -> exposing stable ids [{widen_keep}, {requested}) and "
+                "reopening assembly search. Existing plans remain suspended, not rejected.")
+          widen_keep, widen_hash = requested, new_hash
+          cfg.grasp_sampler_db_hash = new_hash
+          manifest.setdefault("grasp_widen_epochs", []).append(
+              {"keep": requested, "db_hash": new_hash})
+          write_manifest()
+          session = _milestone_candidate_session(cfg, C, assembly, robots, robot_ik)
+          continue
       print(f"[mp-open] assembly-plan session exhausted after {len(records)} candidate(s).")
       break
     i = len(records) + 1
@@ -2616,6 +2720,29 @@ def run(cfg, explicit=None):
   from problem import set_sampled_grasps, clear_sampled_scene_ctx
   if cfg.grasp_sampler_scenes and not cfg.grasp_sampler:
     raise SystemExit("--grasp-sampler-scenes requires --grasp-sampler")
+  if cfg.grasp_local_widen and cfg.grasp_widen:
+    # Named standard currently carries the older whole-search retry policy. An explicit
+    # local schedule replaces it cleanly instead of forcing profile users to remember a
+    # second negating flag; the resolved/saved config records the actual policy.
+    print("[flag] --grasp-local-widen supersedes profile --grasp-widen; disabling the "
+          "whole-search restart schedule.")
+    cfg.grasp_widen = False
+  if cfg.grasp_widen:
+    if not cfg.grasp_sampler or cfg.grasp_sampler_version < 2:
+      raise SystemExit("--grasp-widen requires --grasp-sampler-version 2 or 3")
+    if cfg.grasp_widen_batch < 1:
+      raise SystemExit("--grasp-widen-batch must be >= 1")
+    if cfg.grasp_widen_max < cfg.grasp_sampler_keep:
+      raise SystemExit("--grasp-widen-max must be >= --grasp-sampler-keep")
+  if cfg.grasp_local_widen:
+    if not cfg.milestones:
+      raise SystemExit("--grasp-local-widen currently requires --milestones")
+    if not cfg.grasp_sampler or cfg.grasp_sampler_version < 2:
+      raise SystemExit("--grasp-local-widen requires --grasp-sampler-version 2 or 3")
+    if cfg.grasp_widen_batch < 1:
+      raise SystemExit("--grasp-widen-batch must be >= 1")
+    if cfg.grasp_widen_max < cfg.grasp_sampler_keep:
+      raise SystemExit("--grasp-widen-max must be >= --grasp-sampler-keep")
   # a previous in-process run's scene filter must not leak into THIS run's assembly
   # definition (define() queries the grasp DB, which raises under a stale part-less ctx).
   clear_sampled_scene_ctx()
@@ -2629,17 +2756,34 @@ def run(cfg, explicit=None):
     set_sampled_grasps({"seed": cfg.grasp_sampler_seed,
                         "candidates": cfg.grasp_sampler_candidates,
                         "keep": cfg.grasp_sampler_keep,
+                        "master_keep": (cfg.grasp_widen_max if cfg.grasp_local_widen
+                                        else cfg.grasp_sampler_keep),
                         "version": cfg.grasp_sampler_version,
                         "margin": cfg.grasp_sampler_margin,
                         "pad_support": cfg.grasp_sampler_pad_support,
                         "wrap": cfg.grasp_sampler_wrap})
     print(f"[flag] --grasp-sampler ACTIVE: V{cfg.grasp_sampler_version} "
-          + ("HYBRID conventional + mesh-sampled" if cfg.grasp_sampler_version >= 2
+          + ("TASK-COVERAGE conventional + mesh-sampled" if cfg.grasp_sampler_version >= 3
+             else "HYBRID conventional + mesh-sampled" if cfg.grasp_sampler_version >= 2
              else "legacy replacement mesh-sampled")
           + f" grasp DB ({cfg.grasp_sampler_candidates} raw candidates -> "
-          f"{cfg.grasp_sampler_keep} total kept per part; suction + antipodal blocks; seed "
+          + (f"{cfg.grasp_sampler_keep} initially active, finite master requested up to "
+             f"{cfg.grasp_widen_max} per part"
+             if cfg.grasp_local_widen else
+             f"{cfg.grasp_sampler_keep} total kept per part")
+          + f"; suction + antipodal blocks; seed "
           f"{cfg.grasp_sampler_seed}). Grasp ids index the SAMPLED list -- plans/witnesses "
           f"only replay under the same sampler settings (saved with the plan).")
+    if cfg.grasp_widen:
+      print(f"[flag] --grasp-widen ACTIVE: start with K={cfg.grasp_sampler_keep}; after a "
+            f"no-plan return expose {cfg.grasp_widen_batch} stable IDs per epoch up to "
+            f"K={cfg.grasp_widen_max}, stopping earlier when the evaluated master hash is "
+            "unchanged. Finite misses remain open; the final effective K/hash are saved.")
+    if cfg.grasp_local_widen:
+      print(f"[flag] --grasp-local-widen ACTIVE: one stable finite master is built up to "
+            f"K={cfg.grasp_widen_max}; concrete fills start with K={cfg.grasp_sampler_keep} "
+            f"per part and expose {cfg.grasp_widen_batch} more incoming-part columns after "
+            "a local failure. IK misses remain open and grasp IDs never change.")
   else:
     set_sampled_grasps(None)
   if getattr(cfg, "stable_rest_poses", False):
@@ -2925,18 +3069,34 @@ def run(cfg, explicit=None):
     print(f"[flag] NOTE: --scatter-spacing {cfg.scatter_spacing:g} has NO EFFECT here: "
           f"{'--random-init' if cfg.random_init is not None else '--grid-init'} overrides the "
           f"scatter line.")
+  if cfg.center_scatter and cfg.grid_init is None and cfg.random_init is None:
+    print("[flag] --center-scatter ACTIVE: parts use a compact centred lattice; spacing and "
+          "part order are unchanged, layout span grows as sqrt(part count).")
   C = add_disassembled_obj(C, assembly, perturb_start_pose=cfg.perturb_start_pose,
                            spacing=cfg.scatter_spacing, random_init=cfg.random_init,
                            float_height=cfg.part_float, min_sep=cfg.min_sep,
-                           grid=cfg.grid_init, grid_gap=cfg.grid_gap)
+                           grid=cfg.grid_init, grid_gap=cfg.grid_gap,
+                           center_scatter=cfg.center_scatter)
 
+  _sampler_robot_ik = None
   if cfg.grasp_sampler_scenes:
     from problem import install_sampled_scene_ctx
-    install_sampled_scene_ctx(C, assembly, robots=get_robots(C))
+    # V3 conditions the bounded prefix on exact INITIAL-pick reach. Build the same calibrated
+    # RobotIK object search will later use, and only expose its exact branches as ranking facts.
+    # V2 replay remains byte-identical and does not pay for or include this context.
+    if cfg.grasp_sampler_version >= 3 and cfg.real_ik and cfg.ik_seeding:
+      _sampler_robot_ik = RobotIK(C, get_robots(C))
+      _sampler_robot_ik.ik_seeding = True
+    install_sampled_scene_ctx(C, assembly, robots=get_robots(C),
+                              robot_ik=_sampler_robot_ik)
     print("[flag] --grasp-sampler-scenes ACTIVE: every candidate is tagged PER GRIPPER KIND "
           "with floating-EE verdicts at its INITIAL pose (PICK) and fully ASSEMBLED pose; "
           "the bounded DB reserves diverse proposals for those contexts. Exact intermediate-"
           "state cheap/IK gates remain authoritative. Grasp ids are per PART INSTANCE.")
+    if _sampler_robot_ik is not None:
+      print("[grasp-sampler-scenes] V3 task conditioning ACTIVE: exact calibrated fixed-arm "
+            "branches at each initial pick are soft max-min coverage facts. Empty SSIK sets "
+            "are never deleted; scene/family coverage retains tolerant-KOMO alternatives.")
     if _closure_active:
       print("[grasp-sampler-scenes] strict closure generation ACTIVE: a two-finger source "
             "whose fingers intersect the table may emit a distinct minimum approach-retracted "
@@ -3124,7 +3284,8 @@ def run(cfg, explicit=None):
     raise SystemExit("main.py: --mp-export-save/--mp-export-load require --motion-plan")
   if cfg.solve or cfg.load_plan:
     robots = get_robots(C)
-    robot_ik = RobotIK(C, robots) if cfg.real_ik else None
+    robot_ik = (_sampler_robot_ik if _sampler_robot_ik is not None else
+                RobotIK(C, robots) if cfg.real_ik else None)
     if (robot_ik is not None and not np.allclose(
         robot_ik.home, robot_ik.exit_configuration, atol=1e-12, rtol=0.0)):
       print("[robot] distinct HOME/EXIT poses ACTIVE: the physical trajectory starts/ends "
@@ -3360,16 +3521,24 @@ def run(cfg, explicit=None):
                 f"current {getattr(cfg, _k, None)!r} -- witnesses will be solved in the WRONG "
                 f"scene. Pass --config {cfg.load_plan} (its config block) to match.")
     else:
-      # Necessary-condition preflight on the COMPLETE grasp DB, before staged refinement or
-      # symbolic search. A part that cannot be picked even with every other part removed can
-      # never be recovered by decluttering, IK restarts, widening, or additional search nodes.
+      # Necessary-condition preflight on the CURRENT grasp prefix. Without lazy widening this
+      # is the complete configured DB and can abort immediately. Under --grasp-widen an empty
+      # prefix is only a request for the next prefix; the same sound abort runs again after the
+      # finite master pool is exhausted.
       from solver import _search_context, isolated_graspability_report
       _pre_checker, _pre_table = _search_context(C, assembly, robots)
       _pre = isolated_graspability_report(
           C, assembly, robots, _pre_checker, _pre_table,
-          require_closure=bool(cfg.grasp_closure_check), verbose=True)
+          require_closure=bool(cfg.grasp_closure_check), robot_ik=robot_ik, verbose=True)
+      if cfg.grasp_local_widen:
+        for _p, _result in _pre.items():
+          _accepted = {gid for _kind, _robot, gid in _result["accepted"]}
+          _active = sum(gid < int(cfg.grasp_sampler_keep) for gid in _accepted)
+          print(f"[grasp-funnel {_p}] isolated-pick active/master="
+                f"{_active}/{len(_accepted)} (K={cfg.grasp_sampler_keep}); closure and "
+                "open-hand geometry are already included in this count.")
       _unpickable = [p for p, result in _pre.items() if not result["ok"]]
-      if _unpickable:
+      if _unpickable and not cfg.grasp_widen:
         layer = "open-hand collision + virtual closure" if cfg.grasp_closure_check \
             else "open-hand collision"
         raise SystemExit(
@@ -3377,16 +3546,31 @@ def run(cfg, explicit=None):
             f"{layer}. Other parts were removed, so search/IK cannot repair this. Inspect "
             f"with --viz-initial-grasps {_unpickable[0]} --viser, increase the grasp "
             "database, or correct the gripper/part geometry.")
+      if _unpickable and cfg.grasp_widen:
+        print(f"[grasp-preflight] current {cfg.grasp_sampler_keep}-grasp prefix cannot pick "
+              f"{_unpickable} in isolation; deferring the sound abort while the finite V3 "
+              "master pool is widened.")
       try:
         print(f"[rss] peak RSS before solve: {_rss_mb():.0f} MB")   # A1/A6 instrumentation
         _staged_grasps = bool(cfg.grasp_sampler and cfg.grasp_sampler_version >= 2
                               and cfg.grasp_refine)
-        if _staged_grasps:
+        _staged_dispatch = bool(_staged_grasps and not cfg.mp_open_plans)
+        _original_bracing = bool(cfg.bracing)
+        _original_scope_widening = bool(cfg.fill_scope_widening)
+        if _staged_dispatch:
           from problem import set_sampled_canonical_only
           set_sampled_canonical_only(True)
-          print("[grasp-refine] epoch 0: primitive parts use the exact conventional grasp "
-                "prefix; mesh/compound parts keep their sampled DB. Sampled primitive "
-                "extras reopen only if this compact search exhausts.")
+          # Monotone action-space widening. The former nesting did the most expensive thing
+          # first: exhaust compact grasps through unrestricted bracing/all-part recovery, and
+          # only THEN expose sampled grasps. OpenArm car-mini spent minutes in a symbolic
+          # recovery whose target body had no viable compact route. Grow the three independent
+          # alphabets in branching-factor order instead; the final epoch is exactly the old
+          # complete action space, so no plan is removed.
+          cfg.bracing = False
+          cfg.fill_scope_widening = False
+          print("[grasp-refine] epoch 0: conventional primitive grasps + local unbraced "
+                "manipulation. This is the smallest nested action space; failures do not "
+                "refute later epochs.")
         if cfg.mp_open_plans:
           print("[flag] --mp-open-plans ACTIVE: complete assembly plans are generated from "
                 "one resumable milestone session; finite MP failures suspend a plan, probe "
@@ -3394,11 +3578,90 @@ def run(cfg, explicit=None):
                 "timeout becomes a symbolic or boundary no-good.")
           return _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=explicit)
         plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
-        if plan is None and _staged_grasps:
+        if plan is None and _staged_dispatch:
           set_sampled_canonical_only(False)
-          print("[grasp-refine] compact grasp search found no plan -> epoch 1 re-search with "
-                "the full hybrid DB (stable existing ids/witness cache retained).")
+          print("[grasp-refine] epoch 0 exhausted -> epoch 1: full hybrid grasp DB, still "
+                "local and unbraced (stable ids/witness cache retained).")
           plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
+        if plan is None and _staged_dispatch and _original_bracing:
+          cfg.bracing = True
+          print("[grasp-refine] epoch 1 exhausted -> epoch 2: add bracing, retain full grasps "
+                "and local manipulation scope.")
+          plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
+        if plan is None and _staged_dispatch and _original_scope_widening:
+          cfg.bracing = _original_bracing
+          cfg.fill_scope_widening = True
+          print("[grasp-refine] local epochs exhausted -> final completeness epoch: full "
+                "grasps + configured bracing + all-part scope widening.")
+          plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
+        if plan is None and cfg.grasp_local_widen:
+          # Local column generation is deliberately bounded per milestone boundary so a bad
+          # predecessor cannot monopolize all grasp/IK effort. Completeness relative to the
+          # finite sampled master is recovered once, here, after milestone backtracking has
+          # exhausted those compact attempts. The RobotIK object and stable ids survive.
+          print("[grasp-columns] compact milestone alternatives exhausted -> one final "
+                "full-master milestone pass. This is the finite action-space completeness "
+                "net; no grasp or IK failure was promoted to a permanent no-good.")
+          cfg.grasp_local_widen = False
+          try:
+            plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
+          finally:
+            cfg.grasp_local_widen = True
+          cfg.grasp_local_caps = {p: int(cfg.grasp_widen_max) for p in assembly.objects}
+          assembly._grasp_local_caps = dict(cfg.grasp_local_caps)
+        if plan is None and cfg.grasp_widen:
+          from problem import (set_sampled_canonical_only, set_sampled_grasp_keep,
+                               sampled_grasp_db_signature)
+          if not cfg.grasp_sampler or cfg.grasp_sampler_version < 2:
+            raise ValueError("--grasp-widen requires --grasp-sampler-version 2 or 3")
+          if cfg.grasp_widen_batch < 1:
+            raise ValueError("--grasp-widen-batch must be >= 1")
+          if cfg.grasp_widen_max < cfg.grasp_sampler_keep:
+            raise ValueError("--grasp-widen-max must be >= --grasp-sampler-keep")
+          set_sampled_canonical_only(False)
+          cfg.bracing = _original_bracing
+          cfg.fill_scope_widening = _original_scope_widening
+          prev_keep = int(cfg.grasp_sampler_keep)
+          prev_hash = str(cfg.grasp_sampler_db_hash)
+          epoch = 0
+          while plan is None and prev_keep < int(cfg.grasp_widen_max):
+            requested = min(int(cfg.grasp_widen_max), prev_keep + int(cfg.grasp_widen_batch))
+            set_sampled_grasp_keep(requested)
+            cfg.grasp_sampler_keep = requested
+            new_hash = sampled_grasp_db_signature(assembly)
+            if new_hash == prev_hash:
+              # The evaluated master pool can be shorter than the user-facing upper bound
+              # (e.g. primitive canonical rows + the fixed scene-probe pool). Restore the
+              # last effective prefix so saved provenance says exactly what was searched.
+              set_sampled_grasp_keep(prev_keep)
+              cfg.grasp_sampler_keep = prev_keep
+              cfg.grasp_sampler_db_hash = prev_hash
+              print(f"[grasp-widen] finite evaluated master pool exhausted at effective "
+                    f"prefix {prev_keep}; requested {requested} added no candidate. No "
+                    "geometric infeasibility is inferred from the finite search budget.")
+              break
+            cfg.grasp_sampler_db_hash = new_hash
+            epoch += 1
+            print(f"[grasp-widen] epoch {epoch}: search returned no plan with prefix "
+                  f"{prev_keep}; exposing stable ids [{prev_keep}, {requested}) and retrying "
+                  "the same action/IK semantics. Prior ids and successful witnesses remain "
+                  "valid; failures are not blacklisted.")
+            plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
+            prev_keep, prev_hash = requested, new_hash
+          if plan is None:
+            _final_checker, _final_table = _search_context(C, assembly, robots)
+            _final_pre = isolated_graspability_report(
+                C, assembly, robots, _final_checker, _final_table,
+                require_closure=bool(cfg.grasp_closure_check), robot_ik=robot_ik,
+                verbose=True)
+            _final_unpickable = [p for p, result in _final_pre.items() if not result["ok"]]
+            if _final_unpickable:
+              raise SystemExit(
+                  f"[grasp-preflight] ABORT after grasp-master exhaustion: no isolated "
+                  f"feasible pick for {_final_unpickable}. Search, IK effort, and clutter "
+                  "cannot repair this intrinsic gripper/object/table failure; inspect with "
+                  f"--viz-initial-grasps {_final_unpickable[0]} --viser or correct the "
+                  "gripper/part geometry.")
       except IKFailureLogDone:
         print(f"[ik-failures] window/cap reached -- search stopped for debugging "
               f"({len(fail_rec.steps)} failures collected).")
@@ -3427,9 +3690,16 @@ def run(cfg, explicit=None):
               "memory limit.", flush=True)
         raise MemoryError("native search allocation failed under memory guard") from exc
       finally:
+        if '_original_bracing' in locals():
+          cfg.bracing = _original_bracing
+          cfg.fill_scope_widening = _original_scope_widening
         if cfg.grasp_sampler:
           from problem import set_sampled_canonical_only
           set_sampled_canonical_only(False)               # post-passes/replay see full DB
+    if cfg.grasp_local_widen and hasattr(assembly, "_grasp_local_caps"):
+      cfg.grasp_local_caps = dict(assembly._grasp_local_caps)
+      used = ", ".join(f"{p}:{k}" for p, k in sorted(cfg.grasp_local_caps.items()))
+      print(f"[grasp-columns] final active prefixes: {used} (finite master hash persisted).")
     if robot_ik is not None and cfg.strict_collisions is not None:
       print(f"[strict-collisions] vetoed {robot_ik.strict_rejects} dirty KOMO witnesses "
             f"(> {cfg.strict_collisions:g}m total penetration).")

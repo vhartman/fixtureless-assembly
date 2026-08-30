@@ -56,6 +56,21 @@ def _replay_ok(plan, asm, C, robots_list, gk, bracing=False):
   return s.is_goal(asm)
 
 
+def test_centered_scatter_is_a_compact_centred_lattice():
+  asm = A.make_assembly("cross", 3)
+  C = make_four_robot_env(num_robots=1, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2, center_scatter=True)
+  xy = [C.getFrame(p).getRelativePosition()[:2] for p in asm.objects]
+  for got, expected in zip(xy, [[-0.1, -0.1], [0.1, -0.1], [0.0, 0.1]]):
+    assert got == pytest.approx(expected)
+
+  # Compatibility mode retains the historical fixed left anchor for old saved configs.
+  C2 = make_four_robot_env(num_robots=1, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C2, asm, spacing=0.2, center_scatter=False)
+  old_xs = [C2.getFrame(p).getRelativePosition()[0] for p in asm.objects]
+  assert old_xs == pytest.approx([-0.5, -0.3, -0.1])
+
+
 def test_vacuum_engagement_force_is_a_pre_contact_support_load():
   """The cup's sealing push is checked before the new vacuum contact can help balance it.
 

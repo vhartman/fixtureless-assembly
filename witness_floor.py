@@ -11,15 +11,16 @@ and because feasibility is monotone in the floor it can be bisected.
 THREE THINGS THIS FIXES BEYOND THE OBJECTIVE SHAPE.
 
 1. WHERE THE OTHER ARMS SIT WHILE WE MEASURE. `optimize_witnesses`' clearance poses every
-   non-acting joint at `home_map` (solver.py ~1972). An earlier draft of THIS module posed them
+   non-acting joint at the IK EXIT configuration. An earlier draft of THIS module posed them
    at their CARRIED configs instead, reasoning that a handover's partner is emphatically not at
    home. That was WRONG and is reverted: every candidate is solved and verified feasible with
    the other arms AT EXIT, so scoring -- or worse, emitting -- arm A's candidate beside arm B's
    carried config is a combination nothing ever collision-checked, and it produced witnesses
-   with arms visibly through each other. Home-pinning is also the convention the exported plan
-   relies on (mp_export's cur[]/goal_for bookkeeping), so the emitted witness is home outside
-   the arms its step actually moves. The interleaving case that motivated the change is still
-   covered -- by (2), where the candidate itself holds both arms.
+   with arms visibly through each other. EXIT remains in the persisted full-scene certificate,
+   but the exporter slices only the active arms; it is never an execution goal. The interleaving
+   case that motivated the change is still covered -- by (2), where the candidate itself holds
+   both arms. Continuity is separately measured from physical HOME through consecutive active
+   appearances and back to HOME, so EXIT cannot bias the selected chain.
 
 2. MULTI-ARM STEPS ARE JOINT NODES. A handover / add_grasp / braced assemble chooses BOTH arms'
    configs at once, so scoring them independently is meaningless -- the interleaving is the whole
@@ -44,7 +45,7 @@ import time
 import numpy as np
 import robotic as ry
 
-from solver import _replay_states, _search_context, ik_branch, reconfig_crossings, \
+from solver import _replay_states, _search_context, bounded_reconfig_crossings, ik_branch, \
     involved_robots
 
 ELBOW_IDX, WRIST_IDX, ROLL_IDX = 2, 4, 5      # UR joint order within an arm
@@ -87,7 +88,12 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
   fkC = ry.Config()
   fkC.addConfigurationCopy(robot_ik.C)
   names = list(fkC.getJointNames())
-  home_map = dict(zip(names, robot_ik.exit_configuration))
+  # EXIT is the full-scene IK background and remains the safe base for candidate collision
+  # scoring/emission. HOME is the physical path boundary. Keeping these maps separate is
+  # essential for robots whose HOME and EXIT differ: EXIT must not bias the continuity
+  # optimizer into selecting a keyframe near an internal solver pose.
+  exit_map = dict(zip(names, robot_ik.exit_configuration))
+  trajectory_home_map = dict(zip(names, robot_ik.home))
   name_idx = {n: k for k, n in enumerate(names)}
   arm_joints = {r: [n for n in names if n.startswith(r + "_")] for r in robots}
   arm_idx = {r: [k for k, n in enumerate(names) if n.startswith(r + "_")] for r in robots}
@@ -112,7 +118,7 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
     it, so a table-inclusive min is always negative and carries no information."""
     b = bind_wit.get(step) if step is not None else None
     q = (b.copy() if b is not None
-         else np.array([home_map[n] for n in names], dtype=float))
+         else np.array([exit_map[n] for n in names], dtype=float))
     for n, v in qmap.items():
       q[name_idx[n]] = v
     fkC.setJointState(q)
@@ -203,6 +209,41 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
         norm.append(dict(zip(arm_joints[act[1]], [float(x) for x in w])))
     if norm:
       cand[i] = norm
+
+  # The historical active branch generator was 6R-specific and was invoked only AFTER the
+  # canonical chain had already been chosen, to populate optional GoalSets.  OpenArm therefore
+  # optimized its 7R chain over whatever stochastic candidates happened to fall out of bind,
+  # and assemble/handover endpoints often had exactly one choice.  Feed model-derived
+  # null-space continuations into the SAME clearance-floor DP itself. Plain 6R arms retain
+  # their established candidate path; redundant arms use the generic Jacobian construction.
+  generated_7d = {}
+  for i in sorted(cand):
+    mv = movers[i]
+    if not any(len(arm_joints[r]) > 6 for r in mv):
+      continue
+    maps, fun = robot_ik.branch_witnesses(
+        tuple(plan[i]), states[i], states[i + 1], assembly, bind_wit[i], mv,
+        max_seeds=8, time_budget=4.0, min_dist=float(set_spread))
+    if maps:
+      # Deduplicate against stochastic candidates on exactly the mover coordinates the DP
+      # consumes. The baseline remains first and is never removed.
+      seen = {tuple(round(float(c.get(n, exit_map[n])), 3)
+                    for r in mv for n in arm_joints[r]) for c in cand[i]}
+      fresh = []
+      for c in maps:
+        key = tuple(round(float(c.get(n, exit_map[n])), 3)
+                    for r in mv for n in arm_joints[r])
+        if key not in seen:
+          seen.add(key)
+          cand[i].append(c)
+          fresh.append(c)
+      if fresh:
+        generated_7d[i] = (bind_wit[i].copy(), fresh)
+    if verbose:
+      n_fresh = len(generated_7d[i][1]) if i in generated_7d else 0
+      print(f"[witfloor-7d] step {i} {plan[i][0]}: {fun['seeds']} null-space seeds, "
+            f"{fun['solved']} converged, {fun['gated']} gated, {len(maps)} kept "
+            f"({n_fresh} new)")
   # --witness-draw (draw_seed != None): DIVERSITY over re-draws for the bandit outer loop.
   # The ladder is near-deterministic, so every re-run ships the same chain -- including a
   # chain whose hold homotopy is infeasible to CONNECT (chair-8: the grasp approaches the
@@ -227,7 +268,7 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
   def solve(alpha_v):
     """Viterbi over the whole plan with a per-step clearance FLOOR. Returns (chain, cost) or
     (None, reason) if some step has no candidate clearing its floor."""
-    layers, bp, prev = [], [], [(dict(home_map), 0.0, None, 0)]
+    layers, bp, prev = [], [], [(dict(trajectory_home_map), 0.0, None, 0)]
     for i in steps:
       mv = movers[i]
       scored, gaps = [], []
@@ -282,8 +323,8 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
           e, xb = 0.0, 0
           for r in mv:
             jn = arm_joints[r]
-            qprev = np.array([pmap.get(n, home_map[n]) for n in jn])
-            qc = np.array([cc.get(n, pmap.get(n, home_map[n])) for n in jn])
+            qprev = np.array([pmap.get(n, trajectory_home_map[n]) for n in jn])
+            qc = np.array([cc.get(n, pmap.get(n, trajectory_home_map[n])) for n in jn])
             # NO ROLL REWRITE. This used to re-express qc on the roll representative nearest
             # qprev and WRITE IT BACK into the emitted joints, on the theory that tool roll is a
             # symmetry. It is a symmetry of the two-finger GRASP -- fingers swap, same faces --
@@ -303,7 +344,9 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
             # "sign" = the (elbow, wrist_2) sign label; "motion" = measured reconfiguration,
             # which also catches the shoulder flip the label is blind to (see reconfig_crossings).
             if branch_metric == "motion":
-              nb = reconfig_crossings(qc, qprev, ROLL_IDX, reconfig_thresh)
+              # Use the actual bounded coordinates MP must traverse. Modulo-2pi wrapping can
+              # invent a path through a hardware stop, and UR's roll index is not OpenArm's.
+              nb = bounded_reconfig_crossings(qc, qprev, reconfig_thresh)
             else:
               nb = sum(1 for x, y in zip(ik_branch(qc, ELBOW_IDX, WRIST_IDX),
                                          ik_branch(qprev, ELBOW_IDX, WRIST_IDX)) if x != y)
@@ -319,8 +362,26 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
       layers.append(layer_sel)
       bp.append(layer_bp)
       prev = layer
-    sel = int(np.argmin([c for _, c, _, _ in prev]))
-    cost, crossings = prev[sel][1], prev[sel][3]
+    # The physical trajectory ends at HOME, not EXIT. Add the exact terminal leg before
+    # choosing the Viterbi survivor; otherwise the last witness for each arm is optimized
+    # without regard to the motion the planner must actually execute.
+    terminal = []
+    for pmap, pcost, _pc, pxb in prev:
+      e, xb = 0.0, 0
+      for r in robots:
+        jn = arm_joints[r]
+        qprev = np.array([pmap.get(n, trajectory_home_map[n]) for n in jn])
+        qhome = np.array([trajectory_home_map[n] for n in jn])
+        if branch_metric == "motion":
+          nb = bounded_reconfig_crossings(qhome, qprev, reconfig_thresh)
+        else:
+          nb = sum(1 for x, y in zip(ik_branch(qhome, ELBOW_IDX, WRIST_IDX),
+                                     ik_branch(qprev, ELBOW_IDX, WRIST_IDX)) if x != y)
+        e += branch_weight * nb + float(np.linalg.norm(qhome - qprev))
+        xb += nb
+      terminal.append((pcost + e, pxb + xb))
+    sel = int(np.argmin([c for c, _xb in terminal]))
+    cost, crossings = terminal[sel]
     # BACKTRACK PROPERLY. `chosen[j]` is the candidate dict the winning chain used at steps[j];
     # `layers[j][k]` is the k-th SURVIVING candidate of that layer (post-floor), so the layer
     # lists and the backpointers must be indexed together. Emitting from a separate greedy pass
@@ -355,7 +416,7 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
   # DP selected an improvement. Thus no optimizer outcome can turn a required keyframe null.
   wit = ([None] * len(plan) if baseline_witnesses is None
          else [None if w is None else w.copy() for w in baseline_witnesses])
-  qm = dict(home_map)
+  qm = dict(trajectory_home_map)
   got, _why = solve(best_a)
   cost, chosen, crossings = got if got is not None else (None, [dict(cand[i][0]) for i in steps], -1)
   for j, i in enumerate(steps):
@@ -373,7 +434,7 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
     # is the only safe base; `qm` exists solely to measure branch crossings against the arm's
     # own previous witness.
     b = bind_wit.get(i)
-    w = np.array([home_map[n] for n in names], dtype=float) if b is None else b.copy()
+    w = np.array([exit_map[n] for n in names], dtype=float) if b is None else b.copy()
     for n, v in chosen[j].items():          # EXACTLY the joints this candidate defines
       w[name_idx[n]] = v                    # (not "every mover joint, read from qm" -- qm is
     wit[i] = w                              # seeded from home and would carry a stale value
@@ -419,9 +480,15 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
       # acting arm alone for its canonical tool pose from branch-flip seeds -- everything else
       # frozen at bind's witness -- and its finds join the SAME pool, gates and greedy
       # selection as the harvested candidates.
-      gen_maps, gfun = robot_ik.branch_witnesses(
-          tuple(plan[i]), states[i], states[i + 1], assembly, base_w, mv,
-          max_seeds=12, time_budget=6.0, min_dist=float(set_spread))
+      cached_gen = generated_7d.get(i)
+      if cached_gen is not None and np.allclose(base_w, cached_gen[0], atol=1e-9, rtol=0.0):
+        gen_maps = list(cached_gen[1])
+        gfun = {"seeds": 0, "solved": 0, "gated": 0, "exact": 0,
+                "kept": len(gen_maps)}
+      else:
+        gen_maps, gfun = robot_ik.branch_witnesses(
+            tuple(plan[i]), states[i], states[i + 1], assembly, base_w, mv,
+            max_seeds=12, time_budget=6.0, min_dist=float(set_spread))
       if verbose:
         print(f"[witsets-gen] step {i} {plan[i][0]}: {gfun['seeds']} seeds tried, "
               f"{gfun['solved']} converged, {gfun['gated']} gated, "

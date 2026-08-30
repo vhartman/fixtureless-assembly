@@ -130,6 +130,9 @@ def build_scene(cfg):
   set_sampled_grasps({"seed": int(_saved(cfg, "grasp_sampler_seed")),
                       "candidates": int(_saved(cfg, "grasp_sampler_candidates")),
                       "keep": int(_saved(cfg, "grasp_sampler_keep")),
+                      "master_keep": (int(_saved(cfg, "grasp_widen_max"))
+                                      if _saved(cfg, "grasp_local_widen", legacy=False)
+                                      else int(_saved(cfg, "grasp_sampler_keep"))),
                       # Missing means the replacement V1 database used by every historical
                       # sampled plan. Never rebuild an old positional grasp id as hybrid V2.
                       "version": int(_saved(cfg, "grasp_sampler_version", legacy=1)),

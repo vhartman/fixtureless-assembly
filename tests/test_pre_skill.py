@@ -366,6 +366,24 @@ def test_accepted_pre_pin_does_not_turn_an_idle_arm_into_a_task_participant():
   assert tasks[2].robots == ["a2"]                         # unrelated split unchanged
 
 
+def test_transition_hint_never_turns_idle_exit_pins_into_path_coordinates():
+  """The full IK certificate uses EXIT for idle arms, but the physical hint must not."""
+  class _Problem:
+    robot_idx = {"a1": list(range(6)), "a2": list(range(6, 12))}
+
+  class _Mode:
+    entry_configuration = np.concatenate([np.full(6, 1.0), np.full(6, 2.0)])
+
+  class _Task:
+    robots = ["a1"]
+
+  # a2=-9 represents the collision-safe EXIT background in the IK certificate.
+  certificate = np.concatenate([np.full(6, 3.0), np.full(6, -9.0)])
+  merged = MP._active_slice_transition_hint(_Problem(), _Mode(), _Task(), certificate)
+  assert merged[:6] == pytest.approx(np.full(6, 3.0))
+  assert merged[6:] == pytest.approx(np.full(6, 2.0))
+
+
 def test_build_tasks_without_the_argument_keeps_solving_them_itself():
   """Flag OFF is the historical path, untouched."""
   (_t, seq, _s), rik = _tasks(None)

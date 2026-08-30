@@ -3970,9 +3970,21 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
               ramp_min=RAMP_MIN, dwell=dwell, event_durations=_event_budget)
           _bad_phase = _phase_audit(traj)
           if _bad_phase is not None:
+            # Distinguish a genuinely invalid synchronized sample from mutable collision-
+            # scene/cache contamination after the coordination search has queried modes in
+            # a non-monotone order.  The saved-path preflight above walks the same geometry
+            # monotonically, so without this retry both failure classes looked identical.
+            _bi_bad, _mode_bad, _pairs_bad = _bad_phase
+            _retry_bad = None
+            if hasattr(problem, "prev_mode"):
+              problem.prev_mode = None
+              _retry_verdict = _strict_collide(traj.q[_bi_bad], _mode_bad)
+              _retry_bad = (_retry_verdict is not False,
+                            list(getattr(_strict_collide, "last_pairs", [])[:5]))
             raise RuntimeError(
                 f"[sim/mp] synchronized fallback failed its exact audit at sample "
-                f"{_bad_phase[0]}, mode {_bad_phase[1]}: {_bad_phase[2]}")
+                f"{_bad_phase[0]}, mode {_bad_phase[1]}: {_bad_phase[2]}; "
+                f"fresh-mode retry={_retry_bad}")
         print(f"[sim/mp] --phase-schedule exact final audit: "
               f"{_phase_audit.last['samples']}/{len(traj.q)} trajectory samples at "
               f"<={phase_audit_resolution:g}rad joint-path variation + "
@@ -4984,7 +4996,7 @@ _STANDARD_SIM_PROFILE = {
     "phase_batch": True,
     "phase_batch_min_motion": 0.08,
     "phase_batch_max_gap": 0.35,
-    "phase_audit_resolution": 0.01,
+    "phase_audit_resolution": 0.002,
     # Runtime convergence/contact guards. The normalized wrench guard is intentionally
     # profile-owned: its historical global default is off for old artifact reproduction.
     "settle_tol": 0.002,
@@ -5002,7 +5014,7 @@ _STANDARD_SIM_PROFILE = {
     # Fail closed on a saved diagonal that violates the MP geometry or joint limits.
     "path_preflight": True,
     "path_preflight_tolerance": PATH_PREFLIGHT_TOL,
-    "path_preflight_resolution": 0.01,
+    "path_preflight_resolution": 0.002,
     # Robot-independent visual/physics baseline. FR3 currently overrides these explicitly.
     "joint_rate": 1.0,
     "mass_scale": 1.0,

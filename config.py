@@ -45,6 +45,7 @@ class RunConfig:
   part_float: float = 0.002
   random_init: Optional[float] = None
   scatter_spacing: float = 1.0 / 7.0
+  center_scatter: bool = False
   grid_init: Optional[int] = None
   grid_gap: float = 0.1
   min_sep: Optional[float] = None
@@ -162,6 +163,11 @@ class RunConfig:
   grasp_sampler_version: int = 2
   grasp_sampler_db_hash: Optional[str] = None
   grasp_refine: bool = False
+  grasp_widen: bool = False
+  grasp_widen_batch: int = 8
+  grasp_widen_max: int = 96
+  grasp_local_widen: bool = False
+  grasp_local_caps: Optional[dict] = None
   grasp_sampler_margin: float = 0.008
   grasp_sampler_pad_support: float = 0.75
   grasp_sampler_wrap: Optional[float] = None

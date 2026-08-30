@@ -321,7 +321,7 @@ class Assembly:
 
 def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, max_tries=200,
                          spacing=1.0 / 7.0, per_row=8, random_init=None, float_height=0.015,
-                         min_sep=None, grid=None, grid_gap=0.1):
+                         min_sep=None, grid=None, grid_gap=0.1, center_scatter=False):
   # scatter the assembly's parts on the table as loose cubes (test scene). Geometry
   # (cube_size / cube_radius) comes from the assembly, not a global. `spacing` = the x-pitch
   # of the scatter line (default = historical 1/7 m ~ 0.143); a knob for analysing how much
@@ -366,8 +366,21 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
           # reach. Default 1/7m spacing still yields eight columns and stays byte-identical.
           pitch = max(float(spacing), 1e-9)
           reachable_cols = int(np.floor(1.0 / pitch + 1e-9)) + 1
-          row, col = divmod(i, max(1, min(int(per_row), reachable_cols)))
-          pos = np.array([-0.5 + col * spacing, row * spacing, z])
+          max_cols = max(1, min(int(per_row), reachable_cols))
+          # A centred standard scatter is a compact deterministic lattice, not a 1xN line:
+          # with fixed pitch the latter's workspace span grows linearly in part count and put
+          # opposite car-mini wheels outside a short arm's reach. Roughly square rows preserve
+          # the declared density while making spatial extent grow as sqrt(N).
+          cols = (min(max_cols, max(1, int(np.ceil(np.sqrt(len(assembly.objects))))))
+                  if center_scatter else max_cols)
+          row, col = divmod(i, cols)
+          if center_scatter:
+              rows = -(-len(assembly.objects) // cols)
+              n_this_row = min(cols, len(assembly.objects) - row * cols)
+              pos = np.array([(col - (n_this_row - 1) / 2.0) * spacing,
+                              (row - (rows - 1) / 2.0) * spacing, z])
+          else:
+              pos = np.array([-0.5 + col * spacing, row * spacing, z])
           if random_init is None:
               pos = pos + np.asarray(assembly.scatter_offsets.get(name, np.zeros(3)),
                                      dtype=float)
@@ -1986,6 +1999,10 @@ def set_sampled_grasps(mode):
       "seed": int(mode.get("seed", 0)),
       "candidates": max(8, int(mode.get("candidates", 200))),
       "keep": max(2, int(mode.get("keep", 12))),
+      # V2/V3 may construct a larger immutable MASTER while a search exposes only a
+      # prefix.  Ordinary callers omit this and retain the historical keep-sized DB.
+      "master_keep": max(2, int(mode.get("keep", 12)),
+                         int(mode.get("master_keep", mode.get("keep", 12)))),
       "margin": float(mode.get("margin", 0.008)),
       "pad_support": float(mode.get("pad_support", 0.75)),
       "wrap": (None if mode.get("wrap") is None else float(mode.get("wrap")))}
@@ -2005,7 +2022,7 @@ def set_sampled_canonical_only(on=False):
   _SAMPLED_CANONICAL_ONLY = bool(on)
 
 
-def install_sampled_scene_ctx(C, assembly, robots=None):
+def install_sampled_scene_ctx(C, assembly, robots=None, robot_ik=None):
   """--grasp-sampler-scenes: give the sampled DB the two SCENE views it filters candidates
   against -- the INITIAL scene (can this grasp pick the part where it lies?) and the FULLY
   ASSEMBLED scene (can this grasp stand at the part's seated pose?) -- using the search's
@@ -2031,10 +2048,33 @@ def install_sampled_scene_ctx(C, assembly, robots=None):
   poses_asm = tuple(sorted((p, tuple(np.round(np.asarray(
       _state_part_poses(s_full, assembly, lift=0.0)[p], dtype=float), 4)))
                             for p in assembly.objects))
-  sig = ("scenes", poses_pick, poses_asm)
+  # V3 may use exact fixed-arm reach as a SOFT ranking certificate.  Include the physical
+  # embodiment in the context signature: two scenes with identical part poses but different
+  # arm bases/limits must never share an id-bearing candidate ordering in one process.
+  reach_sig = ()
+  if robot_ik is not None:
+    reach_rows = []
+    names = list(robot_ik.C.getJointNames())
+    try:
+      lo, hi = (np.asarray(x, dtype=float).ravel() for x in robot_ik.C.getJointLimits())
+    except Exception:
+      lo = hi = np.zeros(0)
+    for r in robots:
+      idx = [i for i, n in enumerate(names) if n.startswith(r + "_")]
+      base = robot_ik.base_link.get(r)
+      bp = () if base is None else tuple(np.round(
+          np.asarray(robot_ik.C.getFrame(base).getPose(), dtype=float), 6))
+      lim = tuple((round(float(lo[i]), 6), round(float(hi[i]), 6))
+                  for i in idx if i < len(lo))
+      reach_rows.append((r, robot_ik.robot_arm.get(r), robot_ik.tool_kind.get(r), bp, lim))
+    reach_sig = tuple(reach_rows)
+  sig = ("scenes", poses_pick, poses_asm, reach_sig)
   _SAMPLED_SCENE_CTX = {"checker": checker, "kind_robot": kind_robot,
                         "s0": s0, "s_full": s_full,
-                        "assembly": assembly, "sig": sig}
+                        "assembly": assembly, "sig": sig,
+                        "robots": tuple(robots), "robot_ik": robot_ik,
+                        "ik_scene": (None if robot_ik is None else
+                                     robot_ik.scene_for(s0, assembly))}
   _SAMPLED_VIEWS_CACHE.clear()
   _SAMPLED_META_CACHE.clear()
 
@@ -2043,6 +2083,27 @@ def clear_sampled_scene_ctx():
   """Drop the scene-filter context (a new scene is about to be built in this process)."""
   global _SAMPLED_SCENE_CTX
   _SAMPLED_SCENE_CTX = None
+  _SAMPLED_VIEWS_CACHE.clear()
+  _SAMPLED_META_CACHE.clear()
+
+
+def set_sampled_grasp_keep(keep):
+  """Monotonically resize the active V2/V3 sampled database without changing its source.
+
+  V2/V3 raw clouds and master rankings are independent of ``keep``.  Increasing it therefore
+  appends grasp ids; decreasing it restores an earlier prefix.  This is the only mutation the
+  failure-driven search widening path needs, and deliberately retains the installed scene/IK
+  context so the new prefix is ranked under exactly the same physical problem.
+  """
+  if _SAMPLED_GRASPS is None:
+    raise ValueError("sampled grasp database is disabled")
+  if int(_SAMPLED_GRASPS.get("version", 1)) < 2:
+    raise ValueError("grasp widening requires sampler V2 or newer")
+  _SAMPLED_GRASPS["keep"] = max(2, int(keep))
+  # This API is the legacy/global widening operation: it physically grows the evaluated
+  # DB.  Fill-local widening never calls it; that path constructs master_keep once and
+  # gates stable ids inside the concrete fill.
+  _SAMPLED_GRASPS["master_keep"] = _SAMPLED_GRASPS["keep"]
   _SAMPLED_VIEWS_CACHE.clear()
   _SAMPLED_META_CACHE.clear()
 
@@ -2504,6 +2565,75 @@ def _closure_ranked_canonical(entries):
   return out
 
 
+def _task_coverage_order(entries):
+  """Deterministic V3 master order by balanced task-certificate coverage.
+
+  Every candidate carries a set of discrete, equally weighted TASK facts: gripper-kind
+  PICK/ASSEMBLE clearance, a conjunctive PICK+ASSEMBLE bridge certificate, press-transmitting
+  mate feasibility, and exact initial-pick reach for each calibrated fixed arm. Selection
+  repeatedly serves the
+  least-covered facts; among candidates that do so it maximizes the number of such facts and
+  then the distance to the already selected contact poses.  This is a max-min coverage rule,
+  not a fitted score with assembly-specific weights.  Once all facts have equal coverage it
+  naturally starts another coverage round.
+
+  Exact reach is deliberately only a fact.  Candidates with no SSIK branch remain in the
+  family/scene pools and can still be selected or reached by tolerant KOMO.  The returned
+  order is independent of the requested K, so larger prefixes append stable grasp ids.
+  """
+  if not entries:
+    return []
+
+  def facts(entry):
+    _row, meta = entry
+    fs = set()
+    scenes = meta.get("scene_by_kind") or {}
+    for kind, roles in scenes.items():
+      roles = tuple(roles)
+      for role in roles:
+        fs.add(("scene", str(kind), str(role)))
+      if "pick" in roles and "assemble" in roles:
+        fs.add(("bridge", str(kind)))
+    for robot, n in (meta.get("reach_by_robot") or {}).items():
+      if int(n) > 0:
+        fs.add(("reach", str(robot)))
+    for kind, ok in (meta.get("press_by_kind") or {}).items():
+      if ok:
+        fs.add(("press", str(kind)))
+        if "assemble" in scenes.get(kind, ()):
+          fs.add(("mate-press", str(kind)))
+    return frozenset(fs)
+
+  def feat(entry):
+    pose = np.asarray(entry[0][0], dtype=float)
+    R = _quat_to_R(pose[3:])
+    return np.concatenate([pose[:3], 0.02 * R[:, 0], 0.02 * R[:, 1], 0.02 * R[:, 2]])
+
+  rows = list(entries)
+  F = np.asarray([feat(e) for e in rows], dtype=float)
+  factsets = [facts(e) for e in rows]
+  universe = sorted(set().union(*factsets), key=repr)
+  counts = {f: 0 for f in universe}
+  left = set(range(len(rows)))
+  chosen = []
+  min_dist = np.full(len(rows), np.inf)
+  while left:
+    least = min((counts[f] for i in left for f in factsets[i]), default=0)
+    scores = []
+    for i in sorted(left):
+      nleast = sum(counts[f] == least for f in factsets[i])
+      # Rounded distance plus negative source index gives a deterministic total order.
+      d = float(min_dist[i]) if chosen else 0.0
+      scores.append((nleast, round(d, 12), -i, i))
+    i = max(scores)[-1]
+    chosen.append(i); left.remove(i)
+    for f in factsets[i]:
+      counts[f] += 1
+    dnew = np.linalg.norm(F - F[i], axis=1)
+    min_dist = np.minimum(min_dist, dnew)
+  return [rows[i] for i in chosen]
+
+
 def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
   """Select the bounded V2 DB and return ``[(row, metadata), ...]``.
 
@@ -2524,7 +2654,48 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
   checker = None if ctx is None else ctx["checker"]
   kind_robot = {} if ctx is None else ctx["kind_robot"]
   asm = None if ctx is None else ctx["assembly"]
+  task_ik = None if ctx is None else ctx.get("robot_ik")
+  task_ik_scene = None if ctx is None else ctx.get("ik_scene")
   seal = float(wrench.PARAMS.get("vacuum_seal_diameter", 0.0))
+
+  # Hoist the candidate-independent half of the inserted-part press certificate. This is
+  # exactly the solo held-part LP used by compute_useful_grasps/_sig_press_ok, except that the
+  # candidate still has an explicit pose rather than a final grasp id. It is therefore safe to
+  # use while constructing the id-bearing V3 order and prevents geometrically attractive but
+  # load-incapable grasps from consuming the whole bounded prefix.
+  press_ctx = None
+  if (int(_SAMPLED_GRASPS.get("version", 1)) >= 3
+      and asm is not None and asm.relative_pose(part) is not None):
+    parent, place, supports = {}, {}, {}
+    for p in asm.objects:
+      parent[p] = ("table",)
+      supports[p] = frozenset({("table",)})
+      place[p] = ("slot", _part_index(p), _IDENTITY_FACE)
+    parent[part] = ("gripper", "zzq")
+    place.pop(part, None)
+    supports[part] = frozenset()
+    pst = State(parent=parent, place=place, supports=supports,
+                poses=dict(_flat_poses(asm)))
+    pposes = _state_part_poses(pst, asm, lift=0.0)
+    centroid = np.asarray(pposes[part][:3], dtype=float)
+    loads = _inserter_load_variants(
+        pst, asm, part, asm.relative_pose(part)[0])
+    gravity = wrench.gravity_wrench([(asm.mass(part), np.zeros(3))])
+    press_ctx = (np.asarray(pposes[part], dtype=float), centroid, loads, gravity)
+
+  def pose_press_ok(row, kind):
+    if press_ctx is None:
+      return True
+    ppose, centroid, loads, gravity = press_ctx
+    gpose = _pose_compose(ppose, part_pose(row))
+    R = _quat_to_R(np.asarray(gpose[3:], dtype=float))
+    cap = wrench.grasp_capability(
+        np.asarray(gpose[:3], dtype=float) - centroid,
+        R[:, 2], R[:, 0], R[:, 1], kind, surface=row[1])
+    return all(wrench.equilibrium_feasible(
+        [cap], gravity + wrench.point_force_wrench(
+            force, np.asarray(point, dtype=float) - centroid))
+               for force, point in loads)
 
   # Physical generation policy, not a collision relaxation. A candidate already places the
   # pads at a valid antipodal contact; translating the hand OUTWARD along its approach slides
@@ -2614,8 +2785,31 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
             close_hits.append(role)
       roles[kind] = tuple(hits)
       closure_roles[kind] = tuple(close_hits)
+    reach = {}
+    # Exact fixed-arm reach is an inexpensive TASK-CONDITIONING signal for initial picks.
+    # It is never a deletion gate: exactless candidates remain in the scene/family coverage
+    # facts because tolerant KOMO has measured successes beyond the calibrated SSIK set.
+    if task_ik is not None and task_ik_scene is not None:
+      pose = part_pose(row)
+      for robot in ctx.get("robots", ()):
+        kind = task_ik.tool_kind.get(robot)
+        if "pick" not in roles.get(kind, ()) or not task_ik._analytic_reject_ok(robot):
+          reach[robot] = 0
+          continue
+        target = np.concatenate([
+            pose[:3], _quat_mul(pose[3:], task_ik.q_correction[robot])])
+        reach[robot] = len(task_ik._analytic_seeds(
+            task_ik_scene, robot, target, part))
+    press = {}
+    if int(_SAMPLED_GRASPS.get("version", 1)) >= 3:
+      for kind in sorted(kind_robot):
+        kind_ok = not (kind == "vacuum" and
+                       (row[6] == "pinch" or row[1] == "curved" or row[2] < seal))
+        press[kind] = bool(kind_ok and pose_press_ok(row, kind))
     meta = {"origin": origin, "scene_by_kind": roles,
             "closure_by_kind": closure_roles,
+            "reach_by_robot": reach,
+            "press_by_kind": press,
             "sets": tuple(sorted({x for xs in roles.values() for x in xs}))}
     if refinement is not None:
       tag, delta, source = refinement
@@ -2654,7 +2848,8 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
   if checker is not None and checker.closure_check:
     canonical = _closure_ranked_canonical(canonical)
   closure_select = bool(checker is not None and checker.closure_check)
-  if len(canonical) >= keep and not closure_select:
+  if (int(_SAMPLED_GRASPS.get("version", 1)) < 3
+      and len(canonical) >= keep and not closure_select):
     return canonical[:keep]
 
   # A strict repaired pose is useless if the immutable source prefix still consumes the whole
@@ -2710,6 +2905,18 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
   good_ids = {id(e[0]) for e in good}
   bad = sorted((e for e in sampled if id(e[0]) not in good_ids),
                key=lambda e: (-e[0][5], -e[0][4], tuple(np.round(e[0][0], 9))))
+
+  # V3 treats conventional and sampled rows as one task-conditioned master pool.  V2 keeps
+  # the historical immutable canonical prefix below for old plans.  Bad-support rows remain
+  # available only after physically supported rows, preserving the existing fallback without
+  # letting a geometric outlier win merely because it covers a rare task label.
+  if int(_SAMPLED_GRASPS.get("version", 1)) >= 3:
+    ranked = _task_coverage_order(list(canonical) + list(good))
+    ranked.extend(e for e in _task_coverage_order(bad)
+                  if all(id(e[0]) != id(old[0]) for old in ranked))
+    if not ranked:
+      ranked = _task_coverage_order(list(canonical) + list(sampled))
+    return ranked[:keep]
 
   def ordered(entries):
     by_id = {id(e[0]): e for e in entries}
@@ -2778,7 +2985,7 @@ def _sampled_keys(spec, offset, part=None):
             float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)),
             cfgv.get("wrap"))
   ctx = _SAMPLED_SCENE_CTX
-  cache = base + (() if version == 1 else (cfgv["keep"],))
+  cache = base + (() if version == 1 else (cfgv.get("master_keep", cfgv["keep"]),))
   return base, cache + (part, (ctx["sig"] if ctx is not None else None))
 
 
@@ -2910,7 +3117,10 @@ def _sampled_grasp_views(spec, offset, part=None):
                       min(float(clr[k]), float(_edge_clearance(mesh, p2)[0])),
                       _sup, "pinch", zi >= 2))             # zi >= 2: the wrap-roll pair
 
-  keep = cfgv["keep"]
+  # The positional list is the finite MASTER. Concrete local fills may expose a smaller
+  # per-part prefix without regenerating this list, so ids and all cached IK witnesses stay
+  # valid across widening epochs.
+  keep = cfgv.get("master_keep", cfgv["keep"])
   if int(cfgv.get("version", 1)) >= 2:
     selected = _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, sq)
     if not selected:

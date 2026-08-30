@@ -38,25 +38,36 @@ openarm_ee_coll2 (ur_ee_link): {
 # Open-pose finger sweep used by the real model.  The two parallel capsules approximate
 # each finger's 55mm width; their parent offsets are folded into these flange-relative poses.
 openarm_finger1_coll (ur_ee_link): {
-  shape: capsule, size: [.08 .015], Q: "t(-.0114 .058 -.118)",
+  shape: capsule, size: [.06 .015], Q: "t(-.01043 .058 -.1205)",
   color: [1 1 1 .5], contact: -1
 }
 openarm_finger1_coll2 (ur_ee_link): {
-  shape: capsule, size: [.08 .015], Q: "t(.0086 .058 -.118)",
+  shape: capsule, size: [.06 .015], Q: "t(.00857 .058 -.1205)",
   color: [1 1 1 .5], contact: -1
 }
 openarm_finger2_coll (ur_ee_link): {
-  shape: capsule, size: [.08 .015], Q: "t(-.0114 -.058 -.118)",
+  shape: capsule, size: [.06 .015], Q: "t(-.01043 -.058 -.1205)",
   color: [1 1 1 .5], contact: -1
 }
 openarm_finger2_coll2 (ur_ee_link): {
-  shape: capsule, size: [.08 .015], Q: "t(.0086 -.058 -.118)",
+  shape: capsule, size: [.06 .015], Q: "t(.00857 -.058 -.1205)",
   color: [1 1 1 .5], contact: -1
 }
 
 gripper_center (ur_ee_link): {
-  shape: marker, size: [.03], Q: "t(-.0014 0 -.155) d(180 1 0 0)", color: [.9 .9 .9]
+  shape: marker, size: [.03], Q: "t(-.0014 0 -.14) d(180 1 0 0)", color: [.9 .9 .9]
 }
 ur_gripper_center (gripper_center): {
   shape: sphere, size: [.004], contact: 0
 }
+
+openarm_right_ee_base_link_0 (ur_ee_link): { rel: "d(-90 1 0 0) t(0.0205 0.0 0.0) E(0.0 -0.0 0.0)", mesh: <meshes/ee/visual/ee_base_link.dae>, color: [0.752941176470588 0.752941176470588 0.752941176470588 1], visual: true }
+openarm_right_ee_link1: { mass: 0.125979047366671, inertia: [3.61105363396623e-05 1.35880208293387e-06 7.13916341634141e-06 3.62137424319396e-05 -3.60343788693423e-06 1.74958961632907e-05],}
+openarm_right_ee_link1_0 (openarm_right_ee_link1): { rel: "d(-90 1 0 0)", mesh: <meshes/ee/visual/finger_inner.dae>, color: [0.752941176470588 0.752941176470588 0.752941176470588 1], visual: true }
+openarm_right_ee_link2: { mass: 0.11372, inertia: [3.4565e-05 -1.3392e-06 7.1576e-06 3.5306e-05 3.7172e-06 1.6571e-05],}
+openarm_right_ee_link2_0 (openarm_right_ee_link2): { rel: "d(-90 1 0 0)", mesh: <meshes/ee/visual/finger_outer.dae>, color: [0.752941176470588 0.752941176470588 0.752941176470588 1], visual: true }
+
+openarm_right_finger_joint1_origin (ur_ee_link): { Q: "t(-0.0014300000000005003 0.0180000000000009 -0.0680000000000174) E(0.0 -0.0 0.0)" }
+openarm_right_finger_joint1 (openarm_right_finger_joint1_origin openarm_right_ee_link1): { joint: rigid, q: 0.5 }
+openarm_right_finger_joint2_origin (ur_ee_link): { Q: "t(-0.0014300000000005003 -0.0180000000000012 -0.0680000000000215) E(0.0 -0.0 0.0)" }
+openarm_right_finger_joint2 (openarm_right_finger_joint2_origin openarm_right_ee_link2): { joint: rigid, q: -0.5 }

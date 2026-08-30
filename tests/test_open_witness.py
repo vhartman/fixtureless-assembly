@@ -1,4 +1,5 @@
 from open_witness import OpenWitnessPool, run_open_lazy_fill
+import solver as solver_mod
 from solver import RobotIK, _IncrementalLazySearch
 
 
@@ -158,6 +159,27 @@ def test_node_budget_epochs_geometrically_widen_discrete_search():
   assert budgets == [10, 20]
   assert report.budget_hits == 1
   assert report.max_node_budget == 20
+
+
+def test_milestone_anytime_uses_deadline_fair_open_witness_and_restores_cap(monkeypatch):
+  class RIK:
+    open_witness = True
+    open_witness_epochs = 2
+
+  rik = RIK()
+  seen = {}
+
+  def fake_milestones(*_args, **kwargs):
+    seen["epochs"] = rik.open_witness_epochs
+    seen["deadline"] = kwargs.get("deadline")
+    return [("release", "a1", "obj")]
+
+  monkeypatch.setattr(solver_mod, "solve_assembly_problem_milestones", fake_milestones)
+  out = solver_mod.solve_assembly_problem_milestones_anytime(
+      object(), object(), robots=("a1",), time_budget=1.0, verbose=False, robot_ik=rik)
+  assert out == [("release", "a1", "obj")]
+  assert seen["epochs"] == 0 and seen["deadline"] is not None
+  assert rik.open_witness_epochs == 2
 
 
 def test_open_scheduler_replans_immediately_after_first_failed_plan_edge():

@@ -33,11 +33,11 @@ openarm_left_joint4 (openarm_left_joint4_origin openarm_left_link4): { joint: hi
 openarm_left_joint5_origin (openarm_left_link4): { Q: [0 0 -0.0955000000000005] }
 openarm_left_joint5 (openarm_left_joint5_origin openarm_left_link5): { joint: hingeZ, limits: [-1.5708 1.5708], ctrl_limits: [20.944 -1 7],}
 openarm_left_joint6_origin (openarm_left_link5): { Q: [0 0 -0.120499999999998] }
-# Planning-model workaround: the calibrated wrist limits (j6 +/-0.7854, j7 +/-1.5708)
-# leave car-mini assembly endpoints on a zero-width boundary. Keep the final two wrist axes
-# relaxed until the physical OpenArm workspace/calibration is validated end-to-end.
-openarm_left_joint6 (openarm_left_joint6_origin openarm_left_link6): { joint: hingeY, limits: [-3.1416 3.1416], ctrl_limits: [20.944 -1 7],}
-openarm_left_joint7 (openarm_left_link6 openarm_left_ee_base_link): { joint: hingeX, limits: [-3.1416 3.1416], ctrl_limits: [20.944 -1 7],}
+# The calibrated limits (j6 +/-0.7854, j7 +/-1.5708) lose all SSIK branches for some
+# demonstrated Car Mini tool poses. Fresh search + optimized MP succeeds at +/-1.8 for both;
+# j7 keeps another 0.05rad because that stricter validation path touched its lower bound.
+openarm_left_joint6 (openarm_left_joint6_origin openarm_left_link6): { joint: hingeY, limits: [-1.8 1.8], ctrl_limits: [20.944 -1 7],}
+openarm_left_joint7 (openarm_left_link6 openarm_left_ee_base_link): { joint: hingeX, limits: [-1.85 1.85], ctrl_limits: [20.944 -1 7],}
 openarm_left_finger_joint1_origin (openarm_left_ee_base_link): { Q: "t(-0.0014300000000005003 -0.0180000000000009 -0.0680000000000174) E(0.0 -0.0 0.0)" }
 openarm_left_finger_joint1 (openarm_left_finger_joint1_origin openarm_left_ee_link1): { joint: rigid, q: -0.5 }
 openarm_left_finger_joint2_origin (openarm_left_ee_base_link): { Q: "t(-0.0014300000000005003 0.0180000000000012 -0.0680000000000215) E(0.0 -0.0 0.0)" }
@@ -54,11 +54,11 @@ left_joint5_coll (openarm_left_joint5): { shape: capsule, color: [1.,1.,1.,.5], 
 left_ee_coll (openarm_left_ee_base_link): { shape: capsule, color: [1.,1.,1.,.5], size: [.02, .04], Q: "t(.005 0. -.03) d(0 1 0 0)", contact: -2 }
 left_ee_coll1 (openarm_left_ee_base_link): { shape: capsule, color: [1.,1.,1.,.5], size: [.06, .03], Q: "t(-.005 0 -.075) d(90 1 0 0)", contact: -2 }
 left_ee_coll2 (openarm_left_ee_base_link): { shape: capsule, color: [1.,1.,1.,.5], size: [.06, .03], Q: "t(.02 0 -.075) d(90 1 0 0)", contact: -2 }
-left_finger1_coll (openarm_left_finger_joint1_origin): { shape: capsule, color: [1.,1.,1.,.5], size: [.08, .015], Q: "t(-0.01 -0.04 -.05)", contact: -2 }
-left_finger1_coll2 (openarm_left_finger_joint1_origin): { shape: capsule, color: [1.,1.,1.,.5], size: [.08, .015], Q: "t(0.01 -0.04 -.05)", contact: -2 }
-left_finger2_coll1 (openarm_left_finger_joint2_origin): { shape: capsule, color: [1.,1.,1.,.5], size: [.08, .015], Q: "t(-0.01 0.04 -.05)", contact: -2 }
-left_finger2_coll2 (openarm_left_finger_joint2_origin): { shape: capsule, color: [1.,1.,1.,.5], size: [.08, .015], Q: "t(0.01 0.04 -.05)", contact: -2 }
-gripper_center (openarm_left_ee_base_link): { shape: marker, size: [.03], color: [.9,.9,.9], Q: "t(-.0014 0 -.155) d(180 1 0 0)" }
+left_finger1_coll (openarm_left_finger_joint1_origin): { shape: capsule, color: [1.,1.,1.,.5], size: [.06, .015], Q: "t(-0.009 -0.04 -.0525)", contact: -2 }
+left_finger1_coll2 (openarm_left_finger_joint1_origin): { shape: capsule, color: [1.,1.,1.,.5], size: [.06, .015], Q: "t(0.01 -0.04 -.0525)", contact: -2 }
+left_finger2_coll1 (openarm_left_finger_joint2_origin): { shape: capsule, color: [1.,1.,1.,.5], size: [.06, .015], Q: "t(-0.009 0.04 -.0525)", contact: -2 }
+left_finger2_coll2 (openarm_left_finger_joint2_origin): { shape: capsule, color: [1.,1.,1.,.5], size: [.06, .015], Q: "t(0.01 0.04 -.0525)", contact: -2 }
+gripper_center (openarm_left_ee_base_link): { shape: marker, size: [.03], color: [.9,.9,.9], Q: "t(-.0014 0 -.14) d(180 1 0 0)" }
 
 Edit openarm_left_joint1: { q: -0.0 }
 Edit openarm_left_joint2: { q: 0.2 }

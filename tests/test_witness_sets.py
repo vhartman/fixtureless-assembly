@@ -173,3 +173,29 @@ def test_branch_seeds_bad_shapes_are_refused():
   S = _solver_mod()
   assert S.branch_seeds(np.zeros(5), UR10_LO, UR10_HI) == ([], [])
   assert S.branch_seeds(np.zeros(6), UR10_LO[:5], UR10_HI) == ([], [])
+
+
+def test_redundancy_seeds_follow_nullspace_and_respect_limits():
+  S = _solver_mod()
+  q = np.zeros(7)
+  lo, hi = np.full(7, -1.0), np.full(7, 1.0)
+  # Six independent task rows leave exactly joint 7 as the local self-motion direction.
+  J = np.c_[np.eye(6), np.zeros(6)]
+  seeds = S.redundancy_seeds(q, lo, hi, J, max_seeds=6)
+  again = S.redundancy_seeds(q, lo, hi, J, max_seeds=6)
+  assert len(seeds) == 6
+  assert all(np.array_equal(a, b) for a, b in zip(seeds, again))
+  assert all(np.all(x >= lo) and np.all(x <= hi) for x in seeds)
+  assert all(np.allclose(x[:6], 0.0) and abs(x[6]) > 0.0 for x in seeds)
+  # A full-rank 6R pose task has no redundant continuation direction.
+  assert S.redundancy_seeds(np.zeros(6), np.full(6, -1), np.full(6, 1),
+                            np.eye(6)) == []
+
+
+def test_bounded_motion_crossing_does_not_invent_a_two_pi_wrap():
+  S = _solver_mod()
+  # These bounded configurations are 4rad apart. The legacy branch-label metric reduces that
+  # modulo 2*pi; the motion-quality metric must count what the planner physically traverses.
+  a, b = np.array([-3.47]), np.array([0.54])
+  assert S.reconfig_crossings(a, b, thresh=3.0) == 0
+  assert S.bounded_reconfig_crossings(a, b, thresh=3.0) == 1

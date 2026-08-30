@@ -111,7 +111,9 @@ def test_car_mini_mocap_corridor_executes_cleanly_and_verifies(capsys):
 def test_a_legacy_path_without_final_export_is_refused(capsys):
   """A bare-list path has neither exact tasks nor final keyframes. Replay must not improvise
   replacements by re-solving IK; regeneration is safer than a plausible-looking wrong run."""
-  out = _run(capsys, CAR)
+  with pytest.raises(SystemExit) as exc:
+    _run(capsys, CAR)
+  out = capsys.readouterr().out + str(exc.value)
   assert "has no final post-fusion export block" in out
   assert "Refusing to re-solve IK" in out
   assert "actions ok" not in out, "legacy path executed despite lacking its exact export"

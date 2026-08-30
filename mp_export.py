@@ -1377,13 +1377,12 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
       else:
         self.sequence = self._make_sequence_from_names(seq)   # flat order (incl. terminal)
       self.sequence_names = list(seq)
-      # FULL PRE-KEYFRAME HINTS, NOT GOAL CONSTRAINTS. The pre-skill consistency solve pins
-      # idle arms only to prove one safe full configuration. Exporting those pins as task
-      # participants made a two-arm assemble rendezvous a four-arm synchronization task
-      # (OpenArm car-mini task 22) and created a joint-limit bottleneck. BiRRT may use this full
-      # vector once when seeding the transition; if it is invalid in the accumulated mode it
-      # simply falls back to ordinary sampling, while the task itself still names only the
-      # robots physically involved.
+      # PRE-KEYFRAME HINTS, NOT GOAL CONSTRAINTS. The pre-skill consistency solve pins idle
+      # arms at EXIT only to prove one safe IK scene. Exporting those pins as task participants
+      # made a two-arm assemble rendezvous a four-arm synchronization task (OpenArm car-mini
+      # task 22). The transition sampler below therefore copies ONLY the task-robot slices from
+      # this certificate onto the mode's entry configuration. Idle EXIT pins neither constrain
+      # the task nor become waypoints in the physical path.
       _pre_src = resolved_pre_witnesses if resolved_pre_witnesses is not None else pre_witnesses
       self.transition_hints = {}
       for _i, _nms in enumerate(step_names):
@@ -1465,6 +1464,23 @@ def _init_compact_bidir_tree(tree, env):
   tree.batch_subtree_b = np.empty((tree.initial_capacity, robot_dims), dtype=np.float64)
   tree.node_ids_subtree_b = np.empty(tree.initial_capacity, dtype=np.int64)
   tree.connected = False
+
+
+def _active_slice_transition_hint(problem, mode, task, full_hint):
+  """Merge a full-scene IK certificate into a physical transition sample.
+
+  Only robots constrained by ``task`` come from the certificate.  Inactive robot coordinates
+  come from this mode's entry, because their EXIT values were merely the background used by IK
+  and are not motion-planning waypoints.
+  """
+  entry = _PairedGoal._flat_entry(mode).copy()
+  hint = np.asarray(full_hint, dtype=float).ravel()
+  if entry.size != hint.size:
+    raise ValueError("transition hint and mode entry have different dimensions")
+  for robot in task.robots:
+    idx = np.asarray(problem.robot_idx[robot], dtype=int)
+    entry[idx] = hint[idx]
+  return entry
 
 
 def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
@@ -1566,10 +1582,11 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
   except Exception:
     BidirectionalTree.__init__ = _tree_init
     raise
-  # Seed a pre-skill transition once with the full configuration already certified by the
-  # funnel IK. Crucially, this is a HINT: only task.robots remain constrained, and a hint that
-  # is stale in the accumulated attachment scene is discarded after one ordinary predicate
-  # call. mr_bench stays untouched on disk.
+  # Seed a pre-skill transition once from the funnel IK. Only task.robots are copied from the
+  # full IK certificate; every idle robot remains at this mode's entry configuration. This is
+  # important when HOME != EXIT: the latter is merely an internal collision-safe IK background,
+  # not a waypoint. The merged hint is still checked in the accumulated attachment scene and
+  # discarded after one failed predicate call. mr_bench stays untouched on disk.
   _transition_hints = dict(getattr(problem, "transition_hints", {}) or {})
   if _transition_hints:
     _sample_transition0 = planner.sample_transition_configuration
@@ -1583,7 +1600,8 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
         _flat = _transition_hints.get(str(_task.name))
         if _flat is not None and _key not in _hint_attempted:
           _hint_attempted.add(_key)
-          _parts = [np.asarray(_flat, dtype=float)[problem.robot_idx[_r]].copy()
+          _entry = _active_slice_transition_hint(problem, mode, _task, _flat)
+          _parts = [_entry[np.asarray(problem.robot_idx[_r], dtype=int)].copy()
                     for _r in problem.robots]
           _q = type(problem.get_start_pos()).from_list(_parts)
           if problem.is_collision_free(_q, mode):
@@ -1594,8 +1612,8 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
 
     planner.sample_transition_configuration = _sample_transition_with_hint
     planner._sample_transition_config_fn = _sample_transition_with_hint
-    print(f"[mp/birrt] {len(_transition_hints)} full pre-keyframe transition hint(s) ACTIVE; "
-          "idle IK pins do not become task participants.")
+    print(f"[mp/birrt] {len(_transition_hints)} active-slice pre-keyframe transition hint(s) "
+          "ACTIVE; idle IK EXIT pins do not enter the path.")
   # Constructing new trees happens throughout plan(), so restoring here would only compact
   # the initial tree. Keep the class patched until the planner pull has finished below.
   print(f"[mp/birrt] compact mode trees ACTIVE: initial capacity "
@@ -1974,8 +1992,21 @@ def mode_sequence(problem):
   env = problem
   q_home = env.get_start_pos()
   conf_type = type(q_home)
-  q_exit_full = np.asarray(getattr(env, "exit_configuration", env.C.getJointState()),
-                           dtype=float)
+  robot_idx = getattr(env, "robot_idx", None)
+  if robot_idx is None:
+    robot_idx, off = {}, 0
+    for r in env.robots:
+      robot_idx[r] = list(range(off, off + env.robot_dims[r]))
+      off += env.robot_dims[r]
+  # Do not put ``env.C.getJointState()`` directly in getattr's default: Python evaluates the
+  # default eagerly even when exit_configuration exists. Lightweight problem adapters used by
+  # reports/tests intentionally expose neither C nor a full planning scene.
+  q_exit = getattr(env, "exit_configuration", None)
+  if q_exit is None:
+    q_exit = (env.C.getJointState() if hasattr(env, "C")
+              else np.concatenate([np.asarray(q_home.robot_state(j), dtype=float).ravel()
+                                   for j, _r in enumerate(env.robots)]))
+  q_exit_full = np.asarray(q_exit, dtype=float).ravel()
 
   def goal_config(m, task):                                  # as report_problem_clearance
     goal = _goal_q(task.goal, m)
@@ -1989,7 +2020,7 @@ def mode_sequence(problem):
             break
           off += env.robot_dims[tr]
       else:
-        q.append(q_exit_full[np.asarray(env.robot_idx[r], dtype=int)])
+        q.append(q_exit_full[np.asarray(robot_idx[r], dtype=int)])
     return conf_type.from_list(q)
 
   chain, m = [], env.start_mode

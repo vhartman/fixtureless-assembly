@@ -102,13 +102,17 @@ def test_standard_search_profile_resolves_robust_batch_defaults():
   assert not a.fill_skeleton_first
   assert a.fill_scope_widening
   assert not a.fill_touch_all
+  assert a.center_scatter
+  assert not main.parse_args(
+      ["--search-profile", "standard", "--no-center-scatter"]).center_scatter
   assert a.milestone_boundaries == 4
   assert a.real_ik and a.wrench and a.wrench_aware_h
   assert a.grasp_model == "asymmetric"
   assert a.optimize_witnesses == "floor"
   assert a.witness_margin == 0.005
   assert a.witness_joint_margin == 0.02
-  assert a.witness_branch_budget == 5 and a.witness_sets == 4
+  assert a.witness_branch_budget == 0 and a.witness_branch_metric == "motion"
+  assert a.witness_sets == 4
   assert a.tight_fingers and not a.grasp_closure_check and a.strict_collisions == 1e-6
   assert a.open_witness and a.open_witness_batch == 7 and a.open_witness_epochs == 2
   assert a.lazy_edge_selector == "forward"
@@ -117,7 +121,9 @@ def test_standard_search_profile_resolves_robust_batch_defaults():
   assert a.grasp_sampler and a.grasp_sampler_version == 2
   assert a.grasp_sampler_scenes and a.grasp_sampler_keep == 20
   assert a.grasp_sampler_candidates == 96
-  assert a.grasp_refine
+  assert not a.grasp_refine
+  assert a.grasp_widen and a.grasp_widen_batch == 8 and a.grasp_widen_max == 96
+  assert main.parse_args(["--search-profile", "standard", "--grasp-refine"]).grasp_refine
   assert a.grasp_sampler_wrap == 0.015
   assert a.quiet_rai and not a.view
 
@@ -209,7 +215,8 @@ def test_saved_plan_persists_resolved_search_semantics(tmp_path):
               "milestone_boundaries", "fill_scope_widening", "open_witness",
               "open_witness_batch", "open_witness_epochs", "lazy_edge_selector", "analytic_seed_cap",
               "ssik_seed_neighborhood", "ssik_neighborhood_cap",
-              "fail_order", "empty_seed_refutes"):
+              "fail_order", "empty_seed_refutes", "grasp_widen", "grasp_widen_batch",
+              "grasp_widen_max", "grasp_local_widen", "grasp_local_caps"):
     assert saved[key] == getattr(cfg, key)
   loaded = RunConfig.from_file(str(out))
   assert loaded.milestone_boundaries == 4
@@ -233,7 +240,7 @@ def test_standard_motion_profile_pins_the_motion_contract():
   assert a.mp_plan_candidates == 4 and a.mp_plan_epochs == 6
   assert a.mp_plan_initial_runtime == 15.0
   assert not a.mp_no_shortcut and a.mp_shortcut_iters == 100
-  assert a.mp_shortcut_strategy == "native" and a.mp_shortcut_res is None
+  assert a.mp_shortcut_strategy == "native" and a.mp_shortcut_res == 0.002
   assert a.mp_collision_tolerance == 1e-4
   assert a.mp_robot_margin == 0.1 and a.mp_margin_ramp == 0.1
   assert a.mp_table_margin == 0.0 and a.mp_cograsp
@@ -366,11 +373,12 @@ def test_profile_values_are_reversible_by_explicit_cli():
       "--search-profile", "fast-open", "--weight", "5", "--no-open-witness",
       "--analytic-seed-cap", "9", "--witness-margin", "0.002", "--view",
       "--no-quiet-rai", "--no-grasp-sampler", "--no-grasp-sampler-scenes",
-      "--no-grasp-refine",
+      "--no-grasp-refine", "--no-grasp-widen",
   ])
   assert a.weight == 5.0 and not a.open_witness and a.analytic_seed_cap == 9
   assert a.witness_margin == 0.002 and a.view and not a.quiet_rai
-  assert not a.grasp_sampler and not a.grasp_sampler_scenes and not a.grasp_refine
+  assert (not a.grasp_sampler and not a.grasp_sampler_scenes and not a.grasp_refine
+          and not a.grasp_widen)
 
 
 def test_profile_wins_over_config_and_individual_cli_wins_over_both(tmp_path):

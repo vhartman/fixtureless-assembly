@@ -168,6 +168,8 @@ def test_cli_defaults_and_guard():
     main.run(RunConfig(grasp_sampler=True, dense_grasps=True, solve=False, view=False))
   with pytest.raises(SystemExit):
     main.run(RunConfig(grasp_sampler_scenes=True, solve=False, view=False))
+  with pytest.raises(SystemExit):
+    main.run(RunConfig(grasp_widen=True, solve=False, view=False))
 
 
 def test_v2_hybrid_contains_conventional_grasps_and_refines_by_prefix():
@@ -203,6 +205,57 @@ def test_closure_ranking_prioritizes_certified_canonical_rows_without_deleting_f
   coverages = [sum(len(v) for v in e[1]["closure_by_kind"].values()) for e in ranked]
   assert coverages == [2, 1, 0, 0]
   assert {id(e[0]) for e in ranked} == {id(e[0]) for e in entries}
+
+
+def test_v3_task_coverage_prefers_multi_role_reachable_candidate_without_deletion():
+  def entry(i, family, roles=(), reach=0, origin="sampled"):
+    row = (np.array([0.02 * i, 0.0, 0.06, 1.0, 0.0, 0.0, 0.0]),
+           "flat", 0.05, np.zeros(6), 0.02, 1.0, family, False)
+    meta = {"origin": origin, "scene_by_kind": {"two_finger": tuple(roles)},
+            "reach_by_robot": {"a1": reach}}
+    return row, meta
+
+  pick_only = entry(0, "suction", ("pick",))
+  bridge = entry(1, "canonical", ("pick", "assemble"), reach=3, origin="canonical")
+  mate_only = entry(2, "pinch", ("assemble",))
+  ranked = P._task_coverage_order([pick_only, bridge, mate_only])
+  assert ranked[0] is bridge
+  assert {id(e[0]) for e in ranked} == {id(e[0]) for e in (pick_only, bridge, mate_only)}
+
+
+def test_v3_keep_widening_is_append_only():
+  P.set_rolls_per_face(2)
+  mode = {"version": 3, "seed": 4, "candidates": 96, "keep": 20,
+          "margin": 0.008, "pad_support": 0.75, "wrap": 0.015}
+  P.set_sampled_grasps(mode)
+  q20 = [np.asarray(q).copy() for q in P.part_grasp_poses(CUBE)]
+  P.set_sampled_grasp_keep(28)
+  q28 = P.part_grasp_poses(CUBE)
+  assert len(q28) >= len(q20)
+  assert all(np.array_equal(a, b) for a, b in zip(q20, q28))
+
+
+def test_local_widen_builds_one_larger_stable_master():
+  """The local schedule must not regenerate/rebind ids when a fill exposes more columns."""
+  P.set_rolls_per_face(2)
+  base = {"version": 2, "seed": 4, "candidates": 96, "keep": 12,
+          "margin": 0.008, "pad_support": 0.75, "wrap": 0.015}
+  P.set_sampled_grasps(base)
+  q12 = [np.asarray(q).copy() for q in P.part_grasp_poses(CUBE)]
+  P.set_sampled_grasps({**base, "master_keep": 28})
+  master = P.part_grasp_poses(CUBE)
+  assert len(master) > len(q12)
+  assert all(np.array_equal(a, b) for a, b in zip(q12, master))
+
+
+def test_per_part_grasp_caps_gate_only_new_grasp_choices():
+  caps = {"obj_0": 4, "obj_1": 9}
+  assert S._grasp_action_within_cap(("pick", "a1", "obj_0", 3), caps)
+  assert not S._grasp_action_within_cap(("handover", "a2", "obj_0", 4), caps)
+  assert S._grasp_action_within_cap(("add_grasp", "a2", "obj_1", 8), caps)
+  # Existing contacts are never invalidated by the active-column schedule.
+  assert S._grasp_action_within_cap(("assemble", "a1", "obj_0", "obj_1"), caps)
+  assert S._grasp_action_within_cap(("release", "a1", "obj_0"), caps)
 
 
 def test_v2_scene_masks_are_per_gripper_kind():

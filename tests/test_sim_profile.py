@@ -27,13 +27,13 @@ def test_standard_sim_profile_pins_reproduction_contract():
   assert a.phase_schedule and a.phase_smooth and a.phase_batch
   assert a.phase_servo_time == 0.15 and a.phase_smooth_time == 0.12
   assert a.phase_batch_min_motion == 0.08 and a.phase_batch_max_gap == 0.35
-  assert a.phase_audit_resolution == 0.01
+  assert a.phase_audit_resolution == 0.002
   assert a.settle_tol == 0.002 and a.settle_max == 1.0
   assert a.servo_force == 6.0 and a.servo_max_dev == 0.010
   assert a.servo_torque_guard == 0.6 and a.servo_tol == 0.002
   assert a.force_limits and a.corner_limits
   assert a.path_preflight and a.path_preflight_tolerance == 1e-4
-  assert a.path_preflight_resolution == 0.01
+  assert a.path_preflight_resolution == 0.002
   assert a.joint_rate == 1.0 and a.mass_scale == 1.0 and a.coll_scale == 1.0
   assert not a.corridor and not a.corridor_online and not a.pace
   assert not a.phase_intent and not a.c2_spline and not a.limit_rate
