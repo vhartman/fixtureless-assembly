@@ -472,6 +472,127 @@ def test_open_pool_retains_the_exact_successful_witness():
   assert pool.probe(action, s, n, object()) == (True, witness, False)
 
 
+def test_open_pool_shares_attempt_cursor_for_identical_physical_query():
+  calls = []
+
+  class RIK:
+    open_witness_batch = 2
+
+    def _query_key(self, _action, _state, _successor, _assembly):
+      return ("same-physical-query",)
+
+    def probe_bind_batch(self, _action, _state, _successor, _assembly, attempt, budget):
+      calls.append((attempt, budget))
+      return False, None
+
+  assembly = object()
+  pool = OpenWitnessPool(RIK(), assembly)
+  action = ("pick", "a1", "obj", 0)
+  pool.probe(action, _State("symbolic-a"), _State("next-a"), assembly)
+  pool.probe(action, _State("symbolic-b"), _State("next-b"), assembly)
+
+  # The second symbolic alias continues at fresh effort. It does not replay attempt zero or
+  # the analytic initialization bundle.
+  assert calls == [(0, 2), (2, 2)]
+
+
+def test_open_pool_retains_failure_effort_across_fill_sessions():
+  calls = []
+
+  class RIK:
+    lazy_edge_selector = "forward"
+    open_witness_batch = 2
+
+    def _query_key(self, _action, _state, _successor, _assembly):
+      return ("same-physical-query",)
+
+    def probe_bind_batch(self, _action, _state, _successor, _assembly, attempt, budget):
+      calls.append((attempt, budget))
+      return False, None
+
+  rik = RIK()
+  assembly = object()
+  s0, s1 = _State("symbolic-a"), _State("next-a")
+  action = ("pick", "a1", "obj", 0)
+
+  class Engine:
+    budget_hit = False
+
+    def __init__(self, suspended):
+      self.suspended = suspended
+
+    def search(self, _max_nodes, deadline=None):
+      return None if (s0, action) in self.suspended else [action]
+
+    def delete_edge(self, *_args):
+      pass
+
+  def walk(_plan):
+    yield s0, action, s1
+
+  for tag in ("obj_1", "obj_2"):
+    run_open_lazy_fill(
+        robot_ik=rik, assembly=assembly, make_engine=Engine, walk_plan=walk,
+        is_ik=lambda _a: True, max_nodes=10, max_epochs=1, tag=tag)
+
+  pool = rik._open_witness_pool
+  assert calls == [(0, 2), (2, 2)]
+  assert pool.sessions == 2
+  assert pool.revisit_probes == 1
+  assert pool.cross_session_revisit_probes == 1
+  assert pool.cross_tag_revisit_probes == 1
+  assert pool.prior_slots_not_replayed == 2
+
+
+def test_physical_alias_revisit_uses_fresh_effort_in_the_same_epoch():
+  calls = []
+  a = ("pick", "a1", "obj", 0)
+  b = ("pick", "a1", "obj", 1)
+  s0, s1, s2 = _State("s0"), _State("s1"), _State("s2")
+
+  class RIK:
+    lazy_edge_selector = "forward"
+    open_witness_batch = 2
+
+    def _query_key(self, _action, _state, _successor, _assembly):
+      return ("same-physical-query",)
+
+    def probe_bind_batch(self, action, _state, _successor, _assembly, attempt, budget):
+      calls.append((action, attempt, budget))
+      return False, None
+
+  class Engine:
+    budget_hit = False
+
+    def __init__(self, suspended):
+      self.suspended = suspended
+
+    def search(self, _max_nodes, deadline=None):
+      if (s0, a) not in self.suspended:
+        return [a]
+      if (s0, b) not in self.suspended:
+        return [b]
+      return None
+
+    def delete_edge(self, *_args):
+      pass
+
+  def walk(plan):
+    action = plan[0]
+    yield s0, action, s1 if action == a else s2
+
+  rik = RIK()
+  _plan, _end, report = run_open_lazy_fill(
+      robot_ik=rik, assembly=object(), make_engine=Engine, walk_plan=walk,
+      is_ik=lambda _a: True, max_nodes=10, max_epochs=1, tag="obj")
+
+  # A finite stochastic failure is not a reusable negative verdict. The alias shares the
+  # cursor, so it skips attempt zero but receives genuinely fresh effort immediately.
+  assert calls == [(a, 0, 2), (b, 2, 2)]
+  assert report.open_failures == 2
+  assert rik._open_witness_pool.revisit_probes == 1
+
+
 def test_zero_epochs_requires_a_deadline():
   class RIK:
     pass

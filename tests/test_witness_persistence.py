@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from plan_io import missing_required_witnesses, read_plan, read_witnesses, \
     read_witness_stage, require_complete_witnesses, witness_block, write_plan
 import mp_export as MP
+import solver
 
 
 JOINTS = ["a1_j0", "a1_j1", "a2_j0", "a2_j1"]
@@ -73,6 +74,118 @@ def test_required_ik_witnesses_fail_closed_but_release_null_is_valid():
     require_complete_witnesses(PLAN, wit, who="test artifact")
   wit[1] = np.ones(4)
   assert require_complete_witnesses(PLAN, wit) is wit
+
+
+def test_rewritten_plan_reuses_only_same_action_and_scene_certificate(monkeypatch):
+  """Release reordering must never treat an old witness index as a certificate.
+
+  The same action can appear at a different predecessor scene after a release is hoisted.  The
+  persistence helper may reuse the source witness only when RobotIK's ordinary cache key agrees;
+  otherwise it must issue a fresh bind.
+  """
+  source = [("pick", "a1", "obj_0", 0)]
+  candidate = [("pick", "a1", "obj_0", 0)]
+
+  class _State:
+    def __init__(self, sig):
+      self.sig = sig
+
+  source_states = [_State("source"), _State("after")]
+  candidate_states = [_State("source"), _State("after")]
+
+  def replay(_C, _assembly, plan, *_args, **_kwargs):
+    return source_states if plan is source else candidate_states
+
+  monkeypatch.setattr(solver, "_replay_states", replay)
+
+  class _IK:
+    _ik_cache = {}
+
+    @staticmethod
+    def _scene_sig(state):
+      return state.sig
+
+    def __init__(self):
+      self.bind_calls = 0
+
+    def bind(self, *_args):
+      self.bind_calls += 1
+      return True, np.array([9.0])
+
+  ik = _IK()
+  source_witness = np.array([1.0])
+  out_same = solver.collect_plan_witnesses(
+      None, None, candidate, ["a1"], ik, grasp_table={}, resolve_missing=True,
+      verbose=False, reuse_from_plan=source, reuse_from_witnesses=[source_witness])
+
+  # An unchanged predecessor scene is genuinely the same certificate even though this is a
+  # different plan object/indexing context.
+  assert ik.bind_calls == 0
+  np.testing.assert_array_equal(out_same[0], source_witness)
+
+  candidate_states[0] = _State("candidate")
+  out = solver.collect_plan_witnesses(
+      None, None, candidate, ["a1"], ik, grasp_table={}, resolve_missing=True,
+      verbose=False, reuse_from_plan=source, reuse_from_witnesses=[source_witness])
+
+  # The action text is identical, but the predecessor signature is not: the old vector must
+  # not leak positionally into the candidate.  A fresh exact bind supplies the new certificate.
+  assert ik.bind_calls == 1
+  np.testing.assert_array_equal(out[0], [9.0])
+
+
+def test_release_hoist_rolls_back_to_source_witnesses_on_failed_recertification(
+    monkeypatch, capsys):
+  source = [("pick", "a1", "obj_0", 0),
+            ("assemble", "a1", "obj_0", "obj_1"),
+            ("release", "a1", "obj_0")]
+  candidate = [("pick", "a1", "obj_0", 0),
+               ("release", "a1", "obj_0"),
+               ("assemble", "a1", "obj_0", "obj_1")]
+  source_witnesses = [np.array([1.0]), np.array([2.0]), None]
+  monkeypatch.setattr(solver, "hoist_releases", lambda *_args, **_kwargs: candidate)
+
+  seen = {}
+
+  def recertify(*args, **kwargs):
+    seen.update(kwargs)
+    assert list(args[2]) == candidate
+    # The moved assembly edge has no exact certificate.  This is the normal IK failure mode
+    # that used to bubble out of require_complete_witnesses and discard the whole plan.
+    return [np.array([1.0]), None, None]
+
+  monkeypatch.setattr(solver, "collect_plan_witnesses", recertify)
+  final_plan, final_witnesses, applied = solver.hoist_releases_certified(
+      None, None, source, source_witnesses, ["a1"], object(), verbose=True)
+
+  assert not applied
+  assert list(final_plan) == source
+  np.testing.assert_array_equal(final_witnesses[0], source_witnesses[0])
+  np.testing.assert_array_equal(final_witnesses[1], source_witnesses[1])
+  assert final_witnesses[2] is None
+  assert seen["resolve_missing"]
+  assert seen["reuse_from_plan"] is source
+  assert "rollback" in capsys.readouterr().out
+
+
+def test_release_hoist_commits_only_after_complete_recertification(monkeypatch):
+  source = [("pick", "a1", "obj_0", 0),
+            ("assemble", "a1", "obj_0", "obj_1"),
+            ("release", "a1", "obj_0")]
+  candidate = [("pick", "a1", "obj_0", 0),
+               ("release", "a1", "obj_0"),
+               ("assemble", "a1", "obj_0", "obj_1")]
+  source_witnesses = [np.array([1.0]), np.array([2.0]), None]
+  candidate_witnesses = [np.array([1.0]), None, np.array([3.0])]
+  monkeypatch.setattr(solver, "hoist_releases", lambda *_args, **_kwargs: candidate)
+  monkeypatch.setattr(solver, "collect_plan_witnesses",
+                      lambda *_args, **_kwargs: candidate_witnesses)
+
+  final_plan, final_witnesses, applied = solver.hoist_releases_certified(
+      None, None, source, source_witnesses, ["a1"], object(), verbose=False)
+
+  assert applied and list(final_plan) == candidate
+  np.testing.assert_array_equal(final_witnesses[2], [3.0])
 
 
 def test_final_motion_export_round_trips_post_fusion_and_pre_keyframes(tmp_path):

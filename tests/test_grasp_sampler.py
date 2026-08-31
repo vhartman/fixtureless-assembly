@@ -414,3 +414,175 @@ def test_scene_aware_off_is_byte_identical():
   assert len(before) == len(after)
   for a, b in zip(before, after):
     np.testing.assert_array_equal(a, b)
+
+
+def _synthetic_scene_reservation_input(monkeypatch):
+  """A V2-prefix counterexample with four scene-valid sampled rows.
+
+  Two conventional rows fill K=2 but are collision-free in neither context.  The sampled
+  row pairs respectively serve PICK and ASSEMBLE, making this a small deterministic test of
+  whether a scene-aware bounded DB actually reserves its advertised roles.
+  """
+  def row(x, family="suction"):
+    return (np.array([float(x), 0.0, 0.08, 1.0, 0.0, 0.0, 0.0]),
+            "flat", 0.05, np.array([float(x), 0.0, 0.0, 0.0, 0.0, 0.0]),
+            0.02, 1.0, family, False)
+
+  canonical = [row(0.0, "canonical"), row(0.1, "canonical")]
+  monkeypatch.setattr(P, "_canonical_sample_rows", lambda _spec, _offset: canonical)
+  pick_state, asm_state = object(), object()
+
+  class Checker:
+    closure_check = False
+
+    def pose_collision_free(self, state, _part, pose, _assembly, robot=None):
+      del robot
+      x = float(np.asarray(pose, dtype=float)[0])
+      return ((state is pick_state and abs(x - 1.0) < 1e-9)
+              or (state is pick_state and abs(x - 1.1) < 1e-9)
+              or (state is asm_state and abs(x - 2.0) < 1e-9)
+              or (state is asm_state and abs(x - 2.1) < 1e-9))
+
+    def pose_grasp_closure_free(self, state, part, pose, assembly, robot):
+      return self.pose_collision_free(state, part, pose, assembly, robot=robot)
+
+    def pose_grasp_closure_result(self, *_args, **_kwargs):
+      return None                                         # no analytic table-repair variant
+
+  ctx = {"checker": Checker(), "kind_robot": {"two_finger": "a1"},
+         "assembly": object(), "s0": pick_state, "s_full": asm_state,
+         "robot_ik": None, "ik_scene": None}
+  return (("box", (0.05, 0.05, 0.05, 0.0)), "obj_0",
+          [row(1.0), row(1.1), row(2.0), row(2.1)], [], ctx)
+
+
+def test_v4_scene_reservation_preempts_a_full_v2_canonical_prefix(monkeypatch):
+  """V4 gives --grasp-sampler-scenes a bounded PICK/ASSEMBLE guarantee; V2 is unchanged."""
+  spec, part, suction, antip, ctx = _synthetic_scene_reservation_input(monkeypatch)
+
+  P.set_sampled_grasps({"version": 2, "seed": 0, "candidates": 8, "keep": 2})
+  v2 = P._hybrid_v2_rows(spec, 0.01, part, suction, antip, 2, ctx, None)
+  assert [float(e[0][0][0]) for e in v2] == [0.0, 0.1]
+
+  P.set_sampled_grasps({"version": 4, "seed": 0, "candidates": 8, "keep": 2})
+  v4 = P._hybrid_v2_rows(spec, 0.01, part, suction, antip, 2, ctx, None)
+  xs = [float(e[0][0][0]) for e in v4]
+  assert xs[0] in (1.0, 1.1) and xs[1] in (2.0, 2.1)
+  facts = {(kind, role) for _row, meta in v4
+           for kind, roles in meta["scene_by_kind"].items() for role in roles}
+  assert facts == {("two_finger", "pick"), ("two_finger", "assemble")}
+
+
+def test_v4_scene_reservation_master_is_append_only(monkeypatch):
+  """The scene-reserved master is fixed before slicing, so widening preserves all ids."""
+  spec, part, suction, antip, ctx = _synthetic_scene_reservation_input(monkeypatch)
+  P.set_sampled_grasps({"version": 4, "seed": 0, "candidates": 8, "keep": 2})
+  k2 = P._hybrid_v2_rows(spec, 0.01, part, suction, antip, 2, ctx, None)
+  P.set_sampled_grasps({"version": 4, "seed": 0, "candidates": 8, "keep": 4})
+  k4 = P._hybrid_v2_rows(spec, 0.01, part, suction, antip, 4, ctx, None)
+  assert len(k2) == 2 and len(k4) == 4
+  for old, new in zip(k2, k4):
+    np.testing.assert_array_equal(old[0][0], new[0][0])
+
+
+def test_v4_closure_tail_is_the_v2_tail_not_zero_role_canonical(monkeypatch):
+  """Reservations may reorder V2, but do not promote closure-invalid canonical fallbacks."""
+  spec, part, suction, antip, ctx = _synthetic_scene_reservation_input(monkeypatch)
+  ctx["checker"].closure_check = True
+
+  P.set_sampled_grasps({"version": 2, "seed": 0, "candidates": 8, "keep": 6})
+  v2 = P._hybrid_v2_rows(spec, 0.01, part, suction, antip, 6, ctx, None)
+  P.set_sampled_grasps({"version": 4, "seed": 0, "candidates": 8, "keep": 6})
+  v4 = P._hybrid_v2_rows(spec, 0.01, part, suction, antip, 6, ctx, None)
+
+  x2 = [float(e[0][0][0]) for e in v2]
+  x4 = [float(e[0][0][0]) for e in v4]
+  assert x4 == x2                               # reservations are V2's first two rows here
+  assert set(x4[:4]) == {1.0, 1.1, 2.0, 2.1}
+  assert x4[4:] == [0.0, 0.1]                  # zero-role canonical poses remain last resort
+
+
+def _install_mixed_public_scene_ctx():
+  """Cheap deterministic scene labels while exercising the real mesh sampler and caches."""
+  pick_state, asm_state = object(), object()
+
+  class Checker:
+    closure_check = False
+
+    def pose_collision_free(self, state, _part, pose, _assembly, robot=None):
+      x, y = np.asarray(pose, dtype=float)[:2]
+      if robot == "finger":
+        return bool(x < -0.02) if state is pick_state else bool(y < -0.02)
+      if robot == "vacuum":
+        return bool(x > 0.02) if state is pick_state else bool(y > 0.02)
+      return False
+
+  P._SAMPLED_SCENE_CTX = {
+      "checker": Checker(), "kind_robot": {"two_finger": "finger", "vacuum": "vacuum"},
+      "assembly": object(), "s0": pick_state, "s_full": asm_state,
+      "sig": ("test-mixed-real-sampler",), "robots": (),
+      "robot_ik": None, "ik_scene": None,
+  }
+
+
+def _pose_bytes(poses):
+  return tuple(np.asarray(q, dtype="<f8").tobytes() for q in poses)
+
+
+def test_v4_shares_only_v2_raw_seed_key_and_keeps_v3_identity():
+  """The V4 ablation must not silently regenerate either the V2 or persisted V3 cloud."""
+  mode = {"seed": 23, "candidates": 96, "keep": 20,
+          "margin": 0.004, "pad_support": 0.6, "wrap": 0.015}
+  keys = {}
+  for version in (2, 3, 4):
+    P.set_sampled_grasps({**mode, "version": version})
+    keys[version] = P._sampled_keys(CUBE, 0.01, "obj_0")
+  assert keys[4][0] == keys[2][0]
+  assert keys[4][1] != keys[2][1]
+  assert keys[3][0][2] == 3                    # V3's historical RNG tuple remains version 3
+  assert keys[3][0] != keys[2][0]
+
+
+def test_v4_real_sampler_is_only_an_ordering_of_the_v2_candidate_master():
+  """V2 and V4 use one raw cloud; V4's cache/IDs remain a distinct ordered database."""
+  P.set_rolls_per_face(2)
+  _install_mixed_public_scene_ctx()
+  mode = {"seed": 17, "candidates": 96, "keep": 128, "master_keep": 128,
+          "margin": 0.0, "pad_support": 0.0, "wrap": 0.015}
+
+  P.set_sampled_grasps({**mode, "version": 2})
+  raw_v2, cache_v2 = P._sampled_keys(CUBE, 0.01, "obj_0")
+  q2 = P.part_grasp_poses(CUBE, part="obj_0")
+
+  P.set_sampled_grasps({**mode, "version": 4})
+  raw_v4, cache_v4 = P._sampled_keys(CUBE, 0.01, "obj_0")
+  q4 = P.part_grasp_poses(CUBE, part="obj_0")
+  m4 = P.sampled_grasp_meta(CUBE, part="obj_0")
+
+  assert raw_v4 == raw_v2                         # exactly V2's stochastic surface cloud
+  assert cache_v4 != cache_v2                     # but never alias positional DB identities
+  assert len(q4) == len(q2) > 20
+  assert set(_pose_bytes(q4)) == set(_pose_bytes(q2))
+  assert _pose_bytes(q4) != _pose_bytes(q2)        # the advertised reservation reordering
+  first_facts = {(kind, role) for md in m4[:4]
+                 for kind, roles in md["scene_by_kind"].items() for role in roles}
+  assert first_facts == {("two_finger", "pick"), ("two_finger", "assemble"),
+                         ("vacuum", "pick"), ("vacuum", "assemble")}
+
+
+def test_v4_global_widening_preserves_cached_prefix_ids():
+  """Exercise K -> K+B through the public cache-reset API, not the selector in isolation."""
+  P.set_rolls_per_face(2)
+  _install_mixed_public_scene_ctx()
+  mode = {"version": 4, "seed": 19, "candidates": 96, "keep": 6,
+          "margin": 0.0, "pad_support": 0.0, "wrap": 0.015}
+  P.set_sampled_grasps(mode)
+  q6 = P.part_grasp_poses(CUBE, part="obj_0")
+  assert P.part_grasp_poses(CUBE, part="obj_0") is q6      # actual cache hit
+
+  old = tuple(np.asarray(q).copy() for q in q6)
+  P.set_sampled_grasp_keep(12)                             # clears and rebuilds the cache
+  q12 = P.part_grasp_poses(CUBE, part="obj_0")
+  assert len(q6) == 6 and len(q12) == 12
+  for a, b in zip(old, q12):
+    np.testing.assert_array_equal(a, b)

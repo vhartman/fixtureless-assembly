@@ -20,8 +20,12 @@ import problem as P
 @pytest.fixture(autouse=True)
 def _legacy_by_default():
   P.set_stable_rest_poses(False)
+  P.set_placement_yaws(1)
+  P.set_placement_yaw_prefix(None)
   yield
   P.set_stable_rest_poses(False)                           # module state: never leak
+  P.set_placement_yaws(1)
+  P.set_placement_yaw_prefix(None)
 
 
 ASSEMBLIES = [("cross", 7), ("car-mini", 5), ("chair", 8)]
@@ -37,6 +41,89 @@ def test_legacy_table_is_byte_identical_to_the_old_rule(kind, n):
     for face in range(len(P._FACE_DOWN_QUATS)):
       assert np.allclose(P.placement_quat(a, grp, ref, face),
                          P._legacy_placement_quat(a, ref, face), atol=1e-12)
+
+
+def test_yaw_lattice_keeps_legacy_prefix_and_distinct_state_ids():
+  """Yaw is a physical placement degree of freedom, not a pose-only decoration: every
+  rotation must survive in State.key(), while N=1 and ids 0..5 remain untouched."""
+  P.set_placement_yaws(4)
+  a = P.make_assembly("cross", 1)
+  table = P.placement_table(a, ("obj_0",), "obj_0")
+  assert tuple(table)[:6] == tuple(range(6))
+  assert len(table) == 24                              # six cube faces x four table yaws
+
+  p = "obj_0"
+  held = P.State(parent={p: ("gripper", "a1")}, grasp={p: 0}, place={},
+                 supports={p: frozenset({("grasp", "a1", p, 0)})},
+                 poses={p: np.array([0.0, 0.0, 0.1, 1.0, 0.0, 0.0, 0.0])})
+  landings = list(P.places(held, a, ["a1"]))
+  assert len(landings) == 24
+  assert len({s.key() for _action, s in landings}) == 24
+  assert len({action[3] for action, _s in landings}) == 24
+  assert P.rest_face_classes(a, {p}) == tuple(range(6))
+  assert {P.placement_rest_class(a, action[3]) for action, _s in landings} == set(range(6))
+
+
+def test_yaw_order_is_uniform_coarse_to_fine():
+  order = P.placement_yaw_order(12)
+  assert order[:4] == (0, 6, 3, 9)                    # 0, pi, +pi/2, -pi/2
+  assert set(order) == set(range(12))
+  assert P.placement_yaw_levels(12) == (1, 2, 4, 8, 12)
+
+
+def test_yaw_prefix_widens_actions_without_rebinding_ids():
+  P.set_placement_yaws(4)
+  a = P.make_assembly("cross", 1)
+  full = dict(P.placement_table(a, {"obj_0"}, "obj_0"))
+  expected = {1: 6, 2: 12, 4: 24}
+  seen = set()
+  for prefix, count in expected.items():
+    P.set_placement_yaw_prefix(prefix)
+    faces = P.rest_faces(a, {"obj_0"})
+    assert len(faces) == count
+    assert seen.issubset(faces)
+    seen = set(faces)
+    assert all(np.allclose(P.placement_quat(a, {"obj_0"}, "obj_0", face), full[face])
+               for face in faces)
+  P.set_placement_yaw_prefix(None)
+  assert set(P.rest_faces(a, {"obj_0"})) == set(full)
+
+
+def test_yaw_prefix_rank_is_local_to_each_subassembly_table():
+  """Quaternion ids are global, widening ranks are not. The same rotation may be a base in
+  one table and a later copy in another; one table's schedule must never leak into the other."""
+  P.set_placement_yaws(4)
+  a = P.make_assembly("cross", 2)
+  keys = []
+  for obj in ("obj_0", "obj_1"):
+    group = {obj}
+    ref = P.reference_part(group)
+    P.placement_table(a, group, ref)
+    keys.append((P._subasm_key(group), ref, P._STABLE_REST_POSES, P._PLACEMENT_YAWS))
+  assert a._placement_yaw_ranks[keys[0]][0] == 0
+  assert a._placement_yaw_ranks[keys[1]][0] == 0
+  # Model the collision that a single global pid->rank dictionary could suffer.
+  a._placement_yaw_ranks[keys[0]][0] = 3
+  P.set_placement_yaw_prefix(1)
+  assert 0 in P.rest_faces(a, {"obj_1"})
+
+
+def test_anchor_rest_yaws_without_changing_tilt_or_height():
+  """Reserved id 5 keeps a wheel's authored/scattered tilt. Its yaw copies may rotate the
+  horizontal projection, but may neither straighten/tilt its axis nor change table height."""
+  P.set_placement_yaws(4)
+  a = P.make_assembly("car-mini", 5)
+  ref, group = "obj_1", {"obj_1"}
+  table = P.placement_table(a, group, ref)
+  variants = [pid for pid in table if a._placement_yaw_base[pid] == P._IDENTITY_FACE]
+  assert len(variants) == 4
+  anchor = np.concatenate([np.array([0.0, 0.0, 0.1]), a.scatter_orientations[ref]])
+  poses = [P._group_rest_pose(a, group, ref, anchor, pid) for pid in variants]
+  shape_axis = P._quat_to_R(P._shape_quat(a.part_shape(ref))) @ np.array([0.0, 0.0, 1.0])
+  axes = [P._quat_to_R(pose[3:]) @ shape_axis for pose in poses]
+  assert np.ptp([pose[2] for pose in poses]) < 1e-12
+  assert np.ptp([axis[2] for axis in axes]) < 1e-12
+  assert all(np.isclose(np.linalg.norm(axis), 1.0) for axis in axes)
 
 
 def test_identity_id_is_reserved_in_both_modes():

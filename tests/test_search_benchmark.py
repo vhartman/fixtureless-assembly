@@ -115,8 +115,15 @@ def test_log_parser_extracts_backward_and_ik_work():
 [strict-collisions] vetoed 4 dirty KOMO witnesses (> 0.0001m total penetration).
 [ik-clearance] vetoed 3 IK candidate(s) below the shared 5.0mm search/witness margin.
 [ik-prof] binds: 432 called, 7 cache hits (2%), 425 solved (158 ok / 267 failed), bind wall 272.2s
+[ik-prof] bind outcome time: successes 31.7s (12%), failures 240.5s (88%)
 [ik-prof] NLP solves: 5655 in 244.1s (seeded 869/31.9s, unseeded 1587/77.3s, restarts 3199/134.9s)
 [ik-prof] reach precheck: 402 relaxed solves in 96.5s (179 rejects caught); post-solve gates 513x in 0.6s; getPath calls 513
+[ik-reuse] positive certificates: 44 accepted / 47 tried in 0.13s; library=143 vectors over 143 kinematic cores.
+[ik-reuse] negative diagnostic ONLY (no pruning): 3 repeated exact-scene failures / 0.4s; 428 cross-scene same-core repeats / 16.6s optimistic nogood upper bound.
+[ik-reuse] physical-query invariant: 37 symbolic aliases collapsed across 211 physical queries; exact witnesses and open failure effort are shared under the skill-local equivalence.
+[fill-policy-widen obj_2] Bellman frontier adds one grasp batch (loose, context=('obj_2',), part=obj_2, class=1) ids [20, 21]; 1 demand batch(es) remain. One bounded forward-IK epoch; activated columns remain available to later policy branches.
+[fill-policy-widen obj_2] grasp batch did not validate; retaining its finite column and advancing to the next Bellman demand.
+[fill-policy-widen obj_2] Bellman frontier adds one rest/yaw orbit (group=('obj_0',), class=2); activated orbits and raw columns remain available to later policy branches. One bounded forward-IK epoch.
 [rss] peak RSS after solve: 1712 MB
 """
   got = B.parse_log(log)
@@ -125,11 +132,22 @@ def test_log_parser_extracts_backward_and_ik_work():
   assert got["milestone_search_s"] == 49.12
   assert got["milestone_repairs"] == 2
   assert got["ik_bind_calls"] == 432 and got["ik_bind_fail"] == 267
+  assert got["ik_bind_success_s"] == 31.7 and got["ik_bind_fail_s"] == 240.5
   assert got["ik_nlp_solves"] == 5655 and got["ik_restart_solves"] == 3199
   assert got["ik_precheck_rejects"] == 179
+  assert got["ik_reuse_hits"] == 44 and got["ik_reuse_trials"] == 47
+  assert got["ik_reuse_s"] == 0.13
+  assert got["ik_negative_exact_repeats"] == 3
+  assert got["ik_negative_exact_repeat_s"] == 0.4
+  assert got["ik_negative_core_repeats"] == 428
+  assert got["ik_negative_core_repeat_s"] == 16.6
+  assert got["ik_physical_aliases"] == 37 and got["ik_physical_queries"] == 211
   assert got["strict_collision_rejects"] == 4
   assert got["clearance_rejects"] == 3
   assert got["peak_rss_reported_mb"] == 1712
+  assert got["policy_grasp_batches"] == 1
+  assert got["policy_yaw_orbits"] == 1
+  assert got["policy_failed_probes"] == 1
   assert got["skeleton_successful_fills"] == 1
   assert got["skeleton_fallback_fills"] == 1
   assert got["skeleton_candidates"] == 3

@@ -90,6 +90,40 @@ def test_historical_sampler_config_defaults_to_v1(tmp_path):
   assert cfg.grasp_sampler and cfg.grasp_sampler_version == 1
 
 
+def test_sampler_v4_profile_roundtrips_and_v2_witnesses_do_not_rebind(tmp_path, capsys):
+  """The standard V4 DB identity survives --save/--config; V2 remains a distinct legacy DB."""
+  import json
+
+  v4 = RunConfig.from_namespace(main.parse_args(["--search-profile", "standard"]))
+  v4.grasp_sampler_db_hash = "v4-test-content-hash"
+  v4_path = tmp_path / "v4-plan.json"
+  main.save_plan(str(v4_path), v4, [])
+  raw = json.loads(v4_path.read_text())["config"]
+  assert raw["grasp_sampler_version"] == 4
+  assert raw["grasp_sampler_db_hash"] == "v4-test-content-hash"
+  assert raw["grasp_sampler_scenes"] is True
+  assert raw["ik_positive_reuse"] is True
+  restored = RunConfig.from_file(str(v4_path))
+  assert (restored.grasp_sampler, restored.grasp_sampler_version,
+          restored.grasp_sampler_db_hash, restored.grasp_sampler_scenes) == \
+      (True, 4, "v4-test-content-hash", True)
+  # This is the documented --config PLAN.json path used before --load-plan/replay.
+  assert main.parse_args(["--config", str(v4_path)]).grasp_sampler_version == 4
+
+  # Keep every other witness-relevant setting equal: the rejection below must come from the
+  # positional sampled DB identity, not a coincidental profile difference such as yaw count.
+  v2 = RunConfig.from_dict(restored.to_dict())
+  v2.grasp_sampler_version = 2
+  v2.grasp_sampler_db_hash = "v2-test-content-hash"
+  v2_path = tmp_path / "v2-plan.json"
+  main.save_plan(str(v2_path), v2, [])
+  assert RunConfig.from_file(str(v2_path)).grasp_sampler_version == 2
+  saved_v2 = {k: getattr(v2, k) for k in main._WITNESS_FIELDS}
+  assert not main._witnesses_baseline_compatible(saved_v2, restored)
+  out = capsys.readouterr().out
+  assert "grasp_sampler_version" in out and "grasp_sampler_db_hash" in out
+
+
 def test_standard_search_profile_resolves_robust_batch_defaults():
   a = main.parse_args(["--search-profile", "standard"])
   assert a.weight == 1.0
@@ -115,16 +149,24 @@ def test_standard_search_profile_resolves_robust_batch_defaults():
   assert a.witness_sets == 4
   assert a.tight_fingers and not a.grasp_closure_check and a.strict_collisions == 1e-6
   assert a.open_witness and a.open_witness_batch == 7 and a.open_witness_epochs == 2
+  assert a.ik_positive_reuse
+  assert not main.parse_args(
+      ["--search-profile", "standard", "--no-ik-positive-reuse"]).ik_positive_reuse
   assert a.lazy_edge_selector == "forward"
   assert a.analytic_seed_cap is None
   assert a.ssik_seed_neighborhood == 0.0 and a.ssik_neighborhood_cap == 6
-  assert a.grasp_sampler and a.grasp_sampler_version == 2
+  assert a.grasp_sampler and a.grasp_sampler_version == 4
   assert a.grasp_sampler_scenes and a.grasp_sampler_keep == 20
   assert a.grasp_sampler_candidates == 96
   assert not a.grasp_refine
   assert a.grasp_widen and a.grasp_widen_batch == 8 and a.grasp_widen_max == 96
   assert main.parse_args(["--search-profile", "standard", "--grasp-refine"]).grasp_refine
   assert a.grasp_sampler_wrap == 0.015
+  assert a.placement_yaws == 4 and a.placement_yaw_widening
+  assert main.parse_args([
+      "--search-profile", "standard", "--placement-yaws", "1",
+      "--no-placement-yaw-widening"
+  ]).placement_yaws == 1
   assert a.quiet_rai and not a.view
 
 
@@ -173,6 +215,7 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
   monkeypatch.setattr(main, "solve_assembly_problem_milestones", fake)
   cfg = RunConfig(milestones=True, milestone_oracle="structural",
                   fill_local_h=True, fill_exact=True, fill_policy_first=True,
+                  fill_policy_guide=True,
                   fill_skeleton_first=True,
                   fill_scope_widening=True, milestone_boundaries=3,
                   wrench_aware_h=False)
@@ -180,6 +223,7 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
   assert seen["milestone_oracle"] == "structural"
   assert seen["fill_local_h"] is True and seen["fill_exact"] is True
   assert seen["fill_policy_first"] is True
+  assert seen["fill_policy_guide"] is True
   assert seen["fill_skeleton_first"] is True
   assert seen["fill_scope_widening"] is True
   assert seen["milestone_boundaries"] == 3
@@ -191,6 +235,8 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
   assert main.parse_args(["--fill-skeleton-first"]).fill_skeleton_first is True
   assert main.parse_args(["--fill-policy-first"]).fill_policy_first is True
   assert main.parse_args(["--no-fill-policy-first"]).fill_policy_first is False
+  assert main.parse_args(["--fill-policy-guide"]).fill_policy_guide is True
+  assert main.parse_args(["--no-fill-policy-guide"]).fill_policy_guide is False
   assert main.parse_args(["--fill-scope-widening"]).fill_scope_widening is True
   assert main.parse_args(["--no-fill-scope-widening"]).fill_scope_widening is False
   assert main.parse_args(["--fill-touch-all"]).fill_touch_all is True
@@ -200,6 +246,29 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
   assert main.parse_args([
       "--diagnose-plan-rank", "known.json"
   ]).diagnose_plan_rank == "known.json"
+
+
+def test_solver_scoped_policy_flags_fail_closed_in_other_engines():
+  # `--milestones` defaults to true, but dispatch gives explicit solver families priority.
+  # The validation must follow that same precedence instead of treating the dormant default as
+  # evidence that a milestone-only schedule will run.
+  lazy = RunConfig(milestones=True, lazy=True, fill_policy_guide=True,
+                   fill_local_h=True)
+  assert main._selected_solver_engine(lazy) == "lazy"
+  with pytest.raises(SystemExit, match="fill-policy-guide.*selected engine is lazy"):
+    main._validate_solver_scoped_flags(lazy)
+
+  optimistic = RunConfig(milestones=True, optimistic=True, grasp_local_widen=True)
+  with pytest.raises(SystemExit, match="grasp-local-widen.*selected engine is optimistic"):
+    main._validate_solver_scoped_flags(optimistic)
+
+  exact = RunConfig(milestones=False, fill_policy_first=True, fill_local_h=True)
+  with pytest.raises(SystemExit, match="fill-policy-first.*selected engine is exact"):
+    main._validate_solver_scoped_flags(exact)
+
+  ordinary = RunConfig(milestones=True, fill_policy_guide=True, fill_local_h=True,
+                       grasp_local_widen=True)
+  assert main._validate_solver_scoped_flags(ordinary) == "milestones"
 
 
 def test_saved_plan_persists_resolved_search_semantics(tmp_path):
@@ -216,7 +285,8 @@ def test_saved_plan_persists_resolved_search_semantics(tmp_path):
               "open_witness_batch", "open_witness_epochs", "lazy_edge_selector", "analytic_seed_cap",
               "ssik_seed_neighborhood", "ssik_neighborhood_cap",
               "fail_order", "empty_seed_refutes", "grasp_widen", "grasp_widen_batch",
-              "grasp_widen_max", "grasp_local_widen", "grasp_local_caps"):
+              "grasp_widen_max", "grasp_local_widen", "grasp_local_caps",
+              "placement_yaws", "placement_yaw_widening"):
     assert saved[key] == getattr(cfg, key)
   loaded = RunConfig.from_file(str(out))
   assert loaded.milestone_boundaries == 4
@@ -228,6 +298,13 @@ def test_saved_plan_persists_resolved_search_semantics(tmp_path):
   assert main.parse_args([
       "--search-profile", "standard", "--lazy-edge-selector", "terminal-first"
   ]).lazy_edge_selector == "terminal-first"
+
+
+def test_every_nonpresentation_standard_setting_is_persisted():
+  """A profile change must not silently create a replay/re-solve semantic gap."""
+  presentation_only = {"quiet_rai", "view"}
+  assert set(main._STANDARD_SEARCH_PROFILE) - presentation_only <= \
+      set(main._SAVE_CONFIG_FIELDS)
 
 
 def test_standard_motion_profile_pins_the_motion_contract():
@@ -427,6 +504,41 @@ def test_loaded_plan_is_not_hoisted_twice_without_explicit_request():
   assert not main._should_hoist_plan(loaded, {"hoist_releases"})
 
 
+def test_compact_placement_yaw_prefix_is_fresh_search_only(monkeypatch):
+  """A saved non-prefix placement ID must remain visible to every plan consumer."""
+  import problem
+
+  seen = []
+  monkeypatch.setattr(problem, "set_placement_yaw_prefix", seen.append)
+
+  fresh = RunConfig(solve=True, placement_yaws=4, placement_yaw_widening=True)
+  assert main._set_search_placement_yaw_prefix(fresh, active=True) == 1
+  assert seen[-1] == 1
+
+  # --load-plan wins even if --solve is also present: neither spelling may reactivate the
+  # compact search prefix while reconstructing witnesses or a motion export.
+  for solve in (False, True):
+    loaded = RunConfig(solve=solve, load_plan="plan.json", placement_yaws=4,
+                       placement_yaw_widening=True)
+    assert main._set_search_placement_yaw_prefix(loaded, active=True) is None
+    assert seen[-1] is None
+
+  assert main._set_search_placement_yaw_prefix(fresh, active=False) is None
+  assert seen[-1] is None
+
+
+def test_explicit_release_hoist_can_reuse_the_source_witness_certificate():
+  """Hoisting is a post-pass, not a property of the source IK scene.
+
+  The transaction itself re-certifies changed candidate edges.  A different requested hoist
+  setting must therefore not discard the valid persisted certificate for the unmodified source
+  plan before that transaction gets a chance to roll back to it.
+  """
+  saved_run = RunConfig(hoist_releases=False)
+  saved = {k: getattr(saved_run, k) for k in main._WITNESS_FIELDS}
+  assert main._witnesses_baseline_compatible(saved, RunConfig(hoist_releases=True))
+
+
 def test_optimizer_change_keeps_search_witness_as_baseline_but_reoptimizes():
   saved_run = RunConfig(optimize_witnesses=None, witness_branch_budget=0)
   saved = {k: getattr(saved_run, k) for k in main._WITNESS_FIELDS}
@@ -440,6 +552,21 @@ def test_feasibility_setting_change_rejects_saved_witness_baseline():
   saved = {k: getattr(saved_run, k) for k in main._WITNESS_FIELDS}
   current = RunConfig(strict_collisions=1e-6)
   assert not main._witnesses_baseline_compatible(saved, current)
+
+
+def test_placement_yaws_are_parsed_persisted_and_invalidate_witnesses(tmp_path):
+  import json
+
+  cfg = RunConfig.from_namespace(main.parse_args(["--placement-yaws", "8"]))
+  assert cfg.placement_yaws == 8
+  out = tmp_path / "yaw-plan.json"
+  main.save_plan(str(out), cfg, [])
+  assert json.loads(out.read_text())["config"]["placement_yaws"] == 8
+  assert RunConfig.from_file(str(out)).placement_yaws == 8
+
+  saved_run = RunConfig(placement_yaws=1)
+  saved = {k: getattr(saved_run, k) for k in main._WITNESS_FIELDS}
+  assert not main._witnesses_baseline_compatible(saved, RunConfig(placement_yaws=8))
 
 
 def test_mp_export_clearance_settings_default_to_saved_artifact():

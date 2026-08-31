@@ -95,6 +95,7 @@ class RunConfig:
   fill_local_h: bool = False
   fill_exact: bool = False
   fill_policy_first: bool = False
+  fill_policy_guide: bool = False
   fill_skeleton_first: bool = False
   milestone_boundaries: int = 1
   lazy_fills: bool = True
@@ -137,6 +138,7 @@ class RunConfig:
   # -- IK & feasibility --
   real_ik: bool = True
   ik_seeding: bool = True
+  ik_positive_reuse: bool = False
   ik_restarts: int = 12
   precheck_restarts: int = 12
   fail_order: bool = False
@@ -173,6 +175,7 @@ class RunConfig:
   grasp_sampler_wrap: Optional[float] = None
   grasp_sampler_scenes: bool = False
   stable_rest_poses: bool = False
+  placement_yaws: int = 1
   tight_fingers: bool = True
   openarm_real_finger_radius_scale: float = 1.0
   grasp_closure_check: bool = False
@@ -257,6 +260,7 @@ class RunConfig:
   diagnose_plan_rank: Optional[str] = None
   fill_scope_widening: bool = False
   fill_touch_all: bool = False
+  placement_yaw_widening: bool = False
 
   # -- output & persistence --
   utilization: bool = False

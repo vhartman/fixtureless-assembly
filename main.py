@@ -33,6 +33,9 @@ _STANDARD_SEARCH_PROFILE = {
     # the probe available, but do not make a failed strict concretization part of standard
     # until abstract counterexamples can be repaired instead of merely falling through.
     "fill_policy_first": False,
+    # Post-failure reverse-policy column selection is an ablation until it has a broader
+    # benchmark win.  The ordinary compact fill itself stays byte-for-byte unchanged.
+    "fill_policy_guide": False,
     "fill_skeleton_first": False,
     "milestone_boundaries": 4,
     "fill_scope_widening": True,
@@ -71,6 +74,9 @@ _STANDARD_SEARCH_PROFILE = {
     "mate_eq_weight": 100.0,
     "place_eq_weight": 100.0,
     "ik_seeding": True,
+    # Canonicalize physically identical pre/post IK programs. Exact witnesses and stochastic
+    # effort cursors are shared; different obstacle scenes never exchange a verdict.
+    "ik_positive_reuse": True,
     # Search/action semantics used by the current hands-off assembly artifacts.
     "bracing": True,
     "handovers": True,
@@ -91,13 +97,15 @@ _STANDARD_SEARCH_PROFILE = {
     # dominate (5537 vs 3490 binds on Car-mini obj_1). Alternatives remain explicit ablations.
     "lazy_edge_selector": "forward",
     "analytic_seed_cap": None,
-    # Hybrid V2 grasp DB: conventional primitive grasps remain a stable prefix and mesh-
-    # sampled candidates add off-centre/wrap alternatives. Exact state gates stay authoritative.
+    # V4 keeps V2's hybrid conventional/sample alphabet, but reserves a small, deterministic
+    # scene-positive PICK/ASSEMBLE prefix before the ordinary hybrid order.  This prevents a
+    # compact K prefix from accidentally containing no initial acquisition for a part merely
+    # because conventional rows happened to occupy it. Exact state gates stay authoritative.
     "grasp_sampler": True,
-    # V2's scene/family round-robin remains the measured selector. The task-coverage V3
+    # V4's scene-reserved hybrid order remains the measured selector. The task-coverage V3
     # ablation over-prioritized one-per-fact coverage and cut mate-useful redundancy on the
     # difficult OpenArm wheels (7 -> 4), so it stays explicit rather than becoming a default.
-    "grasp_sampler_version": 2,
+    "grasp_sampler_version": 4,
     "grasp_sampler_keep": 20,
     "grasp_sampler_candidates": 96,
     "grasp_sampler_scenes": True,
@@ -105,12 +113,17 @@ _STANDARD_SEARCH_PROFILE = {
     # those contacts, this emits the complementary side-approach roll that tight insertions
     # often need. Vacuum curvature remains governed separately by --allow-curved-grasps.
     "grasp_sampler_wrap": 0.015,
+    # A horizontal table leaves world-z placement yaw physically free.  Keep four useful
+    # quarter-turn representatives in the finite action space, but expose them per failed fill
+    # (1 -> 2 -> 4) so ordinary problems pay exactly the historical N=1 search cost.
+    "placement_yaws": 4,
+    "placement_yaw_widening": True,
     # Full hybrid grasps are the robust default. On centred OpenArm car-mini, compact-only
     # obj_2 exhausted 6280 effort slots; the full DB solved the same fill in 13 slots/0.8s.
     # The optional staged policy remains available as --grasp-refine for ablation/anytime use.
     "grasp_refine": False,
     # Keep the fast 20-grasp alphabet on ordinary instances. If a complete fill attempt
-    # fails, monotonically expose another stable V3 prefix instead of spending unlimited IK
+    # fails, monotonically expose another stable V4 prefix instead of spending unlimited IK
     # effort on a parameterization set that may simply omit the required contact.
     "grasp_widen": True,
     "grasp_widen_batch": 8,
@@ -327,6 +340,23 @@ def build_parser():
            "the flag does not replay without it (saved in the plan config). Default off.",
   )
   g_scene.add_argument(
+      "--placement-yaws", type=int, default=1, metavar="N",
+      help="Offer N uniformly spaced WORLD-Z rotations of every stable table placement "
+           "(1..24; default 1 preserves the historical action space exactly). Table yaw "
+           "is physically free, so every copy inherits the same support-stability verdict, "
+           "but it can expose a different fixed-arm IK solution. Rotations have distinct "
+           "placement ids and are saved with the plan. Branching grows by up to N; 4 or 8 "
+           "is a useful diagnostic before 12.",
+  )
+  g_search.add_argument(
+      "--placement-yaw-widening", action=argparse.BooleanOptionalAction, default=False,
+      help="With --placement-yaws N>1 and the ordinary milestone solver, expose the finite "
+           "yaw lattice per failed LOCAL fill in coarse-to-fine prefixes (1,2,4,...,N) "
+           "before widening to all-part manipulation. Successful IK witnesses are reused; "
+           "the final prefix is the same complete action space as eager N. Off keeps eager "
+           "placement enumeration.",
+  )
+  g_scene.add_argument(
       "--plain-box", action="store_true",
       help="Cube parts use rai's SHARP box (ST.box) instead of the default sphere-swept ssBox. "
            "ssBox inflates every face by the corner radius r, so two flush-mated cubes overlap "
@@ -491,7 +521,8 @@ def build_parser():
       metavar="ROBOT:PART:GRASP:N_ASSEMBLED[:FACE]",
       help="Pop up the real-robot place IK: with N_ASSEMBLED parts already mated, ROBOT "
            "picks the subassembly by PART at GRASP and sets it on the table resting on "
-           "placement FACE (0-5, 5=upright default), then exit. "
+           "placement id FACE (0-5 in the legacy table, 5=upright default; augmented/stable "
+           "tables also use persisted quaternion-derived ids), then exit. "
            "E.g. --test-place-ik a1:obj_1:0:1:0.",
   )
   g_ik.add_argument(
@@ -515,6 +546,16 @@ def build_parser():
            "(peg-stool chamfer): restarts deliver 25/202 full-solve successes and nothing "
            "wins at attempt >=7. Lower to trade stochastic completeness for time -- a missed "
            "witness blacklists the edge (the fill's other candidates still run).",
+  )
+  g_ik.add_argument(
+      "--ik-positive-reuse", action=argparse.BooleanOptionalAction, default=False,
+      help="Canonicalize skill-local physical IK programs across symbolic aliases (table "
+           "scene for picks/table-supported skills; payload robot/grasp assignments for "
+           "handovers; participating payloads for assembly; destination scene for place). "
+           "Their exact witness and open-witness effort cursor are shared directly, including "
+           "which deterministic NLP/bias slots were already attempted. Enabled by "
+           "--search-profile standard; "
+           "--no-ik-positive-reuse is the matched ablation.",
   )
   g_ik.add_argument(
       "--precheck-restarts", type=int, default=12, metavar="N",
@@ -584,23 +625,25 @@ def build_parser():
   )
   g_ik.add_argument(
       "--grasp-sampler-keep", type=int, default=20, metavar="N",
-      help="--grasp-sampler: initial TOTAL grasps kept per part (default 20). Hybrid V2 "
-           "reserves conventional primitive grasps first; V3 selects a task-conditioned "
-           "stable prefix over conventional and sampled candidates. Mesh/compound parts use "
-           "the whole budget. "
+      help="--grasp-sampler: initial TOTAL grasps kept per part (default 20). V4 reserves "
+           "available scene-positive pick/assemble representatives before its V2-compatible "
+           "hybrid tail; V3 selects a task-conditioned stable prefix over conventional and "
+           "sampled candidates. Mesh/compound parts use the whole budget. "
            "Legacy V1 splits the budget ~half suction / half antipodal.",
   )
   g_ik.add_argument(
-      "--grasp-sampler-version", type=int, choices=(1, 2, 3), default=2, metavar="V",
-      help="Sampled grasp database format. V3 balances task certificates (pick/assemble, "
-           "closure, fixed-arm initial reach, and grasp family) in a K-independent stable "
-           "order. V2 retains the conventional-prefix hybrid database for old plans; V1 "
-           "reconstructs the original replacement sampler.",
+      "--grasp-sampler-version", type=int, choices=(1, 2, 3, 4), default=2, metavar="V",
+      help="Sampled grasp database format. V4 is the standard scene-reserved hybrid: it "
+           "keeps V2's conventional-plus-sampled alphabet but reserves deterministic "
+           "scene-positive PICK/ASSEMBLE representatives before the normal hybrid order. "
+           "V3 is the explicit task-coverage ablation (fixed-arm/LP facts); V2 retains the "
+           "legacy conventional-prefix hybrid database for old plans; V1 reconstructs the "
+           "original replacement sampler.",
   )
   g_ik.add_argument("--grasp-sampler-db-hash", default=None, help=argparse.SUPPRESS)
   g_ik.add_argument(
       "--grasp-refine", action=argparse.BooleanOptionalAction, default=False,
-      help="With hybrid V2 sampling, search primitives first with the exact conventional "
+      help="With hybrid V2/V4 sampling, search primitives first with the exact conventional "
            "grasp prefix (mesh/compound parts still use samples), then retry with sampled "
            "primitive extras only if that compact search finds no plan. Off exposes the full "
            "configured hybrid prefix immediately. This is an explicit ablation; standard uses "
@@ -610,7 +653,7 @@ def build_parser():
       "--grasp-widen", action=argparse.BooleanOptionalAction, default=False,
       help="If search returns no plan with the initial sampled-grasp prefix, retry with "
            "monotonically larger stable prefixes. A finite IK/search miss never deletes an "
-           "old grasp; successful witnesses remain reusable. V2/V3 only.",
+           "old grasp; successful witnesses remain reusable. V2/V3/V4 only.",
   )
   g_ik.add_argument(
       "--grasp-widen-batch", type=int, default=8, metavar="N",
@@ -624,12 +667,16 @@ def build_parser():
   )
   g_ik.add_argument(
       "--grasp-local-widen", action=argparse.BooleanOptionalAction, default=False,
-      help="Build one finite V2/V3 master database up to --grasp-widen-max, but expose "
+      help="Build one finite V2/V3/V4 master database up to --grasp-widen-max, but expose "
            "only --grasp-sampler-keep ids per part to a milestone fill. If the fill "
            "stalls, enlarge the incoming part's prefix by --grasp-widen-batch before "
-           "opening the combinatorial bracing/all-part recovery spaces. The final phase "
-           "exposes the full finite master, so this is lazy column generation rather than "
-           "a grasp-pruning rule. Milestone solver only; incompatible with --grasp-widen.",
+           "opening the combinatorial bracing/all-part recovery spaces. If that complete "
+           "compact milestone session exhausts, the same iterator runs one eager pass with "
+           "the full finite master, so this is lazy column generation rather than a "
+           "grasp-pruning rule. Milestone solver only. If both widening schedules resolve "
+           "true (for example, standard profile + explicit local widening), this local "
+           "schedule supersedes the whole-search --grasp-widen schedule and that resolved "
+           "choice is logged and saved.",
   )
   g_ik.add_argument("--grasp-local-caps", default=None, help=argparse.SUPPRESS)
   g_ik.add_argument(
@@ -1049,9 +1096,11 @@ def build_parser():
   )
   g_search.add_argument(
       "--open-witness", action=argparse.BooleanOptionalAction, default=False,
-      help="Fair witness policy for lazy milestone fills: give each blocking IK edge one "
-           "small batch, temporarily suspend it, and explore alternatives before revisiting "
-           "it in the next fairness epoch. Failed probes remain OPEN and are not stored in "
+      help="Fair witness policy for lazy milestone fills: give each blocking symbolic edge "
+           "one small batch, temporarily suspend that edge, and explore alternatives before "
+           "revisiting it in the next fairness epoch. Physically equivalent aliases share "
+           "the effort cursor and therefore use fresh rather than repeated attempt slots. "
+           "Failed probes remain OPEN and are not stored in "
            "the legacy permanent IK/edge blacklist. Enabled by --search-profile standard; "
            "the no-profile built-in remains off for historical command compatibility.",
   )
@@ -1130,6 +1179,22 @@ def build_parser():
            "transitions are admitted; there is no hand-written action or length bound. A "
            "failed/spurious abstract policy falls through to the complete local fill. "
            "Requires --fill-local-h. Experimental and not enabled by a profile.",
+  )
+  g_search.add_argument(
+      "--fill-policy-guide", action=argparse.BooleanOptionalAction, default=False,
+      help="After the normal compact attempt (and, with --grasp-local-widen, one numeric "
+           "local widening) fails, use a separate full-master reverse PDB for a non-pruning "
+           "additive rescue lift. Existing prefixes remain active; a breadth-first traversal "
+           "of all settled Bellman-optimal branches schedules one bounded stable-ID batch per "
+           "hidden grasp-signature fibre (mover or support), then each requested stable-rest "
+           "yaw orbit. Failed probes retain prior coordinates and advance to another branch; "
+           "normal forward IK remains authoritative and the ordinary grasp/yaw/scope recovery "
+           "schedule remains available. Requires "
+           "--fill-local-h; "
+           "experimental and not enabled by a profile. It never performs backward expensive "
+           "IK validation: the configured lazy validation order remains in force. Requires "
+           "--milestones, --fill-local-h, and either --grasp-local-widen or "
+           "--placement-yaw-widening.",
   )
   g_search.add_argument(
       "--fill-skeleton-first", action=argparse.BooleanOptionalAction, default=False,
@@ -1894,9 +1959,10 @@ def build_parser():
       "--load-plan", metavar="FILE", default=None,
       help="Read the ACTIONS from a saved plan JSON and skip the search, then run the normal "
            "post-passes and export on them (--optimize-witnesses, --fuse-cograsp, "
-           "--motion-plan). Use this to apply a witness pass to a plan you already trust: a "
-           "saved config does NOT carry the solver settings, so re-solving with --config gives "
-           "a DIFFERENT plan. Pair it with --config <the same file> so the scene matches.",
+           "--motion-plan). Use this to apply a witness pass to a plan you already trust. "
+           "Modern files persist the resolved search settings, but re-solving can still choose "
+           "a different finite/anytime result; --load-plan keeps the certified action list "
+           "fixed. Pair it with --config <the same file> so the scene matches.",
   )
   g_output.add_argument(
       "--refresh-witnesses", action="store_true",
@@ -1988,7 +2054,7 @@ _SAVE_CONFIG_FIELDS = (
     # weightless contains releases/lateral mates that are UNSTABLE under gravity, so a rebuild
     # without it cannot reproduce the actions (user-hit: sim StopIteration on a cross-12 plan)
     "mixed_wrench_h", "strict_collisions", "witness_robot_collisions", "plain_box",
-    "stable_rest_poses",                                 # placement ids index the per-group
+    "stable_rest_poses", "placement_yaws",              # placement ids index the per-group
     # placement table, so this changes the ACTION SPACE, not only the geometry
     # SUCCESSOR-AFFECTING and previously UNSAVED: a plan solved with any of these replays
     # against a DIFFERENT successor set than the search that made it, and the first symptom is
@@ -2027,8 +2093,8 @@ _SAVE_CONFIG_FIELDS = (
     "witness_branch_metric", "witness_reconfig_thresh",  # different one yields a different
     # None-pattern, and build_tasks SKIPS a task whose witness is None -- so the rebuilt mode
     # chain stops matching the saved --mp-path ("mode alignment failed: N unmatched").
-    "hoist_releases",                                    # rewrites the PLAN (before --save, so
-    # the saved actions are already hoisted) -- recorded so a rebuild can tell what it is replaying
+    "hoist_releases",                                    # requested release-hoist policy. A real-IK
+    # rewrite is transactional: failed re-certification preserves the saved source action order.
     "witness_clearance", "handovers", "allow_place",
     "fuse_cograsp", "fuse_pre_skill",                   # motion-only witness/keyframe passes
     "mp_sequence",                                       # depgraph vs sequence = a different
@@ -2055,11 +2121,12 @@ _SAVE_CONFIG_FIELDS = (
     # resolved values rather than only a named-profile label: profiles may evolve, whereas a
     # paper artifact must keep the semantics it was actually solved under.
     "weight", "milestones", "goal_on_table", "milestone_oracle", "fill_local_h", "fill_exact",
-    "fill_policy_first", "fill_skeleton_first", "milestone_boundaries",
-    "fill_scope_widening", "fill_touch_all",
+    "fill_policy_first", "fill_policy_guide", "fill_skeleton_first", "milestone_boundaries",
+    "fill_scope_widening", "fill_touch_all", "placement_yaw_widening",
     "fill_window", "lazy_fills", "open_witness", "open_witness_batch",
     "open_witness_epochs", "lazy_edge_selector", "analytic_seed_cap", "ssik_seed_neighborhood",
     "ssik_neighborhood_cap", "fail_order", "empty_seed_refutes",
+    "ik_positive_reuse",
     "wrench_aware_h", "sig_collapsed_h", "sig_components",
 )
 
@@ -2092,13 +2159,13 @@ _WITNESS_FIELDS = (
     "grasp_accuracy", "grasp_eq_weight",
     "ik_accuracy", "ik_seeding", "ssik_seed_neighborhood", "ssik_neighborhood_cap",
     "seed", "bracing", "handovers", "allow_place",
-    "tight_fingers", "openarm_real_finger_radius_scale", "part_float", "hoist_releases", "witness_margin",
+    "tight_fingers", "openarm_real_finger_radius_scale", "part_float", "witness_margin",
     "witness_joint_margin", "witness_draw",
     "witness_sets", "witness_set_spread",
     "grasp_sampler", "grasp_sampler_keep", "grasp_sampler_candidates", "grasp_sampler_seed",
     "grasp_sampler_version", "grasp_sampler_db_hash",
     "grasp_sampler_margin", "grasp_sampler_pad_support", "grasp_sampler_wrap",
-    "grasp_sampler_scenes")
+    "grasp_sampler_scenes", "placement_yaws")
 
 
 def _witnesses_reusable(saved_cfg, cfg):
@@ -2143,6 +2210,65 @@ def _witnesses_baseline_compatible(saved_cfg, cfg):
           + ", ".join(bad) + ".")
   return not bad
 
+
+def _selected_solver_engine(cfg):
+  """Return the one search engine selected by `_dispatch_solve`'s precedence.
+
+  Several newer flags refine the ordinary milestone *iterator*, rather than the common action
+  model.  Keeping this small precedence mirror beside dispatch lets the CLI reject an otherwise
+  plausible spelling which a higher-priority solver would silently ignore.  It deliberately
+  describes only public engine families, not individual implementation branches.
+  """
+  if cfg.ladder_lns is not None:
+    return "ladder-lns"
+  if cfg.ladder is not None:
+    return "ladder"
+  if cfg.milestones_anytime is not None:
+    return "milestones-anytime"
+  if cfg.bounded or cfg.dfbnb:
+    return "bounded"
+  if cfg.lazy:
+    return "lazy"
+  if cfg.optimistic:
+    return "optimistic"
+  if cfg.anytime is not None:
+    return "anytime"
+  return "milestones" if cfg.milestones else "exact"
+
+
+def _validate_solver_scoped_flags(cfg):
+  """Fail closed for flags implemented by a specific search schedule.
+
+  The core finite grasp/placement action space is shared by all engines.  In contrast, local
+  columns, yaw bands, and the reverse-policy rescue are *ordering schedules* implemented only
+  by the ordinary milestone iterator.  Accepting those flags under a higher-priority solver
+  would make an experiment look configured while doing nothing.
+  """
+  engine = _selected_solver_engine(cfg)
+  if cfg.grasp_local_widen and engine != "milestones":
+    raise SystemExit("--grasp-local-widen requires the ordinary --milestones solver; "
+                     f"selected engine is {engine}")
+  if cfg.placement_yaw_widening and engine != "milestones":
+    raise SystemExit("--placement-yaw-widening is currently scheduled only by the ordinary "
+                     f"--milestones solver; selected engine is {engine}")
+  if cfg.fill_policy_first:
+    if not cfg.fill_local_h:
+      raise SystemExit("--fill-policy-first requires --fill-local-h")
+    if engine not in ("milestones", "milestones-anytime", "optimistic"):
+      raise SystemExit("--fill-policy-first is implemented only by milestone/optimistic "
+                       f"local fills; selected engine is {engine}")
+  if cfg.fill_policy_guide:
+    if engine != "milestones":
+      raise SystemExit("--fill-policy-guide is implemented only by the ordinary "
+                       f"--milestones solver; selected engine is {engine}")
+    if not cfg.fill_local_h:
+      raise SystemExit("--fill-policy-guide requires --fill-local-h")
+    if not (cfg.grasp_local_widen or cfg.placement_yaw_widening):
+      raise SystemExit("--fill-policy-guide requires --grasp-local-widen or "
+                       "--placement-yaw-widening; otherwise it has no fibre to widen")
+  return engine
+
+
 def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
   # Select the search engine from the cfg flags and run it; returns the plan (or None).
   # PURE dispatch: no global-state changes here (all set-up ran before this is called), so
@@ -2178,6 +2304,7 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         fill_window=cfg.fill_window, milestone_oracle=cfg.milestone_oracle,
         fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
         fill_policy_first=cfg.fill_policy_first,
+        fill_policy_guide=cfg.fill_policy_guide,
         fill_skeleton_first=cfg.fill_skeleton_first,
         fill_scope_widening=cfg.fill_scope_widening,
         milestone_boundaries=cfg.milestone_boundaries)
@@ -2217,6 +2344,7 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
                                              fill_local_h=cfg.fill_local_h,
                                              fill_exact=cfg.fill_exact,
                                              fill_policy_first=cfg.fill_policy_first,
+                                             fill_policy_guide=cfg.fill_policy_guide,
                                              fill_skeleton_first=cfg.fill_skeleton_first,
                                              chain_h=cfg.optimistic_chain_h,
                                              grasp_collapsed_h=cfg.grasp_collapsed_h,
@@ -2245,13 +2373,15 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         lazy_fills=cfg.lazy_fills, milestone_oracle=cfg.milestone_oracle,
         fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
         fill_policy_first=cfg.fill_policy_first,
+        fill_policy_guide=cfg.fill_policy_guide,
         fill_skeleton_first=cfg.fill_skeleton_first,
         fill_scope_widening=cfg.fill_scope_widening,
         milestone_boundaries=cfg.milestone_boundaries,
         grasp_local_widen=cfg.grasp_local_widen,
         grasp_initial_keep=cfg.grasp_sampler_keep,
         grasp_widen_batch=cfg.grasp_widen_batch,
-        grasp_widen_max=cfg.grasp_widen_max)
+        grasp_widen_max=cfg.grasp_widen_max,
+        placement_yaw_widening=cfg.placement_yaw_widening)
   else:
     plan = solve_assembly_problem(C, assembly, robots=robots, canonical=cfg.canonical,
                                   weight=cfg.weight, robot_ik=robot_ik, wrench=cfg.wrench,
@@ -2282,13 +2412,15 @@ def _milestone_candidate_session(cfg, C, assembly, robots, robot_ik):
       lazy_fills=cfg.lazy_fills, milestone_oracle=cfg.milestone_oracle,
       fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
       fill_policy_first=cfg.fill_policy_first,
+      fill_policy_guide=cfg.fill_policy_guide,
       fill_skeleton_first=cfg.fill_skeleton_first,
       fill_scope_widening=cfg.fill_scope_widening,
       milestone_boundaries=cfg.milestone_boundaries,
       grasp_local_widen=cfg.grasp_local_widen,
       grasp_initial_keep=cfg.grasp_sampler_keep,
       grasp_widen_batch=cfg.grasp_widen_batch,
-      grasp_widen_max=cfg.grasp_widen_max)
+      grasp_widen_max=cfg.grasp_widen_max,
+      placement_yaw_widening=cfg.placement_yaw_widening)
 
 
 def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
@@ -2303,7 +2435,7 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
   import shutil
   import subprocess
   import time
-  from solver import collect_plan_witnesses, hoist_releases
+  from solver import collect_plan_witnesses, hoist_releases_certified
   from plan_io import require_complete_witnesses, witness_block
 
   if not cfg.motion_plan or not cfg.solve or cfg.load_plan:
@@ -2361,6 +2493,7 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
                                 and cfg.grasp_refine),
       "grasp_widening": bool(cfg.grasp_sampler and cfg.grasp_sampler_version >= 2
                               and cfg.grasp_widen),
+      "grasp_local_widening": bool(cfg.grasp_local_widen),
   }
   seen_plan_ids = set()
 
@@ -2377,9 +2510,22 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
 
   def prepare(raw_plan, index):
     plan = list(raw_plan)
+    # The resumable milestone iterator can cross from its compact K->K+B session into the
+    # finite-master completion session between candidate pulls.  Persist the cap that made
+    # THIS candidate, not the command's initial K, before writing a replay/MP artifact.
+    if cfg.grasp_local_widen and hasattr(assembly, "_grasp_local_caps"):
+      cfg.grasp_local_caps = dict(assembly._grasp_local_caps)
+    # Certify the candidate emitted by the paused search before touching its action order.
+    # The transactional hoist below can then safely fall back to this exact source artifact.
+    witnesses = collect_plan_witnesses(
+        C, assembly, plan, robots, robot_ik,
+        gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
+        handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
+        resolve_missing=True)
+    require_complete_witnesses(plan, witnesses, who="open-plan source certificate")
     if cfg.hoist_releases:
-      plan = hoist_releases(
-          C, assembly, plan, robots,
+      plan, witnesses, _hoist_applied = hoist_releases_certified(
+          C, assembly, plan, witnesses, robots, robot_ik,
           gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
           handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing)
     pid = plan_id(plan)
@@ -2389,11 +2535,6 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
     seen_plan_ids.add(pid)
     prefix = _os.path.join(work, f"candidate-{index:03d}-{pid}")
     pfile, efile = prefix + "-plan.json", prefix + "-export.json"
-    witnesses = collect_plan_witnesses(
-        C, assembly, plan, robots, robot_ik,
-        gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
-        handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
-        resolve_missing=True)
     require_complete_witnesses(plan, witnesses, who="open-plan search certificate")
     save_plan(pfile, cfg, plan,
               witnesses=witness_block(list(robot_ik.C.getJointNames()), witnesses,
@@ -2642,6 +2783,21 @@ def _merge_mp_export_clearance_settings(cfg, saved, explicit=None):
   return values, sources
 
 
+def _set_search_placement_yaw_prefix(cfg, active):
+  """Install the compact yaw prefix only while a fresh search is running.
+
+  Placement IDs are persisted plan data.  Load-plan, replay, visualization and every
+  post-processing pass must therefore see the complete configured table, even when the saved
+  search used failure-driven yaw widening.  ``cfg.solve`` alone is insufficient because the
+  CLI permits ``--solve --load-plan`` and load-plan deliberately wins without searching.
+  """
+  prefix = (1 if active and cfg.solve and not cfg.load_plan
+            and cfg.placement_yaw_widening else None)
+  from problem import set_placement_yaw_prefix
+  set_placement_yaw_prefix(prefix)
+  return prefix
+
+
 def run(cfg, explicit=None):
   # cfg: RunConfig -- the single typed configuration object for the whole run. Every setting
   # below reads a cfg field; the thin main() wrapper builds cfg from the parsed CLI args.
@@ -2649,6 +2805,16 @@ def run(cfg, explicit=None):
   # library callers. The dead-flag warnings below fire only for explicit flags.
   if cfg.optimize_witnesses == "off":          # 'floor' is the default; 'off' is the escape
     cfg.optimize_witnesses = None
+  explicit_set = set(explicit or ())
+  if cfg.placement_yaw_widening and cfg.placement_yaws <= 1:
+    if "placement_yaws" in explicit_set and "placement_yaw_widening" not in explicit_set:
+      # A scalar family size of one has no widening to schedule. Let the natural one-flag
+      # standard-profile ablation work; an explicitly contradictory pair still fails below.
+      cfg.placement_yaw_widening = False
+      print("[flag] explicit --placement-yaws 1 disables profile-owned placement-yaw "
+            "widening (historical action-space ablation).")
+    else:
+      raise SystemExit("--placement-yaw-widening requires --placement-yaws N with N > 1")
   _profile = getattr(cfg, "_search_profile", None)
   if _profile:
     print(f"[profile] search '{_profile}' resolved: weight={cfg.weight:g}, "
@@ -2661,6 +2827,8 @@ def run(cfg, explicit=None):
           + (f" batch={cfg.open_witness_batch} epochs={cfg.open_witness_epochs}"
              f" selector={cfg.lazy_edge_selector}"
              if cfg.open_witness else "")
+          + (f", placements=1->{cfg.placement_yaws} yaw bands"
+             if cfg.placement_yaw_widening else f", placements={cfg.placement_yaws} yaw(s) eager")
           + f", analytic-seed-cap={cfg.analytic_seed_cap or 'all'}. "
           "Explicit individual flags remain authoritative.")
   _mp_profile = getattr(cfg, "_motion_profile", None)
@@ -2724,21 +2892,24 @@ def run(cfg, explicit=None):
     # Named standard currently carries the older whole-search retry policy. An explicit
     # local schedule replaces it cleanly instead of forcing profile users to remember a
     # second negating flag; the resolved/saved config records the actual policy.
-    print("[flag] --grasp-local-widen supersedes profile --grasp-widen; disabling the "
+    print("[flag] --grasp-local-widen supersedes --grasp-widen; disabling the "
           "whole-search restart schedule.")
     cfg.grasp_widen = False
+  # These are search-schedule flags. A replay/export-only invocation may retain their saved
+  # provenance while never selecting a search engine at all, so validate them only when this
+  # process is actually asked to solve.
+  if cfg.solve and not cfg.load_plan:
+    _validate_solver_scoped_flags(cfg)
   if cfg.grasp_widen:
     if not cfg.grasp_sampler or cfg.grasp_sampler_version < 2:
-      raise SystemExit("--grasp-widen requires --grasp-sampler-version 2 or 3")
+      raise SystemExit("--grasp-widen requires --grasp-sampler-version 2, 3, or 4")
     if cfg.grasp_widen_batch < 1:
       raise SystemExit("--grasp-widen-batch must be >= 1")
     if cfg.grasp_widen_max < cfg.grasp_sampler_keep:
       raise SystemExit("--grasp-widen-max must be >= --grasp-sampler-keep")
   if cfg.grasp_local_widen:
-    if not cfg.milestones:
-      raise SystemExit("--grasp-local-widen currently requires --milestones")
     if not cfg.grasp_sampler or cfg.grasp_sampler_version < 2:
-      raise SystemExit("--grasp-local-widen requires --grasp-sampler-version 2 or 3")
+      raise SystemExit("--grasp-local-widen requires --grasp-sampler-version 2, 3, or 4")
     if cfg.grasp_widen_batch < 1:
       raise SystemExit("--grasp-widen-batch must be >= 1")
     if cfg.grasp_widen_max < cfg.grasp_sampler_keep:
@@ -2763,7 +2934,9 @@ def run(cfg, explicit=None):
                         "pad_support": cfg.grasp_sampler_pad_support,
                         "wrap": cfg.grasp_sampler_wrap})
     print(f"[flag] --grasp-sampler ACTIVE: V{cfg.grasp_sampler_version} "
-          + ("TASK-COVERAGE conventional + mesh-sampled" if cfg.grasp_sampler_version >= 3
+          + ("TASK-COVERAGE conventional + mesh-sampled" if cfg.grasp_sampler_version == 3
+             else "SCENE-RESERVED HYBRID conventional + mesh-sampled"
+                  if cfg.grasp_sampler_version == 4
              else "HYBRID conventional + mesh-sampled" if cfg.grasp_sampler_version >= 2
              else "legacy replacement mesh-sampled")
           + f" grasp DB ({cfg.grasp_sampler_candidates} raw candidates -> "
@@ -2783,16 +2956,32 @@ def run(cfg, explicit=None):
       print(f"[flag] --grasp-local-widen ACTIVE: one stable finite master is built up to "
             f"K={cfg.grasp_widen_max}; concrete fills start with K={cfg.grasp_sampler_keep} "
             f"per part and expose {cfg.grasp_widen_batch} more incoming-part columns after "
-            "a local failure. IK misses remain open and grasp IDs never change.")
+            "a local failure. If the compact resumable session exhausts, one eager "
+            "finite-master session follows. IK misses remain open and grasp IDs never change.")
   else:
     set_sampled_grasps(None)
+  from problem import set_placement_yaws, set_stable_rest_poses
+  set_stable_rest_poses(bool(getattr(cfg, "stable_rest_poses", False)))
+  set_placement_yaws(cfg.placement_yaws)
+  # The compact prefix is a search schedule, never part of the scene/plan identity.  Keep the
+  # full table visible while constructing the scene and for all no-search consumers; the
+  # search branch below activates prefix 1 inside its own try/finally scope.
+  _set_search_placement_yaw_prefix(cfg, active=False)
   if getattr(cfg, "stable_rest_poses", False):
-    from problem import set_stable_rest_poses
-    set_stable_rest_poses(True)
     print("[flag] --stable-rest-poses ACTIVE: placements come from the shape's TRUE stable "
           "rest orientations (convex hull + mass-weighted centre of mass), not the six "
           "axis-aligned faces. Placement id 5 still means 'as anchored'. Grasp ids are "
           "unaffected; PLACEMENT ids rebind, so plans do not cross the flag.")
+  if cfg.placement_yaws != 1:
+    print(f"[flag] --placement-yaws {cfg.placement_yaws} ACTIVE: each stable table rest is "
+          "augmented with a uniform world-z yaw lattice. Support stability is shared, but "
+          "every yaw has its own replay-safe placement id and IK witness; place branching "
+          f"grows by up to {cfg.placement_yaws}x.")
+  if cfg.placement_yaw_widening:
+    print("[flag] --placement-yaw-widening ACTIVE: each milestone fill starts with the "
+          "historical yaw only, opens the finite lattice coarse-to-fine on local failure, "
+          "then admits all-part manipulation. The complete configured lattice remains the "
+          "final action-space net.")
   if cfg.plain_box:
     from problem import set_plain_box
     set_plain_box(True)
@@ -3083,8 +3272,8 @@ def run(cfg, explicit=None):
     from problem import install_sampled_scene_ctx
     # V3 conditions the bounded prefix on exact INITIAL-pick reach. Build the same calibrated
     # RobotIK object search will later use, and only expose its exact branches as ranking facts.
-    # V2 replay remains byte-identical and does not pay for or include this context.
-    if cfg.grasp_sampler_version >= 3 and cfg.real_ik and cfg.ik_seeding:
+    # V2/V4 replay remains byte-identical and does not pay for or include this V3-only context.
+    if cfg.grasp_sampler_version == 3 and cfg.real_ik and cfg.ik_seeding:
       _sampler_robot_ik = RobotIK(C, get_robots(C))
       _sampler_robot_ik.ik_seeding = True
     install_sampled_scene_ctx(C, assembly, robots=get_robots(C),
@@ -3308,10 +3497,15 @@ def run(cfg, explicit=None):
       robot_ik.restarts_full = cfg.ik_restarts
       robot_ik.restarts_precheck = cfg.precheck_restarts
       robot_ik.fail_order = cfg.fail_order
+      robot_ik.positive_ik_reuse = bool(cfg.ik_positive_reuse)
       robot_ik.analytic_seed_cap = cfg.analytic_seed_cap
       robot_ik.ssik_seed_neighborhood = float(cfg.ssik_seed_neighborhood)
       robot_ik.ssik_neighborhood_cap = int(cfg.ssik_neighborhood_cap)
       robot_ik.empty_seed_refutes = cfg.empty_seed_refutes
+      if cfg.ik_positive_reuse:
+        print("[flag] --ik-positive-reuse ACTIVE: identical skill-local physical queries "
+              "(table scene or participating payload/grasps, as appropriate) share their "
+              "exact witness and open-witness effort cursor; failures remain open.")
       if cfg.ssik_seed_neighborhood < 0.0:
         raise SystemExit("main.py: --ssik-seed-neighborhood must be >= 0")
       if cfg.ssik_neighborhood_cap < 1:
@@ -3484,14 +3678,12 @@ def run(cfg, explicit=None):
       robot_ik.fail_log_stop = True                # abort the search when the window closes
     if cfg.load_plan:
       # RE-RUN THE POST-PASSES ON A PLAN YOU ALREADY TRUST -- no search.
-      # A saved plan's `config` block does NOT persist the solver settings (no weight, no
-      # heuristic, no lazy, no anytime budget, no --min-sep), so `--config saved.json` does not
-      # reproduce the run that wrote it: MEASURED on car-mini, a re-solve with guessed flags gave
-      # a 29-action plan that executes 19-21/29 where the saved 25-action plan runs 17/17. That
-      # makes a fresh solve the wrong way to apply a WITNESS pass (--optimize-witnesses,
-      # --fuse-cograsp) or to re-export a --motion-plan path: it silently changes the plan the
-      # result is about. Loading the actions keeps the discrete plan fixed and re-runs only what
-      # was asked for. The scene still comes from --config/CLI, so it must MATCH the saved plan.
+      # Modern saved plans persist the resolved solver settings as reproducibility provenance,
+      # but re-running those settings is still the wrong way to apply a witness pass
+      # (--optimize-witnesses, --fuse-cograsp) or re-export a motion path: a finite/anytime
+      # search may return a different discrete plan. Loading keeps the certified action list
+      # fixed and re-runs only what was requested. The scene still comes from --config/CLI, so
+      # it must MATCH the saved plan.
       from plan_io import read_plan as _read_saved_plan
       _saved_cfg, plan = _read_saved_plan(cfg.load_plan)
       # Keep the original search certificate if this plan is written out again.
@@ -3548,9 +3740,10 @@ def run(cfg, explicit=None):
             "database, or correct the gripper/part geometry.")
       if _unpickable and cfg.grasp_widen:
         print(f"[grasp-preflight] current {cfg.grasp_sampler_keep}-grasp prefix cannot pick "
-              f"{_unpickable} in isolation; deferring the sound abort while the finite V3 "
-              "master pool is widened.")
+              f"{_unpickable} in isolation; deferring the sound abort while the finite "
+              "sampled-master pool is widened.")
       try:
+        _set_search_placement_yaw_prefix(cfg, active=True)
         print(f"[rss] peak RSS before solve: {_rss_mb():.0f} MB")   # A1/A6 instrumentation
         _staged_grasps = bool(cfg.grasp_sampler and cfg.grasp_sampler_version >= 2
                               and cfg.grasp_refine)
@@ -3594,26 +3787,11 @@ def run(cfg, explicit=None):
           print("[grasp-refine] local epochs exhausted -> final completeness epoch: full "
                 "grasps + configured bracing + all-part scope widening.")
           plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
-        if plan is None and cfg.grasp_local_widen:
-          # Local column generation is deliberately bounded per milestone boundary so a bad
-          # predecessor cannot monopolize all grasp/IK effort. Completeness relative to the
-          # finite sampled master is recovered once, here, after milestone backtracking has
-          # exhausted those compact attempts. The RobotIK object and stable ids survive.
-          print("[grasp-columns] compact milestone alternatives exhausted -> one final "
-                "full-master milestone pass. This is the finite action-space completeness "
-                "net; no grasp or IK failure was promoted to a permanent no-good.")
-          cfg.grasp_local_widen = False
-          try:
-            plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
-          finally:
-            cfg.grasp_local_widen = True
-          cfg.grasp_local_caps = {p: int(cfg.grasp_widen_max) for p in assembly.objects}
-          assembly._grasp_local_caps = dict(cfg.grasp_local_caps)
         if plan is None and cfg.grasp_widen:
           from problem import (set_sampled_canonical_only, set_sampled_grasp_keep,
                                sampled_grasp_db_signature)
           if not cfg.grasp_sampler or cfg.grasp_sampler_version < 2:
-            raise ValueError("--grasp-widen requires --grasp-sampler-version 2 or 3")
+            raise ValueError("--grasp-widen requires --grasp-sampler-version 2, 3, or 4")
           if cfg.grasp_widen_batch < 1:
             raise ValueError("--grasp-widen-batch must be >= 1")
           if cfg.grasp_widen_max < cfg.grasp_sampler_keep:
@@ -3696,6 +3874,7 @@ def run(cfg, explicit=None):
         if cfg.grasp_sampler:
           from problem import set_sampled_canonical_only
           set_sampled_canonical_only(False)               # post-passes/replay see full DB
+        _set_search_placement_yaw_prefix(cfg, active=False)  # saved plan/post-passes see all ids
     if cfg.grasp_local_widen and hasattr(assembly, "_grasp_local_caps"):
       cfg.grasp_local_caps = dict(assembly._grasp_local_caps)
       used = ", ".join(f"{p}:{k}" for p, k in sorted(cfg.grasp_local_caps.items()))
@@ -3727,26 +3906,12 @@ def run(cfg, explicit=None):
       print(f"plan ({len(plan)} actions):")
       for step in plan:
         print("  ", step)
-      # A saved plan already contains every post-pass that ran before save_plan. Reapplying
-      # the non-idempotent hoist on --load-plan can move releases a SECOND time, so the motion
-      # path is then for a different action order than the JSON which sim.py reloads. The
-      # saved true value documents how the plan was made; it is not a request to mutate it on
-      # every load. An explicit CLI --hoist-releases remains the opt-in way to apply the pass
-      # to an older/unhoisted file.
-      if _should_hoist_plan(cfg, explicit):
-        # BEFORE save/witnesses/utilization/motion-plan, so all downstream consumers see the
-        # hoisted plan (witnesses are solved for the hoisted states).
-        from solver import hoist_releases
-        plan = hoist_releases(C, assembly, plan, robots,
-                              gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
-                              handovers=cfg.handovers, allow_place=cfg.allow_place,
-                              bracing=cfg.bracing)
       # SEARCH CERTIFICATE PERSISTENCE. The exact witness that made each selected IK edge pass
       # is the baseline for every later stage. Never ask a new process to rediscover it. A
-      # fresh plan is collected from the positive search cache/open pool; release hoisting may
-      # have changed a predecessor scene, in which case only those changed edges are certified
-      # here, before anything is written. A loaded plan is read-only unless the user explicitly
-      # asks for --refresh-witnesses.
+      # fresh plan is collected from the positive search cache/open pool. A release-hoist is a
+      # transaction *after* this source certificate exists: it can commit only if every changed
+      # predecessor scene is re-certified, otherwise the original plan/witnesses are retained.
+      # A loaded plan is read-only unless the user explicitly asks for --refresh-witnesses.
       from plan_io import (read_witnesses, read_witness_stage, require_complete_witnesses,
                            witness_block)
       joint_names = list(robot_ik.C.getJointNames()) if robot_ik is not None else []
@@ -3789,6 +3954,44 @@ def run(cfg, explicit=None):
             gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
             handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
             resolve_missing=True)
+      if baseline_witnesses is not None:
+        require_complete_witnesses(plan, baseline_witnesses,
+                                   who="source search-witness persistence")
+
+      # A saved plan already contains every post-pass that ran before save_plan. Reapplying
+      # the non-idempotent hoist on --load-plan can move releases a SECOND time, so the motion
+      # path is then for a different action order than the JSON which sim.py reloads. The
+      # saved true value documents how the plan was made; it is not a request to mutate it on
+      # every load. An explicit CLI --hoist-releases remains the opt-in way to apply the pass
+      # to an older/unhoisted file.
+      _hoist_applied = False
+      if _should_hoist_plan(cfg, explicit):
+        gk = wrench_kind_arg(C, robots) if cfg.wrench else None
+        if robot_ik is None:
+          # There is no keyframe certificate in a floating-EE / symbolic-only solve. Retain the
+          # original cheap-geometric hoist behaviour in that mode.
+          from solver import hoist_releases
+          plan = hoist_releases(C, assembly, plan, robots, gripper_kind=gk,
+                                handovers=cfg.handovers, allow_place=cfg.allow_place,
+                                bracing=cfg.bracing)
+        elif baseline_witnesses is None:
+          # A final loaded MP export is a zero-IK artifact for this exact plan; changing action
+          # order would invalidate its task signature and there is no source certificate to
+          # transactionally preserve here.
+          print("[hoist] skipped: no source witness block is available to recertify the "
+                "rewritten plan; retaining the original plan.")
+        else:
+          from solver import hoist_releases_certified
+          plan, baseline_witnesses, _hoist_applied = hoist_releases_certified(
+              C, assembly, plan, baseline_witnesses, robots, robot_ik,
+              gripper_kind=gk, handovers=cfg.handovers, allow_place=cfg.allow_place,
+              bracing=cfg.bracing)
+          if _hoist_applied:
+            # Persisted optimized witnesses/sets were aligned to the source ordering.  The
+            # newly certified candidate is a search-stage baseline; any requested optimizer
+            # must run again rather than treating the old final stage as positionally reusable.
+            _saved_witness_stage = None
+
       if baseline_witnesses is not None:
         require_complete_witnesses(plan, baseline_witnesses,
                                    who="search-witness persistence")

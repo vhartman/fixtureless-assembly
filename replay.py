@@ -99,7 +99,7 @@ def apply_wrench_params(cfg):
 def build_scene(cfg):
   # reconstruct the exact environment the plan was solved in (same seed => same scatter/perturb)
   set_seed(cfg["seed"])
-  # Closure-aware V2 sampling changes the ranked, bounded grasp database. Restore it BEFORE
+  # Closure-aware versioned sampling changes the ranked, bounded grasp database. Restore it BEFORE
   # make_assembly/install_sampled_scene_ctx so a saved grasp id cannot silently rebind (and so
   # the database-hash check below compares like with like).
   from solver import set_grasp_closure_check
@@ -148,10 +148,12 @@ def build_scene(cfg):
                       "wrap": _saved(cfg, "grasp_sampler_wrap")}
                      if _saved(cfg, "grasp_sampler") else None)  # sampled ids: same hazard class
   set_plain_box(bool(_saved(cfg, "plain_box")))                # cube collision geometry must match
-  from problem import set_stable_rest_poses
+  from problem import set_placement_yaw_prefix, set_placement_yaws, set_stable_rest_poses
   # PLACEMENT ids index the per-group table, so a replay must fill it the same way the
   # search did. Missing key => False, which is what every plan saved before the flag used.
   set_stable_rest_poses(bool(_saved(cfg, "stable_rest_poses")))
+  set_placement_yaws(int(_saved(cfg, "placement_yaws")))
+  set_placement_yaw_prefix(None)                            # scheduling never restricts replay
   from env import set_tight_fingers
   # LEGACY-FAITHFUL: tight fingers became the DEFAULT on 2026-07-29, so a plan saved before
   # the flag was persisted was certified with the FAT proxy. Missing => False, not True.
@@ -208,7 +210,13 @@ def build_scene(cfg):
                            # came later. Missing => 0.015, what pre-flag plans were solved with.
                            float_height=_saved(cfg, "part_float", legacy=0.015),
                            min_sep=_saved(cfg, "min_sep"), grid=_saved(cfg, "grid_init"),
-                           grid_gap=_saved(cfg, "grid_gap"))
+                           grid_gap=_saved(cfg, "grid_gap"),
+                           # The standard profile now centres the scatter lattice.  This is
+                           # scene geometry, not merely a search preference: omitting it puts
+                           # every part at a different world pose during replay.  Plans that
+                           # predate the persisted field retain the historical left-anchored
+                           # layout rather than inheriting today's profile default.
+                           center_scatter=bool(_saved(cfg, "center_scatter", legacy=False)))
   if _saved(cfg, "grasp_sampler_scenes", legacy=False):
     # the scene-filtered DB is per PART INSTANCE and its ids are what the plan indexes: the
     # replay scene must install the same filter context or every saved grasp id misreads.

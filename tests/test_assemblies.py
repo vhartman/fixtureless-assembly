@@ -921,6 +921,64 @@ def test_fill_policy_edge_uses_bellman_equality_and_rejects_hidden_stutters():
   assert not S._fill_policy_edge(pdb, ("s", 0), action, ("s", 1))
 
 
+def test_policy_atoms_follow_one_bellman_route_as_atomic_fibres():
+  """The guide sees ordered raw signature fibres, never a union/product of policy paths."""
+  import solver as S
+
+  pdb = object.__new__(S.CollapsedLabeledHeuristic)
+  held = object()
+  pdb.H = held
+  pdb._labeled_loose = True
+  pdb._vgroups = {("base",): {("obj_0", "support-class"): (5, 6)}}
+  pdb._svgroups = {"obj_1": {"loose-class": (7,)},
+                   "obj_alt": {"alt-class": (8,)}}
+  s0 = (("base",), (), held, ())
+  s1 = (("base",), (("obj_0", "support-class"),), held,
+        (("obj_1", "loose-class"),))
+  s2 = (("base",), (("obj_0", "support-class"),), "rest-class", ())
+  alternate = (("z",), (), held, (("obj_alt", "alt-class"),))
+  pdb._policy_next = {s0: {s1, alternate}, s1: {s2}}
+  pdb.abstract = lambda _state: s0
+  pdb.value = lambda _state: 3.0
+
+  atoms = pdb.policy_atoms(object())
+  assert atoms == (
+      ("grasp", "support", ("base",), "obj_0", "support-class", frozenset({5, 6})),
+      ("grasp", "loose", ("obj_1",), "obj_1", "loose-class", frozenset({7})),
+      ("yaw", ("base",), "rest-class"),
+  )
+
+
+def test_policy_atom_frontier_covers_all_bellman_branches_breadth_first():
+  """Widening sees an alternative optimal branch hidden by deterministic path selection."""
+  import solver as S
+
+  pdb = object.__new__(S.CollapsedLabeledHeuristic)
+  held = object()
+  pdb.H = held
+  pdb._labeled_loose = True
+  pdb._vgroups = {("base",): {("obj_0", "support-class"): (5, 6)}}
+  pdb._svgroups = {"obj_1": {"loose-class": (7,)},
+                   "obj_alt": {"alt-class": (8,)}}
+  s0 = (("base",), (), held, ())
+  s1 = (("base",), (("obj_0", "support-class"),), held,
+        (("obj_1", "loose-class"),))
+  s2 = (("base",), (("obj_0", "support-class"),), "rest-class", ())
+  alternate = (("z",), (), held, (("obj_alt", "alt-class"),))
+  pdb._policy_next = {s0: {s1, alternate}, s1: {s2}}
+  pdb.abstract = lambda _state: s0
+  pdb.value = lambda _state: 3.0
+
+  atoms = pdb.policy_atom_frontier(object())
+  assert atoms == (
+      ("grasp", "loose", ("obj_1",), "obj_1", "loose-class", frozenset({7})),
+      ("grasp", "loose", ("obj_alt",), "obj_alt", "alt-class", frozenset({8})),
+      ("grasp", "support", ("base",), "obj_0", "support-class",
+       frozenset({5, 6})),
+      ("yaw", ("base",), "rest-class"),
+  )
+
+
 def test_fill_policy_first_refines_a_replayable_sequence():
   A.set_seed(0); A.set_rolls_per_face(1)
   asm = A.make_assembly("cross", 3)
@@ -933,6 +991,580 @@ def test_fill_policy_first_refines_a_replayable_sequence():
       fill_policy_first=True)
   assert plan is not None
   assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+
+
+def test_fill_policy_guide_requires_a_widened_fibre():
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 3)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  with pytest.raises(ValueError, match="no fibre to widen"):
+    A.solve_assembly_problem_milestones(
+        C, asm, robots=robots, weight=1.0, verbose=False,
+        milestone_oracle="structural", fill_local_h=True, fill_exact=True,
+        fill_policy_guide=True)
+
+
+def test_fill_policy_guide_rejects_backends_that_cannot_schedule_a_fibre():
+  """Library callers get the same fail-closed contract as the CLI."""
+  import solver as S
+
+  with pytest.raises(ValueError, match="ordinary milestone"):
+    S.solve_assembly_problem_optimistic(
+        None, None, robots=[], fill_local_h=True, fill_policy_guide=True)
+  with pytest.raises(ValueError, match="ordinary milestone"):
+    S.solve_assembly_problem_milestones_anytime(
+        None, None, robots=[], fill_policy_guide=True)
+
+
+def test_fill_policy_widening_failure_falls_through_to_complete_fill(monkeypatch, capsys):
+  """A spurious post-failure policy lift changes effort order, never feasibility."""
+  import solver as S
+
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 2)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  monkeypatch.setattr(
+      S.CollapsedLabeledHeuristic, "policy_atom_frontier",
+      lambda _self, _state: (("grasp", "loose", ("obj_1",), "obj_1", 999,
+                              frozenset({999})),))
+  # Make the compact and its one numerical widening stall.  The invalid full-master policy
+  # demand must then fail open to ordinary local recovery rather than become a no-good.
+  original_add = S._add_one_part
+  calls = {"n": 0}
+
+  def first_compact_miss(*args, **kwargs):
+    if kwargs.get("diagnostic_only"):
+      return original_add(*args, **kwargs)
+    if calls["n"] < 2:
+      calls["n"] += 1
+      return None, None
+    calls["n"] += 1
+    return original_add(*args, **kwargs)
+
+  monkeypatch.setattr(S, "_add_one_part", first_compact_miss)
+  plan = A.solve_assembly_problem_milestones(
+      C, asm, robots=robots, weight=1.0, verbose=True,
+      milestone_oracle="structural", fill_local_h=True, fill_exact=True,
+      fill_policy_guide=True, grasp_local_widen=True, bracing=True,
+      # The one ordinary expansion reaches the finite master, so after the spurious policy
+      # probe the unmodified full-master recovery can still finish this direct solver call.
+      grasp_initial_keep=1, grasp_widen_max=20, grasp_widen_batch=5)
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+  out = capsys.readouterr().out
+  assert "requested no novel grasp coordinate; continuing ordinary widening" in out, out
+
+
+def test_fill_policy_lift_adds_to_instead_of_replacing_compact_columns(monkeypatch):
+  """The policy batch retains every ordinary prefix column for every manipulated part."""
+  import solver as S
+
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 2)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  # g5 is outside K=1 and the ordinary K=2 expansion, but inside the finite master.
+  monkeypatch.setattr(
+      S.CollapsedLabeledHeuristic, "policy_atom_frontier",
+      lambda _self, _state: (("grasp", "loose", ("obj_1",), "obj_1", 5,
+                              frozenset({5})),))
+  original_add = S._add_one_part
+  calls, observed = {"ordinary": 0}, []
+
+  def capture_policy_alphabet(*args, **kwargs):
+    if kwargs.get("diagnostic_only"):
+      return original_add(*args, **kwargs)
+    active = kwargs.get("grasp_active")
+    if active is not None and 5 in active.get("obj_1", ()):
+      observed.append({p: set(gs) for p, gs in active.items()})
+      return original_add(*args, **kwargs)
+    if calls["ordinary"] < 2:
+      calls["ordinary"] += 1
+      return None, None                    # compact + ordinary numeric batch both miss
+    calls["ordinary"] += 1
+    return original_add(*args, **kwargs)
+
+  monkeypatch.setattr(S, "_add_one_part", capture_policy_alphabet)
+  plan = A.solve_assembly_problem_milestones(
+      C, asm, robots=robots, weight=1.0, verbose=False,
+      milestone_oracle="structural", fill_local_h=True, fill_exact=True,
+      fill_policy_guide=True, grasp_local_widen=True,
+      grasp_initial_keep=1, grasp_widen_max=20, grasp_widen_batch=1)
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+  assert observed, "the failed compact fill should have triggered one policy lift"
+  alphabet = observed[0]
+  assert {0, 5} <= alphabet["obj_1"]
+  assert 0 in alphabet["obj_0"], "target's ordinary compact column must remain available"
+
+
+def test_fill_policy_lift_advances_across_branches_and_retains_prior_columns(monkeypatch):
+  """A failed first Bellman demand does not hide an equally short alternative branch."""
+  import solver as S
+
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 2)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  monkeypatch.setattr(
+      S.CollapsedLabeledHeuristic, "policy_atom_frontier",
+      lambda _self, _state: (
+          ("grasp", "loose", ("obj_1",), "obj_1", "branch-a", frozenset({5})),
+          ("grasp", "loose", ("obj_1",), "obj_1", "branch-b", frozenset({4})),
+      ))
+  original_add = S._add_one_part
+  calls, observed = {"ordinary": 0}, []
+
+  def require_second_branch(*args, **kwargs):
+    if kwargs.get("diagnostic_only"):
+      return original_add(*args, **kwargs)
+    active = kwargs.get("grasp_active")
+    if active is not None and 5 in active.get("obj_1", ()):
+      observed.append(set(active["obj_1"]))
+      if 4 not in active["obj_1"]:
+        return None, None                    # first optimal branch is concretely spurious
+      return original_add(*args, **kwargs)   # second branch retains the first and succeeds
+    if calls["ordinary"] < 2:
+      calls["ordinary"] += 1
+      return None, None                      # compact + ordinary numeric batch both miss
+    calls["ordinary"] += 1
+    return original_add(*args, **kwargs)
+
+  monkeypatch.setattr(S, "_add_one_part", require_second_branch)
+  plan = A.solve_assembly_problem_milestones(
+      C, asm, robots=robots, weight=1.0, verbose=False,
+      milestone_oracle="structural", fill_local_h=True, fill_exact=True,
+      fill_policy_guide=True, grasp_local_widen=True,
+      grasp_initial_keep=1, grasp_widen_max=20, grasp_widen_batch=1)
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+  assert len(observed) >= 2
+  assert 5 in observed[0] and 4 not in observed[0]
+  assert {4, 5} <= observed[1]
+  assert asm._grasp_local_caps["obj_1"] >= 6
+
+
+def test_fill_policy_lift_can_select_one_hidden_support_fibre(monkeypatch):
+  """The Bellman atom may widen an existing support, not only the incoming mover.
+
+  The probe activates one coordinate at a time: a policy-selected support raw id is added to
+  the unchanged prefix while a later hidden mover id stays closed.  This is the important
+  non-Cartesian generalization that can reach a hidden support as well as the mover.
+  """
+  import solver as S
+
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 2)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  monkeypatch.setattr(
+      S.CollapsedLabeledHeuristic, "policy_atom_frontier",
+      lambda _self, _state: (("grasp", "support", ("obj_0",), "obj_0", 5,
+                              frozenset({5})),
+                            ("grasp", "loose", ("obj_1",), "obj_1", 6,
+                             frozenset({6}))))
+  original_add = S._add_one_part
+  calls, observed = {"ordinary": 0}, []
+
+  def capture_one_coordinate(*args, **kwargs):
+    if kwargs.get("diagnostic_only"):
+      return original_add(*args, **kwargs)
+    active = kwargs.get("grasp_active")
+    if active is not None and 5 in active.get("obj_0", ()):
+      # Merely exposing g5 in the column table is insufficient: ADD_GRASP is separately
+      # filtered by the bracing phase and brace_allow.  Reject the policy probe until it
+      # actually admits exactly the selected hidden support fibre (plus no unrelated g6).
+      brace_allow = kwargs.get("brace_allow")
+      if (kwargs.get("bracing") and brace_allow is not None
+          and ("obj_0", 5) in brace_allow and ("obj_1", 6) not in brace_allow):
+        observed.append(({p: set(gs) for p, gs in active.items()}, set(brace_allow)))
+        return original_add(*args, **kwargs)
+      return None, None
+    if calls["ordinary"] < 2:
+      calls["ordinary"] += 1
+      return None, None                    # compact + ordinary numeric batch both miss
+    calls["ordinary"] += 1
+    return original_add(*args, **kwargs)
+
+  monkeypatch.setattr(S, "_add_one_part", capture_one_coordinate)
+  plan = A.solve_assembly_problem_milestones(
+      C, asm, robots=robots, weight=1.0, verbose=False,
+      milestone_oracle="structural", fill_local_h=True, fill_exact=True,
+      fill_policy_guide=True, grasp_local_widen=True, bracing=True,
+      grasp_initial_keep=1, grasp_widen_max=20, grasp_widen_batch=1)
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+  assert observed, "the failed compact fill should have selected the support atom"
+  alphabet, brace_allow = observed[0]
+  assert {0, 5} <= alphabet["obj_0"]
+  assert 6 not in alphabet.get("obj_1", ()), "only one new policy coordinate may open"
+  assert ("obj_0", 5) in brace_allow
+  assert ("obj_1", 6) not in brace_allow
+  # The published monotone cap may be a replay-safe superset, but it cannot understate the
+  # sparse action id that produced the returned plan; exact sparse provenance is retained too.
+  assert asm._grasp_local_caps["obj_0"] >= 6
+  assert 5 in asm._grasp_local_active_ids["obj_0"]
+
+
+def test_policy_yaw_orbit_is_additive_to_the_existing_prefix():
+  """One selected yaw orbit must not remove ordinary prefix PLACE actions."""
+  import numpy as np
+  import problem as P
+  import solver as S
+
+  old_yaws, old_prefix = P._PLACEMENT_YAWS, P._PLACEMENT_YAW_PREFIX
+  P.set_placement_yaws(2)
+  try:
+    asm = A.make_assembly("cross", 1)
+    p = "obj_0"
+    held = P.State(
+        parent={p: ("gripper", "a1")}, grasp={p: 0}, place={},
+        supports={p: frozenset({("grasp", "a1", p, 0)})},
+        poses={p: np.array([0.0, 0.0, 0.1, 1.0, 0.0, 0.0, 0.0])})
+    P.set_placement_yaw_prefix(1)
+    compact = list(P.places(held, asm, ["a1"]))
+    compact_actions = {a for a, _s in compact}
+    compact_classes = {P.placement_rest_class(asm, a[3]) for a, _s in compact}
+    assert len(compact_classes) >= 2
+
+    selected_class = next(iter(compact_classes))
+    P.set_placement_yaw_prefix(None)
+    full = list(P.places(held, asm, ["a1"]))
+    active = {("obj_0",): frozenset({selected_class})}
+    allowed = {
+        a for a, ns in full
+        if S._placement_action_in_classes(a, ns, asm, active, prefix=1)
+    }
+    selected_orbit = {
+        a for a, _ns in full if P.placement_rest_class(asm, a[3]) == selected_class
+    }
+    assert compact_actions <= allowed
+    assert selected_orbit <= allowed
+    assert any(a not in allowed for a, _ns in full), (
+        "the policy probe should add one orbit, not eagerly open every hidden yaw")
+  finally:
+    P.set_placement_yaws(old_yaws)
+    P.set_placement_yaw_prefix(old_prefix)
+
+
+def test_fill_policy_raw_stage_defers_yaw_to_one_yaw_probe(monkeypatch):
+  """A raw-column policy pass must not spend the later yaw probe itself.
+
+  With both finite dimensions enabled, a route that has no hidden raw fibre but does request a
+  rest class used to try that yaw orbit once from the raw stage and immediately once more from
+  the yaw-only stage.  The probe is an effort ordering, but paying it twice is needlessly
+  expensive.  Force the unique policy yaw attempt to fail, then let the ordinary yaw lattice
+  solve the same small fill; exactly one restricted-rest attempt must have occurred.
+  """
+  import problem as P
+  import solver as S
+
+  old_yaws, old_prefix = P._PLACEMENT_YAWS, P._PLACEMENT_YAW_PREFIX
+  P.set_placement_yaws(2)
+  P.set_placement_yaw_prefix(None)
+  try:
+    A.set_seed(0); A.set_rolls_per_face(1)
+    asm = A.make_assembly("cross", 2)
+    C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+    A.add_disassembled_obj(C, asm, spacing=0.2)
+    robots = A.get_robots(C)
+    monkeypatch.setattr(
+        S.CollapsedLabeledHeuristic, "policy_atom_frontier",
+        lambda _self, _state: (("yaw", ("obj_0",), P._IDENTITY_FACE),))
+    original_add, observed = S._add_one_part, []
+    phase = {"policy_seen": False}
+
+    def miss_until_policy_then_use_ordinary(*args, **kwargs):
+      if kwargs.get("diagnostic_only"):
+        return original_add(*args, **kwargs)
+      rests = kwargs.get("placement_active")
+      if rests is not None:
+        observed.append({group: set(classes) for group, classes in rests.items()})
+        phase["policy_seen"] = True
+        return None, None                         # policy orbit itself is spurious here
+      if not phase["policy_seen"]:
+        return None, None                         # compact + raw schedule both fail first
+      return original_add(*args, **kwargs)        # ordinary yaw lattice remains authoritative
+
+    monkeypatch.setattr(S, "_add_one_part", miss_until_policy_then_use_ordinary)
+    plan = A.solve_assembly_problem_milestones(
+        C, asm, robots=robots, weight=1.0, verbose=False,
+        milestone_oracle="structural", fill_local_h=True, fill_exact=True,
+        fill_policy_guide=True, grasp_local_widen=True,
+        grasp_initial_keep=20, grasp_widen_batch=1, grasp_widen_max=20,
+        placement_yaw_widening=True)
+    assert plan is not None
+    assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+    assert observed == [{("obj_0",): {P._IDENTITY_FACE}}]
+  finally:
+    P.set_placement_yaws(old_yaws)
+    P.set_placement_yaw_prefix(old_prefix)
+
+
+def test_fill_policy_yaw_probe_retains_failed_raw_branch_columns(monkeypatch):
+  """Independent policy dimensions accumulate when a relaxed route needs both of them."""
+  import problem as P
+  import solver as S
+
+  old_yaws, old_prefix = P._PLACEMENT_YAWS, P._PLACEMENT_YAW_PREFIX
+  P.set_placement_yaws(2)
+  P.set_placement_yaw_prefix(None)
+  try:
+    A.set_seed(0); A.set_rolls_per_face(1)
+    asm = A.make_assembly("cross", 2)
+    C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+    A.add_disassembled_obj(C, asm, spacing=0.2)
+    robots = A.get_robots(C)
+    monkeypatch.setattr(
+        S.CollapsedLabeledHeuristic, "policy_atom_frontier",
+        lambda _self, _state: (
+            ("grasp", "loose", ("obj_1",), "obj_1", "raw", frozenset({5})),
+            ("yaw", ("obj_0",), P._IDENTITY_FACE),
+        ))
+    original_add = S._add_one_part
+    seen = {"raw": False, "combined": False}
+
+    def require_both_dimensions(*args, **kwargs):
+      if kwargs.get("diagnostic_only"):
+        return original_add(*args, **kwargs)
+      active = kwargs.get("grasp_active")
+      rests = kwargs.get("placement_active")
+      if active is not None and 5 in active.get("obj_1", ()):
+        if rests is None:
+          seen["raw"] = True
+          return None, None
+        seen["combined"] = True
+        assert P._IDENTITY_FACE in rests[("obj_0",)]
+        return original_add(*args, **kwargs)
+      return None, None
+
+    monkeypatch.setattr(S, "_add_one_part", require_both_dimensions)
+    plan = A.solve_assembly_problem_milestones(
+        C, asm, robots=robots, weight=1.0, verbose=False,
+        milestone_oracle="structural", fill_local_h=True, fill_exact=True,
+        fill_policy_guide=True, grasp_local_widen=True,
+        grasp_initial_keep=1, grasp_widen_batch=1, grasp_widen_max=20,
+        placement_yaw_widening=True)
+    assert plan is not None
+    assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+    assert seen == {"raw": True, "combined": True}
+  finally:
+    P.set_placement_yaws(old_yaws)
+    P.set_placement_yaw_prefix(old_prefix)
+
+
+def test_public_milestone_iterator_publishes_policy_yaw_for_replay(monkeypatch):
+  """A yielded non-prefix PLACE remains enumerable while the session is suspended.
+
+  The policy probe deliberately restores the compact yaw prefix before returning to search.
+  Public consumers such as ``--mp-open-plans`` validate a yielded candidate *before* search
+  resumes, so the iterator—not just ``main.run``'s outer cleanup—must temporarily publish the
+  full finite yaw lattice.  The fake inner iterator stands in for a successful policy-yaw fill.
+  """
+  import numpy as np
+  import problem as P
+  import solver as S
+
+  old_yaws, old_prefix = P._PLACEMENT_YAWS, P._PLACEMENT_YAW_PREFIX
+  P.set_placement_yaws(2)
+  try:
+    asm = A.make_assembly("cross", 1)
+    p = "obj_0"
+    held = P.State(
+        parent={p: ("gripper", "a1")}, grasp={p: 0}, place={},
+        supports={p: frozenset({("grasp", "a1", p, 0)})},
+        poses={p: np.array([0.0, 0.0, 0.1, 1.0, 0.0, 0.0, 0.0])})
+    P.set_placement_yaw_prefix(None)
+    full = list(P.places(held, asm, ["a1"]))
+    P.set_placement_yaw_prefix(1)
+    compact = {a for a, _s in P.places(held, asm, ["a1"])}
+    policy_place = next(a for a, _s in full if a not in compact)
+
+    def fake_once(*_args, **_kwargs):
+      # This is the state left by the successful one-coordinate probe before it returns its
+      # plan to the outer milestone iterator.
+      P.set_placement_yaw_prefix(1)
+      yield [policy_place]
+
+    monkeypatch.setattr(S, "_iter_assembly_problem_milestones_once", fake_once)
+    session = S.iter_assembly_problem_milestones(
+        None, asm, robots=["a1"], verbose=False, placement_yaw_widening=True)
+    assert next(session) == [policy_place]
+    assert P._PLACEMENT_YAW_PREFIX is None
+    assert policy_place in {a for a, _s in P.places(held, asm, ["a1"])}
+    session.close()
+    assert P._PLACEMENT_YAW_PREFIX is None
+  finally:
+    P.set_placement_yaws(old_yaws)
+    P.set_placement_yaw_prefix(old_prefix)
+
+
+def test_terminal_settle_searches_full_yaw_lattice_and_restores_schedule(monkeypatch):
+  """The final held assembly is settled with all configured yaws, then search state restores."""
+  import problem as P
+  import solver as S
+
+  old_yaws, old_prefix = P._PLACEMENT_YAWS, P._PLACEMENT_YAW_PREFIX
+  P.set_placement_yaws(2)
+  P.set_placement_yaw_prefix(1)
+  try:
+    A.set_seed(0); A.set_rolls_per_face(1)
+    asm = A.make_assembly("cross", 2)
+    C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+    A.add_disassembled_obj(C, asm, spacing=0.2)
+    robots = A.get_robots(C)
+    original_settle, seen = S._settle_to_goal, []
+
+    def observe_full_lattice(*args, **kwargs):
+      seen.append(P._PLACEMENT_YAW_PREFIX)
+      return original_settle(*args, **kwargs)
+
+    monkeypatch.setattr(S, "_settle_to_goal", observe_full_lattice)
+    # With intermediate placement disabled, the completed two-part assembly remains held and
+    # necessarily enters the dedicated final-settle search.
+    inner = S._iter_assembly_problem_milestones_once(
+        C, asm, robots=robots, weight=1.0, verbose=False,
+        milestone_oracle="structural", fill_local_h=True, fill_exact=True,
+        allow_place=False, placement_yaw_widening=True)
+    plan = next(inner)
+    assert plan is not None
+    assert seen and all(prefix is None for prefix in seen)
+    # Bypass the public publishing wrapper here so this checks the private scheduler restore.
+    assert P._PLACEMENT_YAW_PREFIX == 1
+    inner.close()
+  finally:
+    P.set_placement_yaws(old_yaws)
+    P.set_placement_yaw_prefix(old_prefix)
+
+
+def test_optional_policy_pdb_state_guard_falls_through_but_baseline_does_not(
+    monkeypatch, capsys):
+  """Only the optional full-master guide may fail open on its PDB resource guard."""
+  import solver as S
+
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 2)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  original_make, original_add = S._make_fill_local_pdb, S._add_one_part
+  builds, calls = {"n": 0}, {"ordinary": 0}
+
+  def fail_only_full_master(*args, **kwargs):
+    builds["n"] += 1
+    if builds["n"] == 2:
+      raise RuntimeError(
+          "fill-local PDB for interface 'obj_1' exceeded its 200000-state guard")
+    return original_make(*args, **kwargs)
+
+  def force_policy_query(*args, **kwargs):
+    if kwargs.get("diagnostic_only"):
+      return original_add(*args, **kwargs)
+    if calls["ordinary"] < 2:
+      calls["ordinary"] += 1
+      return None, None
+    calls["ordinary"] += 1
+    return original_add(*args, **kwargs)
+
+  monkeypatch.setattr(S, "_make_fill_local_pdb", fail_only_full_master)
+  monkeypatch.setattr(S, "_add_one_part", force_policy_query)
+  plan = A.solve_assembly_problem_milestones(
+      C, asm, robots=robots, weight=1.0, verbose=True,
+      milestone_oracle="structural", fill_local_h=True, fill_exact=True,
+      fill_policy_guide=True, grasp_local_widen=True,
+      grasp_initial_keep=1, grasp_widen_batch=1, grasp_widen_max=20)
+  assert plan is not None
+  assert "optional full-master reverse policy hit its state guard" in capsys.readouterr().out
+
+  # The compact PDB is the selected fill heuristic, not an optional scheduling hint.  Its
+  # identical guard remains explicit/fail-closed.
+  monkeypatch.setattr(S, "_make_fill_local_pdb", lambda *_a, **_k: (_ for _ in ()).throw(
+      RuntimeError("fill-local PDB baseline guard")))
+  with pytest.raises(RuntimeError, match="baseline guard"):
+    A.solve_assembly_problem_milestones(
+        C, asm, robots=robots, weight=1.0, verbose=False,
+        milestone_oracle="structural", fill_local_h=True, fill_exact=True)
+
+
+def test_local_widen_reaches_all_part_master_before_returning_no_plan(monkeypatch):
+  """Local columns are an effort order, not a K+B grasp-pruning rule.
+
+  Force every compact-session fill to miss.  The direct solver (not main's old whole-search
+  wrapper) must then start its one eager finite-master completion session before returning.
+  """
+  import solver as S
+
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 2)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  _checker, table = A._search_context(C, asm, robots)
+  master = {
+      p: min(20, max((gid for rows in table.values()
+                      for owner, gid, _pose in rows if owner == p), default=-1) + 1)
+      for p in asm.objects
+  }
+  original_add, observed = S._add_one_part, []
+
+  def wait_for_master(*args, **kwargs):
+    if kwargs.get("diagnostic_only"):
+      return original_add(*args, **kwargs)
+    caps = kwargs.get("grasp_cap")
+    if isinstance(caps, dict):
+      snapshot = dict(caps)
+      observed.append(snapshot)
+      if not all(snapshot[p] >= master[p] for p in asm.objects):
+        return None, None
+    return original_add(*args, **kwargs)
+
+  monkeypatch.setattr(S, "_add_one_part", wait_for_master)
+  plan = A.solve_assembly_problem_milestones(
+      C, asm, robots=robots, weight=1.0, verbose=False,
+      milestone_oracle="structural", fill_local_h=True, fill_exact=True,
+      grasp_local_widen=True, grasp_initial_keep=1,
+      grasp_widen_batch=1, grasp_widen_max=20)
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+  assert observed
+  assert any(s["obj_1"] > 1 and s["obj_0"] == 1 for s in observed)
+  assert any(all(s[p] >= master[p] for p in asm.objects) for s in observed)
+  assert all(asm._grasp_local_caps[p] >= master[p] for p in asm.objects)
+
+
+def test_local_widen_iterator_runs_one_eager_master_completion(monkeypatch):
+  """The resumable/MP-facing iterator gets the same completion epoch as direct solve."""
+  import solver as S
+  from types import SimpleNamespace
+
+  asm = SimpleNamespace(objects=("obj_0", "obj_1"))
+  table = {
+      ("obj_0",): [("obj_0", 0, None)],
+      ("obj_0", "obj_1"): [("obj_1", 4, None)],
+  }
+  calls = []
+
+  def fake_once(_C, _assembly, *, grasp_local_widen, grasp_initial_keep, **_kwargs):
+    calls.append((grasp_local_widen, grasp_initial_keep))
+    if grasp_initial_keep == 5:
+      yield [("full-master",)]
+
+  monkeypatch.setattr(S, "_iter_assembly_problem_milestones_once", fake_once)
+  monkeypatch.setattr(S, "_search_context", lambda *_args, **_kwargs: (None, table))
+  plans = list(S.iter_assembly_problem_milestones(
+      None, asm, robots=["a1"], verbose=False, grasp_local_widen=True,
+      grasp_initial_keep=2, grasp_widen_batch=1, grasp_widen_max=5))
+  assert plans == [[("full-master",)]]
+  assert calls == [(True, 2), (True, 5)]
+  # obj_1 appears only in a non-singleton row: the completion cap scans the real master.
+  assert asm._grasp_local_caps == {"obj_0": 1, "obj_1": 5}
 
 
 def test_fill_policy_failure_falls_through_to_unrestricted_fill(monkeypatch, capsys):

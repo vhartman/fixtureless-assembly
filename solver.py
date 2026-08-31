@@ -15,6 +15,24 @@ import problem as _problem
 globals().update({k: v for k, v in vars(_problem).items() if not k.startswith("__")})
 
 
+def _timed_bind_stage(name):
+  """Measure an exclusive leaf stage only while a public RobotIK.bind is active."""
+  def decorate(fn):
+    def wrapped(self, *args, **kwargs):
+      if not getattr(self, "_bind_profile_depth", 0):
+        return fn(self, *args, **kwargs)
+      import time as _time
+      t0 = _time.perf_counter()
+      try:
+        return fn(self, *args, **kwargs)
+      finally:
+        dt = _time.perf_counter() - t0
+        self.prof[f"{name}_calls"] = self.prof.get(f"{name}_calls", 0) + 1
+        self.prof[f"{name}_time"] = self.prof.get(f"{name}_time", 0.0) + dt
+    return wrapped
+  return decorate
+
+
 # weight of the soft orientation bias on a held subassembly in the assemble IK (see
 # RobotIK._ik_assemble). LOW relative to the mate eq weight (1e1) so it only nudges the
 # free-orientation DOF toward a canonical pose without fighting the hard mate constraint.
@@ -629,7 +647,12 @@ class RobotIK:
     self.prof = {
         "bind_calls": 0, "bind_cache_hits": 0, "bind_solves": 0,
         "bind_success": 0, "bind_fail": 0, "bind_time": 0.0,
+        "bind_success_time": 0.0, "bind_fail_time": 0.0,
+        # Number of legacy symbolic cache keys canonically identified as an already-seen
+        # physical query. This is reuse, not a relaxed/cross-scene candidate transfer.
+        "physical_query_collapses": 0,
         "precheck_calls": 0, "precheck_time": 0.0,
+        "precheck_nlp_solves": 0, "precheck_nlp_time": 0.0,
         "seeded_solves": 0, "seeded_time": 0.0,
         "unseeded_solves": 0, "unseeded_time": 0.0,
         "restart_solves": 0, "restart_time": 0.0,
@@ -639,6 +662,7 @@ class RobotIK:
         "calls_with_seeds": 0, "calls_without_seeds": 0,  # why so few analytic solves?
         "wins": {},                                       # winning attempt histogram
     }
+    self._bind_profile_depth = 0
     self.mate_eq_weight = None                            # None = 1e1 (rai default here)
     self.place_eq_weight = None                           # same, for _ik_place's object-pose eq
     # Virtual jaw close: an independent collision certificate, never an active joint or
@@ -808,6 +832,15 @@ class RobotIK:
     self.collision_deep_reject = 0.05
     self.collision_rejects = 0                            # rejects by the depth gate
     self._ik_cache = {}                                   # (action, scene sig) -> (ok, witness)
+    # PHYSICAL-QUERY INVARIANT. The legacy cache key below preserves every symbolic scene
+    # distinction. With this opt-in flag, physically identical pre/post skill queries instead
+    # share one canonical key and therefore one positive certificate AND one open-witness
+    # effort cursor. This is direct memoization: no vector is transferred across obstacle
+    # scenes. Revisited solves skip deterministic seeded/unseeded NLP attempts and advance to
+    # fresh random/bias slots; scene construction, analytic enumeration/branch probing, and the
+    # relaxed precheck are currently rebuilt. Stochastic failures remain open exactly as before.
+    self.positive_ik_reuse = False
+    self._physical_query_legacy = {}                      # physical key -> legacy keys seen
     # WITNESS-OPTIMIZATION pull spec (post-pass only; None during search => every solve is
     # byte-identical to today). Set by optimize_witnesses: {'mode': 'joint'|'ee',
     # 'robot': r, 'qmap': {joint_name: prev_val}, 'ee_pos': xyz, 'ee_quat': wxyz,
@@ -1047,6 +1080,7 @@ class RobotIK:
   #     at the grasp transform, so it moves with that arm,
   #   * all robots at the manipulation exit pose (the per-skill IK then frees only ACTIVE arms).
   # ------------------------------------------------------------------------------------
+  @_timed_bind_stage("scene")
   def scene_for(self, state, assembly):
     C = ry.Config()
     C.addConfigurationCopy(self.C)                        # home; loose parts at initial poses
@@ -1118,6 +1152,96 @@ class RobotIK:
       f.setQuaternion(member[3:])
       C.attach(gpart, p)
 
+  @staticmethod
+  def _physical_pose_key(pose):
+    """Stable within-solve identity for a world pose in a physical IK query."""
+    return tuple(np.round(np.asarray(pose, dtype=float).ravel(), 9))
+
+  def _physical_group_sig(self, state, group):
+    """Rigid payload plus the robot/grasp assignments that physically pose it."""
+    members = tuple(sorted(group))
+    root = _group_root(state, group)
+    contacts = tuple(sorted((r, pt, gid) for r, (pt, gid) in self.holders(state).items()
+                            if pt in group))
+    primary = next(((r, pt, gid) for r, pt, gid in contacts
+                    if pt == root and state.parent.get(root) == ("gripper", r)), None)
+    return members, primary, contacts
+
+  def _physical_table_sig(self, state, assembly):
+    """All groups physically fixed to the table, including braces and world poses."""
+    poses = _state_part_poses(state, assembly, lift=0.0)
+    out = []
+    for group in state.subassemblies():
+      members, primary, contacts = self._physical_group_sig(state, group)
+      if primary is not None:
+        continue
+      world = tuple((p, self._physical_pose_key(poses[p])) for p in members)
+      out.append((members, world, contacts))
+    return tuple(sorted(out))
+
+  def _physical_query_sig(self, action, s0, s1, assembly):
+    """Skill-local physical program, excluding unrelated symbolic bookkeeping.
+
+    Each skill depends on a different physical slice. A pick sees the fixed table scene; a
+    handover sees the holder/receiver grasps on its payload; an add-grasp also sees the table
+    scene when the payload is fixed there; assemble sees the two rendezvous payloads and the
+    table only for a table-anchored mate; and place sees its held payload plus the resulting
+    destination table scene. This is deliberately not the complete predecessor/successor
+    state: two symbolic histories that pose the same physical skill are one query.
+    """
+    action = tuple(action)
+    kind = action[0]
+    if kind == "pick":
+      return kind, self._physical_table_sig(s0, assembly)
+
+    part = action[2]
+    moving = next((g for g in s0.subassemblies() if part in g), frozenset((part,)))
+    moving_sig = self._physical_group_sig(s0, moving)
+    if kind == "handover":
+      return kind, moving_sig
+    if kind == "add_grasp":
+      table = self._physical_table_sig(s0, assembly) if moving_sig[1] is None else ()
+      return kind, moving_sig, table
+    if kind == "place":
+      # The target pose/cell is materialized in s1; action text alone is not sufficient for
+      # decluttering placements whose cell payload lives in State.poses.
+      return kind, moving_sig, self._physical_table_sig(s1, assembly)
+    if kind == "assemble":
+      onto = action[3]
+      target = next((g for g in s0.subassemblies() if onto in g), frozenset((onto,)))
+      target_sig = self._physical_group_sig(s0, target)
+      table = self._physical_table_sig(s0, assembly) if target_sig[1] is None else ()
+      return kind, moving_sig, target_sig, table
+    # Defensive future-skill fallback: retain the old complete support-scene distinction.
+    return kind, self._scene_sig(s0), self._scene_sig(s1)
+
+  def _query_key(self, action, s0, s1, assembly):
+    """Cache/effort key; canonical physical invariant when the profile enables it."""
+    action = tuple(action)
+    legacy = (action, self._scene_sig(s0))
+    if not getattr(self, "positive_ik_reuse", False):
+      return legacy
+    key = (action, self._physical_query_sig(action, s0, s1, assembly))
+    aliases = self._physical_query_legacy.setdefault(key, set())
+    if legacy not in aliases:
+      if aliases:
+        self.prof["physical_query_collapses"] += 1
+      aliases.add(legacy)
+    return key
+
+  def _timed_stage_call(self, name, fn, *args, **kwargs):
+    """Time a dynamically defined stage (the per-skill nested KOMO builders)."""
+    if not getattr(self, "_bind_profile_depth", 0):
+      return fn(*args, **kwargs)
+    import time as _time
+    t0 = _time.perf_counter()
+    try:
+      return fn(*args, **kwargs)
+    finally:
+      dt = _time.perf_counter() - t0
+      self.prof[f"{name}_calls"] = self.prof.get(f"{name}_calls", 0) + 1
+      self.prof[f"{name}_time"] = self.prof.get(f"{name}_time", 0.0) + dt
+
   # ------------------------------------------------------------------------------------
   # per-skill IK. bind() dispatches on the action; each skill sets up its scene and its
   # own objective, then solves. Returns (feasible, witness or None).
@@ -1138,31 +1262,41 @@ class RobotIK:
     self.last_margin_reject = None
     self.last_closure_reject = None
     _bt0 = _time.perf_counter()
-    # VERDICT + WITNESS CACHE on a discrete scene signature: the search re-probes the SAME
-    # (action, scene) from many parent states, and a FAILED solve costs ~135ms (initial +
+    # VERDICT + WITNESS CACHE on a query signature: the search re-probes the SAME
+    # physical skill from many parent states, and a FAILED solve costs ~135ms (initial +
     # 12 restarts) vs ~5ms for a success -- measured 81 re-probed pick failures per 40
     # expansions on cross7-R3. Unlike the cheap checker's signature this one KEEPS robot
     # identities (fixed bases: who reaches matters) and the grasp contacts' robots. Caching
     # also makes the stochastic restarts deterministic within a solve (same query -> same
     # verdict), which the search prefers anyway.
-    key = (action, self._scene_sig(s0))
+    _qkt0 = _time.perf_counter()
+    key = self._query_key(action, s0, s1, assembly)
+    self.prof["query_key_calls"] = self.prof.get("query_key_calls", 0) + 1
+    self.prof["query_key_time"] = self.prof.get("query_key_time", 0.0) \
+        + (_time.perf_counter() - _qkt0)
     if self._opt_pull is None:                            # pulled re-solves are step-specific:
       hit = self._ik_cache.get(key)                       # never read/write the cache for them
       if hit is not None:
         self.prof["bind_cache_hits"] += 1
         return hit
-    if kind == "pick":
-      res = self._ik_pick(action, s0, s1, assembly, seed)
-    elif kind == "place":
-      res = self._ik_place(action, s0, s1, assembly, seed)
-    elif kind == "assemble":
-      res = self._ik_assemble(action, s0, s1, assembly, seed)
-    else:                                                 # add_grasp / handover: 2nd arm
-      res = self._ik_add_grasp(action, s0, s1, assembly, seed)
+    _old_depth = getattr(self, "_bind_profile_depth", 0)
+    self._bind_profile_depth = _old_depth + 1
+    try:
+      if kind == "pick":
+        res = self._ik_pick(action, s0, s1, assembly, seed)
+      elif kind == "place":
+        res = self._ik_place(action, s0, s1, assembly, seed)
+      elif kind == "assemble":
+        res = self._ik_assemble(action, s0, s1, assembly, seed)
+      else:                                               # add_grasp / handover: 2nd arm
+        res = self._ik_add_grasp(action, s0, s1, assembly, seed)
+    finally:
+      self._bind_profile_depth = _old_depth
     self.prof["bind_solves"] += 1
     self.prof["bind_success" if res[0] else "bind_fail"] += 1
     _dt = _time.perf_counter() - _bt0
     self.prof["bind_time"] += _dt
+    self.prof["bind_success_time" if res[0] else "bind_fail_time"] += _dt
     # A1: include the acting robot. Fixed bases make nominally identical grasp ids very
     # different reachability queries; aggregating all arms hid exactly that distinction in
     # the OpenArm car-mini obj_3 bottleneck.
@@ -1206,7 +1340,7 @@ class RobotIK:
   def probe_bind_batch(self, action, s0, s1, assembly, attempt=0, budget=1):
     """One OPEN visit containing a bounded batch, with scene/precheck setup paid once."""
     budget = max(1, int(budget))
-    key = (action, self._scene_sig(s0))
+    key = self._query_key(action, s0, s1, assembly)
     cached = self._ik_cache.get(key)
     if cached is not None and cached[0]:
       return cached
@@ -1260,14 +1394,24 @@ class RobotIK:
     p = self.prof
     nlp_n = p["seeded_solves"] + p["unseeded_solves"] + p["restart_solves"]
     nlp_t = p["seeded_time"] + p["unseeded_time"] + p["restart_time"]
+    margin_n = int(p.get("margin_refine_solves", 0))
+    margin_t = float(p.get("margin_refine_time", 0.0))
+    optimizer_n, optimizer_t = nlp_n + margin_n, nlp_t + margin_t
     print(f"[ik-prof] binds: {p['bind_calls']} called, {p['bind_cache_hits']} cache hits "
           f"({100 * p['bind_cache_hits'] / max(1, p['bind_calls']):.0f}%), "
           f"{p['bind_solves']} solved ({p['bind_success']} ok / {p['bind_fail']} failed), "
           f"bind wall {p['bind_time']:.1f}s")
+    print(f"[ik-prof] bind outcome time: successes {p['bind_success_time']:.1f}s "
+          f"({100 * p['bind_success_time'] / max(p['bind_time'], 1e-9):.0f}%), "
+          f"failures {p['bind_fail_time']:.1f}s "
+          f"({100 * p['bind_fail_time'] / max(p['bind_time'], 1e-9):.0f}%)")
     print(f"[ik-prof] NLP solves: {nlp_n} in {nlp_t:.1f}s "
           f"(seeded {p['seeded_solves']}/{p['seeded_time']:.1f}s, "
           f"unseeded {p['unseeded_solves']}/{p['unseeded_time']:.1f}s, "
           f"restarts {p['restart_solves']}/{p['restart_time']:.1f}s)")
+    print(f"[ik-prof] optimizer total including lazy margin re-solves: "
+          f"{optimizer_n} in {optimizer_t:.1f}s; reach-precheck share "
+          f"{p['precheck_nlp_solves']}/{p['precheck_nlp_time']:.1f}s")
     if nlp_n:
       print(f"[ik-prof] per-solve avg {1000 * nlp_t / nlp_n:.0f}ms; restart share of NLP "
             f"time {100 * p['restart_time'] / max(nlp_t, 1e-9):.0f}%")
@@ -1275,6 +1419,51 @@ class RobotIK:
           f"{p['precheck_time']:.1f}s ({self.precheck_rejects} rejects caught); "
           f"post-solve gates {p['post_calls']}x in {p['post_time']:.1f}s; "
           f"getPath calls {p['getpath_calls']}")
+    stages = (
+        ("query-key", p.get("query_key_calls", 0), p.get("query_key_time", 0.0)),
+        ("scene", p.get("scene_calls", 0), p.get("scene_time", 0.0)),
+        ("analytic-seed", p.get("analytic_seed_calls", 0),
+         p.get("analytic_seed_time", 0.0)),
+        ("exact-branch-probe", p.get("branch_probe_calls", 0),
+         p.get("branch_probe_time", 0.0)),
+        ("KOMO-build", p.get("komo_build_calls", 0), p.get("komo_build_time", 0.0)),
+        ("optimizer", optimizer_n, optimizer_t),
+        ("post-gates", p.get("post_calls", 0), p.get("post_time", 0.0)),
+        ("closure", p.get("closure_calls", 0), p.get("closure_time", 0.0)),
+    )
+    accounted = sum(float(t) for _name, _n, t in stages)
+    other = max(0.0, float(p["bind_time"]) - accounted)
+    print("[ik-prof] exclusive bind-time stages "
+          "(reach-precheck wall is a labeled subset, not added again):")
+    for name, calls, seconds in stages:
+      print(f"[ik-prof]   {name:18s} {int(calls):6d}x  {float(seconds):7.2f}s "
+            f"({100 * float(seconds) / max(p['bind_time'], 1e-9):4.1f}%)")
+    print(f"[ik-prof]   {'other/control':18s} {'-':>6s}  {other:7.2f}s "
+          f"({100 * other / max(p['bind_time'], 1e-9):4.1f}%)")
+    if self.positive_ik_reuse:
+      print(f"[ik-reuse] physical-query invariant: "
+            f"{p['physical_query_collapses']} symbolic aliases collapsed across "
+            f"{len(self._physical_query_legacy)} candidate-touched physical queries; "
+            f"this includes path inspection, not only IK probes. Exact witnesses and "
+            f"open failure effort are shared under the skill-local equivalence.")
+    pool = getattr(self, "_open_witness_pool", None)
+    if pool is not None:
+      attempted = len(pool.attempts)
+      revisited_keys = sum(v > 1 for v in pool.visits.values())
+      print(f"[ik-reuse] open pool across {pool.sessions} local fill/phase sessions: "
+            f"{attempted} physical queries probed, {revisited_keys} revisited; "
+            f"{pool.revisit_probes}/{pool.probe_calls} probes continued prior effort "
+            f"({pool.cross_session_revisit_probes} across sessions, "
+            f"{pool.cross_tag_revisit_probes} across milestone-part tags), "
+            f"cumulative prior-slot offset={pool.prior_slots_not_replayed}.")
+      print(f"[ik-reuse] positive pool: {len(pool.success)} exact certificates retained; "
+            f"{pool.candidate_success_skips} candidate-path bind(s) skipped before RobotIK, "
+            f"{pool.direct_success_hits} direct pool hit(s). Failed-query suspension remains "
+            "symbolic-edge-local; physical aliases share only the fresh-effort cursor, and "
+            "only that cursor persists across sessions.")
+      if pool.success_visit_hist:
+        visits = ", ".join(f"visit{k}={v}" for k, v in sorted(pool.success_visit_hist.items()))
+        print(f"[ik-reuse] successful-query effort tier: {visits}")
     print(f"[ik-prof] _solve_ik calls with seeds: {p['calls_with_seeds']}, without: "
           f"{p['calls_without_seeds']} "
           f"({100 * p['calls_without_seeds'] / max(1, p['calls_with_seeds'] + p['calls_without_seeds']):.0f}% unseeded)")
@@ -1610,6 +1799,7 @@ class RobotIK:
     finally:
       C.setJointState(saved)
 
+  @_timed_bind_stage("closure")
   def _closure_ok(self, C, q, action, state, backoff=0.0):
     """Achieved-witness counterpart of the cheap virtual finger-close certificate."""
     if (not self.closure_check or backoff > 0.0 or C is None or q is None
@@ -1998,6 +2188,11 @@ class RobotIK:
       self.prof["wins"][k] = self.prof["wins"].get(k, 0) + 1
       self._last_win = k
 
+    def _record_precheck_nlp(dt):
+      if getattr(self, "_pc", False):
+        self.prof["precheck_nlp_solves"] += 1
+        self.prof["precheck_nlp_time"] += dt
+
     margin_cuts = set()                                   # shared by every init of this KOMO
 
     def _certify_with_margin_cuts(result):
@@ -2032,9 +2227,11 @@ class RobotIK:
         komo.initWithConstant(q)
         _t0 = _time.perf_counter()
         current = self._nlp(komo).solve().dict()
+        _ndt = _time.perf_counter() - _t0
         self.prof["margin_refine_solves"] = self.prof.get("margin_refine_solves", 0) + 1
         self.prof["margin_refine_time"] = self.prof.get("margin_refine_time", 0.0) \
-            + (_time.perf_counter() - _t0)
+            + _ndt
+        _record_precheck_nlp(_ndt)
       return None, current
 
     def _try_seed_list(bundle, label):
@@ -2059,8 +2256,10 @@ class RobotIK:
         komo.initWithConstant(seed)
         _t0 = _time.perf_counter()
         r_seed = self._nlp(komo).solve().dict()
+        _ndt = _time.perf_counter() - _t0
         self.prof["seeded_solves"] += 1
-        self.prof["seeded_time"] += _time.perf_counter() - _t0
+        self.prof["seeded_time"] += _ndt
+        _record_precheck_nlp(_ndt)
         if r_seed["feasible"]:
           q_seed, r_seed = _certify_with_margin_cuts(r_seed)
           if q_seed is not None:
@@ -2090,8 +2289,10 @@ class RobotIK:
     if not _open_random_only:
       _t0 = _time.perf_counter()
       r = self._nlp(komo).solve().dict()
+      _ndt = _time.perf_counter() - _t0
       self.prof["unseeded_solves"] += 1
-      self.prof["unseeded_time"] += _time.perf_counter() - _t0
+      self.prof["unseeded_time"] += _ndt
+      _record_precheck_nlp(_ndt)
       if r["feasible"]:
         q_unseeded, r = _certify_with_margin_cuts(r)
         if q_unseeded is not None:
@@ -2113,8 +2314,10 @@ class RobotIK:
       komo.initRandom()
       _t0 = _time.perf_counter()
       r = self._nlp(komo).solve().dict()
+      _ndt = _time.perf_counter() - _t0
       self.prof["restart_solves"] += 1
-      self.prof["restart_time"] += _time.perf_counter() - _t0
+      self.prof["restart_time"] += _ndt
+      _record_precheck_nlp(_ndt)
       if r["feasible"]:
         q_restart, r = _certify_with_margin_cuts(r)
         if q_restart is not None:
@@ -2191,6 +2394,7 @@ class RobotIK:
     combos.sort(key=lambda t: t[0])
     return [q for _, q in combos[:cap]]
 
+  @_timed_bind_stage("branch_probe")
   def _probe_branch_combos(self, C, arm_seeds, exclude=(), cap=8, probe_cap=256):
     # DEPTH-GATED collision probe over the FULL cartesian product of the involved arms'
     # exact analytic branches. Posing EVERY involved arm at one of its branches is a
@@ -2313,6 +2517,7 @@ class RobotIK:
     import analytic_ik
     return analytic_ik.available(self.robot_arm[robot], self.tool_kind[robot])
 
+  @_timed_bind_stage("analytic_seed")
   def _analytic_seeds(self, C, robot, ee_target, target_frame):
     # analytic (ssik) joint solutions for the active arm to place its tool center at `ee_target`
     # (a 7-pose relative to `target_frame`; target_frame=None => ee_target is already a WORLD
@@ -2614,7 +2819,8 @@ class RobotIK:
       if self.analytic_seed_cap is not None:              # --analytic-seed-cap: warm-start
         seeds = seeds[:self.analytic_seed_cap]            # only the K best-ranked branches
     elif (self.reach_precheck and self._pin_joints is None
-          and self._reach_precheck_reject(action, C, build(False))):
+          and self._reach_precheck_reject(
+              action, C, self._timed_stage_call("komo_build", build, False))):
       # includes the EMPTY-analytic-set case: an empty EXACT set does NOT prove the SOFT
       # solve fails -- the tolerant pose eq settles within tolerance of exactly-unreachable
       # poses (measured: the chair posts' thin-cylinder side pinch). Only the residual-gated
@@ -2623,7 +2829,7 @@ class RobotIK:
         self.analytic_rejects += 1
       return False, None                                  # clear reach failure (relaxed solve)
 
-    komo = build(True)
+    komo = self._timed_stage_call("komo_build", build, True)
     if warm is not None:                                   # couple pre-pick to the pick witness
       wseed = self._restrict_seed(warm, C, full_names) if full_names is not None \
           else np.asarray(warm, dtype=float)
@@ -2688,10 +2894,11 @@ class RobotIK:
       return komo
 
     if (self.reach_precheck and self._pin_joints is None
-        and self._reach_precheck_reject(action, C, build(False))):
+        and self._reach_precheck_reject(
+            action, C, self._timed_stage_call("komo_build", build, False))):
       return False, None                                  # clear reach failure (relaxed solve)
 
-    komo = build(True)
+    komo = self._timed_stage_call("komo_build", build, True)
     feasible, witness = self._solve_ik(          # `warm` (full config) couples pre-add-grasp to
         komo, seeds=([np.asarray(warm, dtype=float)] if warm is not None else None),  # the grasp
         C=C)
@@ -2841,10 +3048,11 @@ class RobotIK:
         arm_seeds[robot] = ranked or arm_seeds[robot]
       seeds = arm_seeds.get(robot, []) if single else []
       if (self.reach_precheck and self._pin_joints is None
-          and self._reach_precheck_reject(action, C, build(False))):
+          and self._reach_precheck_reject(
+              action, C, self._timed_stage_call("komo_build", build, False))):
         return False, None                                # clear reach failure (relaxed solve)
 
-    komo = build(True)
+    komo = self._timed_stage_call("komo_build", build, True)
     if warm is not None:                                   # couple pre-place to the place witness
       wseed = self._restrict_seed(warm, C, full_names) if full_names is not None \
           else np.asarray(warm, dtype=float)
@@ -2866,6 +3074,7 @@ class RobotIK:
 
     return feasible, witness
 
+  @_timed_bind_stage("komo_build")
   def _assemble_komo(self, C, part_name, onto, rel_pos, rel_quat, bias_axes,
                      collisions=True):
     # build the assemble KOMO for one orientation bias. Shared by every step of the
@@ -4190,7 +4399,8 @@ def _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_pla
 
 def collect_plan_witnesses(C, assembly, plan, robots, robot_ik, *, gripper_kind=None,
                            handovers=True, allow_place=True, bracing=False,
-                           grasp_table=None, resolve_missing=False, verbose=True):
+                           grasp_table=None, resolve_missing=False, verbose=True,
+                           reuse_from_plan=None, reuse_from_witnesses=None):
   """Collect exact IK certificates already found for ``plan``, aligned by plan index.
 
   Positive RobotIK cache entries are the primary source; the open-witness pool is an explicit
@@ -4198,11 +4408,38 @@ def collect_plan_witnesses(C, assembly, plan, robots, robot_ik, *, gripper_kind=
   for a fresh solve after a plan-rewriting pass such as release hoisting: if the rewrite changes
   an IK predecessor scene, that new edge must be certified before serialization. Loaded plans
   pass False and therefore cannot accidentally redo IK here.
+
+  ``reuse_from_plan``/``reuse_from_witnesses`` are an already-certified source artifact for a
+  plan-rewriting pass. A witness is reused only when BOTH its action and the exact discrete IK
+  scene signature agree with an edge in ``plan``. This is deliberately key-based rather than
+  position-based: release hoisting changes indices, and accepting an old witness merely because
+  it has the same index would silently certify the wrong predecessor scene.
   """
+  if (reuse_from_plan is None) != (reuse_from_witnesses is None):
+    raise ValueError("collect_plan_witnesses: reuse source needs both plan and witnesses")
   if grasp_table is None:
     _checker, grasp_table = _search_context(C, assembly, robots)
   states = _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
                           bracing, grasp_table, "collect_plan_witnesses")
+  def _cert_key(a, before, after):
+    if hasattr(robot_ik, "_query_key"):
+      return robot_ik._query_key(a, before, after, assembly)
+    return a, robot_ik._scene_sig(before)                 # tiny external/test adapter
+
+  reusable = {}
+  if reuse_from_plan is not None:
+    if len(reuse_from_plan) != len(reuse_from_witnesses):
+      raise ValueError("collect_plan_witnesses: reuse source plan/witness length mismatch")
+    source_states = _replay_states(
+        C, assembly, reuse_from_plan, robots, gripper_kind, handovers, allow_place,
+        bracing, grasp_table, "collect_plan_witnesses reuse source")
+    for i, a0 in enumerate(reuse_from_plan):
+      a = tuple(a0)
+      w = reuse_from_witnesses[i]
+      if a and a[0] in _IK_ACTIONS and w is not None:
+        # This is exactly RobotIK's normal cache key.  A copy is made again when it enters
+        # `out`, so callers may safely retain their source witness block on rollback.
+        reusable[_cert_key(a, source_states[i], source_states[i + 1])] = w
   out = [None] * len(plan)
   rebuilt = []
   pool = getattr(robot_ik, "_open_witness_pool", None)
@@ -4210,11 +4447,13 @@ def collect_plan_witnesses(C, assembly, plan, robots, robot_ik, *, gripper_kind=
     a = tuple(a0)
     if a[0] not in _IK_ACTIONS:
       continue
-    key = (a, robot_ik._scene_sig(states[i]))
+    key = _cert_key(a, states[i], states[i + 1])
     hit = robot_ik._ik_cache.get(key)
     w = hit[1] if hit is not None and hit[0] and hit[1] is not None else None
     if w is None and pool is not None:
-      w = pool.witness_for(states[i], a)
+      w = pool.witness_for(states[i], a, states[i + 1], assembly)
+    if w is None:
+      w = reusable.get(key)
     if w is None and resolve_missing:
       # A stale stochastic failure from a previously considered ordering is not a certificate.
       # Hoisting has selected this edge, so give it one normal full-budget certification.
@@ -5088,6 +5327,73 @@ def hoist_releases(C, assembly, plan, robots, gripper_kind=None, handovers=True,
   return out
 
 
+def hoist_releases_certified(C, assembly, plan, witnesses, robots, robot_ik, *,
+                             gripper_kind=None, handovers=True, allow_place=True,
+                             bracing=False, verbose=True):
+  """Transactionally hoist releases without weakening witness persistence.
+
+  ``hoist_releases`` proves only symbolic/cheap-geometric commutativity.  Moving a release can
+  still change the predecessor scene of the action it crosses, so its old IK keyframe is not a
+  certificate for the rewritten edge.  This wrapper keeps the source plan and its complete
+  witness block intact, certifies just the changed candidate edges (reusing source certificates
+  only by ``(action, scene_signature)``), and commits the rewrite only if every IK action in the
+  candidate has a certificate.  A failed certification is therefore an optimization miss, not a
+  failure of the already-solved assembly plan.
+
+  Returns ``(final_plan, final_witnesses, applied)``.  ``final_witnesses`` are aligned to the
+  returned plan in both branches.  Unexpected solver/programming errors still propagate; normal
+  IK infeasibility is represented by a missing candidate witness and rolls back cleanly.
+  """
+  from plan_io import missing_required_witnesses
+
+  if witnesses is None:
+    raise ValueError("hoist_releases_certified needs a complete source witness block")
+  source_plan = plan
+  source_witnesses = [None if w is None else np.asarray(w, dtype=float).copy()
+                      for w in witnesses]
+  source_missing = missing_required_witnesses(source_plan, source_witnesses)
+  if source_missing:
+    detail = ", ".join(f"{i}:{tuple(source_plan[i])}" for i in source_missing[:4])
+    raise ValueError("hoist_releases_certified needs a complete source witness block; "
+                     f"missing {detail}")
+
+  candidate = hoist_releases(
+      C, assembly, source_plan, robots, gripper_kind=gripper_kind,
+      handovers=handovers, allow_place=allow_place, bracing=bracing, verbose=verbose)
+  if list(candidate) == list(source_plan):
+    return source_plan, source_witnesses, False
+
+  try:
+    candidate_witnesses = collect_plan_witnesses(
+        C, assembly, candidate, robots, robot_ik, gripper_kind=gripper_kind,
+        handovers=handovers, allow_place=allow_place, bracing=bracing,
+        resolve_missing=True, verbose=verbose,
+        reuse_from_plan=source_plan, reuse_from_witnesses=source_witnesses)
+  except ValueError as exc:
+    # This can only arise while replaying/certifying the rewritten candidate: the source was
+    # checked above and hoist_releases already accepted it. Treat a non-replayable candidate as
+    # an optimization miss instead of discarding the plan that search already certified.
+    if verbose:
+      print("[hoist] rollback: rewritten release order could not be replay-certified "
+            f"({exc}); retaining the original certified plan and witnesses.")
+    return source_plan, source_witnesses, False
+  missing = missing_required_witnesses(candidate, candidate_witnesses)
+  if missing:
+    detail = ", ".join(f"{i}:{tuple(candidate[i])}" for i in missing[:4])
+    if len(missing) > 4:
+      detail += f", ... ({len(missing)} total)"
+    if verbose:
+      print("[hoist] rollback: rewritten release order lacks exact IK certificate(s) at "
+            f"{detail}; retaining the original certified plan and witnesses.")
+    return source_plan, source_witnesses, False
+
+  if verbose:
+    changed = sum(a != b for a, b in zip(source_plan, candidate))
+    print(f"[hoist] rewrite recertified: {changed} action position(s) changed; "
+          "committing the hoisted plan and aligned witnesses.")
+  return candidate, candidate_witnesses, True
+
+
 def _labeled_geo_ok(checker, assembly, st, ideal_set, note=""):
   """GEO-fact core (--geo-facts): floating-gripper COEXISTENCE check for a crafted labeled
   state -- can all the state's grippers physically BE at their grasps on the assembly at
@@ -5299,7 +5605,7 @@ class LabeledDisassemblyHeuristic:
     # (rest_faces) instead of the old global 0..5 -- so the abstraction offers exactly the
     # resting orientations the real places()/precompute_stable_faces do (e.g. a lone cylinder
     # only cap-down). Same faces on both sides => still a relaxation => still admissible.
-    rf = lambda g: rest_faces(self.assembly, set(g))
+    rf = lambda g: rest_face_classes(self.assembly, set(g))
     Hf = self.H
 
     # ---- WRENCH facts (gripper_kind set): gate the abstract mates/releases with the SAME
@@ -5573,7 +5879,8 @@ class LabeledDisassemblyHeuristic:
     G = tuple(sorted((c[2], c[3]) for p in main
                      for c in state.supports.get(p, ()) if c[0] == "grasp"))
     on_table = any(("table",) in state.supports.get(p, ()) for p in main)
-    face = _placement_face(state, main) if on_table else self.H
+    face = placement_rest_class(self.assembly, _placement_face(state, main)) \
+        if on_table else self.H
     L = tuple(sorted((c[2], c[3]) for p in state.parent if p not in main
                      for c in state.supports.get(p, ()) if c[0] == "grasp"))
     return (ideal, G, face, L)
@@ -6106,7 +6413,7 @@ class CollapsedLabeledHeuristic:
     # (rest_faces) instead of the old global 0..5 -- so the abstraction offers exactly the
     # resting orientations the real places()/precompute_stable_faces do (e.g. a lone cylinder
     # only cap-down). Same faces on both sides => still a relaxation => still admissible.
-    rf = lambda g: rest_faces(self.assembly, set(g))
+    rf = lambda g: rest_face_classes(self.assembly, set(g))
     Hf = self.H
 
     # per-PART loose-pickability: exists-a-face AND exists-a-grasp (the collapse of the fine
@@ -6373,6 +6680,11 @@ class CollapsedLabeledHeuristic:
 
     # goal states: identical seeding to the fine class (L=() either way)
     self.dist = {}
+    # For every settled abstract state, retain ALL Bellman-optimal next states toward the
+    # fill goal.  This is the reverse search's policy graph, not a second planner and not an
+    # IK-validation order.  The milestone driver uses it to decide which finite concrete
+    # grasp/rest columns to expose first; the unrestricted concrete fill remains the net.
+    self._policy_next = {}
     pq = []
     from itertools import combinations
     vg_full = self.valid[all_parts]
@@ -6429,9 +6741,13 @@ class CollapsedLabeledHeuristic:
             if self._kind_counts is not None and not _kind_budget_ok(
                 self._label_kinds, self._kind_counts, s[1], s[3]):
               continue                                    # mixed-EE arm budget (admissible)
-            if nd < self.dist.get(s, float("inf")):
+            old = self.dist.get(s, float("inf"))
+            if nd < old:
               self.dist[s] = nd
+              self._policy_next[s] = {t}
               heapq.heappush(pq, (nd, id(s), s))
+            elif abs(nd - old) <= 1e-9:
+              self._policy_next.setdefault(s, set()).add(t)
           # Expand the queried state before pausing.  A later query may reach one of its
           # predecessors only through this edge; returning immediately after POP would lose
           # that part of the retained frontier and make the oracle order-dependent.
@@ -6474,7 +6790,8 @@ class CollapsedLabeledHeuristic:
       G = tuple(sorted((c[2], c[3]) for p in main
                        for c in state.supports.get(p, ()) if c[0] == "grasp"))
     on_table = any(("table",) in state.supports.get(p, ()) for p in main)
-    face = _placement_face(state, main) if on_table else self.H
+    face = placement_rest_class(self.assembly, _placement_face(state, main)) \
+        if on_table else self.H
     if self._labeled_loose:
       # loose parts keep their (part, grasp-class) label -- the fine class's pick/press
       # discrimination at class resolution (the 2026-07-17 plateau finding).
@@ -6502,6 +6819,120 @@ class CollapsedLabeledHeuristic:
       self.misses += 1
       return float("inf")
     return v
+
+  def policy_atoms(self, state):
+    """Ordered atomic finite-coordinate demands on one Bellman-optimal route.
+
+    This is deliberately an *ordering* interface, not a second feasibility model.  Starting
+    from the queried abstract state, follow one lexicographically deterministic Bellman
+    successor toward the reverse-PDB goal.  Each held loose label yields one ``loose`` grasp
+    fibre; each label on the settled component yields one ``support`` fibre.  ``support`` is
+    intentionally neutral about the concrete action: the same contact can be inherited,
+    acquired by ``add_grasp``, or reached via a handover.  A table-yaw atom is emitted only on
+    a held-to-rest transition, where a concrete PLACE can actually select the free yaw fibre.
+
+    The atom carries all raw variants of one abstract signature label, but never combines two
+    labels or a label with yaw.  The concrete caller activates at most one previously hidden
+    atom, then falls back to ordinary progressive widening.  Thus the relaxation cannot turn
+    an abstract multi-contact route into an eager Cartesian product, and it performs no IK.
+    """
+    if not np.isfinite(self.value(state)):
+      return ()
+    key = self.abstract(state)
+    seen_states, seen_atoms, out = set(), set(), []
+    while key not in seen_states:
+      seen_states.add(key)
+      ideal, G, face, L = key
+      # Include labels already occupied at this point on the route: signature collapse can
+      # hide a raw-variant change as an abstract self-loop, and the finite raw fibre is still
+      # the appropriate atomic thing to try.  Context participates in the key because the
+      # same collapsed label can expand to different raw rows before and after a join.
+      for p, gb in G:
+        raw = frozenset(self._vgroups.get(ideal, {}).get(
+            (p, gb), self._svgroups.get(p, {}).get(gb, (gb,))))
+        atom_key = ("grasp", "support", ideal, p, gb)
+        if raw and atom_key not in seen_atoms:
+          seen_atoms.add(atom_key)
+          out.append(("grasp", "support", ideal, p, gb, raw))
+      if self._labeled_loose:
+        for p, gb in L:
+          raw = frozenset(self._svgroups.get(p, {}).get(gb, (gb,)))
+          atom_key = ("grasp", "loose", (p,), p, gb)
+          if raw and atom_key not in seen_atoms:
+            seen_atoms.add(atom_key)
+            out.append(("grasp", "loose", (p,), p, gb, raw))
+      nxt = tuple(sorted(self._policy_next.get(key, ()), key=repr))
+      if not nxt:
+        break
+      successor = nxt[0]
+      _next_ideal, _next_G, next_face, _next_L = successor
+      # ``H`` is a value in an immutable abstract tuple.  Use value equality rather than
+      # relying on string/object interning when a PDB state has crossed a cache or test seam.
+      if face == self.H and next_face != self.H:
+        atom_key = ("yaw", _next_ideal, next_face)
+        if atom_key not in seen_atoms:
+          seen_atoms.add(atom_key)
+          out.append(("yaw", _next_ideal, next_face))
+      key = successor
+    return tuple(out)
+
+  def policy_atom_frontier(self, state, max_states=10000):
+    """Atomic demands on *all* settled Bellman-optimal routes, in breadth-first order.
+
+    ``policy_atoms`` intentionally exposes one deterministic route.  That is useful as a
+    reproducible diagnostic, but it is too brittle as a widening schedule: signature collapse
+    and omitted robot configurations can make the chosen route concretely spurious while an
+    equally short abstract branch asks for a different grasp fibre or resting class.
+
+    This method traverses the already-computed Bellman policy DAG instead.  It emits each
+    finite-coordinate atom once, ordered first by its minimum abstract transition depth and
+    then deterministically by representation.  It performs no new graph search, IK, or KOMO.
+    The traversal guard only bounds this optional ordering query; callers must retain their
+    ordinary widening schedule when it is reached.
+    """
+    if not np.isfinite(self.value(state)):
+      return ()
+    from collections import deque
+
+    start = self.abstract(state)
+    queue = deque([(start, 0)])
+    seen_states = set()
+    atoms = {}
+
+    def remember(atom, key, depth):
+      old = atoms.get(key)
+      if old is None or depth < old[0]:
+        atoms[key] = (depth, atom)
+
+    while queue and len(seen_states) < int(max_states):
+      key, depth = queue.popleft()
+      if key in seen_states:
+        continue
+      seen_states.add(key)
+      ideal, G, face, L = key
+      for p, gb in G:
+        raw = frozenset(self._vgroups.get(ideal, {}).get(
+            (p, gb), self._svgroups.get(p, {}).get(gb, (gb,))))
+        if raw:
+          remember(("grasp", "support", ideal, p, gb, raw),
+                   ("grasp", "support", ideal, p, gb), depth)
+      if self._labeled_loose:
+        for p, gb in L:
+          raw = frozenset(self._svgroups.get(p, {}).get(gb, (gb,)))
+          if raw:
+            remember(("grasp", "loose", (p,), p, gb, raw),
+                     ("grasp", "loose", (p,), p, gb), depth)
+
+      for successor in sorted(self._policy_next.get(key, ()), key=repr):
+        _next_ideal, _next_G, next_face, _next_L = successor
+        if face == self.H and next_face != self.H:
+          remember(("yaw", _next_ideal, next_face),
+                   ("yaw", _next_ideal, next_face), depth + 1)
+        if successor not in seen_states:
+          queue.append((successor, depth + 1))
+
+    return tuple(atom for _depth, atom in sorted(
+        atoms.values(), key=lambda item: (item[0], repr(item[1]))))
 
   def reverse_stats(self):
     """Small, stable instrumentation surface for eager and query-driven PDB builds."""
@@ -8147,6 +8578,45 @@ def _grasp_action_within_cap(action, grasp_cap):
   return action[3] < cap
 
 
+def _grasp_action_in_columns(action, columns):
+  """Whether a newly selected grasp belongs to a policy-activated finite column set."""
+  if columns is None or action[0] not in (
+      "pick", "add_grasp", "handover", "inhand_reorient"):
+    return True
+  return action[3] in columns.get(action[2], ())
+
+
+def _placement_action_in_classes(action, successor, assembly, classes, prefix=None):
+  """Whether PLACE belongs to the additive policy-yaw action set.
+
+  The policy probe temporarily exposes the complete placement table so it can enumerate one
+  requested world-z-yaw orbit.  It must nevertheless retain every PLACE that was already in
+  the ordinary prefix: the guide is an additive column proposal, not a replacement action
+  space.  ``prefix`` records that prior global prefix while ``classes`` adds complete yaw
+  orbits for selected ``(group, rest-class)`` pairs.  The ordinary unrestricted pass still
+  follows if this early probe fails.
+  """
+  if classes is None or action[0] != "place":
+    return True
+  group = next((g for g in successor.subassemblies() if action[2] in g), None)
+  if group is None:
+    return False
+  if prefix is not None:
+    ref = reference_part(group)
+    # Populate/read the table-local rank registry. Placement ids are global, but their yaw
+    # rank is deliberately table-local (the same quaternion can be a base in one component
+    # and a yaw copy in another).
+    placement_table(assembly, group, ref)
+    key = (_subasm_key(group), ref, _problem._STABLE_REST_POSES,
+           _problem._PLACEMENT_YAWS)
+    rank = getattr(assembly, "_placement_yaw_ranks", {}).get(key, {})
+    if rank.get(action[3], 0) < int(prefix):
+      return True
+  allowed = classes.get(_subasm_key(group))
+  return (allowed is not None
+          and placement_rest_class(assembly, action[3]) in allowed)
+
+
 def _grasp_prefix_table(grasp_table, caps):
   """A read-only-by-convention table view containing only per-part prefix columns.
 
@@ -8163,6 +8633,22 @@ def _grasp_prefix_table(grasp_table, caps):
     out.kinds_of = grasp_table.kinds_of
     out.robot_kinds = grasp_table.robot_kinds
   return out
+
+
+def _finite_grasp_caps(grasp_table, objects, maximum):
+  """Return the exact per-part prefix cap of a finite immutable grasp master.
+
+  A scene-conditioned grasp table can retain a raw id only in a held/assembled row, so the
+  master must be measured across every table row rather than only the singleton pickup row.
+  The result is a cap (one past the largest id), which remains valid even when a part's ids
+  are sparse.
+  """
+  maximum = int(maximum)
+  return {
+      q: min(maximum, max((g for rows in grasp_table.values()
+                            for p, g, _pose in rows if p == q), default=-1) + 1)
+      for q in objects
+  }
 
 
 def _make_fill_local_pdb(start, assembly, robots, checker, grasp_table, p,
@@ -8229,7 +8715,9 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
                   part_grasp_allow=None, brace_allow=None, deadline=None,
                   lazy_fill=False, cost_bound=None, forbid_assemble=None, settle_ref=None,
                   h_extra_shift=None, fill_h=None, exact_fill=False,
-                  skeleton_only=False, policy_pdb=None, touch_all=None,
+                  skeleton_only=False, policy_pdb=None,
+                  grasp_active=None, placement_active=None, placement_active_prefix=None,
+                  touch_all=None,
                   excluded_end_states=None, diagnostic_only=False):
   import os as _os
   verbose = verbose or bool(_os.environ.get("MILESTONE_DEBUG"))
@@ -8275,6 +8763,8 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
       return
     df = pr["bind_fail"] - f0["bind_fail"]
     dt = pr["bind_time"] - f0["bind_time"]
+    dst = pr["bind_success_time"] - f0["bind_success_time"]
+    dft = pr["bind_fail_time"] - f0["bind_fail_time"]
     dmr = int(pr.get("margin_refine_solves", 0)) - int(f0.get("margin_refine_solves", 0))
     dmrt = float(pr.get("margin_refine_time", 0.0)) - float(f0.get("margin_refine_time", 0.0))
     dts = sorted(((k, v[0] - fba.get(k, [0, 0, 0.0])[0],
@@ -8299,7 +8789,8 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
         key=lambda row: (-row[1], row[0]))
     pair_summary = "; ".join(
         f"{kind}:{fa}~{fb} x{n}" for (kind, fa, fb), n in pair_deltas[:4])
-    print(f"[fill-prof {tag}] binds={db} failed={df} bind_time={dt:.1f}s"
+    print(f"[fill-prof {tag}] binds={db} failed={df} bind_time={dt:.1f}s "
+          f"(ok={dst:.1f}s fail={dft:.1f}s)"
           + (f": {tops}" if tops else "")
           + (f"; gates: {', '.join(gates)}" if gates else "")
           + (f"; margin-refine={dmr} ({dmrt:.1f}s)" if dmr else "")
@@ -8411,8 +8902,14 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
       # unrelated assembly join from making the concrete state disagree with outer `ideal`.
       if not _fill_action_in_scope(a, relevant, p, touch_all=touch_all):
         continue
-      if not _grasp_action_within_cap(a, grasp_cap):
+      if grasp_active is not None:
+        if not _grasp_action_in_columns(a, grasp_active):
+          continue                                        # policy-selected finite columns
+      elif not _grasp_action_within_cap(a, grasp_cap):
         continue                                          # only stable ids < this part's cap
+      if not _placement_action_in_classes(
+          a, ns, assembly, placement_active, prefix=placement_active_prefix):
+        continue                                          # policy-selected rest/yaw orbits
       if part_grasp_allow is not None and a[0] == "assemble" and a[2] == p:
         # the abstraction's viable-inserter-grasp hint applies to the MATE -- the grasp `p` is
         # HELD with when it seats -- NOT the pick: `p` may need a reorient pick with a
@@ -8430,10 +8927,7 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
         continue                                          # e.g. the module JOIN belongs to the
       if policy_pdb is not None and not _fill_policy_edge(policy_pdb, s, a, ns):
         continue                                          # proposal: Bellman-optimal PDB corridor
-      yield a, ns                                         # dedicated join fill (tiny space =>
-                                                          # cheap lazy rounds; measured 96 join
-                                                          # refusals x full re-search inside the
-                                                          # obj_11 fill = the 118s bottleneck)
+      yield a, ns
 
   def _diagnose_reference_rank():
     """Run the real optimistic local queue against this fill's demonstrated segment.
@@ -9059,6 +9553,7 @@ def solve_assembly_problem_optimistic(C, assembly, robots=None, verbose=True,
                                       allow_place=True, bracing=False, lazy_fills=False,
                                       chain_h=False, fill_local_h=False, fill_exact=False,
                                       wrench_aware_h=True, fill_policy_first=False,
+                                      fill_policy_guide=False,
                                       fill_skeleton_first=False,
                                       **exact_kw):
   """OPTIMISTIC (Dogar-style) planner (see the section header): add the parts one at a time,
@@ -9088,6 +9583,9 @@ def solve_assembly_problem_optimistic(C, assembly, robots=None, verbose=True,
         "built with their internal parts before joining it. Re-run with --milestones "
         "(the module-aware solver); no optimistic fallback was attempted."
     )
+  if fill_policy_guide:
+    raise ValueError("fill_policy_guide is implemented only by the ordinary milestone "
+                     "solver, where it schedules a grasp or placement-yaw widening fibre")
   if fill_policy_first and not fill_local_h:
     raise ValueError("fill_policy_first requires fill_local_h")
   checker, grasp_table = _search_context(C, assembly, robots)
@@ -9185,7 +9683,6 @@ def solve_assembly_problem_optimistic(C, assembly, robots=None, verbose=True,
             gripper_kind=hgk, bracing=bracing, component_root=assembly.base,
             verbose=verbose)
         fill_pdb_cache[key] = lpdb
-
     sub, s2 = None, None
     if fill_policy_first and lpdb is not None:
       if verbose:
@@ -9453,23 +9950,25 @@ def _add_one_part_declutter(start, p, ideal, assembly, robots, checker, grasp_ta
       print(f"    [declutter] {p}: blocked by {sorted(new)} -> relocating and re-planning")
 
 
-def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, robot_ik=None,
-                                     weight=5.0, max_nodes=20000, wrench=False,
-                                     wrench_aware_h=True,
-                                     handovers=True, allow_place=True, bracing=False,
-                                     max_repairs=100, geo_facts=False,
-                                     sig_collapsed_h=False, deadline=None,
-                                     fill_window=2, lazy_fills=True,
-                                     cost_bound=None, milestone_oracle="global",
-                                     fill_local_h=False, fill_exact=False,
-                                     fill_policy_first=False,
-                                     fill_skeleton_first=False,
-                                     fill_scope_widening=False,
-                                     milestone_boundaries=1,
-                                     grasp_local_widen=False,
-                                     grasp_initial_keep=20,
-                                     grasp_widen_batch=8,
-                                     grasp_widen_max=96):
+def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=True, robot_ik=None,
+                                           weight=5.0, max_nodes=20000, wrench=False,
+                                           wrench_aware_h=True,
+                                           handovers=True, allow_place=True, bracing=False,
+                                           max_repairs=100, geo_facts=False,
+                                           sig_collapsed_h=False, deadline=None,
+                                           fill_window=2, lazy_fills=True,
+                                           cost_bound=None, milestone_oracle="global",
+                                           fill_local_h=False, fill_exact=False,
+                                           fill_policy_first=False,
+                                           fill_policy_guide=False,
+                                           fill_skeleton_first=False,
+                                           fill_scope_widening=False,
+                                           milestone_boundaries=1,
+                                           grasp_local_widen=False,
+                                           grasp_initial_keep=20,
+                                           grasp_widen_batch=8,
+                                           grasp_widen_max=96,
+                                           placement_yaw_widening=False):
   """MILESTONE (Dogar-style, abstraction-guided) planner. Two levels:
 
     LEVEL 1: the assembly SEQUENCE. The labeled abstraction's backward Dijkstra (the same
@@ -9502,11 +10001,17 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
   if int(milestone_boundaries) < 1:
     raise ValueError("milestone_boundaries must be >= 1")
   milestone_boundaries = int(milestone_boundaries)
-  if fill_policy_first and not fill_local_h:
-    raise ValueError("fill_policy_first requires fill_local_h")
+  if (fill_policy_first or fill_policy_guide) and not fill_local_h:
+    raise ValueError("fill_policy_first/fill_policy_guide requires fill_local_h")
+  if fill_policy_guide and not (grasp_local_widen or placement_yaw_widening):
+    raise ValueError("fill_policy_guide requires grasp_local_widen or "
+                     "placement_yaw_widening; otherwise it has no fibre to widen")
   if grasp_local_widen and (grasp_initial_keep < 1 or grasp_widen_batch < 1
                             or grasp_widen_max < grasp_initial_keep):
     raise ValueError("local grasp widening requires initial>=1, batch>=1, and max>=initial")
+  if placement_yaw_widening and _problem._PLACEMENT_YAWS <= 1:
+    raise ValueError("placement yaw widening requires --placement-yaws N with N > 1")
+  yaw_levels = placement_yaw_levels() if placement_yaw_widening else ()
 
   t0 = time.perf_counter()
   if robots is None:
@@ -9518,9 +10023,7 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
     # The table is the immutable finite MASTER constructed by main/problem. Prefix caps are
     # concrete-search state, not DB state: changing one cannot rebind an id or invalidate an
     # IK cache entry. A short physical master simply saturates before the requested maximum.
-    for q in assembly.objects:
-      ids = [g for p, g, _pose in grasp_table.get((q,), ()) if p == q]
-      grasp_available[q] = min(int(grasp_widen_max), max(ids, default=-1) + 1)
+    grasp_available = _finite_grasp_caps(grasp_table, assembly.objects, grasp_widen_max)
     grasp_caps = {q: min(int(grasp_initial_keep), grasp_available[q])
                   for q in assembly.objects}
     assembly._grasp_local_caps = dict(grasp_caps)
@@ -9530,6 +10033,11 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
       print(f"[grasp-columns] active/master prefixes: {summary}. The backward/local "
             "concrete successors see only active columns; local PDBs keep the compact "
             "initial projection and treat later columns as unknown.")
+  # The ordinary local PDB always sees the same compact prefix as the ordinary concrete fill.
+  # A policy-guided widening request may later construct a *separate*, full-master reverse
+  # PDB solely to choose hidden columns.  Keeping the baseline PDB here is important: turning
+  # on an experimental guide must not silently change h, wrench hints, or the easy-fill action
+  # order before the compact search has actually failed.
   local_pdb_grasp_table = _grasp_prefix_table(grasp_table, grasp_caps)
   gk = wrench_kind_arg(C, robots) if wrench else None
   hgk = gk if wrench_aware_h else None
@@ -9602,6 +10110,8 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
   # chain, DAG, or detached module. The cache also prevents the hinted/full/braced widening
   # phases from rebuilding the same local backward solve.
   fill_classes, fill_pdb_cache = None, {}
+  policy_fill_classes, policy_fill_pdb_cache = None, {}
+  policy_fill_pdb_disabled = False
   if fill_local_h:
     fill_classes = compute_grasp_signatures(
         assembly, local_pdb_grasp_table, gripper_kind=hgk,
@@ -9627,6 +10137,36 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
           gripper_kind=hgk, bracing=bracing, component_root=root,
           geo_facts=geo_facts, verbose=verbose)
       fill_pdb_cache[key] = hit
+    return hit
+
+  def policy_fill_pdb(s, q, settle):
+    """Lazily build the full-master reverse PDB used only for post-failure lifting.
+
+    The policy PDB is deliberately separate from ``fill_pdb``: its additional raw grasp
+    representatives must not perturb the compact fill's heuristic, phase hints, or ordinary
+    successor ordering.  Signature collapse keeps this reverse query small even though its
+    concrete lift can request currently hidden stable IDs.
+    """
+    nonlocal policy_fill_classes
+    if not (fill_policy_guide and grasp_local_widen) or policy_fill_pdb_disabled:
+      return None
+    root = assembly.base if settle is None else settle
+    comps = tuple(s.subassemblies())
+    target = next(frozenset(g) for g in comps if root in g)
+    mover = next(frozenset(g) for g in comps if q in g)
+    key = (_subasm_key(target), _subasm_key(mover), q, root)
+    hit = policy_fill_pdb_cache.get(key)
+    if hit is None:
+      if policy_fill_classes is None:
+        policy_fill_classes = compute_grasp_signatures(
+            assembly, grasp_table, gripper_kind=hgk,
+            gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
+            clearance=0.02)
+      hit = _make_fill_local_pdb(
+          s, assembly, robots, checker, grasp_table, q, policy_fill_classes,
+          gripper_kind=hgk, bracing=bracing, component_root=root,
+          geo_facts=geo_facts, verbose=verbose)
+      policy_fill_pdb_cache[key] = hit
     return hit
 
   def oracle(ideal_set, q):
@@ -9681,12 +10221,26 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
     return (gqs or None), unbraced_ok, (braces or None)
 
   def fill(s, q, ideal, fb=None, forbid=None, settle=None, excluded_end_states=None):
+    if placement_yaw_widening:
+      # Every local fill starts from the historical action space. A yaw selected by an
+      # earlier fill remains encoded/resolvable in `s`; only NEW place edges are restricted.
+      # The optional reverse-policy lift opens its requested yaw fibres *after* this compact
+      # fill actually fails.  Starting it open made the guide an accidental eager expansion.
+      set_placement_yaw_prefix(1)
     lpdb = fill_pdb(s, q, settle)
     # In the structural standard there is deliberately no global oracle. The local PDB is
     # nevertheless the exact relaxed model for THIS interface, so its mate/brace facts are
-    # the principled source for a narrow early phase under local grasp widening.
-    hint_source = lpdb if grasp_local_widen and lpdb is not None else None
+    # the principled source for a narrow early phase under local grasp widening.  A full-master
+    # policy PDB is intentionally NOT queried here; it is created only if the compact fill and
+    # its one ordinary numerical column expansion fail and a hidden-column/yaw lift is needed.
+    hint_source = lpdb
     allow, unbraced_ok, ballow = hints(_subasm_key(ideal), q, source=hint_source)
+    if fill_policy_guide and verbose:
+      print(f"[fill-policy-guide {q}] compact fill preserved: "
+            f"mate grasps={0 if allow is None else len(allow)}, "
+            f"brace grasps={0 if ballow is None else len(ballow)}. Compact fill runs "
+            "unchanged; its one ordinary numeric column expansion also runs before a "
+            "separate full-master reverse policy is queried.", flush=True)
     # h-shift for NON-module fills: the settled {ideal+q} abstraction value (see
     # _add_one_part.h_fn). Module fills (settle is not None) keep the epsilon join.
     shift = None
@@ -9709,6 +10263,11 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
           phases.append((nb if dense else None, True, allow, ballow))  # hinted mate + brace
         phases.append((None, True, None, ballow))                    # any mate + hinted brace
       phases.append((None, True, None, None))                        # full braced (net)
+    # The policy probe, yaw widening and grasp-column widening all begin with the same cheap
+    # family: unbraced phases plus PDB-certified braces. Unrestricted bracing is recovery.
+    early_phases = [ph for ph in phases if not ph[1] or ph[3] is not None]
+    if not early_phases:
+      early_phases = phases[:1]
     scope_passes = _fill_scope_passes(_FILL_TOUCH_ALL, fill_scope_widening)
     # A known-path ordering diagnostic must not depend on which easier phase the ORDINARY
     # search happens to solve first (with IK disabled, OpenArm obj_4 has a direct unbraced
@@ -9775,7 +10334,8 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
       _release_fill_scratch(f"{q}:skeleton", verbose)
       if sub is not None:
         return sub, s2
-    def attempt(selected_phases, selected_scopes, cap_map=None, one_open_epoch=False):
+    def attempt(selected_phases, selected_scopes, cap_map=None, one_open_epoch=False,
+                active_columns=None, active_rests=None, active_rest_prefix=None):
       old_epochs = None
       if (one_open_epoch and robot_ik is not None
           and getattr(robot_ik, "open_witness", False)
@@ -9797,15 +10357,17 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
                 s, q, ideal, assembly, robots, checker, grasp_table, robot_ik,
                 weight, max_nodes, verbose, gripper_kind=gk,
                 handovers=handovers, allow_place=allow_place, bracing=br,
-                grasp_cap=cap,
+                grasp_cap=(None if active_columns is not None else cap),
+                grasp_active=active_columns, placement_active=active_rests,
+                placement_active_prefix=active_rest_prefix,
                 h_extra=(None if lpdb is not None else
                          h_lab.value if h_lab is not None else None),
                 part_grasp_allow=ma,
                 brace_allow=ba, deadline=deadline, lazy_fill=lazy_fills,
                 cost_bound=fb, forbid_assemble=forbid, settle_ref=settle,
-                h_extra_shift=shift,
-                fill_h=(lpdb.value if lpdb is not None else None),
-                exact_fill=fill_exact, touch_all=touch_all,
+              h_extra_shift=shift,
+              fill_h=(lpdb.value if lpdb is not None else None),
+              exact_fill=fill_exact, touch_all=touch_all,
                 excluded_end_states=excluded_end_states)
             _release_fill_scratch(f"{q}:phase", verbose)
             if sub is not None:
@@ -9815,8 +10377,282 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
           robot_ik.open_witness_epochs = old_epochs
       return None, None
 
+    # POLICY-GUIDED POST-FAILURE LIFT.  The local PDB is an abstraction of the *whole*
+    # finite master, but it must not replace the historical compact fill with a speculative
+    # narrow search: that was slower on easy Cross fills and turned a guide into a gate.  The
+    # normal compact fill and its one historical numeric incoming-column batch run first.
+    # Only if that familiar route stalls does this helper traverse the Bellman-optimal policy
+    # DAG and progressively expose its missing finite coordinates.  Coordinates remain active
+    # within this local fill, raw fibres are dovetailed one stable-ID batch at a time, and a
+    # failed probe advances to another optimal branch instead of retrying one arbitrary route.
+    # The ordinary monotone prefix/yaw/scope passes still form the completeness net.
+    policy_lift = None
+    if fill_policy_guide and (grasp_local_widen or placement_yaw_widening):
+      _policy_raw_ids = {}
+      policy_active_columns = {}
+      policy_active_rests = {}
+      policy_support_braces = set()
+
+      def raw_ids(part):
+        """Every raw id for ``part`` occurring in the immutable finite master."""
+        hit = _policy_raw_ids.get(part)
+        if hit is None:
+          hit = {gid for rows in grasp_table.values()
+                 for owner, gid, _pose in rows if owner == part}
+          _policy_raw_ids[part] = hit
+        return hit
+
+      def prefix_columns(cap_map):
+        """Exact concrete baseline for a policy lift (not merely its demanded members)."""
+        out = {}
+        for part, cap in cap_map.items():
+          # `_grasp_prefix_table` applies the cap to every subassembly table, not only the
+          # singleton entry.  Mirror that exact finite baseline here so the temporary policy
+          # probe can only add columns; it cannot accidentally remove an ordinary one.
+          ids = {gid for gid in raw_ids(part) if gid < cap}
+          if ids:
+            out[part] = ids
+        return out
+
+      def publish_policy_columns(active):
+        """Record a successful sparse policy alphabet using replay-safe monotone caps."""
+        if active is None:
+          return
+        for p2, ids in active.items():
+          if ids:
+            grasp_caps[p2] = max(grasp_caps[p2], max(ids) + 1)
+        assembly._grasp_local_caps = dict(grasp_caps)
+        assembly._grasp_local_active_ids = {
+            p2: tuple(sorted(ids)) for p2, ids in active.items()
+        }
+
+      def policy_lift(cap_map, *, yaw_only=False):
+        """Dovetail finite demands from every settled Bellman-optimal policy branch.
+
+        The compact attempt and its ordinary numeric incoming-part batch have already failed.
+        Raw signature fibres receive one bounded stable-ID batch in breadth-first order. Each
+        batch
+        is added monotonically to the current local alphabet before one forward-validation
+        epoch.  The later yaw call does the same for distinct stable-rest orbits and retains
+        the raw coordinates already requested by the policy.  No backward IK is performed,
+        and exhaustion falls through to the ordinary widening schedule.
+        """
+        if yaw_only and verbose:
+          print(f"[fill-policy-widen {q}] ordinary raw-column schedule stalled; querying "
+                "the Bellman rest/yaw demand frontier.", flush=True)
+
+        # With local column generation, this is the deliberately separate full-master PDB.
+        # Without it, the ordinary PDB already covers the complete grasp table and can supply
+        # a policy only for the independently widened yaw fibre.
+        nonlocal policy_fill_pdb_disabled
+        if deadline is not None and time.perf_counter() > deadline:
+          if verbose:
+            print(f"[fill-policy-widen {q}] deadline reached before the optional full-master "
+                  "policy query; skipping the guide and continuing the ordinary schedule.",
+                  flush=True)
+          return None, None, False
+        try:
+          ppdb = policy_fill_pdb(s, q, settle) if grasp_local_widen else lpdb
+          if ppdb is None or not np.isfinite(ppdb.value(s)):
+            if verbose:
+              print(f"[fill-policy-widen {q}] no settled reverse policy after compact "
+                    "failure; continuing ordinary widening.", flush=True)
+            return None, None, False
+          atoms = ppdb.policy_atom_frontier(s)
+        except RuntimeError as exc:
+          msg = str(exc)
+          if (grasp_local_widen and
+              ("collapsed labeled abstraction exceeded" in msg
+               or "fill-local PDB" in msg and "exceeded its" in msg)):
+            # The baseline compact PDB is constructed outside this block and deliberately
+            # remains fail-closed. Only this optional, full-master ordering oracle may fail
+            # open: disabling an effort guide cannot change concrete feasibility.
+            policy_fill_pdb_disabled = True
+            if verbose:
+              print(f"[fill-policy-widen {q}] optional full-master reverse policy hit its "
+                    "state guard; disabling the guide and continuing ordinary widening.",
+                    flush=True)
+            return None, None, False
+          raise
+        if deadline is not None and time.perf_counter() > deadline:
+          if verbose:
+            print(f"[fill-policy-widen {q}] deadline reached during the optional "
+                  "full-master policy query; discarding its proposal and continuing the "
+                  "ordinary schedule.", flush=True)
+          return None, None, False
+        active = prefix_columns(cap_map) if grasp_local_widen else None
+        if active is not None:
+          for p2, ids in policy_active_columns.items():
+            active.setdefault(p2, set()).update(ids)
+
+        if not yaw_only:
+          # One bounded batch per distinct policy fibre.  The guide moves across Bellman
+          # branches instead of consuming an entire raw master column; ordinary numerical and
+          # final finite-master widening remain responsible for later members of each fibre.
+          pending = []
+          if active is not None:
+            for atom in atoms:
+              if atom[0] != "grasp":
+                continue
+              _kind, role, context, part, gclass, variants = atom
+              hidden = tuple(
+                  g for g in sorted(set(variants) & raw_ids(part))
+                  if g < grasp_available.get(part, 0) and g not in active.get(part, ())
+              )
+              if hidden:
+                pending.append((role, context, part, gclass,
+                                hidden[:int(grasp_widen_batch)]))
+
+          attempted = False
+          while pending:
+            role, context, part, gclass, proposed = pending.pop(0)
+            chosen = tuple(g for g in proposed if g not in active.get(part, ()))
+            new_supports = ({(part, g) for g in proposed} - policy_support_braces
+                            if role == "support" and bracing else set())
+            if not chosen and not new_supports:
+              continue
+            active.setdefault(part, set()).update(chosen)
+            policy_active_columns.setdefault(part, set()).update(chosen)
+            policy_support_braces.update(new_supports)
+            attempted = True
+
+            policy_phases = early_phases
+            if policy_support_braces and bracing:
+              # A selected support contact is the narrow reverse-policy certificate. Admit
+              # every support fibre accumulated so far, together with previously certified
+              # braces, without opening the unrestricted brace product.
+              prior_braces = set()
+              for _cap, is_braced, _ma, ba in early_phases:
+                if is_braced and ba is not None:
+                  prior_braces.update(ba)
+              selected_braces = prior_braces | policy_support_braces
+              policy_phases = list(early_phases) + [
+                  (None, True, None, frozenset(selected_braces))]
+            if verbose:
+              print(f"[fill-policy-widen {q}] Bellman frontier adds one grasp batch "
+                    f"({role}, context={context}, part={part}, class={gclass!r}) ids "
+                    f"{list(chosen)}; {len(pending)} demand batch(es) remain. One bounded "
+                    "forward-IK epoch; activated columns remain available to later policy "
+                    "branches.", flush=True)
+            sub, s2 = attempt(
+                policy_phases, scope_passes[:1], one_open_epoch=True,
+                active_columns={p: frozenset(ids) for p, ids in active.items()},
+                active_rests=({group: frozenset(classes)
+                               for group, classes in policy_active_rests.items()} or None),
+                active_rest_prefix=1 if policy_active_rests else None)
+            if sub is not None:
+              publish_policy_columns(active)
+              return sub, s2, True
+            if verbose:
+              print(f"[fill-policy-widen {q}] grasp batch did not validate; retaining its "
+                    "finite column and advancing to the next Bellman demand.", flush=True)
+
+          if verbose:
+            msg = ("Bellman grasp demands exhausted without a concrete validation"
+                   if attempted else "reverse policy requested no novel grasp coordinate")
+            print(f"[fill-policy-widen {q}] {msg}; continuing ordinary widening.",
+                  flush=True)
+          return None, None, attempted
+
+        # The reverse abstraction quotients world-z yaw exactly.  It can identify a resting
+        # class but not one preferred yaw copy.  Visit every distinct Bellman-requested rest
+        # class once; later probes retain earlier orbits and any raw columns selected above.
+        if not placement_yaw_widening:
+          return None, None, False
+        old_yaw_prefix = _problem._PLACEMENT_YAW_PREFIX
+        active_yaws = (_problem._PLACEMENT_YAWS if old_yaw_prefix is None
+                       else int(old_yaw_prefix))
+        if active_yaws >= _problem._PLACEMENT_YAWS:
+          return None, None, False
+        attempted = False
+        for atom in atoms:
+          if atom[0] != "yaw":
+            continue
+          _kind, rest_group, rest_class = atom
+          known = policy_active_rests.setdefault(rest_group, set())
+          if rest_class in known:
+            continue
+          known.add(rest_class)
+          attempted = True
+          if verbose:
+            print(f"[fill-policy-widen {q}] Bellman frontier adds one rest/yaw orbit "
+                  f"(group={rest_group}, class={rest_class!r}); activated orbits and raw "
+                  "columns remain available to later policy branches. One bounded "
+                  "forward-IK epoch.", flush=True)
+          set_placement_yaw_prefix(None)
+          try:
+            sub, s2 = attempt(
+                early_phases, scope_passes[:1], one_open_epoch=True,
+                active_columns=({p: frozenset(ids) for p, ids in active.items()}
+                                if active is not None else None),
+                active_rests={group: frozenset(classes)
+                              for group, classes in policy_active_rests.items()},
+                active_rest_prefix=(None if old_yaw_prefix is None
+                                    else int(old_yaw_prefix)))
+          finally:
+            set_placement_yaw_prefix(old_yaw_prefix)
+          if sub is not None:
+            publish_policy_columns(active)
+            return sub, s2, True
+          if verbose:
+            print(f"[fill-policy-widen {q}] rest/yaw orbit did not validate; retaining it "
+                  "and advancing to the next Bellman demand.", flush=True)
+
+        if verbose:
+          msg = ("Bellman rest/yaw demands exhausted without a concrete validation"
+                 if attempted else "reverse policy requested no novel rest/yaw coordinate")
+          print(f"[fill-policy-widen {q}] {msg}; continuing ordinary widening.", flush=True)
+        return None, None, attempted
+
     if not grasp_local_widen:
-      return attempt(phases, scope_passes)
+      if not placement_yaw_widening:
+        return attempt(phases, scope_passes)
+      # FINITE PROGRESSIVE WIDENING. Keep manipulation local while opening the free table-yaw
+      # fibre.  The unrestricted-bracing phase has the same combinatorial character as
+      # all-part manipulation (every free arm x every target grasp), so do not let it consume
+      # the fill budget at N=1 before the cheap yaw parameter has even been exposed.  First
+      # dovetail all unbraced/PDB-certified-brace phases over the finite yaw lattice, then run
+      # unrestricted bracing, and only then pay for all-part manipulation.  This is nested
+      # action-space search, not pruning: the final local and broad passes are exactly eager N.
+      local_scope = scope_passes[:1]
+      early_phases = [ph for ph in phases if not ph[1] or ph[3] is not None]
+      recovery = [ph for ph in phases if ph not in early_phases]
+      # Historical first pass.  The policy lift, if requested, is inserted only AFTER this
+      # exact baseline failure; it temporarily opens selected yaw orbits and restores 1 before
+      # this ordinary coarse-to-fine schedule resumes.
+      first = yaw_levels[0]
+      set_placement_yaw_prefix(first)
+      sub, s2 = attempt(early_phases, local_scope)
+      if sub is not None:
+        return sub, s2
+      if policy_lift is not None:
+        sub, s2, _lifted = policy_lift(None, yaw_only=True)
+        if sub is not None:
+          return sub, s2
+      previous = first
+      for level in yaw_levels[1:]:
+        set_placement_yaw_prefix(level)
+        if verbose:
+          print(f"[place-yaw {q}] local fill failed with {previous} "
+                f"yaw band(s) -> exposing {level}/{_problem._PLACEMENT_YAWS} coarse-to-fine "
+                "bands; stable ids and IK witnesses retained.", flush=True)
+        sub, s2 = attempt(early_phases, local_scope)
+        if sub is not None:
+          return sub, s2
+        previous = level
+      if recovery:
+        if verbose:
+          print(f"[place-yaw {q}] complete {_problem._PLACEMENT_YAWS}-yaw cheap local "
+                "lattice exhausted -> enabling unrestricted bracing.", flush=True)
+        sub, s2 = attempt(recovery, local_scope)
+        if sub is not None:
+          return sub, s2
+      if len(scope_passes) > 1:
+        if verbose:
+          print(f"[place-yaw {q}] complete {_problem._PLACEMENT_YAWS}-yaw local lattice "
+                "exhausted -> widening manipulation scope.", flush=True)
+        return attempt(phases, scope_passes[1:])
+      return None, None
 
     # LAZY COLUMN GENERATION. The early family contains every unbraced phase plus only
     # PDB-certified brace assignments; the unrestricted brace/all-part products remain the
@@ -9828,31 +10664,67 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
       early_phases = phases[:1]
     local_scope = scope_passes[:1]
     local_growths = 0
+    policy_raw_lift_done = False
+    policy_yaw_lift_done = False
     while True:
       q_full = grasp_caps[q] >= grasp_available[q]
       sub, s2 = attempt(early_phases, local_scope, dict(grasp_caps),
                         one_open_epoch=not q_full)
       if sub is not None:
         return sub, s2
-      # One growth per concrete milestone boundary. If that does not work, return control
-      # to the outer milestone search so it can try another settled predecessor/part order.
-      # Repeatedly growing one fixed boundary was measured to spend 24.8s + 20.4s + 18.0s
-      # on OpenArm car-mini K=8 while a different predecessor was still unexplored.
-      if q_full or local_growths >= 1:
-        break
-      old = grasp_caps[q]
-      grasp_caps[q] = min(grasp_available[q], old + int(grasp_widen_batch))
-      local_growths += 1
-      assembly._grasp_local_caps = dict(grasp_caps)
-      if verbose:
-        print(f"[grasp-columns {q}] local fill stalled at K={old}; exposing stable "
-              f"incoming-part ids [{old}, {grasp_caps[q]})/{grasp_available[q]} and "
-              "dovetailing another bounded IK epoch.", flush=True)
+      # One historical numerical growth per concrete milestone boundary. If that does not
+      # work, use one reverse-selected *rescue pass* before returning control to the outer
+      # milestone search. Repeatedly growing one fixed boundary was measured to spend
+      # 24.8s + 20.4s + 18.0s on OpenArm car-mini K=8 while a different predecessor was
+      # still unexplored. The policy therefore does not replace this familiar K -> K+B pass;
+      # it proposes the next non-numeric block only after that pass has failed.
+      if not q_full and local_growths < 1:
+        old = grasp_caps[q]
+        grasp_caps[q] = min(grasp_available[q], old + int(grasp_widen_batch))
+        local_growths += 1
+        assembly._grasp_local_caps = dict(grasp_caps)
+        if verbose:
+          print(f"[grasp-columns {q}] local fill stalled at K={old}; exposing stable "
+                f"incoming-part ids [{old}, {grasp_caps[q]})/{grasp_available[q]} and "
+                "dovetailing another bounded IK epoch.", flush=True)
+        continue
+      if policy_lift is not None and not policy_raw_lift_done:
+        policy_raw_lift_done = True
+        if verbose:
+          print(f"[fill-policy-widen {q}] ordinary compact/raw-column schedule stalled; "
+                "querying the Bellman-optimal demand frontier.", flush=True)
+        sub, s2, _lifted = policy_lift(dict(grasp_caps))
+        if sub is not None:
+          return sub, s2
+      break
 
-    # Admit unrestricted bracing and then ordinary scope widening at the CURRENT prefixes.
-    # A no-plan result is not a finite-master refutation: the caller's final full-master pass
-    # supplies that completeness net after milestone alternatives have been explored.
+    # Raw grasp columns and table yaw are independent finite parameter dimensions.  Complete
+    # the cheap local yaw lattice (and its policy-selected orbit frontier) BEFORE opening
+    # unrestricted bracing: the latter multiplies every free arm by every target grasp and is
+    # strictly the more expensive relaxation.  This is the same nested action-space order as
+    # the non-local yaw scheduler above, now applied consistently to local columns.
     recovery = [ph for ph in phases if ph not in early_phases]
+    if placement_yaw_widening:
+      # Let the normal compact/raw attempts fail first, then traverse the reverse-selected
+      # yaw-orbit frontier before the historical coarse-to-fine yaw lattice resumes.
+      if policy_lift is not None and not policy_yaw_lift_done:
+        policy_yaw_lift_done = True
+        sub, s2, _lifted = policy_lift(dict(grasp_caps), yaw_only=True)
+        if sub is not None:
+          return sub, s2
+      for previous, level in zip(yaw_levels, yaw_levels[1:]):
+        set_placement_yaw_prefix(level)
+        if verbose:
+          print(f"[place-yaw {q}] local fill failed with {previous} yaw band(s) -> "
+                f"exposing {level}/{_problem._PLACEMENT_YAWS} coarse-to-fine bands before "
+                "unrestricted bracing, at the current grasp prefixes.", flush=True)
+        sub, s2 = attempt(early_phases, local_scope, dict(grasp_caps))
+        if sub is not None:
+          return sub, s2
+
+    # Only after every cheap local raw/yaw combination has failed admit unrestricted bracing.
+    # A no-plan result is not a finite-master refutation: the iterator's final full-master
+    # completion pass supplies that net only after local milestone alternatives are explored.
     if recovery:
       sub, s2 = attempt(recovery, local_scope, dict(grasp_caps))
       if sub is not None:
@@ -9961,11 +10833,23 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
         # FINAL SETTLE (set_goal on_table): all parts mated but the assembly is not yet at
         # the goal (still held / a holder remains) -> place it down and release. On failure
         # (cannot stand alone at this build), treat as a dead end and backjump.
-        sub, s2 = _settle_to_goal(s, assembly, robots, checker, grasp_table, robot_ik,
-                                  max(weight, 5.0), max_nodes, gripper_kind=gk,
-                                  handovers=handovers, bracing=bracing,
-                                  lazy_fill=lazy_fills, deadline=deadline,
-                                  grasp_cap=grasp_caps)
+        old_yaw_prefix = _problem._PLACEMENT_YAW_PREFIX
+        if placement_yaw_widening:
+          # This is the last placement decision, not another incoming-part fill. Search its
+          # complete configured finite yaw lattice in one small settle problem; otherwise a
+          # compact prefix can falsely reject an already completed assembly. Restore the
+          # internal schedule on both success and failure. The public iterator publishes the
+          # full table again when it yields a complete plan for replay/witness consumers.
+          set_placement_yaw_prefix(None)
+        try:
+          sub, s2 = _settle_to_goal(s, assembly, robots, checker, grasp_table, robot_ik,
+                                    max(weight, 5.0), max_nodes, gripper_kind=gk,
+                                    handovers=handovers, bracing=bracing,
+                                    lazy_fill=lazy_fills, deadline=deadline,
+                                    grasp_cap=grasp_caps)
+        finally:
+          if placement_yaw_widening:
+            set_placement_yaw_prefix(old_yaw_prefix)
         if sub is None:
           if verbose:
             print(f"[milestones] final settle-to-table FAILED -> backjump", flush=True)
@@ -10127,6 +11011,102 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
   return None
 
 
+def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, robot_ik=None,
+                                     weight=5.0, max_nodes=20000, wrench=False,
+                                     wrench_aware_h=True,
+                                     handovers=True, allow_place=True, bracing=False,
+                                     max_repairs=100, geo_facts=False,
+                                     sig_collapsed_h=False, deadline=None,
+                                     fill_window=2, lazy_fills=True,
+                                     cost_bound=None, milestone_oracle="global",
+                                     fill_local_h=False, fill_exact=False,
+                                     fill_policy_first=False,
+                                     fill_policy_guide=False,
+                                     fill_skeleton_first=False,
+                                     fill_scope_widening=False,
+                                     milestone_boundaries=1,
+                                     grasp_local_widen=False,
+                                     grasp_initial_keep=20,
+                                     grasp_widen_batch=8,
+                                     grasp_widen_max=96,
+                                     placement_yaw_widening=False):
+  """Yield milestone plans, with a finite completion epoch for local grasp columns.
+
+  ``--grasp-local-widen`` is an *anytime ordering* over one immutable sampled-grasp master.
+  Its first session retains the deliberately cheap historical schedule: compact prefixes,
+  one incoming-part ``K -> K+B`` expansion, then milestone repair.  If and only if that whole
+  resumable session exhausts, this wrapper starts exactly one fresh session with every part at
+  the configured finite master cap.  That is the same eager action alphabet as disabling local
+  widening, but it is reached by the iterator too (not just the ordinary CLI wrapper), so
+  direct library calls and ``--mp-open-plans`` cannot mistake a compact-prefix miss for a final
+  no-plan result.  A wall-clock deadline remains authoritative: it reports exhaustion of time,
+  not a completed finite search.
+  """
+  import time
+  if robots is None:
+    robots = get_robots(C)
+  # A policy-selected PLACE can use a yaw outside the compact prefix.  The low-level
+  # iterator restores that prefix after its demand-frontier probes so later *search* stays
+  # compact, but a suspended public iterator is commonly consumed immediately by replay,
+  # witness collection, or --mp-open-plans.  Those consumers must be able to enumerate the
+  # yielded action.  Publish every complete candidate with the full finite yaw table exposed,
+  # and leave that replay-safe table exposed when this generator is exhausted or closed.
+  # The prefix is private, temporary search state rather than part of a returned plan;
+  # subsequent fresh fills reset their own compact prefix at entry.
+
+  def publish(session):
+    for candidate in session:
+      if placement_yaw_widening:
+        set_placement_yaw_prefix(None)
+      yield candidate
+
+  common = dict(
+      robots=robots, verbose=verbose, robot_ik=robot_ik, weight=weight,
+      max_nodes=max_nodes, wrench=wrench, wrench_aware_h=wrench_aware_h,
+      handovers=handovers, allow_place=allow_place, bracing=bracing,
+      max_repairs=max_repairs, geo_facts=geo_facts, sig_collapsed_h=sig_collapsed_h,
+      deadline=deadline, fill_window=fill_window, lazy_fills=lazy_fills,
+      cost_bound=cost_bound, milestone_oracle=milestone_oracle,
+      fill_local_h=fill_local_h, fill_exact=fill_exact,
+      fill_policy_first=fill_policy_first, fill_policy_guide=fill_policy_guide,
+      fill_skeleton_first=fill_skeleton_first,
+      fill_scope_widening=fill_scope_widening,
+      milestone_boundaries=milestone_boundaries,
+      grasp_widen_batch=grasp_widen_batch, grasp_widen_max=grasp_widen_max,
+      placement_yaw_widening=placement_yaw_widening)
+  try:
+    yield from publish(_iter_assembly_problem_milestones_once(
+        C, assembly, grasp_local_widen=grasp_local_widen,
+        grasp_initial_keep=grasp_initial_keep, **common))
+    if not grasp_local_widen:
+      return
+    # A deadline is an operational stop, not evidence that the local-prefix session exhausted;
+    # launching a nominal completion pass after it would only mislabel a timeout as coverage.
+    if deadline is not None and time.perf_counter() > deadline:
+      if verbose:
+        print("[grasp-columns] local session reached its deadline before finite-master "
+              "completion; no no-plan conclusion was drawn.", flush=True)
+      return
+    # The full epoch retains the same sampled database and RobotIK object.  Initialising its
+    # local caps to the finite maximum is preferable to merely flipping a boolean: every
+    # successor is still cap-filtered, and saved provenance records the actual physical master
+    # size (which can be below the user-requested maximum).
+    _full_checker, full_table = _search_context(C, assembly, robots)
+    full_caps = _finite_grasp_caps(full_table, assembly.objects, grasp_widen_max)
+    assembly._grasp_local_caps = dict(full_caps)
+    if verbose:
+      summary = ", ".join(f"{p}:{cap}" for p, cap in sorted(full_caps.items()))
+      print("[grasp-columns] compact milestone session exhausted -> final eager finite-master "
+            f"session ({summary}). This reopens no failed IK witness as a no-good and is the "
+            "completion pass for direct and resumable search.", flush=True)
+    yield from publish(_iter_assembly_problem_milestones_once(
+        C, assembly, grasp_local_widen=True,
+        grasp_initial_keep=grasp_widen_max, **common))
+  finally:
+    if placement_yaw_widening:
+      set_placement_yaw_prefix(None)
+
+
 def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, robot_ik=None,
                                       weight=5.0, max_nodes=20000, wrench=False,
                                       wrench_aware_h=True,
@@ -10137,13 +11117,15 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
                                       cost_bound=None, milestone_oracle="global",
                                       fill_local_h=False, fill_exact=False,
                                       fill_policy_first=False,
+                                      fill_policy_guide=False,
                                       fill_skeleton_first=False,
                                       fill_scope_widening=False,
                                       milestone_boundaries=1,
                                       grasp_local_widen=False,
                                       grasp_initial_keep=20,
                                       grasp_widen_batch=8,
-                                      grasp_widen_max=96):
+                                      grasp_widen_max=96,
+                                      placement_yaw_widening=False):
   """Compatibility wrapper returning only the resumable session's first candidate."""
   return next(iter_assembly_problem_milestones(
       C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik,
@@ -10154,13 +11136,15 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
       cost_bound=cost_bound, milestone_oracle=milestone_oracle,
       fill_local_h=fill_local_h, fill_exact=fill_exact,
       fill_policy_first=fill_policy_first,
+      fill_policy_guide=fill_policy_guide,
       fill_skeleton_first=fill_skeleton_first,
       fill_scope_widening=fill_scope_widening,
       milestone_boundaries=milestone_boundaries,
       grasp_local_widen=grasp_local_widen,
       grasp_initial_keep=grasp_initial_keep,
       grasp_widen_batch=grasp_widen_batch,
-      grasp_widen_max=grasp_widen_max), None)
+      grasp_widen_max=grasp_widen_max,
+      placement_yaw_widening=placement_yaw_widening), None)
 
 
 def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_budget=300.0,
@@ -10173,6 +11157,7 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
                                               milestone_oracle="global",
                                               fill_local_h=False, fill_exact=False,
                                               fill_policy_first=False,
+                                              fill_policy_guide=False,
                                               fill_skeleton_first=False,
                                               fill_scope_widening=False,
                                               milestone_boundaries=1):
@@ -10194,6 +11179,9 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
   guard for large instances."""
   import math
   import time
+  if fill_policy_guide:
+    raise ValueError("fill_policy_guide is currently supported only by the ordinary "
+                     "milestone solver, not --milestones-anytime")
   t0 = time.perf_counter()
   t_end = t0 + time_budget
   # NET RESERVE: milestones must NOT get the whole budget -- if the deadline cuts it,
@@ -10222,6 +11210,7 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
         sig_collapsed_h=sig_collapsed_h, deadline=t_mile, fill_window=fill_window,
         milestone_oracle=milestone_oracle, fill_local_h=fill_local_h,
         fill_exact=fill_exact, fill_policy_first=fill_policy_first,
+        fill_policy_guide=fill_policy_guide,
         fill_skeleton_first=fill_skeleton_first,
         fill_scope_widening=fill_scope_widening,
         milestone_boundaries=milestone_boundaries)

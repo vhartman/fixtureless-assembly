@@ -3,6 +3,7 @@ import numpy as np
 import pytest
 
 import replay as R
+from config import RunConfig
 
 
 class _C:
@@ -58,3 +59,23 @@ def test_replay_restores_vacuum_engagement_successor_gate():
   assert wrench.PARAMS["vacuum_engage_force"] == 7.5
   R.apply_wrench_params({})
   assert wrench.PARAMS["vacuum_engage_force"] == 0.0
+
+
+def test_build_scene_roundtrips_centered_scatter_and_legacy_layout():
+  """Replay must rebuild the saved world poses, not today's profile-owned layout.
+
+  In particular, the compact centred lattice used by the standard profile is materially
+  different from the historical left-anchored line.  A missing field is an old plan and must
+  retain that old layout.
+  """
+  cfg = RunConfig(assembly="cross", parts=3, num_robots=1, floating_ee=True,
+                  vacuum=True, scatter_spacing=0.2, center_scatter=True).to_dict()
+  C, assembly = R.build_scene(cfg)
+  centered = [C.getFrame(p).getRelativePosition()[:2] for p in assembly.objects]
+  np.testing.assert_allclose(centered, [[-0.1, -0.1], [0.1, -0.1], [0.0, 0.1]])
+
+  legacy = dict(cfg)
+  legacy.pop("center_scatter")
+  C_old, assembly_old = R.build_scene(legacy)
+  old_xy = [C_old.getFrame(p).getRelativePosition()[:2] for p in assembly_old.objects]
+  np.testing.assert_allclose(old_xy, [[-0.5, 0.0], [-0.3, 0.0], [-0.1, 0.0]])

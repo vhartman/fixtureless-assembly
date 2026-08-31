@@ -1,11 +1,12 @@
 """Opt-in fair, non-terminal IK witness validation for lazy milestone fills.
 
 The legacy LazySP path asks one edge for its full IK budget and permanently blacklists it on
-failure.  Here a failure means only "not on this visit": each fairness epoch gives an edge one
-bounded BATCH, suspends it for the rest of that epoch, and lets alternate plans run.  When the
-cheap search exhausts those alternatives, a fresh epoch re-opens every failed edge with its
-next batch.  Successes persist; failures never enter a permanent cache.  All attempts in a
-batch share scene construction and reach-precheck setup.
+failure.  Here a failure means only "not on this visit": each blocking symbolic edge receives a
+bounded BATCH and is suspended for the rest of that epoch, while physically equivalent aliases
+share one effort cursor.  An alias revisit therefore skips already-spent deterministic slots but
+may invest genuinely new stochastic effort; it is not a cached negative verdict.  Successes
+persist, failures never enter a permanent cache, and all attempts in a batch share scene
+construction and reach-precheck setup.
 
 This module is intentionally search-engine agnostic.  ``solver._add_one_part`` supplies three
 small adapters (construct engine, walk a plan, identify IK edges), keeping the existing engine
@@ -40,32 +41,60 @@ class OpenWitnessReport:
 class OpenWitnessPool:
   """Solve-scoped compact effort state. Stores counters and exact successful vectors."""
 
-  def __init__(self, robot_ik):
+  def __init__(self, robot_ik, assembly=None):
     self.robot_ik = robot_ik
+    self.assembly = assembly
     self.attempts = defaultdict(int)                     # scene-query -> next attempt index
     self.visits = defaultdict(int)                       # scene-query -> completed effort tiers
     # query -> the exact vector that certified this edge.  Keeping this (not a KOMO/scene)
     # makes search witness persistence independent of RobotIK's incidental memoization cache.
     self.success = {}
+    # Solve-scoped diagnostics.  A run_open_lazy_fill invocation is one local fill/phase;
+    # its tag is normally the incoming milestone part.  These counters distinguish merely
+    # *recognising* aliases from actually reusing a success or advancing failed IK effort.
+    self.sessions = 0
+    self.active_session = 0
+    self.active_tag = None
+    self.probe_calls = 0
+    self.revisit_probes = 0
+    self.cross_session_revisit_probes = 0
+    self.cross_tag_revisit_probes = 0
+    self.prior_slots_not_replayed = 0
+    self.candidate_success_skips = 0
+    self.direct_success_hits = 0
+    self.success_visit_hist = defaultdict(int)
+    self._last_probe_session = {}
+    self._probe_tags = defaultdict(set)
 
-  def key(self, state, action):
+  def begin_session(self, tag):
+    """Mark a new local fill while retaining solve-scoped witness/effort state."""
+    self.sessions += 1
+    self.active_session = self.sessions
+    self.active_tag = tag
+
+  def key(self, state, action, successor=None, assembly=None):
+    assembly = self.assembly if assembly is None else assembly
+    if (successor is not None and assembly is not None
+        and hasattr(self.robot_ik, "_query_key")):
+      return self.robot_ik._query_key(action, state, successor, assembly)
+    # Backward-compatible adapter for tiny external/test RobotIK-like objects. Real search
+    # always supplies successor+assembly and therefore uses the skill-local physical query.
     return action, self.robot_ik._scene_sig(state)
 
-  def known(self, state, action):
-    return self.key(state, action) in self.success
+  def known(self, state, action, successor=None, assembly=None):
+    return self.key(state, action, successor, assembly) in self.success
 
-  def witness_for(self, state, action):
-    return self.success.get(self.key(state, action))
+  def witness_for(self, state, action, successor=None, assembly=None):
+    return self.success.get(self.key(state, action, successor, assembly))
 
-  def failed_effort(self, state, action):
+  def failed_effort(self, state, action, successor=None, assembly=None):
     """Exact-query evidence available before another stochastic probe.
 
-    A key absent from ``success`` has failed every completed visit recorded here.  Keep this
-    deliberately narrower than RobotIK's action-level statistics: fixed-base reachability and
-    collision depend on the complete support scene, so evidence from another scene must not
-    reorder this query.
+    A key absent from ``success`` has failed every completed visit recorded here. The key is
+    RobotIK's action-specific physical program (table scene for a pick, participating payload
+    and grasps for a handover, etc.), not an action-wide failure statistic.
     """
-    key = self.key(state, action)
+    key = self.key(state, action, successor, assembly)
     return self.visits.get(key, 0), self.attempts.get(key, 0)
 
   def _batch_for(self, action, key):
@@ -84,9 +113,24 @@ class OpenWitnessPool:
     return min(cap, 2 << min(visit, 2))                  # 2, 4, then capped full batches
 
   def probe(self, action, state, successor, assembly):
-    key = self.key(state, action)
+    key = self.key(state, action, successor, assembly)
     if key in self.success:
+      self.direct_success_hits += 1
       return True, self.success[key], False
+    prior_visits = self.visits.get(key, 0)
+    prior_slots = self.attempts.get(key, 0)
+    self.probe_calls += 1
+    if prior_visits:
+      self.revisit_probes += 1
+      self.prior_slots_not_replayed += prior_slots
+      previous_session = self._last_probe_session.get(key)
+      if previous_session is not None and previous_session != self.active_session:
+        self.cross_session_revisit_probes += 1
+      tags = self._probe_tags.get(key, ())
+      if tags and self.active_tag not in tags:
+        self.cross_tag_revisit_probes += 1
+    self._last_probe_session[key] = self.active_session
+    self._probe_tags[key].add(self.active_tag)
     batch = self._batch_for(action, key)
     attempt = self.attempts[key]
     self.attempts[key] += batch
@@ -96,6 +140,7 @@ class OpenWitnessPool:
           action, state, successor, assembly, attempt=attempt, budget=batch)
       if ok:
         self.success[key] = witness
+        self.success_visit_hist[self.visits[key]] += 1
       return ok, witness, batch
     # Tiny fake/backward-compatible adapter used by unit tests and external RobotIK-like
     # implementations: emulate the batch with their one-at-a-time interface.
@@ -105,6 +150,7 @@ class OpenWitnessPool:
           action, state, successor, assembly, attempt=attempt + spent - 1)
       if ok:
         self.success[key] = witness
+        self.success_visit_hist[self.visits[key]] += 1
         return True, witness, spent
     return False, witness, batch
 
@@ -122,7 +168,10 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
     raise ValueError("unlimited open-witness epochs require a finite deadline")
   pool = getattr(robot_ik, "_open_witness_pool", None)
   if pool is None:
-    pool = robot_ik._open_witness_pool = OpenWitnessPool(robot_ik)
+    pool = robot_ik._open_witness_pool = OpenWitnessPool(robot_ik, assembly)
+  elif pool.assembly is None:
+    pool.assembly = assembly
+  pool.begin_session(tag)
   report = OpenWitnessReport()
   selector = getattr(robot_ik, "lazy_edge_selector", "forward")
   if selector not in ("forward", "terminal-first", "reverse", "fail-first"):
@@ -133,12 +182,12 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
     """Return unresolved IK edges in the requested LazySP validation order.
 
     Witnesses certify individual endpoints in a fully known symbolic scene, so their solve
-    order need not follow execution order.  ``fail-first`` uses only failures of the EXACT
-    ``(action, scene signature)`` query.  An unseen tie falls back to reverse path order,
+    order need not follow execution order.  ``fail-first`` uses only failures of the SAME
+    skill-local physical query.  An unseen tie falls back to reverse path order,
     putting the contact-critical suffix in front without inventing cross-scene evidence.
     """
     unresolved = [(i, edge) for i, edge in enumerate(walked)
-                  if is_ik(edge[1]) and not pool.known(edge[0], edge[1])]
+                  if is_ik(edge[1]) and not pool.known(*edge, assembly=assembly)]
     if selector == "forward":
       return [edge for _i, edge in unresolved]
     if selector == "terminal-first":
@@ -157,15 +206,15 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
       return [edge for _i, edge in reversed(unresolved)]
 
     def priority(item):
-      i, (state, action, _successor) = item
-      visits, slots = pool.failed_effort(state, action)
-      # A previously failed exact query is the strongest candidate-path refutation.  Among
+      i, (state, action, successor) = item
+      visits, slots = pool.failed_effort(state, action, successor, assembly)
+      # A previously failed physical query is the strongest candidate-path refutation.  Among
       # such queries, prefer more accumulated evidence/effort; otherwise use the deterministic
       # reverse-path fallback.  ``max`` therefore selects the desired edge first.
       return (visits > 0, visits, slots, i)
 
     ranked = sorted(unresolved, key=priority, reverse=True)
-    if ranked and pool.failed_effort(ranked[0][1][0], ranked[0][1][1])[0] > 0:
+    if ranked and pool.failed_effort(*ranked[0][1], assembly=assembly)[0] > 0:
       report.prior_failure_first += 1
     return [edge for _i, edge in ranked]
 
@@ -232,9 +281,16 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
       valid = True
       walked = list(walk_plan(subplan))
       end_state = walked[-1][2] if walked else None
+      # These are actual candidate-path IK calls avoided by solve-scoped positive
+      # certificates.  They intentionally do not appear as RobotIK.bind cache hits because
+      # the lazy validator removes them before bind() is called.
+      pool.candidate_success_skips += sum(
+          is_ik(action) and pool.known(state, action, successor, assembly)
+          for state, action, successor in walked)
       ordered = validation_order(walked)
       forward_unresolved = [edge for edge in walked
-                            if is_ik(edge[1]) and not pool.known(edge[0], edge[1])]
+                            if is_ik(edge[1])
+                            and not pool.known(*edge, assembly=assembly)]
       if ordered != forward_unresolved:
         report.reordered_paths += 1
       for state, action, successor in ordered:

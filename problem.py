@@ -1728,6 +1728,8 @@ def _quat_conj(q):
 
 
 _STABLE_REST_POSES = False   # --stable-rest-poses: see placement_table
+_PLACEMENT_YAWS = 1          # --placement-yaws N: uniform world-z fibre per stable rest
+_PLACEMENT_YAW_PREFIX = None # None=all configured yaw bands; integer=progressive prefix
 
 
 def set_stable_rest_poses(on=True):
@@ -1737,6 +1739,69 @@ def set_stable_rest_poses(on=True):
   mid-run rebinds every saved placement."""
   global _STABLE_REST_POSES
   _STABLE_REST_POSES = bool(on)
+
+
+def set_placement_yaws(n=1):
+  """Discretise the physically free world-z yaw of every stable table placement.
+
+  ``n=1`` is the historical placement table, byte-for-byte.  For ``n>1`` the table keeps
+  every old placement id and appends the rotations ``Rz(2*pi*k/n) R_rest``.  The bound is a
+  guard against accidentally multiplying every place edge by an unbounded CLI value; it is
+  not a geometric assumption.
+  """
+  n = int(n)
+  if not 1 <= n <= 24:
+    raise ValueError("placement yaw count must be in [1, 24]")
+  global _PLACEMENT_YAWS
+  _PLACEMENT_YAWS = n
+
+
+def set_placement_yaw_prefix(n=None):
+  """Expose only the first ``n`` coarse-to-fine yaw bands in concrete place actions.
+
+  This is search scheduling, not a different placement table: every quaternion/id is built
+  once from ``_PLACEMENT_YAWS`` and remains resolvable in states and replay. ``None`` exposes
+  the complete configured lattice. The milestone driver uses finite monotone prefixes, then
+  restores ``None`` before witness/replay passes.
+  """
+  if n is not None:
+    n = int(n)
+    if not 1 <= n <= _PLACEMENT_YAWS:
+      raise ValueError(f"active placement-yaw prefix must be in [1, {_PLACEMENT_YAWS}]")
+  global _PLACEMENT_YAW_PREFIX
+  _PLACEMENT_YAW_PREFIX = n
+
+
+def placement_yaw_levels(n=None):
+  """Exponential finite widening levels ending in the complete yaw lattice."""
+  n = _PLACEMENT_YAWS if n is None else int(n)
+  levels, k = [1], 2
+  while k < n:
+    levels.append(k)
+    k *= 2
+  if n > 1:
+    levels.append(n)
+  return tuple(dict.fromkeys(levels))
+
+
+def placement_yaw_order(n=None):
+  """Indices of a uniform yaw lattice, in deterministic coarse-to-fine order.
+
+  Farthest-point insertion gives useful prefixes (0, pi, then quarter turns, then their
+  gaps) while the complete set remains exactly the ordinary uniform ``n``-bin lattice.
+  """
+  n = _PLACEMENT_YAWS if n is None else int(n)
+  if n <= 1:
+    return (0,)
+  selected = [0]
+  left = set(range(1, n))
+  while left:
+    def separation(k):
+      return min(min((k - j) % n, (j - k) % n) for j in selected)
+    k = max(left, key=lambda x: (separation(x), -x))
+    selected.append(k)
+    left.remove(k)
+  return tuple(selected)
 
 
 def _placement_id(quat):
@@ -1791,7 +1856,7 @@ def placement_table(assembly, group, ref):
   reg = getattr(assembly, "_placement_registry", None)
   if reg is None:
     reg = assembly._placement_registry = {}
-  key = (_subasm_key(group), ref, _STABLE_REST_POSES)
+  key = (_subasm_key(group), ref, _STABLE_REST_POSES, _PLACEMENT_YAWS)
   hit = cache.get(key)
   if hit is not None:
     return hit
@@ -1807,6 +1872,41 @@ def placement_table(assembly, group, ref):
     for q, _prob in _thin_rest_poses(poses, grp):
       table[_placement_id(q)] = np.asarray(q, dtype=float)
     table[_IDENTITY_FACE] = ident
+  # Every stable rest has an S1 fibre: rotating the whole resting group about world gravity
+  # preserves its support polygon and gravity/wrench geometry, but changes fixed-arm reach.
+  # Keep the historical table as a stable prefix.  Variant ids are derived from the complete
+  # quaternion, so the state identity and saved plans cannot alias two different yaws.
+  yaw_base = getattr(assembly, "_placement_yaw_base", None)
+  if yaw_base is None:
+    yaw_base = assembly._placement_yaw_base = {}
+  yaw_ranks = getattr(assembly, "_placement_yaw_ranks", None)
+  if yaw_ranks is None:
+    yaw_ranks = assembly._placement_yaw_ranks = {}
+  # Rank is TABLE-LOCAL. Quaternion ids are intentionally global, and the same rotation can
+  # be a historical base of one subassembly but a yaw copy of another. A global pid->rank map
+  # would then expose that second table's copy at prefix 1 and violate the N=1 compatibility
+  # contract. The yaw-orbit class below may remain global because equivalent quaternions really
+  # are the same abstract rest class.
+  yaw_rank = {face: 0 for face in table}
+  for face in table:
+    yaw_base.setdefault(face, face)
+  if _PLACEMENT_YAWS > 1:
+    base_items = list(table.items())
+    anchor = np.asarray(assembly.scatter_orientations.get(ref, ident), dtype=float)
+    anchor_tilt = _quat_mul(_quat_conj(_anchor_yaw_quat(anchor)), anchor)
+    for rank, k in enumerate(placement_yaw_order(_PLACEMENT_YAWS)[1:], start=1):
+      theta = 2.0 * np.pi * float(k) / float(_PLACEMENT_YAWS)
+      qyaw = np.array([np.cos(theta / 2.0), 0.0, 0.0, np.sin(theta / 2.0)])
+      for face, qrest in base_items:
+        # Id 5 means "as anchored", including a wheel's scatter tilt.  Factor out only its
+        # existing world yaw; _group_rest_pose composes the anchor yaw back in later.
+        qbase = anchor_tilt if face == _IDENTITY_FACE else np.asarray(qrest, dtype=float)
+        q = _quat_mul(qyaw, qbase)
+        pid = _placement_id(q)
+        table.setdefault(pid, q)
+        yaw_base.setdefault(pid, face)
+        yaw_rank[pid] = min(yaw_rank.get(pid, rank), rank)
+  yaw_ranks[key] = yaw_rank
   cache[key] = table
   reg.update(table)                                        # ids are global; keep them all
   return table
@@ -2088,9 +2188,9 @@ def clear_sampled_scene_ctx():
 
 
 def set_sampled_grasp_keep(keep):
-  """Monotonically resize the active V2/V3 sampled database without changing its source.
+  """Monotonically resize the active V2+ sampled database without changing its source.
 
-  V2/V3 raw clouds and master rankings are independent of ``keep``.  Increasing it therefore
+  V2+ raw clouds and master rankings are independent of ``keep``.  Increasing it therefore
   appends grasp ids; decreasing it restores an earlier prefix.  This is the only mutation the
   failure-driven search widening path needs, and deliberately retains the installed scene/IK
   context so the new prefix is ranked under exactly the same physical problem.
@@ -2657,6 +2757,7 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
   task_ik = None if ctx is None else ctx.get("robot_ik")
   task_ik_scene = None if ctx is None else ctx.get("ik_scene")
   seal = float(wrench.PARAMS.get("vacuum_seal_diameter", 0.0))
+  version = int(_SAMPLED_GRASPS.get("version", 1))
 
   # Hoist the candidate-independent half of the inserted-part press certificate. This is
   # exactly the solo held-part LP used by compute_useful_grasps/_sig_press_ok, except that the
@@ -2664,7 +2765,7 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
   # use while constructing the id-bearing V3 order and prevents geometrically attractive but
   # load-incapable grasps from consuming the whole bounded prefix.
   press_ctx = None
-  if (int(_SAMPLED_GRASPS.get("version", 1)) >= 3
+  if (version == 3
       and asm is not None and asm.relative_pose(part) is not None):
     parent, place, supports = {}, {}, {}
     for p in asm.objects:
@@ -2801,7 +2902,7 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
         reach[robot] = len(task_ik._analytic_seeds(
             task_ik_scene, robot, target, part))
     press = {}
-    if int(_SAMPLED_GRASPS.get("version", 1)) >= 3:
+    if version == 3:
       for kind in sorted(kind_robot):
         kind_ok = not (kind == "vacuum" and
                        (row[6] == "pinch" or row[1] == "curved" or row[2] < seal))
@@ -2848,7 +2949,7 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
   if checker is not None and checker.closure_check:
     canonical = _closure_ranked_canonical(canonical)
   closure_select = bool(checker is not None and checker.closure_check)
-  if (int(_SAMPLED_GRASPS.get("version", 1)) < 3
+  if (version == 2
       and len(canonical) >= keep and not closure_select):
     return canonical[:keep]
 
@@ -2907,10 +3008,12 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
                key=lambda e: (-e[0][5], -e[0][4], tuple(np.round(e[0][0], 9))))
 
   # V3 treats conventional and sampled rows as one task-conditioned master pool.  V2 keeps
-  # the historical immutable canonical prefix below for old plans.  Bad-support rows remain
-  # available only after physically supported rows, preserving the existing fallback without
-  # letting a geometric outlier win merely because it covers a rare task label.
-  if int(_SAMPLED_GRASPS.get("version", 1)) >= 3:
+  # the historical immutable canonical prefix below for old plans.  V4 is deliberately a
+  # separate, smaller scene-reservation format: it must not inherit V3's SSIK/LP task facts.
+  # Bad-support rows remain available only after physically supported rows, preserving the
+  # existing fallback without letting a geometric outlier win merely because it covers a rare
+  # task label.
+  if version == 3:
     ranked = _task_coverage_order(list(canonical) + list(good))
     ranked.extend(e for e in _task_coverage_order(bad)
                   if all(id(e[0]) != id(old[0]) for old in ranked))
@@ -2943,29 +3046,78 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
   if bad:                                                 # small/curved shapes may need fallback
     categories.append(ordered(bad))
 
-  out, seen = list(canonical_seed), {id(e[0]) for e in canonical_seed}
+  # Materialise the complete historical V2 order once.  Besides making the order independent
+  # of the final slice, this gives V4 a literal V2 tail: after its bounded reservations, every
+  # remaining row appears in precisely the position V2 assigned it.  In particular, under the
+  # closure model zero-role conventional fallbacks remain *after* the sampled scene-positive
+  # pools instead of being promoted merely because they are conventional.
+  v2_order, v2_seen = list(canonical_seed), {id(e[0]) for e in canonical_seed}
   cursors = [0] * len(categories)
-  while len(out) < keep:
+  while True:
     progressed = False
     for j, block in enumerate(categories):
-      while cursors[j] < len(block) and id(block[cursors[j]][0]) in seen:
+      while cursors[j] < len(block) and id(block[cursors[j]][0]) in v2_seen:
         cursors[j] += 1
       if cursors[j] >= len(block):
         continue
       e = block[cursors[j]]; cursors[j] += 1
-      out.append(e); seen.add(id(e[0])); progressed = True
-      if len(out) >= keep:
-        break
+      v2_order.append(e); v2_seen.add(id(e[0])); progressed = True
     if not progressed:
       break
-  if len(out) < keep:                                     # free-space source poses: last resort
-    for e in canonical_fallback:
-      if id(e[0]) in seen:
+  for e in canonical_fallback:                           # free-space source poses: last resort
+    if id(e[0]) not in v2_seen:
+      v2_order.append(e); v2_seen.add(id(e[0]))
+
+  if version == 4:
+    # V4: make --grasp-sampler-scenes a real bounded-set contract without changing V2's
+    # positional database.  Reserve one deterministic row for every available
+    # (gripper-kind, PICK/ASSEMBLE) fact, then append the ordinary V2 hybrid order.  A bridge
+    # row can satisfy several facts and is only emitted once.  Crucially, the reservation and
+    # the entire tail are built BEFORE the final [:keep] slice: growing K exposes an exact
+    # prefix of one immutable master, so widening never rebinds an old grasp id.
+    #
+    # Canonical source rows are deliberately eligible even when their mesh-pad score falls
+    # below the sampled support gate: that is the historical V2 contract.  Prefer canonical
+    # plus good sampled rows; consult bad sampled rows only when they are the sole carrier of
+    # a scene fact, exactly as the old V2 fallback did for an otherwise empty pool.
+    def has_scene_fact(entry, fact):
+      kind, role = fact
+      return role in entry[1]["scene_by_kind"].get(kind, ())
+
+    facts = [(kind, role) for kind in sorted(kind_robot)
+             for role in ("pick", "assemble")]
+    primary = list(canonical) + list(good)
+    reserve_blocks = []
+    for fact in facts:
+      block = [e for e in primary if has_scene_fact(e, fact)]
+      if not block:
+        block = [e for e in bad if has_scene_fact(e, fact)]
+      if block:
+        reserve_blocks.append((fact, ordered(block)))
+
+    out, seen, covered = [], set(), set()
+    for fact, block in reserve_blocks:
+      if fact in covered:
         continue
-      out.append(e); seen.add(id(e[0]))
-      if len(out) >= keep:
-        break
-  return out
+      entry = next((e for e in block if id(e[0]) not in seen), None)
+      if entry is None:
+        continue
+      out.append(entry)
+      seen.add(id(entry[0]))
+      for kind, roles in entry[1]["scene_by_kind"].items():
+        for role in roles:
+          if role in ("pick", "assemble"):
+            covered.add((kind, role))
+
+    # The rest is the ordinary closure-aware V2 master, with reserved rows removed.  This is
+    # deliberately not "all canonical, then sampled": V2 puts zero-role canonical fallbacks
+    # last when virtual closure is active, and V4 must preserve that physical priority.
+    for entry in v2_order:
+      if id(entry[0]) not in seen:
+        out.append(entry); seen.add(id(entry[0]))
+    return out[:keep]
+
+  return v2_order[:keep]
 
 
 def _sampled_keys(spec, offset, part=None):
@@ -2980,12 +3132,22 @@ def _sampled_keys(spec, offset, part=None):
     base = (_spec_key(spec), float(offset), cfgv["seed"], cfgv["candidates"], cfgv["keep"],
             float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)),
             cfgv.get("wrap"))
+    identity = base
   else:
-    base = (_spec_key(spec), float(offset), version, cfgv["seed"], cfgv["candidates"],
+    # V4 is a controlled ORDERING change over V2, not a second stochastic grasp generator.
+    # Seed its raw surface cloud from V2's exact tuple.  Keep the true version in the cache
+    # identity, however, because the positional DB/order and hence grasp-id meanings differ.
+    # V1, V2 and especially the already-persisted task-conditioned V3 retain their old RNG
+    # tuple byte-for-byte.
+    raw_version = 2 if version == 4 else version
+    base = (_spec_key(spec), float(offset), raw_version, cfgv["seed"], cfgv["candidates"],
             float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)),
             cfgv.get("wrap"))
+    identity = (_spec_key(spec), float(offset), version, cfgv["seed"], cfgv["candidates"],
+                float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)),
+                cfgv.get("wrap"))
   ctx = _SAMPLED_SCENE_CTX
-  cache = base + (() if version == 1 else (cfgv.get("master_keep", cfgv["keep"]),))
+  cache = identity + (() if version == 1 else (cfgv.get("master_keep", cfgv["keep"]),))
   return base, cache + (part, (ctx["sig"] if ctx is not None else None))
 
 
@@ -5525,13 +5687,13 @@ def _rest_stable(assembly, group, ref, face, anchor_q, tol=1e-4, span_tol=1e-3):
 
 
 def rest_faces(assembly, group):
-  # PRECOMPUTED per-subassembly rest-pose TABLE: the canonical placement faces (a subset of
-  # range(len(_FACE_DOWN_QUATS))) on which `group` rests STABLY, accounting for the reference
+  # PRECOMPUTED per-subassembly rest-pose TABLE: the placement ids on which `group` rests
+  # STABLY, accounting for the reference
   # part's scatter anchor (so a wheel scattered cap-down is judged in its cap-down frame).
   # Replaces the old implicit "every one of the 6 faces is placeable" enumeration -- places(),
-  # precompute_stable_faces and both labeled heuristics look placements up here, so the search
-  # and the abstraction stay consistent (same faces => admissibility preserved). Cached on the
-  # assembly, keyed by subassembly, like the grasp table.
+  # precompute_stable_faces and concrete search look placements up here. The backward symbolic
+  # models use rest_face_classes(), the exact quotient by free world-z table yaw. Cached on the
+  # assembly, keyed by subassembly and placement settings, like the grasp table.
   #   The candidate ids come from placement_table, so this is the same filter in both modes:
   #   six canonical faces by default, arbitrary per-group stable quats under
   #   --stable-rest-poses. The stability test is kept in BOTH modes -- computed poses are
@@ -5540,15 +5702,58 @@ def rest_faces(assembly, group):
   cache = getattr(assembly, "_rest_faces_cache", None)
   if cache is None:
     cache = assembly._rest_faces_cache = {}
-  key = _subasm_key(group)
+  key = (_subasm_key(group), _STABLE_REST_POSES, _PLACEMENT_YAWS,
+         _PLACEMENT_YAW_PREFIX)
   hit = cache.get(key)
   if hit is None:
     grp = set(group)
     ref = reference_part(grp)
     anchor_q = assembly.scatter_orientations.get(ref, np.array([1.0, 0.0, 0.0, 0.0]))
-    hit = cache[key] = tuple(f for f in sorted(placement_table(assembly, grp, ref))
-                             if _rest_stable(assembly, grp, ref, f, anchor_q))
+    table = placement_table(assembly, grp, ref)
+    # A world-z yaw is an exact symmetry of table stability: it rotates the support polygon
+    # and COM projection together and leaves all heights unchanged.  Certify each BASE rest
+    # once, then inherit that verdict for its yaw copies.  Apart from avoiding repeated
+    # geometry work, this prevents tiny convex-hull tolerances from accepting one yaw and
+    # rejecting an equivalent one.
+    yaw_base = getattr(assembly, "_placement_yaw_base", {})
+    stable = {}
+    # Preserve the historical sorted-id order when N=1.  With yaw augmentation, table
+    # insertion order is intentional: all historical rests first, then coarse-to-fine yaw
+    # bands, giving the search a useful deterministic prefix without changing its costs.
+    candidates = sorted(table) if _PLACEMENT_YAWS == 1 else tuple(table)
+    if _PLACEMENT_YAW_PREFIX is not None:
+      table_key = (_subasm_key(grp), ref, _STABLE_REST_POSES, _PLACEMENT_YAWS)
+      rank = getattr(assembly, "_placement_yaw_ranks", {}).get(table_key, {})
+      candidates = tuple(face for face in candidates
+                         if rank.get(face, 0) < _PLACEMENT_YAW_PREFIX)
+    out = []
+    for face in candidates:
+      base = yaw_base.get(face, face)
+      if base not in stable:
+        stable[base] = _rest_stable(assembly, grp, ref, base, anchor_q)
+      if stable[base]:
+        out.append(face)
+    hit = cache[key] = tuple(out)
   return hit
+
+
+def rest_face_classes(assembly, group):
+  """Stable-rest ids modulo the physically free table-yaw symmetry.
+
+  Concrete search must retain every yaw because fixed-base arm IK is not yaw-invariant.
+  The symbolic backward models deliberately omit arm reachability, however, and all facts
+  they do retain (support topology, planar-table collision and wrench feasibility) rotate
+  equivariantly about gravity.  Returning one representative per base rest is therefore an
+  exact quotient of that abstraction, not an extra heuristic or a pruning rule.
+  """
+  faces = rest_faces(assembly, group)                    # also populates the base registry
+  base_of = getattr(assembly, "_placement_yaw_base", {})
+  return tuple(dict.fromkeys(base_of.get(face, face) for face in faces))
+
+
+def placement_rest_class(assembly, face):
+  """Abstract stable-rest id for a concrete placement id (quotienting table yaw only)."""
+  return getattr(assembly, "_placement_yaw_base", {}).get(face, face)
 
 
 # ---------------------------------------------------------------------------------------------
