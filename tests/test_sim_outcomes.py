@@ -1,6 +1,6 @@
 """END-TO-END SIM OUTCOMES -- the regression net the unit tests do not provide.
 
-WHY THIS FILE EXISTS. On 2026-07-26 a bare `NameError` killed EVERY `sim.py run --v2`
+WHY THIS FILE EXISTS. On 2026-07-26 a bare `NameError` killed EVERY `sim.py run`
 invocation while all 126 unit tests stayed green, because nothing in the suite ever built a
 SimScene. The same blind spot hid a `--mass-scale` StopIteration and a missing
 `<compiler angle="radian"/>` that made MuJoCo read rai's joint ranges as degrees. All three were
@@ -68,7 +68,7 @@ def _summary(out):
 
 # The old local car path is retained as data, but it predates the exact task/keyframe export.
 # Never turn an outcome regression into a fresh IK solve: skip it until the path is regenerated.
-CAR = ["run", "car-mini-new.json", "--v2", "--mp-path", "mp-car-mini-new.json"]
+CAR = ["run", "car-mini-new.json", "--mp-path", "mp-car-mini-new.json"]
 
 
 @pytest.mark.skipif(not (_have("car-mini-new.json", "mp-car-mini-new.json") and
@@ -126,7 +126,7 @@ def test_cross8_warns_that_its_assembles_have_no_funnel(capsys):
   to a pose already in contact and it arrives LATERALLY -- 0.213mm of penetration while the
   target was still at rest, then ~800 steps of shoving and a weld fired 32mm off. The warning
   is what turns an hour of probing into a line of output, so it must keep firing."""
-  out = _run(capsys, ["run", "cross8.json", "--v2", "--mp-path", "mp.json",
+  out = _run(capsys, ["run", "cross8.json", "--mp-path", "mp.json",
                       "--no-corridor", "--no-actuated", "--no-skill-servo",
                       "--no-force-limits"])
   assert "NO INSERTION FUNNEL" in out

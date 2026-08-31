@@ -86,7 +86,9 @@ def test_frame_conventions():
 
 
 def test_antipodal_width_within_aperture():
-  P.set_sampled_grasps({"seed": 1, "candidates": 128, "keep": 12})
+  # The current database deliberately reserves its conventional source prefix first; use a
+  # large enough bound to exercise the sampled antipodal block as well.
+  P.set_sampled_grasps({"seed": 1, "candidates": 128, "keep": 64})
   big = ("box", (0.2, 0.05, 0.05, 0.005))                  # 200mm > aperture along x
   poses = P.part_grasp_poses(big)
   mins = P.part_grasp_face_min_dims(big)
@@ -107,7 +109,7 @@ def test_cylinder_pinches_include_both_axial_approaches():
   Antipodal contacts fix the closing axis but leave two valid approach directions.  The
   sampled DB must retain both signs, just as the face enumerator retains two pinch rolls.
   """
-  P.set_sampled_grasps({"seed": 0, "candidates": 200, "keep": 12,
+  P.set_sampled_grasps({"seed": 0, "candidates": 200, "keep": 64,
                         "margin": 0.008, "pad_support": 0.75})
   poses = P.part_grasp_poses(CYL)
   meta = P.sampled_grasp_meta(CYL)
@@ -127,7 +129,7 @@ def test_wrap_metric_keeps_peg_side_pinches():
   (surface drop relative to the nearest contact <= W), so at W=0.015 the side pinch passes
   the 0.75 support gate, and the wrap flag reserves part of the pinch quota for the side
   approach so FPS cannot race it out."""
-  gates = {"seed": 0, "candidates": 200, "keep": 12,
+  gates = {"seed": 0, "candidates": 200, "keep": 64,
            "margin": 0.008, "pad_support": 0.75}
   peg = ("cylinder", (0.15, 0.0125))
 
@@ -151,19 +153,14 @@ def test_wrap_metric_keeps_peg_side_pinches():
   poses = P.part_grasp_poses(peg)
   meta = P.sampled_grasp_meta(peg)
   side = _side_radial(poses, meta)
-  assert len(side) >= 2, side                       # the wrap-roll quota (keep 12 -> 2 slots)
+  assert len(side) >= 2, side                       # wrap-roll quota survives bounded selection
   assert all(s >= 0.75 for _nz, s in side), side    # admitted above the gate, no fallback
   # the gate still holds for every retained pinch (no silent fallback under the wrap flag)
   assert all(m["pad_support"] >= 0.75
              for q, m in zip(poses, meta) if m["family"] == "pinch")
 
 
-def test_cli_defaults_and_guard():
-  assert RunConfig().grasp_sampler is False
-  assert RunConfig().grasp_sampler_scenes is False
-  a = main.parse_args([])
-  assert a.grasp_sampler is False and a.grasp_sampler_keep == 20
-  assert a.grasp_sampler_version == 2
+def test_sampler_flag_guards():
   with pytest.raises(SystemExit):
     main.run(RunConfig(grasp_sampler=True, dense_grasps=True, solve=False, view=False))
   with pytest.raises(SystemExit):
@@ -172,12 +169,12 @@ def test_cli_defaults_and_guard():
     main.run(RunConfig(grasp_widen=True, solve=False, view=False))
 
 
-def test_v2_hybrid_contains_conventional_grasps_and_refines_by_prefix():
-  """Primitive V2 DBs keep every conventional grasp and increasing K appends ids."""
+def test_sampler_contains_conventional_grasps_and_refines_by_prefix():
+  """Primitive DBs keep every conventional grasp and increasing K appends ids."""
   P.set_rolls_per_face(2)
   P.set_sampled_grasps(None)
   conventional = [np.asarray(q) for q in P.part_grasp_poses(CUBE)]
-  mode = {"version": 2, "seed": 3, "candidates": 96, "keep": 20,
+  mode = {"seed": 3, "candidates": 96, "keep": 20,
           "margin": 0.008, "pad_support": 0.75, "wrap": 0.015}
   P.set_sampled_grasps(mode)
   q20 = [np.asarray(q).copy() for q in P.part_grasp_poses(CUBE)]
@@ -207,25 +204,9 @@ def test_closure_ranking_prioritizes_certified_canonical_rows_without_deleting_f
   assert {id(e[0]) for e in ranked} == {id(e[0]) for e in entries}
 
 
-def test_v3_task_coverage_prefers_multi_role_reachable_candidate_without_deletion():
-  def entry(i, family, roles=(), reach=0, origin="sampled"):
-    row = (np.array([0.02 * i, 0.0, 0.06, 1.0, 0.0, 0.0, 0.0]),
-           "flat", 0.05, np.zeros(6), 0.02, 1.0, family, False)
-    meta = {"origin": origin, "scene_by_kind": {"two_finger": tuple(roles)},
-            "reach_by_robot": {"a1": reach}}
-    return row, meta
-
-  pick_only = entry(0, "suction", ("pick",))
-  bridge = entry(1, "canonical", ("pick", "assemble"), reach=3, origin="canonical")
-  mate_only = entry(2, "pinch", ("assemble",))
-  ranked = P._task_coverage_order([pick_only, bridge, mate_only])
-  assert ranked[0] is bridge
-  assert {id(e[0]) for e in ranked} == {id(e[0]) for e in (pick_only, bridge, mate_only)}
-
-
-def test_v3_keep_widening_is_append_only():
+def test_keep_widening_is_append_only():
   P.set_rolls_per_face(2)
-  mode = {"version": 3, "seed": 4, "candidates": 96, "keep": 20,
+  mode = {"seed": 4, "candidates": 96, "keep": 20,
           "margin": 0.008, "pad_support": 0.75, "wrap": 0.015}
   P.set_sampled_grasps(mode)
   q20 = [np.asarray(q).copy() for q in P.part_grasp_poses(CUBE)]
@@ -238,7 +219,7 @@ def test_v3_keep_widening_is_append_only():
 def test_local_widen_builds_one_larger_stable_master():
   """The local schedule must not regenerate/rebind ids when a fill exposes more columns."""
   P.set_rolls_per_face(2)
-  base = {"version": 2, "seed": 4, "candidates": 96, "keep": 12,
+  base = {"seed": 4, "candidates": 96, "keep": 12,
           "margin": 0.008, "pad_support": 0.75, "wrap": 0.015}
   P.set_sampled_grasps(base)
   q12 = [np.asarray(q).copy() for q in P.part_grasp_poses(CUBE)]
@@ -258,12 +239,12 @@ def test_per_part_grasp_caps_gate_only_new_grasp_choices():
   assert S._grasp_action_within_cap(("release", "a1", "obj_0"), caps)
 
 
-def test_v2_scene_masks_are_per_gripper_kind():
+def test_scene_masks_are_per_gripper_kind():
   """Mixed fleets must not classify every explicit pose through whichever EE slot is first."""
   import env
   from problem import add_disassembled_obj, get_robots, make_assembly
   P.set_rolls_per_face(2)
-  P.set_sampled_grasps({"version": 2, "seed": 0, "candidates": 64, "keep": 20,
+  P.set_sampled_grasps({"seed": 0, "candidates": 64, "keep": 20,
                         "margin": 0.008, "pad_support": 0.75, "wrap": 0.015})
   C = env.make_four_robot_env(num_robots=2, floating_ee=False, vacuum=[True, False])
   asm = make_assembly("cross", 3)
@@ -295,7 +276,7 @@ def test_openarm_car_wheel_sampler_generates_strict_table_clear_grasp():
   from problem import add_disassembled_obj, get_robots, make_assembly
 
   P.set_rolls_per_face(2)
-  P.set_sampled_grasps({"version": 2, "seed": 0, "candidates": 96, "keep": 16,
+  P.set_sampled_grasps({"seed": 0, "candidates": 96, "keep": 16,
                         "margin": 0.008, "pad_support": 0.75, "wrap": 0.015})
   S.set_grasp_closure_check(True)
   C = env.make_openarm_duo_env(2)
@@ -320,14 +301,14 @@ def test_openarm_car_wheel_sampler_generates_strict_table_clear_grasp():
     assert cert is not None and cert.feasible
 
 
-def test_v2_canonical_epoch_reproduces_legacy_grasp_table():
+def test_canonical_epoch_reproduces_conventional_grasp_table():
   """Staged epoch zero must be the old primitive action space, not merely similar poses."""
   from problem import make_assembly
   P.set_rolls_per_face(2)
   asm = make_assembly("cross", 2)
   P.set_sampled_grasps(None)
   legacy = P.precompute_grasps(asm)
-  P.set_sampled_grasps({"version": 2, "seed": 0, "candidates": 32, "keep": 20,
+  P.set_sampled_grasps({"seed": 0, "candidates": 32, "keep": 20,
                         "margin": 0.008, "pad_support": 0.75, "wrap": 0.015})
   P.set_sampled_canonical_only(True)
   staged = P.precompute_grasps(asm)
@@ -346,7 +327,7 @@ def test_wrap_emits_side_roll_for_long_boxes():
   dimension, palm approaching perpendicular to the long axis. Without the complementary
   roll the sampler only emits pads-along-the-long-axis pinches, whose palm sits at the peg
   END and collides with the seat during insertion -- the cuboid-peg failure the user hit."""
-  gates = {"seed": 0, "candidates": 200, "keep": 12, "margin": 0.008, "pad_support": 0.5}
+  gates = {"seed": 0, "candidates": 200, "keep": 64, "margin": 0.008, "pad_support": 0.5}
   peg = ("box", (0.02, 0.02, 0.11, 0.0))                  # long axis = part z, like the legs
 
   def _side(poses, meta):
@@ -370,10 +351,8 @@ def test_wrap_emits_side_roll_for_long_boxes():
   assert all(s >= 0.5 for s in side)                      # admitted above the support gate
 
 
-def test_scene_aware_sets_free_pick_asm():
-  """--grasp-sampler-scenes: the DB per PART INSTANCE is split into FREE / PICK (floating-EE
-  clear at the initial pose) / ASSEMBLE (clear at the seated pose) sets with per-set quotas.
-  Every tagged row must re-pass its own set's check, and identical parts get their OWN DB."""
+def test_scene_aware_roles_are_certified_per_part_and_gripper():
+  """Every advertised scene role re-passes its check, and equal shapes get per-part DBs."""
   import env
   from problem import add_disassembled_obj, get_robots, make_assembly
   P.set_sampled_grasps({"seed": 0, "candidates": 64, "keep": 12,
@@ -386,15 +365,16 @@ def test_scene_aware_sets_free_pick_asm():
   poses = P.part_grasp_poses(spec, part="obj_1")
   meta = P.sampled_grasp_meta(spec, part="obj_1")
   assert len(poses) == len(meta) == 12
-  assert all("set" in m for m in meta)
-  sets = {m["set"] for m in meta}
-  assert sets <= {"free", "pick", "asm"}
-  assert "pick" in sets and "free" in sets            # a cube on the table has both pools
+  assert all("sets" in m and "scene_by_kind" in m for m in meta)
+  roles = {role for m in meta for role in m["sets"]}
+  assert roles == {"pick", "assemble"}
   ctx = P._SAMPLED_SCENE_CTX
   for pose, m in zip(poses, meta):
-    state = ctx["s0"] if m["set"] == "pick" else ctx["s_full"] if m["set"] == "asm" else None
-    if state is not None:                             # tagged rows re-pass their own gate
-      assert ctx["checker"].pose_collision_free(state, "obj_1", pose, asm)
+    for kind, kind_roles in m["scene_by_kind"].items():
+      for role in kind_roles:
+        state = ctx["s0"] if role == "pick" else ctx["s_full"]
+        assert ctx["checker"].pose_collision_free(
+            state, "obj_1", pose, asm, robot=ctx["kind_robot"][kind])
   # identical shape, different instance: its own DB (same raw cloud, own filter)
   spec2 = asm.part_shape("obj_2")
   assert spec2[0] == "box" and spec2[1] == spec[1]
@@ -417,7 +397,7 @@ def test_scene_aware_off_is_byte_identical():
 
 
 def _synthetic_scene_reservation_input(monkeypatch):
-  """A V2-prefix counterexample with four scene-valid sampled rows.
+  """A conventional-prefix counterexample with four scene-valid sampled rows.
 
   Two conventional rows fill K=2 but are collision-free in neither context.  The sampled
   row pairs respectively serve PICK and ASSEMBLE, making this a small deterministic test of
@@ -450,56 +430,45 @@ def _synthetic_scene_reservation_input(monkeypatch):
       return None                                         # no analytic table-repair variant
 
   ctx = {"checker": Checker(), "kind_robot": {"two_finger": "a1"},
-         "assembly": object(), "s0": pick_state, "s_full": asm_state,
-         "robot_ik": None, "ik_scene": None}
+         "assembly": object(), "s0": pick_state, "s_full": asm_state}
   return (("box", (0.05, 0.05, 0.05, 0.0)), "obj_0",
           [row(1.0), row(1.1), row(2.0), row(2.1)], [], ctx)
 
 
-def test_v4_scene_reservation_preempts_a_full_v2_canonical_prefix(monkeypatch):
-  """V4 gives --grasp-sampler-scenes a bounded PICK/ASSEMBLE guarantee; V2 is unchanged."""
+def test_scene_reservation_preempts_a_full_canonical_prefix(monkeypatch):
+  """The bounded database reserves both PICK and ASSEMBLE scene roles."""
   spec, part, suction, antip, ctx = _synthetic_scene_reservation_input(monkeypatch)
 
-  P.set_sampled_grasps({"version": 2, "seed": 0, "candidates": 8, "keep": 2})
-  v2 = P._hybrid_v2_rows(spec, 0.01, part, suction, antip, 2, ctx, None)
-  assert [float(e[0][0][0]) for e in v2] == [0.0, 0.1]
-
-  P.set_sampled_grasps({"version": 4, "seed": 0, "candidates": 8, "keep": 2})
-  v4 = P._hybrid_v2_rows(spec, 0.01, part, suction, antip, 2, ctx, None)
-  xs = [float(e[0][0][0]) for e in v4]
+  P.set_sampled_grasps({"seed": 0, "candidates": 8, "keep": 2})
+  rows = P._sampled_master_rows(spec, 0.01, part, suction, antip, 2, ctx, None)
+  xs = [float(e[0][0][0]) for e in rows]
   assert xs[0] in (1.0, 1.1) and xs[1] in (2.0, 2.1)
-  facts = {(kind, role) for _row, meta in v4
+  facts = {(kind, role) for _row, meta in rows
            for kind, roles in meta["scene_by_kind"].items() for role in roles}
   assert facts == {("two_finger", "pick"), ("two_finger", "assemble")}
 
 
-def test_v4_scene_reservation_master_is_append_only(monkeypatch):
+def test_scene_reservation_master_is_append_only(monkeypatch):
   """The scene-reserved master is fixed before slicing, so widening preserves all ids."""
   spec, part, suction, antip, ctx = _synthetic_scene_reservation_input(monkeypatch)
-  P.set_sampled_grasps({"version": 4, "seed": 0, "candidates": 8, "keep": 2})
-  k2 = P._hybrid_v2_rows(spec, 0.01, part, suction, antip, 2, ctx, None)
-  P.set_sampled_grasps({"version": 4, "seed": 0, "candidates": 8, "keep": 4})
-  k4 = P._hybrid_v2_rows(spec, 0.01, part, suction, antip, 4, ctx, None)
+  P.set_sampled_grasps({"seed": 0, "candidates": 8, "keep": 2})
+  k2 = P._sampled_master_rows(spec, 0.01, part, suction, antip, 2, ctx, None)
+  P.set_sampled_grasps({"seed": 0, "candidates": 8, "keep": 4})
+  k4 = P._sampled_master_rows(spec, 0.01, part, suction, antip, 4, ctx, None)
   assert len(k2) == 2 and len(k4) == 4
   for old, new in zip(k2, k4):
     np.testing.assert_array_equal(old[0][0], new[0][0])
 
 
-def test_v4_closure_tail_is_the_v2_tail_not_zero_role_canonical(monkeypatch):
-  """Reservations may reorder V2, but do not promote closure-invalid canonical fallbacks."""
+def test_closure_invalid_canonical_rows_remain_last_resort(monkeypatch):
   spec, part, suction, antip, ctx = _synthetic_scene_reservation_input(monkeypatch)
   ctx["checker"].closure_check = True
 
-  P.set_sampled_grasps({"version": 2, "seed": 0, "candidates": 8, "keep": 6})
-  v2 = P._hybrid_v2_rows(spec, 0.01, part, suction, antip, 6, ctx, None)
-  P.set_sampled_grasps({"version": 4, "seed": 0, "candidates": 8, "keep": 6})
-  v4 = P._hybrid_v2_rows(spec, 0.01, part, suction, antip, 6, ctx, None)
-
-  x2 = [float(e[0][0][0]) for e in v2]
-  x4 = [float(e[0][0][0]) for e in v4]
-  assert x4 == x2                               # reservations are V2's first two rows here
-  assert set(x4[:4]) == {1.0, 1.1, 2.0, 2.1}
-  assert x4[4:] == [0.0, 0.1]                  # zero-role canonical poses remain last resort
+  P.set_sampled_grasps({"seed": 0, "candidates": 8, "keep": 6})
+  rows = P._sampled_master_rows(spec, 0.01, part, suction, antip, 6, ctx, None)
+  xs = [float(e[0][0][0]) for e in rows]
+  assert set(xs[:4]) == {1.0, 1.1, 2.0, 2.1}
+  assert xs[4:] == [0.0, 0.1]                  # zero-role canonical poses remain last resort
 
 
 def _install_mixed_public_scene_ctx():
@@ -521,60 +490,29 @@ def _install_mixed_public_scene_ctx():
       "checker": Checker(), "kind_robot": {"two_finger": "finger", "vacuum": "vacuum"},
       "assembly": object(), "s0": pick_state, "s_full": asm_state,
       "sig": ("test-mixed-real-sampler",), "robots": (),
-      "robot_ik": None, "ik_scene": None,
   }
 
 
-def _pose_bytes(poses):
-  return tuple(np.asarray(q, dtype="<f8").tobytes() for q in poses)
-
-
-def test_v4_shares_only_v2_raw_seed_key_and_keeps_v3_identity():
-  """The V4 ablation must not silently regenerate either the V2 or persisted V3 cloud."""
-  mode = {"seed": 23, "candidates": 96, "keep": 20,
-          "margin": 0.004, "pad_support": 0.6, "wrap": 0.015}
-  keys = {}
-  for version in (2, 3, 4):
-    P.set_sampled_grasps({**mode, "version": version})
-    keys[version] = P._sampled_keys(CUBE, 0.01, "obj_0")
-  assert keys[4][0] == keys[2][0]
-  assert keys[4][1] != keys[2][1]
-  assert keys[3][0][2] == 3                    # V3's historical RNG tuple remains version 3
-  assert keys[3][0] != keys[2][0]
-
-
-def test_v4_real_sampler_is_only_an_ordering_of_the_v2_candidate_master():
-  """V2 and V4 use one raw cloud; V4's cache/IDs remain a distinct ordered database."""
+def test_sampler_reserves_each_fleet_scene_role_in_its_prefix():
   P.set_rolls_per_face(2)
   _install_mixed_public_scene_ctx()
   mode = {"seed": 17, "candidates": 96, "keep": 128, "master_keep": 128,
           "margin": 0.0, "pad_support": 0.0, "wrap": 0.015}
-
-  P.set_sampled_grasps({**mode, "version": 2})
-  raw_v2, cache_v2 = P._sampled_keys(CUBE, 0.01, "obj_0")
-  q2 = P.part_grasp_poses(CUBE, part="obj_0")
-
-  P.set_sampled_grasps({**mode, "version": 4})
-  raw_v4, cache_v4 = P._sampled_keys(CUBE, 0.01, "obj_0")
-  q4 = P.part_grasp_poses(CUBE, part="obj_0")
-  m4 = P.sampled_grasp_meta(CUBE, part="obj_0")
-
-  assert raw_v4 == raw_v2                         # exactly V2's stochastic surface cloud
-  assert cache_v4 != cache_v2                     # but never alias positional DB identities
-  assert len(q4) == len(q2) > 20
-  assert set(_pose_bytes(q4)) == set(_pose_bytes(q2))
-  assert _pose_bytes(q4) != _pose_bytes(q2)        # the advertised reservation reordering
-  first_facts = {(kind, role) for md in m4[:4]
+  P.set_sampled_grasps(mode)
+  poses = P.part_grasp_poses(CUBE, part="obj_0")
+  meta = P.sampled_grasp_meta(CUBE, part="obj_0")
+  assert len(poses) > 20
+  first_facts = {(kind, role) for md in meta[:4]
                  for kind, roles in md["scene_by_kind"].items() for role in roles}
   assert first_facts == {("two_finger", "pick"), ("two_finger", "assemble"),
                          ("vacuum", "pick"), ("vacuum", "assemble")}
 
 
-def test_v4_global_widening_preserves_cached_prefix_ids():
+def test_global_widening_preserves_cached_prefix_ids():
   """Exercise K -> K+B through the public cache-reset API, not the selector in isolation."""
   P.set_rolls_per_face(2)
   _install_mixed_public_scene_ctx()
-  mode = {"version": 4, "seed": 19, "candidates": 96, "keep": 6,
+  mode = {"seed": 19, "candidates": 96, "keep": 6,
           "margin": 0.0, "pad_support": 0.0, "wrap": 0.015}
   P.set_sampled_grasps(mode)
   q6 = P.part_grasp_poses(CUBE, part="obj_0")

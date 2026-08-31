@@ -133,9 +133,6 @@ def build_scene(cfg):
                       "master_keep": (int(_saved(cfg, "grasp_widen_max"))
                                       if _saved(cfg, "grasp_local_widen", legacy=False)
                                       else int(_saved(cfg, "grasp_sampler_keep"))),
-                      # Missing means the replacement V1 database used by every historical
-                      # sampled plan. Never rebuild an old positional grasp id as hybrid V2.
-                      "version": int(_saved(cfg, "grasp_sampler_version", legacy=1)),
                       # LEGACY-FAITHFUL: a plan saved BEFORE the edge margin existed carries
                       # no key and was built with NO margin -- reconstructing it at today's
                       # DEFAULT would rebind every saved grasp id. Missing => 0.0, not 0.008.

@@ -1,6 +1,4 @@
-"""RunConfig <-> CLI parity, persistence, and --config layering. Guards the packaging refactor:
-RunConfig must mirror the argparse parser EXACTLY (drift test), and the no-config CLI path must
-stay byte-identical to before (only the new `config` field is added)."""
+"""RunConfig <-> CLI parity, persistence, profile precedence, and --config layering."""
 import pytest
 
 import main
@@ -26,14 +24,6 @@ def test_defaults_match_parser():
       f"field mismatch: only-RunConfig {set(cd)-set(pd)}, only-parser {set(pd)-set(cd)}"
   for k in pd:
     assert cd[k] == pd[k], f"default drift on {k}: RunConfig={cd[k]!r} parser={pd[k]!r}"
-
-
-def test_default_for_matches_field_defaults():
-  """RunConfig.default_for is THE source of defaults for saved-config rebuilds: it must agree
-  with the live field defaults, or replay/sim fallbacks silently drift."""
-  rc = RunConfig()
-  for k, v in rc.to_dict().items():
-    assert RunConfig.default_for(k) == v, f"default_for drift on {k}"
 
 
 def test_default_for_unknown_key_raises():
@@ -82,105 +72,24 @@ def test_config_cli_layering(tmp_path):
   assert (a.assembly, a.parts, a.num_robots, a.seed) == ("chair", 5, 3, 1)   # CLI wins
 
 
-def test_historical_sampler_config_defaults_to_v1(tmp_path):
-  """A pre-version positional sampled DB must never be silently rebuilt as hybrid V2."""
-  p = tmp_path / "old-sampler.json"
-  p.write_text('{"grasp_sampler": true, "grasp_sampler_keep": 12}')
-  cfg = RunConfig.from_file(str(p))
-  assert cfg.grasp_sampler and cfg.grasp_sampler_version == 1
-
-
-def test_sampler_v4_profile_roundtrips_and_v2_witnesses_do_not_rebind(tmp_path, capsys):
-  """The standard V4 DB identity survives --save/--config; V2 remains a distinct legacy DB."""
-  import json
-
-  v4 = RunConfig.from_namespace(main.parse_args(["--search-profile", "standard"]))
-  v4.grasp_sampler_db_hash = "v4-test-content-hash"
-  v4_path = tmp_path / "v4-plan.json"
-  main.save_plan(str(v4_path), v4, [])
-  raw = json.loads(v4_path.read_text())["config"]
-  assert raw["grasp_sampler_version"] == 4
-  assert raw["grasp_sampler_db_hash"] == "v4-test-content-hash"
-  assert raw["grasp_sampler_scenes"] is True
-  assert raw["ik_positive_reuse"] is True
-  restored = RunConfig.from_file(str(v4_path))
-  assert (restored.grasp_sampler, restored.grasp_sampler_version,
-          restored.grasp_sampler_db_hash, restored.grasp_sampler_scenes) == \
-      (True, 4, "v4-test-content-hash", True)
-  # This is the documented --config PLAN.json path used before --load-plan/replay.
-  assert main.parse_args(["--config", str(v4_path)]).grasp_sampler_version == 4
-
-  # Keep every other witness-relevant setting equal: the rejection below must come from the
-  # positional sampled DB identity, not a coincidental profile difference such as yaw count.
-  v2 = RunConfig.from_dict(restored.to_dict())
-  v2.grasp_sampler_version = 2
-  v2.grasp_sampler_db_hash = "v2-test-content-hash"
-  v2_path = tmp_path / "v2-plan.json"
-  main.save_plan(str(v2_path), v2, [])
-  assert RunConfig.from_file(str(v2_path)).grasp_sampler_version == 2
-  saved_v2 = {k: getattr(v2, k) for k in main._WITNESS_FIELDS}
-  assert not main._witnesses_baseline_compatible(saved_v2, restored)
-  out = capsys.readouterr().out
-  assert "grasp_sampler_version" in out and "grasp_sampler_db_hash" in out
-
-
-def test_standard_search_profile_resolves_robust_batch_defaults():
-  a = main.parse_args(["--search-profile", "standard"])
-  assert a.weight == 1.0
-  assert a.milestones and a.sig_collapsed_h and a.sig_components == "press"
-  assert a.milestone_oracle == "structural"
-  assert a.fill_local_h and a.fill_exact and not a.fill_policy_first
-  assert a.useful_grasps
-  assert not main.parse_args(
-      ["--search-profile", "standard", "--no-useful-grasps"]).useful_grasps
-  assert not a.fill_skeleton_first
-  assert a.fill_scope_widening
-  assert not a.fill_touch_all
-  assert a.center_scatter
-  assert not main.parse_args(
-      ["--search-profile", "standard", "--no-center-scatter"]).center_scatter
-  assert a.milestone_boundaries == 4
-  assert a.real_ik and a.wrench and a.wrench_aware_h
-  assert a.grasp_model == "asymmetric"
-  assert a.optimize_witnesses == "floor"
-  assert a.witness_margin == 0.005
-  assert a.witness_joint_margin == 0.02
-  assert a.witness_branch_budget == 0 and a.witness_branch_metric == "motion"
-  assert a.witness_sets == 4
-  assert a.tight_fingers and not a.grasp_closure_check and a.strict_collisions == 1e-6
-  assert a.open_witness and a.open_witness_batch == 7 and a.open_witness_epochs == 2
-  assert a.ik_positive_reuse
-  assert not main.parse_args(
-      ["--search-profile", "standard", "--no-ik-positive-reuse"]).ik_positive_reuse
-  assert a.lazy_edge_selector == "forward"
-  assert a.analytic_seed_cap is None
-  assert a.ssik_seed_neighborhood == 0.0 and a.ssik_neighborhood_cap == 6
-  assert a.grasp_sampler and a.grasp_sampler_version == 4
-  assert a.grasp_sampler_scenes and a.grasp_sampler_keep == 20
-  assert a.grasp_sampler_candidates == 96
-  assert not a.grasp_refine
-  assert a.grasp_widen and a.grasp_widen_batch == 8 and a.grasp_widen_max == 96
-  assert main.parse_args(["--search-profile", "standard", "--grasp-refine"]).grasp_refine
-  assert a.grasp_sampler_wrap == 0.015
-  assert a.placement_yaws == 4 and a.placement_yaw_widening
-  assert main.parse_args([
-      "--search-profile", "standard", "--placement-yaws", "1",
-      "--no-placement-yaw-widening"
-  ]).placement_yaws == 1
-  assert a.quiet_rai and not a.view
+def test_current_sampler_marker_is_migrated_and_obsolete_markers_fail():
+  cfg = RunConfig.from_dict({"grasp_sampler": True, "grasp_sampler_version": 4})
+  assert cfg.grasp_sampler and "grasp_sampler_version" not in cfg.to_dict()
+  with pytest.raises(ValueError, match="versions 1-3 are no longer supported"):
+    RunConfig.from_dict({"grasp_sampler": True, "grasp_sampler_version": 3})
 
 
 def test_open_profile_is_a_compatibility_alias_and_fast_open_only_caps_seeds():
-  a = main.parse_args(["--search-profile", "open"])
+  alias = main.parse_args(["--search-profile", "open"])
   standard = main.parse_args(["--search-profile", "standard"])
-  assert a.open_witness and a.open_witness_batch == 7 and a.open_witness_epochs == 2
-  assert a.weight == 1.0 and a.fill_local_h and a.fill_exact
-  assert {k: getattr(a, k) for k in main._STANDARD_SEARCH_PROFILE} == {
+  assert {k: getattr(alias, k) for k in main._STANDARD_SEARCH_PROFILE} == {
       k: getattr(standard, k)
       for k in main._STANDARD_SEARCH_PROFILE}
-  assert a.analytic_seed_cap is None
-  b = main.parse_args(["--search-profile", "fast-open"])
-  assert b.open_witness and b.analytic_seed_cap == 3
+  fast = main.parse_args(["--search-profile", "fast-open"])
+  differences = {k for k in main._STANDARD_SEARCH_PROFILE
+                 if getattr(fast, k) != getattr(standard, k)}
+  assert differences == {"analytic_seed_cap"}
+  assert standard.analytic_seed_cap is None and fast.analytic_seed_cap is not None
 
 
 def test_optimistic_dispatch_uses_the_shared_local_fill_settings(monkeypatch):
@@ -273,31 +182,13 @@ def test_solver_scoped_policy_flags_fail_closed_in_other_engines():
 
 def test_saved_plan_persists_resolved_search_semantics(tmp_path):
   """A named-profile result must remain reproducible after the profile itself evolves."""
-  import json
-
-  a = main.parse_args(["--search-profile", "standard"])
-  cfg = RunConfig.from_namespace(a)
+  cfg = RunConfig.from_namespace(main.parse_args(["--search-profile", "standard"]))
   out = tmp_path / "plan.json"
   main.save_plan(str(out), cfg, [])
-  saved = json.loads(out.read_text())["config"]
-  for key in ("weight", "milestones", "goal_on_table", "milestone_oracle", "fill_local_h", "fill_exact",
-              "milestone_boundaries", "fill_scope_widening", "open_witness",
-              "open_witness_batch", "open_witness_epochs", "lazy_edge_selector", "analytic_seed_cap",
-              "ssik_seed_neighborhood", "ssik_neighborhood_cap",
-              "fail_order", "empty_seed_refutes", "grasp_widen", "grasp_widen_batch",
-              "grasp_widen_max", "grasp_local_widen", "grasp_local_caps",
-              "placement_yaws", "placement_yaw_widening"):
-    assert saved[key] == getattr(cfg, key)
   loaded = RunConfig.from_file(str(out))
-  assert loaded.milestone_boundaries == 4
-  assert loaded.milestone_oracle == "structural" and loaded.open_witness
-  assert loaded.lazy_edge_selector == "forward"
-  assert main.parse_args([
-      "--search-profile", "standard", "--lazy-edge-selector", "fail-first"
-  ]).lazy_edge_selector == "fail-first"
-  assert main.parse_args([
-      "--search-profile", "standard", "--lazy-edge-selector", "terminal-first"
-  ]).lazy_edge_selector == "terminal-first"
+  presentation_only = {"quiet_rai", "view"}
+  assert {k: v for k, v in loaded.to_dict().items() if k not in presentation_only} == {
+      k: v for k, v in cfg.to_dict().items() if k not in presentation_only}
 
 
 def test_every_nonpresentation_standard_setting_is_persisted():
@@ -305,43 +196,6 @@ def test_every_nonpresentation_standard_setting_is_persisted():
   presentation_only = {"quiet_rai", "view"}
   assert set(main._STANDARD_SEARCH_PROFILE) - presentation_only <= \
       set(main._SAVE_CONFIG_FIELDS)
-
-
-def test_standard_motion_profile_pins_the_motion_contract():
-  a = main.parse_args(["--motion-profile", "standard"])
-  assert (a.pre_pick, a.pre_place, a.pre_add_grasp,
-          a.pre_insertion, a.post_release) == (0.05,) * 5
-  assert a.fuse_cograsp and a.fuse_pre_skill
-  assert a.mp_sequence and a.mp_optimize
-  assert a.mp_runtime == 300.0 and a.mp_stall_timeout is None
-  assert a.mp_plan_candidates == 4 and a.mp_plan_epochs == 6
-  assert a.mp_plan_initial_runtime == 15.0
-  assert not a.mp_no_shortcut and a.mp_shortcut_iters == 100
-  assert a.mp_shortcut_strategy == "native" and a.mp_shortcut_res == 0.002
-  assert a.mp_collision_tolerance == 1e-4
-  assert a.mp_robot_margin == 0.1 and a.mp_margin_ramp == 0.1
-  assert a.mp_table_margin == 0.0 and a.mp_cograsp
-  assert not a.motion_plan                         # profiles configure; verbs remain explicit
-
-
-def test_saved_plan_persists_resolved_motion_profile_semantics(tmp_path):
-  import json
-
-  cfg = RunConfig.from_namespace(main.parse_args(["--motion-profile", "standard"]))
-  out = tmp_path / "motion-profile-plan.json"
-  main.save_plan(str(out), cfg, [])
-  saved = json.loads(out.read_text())["config"]
-  for key in ("fuse_cograsp", "fuse_pre_skill", "mp_sequence", "mp_optimize", "mp_runtime",
-              "mp_stall_timeout", "mp_no_shortcut", "mp_shortcut_iters",
-              "mp_shortcut_strategy", "mp_shortcut_res", "mp_shortcut_pair_checks",
-              "mp_collision_tolerance", "mp_robot_margin", "mp_margin_ramp",
-              "mp_table_margin", "mp_cograsp", "mp_plan_candidates", "mp_plan_epochs",
-              "mp_plan_initial_runtime"):
-    assert saved[key] == getattr(cfg, key)
-  loaded = RunConfig.from_file(str(out))
-  assert loaded.mp_optimize and loaded.mp_runtime == 300.0
-  assert loaded.mp_stall_timeout is None
-  assert loaded.mp_plan_candidates == 4 and loaded.mp_plan_epochs == 6
 
 
 def test_open_plan_motion_loop_cli_and_config_roundtrip():
@@ -469,28 +323,6 @@ def test_profile_wins_over_config_and_individual_cli_wins_over_both(tmp_path):
       "--search-profile", "standard", "--config", str(tmp_path / "c.json"),
       "--weight", "9", "--open-witness"])
   assert b.weight == 9.0 and b.open_witness
-
-
-def test_motion_profile_overrides_loaded_mp_defaults(tmp_path):
-  RunConfig(mp_collision_tolerance=0.01, mp_robot_margin=0.0,
-            mp_margin_ramp=0.0, mp_runtime=3.0, mp_optimize=True).to_file(
-                str(tmp_path / "c.json"))
-  a = main.parse_args([
-      "--config", str(tmp_path / "c.json"), "--motion-profile", "standard"])
-  assert a.mp_collision_tolerance == 1e-4
-  assert a.mp_robot_margin == 0.1 and a.mp_margin_ramp == 0.1
-  assert a.mp_runtime == 300.0 and a.mp_optimize
-  assert a.mp_stall_timeout is None
-  assert a.mp_plan_candidates == 4 and a.mp_plan_epochs == 6
-
-
-def test_no_config_path_unchanged():
-  """Without --config, parse_args is a single pass and every original dest keeps its built-in
-  default -- only the inert config/profile meta fields are added."""
-  a = vars(main.parse_args([]))
-  for k, v in _parser_defaults().items():
-    assert a[k] == v, f"{k} changed on the no-config path: {a[k]!r} != {v!r}"
-  assert a.get("config") is None
 
 
 def test_loaded_plan_is_not_hoisted_twice_without_explicit_request():

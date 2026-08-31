@@ -5011,7 +5011,7 @@ def fuse_pre_skill_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
 
   ALL-OR-NOTHING per split (see _pre_gate): reject -> today's keyframe is kept, with the reason
   printed. The exported TASK STRUCTURE is identical either way -- the split always emits its two
-  tasks -- because sim.py --v2 rebuilds the task list from the saved config alone and any
+  tasks -- because sim.py rebuilds the task list from the saved config alone and any
   per-action structural decision the exporter made would shift its task ids.
 
   Returns (pre_witnesses, report). pre_witnesses maps a plan index to the keyframe mp_export

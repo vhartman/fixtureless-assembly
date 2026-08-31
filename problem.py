@@ -2072,13 +2072,13 @@ def set_dense_grasps(flag):
 # face-centred enumeration, tessellate the part shape into an actual MESH (trimesh) and
 # SAMPLE candidate grasps off its surface -- a suction-style block (surface point + inward
 # normal, canonical roll) plus an antipodal pinch block (opposing surface-point pairs within
-# the finger aperture) -- then DOWNSAMPLE to a search-sized set by farthest-point selection.
+# the finger aperture) -- then build a bounded, scene-reserved, diversity-ordered database.
 # The precursor to a real learned/mesh grasp generator: swap _sample_candidates for the
 # generator, keep everything else. grasp_id stays a positional index into the per-shape
 # list, and part_grasp_poses / part_grasp_surfaces / part_grasp_face_min_dims all delegate
 # to ONE jointly-computed, memoized (poses, surfaces, min_dims) triple so the three
 # parallel views can never shear. OFF (default) = byte-identical to the enumerator.
-_SAMPLED_GRASPS = None         # None = off; else versioned sampler configuration
+_SAMPLED_GRASPS = None         # None = off; else current sampler configuration
 _SAMPLED_VIEWS_CACHE = {}
 _SAMPLED_META_CACHE = {}          # same key: per-candidate gate diagnostics (not the DB)
 _SAMPLED_SCENE_CTX = None         # --grasp-sampler-scenes: pick/assembly filter context
@@ -2094,13 +2094,13 @@ def set_sampled_grasps(mode):
   set_rolls_per_face -- grasp ids index the per-shape candidate list, so flipping this
   mid-run rebinds every saved grasp id."""
   global _SAMPLED_GRASPS, _SAMPLED_CANONICAL_ONLY
+  if mode is not None and mode.get("version") not in (None, 4):
+    raise ValueError("grasp sampler versions 1-3 are no longer supported")
   _SAMPLED_GRASPS = None if mode is None else {
-      "version": int(mode.get("version", 1)),
       "seed": int(mode.get("seed", 0)),
       "candidates": max(8, int(mode.get("candidates", 200))),
       "keep": max(2, int(mode.get("keep", 12))),
-      # V2/V3 may construct a larger immutable MASTER while a search exposes only a
-      # prefix.  Ordinary callers omit this and retain the historical keep-sized DB.
+      # A search may construct a larger immutable master while exposing only a prefix.
       "master_keep": max(2, int(mode.get("keep", 12)),
                          int(mode.get("master_keep", mode.get("keep", 12)))),
       "margin": float(mode.get("margin", 0.008)),
@@ -2112,7 +2112,7 @@ def set_sampled_grasps(mode):
 
 
 def set_sampled_canonical_only(on=False):
-  """Restrict V2 PRIMITIVE grasp tables to their conventional prefix for a search epoch.
+  """Restrict primitive grasp tables to their conventional prefix for a search epoch.
 
   Mesh/compound parts have no conventional database and always retain their samples. This
   changes only which already-stable ids enter precomputed grasp tables; the DB, hashes, saved
@@ -2122,7 +2122,7 @@ def set_sampled_canonical_only(on=False):
   _SAMPLED_CANONICAL_ONLY = bool(on)
 
 
-def install_sampled_scene_ctx(C, assembly, robots=None, robot_ik=None):
+def install_sampled_scene_ctx(C, assembly, robots=None):
   """--grasp-sampler-scenes: give the sampled DB the two SCENE views it filters candidates
   against -- the INITIAL scene (can this grasp pick the part where it lies?) and the FULLY
   ASSEMBLED scene (can this grasp stand at the part's seated pose?) -- using the search's
@@ -2148,33 +2148,11 @@ def install_sampled_scene_ctx(C, assembly, robots=None, robot_ik=None):
   poses_asm = tuple(sorted((p, tuple(np.round(np.asarray(
       _state_part_poses(s_full, assembly, lift=0.0)[p], dtype=float), 4)))
                             for p in assembly.objects))
-  # V3 may use exact fixed-arm reach as a SOFT ranking certificate.  Include the physical
-  # embodiment in the context signature: two scenes with identical part poses but different
-  # arm bases/limits must never share an id-bearing candidate ordering in one process.
-  reach_sig = ()
-  if robot_ik is not None:
-    reach_rows = []
-    names = list(robot_ik.C.getJointNames())
-    try:
-      lo, hi = (np.asarray(x, dtype=float).ravel() for x in robot_ik.C.getJointLimits())
-    except Exception:
-      lo = hi = np.zeros(0)
-    for r in robots:
-      idx = [i for i, n in enumerate(names) if n.startswith(r + "_")]
-      base = robot_ik.base_link.get(r)
-      bp = () if base is None else tuple(np.round(
-          np.asarray(robot_ik.C.getFrame(base).getPose(), dtype=float), 6))
-      lim = tuple((round(float(lo[i]), 6), round(float(hi[i]), 6))
-                  for i in idx if i < len(lo))
-      reach_rows.append((r, robot_ik.robot_arm.get(r), robot_ik.tool_kind.get(r), bp, lim))
-    reach_sig = tuple(reach_rows)
-  sig = ("scenes", poses_pick, poses_asm, reach_sig)
+  sig = ("scenes", poses_pick, poses_asm)
   _SAMPLED_SCENE_CTX = {"checker": checker, "kind_robot": kind_robot,
                         "s0": s0, "s_full": s_full,
                         "assembly": assembly, "sig": sig,
-                        "robots": tuple(robots), "robot_ik": robot_ik,
-                        "ik_scene": (None if robot_ik is None else
-                                     robot_ik.scene_for(s0, assembly))}
+                        "robots": tuple(robots)}
   _SAMPLED_VIEWS_CACHE.clear()
   _SAMPLED_META_CACHE.clear()
 
@@ -2188,17 +2166,15 @@ def clear_sampled_scene_ctx():
 
 
 def set_sampled_grasp_keep(keep):
-  """Monotonically resize the active V2+ sampled database without changing its source.
+  """Monotonically resize the active sampled database without changing its source.
 
-  V2+ raw clouds and master rankings are independent of ``keep``.  Increasing it therefore
+  Raw clouds and master rankings are independent of ``keep``. Increasing it therefore
   appends grasp ids; decreasing it restores an earlier prefix.  This is the only mutation the
   failure-driven search widening path needs, and deliberately retains the installed scene/IK
   context so the new prefix is ranked under exactly the same physical problem.
   """
   if _SAMPLED_GRASPS is None:
     raise ValueError("sampled grasp database is disabled")
-  if int(_SAMPLED_GRASPS.get("version", 1)) < 2:
-    raise ValueError("grasp widening requires sampler V2 or newer")
   _SAMPLED_GRASPS["keep"] = max(2, int(keep))
   # This API is the legacy/global widening operation: it physically grows the evaluated
   # DB.  Fill-local widening never calls it; that path constructs master_keep once and
@@ -2565,28 +2541,11 @@ def _ray_exit(spec, p, d):
   return e, e / max(np.linalg.norm(e), 1e-12)
 
 
-def _fps_downsample(feats, keep):
-  # farthest-point selection over feature vectors, seeded at candidate 0 (the raw order is
-  # deterministic), ties broken by INDEX so the result is a total order -- no float-equality
-  # dependence across platforms.
-  n = len(feats)
-  if n <= keep:
-    return list(range(n))
-  F = np.asarray(feats, dtype=float)
-  chosen = [0]
-  d = np.linalg.norm(F - F[0], axis=1)
-  for _ in range(keep - 1):
-    i = int(np.argmax(np.round(d, 12)))                    # argmax takes the FIRST max: index tiebreak
-    chosen.append(i)
-    d = np.minimum(d, np.linalg.norm(F - F[i], axis=1))
-  return sorted(chosen)
-
-
 def _fps_row_order(rows):
   """Deterministic farthest-first ORDER, independent of the final retained count.
 
-  Taking a longer prefix appends grasp ids instead of rebinding old ones, which makes V2 safe
-  for a later search-side grasp-refinement epoch.
+  Taking a longer prefix appends grasp ids instead of rebinding old ones, which makes
+  search-side grasp widening safe.
   """
   if not rows:
     return []
@@ -2665,77 +2624,8 @@ def _closure_ranked_canonical(entries):
   return out
 
 
-def _task_coverage_order(entries):
-  """Deterministic V3 master order by balanced task-certificate coverage.
-
-  Every candidate carries a set of discrete, equally weighted TASK facts: gripper-kind
-  PICK/ASSEMBLE clearance, a conjunctive PICK+ASSEMBLE bridge certificate, press-transmitting
-  mate feasibility, and exact initial-pick reach for each calibrated fixed arm. Selection
-  repeatedly serves the
-  least-covered facts; among candidates that do so it maximizes the number of such facts and
-  then the distance to the already selected contact poses.  This is a max-min coverage rule,
-  not a fitted score with assembly-specific weights.  Once all facts have equal coverage it
-  naturally starts another coverage round.
-
-  Exact reach is deliberately only a fact.  Candidates with no SSIK branch remain in the
-  family/scene pools and can still be selected or reached by tolerant KOMO.  The returned
-  order is independent of the requested K, so larger prefixes append stable grasp ids.
-  """
-  if not entries:
-    return []
-
-  def facts(entry):
-    _row, meta = entry
-    fs = set()
-    scenes = meta.get("scene_by_kind") or {}
-    for kind, roles in scenes.items():
-      roles = tuple(roles)
-      for role in roles:
-        fs.add(("scene", str(kind), str(role)))
-      if "pick" in roles and "assemble" in roles:
-        fs.add(("bridge", str(kind)))
-    for robot, n in (meta.get("reach_by_robot") or {}).items():
-      if int(n) > 0:
-        fs.add(("reach", str(robot)))
-    for kind, ok in (meta.get("press_by_kind") or {}).items():
-      if ok:
-        fs.add(("press", str(kind)))
-        if "assemble" in scenes.get(kind, ()):
-          fs.add(("mate-press", str(kind)))
-    return frozenset(fs)
-
-  def feat(entry):
-    pose = np.asarray(entry[0][0], dtype=float)
-    R = _quat_to_R(pose[3:])
-    return np.concatenate([pose[:3], 0.02 * R[:, 0], 0.02 * R[:, 1], 0.02 * R[:, 2]])
-
-  rows = list(entries)
-  F = np.asarray([feat(e) for e in rows], dtype=float)
-  factsets = [facts(e) for e in rows]
-  universe = sorted(set().union(*factsets), key=repr)
-  counts = {f: 0 for f in universe}
-  left = set(range(len(rows)))
-  chosen = []
-  min_dist = np.full(len(rows), np.inf)
-  while left:
-    least = min((counts[f] for i in left for f in factsets[i]), default=0)
-    scores = []
-    for i in sorted(left):
-      nleast = sum(counts[f] == least for f in factsets[i])
-      # Rounded distance plus negative source index gives a deterministic total order.
-      d = float(min_dist[i]) if chosen else 0.0
-      scores.append((nleast, round(d, 12), -i, i))
-    i = max(scores)[-1]
-    chosen.append(i); left.remove(i)
-    for f in factsets[i]:
-      counts[f] += 1
-    dnew = np.linalg.norm(F - F[i], axis=1)
-    min_dist = np.minimum(min_dist, dnew)
-  return [rows[i] for i in chosen]
-
-
-def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
-  """Select the bounded V2 DB and return ``[(row, metadata), ...]``.
+def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
+  """Select the bounded scene-reserved DB and return ``[(row, metadata), ...]``.
 
   Conventional primitive grasps are the stable source prefix. Under the explicit closure
   model, a source whose fingers graze the table may additionally emit a deterministic,
@@ -2754,49 +2644,7 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
   checker = None if ctx is None else ctx["checker"]
   kind_robot = {} if ctx is None else ctx["kind_robot"]
   asm = None if ctx is None else ctx["assembly"]
-  task_ik = None if ctx is None else ctx.get("robot_ik")
-  task_ik_scene = None if ctx is None else ctx.get("ik_scene")
   seal = float(wrench.PARAMS.get("vacuum_seal_diameter", 0.0))
-  version = int(_SAMPLED_GRASPS.get("version", 1))
-
-  # Hoist the candidate-independent half of the inserted-part press certificate. This is
-  # exactly the solo held-part LP used by compute_useful_grasps/_sig_press_ok, except that the
-  # candidate still has an explicit pose rather than a final grasp id. It is therefore safe to
-  # use while constructing the id-bearing V3 order and prevents geometrically attractive but
-  # load-incapable grasps from consuming the whole bounded prefix.
-  press_ctx = None
-  if (version == 3
-      and asm is not None and asm.relative_pose(part) is not None):
-    parent, place, supports = {}, {}, {}
-    for p in asm.objects:
-      parent[p] = ("table",)
-      supports[p] = frozenset({("table",)})
-      place[p] = ("slot", _part_index(p), _IDENTITY_FACE)
-    parent[part] = ("gripper", "zzq")
-    place.pop(part, None)
-    supports[part] = frozenset()
-    pst = State(parent=parent, place=place, supports=supports,
-                poses=dict(_flat_poses(asm)))
-    pposes = _state_part_poses(pst, asm, lift=0.0)
-    centroid = np.asarray(pposes[part][:3], dtype=float)
-    loads = _inserter_load_variants(
-        pst, asm, part, asm.relative_pose(part)[0])
-    gravity = wrench.gravity_wrench([(asm.mass(part), np.zeros(3))])
-    press_ctx = (np.asarray(pposes[part], dtype=float), centroid, loads, gravity)
-
-  def pose_press_ok(row, kind):
-    if press_ctx is None:
-      return True
-    ppose, centroid, loads, gravity = press_ctx
-    gpose = _pose_compose(ppose, part_pose(row))
-    R = _quat_to_R(np.asarray(gpose[3:], dtype=float))
-    cap = wrench.grasp_capability(
-        np.asarray(gpose[:3], dtype=float) - centroid,
-        R[:, 2], R[:, 0], R[:, 1], kind, surface=row[1])
-    return all(wrench.equilibrium_feasible(
-        [cap], gravity + wrench.point_force_wrench(
-            force, np.asarray(point, dtype=float) - centroid))
-               for force, point in loads)
 
   # Physical generation policy, not a collision relaxation. A candidate already places the
   # pads at a valid antipodal contact; translating the hand OUTWARD along its approach slides
@@ -2886,31 +2734,8 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
             close_hits.append(role)
       roles[kind] = tuple(hits)
       closure_roles[kind] = tuple(close_hits)
-    reach = {}
-    # Exact fixed-arm reach is an inexpensive TASK-CONDITIONING signal for initial picks.
-    # It is never a deletion gate: exactless candidates remain in the scene/family coverage
-    # facts because tolerant KOMO has measured successes beyond the calibrated SSIK set.
-    if task_ik is not None and task_ik_scene is not None:
-      pose = part_pose(row)
-      for robot in ctx.get("robots", ()):
-        kind = task_ik.tool_kind.get(robot)
-        if "pick" not in roles.get(kind, ()) or not task_ik._analytic_reject_ok(robot):
-          reach[robot] = 0
-          continue
-        target = np.concatenate([
-            pose[:3], _quat_mul(pose[3:], task_ik.q_correction[robot])])
-        reach[robot] = len(task_ik._analytic_seeds(
-            task_ik_scene, robot, target, part))
-    press = {}
-    if version == 3:
-      for kind in sorted(kind_robot):
-        kind_ok = not (kind == "vacuum" and
-                       (row[6] == "pinch" or row[1] == "curved" or row[2] < seal))
-        press[kind] = bool(kind_ok and pose_press_ok(row, kind))
     meta = {"origin": origin, "scene_by_kind": roles,
             "closure_by_kind": closure_roles,
-            "reach_by_robot": reach,
-            "press_by_kind": press,
             "sets": tuple(sorted({x for xs in roles.values() for x in xs}))}
     if refinement is not None:
       tag, delta, source = refinement
@@ -2949,10 +2774,6 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
   if checker is not None and checker.closure_check:
     canonical = _closure_ranked_canonical(canonical)
   closure_select = bool(checker is not None and checker.closure_check)
-  if (version == 2
-      and len(canonical) >= keep and not closure_select):
-    return canonical[:keep]
-
   # A strict repaired pose is useless if the immutable source prefix still consumes the whole
   # bounded K before sampled scene-valid rows are considered. Under closure semantics reserve
   # the prefix only for candidates that actually serve PICK/ASSEMBLE; zero-role originals stay
@@ -3007,20 +2828,6 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
   bad = sorted((e for e in sampled if id(e[0]) not in good_ids),
                key=lambda e: (-e[0][5], -e[0][4], tuple(np.round(e[0][0], 9))))
 
-  # V3 treats conventional and sampled rows as one task-conditioned master pool.  V2 keeps
-  # the historical immutable canonical prefix below for old plans.  V4 is deliberately a
-  # separate, smaller scene-reservation format: it must not inherit V3's SSIK/LP task facts.
-  # Bad-support rows remain available only after physically supported rows, preserving the
-  # existing fallback without letting a geometric outlier win merely because it covers a rare
-  # task label.
-  if version == 3:
-    ranked = _task_coverage_order(list(canonical) + list(good))
-    ranked.extend(e for e in _task_coverage_order(bad)
-                  if all(id(e[0]) != id(old[0]) for old in ranked))
-    if not ranked:
-      ranked = _task_coverage_order(list(canonical) + list(sampled))
-    return ranked[:keep]
-
   def ordered(entries):
     by_id = {id(e[0]): e for e in entries}
     return [by_id[id(r)] for r in _fps_row_order([e[0] for e in entries])]
@@ -3043,81 +2850,67 @@ def _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
       categories.append(ordered(block))
   if good:
     categories.append(ordered(good))
-  if bad:                                                 # small/curved shapes may need fallback
-    categories.append(ordered(bad))
-
-  # Materialise the complete historical V2 order once.  Besides making the order independent
-  # of the final slice, this gives V4 a literal V2 tail: after its bounded reservations, every
-  # remaining row appears in precisely the position V2 assigned it.  In particular, under the
-  # closure model zero-role conventional fallbacks remain *after* the sampled scene-positive
-  # pools instead of being promoted merely because they are conventional.
-  v2_order, v2_seen = list(canonical_seed), {id(e[0]) for e in canonical_seed}
+  # Materialise the complete stable tail before slicing. Under the closure model zero-role
+  # conventional fallbacks remain after the sampled scene-positive pools instead of being
+  # promoted merely because they are conventional. Likewise, below-gate sampled rows are
+  # appended only after every gate-passing row; they fill an otherwise undersized database but
+  # must never be round-robin interleaved into a prefix that already has enough valid rows.
+  tail, tail_seen = list(canonical_seed), {id(e[0]) for e in canonical_seed}
   cursors = [0] * len(categories)
   while True:
     progressed = False
     for j, block in enumerate(categories):
-      while cursors[j] < len(block) and id(block[cursors[j]][0]) in v2_seen:
+      while cursors[j] < len(block) and id(block[cursors[j]][0]) in tail_seen:
         cursors[j] += 1
       if cursors[j] >= len(block):
         continue
       e = block[cursors[j]]; cursors[j] += 1
-      v2_order.append(e); v2_seen.add(id(e[0])); progressed = True
+      tail.append(e); tail_seen.add(id(e[0])); progressed = True
     if not progressed:
       break
+  for e in ordered(bad):                                  # finite fallback for tiny/curved parts
+    if id(e[0]) not in tail_seen:
+      tail.append(e); tail_seen.add(id(e[0]))
   for e in canonical_fallback:                           # free-space source poses: last resort
-    if id(e[0]) not in v2_seen:
-      v2_order.append(e); v2_seen.add(id(e[0]))
+    if id(e[0]) not in tail_seen:
+      tail.append(e); tail_seen.add(id(e[0]))
 
-  if version == 4:
-    # V4: make --grasp-sampler-scenes a real bounded-set contract without changing V2's
-    # positional database.  Reserve one deterministic row for every available
-    # (gripper-kind, PICK/ASSEMBLE) fact, then append the ordinary V2 hybrid order.  A bridge
-    # row can satisfy several facts and is only emitted once.  Crucially, the reservation and
-    # the entire tail are built BEFORE the final [:keep] slice: growing K exposes an exact
-    # prefix of one immutable master, so widening never rebinds an old grasp id.
-    #
-    # Canonical source rows are deliberately eligible even when their mesh-pad score falls
-    # below the sampled support gate: that is the historical V2 contract.  Prefer canonical
-    # plus good sampled rows; consult bad sampled rows only when they are the sole carrier of
-    # a scene fact, exactly as the old V2 fallback did for an otherwise empty pool.
-    def has_scene_fact(entry, fact):
-      kind, role = fact
-      return role in entry[1]["scene_by_kind"].get(kind, ())
+  # Reserve one deterministic row for every available (gripper-kind, PICK/ASSEMBLE) fact,
+  # then append the stable tail. A bridge row can satisfy several facts and is emitted once.
+  # The complete order is built before slicing, so widening never rebinds an old grasp id.
+  def has_scene_fact(entry, fact):
+    kind, role = fact
+    return role in entry[1]["scene_by_kind"].get(kind, ())
 
-    facts = [(kind, role) for kind in sorted(kind_robot)
-             for role in ("pick", "assemble")]
-    primary = list(canonical) + list(good)
-    reserve_blocks = []
-    for fact in facts:
-      block = [e for e in primary if has_scene_fact(e, fact)]
-      if not block:
-        block = [e for e in bad if has_scene_fact(e, fact)]
-      if block:
-        reserve_blocks.append((fact, ordered(block)))
+  facts = [(kind, role) for kind in sorted(kind_robot)
+           for role in ("pick", "assemble")]
+  primary = list(canonical) + list(good)
+  reserve_blocks = []
+  for fact in facts:
+    block = [e for e in primary if has_scene_fact(e, fact)]
+    if not block:
+      block = [e for e in bad if has_scene_fact(e, fact)]
+    if block:
+      reserve_blocks.append((fact, ordered(block)))
 
-    out, seen, covered = [], set(), set()
-    for fact, block in reserve_blocks:
-      if fact in covered:
-        continue
-      entry = next((e for e in block if id(e[0]) not in seen), None)
-      if entry is None:
-        continue
-      out.append(entry)
-      seen.add(id(entry[0]))
-      for kind, roles in entry[1]["scene_by_kind"].items():
-        for role in roles:
-          if role in ("pick", "assemble"):
-            covered.add((kind, role))
+  out, seen, covered = [], set(), set()
+  for fact, block in reserve_blocks:
+    if fact in covered:
+      continue
+    entry = next((e for e in block if id(e[0]) not in seen), None)
+    if entry is None:
+      continue
+    out.append(entry)
+    seen.add(id(entry[0]))
+    for kind, roles in entry[1]["scene_by_kind"].items():
+      for role in roles:
+        if role in ("pick", "assemble"):
+          covered.add((kind, role))
 
-    # The rest is the ordinary closure-aware V2 master, with reserved rows removed.  This is
-    # deliberately not "all canonical, then sampled": V2 puts zero-role canonical fallbacks
-    # last when virtual closure is active, and V4 must preserve that physical priority.
-    for entry in v2_order:
-      if id(entry[0]) not in seen:
-        out.append(entry); seen.add(id(entry[0]))
-    return out[:keep]
-
-  return v2_order[:keep]
+  for entry in tail:
+    if id(entry[0]) not in seen:
+      out.append(entry); seen.add(id(entry[0]))
+  return out[:keep]
 
 
 def _sampled_keys(spec, offset, part=None):
@@ -3125,29 +2918,14 @@ def _sampled_keys(spec, offset, part=None):
   identical parts share it, so their clouds match. The cache key adds the PART INSTANCE and
   the scene-filter signature (--grasp-sampler-scenes), so each part filters its own cloud."""
   cfgv = _SAMPLED_GRASPS
-  version = int(cfgv.get("version", 1))
-  # V1 included K in its private RNG seed; preserve that byte-for-byte for old plans. V2's
-  # raw cloud and ranking are K-independent, so increasing K is an append-only refinement.
-  if version == 1:
-    base = (_spec_key(spec), float(offset), cfgv["seed"], cfgv["candidates"], cfgv["keep"],
-            float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)),
-            cfgv.get("wrap"))
-    identity = base
-  else:
-    # V4 is a controlled ORDERING change over V2, not a second stochastic grasp generator.
-    # Seed its raw surface cloud from V2's exact tuple.  Keep the true version in the cache
-    # identity, however, because the positional DB/order and hence grasp-id meanings differ.
-    # V1, V2 and especially the already-persisted task-conditioned V3 retain their old RNG
-    # tuple byte-for-byte.
-    raw_version = 2 if version == 4 else version
-    base = (_spec_key(spec), float(offset), raw_version, cfgv["seed"], cfgv["candidates"],
-            float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)),
-            cfgv.get("wrap"))
-    identity = (_spec_key(spec), float(offset), version, cfgv["seed"], cfgv["candidates"],
-                float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)),
-                cfgv.get("wrap"))
+  # The constant 2 is the established raw-cloud RNG salt. It is not a selectable algorithm
+  # version; retaining it keeps current sampler outputs stable while the public version switch
+  # and all obsolete generation branches are gone.
+  base = (_spec_key(spec), float(offset), 2, cfgv["seed"], cfgv["candidates"],
+          float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)),
+          cfgv.get("wrap"))
   ctx = _SAMPLED_SCENE_CTX
-  cache = identity + (() if version == 1 else (cfgv.get("master_keep", cfgv["keep"]),))
+  cache = base + (cfgv.get("master_keep", cfgv["keep"]),)
   return base, cache + (part, (ctx["sig"] if ctx is not None else None))
 
 
@@ -3283,110 +3061,19 @@ def _sampled_grasp_views(spec, offset, part=None):
   # per-part prefix without regenerating this list, so ids and all cached IK witnesses stay
   # valid across widening epochs.
   keep = cfgv.get("master_keep", cfgv["keep"])
-  if int(cfgv.get("version", 1)) >= 2:
-    selected = _hybrid_v2_rows(spec, offset, part, suction, antip, keep, ctx, sq)
-    if not selected:
-      raise ValueError(f"--grasp-sampler: no feasible candidates for shape {spec!r}")
-    poses, surfs, mins, meta = [], [], [], []
-    for row, extra in selected:
-      pose, surf, mind, _f, _clr, _sup, _fam = row[:7]
-      pose = np.asarray(pose, dtype=float)
-      if sq is not None:
-        pose = np.concatenate([_quat_to_R(sq) @ pose[:3], _quat_mul(sq, pose[3:])])
-      pose.setflags(write=False)
-      poses.append(pose); surfs.append(surf); mins.append(float(mind))
-      m = {"edge_clearance": float(_clr), "pad_support": float(_sup),
-           "family": _fam, **extra}
-      meta.append(m)
-    _SAMPLED_META_CACHE[key] = tuple(meta)
-    hit = _SAMPLED_VIEWS_CACHE[key] = (tuple(poses), tuple(surfs), tuple(mins))
-    return hit
-
-  k_suc = (keep + 1) // 2
-  k_pinch = keep - k_suc
-
-  def _retain(block, k_want):
-    if not block or k_want <= 0:
-      return []
-    if margin > 0.0 or min_support > 0.0:
-      good = [b for b in block if b[4] >= margin and b[5] >= min_support]
-      if len(good) < k_want:
-        # the shape cannot honour the gates (a small face, a thin part, a short pad). Fall
-        # back to the k_want BEST candidates -- most pad support first, then most interior --
-        # rather than dropping the block or silently accepting corner grasps. Deterministic.
-        block = sorted(block, key=lambda b: (-b[5], -b[4], tuple(np.round(b[0], 9))))[:k_want]
-      else:
-        block = good
-    idx = _fps_downsample([b[3] for b in block], k_want)
-    return [block[i] for i in idx]
-
-  if ctx is not None:
-    # --grasp-sampler-scenes: tag every raw candidate with its two scene verdicts, using the
-    # search's own floating-EE gate at the part's INITIAL pose (the PICK set) and at its
-    # ASSEMBLED pose (the ASSEMBLE set). Everything else is the FREE set (also the handover
-    # pool: a mid-air handover sees no table and no structure).
-    suction = [list(b) for b in suction]
-    antip = [list(b) for b in antip]
-    checker, s0, s_full, asm = ctx["checker"], ctx["s0"], ctx["s_full"], ctx["assembly"]
-    for blk in (suction, antip):
-      for b in blk:
-        b.append(bool(checker.pose_collision_free(s0, part, b[0], asm)))       # PICK
-        b.append(bool(checker.pose_collision_free(s_full, part, b[0], asm)))   # ASSEMBLE
-
-  def _retain_sets(block, k_want):
-    # scene-aware selection: a third of the quota to each scene-feasible set, FPS inside
-    # each pool (diversity per purpose), unused slots fall back to the FREE pool. A
-    # candidate in two pools is picked once. Without the scene context this is _retain.
-    if ctx is None:
-      return _retain(block, k_want)
-    q = max(1, k_want // 3)
-    pick_pool = [b for b in block if b[8]]
-    out = _retain(pick_pool, min(q, len(pick_pool)))
-    chosen = {id(b) for b in out}
-    asm_rest = [b for b in block if b[9] and id(b) not in chosen]
-    out_a = _retain(asm_rest, min(q, len(asm_rest)))
-    chosen.update(id(b) for b in out_a)
-    free_pool = [b for b in block if id(b) not in chosen]
-    out_f = _retain(free_pool, max(0, k_want - len(out) - len(out_a)))
-    return out + out_a + out_f
-
-  rows = _retain_sets(suction, k_suc)
-  if wrap is not None and any(b[7] for b in antip):
-    # --grasp-sampler-wrap emits the wrap roll (side approach) as an extra +- pair.  FPS
-    # alone races it out: once the wrap budget admits everything, every side-approach row
-    # shares a feature with its axial sibling (same mid, 0.02*approach) and the pinch quota
-    # fills with axial rows spread along the part before a side row is reached.  Give the
-    # side approach a guaranteed share of the pinch budget -- a strategy quota, exactly
-    # like the suction/pinch split -- so the planner can CHOOSE between grasping the peg
-    # from the end and from the side.  Unused slots (a flat box emits no wrap roll) fall
-    # back to the axial rows.
-    side_rows = _retain_sets([b for b in antip if b[7]], max(1, k_pinch // 3))
-    rows.extend(side_rows)
-    rows.extend(_retain_sets([b for b in antip if not b[7]], k_pinch - len(side_rows)))
-  else:
-    rows.extend(_retain_sets(antip, k_pinch))
-  if not rows:
+  selected = _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, sq)
+  if not selected:
     raise ValueError(f"--grasp-sampler: no feasible candidates for shape {spec!r}")
   poses, surfs, mins, meta = [], [], [], []
-  for row in rows:
+  for row, extra in selected:
     pose, surf, mind, _f, _clr, _sup, _fam = row[:7]
-    _side = row[7]
-    _set = ("pick" if row[8] else ("asm" if row[9] else "free")) if len(row) > 8 else None
-    if sq is not None:                                     # rotate into the PART frame
-      pose = np.concatenate([_quat_to_R(sq) @ pose[:3], _quat_mul(sq, pose[3:])])
     pose = np.asarray(pose, dtype=float)
+    if sq is not None:
+      pose = np.concatenate([_quat_to_R(sq) @ pose[:3], _quat_mul(sq, pose[3:])])
     pose.setflags(write=False)
     poses.append(pose); surfs.append(surf); mins.append(float(mind))
-    # what the two contact gates measured for THIS candidate, kept for diagnostics and for
-    # the tests: re-deriving it outside is not possible for a pinch (the pad contact points
-    # are not recoverable from the pose alone), and a wrong re-derivation reads as a
-    # regression that is not there.
-    _m = {"edge_clearance": float(_clr), "pad_support": float(_sup), "family": _fam}
-    if _set is not None:
-      _m["set"] = _set
-    meta.append(_m)
-  # the returned view stays a 3-TUPLE: several call sites unpack it positionally, and the
-  # diagnostics are not part of the grasp DB. They ride in a parallel cache on the same key.
+    meta.append({"edge_clearance": float(_clr), "pad_support": float(_sup),
+                 "family": _fam, **extra})
   _SAMPLED_META_CACHE[key] = tuple(meta)
   hit = _SAMPLED_VIEWS_CACHE[key] = (tuple(poses), tuple(surfs), tuple(mins))
   return hit
@@ -3409,7 +3096,7 @@ def sampled_grasp_db_signature(assembly):
 
   Sampler flags and seeds are necessary but not sufficient provenance: changing generator code
   under the same flags used to silently reinterpret every saved grasp id. New plans persist this
-  hash and replay refuses a mismatch. The per-part name is included because scene-aware V2 DBs
+  hash and replay refuses a mismatch. The per-part name is included because scene-aware DBs
   intentionally differ across geometrically identical instances.
   """
   import hashlib
@@ -4022,7 +3709,7 @@ def _shape_half_z(spec, R):
 
 def part_grasp_poses(spec, rolls=None, offset=0.01, part=None):
   """All candidate grasp poses of a part shape, in the part's OWN frame -- the per-part
-  grasp DB the labeled tables index into (grasp_id = position in this list). V1 generator:
+  grasp DB the labeled tables index into (grasp_id = position in this list). Enumerator path:
   the six axis-direction grasps at the FACE CENTER (approach along -direction, standoff =
   the shape's half-extent along that direction + offset) x `rolls` spins about the approach
   axis. For a cube this reproduces cube_grasp_pose exactly (same ids, same poses); for a
@@ -4291,7 +3978,7 @@ def compute_cube_grasps(assembly, subassembly, offset=0.01,
     root = C_col.getFrame("ee_ur_base")
     root.setPosition(base_world[:3])
     root.setQuaternion(base_world[3:])
-    # Hybrid V2's conventional prefix must pass through the exact legacy filter too. Applying
+    # The sampler's conventional rows pass through the exact enumerator filter too. Applying
     # the sampled own-part capsule tolerance to those same poses changed which canonical ids
     # survived, perturbing otherwise-unrelated searches before an added sample was even used.
     if _SAMPLED_GRASPS is None or conventional:
@@ -4336,7 +4023,7 @@ def compute_cube_grasps(assembly, subassembly, offset=0.01,
       if (_SAMPLED_CANONICAL_ONLY and sample_meta
           and assembly.part_shape(obj)[0] not in ("mesh", "compound")
           and sample_meta[grasp_id].get("origin") != "canonical"):
-        continue                                          # staged V2 search: samples reopen later
+        continue                                          # staged search: samples reopen later
       if vacuum and (surfaces[grasp_id] == "curved" or face_dims[grasp_id] < seal):
         continue                                          # no seal on curvature or on a face
                                                           # smaller than the cup (chair caps)

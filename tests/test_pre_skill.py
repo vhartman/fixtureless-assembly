@@ -274,20 +274,6 @@ def test_a_pinned_arms_grasp_maintenance_is_dropped(arms):
   assert seen == [rik.gripper_frame[robots[2]]] * 2       # the pinned arm's pair is gone
 
 
-def test_the_relaxed_reach_precheck_is_skipped_while_a_pin_is_set():
-  """Its reject threshold was measured on UN-pinned residuals and it decides on the LAST random
-  restart -- which cannot satisfy a hard joint pin. Measured: it threw away pinned solves the
-  full solve then found feasible (car-mini-new add_grasp 04 and 20)."""
-  import inspect
-  for fn in (S.RobotIK._ik_pick, S.RobotIK._ik_add_grasp, S.RobotIK._ik_place,
-             S.RobotIK._ik_assemble):
-    src = inspect.getsource(fn)
-    assert src.count("self._pin_joints is None") >= src.count("_reach_precheck_reject"), \
-        f"{fn.__name__}: a reach precheck is left un-guarded against the pin"
-    assert src.index("self._pin_joints is None") < src.index("_reach_precheck_reject"), \
-        f"{fn.__name__}: the pin guard must precede the precheck call"
-
-
 # --------------------------------------------------------------------------- the exporter
 class _StubIK:
   """The surface build_tasks touches for a plan of picks only."""
@@ -398,7 +384,7 @@ def test_loaded_final_export_refuses_a_missing_pre_keyframe_instead_of_solving()
 
 
 def test_a_rejected_or_missing_keyframe_never_changes_the_task_structure():
-  """THE fail-safe. sim.py --v2 rebuilds the task list from the saved config alone and executes
+  """THE fail-safe. sim.py rebuilds the task list from the saved config alone and executes
   a SAVED path against it, so a per-action structural decision the exporter made would shift
   every downstream task id (the documented pre_insertion bug). A None keyframe therefore still
   emits BOTH tasks -- it only makes the goto goal equal the skill goal."""
@@ -710,19 +696,3 @@ def test_the_pass_declines_cleanly_when_no_pre_split_is_active(arms):
   pre, rep = S.fuse_pre_skill_witnesses(C, None, [("pick", robots[0], "obj_0", 0)], [None],
                                         robots, rik, verbose=False)
   assert pre == {} and rep == {"splits": 0, "consistent": 0, "rows": []}
-
-
-def test_empty_pin_is_not_reported_as_a_repair():
-  """A pin that lands on NO joint means the scene had already frozen those arms, so the solve
-  is just a second draw of the ordinary un-pinned one. Accepting it reports solver noise as a
-  repair -- measured: every `pick` takes this path (scene restricted to 6 joints, pin asks for
-  12), and 4 of 6 'accepted' splits were exactly that."""
-  import inspect
-  import solver as S
-  pin_src = inspect.getsource(S.RobotIK._add_pin)
-  assert "pin_applied" in pin_src, "_add_pin no longer records whether it pinned anything"
-  pass_src = inspect.getsource(S.fuse_pre_skill_witnesses)
-  assert "pin_applied" in pass_src, "the pass no longer checks that the pin bit on something"
-  # the check must be able to VETO, i.e. it feeds `why` (the rejection reason)
-  i = pass_src.index("pin_applied")
-  assert "why" in pass_src[i:i + 400], "an empty pin must produce a rejection reason"

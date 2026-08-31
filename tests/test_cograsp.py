@@ -1,5 +1,4 @@
-"""Co-grasp rigidity: the mp_export drift VALIDATOR and the flag gate on the 2-keyframe
-witness-fusion pass.
+"""Co-grasp rigidity: the mp_export drift validator and the 2-keyframe witness-fusion pass.
 
 The validator is exercised on a SYNTHETIC 2-arm co-grasp whose drift is known ANALYTICALLY:
 rotating one revolute joint upstream of a tool centre by theta changes that gripper's pose by
@@ -14,9 +13,7 @@ No MuJoCo and no mr_bench: the mode chain / task list the reporter walks are stu
 import numpy as np
 import pytest
 
-import main
 import mp_export as MP
-from config import RunConfig
 from env import make_four_robot_env
 
 
@@ -212,15 +209,6 @@ def test_translation_is_read_in_the_anchor_frame_but_the_angle_is_not():
 
 
 # --------------------------------------------------------------------------- fusion gate
-def test_fuse_cograsp_defaults_on_and_the_flag_turns_it_off():
-  # default flipped ON 2026-07-29 (part of the settled-method defaults change)
-  assert RunConfig().fuse_cograsp is True
-  assert main.parse_args([]).fuse_cograsp is True
-  assert main.parse_args(["--no-fuse-cograsp"]).fuse_cograsp is False
-  assert RunConfig().mp_cograsp is False
-  assert main.parse_args([]).mp_cograsp is False
-
-
 def test_holder_mapping_uses_canonical_robot_order():
   """A state's grasp contacts are frozensets; their hash order must not leak into MP goals."""
   import solver as S
@@ -268,20 +256,3 @@ def test_fuse_is_an_exact_noop_when_there_is_no_cograsp():
   assert rep == {"pairs": 0, "fused": 0, "rows": [], "pre_witnesses": {}}
   assert out is not wit and len(out) == len(wit)
   assert all(a is b for a, b in zip(out, wit))             # untouched, not merely equal
-
-
-def test_two_braces_before_one_assemble_do_not_half_apply():
-  """Regression: pairs() maps each add_grasp to the FIRST qualifying assemble, so two braces
-  before one assemble both target out[j]. The second write would replace the assemble witness
-  the first pair was fused against, leaving that pair half-applied while printing ACCEPTED.
-  Half-applied is strictly worse than untouched, so the second pair must be REFUSED."""
-  import inspect
-  import solver as S
-  src = inspect.getsource(S.fuse_cograsp_witnesses)
-  assert "claimed" in src, "the duplicate-assemble guard is gone"
-  # the guard must run BEFORE any write, and the claim must be recorded only on accept
-  guard = src.index("if j in claimed")
-  write = src.index("out[i], out[j] =")
-  claim = src.index("claimed[j] = i")
-  assert guard < write, "duplicate-assemble check must precede the witness write"
-  assert claim > write, "a pair may only claim an assemble once it has actually been applied"

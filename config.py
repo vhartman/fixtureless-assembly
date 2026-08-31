@@ -162,7 +162,6 @@ class RunConfig:
   grasp_sampler_keep: int = 20
   grasp_sampler_candidates: int = 200
   grasp_sampler_seed: int = 0
-  grasp_sampler_version: int = 2
   grasp_sampler_db_hash: Optional[str] = None
   grasp_refine: bool = False
   grasp_widen: bool = False
@@ -287,7 +286,15 @@ class RunConfig:
   @classmethod
   def from_dict(cls, d):
     """Build from a plain dict; rejects unknown keys (typos in a hand-written file) but
-    tolerates a stray `config` key."""
+    tolerates a stray `config` key. The former sampler-version field is accepted only when it
+    names the current format, so existing current-format artifacts remain readable without
+    retaining any legacy generator."""
+    d = dict(d)
+    old_sampler_version = d.pop("grasp_sampler_version", None)
+    if old_sampler_version not in (None, 4):
+      raise ValueError(
+          "RunConfig: grasp sampler versions 1-3 are no longer supported; regenerate the "
+          "plan with the current scene-reserved sampler")
     known = {f.name for f in fields(cls)}
     unknown = set(d) - known - {"config"}
     if unknown:
@@ -337,12 +344,6 @@ class RunConfig:
       d.pop("_search_witness_margin", None)
       for key, value in legacy.items():
         d.setdefault(key, value)
-    # Before sampler V2 existed, every JSON carrying `grasp_sampler: true` meant the old
-    # replacement database. Treat an absent version as V1 for both saved plans and standalone
-    # historical config files; otherwise positional grasp ids silently change meaning.
-    if d.get("grasp_sampler") and "grasp_sampler_version" not in d:
-      d = dict(d)
-      d["grasp_sampler_version"] = 1
     return cls.from_dict(d)
 
 
