@@ -1127,15 +1127,15 @@ def build_parser():
   g_solver.add_argument(
       "--milestones-anytime", type=float, nargs="?", const=300.0, default=None,
       metavar="SEC",
-      help="THE SINGLE RECIPE: adaptive-width milestones (DAG modules + width-2 window "
-           "fills on width-1 failure) under a hard deadline (default 300s), then bounded "
-           "improvement (PEA*, memory-safe) with the remaining budget; PEA-greedy net if "
+      help="Greedy milestone incumbent under a hard deadline (default 300s), then bounded "
+           "large-neighborhood improvement: re-fill consecutive one- through --fill-window "
+           "milestone windows under their current cost, accept strict improvements, and "
+           "restart the sweep. PEA-greedy net if "
            "milestones itself was cut. With --open-witness, stochastic IK failures are "
            "fairly reopened until the milestone-phase deadline instead of inheriting its "
-           "finite operational epoch cap. Always returns the best plan found within SEC; "
-           "never OOMs; result <= min(milestone cost, weight x optimal) when the "
-           "improvement pass completes under a deterministic feasibility oracle. Use "
-           "--weight inf for greedy fills (fastest).",
+           "finite operational epoch cap. Always retains the best validated plan. This LNS "
+           "schedule is not a global optimality proof unless it reaches the admissible lower "
+           "bound; use the separate ladder proof rung when a certificate is required.",
   )
   g_search.add_argument(
       "--lazy-fills", action=argparse.BooleanOptionalAction, default=True,
@@ -2181,7 +2181,8 @@ _SAVE_CONFIG_FIELDS = (
     # `--config PLAN.json --solve` must also reproduce the search that selected it. Persist the
     # resolved values rather than only a named-profile label: profiles may evolve, whereas a
     # paper artifact must keep the semantics it was actually solved under.
-    "weight", "milestones", "goal_on_table", "milestone_oracle", "fill_local_h", "fill_exact",
+    "weight", "milestones", "milestones_anytime", "goal_on_table", "milestone_oracle",
+    "fill_local_h", "fill_exact",
     "fill_greedy", "fill_incumbent_first",
     "fill_policy_first", "fill_policy_guide", "fill_skeleton_first", "milestone_boundaries",
     "fill_scope_widening", "fill_touch_all", "placement_yaw_widening",
@@ -3310,7 +3311,8 @@ def run(cfg, explicit=None):
           f"rung, monotone incumbent bound).")
   if cfg.milestones_anytime is not None:
     print(f"[flag] --milestones-anytime ACTIVE: budget {cfg.milestones_anytime:g}s "
-          f"(adaptive-width milestones -> bounded improvement -> PEA-greedy net).")
+          f"(milestone incumbent -> k=1..{cfg.fill_window} LNS improvement; "
+          "PEA-greedy feasibility net only if the incumbent phase is cut).")
   if cfg.corridor_h:
     print("[flag] --corridor-h ACTIVE: phase-2 heuristic built only up to the incumbent "
           "bound (misses prune); requires --bounded.")

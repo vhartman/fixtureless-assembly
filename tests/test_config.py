@@ -250,6 +250,18 @@ def test_saved_plan_persists_resolved_search_semantics(tmp_path):
       k: v for k, v in cfg.to_dict().items() if k not in presentation_only}
 
 
+def test_saved_plan_persists_milestone_anytime_budget(tmp_path):
+  cfg = RunConfig.from_namespace(main.parse_args([
+      "--search-profile", "standard", "--milestones-anytime", "300",
+  ]))
+  out = tmp_path / "anytime-plan.json"
+  main.save_plan(str(out), cfg, [])
+  loaded = RunConfig.from_file(str(out))
+  assert loaded.milestones_anytime == 300.0
+  assert loaded.fill_greedy is True
+  assert loaded.weight == 1.0
+
+
 def test_every_nonpresentation_standard_setting_is_persisted():
   """A profile change must not silently create a replay/re-solve semantic gap."""
   presentation_only = {"quiet_rai", "view"}

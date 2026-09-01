@@ -1,3 +1,5 @@
+import pytest
+
 from open_witness import OpenWitnessPool, run_open_lazy_fill
 import solver as solver_mod
 from solver import RobotIK, _IncrementalLazySearch
@@ -180,6 +182,304 @@ def test_milestone_anytime_uses_deadline_fair_open_witness_and_restores_cap(monk
   assert out == [("release", "a1", "obj")]
   assert seen["epochs"] == 0 and seen["deadline"] is not None
   assert rik.open_witness_epochs == 2
+
+
+def test_milestone_anytime_improves_with_two_window_lns_not_full_astar(monkeypatch):
+  inc = [("release", "a1", "obj")]
+  seen = {}
+
+  class Checker:
+    gripper_path = None
+
+  class H:
+    def __init__(self, *_args, **_kwargs):
+      pass
+
+    def value(self, _state):
+      return 0.0
+
+  monkeypatch.setattr(solver_mod, "solve_assembly_problem_milestones",
+                      lambda *_args, **_kwargs: inc)
+  monkeypatch.setattr(solver_mod, "_search_context",
+                      lambda *_args, **_kwargs: (Checker(), object()))
+  monkeypatch.setattr(solver_mod, "GraspCollapsedHeuristic", H)
+
+  def fake_lns(plan, *_args, **kwargs):
+    seen["plan"] = plan
+    seen["k_max"] = kwargs["k_max"]
+    return plan
+
+  monkeypatch.setattr(solver_mod, "_lns_improve", fake_lns)
+  monkeypatch.setattr(
+      solver_mod, "solve_assembly_problem",
+      lambda *_args, **_kwargs: pytest.fail("full-state A* must not be the improvement layer"))
+  out = solver_mod.solve_assembly_problem_milestones_anytime(
+      object(), object(), robots=("a1",), time_budget=20.0, verbose=False,
+      fill_window=2)
+  assert out == inc
+  assert seen == {"plan": inc, "k_max": 2}
+
+
+def test_lns_refill_uses_astar_and_freezes_parts_outside_destroyed_span(monkeypatch):
+  class State(_State):
+    def key(self):
+      return self.name
+
+    def is_goal(self, _assembly):
+      return False
+
+  class Heuristic:
+    def value(self, _state):
+      return 0.0
+
+  class Assembly:
+    objects = ("moving", "target", "outside")
+
+  start, target = State("start"), State("target-state")
+  actions = [
+      (("handover", "a1", "moving", 0), State("inside")),
+      (("release", "a2", "outside"), State("outside-release")),
+      (("assemble", "a1", "moving", "target"), State("inside-assemble")),
+      (("assemble", "a1", "moving", "outside"), State("outside-assemble")),
+  ]
+  monkeypatch.setattr(solver_mod, "successors", lambda *_args, **_kwargs: actions)
+  monkeypatch.setattr(
+      solver_mod, "_pea_star",
+      lambda *_args, **_kwargs: pytest.fail("local LNS must not use PEA*"))
+  calls = []
+
+  def fake_astar(_start, **kwargs):
+    calls.append(kwargs)
+    assert [a for a, _ns in kwargs["succ_fn"](start)] == [actions[0][0], actions[2][0]]
+    assert kwargs["max_nodes"] == 20000
+    assert kwargs["cost_bound"] == 7
+    assert kwargs["tag"] == "lns refill A*"
+    kwargs["stats_out"].update(outcome="found", expanded=3, edge_checks=2,
+                                peak_frontier=4)
+    plan = solver_mod.Plan()
+    plan.states = [start]
+    return plan
+
+  monkeypatch.setattr(solver_mod, "_astar", fake_astar)
+  common = dict(
+      start=start, touched_parts={"moving", "target"}, target=target,
+      assembly=Assembly(), robots=("a1", "a2"), checker=object(), grasp_table=object(),
+      weight=5.0, max_nodes=20000, h_lab=Heuristic(), cost_bound=7)
+  assert solver_mod._refill_window(robot_ik=None, **common) == []
+
+  engines = []
+  class FakeIncremental:
+    def __init__(self, _start, **kwargs):
+      engines.append(kwargs)
+      assert [a for a, _ns in kwargs["succ_fn"](start)] == [actions[0][0], actions[2][0]]
+      assert kwargs["cost_bound"] == 7
+      self.expanded = 3
+      self.budget_hit = False
+      self.repairable = kwargs.get("repairable", True)
+
+    def search(self, max_nodes, deadline=None):
+      assert max_nodes == 20000
+      plan = solver_mod.Plan()
+      plan.states = [start]
+      return plan
+
+    def footprint(self):
+      return {"frontier": 2, "heap_entries": 4,
+              "peak_frontier": 3, "peak_heap_entries": 4}
+
+  monkeypatch.setattr(solver_mod, "_IncrementalLazySearch", FakeIncremental)
+  assert solver_mod._refill_window(robot_ik=object(), **common) == []
+  assert len(calls) == 2
+  assert len(engines) == 0                 # no IK failure -> no repair graph allocated
+
+
+def test_lns_refill_memoizes_identical_heuristic_and_cheap_queries(monkeypatch):
+  class State(_State):
+    def key(self):
+      return self.name
+
+    def is_goal(self, _assembly):
+      return False
+
+  class Heuristic:
+    def __init__(self):
+      self.calls = []
+
+    def value(self, state):
+      self.calls.append(state.name)
+      return 0.0
+
+  class Assembly:
+    objects = ("moving",)
+
+  start, target, nxt = State("start"), State("target"), State("next")
+  action = ("pick", "a1", "moving", 0)
+  heuristic = Heuristic()
+  cheap_calls = []
+  successor_calls = []
+  def successors(*_args, **_kwargs):
+    successor_calls.append(1)
+    return [(action, nxt)]
+  monkeypatch.setattr(solver_mod, "successors", successors)
+  monkeypatch.setattr(
+      solver_mod, "cheap_feasible",
+      lambda act, prev, ns, *_args: cheap_calls.append((prev, act, ns)) or True)
+
+  def fake_astar(_start, **kwargs):
+    assert kwargs["h_fn"](start) == kwargs["h_fn"](start) == 0.0
+    edge = next(iter(kwargs["succ_fn"](start)))
+    assert next(iter(kwargs["succ_fn"](start))) == edge
+    assert next(iter(kwargs["succ_fn"](start))) == edge
+    assert kwargs["edge_check_fn"](start, *edge) is True
+    assert kwargs["edge_check_fn"](start, *edge) is True
+    kwargs["stats_out"].update(outcome="found", expanded=1, edge_checks=2,
+                                peak_frontier=1)
+    return []
+
+  monkeypatch.setattr(solver_mod, "_astar", fake_astar)
+  stats = {}
+  assert solver_mod._refill_window(
+      start, {"moving"}, target, Assembly(), ("a1",), object(), object(), None,
+      1.0, 10, heuristic, stats=stats) == []
+  # target is evaluated once for the differential offset; the duplicate start query and
+  # duplicate exact edge gate are each computed only once.
+  assert heuristic.calls == ["target", "start"]
+  assert len(cheap_calls) == 1
+  assert stats["heuristic_calls"] == 2
+  assert stats["heuristic_misses"] == 1
+  assert stats["cheap_checks"] == 2
+  assert stats["cheap_cache_hits"] == 1
+  # Cache-on-second-access: the second request admits, and the third hits.
+  assert len(successor_calls) == 2
+  assert stats["successor_calls"] == 3
+  assert stats["successor_cache_hits"] == 1
+
+
+def test_lns_uses_weight_one_cleanup_then_weighted_wider_windows(monkeypatch, capsys):
+  class State(_State):
+    def key(self):
+      return self.name
+
+    def subassemblies(self):
+      if self.name == "s0":
+        return (frozenset({"obj_0"}), frozenset({"obj_1"}), frozenset({"obj_2"}))
+      if self.name == "s1":
+        return (frozenset({"obj_0", "obj_1"}), frozenset({"obj_2"}))
+      return (frozenset({"obj_0", "obj_1", "obj_2"}),)
+
+  s0, s1, s2 = State("s0"), State("s1"), State("s2")
+  a1 = ("assemble", "a1", "obj_1", "obj_0")
+  a2 = ("assemble", "a1", "obj_2", "obj_0")
+  graph = {s0: [(a1, s1)], s1: [(a2, s2)], s2: []}
+
+  class Assembly:
+    base = "obj_0"
+    objects = ("obj_0", "obj_1", "obj_2")
+
+  class H:
+    def value(self, _state):
+      return 0.0
+
+  monkeypatch.setattr(solver_mod, "get_initial_state", lambda *_args: s0)
+  monkeypatch.setattr(
+      solver_mod, "successors", lambda state, *_args, **_kwargs: graph[state])
+  monkeypatch.setattr(
+      solver_mod, "_part_mated",
+      lambda state, part: part == "obj_0" or part == "obj_1" and state in (s1, s2)
+      or part == "obj_2" and state == s2)
+  calls = []
+
+  def fake_refill(*_args, **kwargs):
+    report = kwargs["stats"]
+    report.update(outcome="exhausted", wall=0.01, search_calls=1, expanded=7,
+                  peak_frontier=11, successors_scoped=13, successors_seen=17,
+                  cheap_checks=5, ik_binds=2, ik_failures=1)
+    calls.append((kwargs.get("deadline"), _args[8]))       # positional weight
+    return None
+
+  monkeypatch.setattr(solver_mod, "_refill_window", fake_refill)
+  import time
+  end = time.perf_counter() + 30.0
+  plan = solver_mod._lns_improve(
+      [a1, a2], object(), Assembly(), ("a1",), object(), object(), None,
+      weight=5.0, max_nodes=20000, verbose=True, h_lab=H(), deadline=end,
+      k_max=2)
+  assert plan == [a1, a2]
+  assert [weight for _deadline, weight in calls] == [1.0, 1.0, 5.0]
+  assert calls[0][0] < calls[1][0] < calls[2][0] <= end
+  out = capsys.readouterr().out
+  assert out.count("[lns-window]") == 3
+  assert "w=1" in out and "w=5" in out
+  assert "expanded=7" in out and "peak-open=11" in out and "IK=2(1f)" in out
+
+
+def test_lns_endpoint_pdb_bound_skips_only_exact_splice_window(monkeypatch, capsys):
+  class State(_State):
+    def key(self):
+      return self.name
+
+    def subassemblies(self):
+      if self.name == "s0":
+        return (frozenset({"obj_0"}), frozenset({"obj_1"}), frozenset({"obj_2"}))
+      if self.name == "s1":
+        return (frozenset({"obj_0", "obj_1"}), frozenset({"obj_2"}))
+      return (frozenset({"obj_0", "obj_1", "obj_2"}),)
+
+  s0, s1, s2 = State("s0"), State("s1"), State("s2")
+  a1 = ("assemble", "a1", "obj_1", "obj_0")
+  a2 = ("assemble", "a1", "obj_2", "obj_0")
+  graph = {s0: [(a1, s1)], s1: [(a2, s2)], s2: []}
+
+  class Assembly:
+    base = "obj_0"
+    objects = ("obj_0", "obj_1", "obj_2")
+
+  class Landmark:
+    def value(self, _state):
+      return 0.0
+
+  class Endpoint:
+    def value(self, _state):
+      return float("inf")
+
+    def reverse_stats(self):
+      return {"settled": 4, "discovered": 4, "reverse_time": 0.001}
+
+  monkeypatch.setattr(solver_mod, "get_initial_state", lambda *_args: s0)
+  monkeypatch.setattr(
+      solver_mod, "successors", lambda state, *_args, **_kwargs: graph[state])
+  monkeypatch.setattr(
+      solver_mod, "_part_mated",
+      lambda state, part: part == "obj_0" or part == "obj_1" and state in (s1, s2)
+      or part == "obj_2" and state == s2)
+  endpoint_calls = []
+
+  def fake_endpoint(start, target, chain, *_args):
+    endpoint_calls.append((start, target, chain))
+    return Endpoint()
+
+  refills = []
+
+  def fake_refill(*args, **kwargs):
+    refills.append((args, kwargs))
+    kwargs["stats"].update(outcome="exhausted", wall=0.0)
+    return None
+
+  monkeypatch.setattr(solver_mod, "_make_lns_endpoint_pdb", fake_endpoint)
+  monkeypatch.setattr(solver_mod, "_refill_window", fake_refill)
+  plan = solver_mod._lns_improve(
+      [a1, a2], object(), Assembly(), ("a1",), object(), object(), None,
+      weight=5.0, max_nodes=20000, verbose=True, h_lab=Landmark(), k_max=1)
+
+  assert plan == [a1, a2]
+  assert endpoint_calls == [(s0, s1,
+                             [("obj_0",), ("obj_0", "obj_1")])]
+  # The final window has a set-valued assembly goal, not the exact incumbent endpoint.
+  assert len(refills) == 1
+  assert refills[0][0][0] is s1 and refills[0][0][2] is None
+  out = capsys.readouterr().out
+  assert "outcome=endpoint-bound" in out
+  assert "status=bounded-out" in out
 
 
 def test_open_scheduler_replans_immediately_after_first_failed_plan_edge():

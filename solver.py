@@ -201,12 +201,19 @@ class CollisionChecker:
     for i, prefix in enumerate(self.slots):
       template.getFrame(prefix + "ur_base").setPosition(_park_pos(i))
     self.template = template
-    self._verdicts = {}                                    # discrete scene signature -> bool
+    self._verdicts = {}                                    # repeated scene signature -> bool
+    # Scene signatures are large nested tuples. A wide search can issue hundreds of thousands
+    # of one-off checks, and retaining every key made this exact cache consume >1 GiB between
+    # LNS windows. Admit only on the second access (the standard 2Q/second-chance idea): the
+    # first access retains one integer hash; an admitted verdict is still looked up by the FULL
+    # exact key, so a hash collision can at worst admit early, never return a wrong result.
+    self._verdict_seen_hashes = set()
     # A collision-only, object-dependent jaw-closing certificate.  Kept off until the caller
     # explicitly asks for it so old saved plans remain replayable under their original action
     # semantics; the standard profile enables it after its calibration smoke tests.
     self.closure_check = _GRASP_CLOSURE_CHECK
     self._closure_verdicts = {}
+    self._closure_seen_hashes = set()
     self._closure_results = {}                            # pose-valued sampler diagnostics
     self.closure_rejects = {}
     # PERSISTENT scene reuse (2026-07-17): rai's stale-broadphase problem is solved by a
@@ -371,7 +378,11 @@ class CollisionChecker:
       msg = (f"cheap check: {'FREE' if ok else 'COLLIDING'}\n{note}\n"
              + "\n".join(f"  {a} x {b}  depth {d:.4f}" for a, b, d in pairs))
       C_col.view(True, msg)
-    self._verdicts[key] = ok
+    kh = hash(key)
+    if kh in self._verdict_seen_hashes:
+      self._verdicts[key] = ok
+    else:
+      self._verdict_seen_hashes.add(kh)
     return ok
 
   def penetrating_pairs(self, state, assembly, extra_grasps=()):
@@ -430,7 +441,11 @@ class CollisionChecker:
       res = _certify_closure(C_col, prefix, part)
       ok = bool(res.feasible)
       reason = res.reason
-    self._closure_verdicts[key] = ok
+    kh = hash(key)
+    if kh in self._closure_seen_hashes:
+      self._closure_verdicts[key] = ok
+    else:
+      self._closure_seen_hashes.add(kh)
     if not ok:
       self.closure_rejects[reason or "unknown"] = self.closure_rejects.get(reason or "unknown", 0) + 1
       if _CHEAP_DEBUG_VIEW:
@@ -6857,7 +6872,8 @@ class CollapsedLabeledHeuristic:
                max_states=2_000_000, clearance=0.02, gripper_kind=None, bracing=False,
                collapse_grasps=False, geo_checker=None, grasp_classes=None,
                labeled_loose=False, dist_cap=None, ideal_chain=None,
-               component_root=None, fill_goal=False, lazy_build=False):
+               component_root=None, fill_goal=False, lazy_build=False,
+               goal_states=None):
     import heapq
     import time as _time
 
@@ -6874,6 +6890,7 @@ class CollapsedLabeledHeuristic:
     self._kinds_of = getattr(grasp_table, "kinds_of", None)
     self._all_kinds = tuple(sorted(set(getattr(grasp_table, "robot_kinds", {}).values())))
     self._collapse = bool(collapse_grasps)                 # see GraspCollapsedHeuristic
+    self._grasp_classes = grasp_classes                    # reusable projection for retargeted PDBs
     objs = list(assembly.objects)
     base = assembly.base if component_root is None else component_root
     if base not in objs:
@@ -6881,6 +6898,9 @@ class CollapsedLabeledHeuristic:
     self._component_root = base
     self._fill_goal = bool(fill_goal)
     self._lazy_build = bool(lazy_build)
+    self._goal_states = tuple(goal_states or ())
+    if self._goal_states and self._fill_goal:
+      raise ValueError("goal_states and fill_goal are mutually exclusive")
     # A chain projection retains the FULL remaining-order signal but restricts the abstract
     # ideals to one caller-selected prefix chain and permits only that prefix's NEXT part to
     # be loose. This removes the unrelated loose-part/order-ideal cross product while keeping
@@ -7271,7 +7291,35 @@ class CollapsedLabeledHeuristic:
             if self.single[q]:
               yield (ideal, G, face, tadd(L, q)), 1.0
 
-    # goal states: identical seeding to the fine class (L=() either way)
+    def abstract_state(state):
+      """Project a concrete state with this PDB's exact chain/signature convention."""
+      main = next(g for g in state.subassemblies() if self._component_root in g)
+      ideal = _subasm_key(main)
+      if self._collapse:
+        G = tuple(sorted({(c[2], self._gcollapse(c[2], c[3])) for p in main
+                          for c in state.supports.get(p, ()) if c[0] == "grasp"}))
+      else:
+        G = tuple(sorted((c[2], c[3]) for p in main
+                         for c in state.supports.get(p, ()) if c[0] == "grasp"))
+      on_table = any(("table",) in state.supports.get(p, ()) for p in main)
+      face = placement_rest_class(self.assembly, _placement_face(state, main)) \
+          if on_table else self.H
+      if self._labeled_loose:
+        L = tuple(sorted({(c[2], self._gcollapse(c[2], c[3])) for p in state.parent
+                          if p not in main
+                          and (self._tracked_loose is None or p in self._tracked_loose)
+                          for c in state.supports.get(p, ()) if c[0] == "grasp"}))
+      else:
+        L = tuple(sorted({c[2] for p in state.parent
+                          if p not in main
+                          and (self._tracked_loose is None or p in self._tracked_loose)
+                          for c in state.supports.get(p, ()) if c[0] == "grasp"}))
+      return (ideal, G, face, L)
+
+    self._abstract_state = abstract_state
+
+    # goal states: ordinary/fill constructors seed their historical goal sets. A retargeted
+    # endpoint PDB instead seeds the caller's concrete boundary under THIS projection.
     self.dist = {}
     # For every settled abstract state, retain ALL Bellman-optimal next states toward the
     # fill goal.  This is the reverse search's policy graph, not a second planner and not an
@@ -7280,27 +7328,37 @@ class CollapsedLabeledHeuristic:
     self._policy_next = {}
     pq = []
     from itertools import combinations
-    vg_full = self.valid[all_parts]
-    # A fill-local PDB has its OWN goal: the requested part is mated, no tracked loose part
-    # remains, and the component is either on a stable table face or held by exactly one
-    # carrier. This matches _add_one_part.goal_fn directly and removes the former shifted
-    # full-assembly heuristic. The ordinary constructor path retains the global set_goal spec.
-    if self._fill_goal:
-      _faces = [Hf] + list(rf(all_parts))
-      _kmax = 1
-    else:
-      _gm = _problem._GOAL_MODE
-      _on_tab = _gm["on_table"] or _gm["pose"] is not None
-      _faces = list(rf(all_parts)) if _on_tab else [Hf] + list(rf(all_parts))
-      _kmax = 0 if _gm["hands_off"] else self.R
-    for k in range(_kmax + 1):
-      for combo in combinations(vg_full, k):
-        for face in _faces:
-          if face is Hf and len(combo) < 1:
-            continue
-          st = (all_parts, combo, face, ())
+    if self._goal_states:
+      for goal in self._goal_states:
+        st = abstract_state(goal)
+        if st[0] != all_parts:
+          raise ValueError(
+              f"retargeted PDB goal ideal {st[0]} does not match chain endpoint {all_parts}")
+        if st not in self.dist:
           self.dist[st] = 0.0
           heapq.heappush(pq, (0.0, id(st), st))
+    else:
+      vg_full = self.valid[all_parts]
+      # A fill-local PDB has its OWN goal: the requested part is mated, no tracked loose part
+      # remains, and the component is either on a stable table face or held by exactly one
+      # carrier. This matches _add_one_part.goal_fn directly and removes the former shifted
+      # full-assembly heuristic. The ordinary constructor path retains the global set_goal spec.
+      if self._fill_goal:
+        _faces = [Hf] + list(rf(all_parts))
+        _kmax = 1
+      else:
+        _gm = _problem._GOAL_MODE
+        _on_tab = _gm["on_table"] or _gm["pose"] is not None
+        _faces = list(rf(all_parts)) if _on_tab else [Hf] + list(rf(all_parts))
+        _kmax = 0 if _gm["hands_off"] else self.R
+      for k in range(_kmax + 1):
+        for combo in combinations(vg_full, k):
+          for face in _faces:
+            if face is Hf and len(combo) < 1:
+              continue
+            st = (all_parts, combo, face, ())
+            self.dist[st] = 0.0
+            heapq.heappush(pq, (0.0, id(st), st))
 
     _staged_gate = _problem._STAGED_MATES and bool(assembly.staged_mates)
     self._settled = set()
@@ -7372,32 +7430,7 @@ class CollapsedLabeledHeuristic:
             f"built in {self.build_time:.2f}s")
 
   def abstract(self, state):
-    main = next(g for g in state.subassemblies() if self._component_root in g)
-    ideal = _subasm_key(main)
-    if self._collapse:
-      # grasp ids collapsed to their BASE variant; set-dedup so two variants of the same
-      # base label map onto ONE abstract slot (fewer committed arms = more permissive).
-      G = tuple(sorted({(c[2], self._gcollapse(c[2], c[3])) for p in main
-                        for c in state.supports.get(p, ()) if c[0] == "grasp"}))
-    else:
-      G = tuple(sorted((c[2], c[3]) for p in main
-                       for c in state.supports.get(p, ()) if c[0] == "grasp"))
-    on_table = any(("table",) in state.supports.get(p, ()) for p in main)
-    face = placement_rest_class(self.assembly, _placement_face(state, main)) \
-        if on_table else self.H
-    if self._labeled_loose:
-      # loose parts keep their (part, grasp-class) label -- the fine class's pick/press
-      # discrimination at class resolution (the 2026-07-17 plateau finding).
-      L = tuple(sorted({(c[2], self._gcollapse(c[2], c[3])) for p in state.parent
-                        if p not in main
-                        and (self._tracked_loose is None or p in self._tracked_loose)
-                        for c in state.supports.get(p, ()) if c[0] == "grasp"}))
-    else:
-      L = tuple(sorted({c[2] for p in state.parent
-                        if p not in main
-                        and (self._tracked_loose is None or p in self._tracked_loose)
-                        for c in state.supports.get(p, ()) if c[0] == "grasp"}))
-    return (ideal, G, face, L)
+    return self._abstract_state(state)
 
   def value(self, state):
     key = self.abstract(state)
@@ -7673,8 +7706,8 @@ def _table_aware_pick_fact(assembly, S_key, face, gpart, gid, gripper_path,
 # faces, so the canonical exists-a-face pick gates cover them; see chair history.)
 
 
-def _por_parts(a):
-  # parts an action's manipulation touches (assemble touches the mate target too)
+def _action_parts(a):
+  """Assembly parts whose physical state an action may change or constrain."""
   return {a[2], a[3]} if a[0] == "assemble" else {a[2]}
 
 
@@ -7689,7 +7722,7 @@ def _por_keep(a_in, b):
   # scenes (--min-sep) with floating EEs where the independence assumption actually holds.
   if a_in[1] == b[1]:
     return True                                           # same robot: dependent
-  if _por_parts(a_in) & _por_parts(b):
+  if _action_parts(a_in) & _action_parts(b):
     return True                                           # shared part: dependent
   return not (tuple(map(str, b)) < tuple(map(str, a_in)))
 
@@ -7707,7 +7740,7 @@ def _outcome(kind):
 def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
            edge_check_fn=None, weight=1.0, max_nodes=200000, verbose=True,
            tag="A*", t0=None, cost_bound=None, deadline=None, order_key_fn=None,
-           stats_every=None, por=False, pathmax=False):
+           stats_every=None, por=False, pathmax=False, stats_out=None):
   """Generic LAZY weighted-A* engine, shared by every search variant (exact + optimistic).
 
   The domain enters only through callbacks -- this function knows nothing about assemblies:
@@ -7739,6 +7772,10 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
 
   if goal_fn(start):
     _outcome("found")
+    if stats_out is not None:
+      stats_out.clear()
+      stats_out.update(outcome="found", expanded=0, claimed=0, edge_checks=0,
+                       peak_frontier=0, elapsed=time.perf_counter() - t0)
     return []
   tie = itertools.count()                                 # stable tie-break (shallower g first)
   # optional ACTION-PREFERENCE tie-break, ranked between h and g: among equal-(f,h) nodes,
@@ -7758,7 +7795,18 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
   optimal = weight == 1.0
   expanded = 0
   edge_checks = 0
+  peak_frontier = 1
   kind_stats = {}                                         # action kind -> [checked, failed]
+
+  def finish(kind):
+    _outcome(kind)
+    if stats_out is not None:
+      stats_out.clear()
+      stats_out.update(outcome=kind, expanded=expanded, claimed=len(claimed),
+                       edge_checks=edge_checks, peak_frontier=peak_frontier,
+                       frontier=len(pq), elapsed=time.perf_counter() - t0,
+                       edge_checks_by_kind={k: tuple(v) for k, v in kind_stats.items()})
+
   next_stats = (time.perf_counter() + stats_every) if stats_every else None
   while pq:
     if next_stats is not None and time.perf_counter() > next_stats:
@@ -7775,7 +7823,7 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
     if deadline is not None and time.perf_counter() > deadline:
       if verbose:
         print(f"[{tag}] deadline reached after {expanded} expansions")
-      _outcome("deadline")
+      finish("deadline")
       return None
     if action is not None and edge_check_fn is not None:
       edge_checks += 1
@@ -7799,7 +7847,7 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
         if kind_stats:
           per_kind = "  ".join(f"{k}:{c}({x}f)" for k, (c, x) in sorted(kind_stats.items()))
           print(f"[{tag}] edge checks by kind (f=failed): {per_kind}")
-      _outcome("found")
+      finish("found")
       return plan
 
     expanded += 1
@@ -7807,7 +7855,7 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
       if verbose:
         print(f"[{tag}] gave up after {max_nodes} expansions ({len(claimed)} states "
               f"claimed) in {time.perf_counter() - t0:.2f}s")
-      _outcome("budget")
+      finish("budget")
       return None
 
     for act, ns in succ_fn(s):
@@ -7831,11 +7879,13 @@ def _astar(start, *, goal_fn, succ_fn, cost_fn, h_fn, cheap_fn=None,
       if cost_bound is not None and ng + hns >= cost_bound:
         continue                                          # sound prune vs the incumbent
       heapq.heappush(pq, (f_value(ng, hns), hns, okey(act), ng, next(tie), ns, s, act))
+      if stats_out is not None and len(pq) > peak_frontier:
+        peak_frontier = len(pq)
 
   if verbose:
     print(f"[{tag}] exhausted {len(claimed)} states with no plan "
           f"in {time.perf_counter() - t0:.2f}s")
-  _outcome("exhausted")
+  finish("exhausted")
   return None
 
 
@@ -8387,6 +8437,10 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
   if robots is None:
     robots = get_robots(C)
   gk = wrench_kind_arg(C, robots) if wrench else None      # scalar; {robot: kind} when MIXED
+  # The concrete grasp table is also the source of the non-pruning useful-grasp ordering.
+  # Build the shared search context before consuming it; the old order stayed latent while
+  # useful-grasps was off, then crashed every exact/anytime phase with an unbound local.
+  checker, grasp_table = _search_context(C, assembly, robots)
   if _problem._USEFUL_FLAG:
     _problem.set_useful_grasps(compute_useful_grasps(assembly, grasp_table, gk))
     if verbose:
@@ -8401,7 +8455,6 @@ def solve_assembly_problem(C, assembly, robots=None, max_nodes=200000, verbose=T
                                gripper_kind=gk if wrench_aware_h else None) \
       if use_heuristic and not math.isinf(weight) else None
 
-  checker, grasp_table = _search_context(C, assembly, robots)
   if gk is not None:
     reset_wrench_cache()
 
@@ -8645,6 +8698,8 @@ class _IncrementalLazySearch:
     # retaining O(edges) recovery routes. That trades recomputation for an O(states) live
     # frontier without changing the graph, feasibility predicates, or eventual completeness.
     self._pending = {}                                    # incoming edge, or state in compact mode
+    self.peak_frontier = 0
+    self.peak_heap_entries = 0
     self.claimed = {}
     self.came_from = {start: (None, None)}
     # A node can be unclaimed/reclaimed hundreds of times while lazy IK deletes candidate
@@ -8719,6 +8774,8 @@ class _IncrementalLazySearch:
       heapq.heapify(self.pq)
       if self.profile_enabled:
         self.profile["heap_rebuilds"] += 1
+    self.peak_frontier = max(self.peak_frontier, len(self._pending))
+    self.peak_heap_entries = max(self.peak_heap_entries, len(self.pq))
     if self.profile_enabled:
       self.profile["queue_wall"] += time.perf_counter() - t0
     return True
@@ -8786,6 +8843,8 @@ class _IncrementalLazySearch:
     return {
         "frontier": len(self._pending),
         "heap_entries": len(self.pq),
+        "peak_frontier": self.peak_frontier,
+        "peak_heap_entries": self.peak_heap_entries,
         "claimed": len(self.claimed),
         "alternates": (len(self._compact_alts) if self.compact_frontier
                        else sum(len(v) for v in self.alts.values())),
@@ -12031,22 +12090,19 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
                                               fill_scope_widening=False,
                                               milestone_boundaries=1,
                                               placement_yaw_widening=False):
-  """THE SINGLE RECIPE (--milestones-anytime SEC): adaptive-width milestones under a hard
-  deadline, then spend whatever budget remains on principled add-ons -- one algorithm plus
-  its own refinements, not a solver lottery:
+  """Milestone-anytime search: greedy local fills followed by bounded milestone LNS.
 
-    1. MILESTONES (DAG modules + width-2 windows), deadline = the full budget. The only
-       method with 100%% coverage on every measured instance/robot-count/embodiment.
-    2. If it produced a plan and time remains: BOUNDED IMPROVEMENT -- the exact search
-       under the incumbent's cost (PEA* engine: memory-safe), deadline = remaining budget.
-       Returns the better plan; the incumbent survives a deadline hit by construction.
-    3. If milestones itself was cut by the deadline: PEA-GREEDY net (weight=inf, banded
-       frontier => no OOM) with the remaining time -- fast plan or honest None.
+    1. MILESTONES supplies a validated incumbent using the configured local-fill policy.
+    2. LNS cuts that incumbent after assembly events and re-fills consecutive windows of
+       one through ``fill_window`` mated parts under the old window cost. Endpoints are exact,
+       every accepted replacement is strictly cheaper, and the sweep restarts after an accept.
+    3. If milestones is cut before finding an incumbent, a PEA-greedy feasibility net uses
+       the reserved tail of the deadline.
 
-  Result <= min(milestone cost, weight x optimal) when phase 2 completes under a deterministic
-  feasibility oracle; always retains the best incumbent.  The deadline is cooperative (one
-  native nonlinear solve may overrun it), and the caller should still use a process memory
-  guard for large instances."""
+  This is an incumbent-preserving improvement algorithm, not a global optimality proof. Reaching
+  the admissible lower bound can certify a particular result; otherwise use the separate ladder
+  proof rung for a full-state bounded search. The deadline is cooperative (one native nonlinear
+  solve may overrun it), and large instances should still use a process memory guard."""
   import math
   import time
   if fill_policy_guide:
@@ -12107,36 +12163,119 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
   if remaining > 10.0:
     if verbose:
       print(f"[mile-anytime] incumbent cost {U:g} ({len(inc)} actions) "
-            f"in {time.perf_counter() - t0:.1f}s -> bounded improvement, "
+            f"in {time.perf_counter() - t0:.1f}s -> milestone LNS k=1..{fill_window}, "
             f"{remaining:.0f}s left")
-    best = solve_assembly_problem(
-        C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik, weight=weight,
-        wrench=wrench, handovers=handovers, allow_place=allow_place, bracing=bracing,
-        labeled_h=labeled_h, collapsed_h=collapsed_h,
-        grasp_collapsed_h=grasp_collapsed_h, sig_collapsed_h=sig_collapsed_h,
-        geo_facts=geo_facts, cost_bound=U, pea=True, deadline=t_end)
-    if best is not None and sum(action_cost(a) for a in best) < U:
+    checker, grasp_table = _search_context(C, assembly, robots)
+    gk = wrench_kind_arg(C, robots) if wrench else None
+    if gk is not None:
+      reset_wrench_cache()
+    h_cls = (SignatureCollapsedHeuristic if sig_collapsed_h
+             else CollapsedLabeledHeuristic if collapsed_h
+             else LabeledDisassemblyHeuristic if labeled_h
+             else GraspCollapsedHeuristic)
+    h_lab = h_cls(
+        assembly, len(robots), grasp_table,
+        gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
+        verbose=False, gripper_kind=(gk if wrench_aware_h else None), bracing=bracing)
+    best = _lns_improve(
+        inc, C, assembly, robots, checker, grasp_table, robot_ik,
+        max(weight, 5.0), 20000, verbose, h_lab, gripper_kind=gk,
+        handovers=handovers, allow_place=allow_place, bracing=bracing,
+        deadline=t_end, t0=t0, k_max=max(1, int(fill_window)), object_unit=True)
+    best_cost = sum(action_cost(a) for a in best)
+    if best_cost < U:
       if verbose:
-        print(f"[mile-anytime] improved {U:g} -> {sum(action_cost(a) for a in best):g} "
+        print(f"[mile-anytime] LNS improved {U:g} -> {best_cost:g} "
               f"in {time.perf_counter() - t0:.1f}s total")
       return best
+    if verbose:
+      elapsed = time.perf_counter() - t0
+      if time.perf_counter() >= t_end:
+        print(f"[mile-anytime] LNS deadline reached without improving cost {U:g} "
+              f"in {elapsed:.1f}s total (no fixpoint certificate)")
+      else:
+        print(f"[mile-anytime] LNS reached a k<={fill_window} fixpoint at cost {U:g} "
+              f"in {elapsed:.1f}s total")
   if verbose:
     print(f"[mile-anytime] returning the milestone plan (cost {U:g}) "
           f"in {time.perf_counter() - t0:.1f}s total")
   return inc
 
 
-def _refill_window(start, ps, ideal, target, assembly, robots, checker, grasp_table,
+def _make_lns_endpoint_pdb(start, target, ideal_chain, assembly, robots, grasp_table,
+                           h_landmark, cost_bound):
+  """Retarget the incumbent's projected model at one exact LNS boundary.
+
+  The ordinary milestone fill and this endpoint heuristic now share the same reverse-Dijkstra
+  implementation and grasp-signature quotient. ``ideal_chain`` restricts the projected assembly
+  ideals to the destroyed milestone interval. Reverse search is truncated strictly below the
+  incumbent window cost: anything absent after exhaustion cannot participate in an improvement.
+  """
+  if not isinstance(h_landmark, CollapsedLabeledHeuristic):
+    return None                                           # nonstandard fine-h ablation
+  start_main = next(g for g in start.subassemblies() if assembly.base in g)
+  if _subasm_key(start_main) != _subasm_key(ideal_chain[0]):
+    raise ValueError("LNS endpoint-PDB chain does not start at the splice state")
+  cap = np.nextafter(float(cost_bound), -np.inf)
+  return CollapsedLabeledHeuristic(
+      assembly, len(robots), grasp_table,
+      gripper_path=h_landmark._ee_path, verbose=False, max_states=200_000,
+      clearance=h_landmark._clearance, gripper_kind=h_landmark._gk,
+      bracing=h_landmark._bracing, collapse_grasps=h_landmark._collapse,
+      grasp_classes=h_landmark._grasp_classes,
+      labeled_loose=h_landmark._labeled_loose, dist_cap=cap,
+      ideal_chain=ideal_chain, component_root=h_landmark._component_root,
+      lazy_build=True, goal_states=(target,))
+
+
+def _refill_window(start, touched_parts, target, assembly, robots, checker, grasp_table,
                    robot_ik, weight, max_nodes, h_lab, gripper_kind=None, handovers=True,
-                   allow_place=True, bracing=False, deadline=None, cost_bound=None):
-  """Re-fill the window's parts `ps` from state `start`. If `target` is a State, the search
-  must arrive at THAT EXACT settled state (so the plan's suffix splices back unchanged); if
-  target is None the goal is the real assembly goal (the k=m / whole-plan window). Uses the
-  LABELED heuristic: to the real goal it is h_lab(s); to a fixed intermediate target it is
-  max(0, h_lab(s) - h_lab(target)) -- admissible because the abstraction distance is
-  consistent (h_lab(s) <= cost(s->target) + h_lab(target)). Lazy-validated like the fills."""
-  ps = tuple(ps)
-  relevant = set(ideal) | set(ps)
+                   allow_place=True, bracing=False, deadline=None, cost_bound=None,
+                   stats=None, endpoint_h=None):
+  """Re-fill one destroyed incumbent window with the bounded heap-based A* engine.
+
+  ``touched_parts`` is the exact physical footprint of the removed actions. Every generated
+  action must touch only that footprint, so parts outside the neighborhood remain frozen and
+  the unchanged suffix is meaningful. If ``target`` is a State, the search must arrive at that
+  exact state; otherwise it targets the real assembly goal (the whole-plan window).
+
+  The labeled differential heuristic is ``max(0, h(s) - h(target))``. It is admissible when
+  the abstraction distance is consistent. For an exact non-final splice, ``endpoint_h`` is a
+  second admissible reverse-PDB distance rooted directly at the projected target; their maximum
+  is used. IK remains lazy: a failed candidate edge is removed and the same bounded A* problem
+  is repaired incrementally after a one-time handoff from the memory-light initial A*."""
+  import os
+  import time
+  relevant = set(touched_parts)
+  t_refill = time.perf_counter()
+  profile_enabled = bool(os.environ.get("FILL_SEARCH_PROFILE"))
+  successor_states = set() if profile_enabled else None
+  if stats is None:
+    stats = {}
+  stats.clear()
+  stats.update(search_calls=0, expanded=0, edge_checks=0, peak_frontier=0,
+               successor_calls=0, successors_seen=0, successors_scoped=0,
+               successor_cache_hits=0, successor_cache_edges=0,
+               heuristic_calls=0, heuristic_misses=0, cheap_checks=0,
+               cheap_cache_hits=0, ik_binds=0, ik_failures=0,
+               successor_wall=0.0, heuristic_wall=0.0, cheap_wall=0.0,
+               ik_wall=0.0, footprint=len(relevant))
+
+  def absorb(astar_stats):
+    stats["search_calls"] += 1
+    stats["expanded"] += astar_stats.get("expanded", 0)
+    stats["edge_checks"] += astar_stats.get("edge_checks", 0)
+    stats["peak_frontier"] = max(stats["peak_frontier"],
+                                 astar_stats.get("peak_frontier", 0))
+    stats["search_outcome"] = astar_stats.get("outcome", "unknown")
+
+  def done(plan, outcome=None):
+    stats["outcome"] = outcome or stats.get("search_outcome", "unknown")
+    stats["wall"] = time.perf_counter() - t_refill
+    stats["plan_cost"] = (sum(action_cost(a) for a in plan) if plan is not None else None)
+    if successor_states is not None:
+      stats["successor_states"] = len(successor_states)
+    return plan
   # DIFFERENTIAL (landmark) heuristic, uniform across all k: h(s) = h_abs(s) - h_abs(target),
   # the same abstraction distance the whole system uses, with the goal as landmark --
   # admissible by consistency (h_abs(s) <= cost(s->target) + h_abs(target)). For the k=m
@@ -12151,61 +12290,175 @@ def _refill_window(start, ps, ideal, target, assembly, robots, checker, grasp_ta
     def goal_fn(s):
       return s.is_goal(assembly)
 
+  # A graph-search heuristic is a pure function of the value-state. A* asks for it once per
+  # GENERATED edge, including duplicates, and every lazy-IK restart asks all over again. The
+  # reverse PDB itself memoizes abstract states, but constructing the projection and combining
+  # the two bounds are still repeated work. Cache the exact concrete-state query for this
+  # refill; values cannot change while either reverse oracle is being extended (a query is
+  # returned only after its abstract state has been settled).
+  h_cache = {}
+  h_sentinel = object()
+
   def h_fn(s):
-    return max(0.0, h_lab.value(s) - h_tgt)
+    stats["heuristic_calls"] += 1
+    hit = h_cache.get(s, h_sentinel)
+    if hit is not h_sentinel:
+      return hit
+    stats["heuristic_misses"] += 1
+    th = time.perf_counter() if profile_enabled else None
+    landmark = max(0.0, h_lab.value(s) - h_tgt)
+    value = max(landmark, endpoint_h.value(s)) if endpoint_h is not None else landmark
+    h_cache[s] = value
+    if profile_enabled:
+      stats["heuristic_wall"] += time.perf_counter() - th
+    return value
+
+  # Successor construction is deterministic but each complete list retains many State
+  # payloads. Use cache-on-second-access: a one-pass A* stores only the state marker, while a
+  # state regenerated by a lazy-IK restart is admitted and reused on its third and later
+  # visits. This is the usual second-chance admission policy, here chosen for memory rather
+  # than semantics. LRU robot ordering carries non-identity history, so it deliberately keeps
+  # the regenerating path instead of aliasing value-equal states.
+  successor_seen_once = set()
+  successor_cache = {}
+  successor_cache_safe = not _problem._LRU_ROBOTS
 
   def succ_fn(s):
+    stats["successor_calls"] += 1
+    if successor_states is not None:
+      successor_states.add(s)
+    if successor_cache_safe:
+      hit = successor_cache.get(s, h_sentinel)
+      if hit is not h_sentinel:
+        stats["successor_cache_hits"] += 1
+        stats["successor_cache_edges"] += len(hit)
+        yield from hit
+        return
+    ts = time.perf_counter() if profile_enabled else None
+    scoped = []
     for a, ns in successors(s, assembly, robots, grasp_table=grasp_table,
                             gripper_kind=gripper_kind, handovers=handovers,
                             allow_place=allow_place, bracing=bracing):
-      if a[2] in relevant or a[0] == "release":           # inherited-grasp release always
-        yield a, ns                                       # legal (see _add_one_part)
+      stats["successors_seen"] += 1
+      if _action_parts(a) <= relevant:
+        stats["successors_scoped"] += 1
+        scoped.append((a, ns))
+    if profile_enabled:
+      stats["successor_wall"] += time.perf_counter() - ts
+    if successor_cache_safe:
+      if s in successor_seen_once:
+        successor_cache[s] = tuple(scoped)
+      else:
+        successor_seen_once.add(s)
+    yield from scoped
 
+  # cheap_feasible is also a deterministic physical query for one symbolic edge. Lazy IK
+  # may restart A* many times, but deleting an unrelated IK edge cannot change geometry,
+  # closure, or the checker. Reuse both acceptance and rejection; unlike negative IK reuse,
+  # this is a complete collision computation rather than a finite-effort failure.
+  cheap_cache = {}
   def cheap_only(prev, act, ns):
-    return cheap_feasible(act, prev, ns, assembly, checker)
+    stats["cheap_checks"] += 1
+    key = (prev, act)
+    hit = cheap_cache.get(key, h_sentinel)
+    if hit is not h_sentinel:
+      stats["cheap_cache_hits"] += 1
+      return hit
+    tc = time.perf_counter() if profile_enabled else None
+    value = cheap_feasible(act, prev, ns, assembly, checker)
+    cheap_cache[key] = value
+    if profile_enabled:
+      stats["cheap_wall"] += time.perf_counter() - tc
+    return value
 
-  if robot_ik is not None:                                # LAZY-validated (see _add_parts)
+  if robot_ik is not None:                                # LAZY-validated (see _add_one_part)
+    # Lazy graph search shared with the ordinary milestone fills. After the memory-light first
+    # candidate, a failed IK edge is deleted from a persistent tree and only its dependent
+    # subtree is repaired; the old LNS-specific loop discarded the complete heap and regenerated
+    # the same graph up to 200 times. This is standard incremental LazySP behaviour: successors,
+    # costs, heuristic, bound, and candidate order are unchanged.
     bl, ok_cache = set(), set()
+    def make_engine():
+      return _IncrementalLazySearch(
+          start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
+          weight=weight, blacklist=bl, cheap_gate=cheap_only, cost_bound=cost_bound,
+          # succ_fn already uses memory-conscious cache-on-second-access; do not retain a
+          # second complete edge graph inside the generic engine.
+          memoize_successors=False)
 
-    def succ_lazy(s):
-      for a, ns in succ_fn(s):
-        if (s, a) not in bl:
-          yield a, ns
+    # Most bounded windows never reach a candidate or need an edge deletion. Start as an
+    # ordinary heap A* without the incremental engine's alternate-route index. On the first
+    # IK refutation, build the repair engine ONCE under the accumulated blacklist; all exact
+    # physical/heuristic/successor query caches above survive the handoff. Thereafter each
+    # deletion is repaired incrementally. This is adaptive storage for one search problem.
+    astar_stats = {}
+    subplan = _astar(start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost,
+                     h_fn=h_fn, cheap_fn=None, edge_check_fn=cheap_only, weight=weight,
+                     max_nodes=max_nodes, verbose=False, tag="lns refill A*",
+                     deadline=deadline, cost_bound=cost_bound, stats_out=astar_stats)
+    absorb(astar_stats)
+    if subplan is None:
+      return done(None)
 
+    engine = None
     for _round in range(200):
-      subplan = _pea_star(start, goal_fn=goal_fn, succ_fn=succ_lazy, cost_fn=action_cost,
-                          h_fn=h_fn, cheap_fn=None, edge_check_fn=cheap_only, weight=weight,
-                          max_nodes=max_nodes, verbose=False, tag="lns refill",
-                          deadline=deadline, cost_bound=cost_bound)
-      if subplan is None:
-        return None
-      s = start
       valid = True
-      for a in subplan:
-        ns = next(n2 for act2, n2 in successors(s, assembly, robots,
-                                                grasp_table=grasp_table,
-                                                gripper_kind=gripper_kind,
-                                                handovers=handovers,
-                                                allow_place=allow_place, bracing=bracing)
-                  if act2 == a)
+      for s, a, ns in zip(subplan.states, subplan, subplan.states[1:]):
         if a[0] in _IK_ACTIONS and (s, a) not in ok_cache:
+          stats["ik_binds"] += 1
+          ti = time.perf_counter() if profile_enabled else None
           okb, _w = robot_ik.bind(a, s, ns, assembly)
+          if profile_enabled:
+            stats["ik_wall"] += time.perf_counter() - ti
           if not okb:
+            stats["ik_failures"] += 1
             bl.add((s, a))
+            if engine is not None:
+              engine.delete_edge(s, a, ns)
             valid = False
           else:
             ok_cache.add((s, a))
-        s = ns
       if valid:
-        return subplan
-    return None
+        stats["search_outcome"] = "found"
+        return done(subplan, "found")
+      if engine is None:
+        # The completed first A* and the repair engine otherwise retain two object-level
+        # copies of the same value graph: these callback caches key on the first search's
+        # concrete State instances, while the repair engine interns its regenerated ones.
+        # Release that scratch at the one-time handoff. The reverse PDB, CollisionChecker's
+        # physical-scene verdicts, IK successes/failures, and `bl` remain warm, so no physical
+        # query or feasibility fact is forgotten.
+        h_cache.clear()
+        cheap_cache.clear()
+        successor_seen_once.clear()
+        successor_cache.clear()
+        import gc
+        gc.collect()
+        engine = make_engine()
+      stats["search_calls"] += 1
+      subplan = engine.search(max_nodes, deadline=deadline)
+      stats["expanded"] = astar_stats.get("expanded", 0) + engine.expanded
+      footprint = engine.footprint()
+      if profile_enabled:
+        stats["engine_profile"] = engine.profile_snapshot()
+      stats["peak_frontier"] = max(
+          stats["peak_frontier"], footprint["peak_frontier"],
+          footprint["peak_heap_entries"])
+      if subplan is None:
+        stats["search_outcome"] = (
+            "deadline" if deadline is not None and time.perf_counter() >= deadline
+            else "budget" if engine.budget_hit else "exhausted")
+        return done(None)
+    stats["search_outcome"] = "round-limit"
+    return done(None, "round-limit")
 
-  def edge_check_fn(prev, act, ns):
-    return cheap_feasible(act, prev, ns, assembly, checker)
-  return _pea_star(start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
-                   cheap_fn=None, edge_check_fn=edge_check_fn, weight=weight,
-                   max_nodes=max_nodes, verbose=False, tag="lns refill", deadline=deadline,
-                   cost_bound=cost_bound)
+  astar_stats = {}
+  result = _astar(start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
+                  cheap_fn=None, edge_check_fn=cheap_only, weight=weight,
+                  max_nodes=max_nodes, verbose=False, tag="lns refill A*", deadline=deadline,
+                  cost_bound=cost_bound, stats_out=astar_stats)
+  absorb(astar_stats)
+  return done(result)
 
 
 def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weight,
@@ -12224,6 +12477,17 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
   object_unit=False (baseline): k = SETTLED segments (a part mated, nothing loose, <=1
   holder); coarser and uneven (segments merge under hold-through re-fills). Kept for
   ablation.
+
+  The k=1 cleanup rung uses weight-one A*: these deliberately small coordinates are searched
+  in cost order. Wider neighborhoods retain ``weight`` as their exploration order. When a finite
+  deadline is present, every remaining window receives an equal share of the remaining wall
+  budget (cooperatively).
+
+  Every non-final window also builds a bounded reverse PDB rooted at its exact projected splice
+  endpoint, using the same abstraction and signature quotient as ordinary local fills. Its
+  distance is maximized with the global-landmark difference. Reverse exhaustion below the strict
+  incumbent bound certifies that the window cannot improve and avoids concrete forward search.
+  The final window retains the ordinary, non-unique assembly goal.
 
   Growing k covers reorderings a small window can't reach; k=n is the whole-plan bounded
   search. Standard LNS: RESTART the sweep on any accept (the plan, hence its partition,
@@ -12310,20 +12574,133 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
         is_last = (i + k == m)
         h_start = h_lab.value(states[i])
         h_tgt = 0.0 if is_last else h_lab.value(states[i + k])
-        if old_cost <= max(0.0, h_start - h_tgt):
-          continue                                        # window already at its lower bound
-        ideal0 = {p for p in assembly.objects if _part_mated(states[i], p)}
-        # RELEVANT parts the re-fill may touch = everything the window's actions touch
-        # (mated-in-window + any staged/released part) beyond what is already mated. This
-        # makes reaching the exact end state possible regardless of interleaving.
-        ps = {a[2] for a in span} - ideal0
         parts_mated = sorted({p for sp in seg_parts[i:i + k] for p in sp})
-        sub = _refill_window(states[i], ps, ideal0,
+        window_weight = 1.0 if k == 1 else weight
+        if old_cost <= max(0.0, h_start - h_tgt):
+          if verbose:
+            print(f"[lns-window] k={k} parts[{i}:{i + k}] {tuple(parts_mated)} "
+                  f"w={window_weight:g} bound={old_cost:g} outcome=lower-bound "
+                  f"h-diff={max(0.0, h_start - h_tgt):g}", flush=True)
+          continue                                        # window already at its lower bound
+        # Destroyed-action neighborhood: include every part physically touched by the removed
+        # incumbent span. In particular, ASSEMBLE contributes both its moved part and target;
+        # RELEASE contributes only its actual part. All other parts remain frozen. Increasing k
+        # exposes the union of more consecutive incumbent spans instead of globally widening.
+        touched_parts = set().union(*(_action_parts(a) for a in span)) if span else set()
+        # FAIR SLICING: an early pathological coordinate must not starve all later windows.
+        # Recompute after every attempt, so unused time is automatically redistributed. Native
+        # nonlinear solves may overrun their cooperative slice, but the next A* pop observes it.
+        window_deadline = deadline
+        allocated = None
+        if deadline is not None:
+          later_at_k = m - k + 1 - i
+          later_widths = sum(m - kk + 1 for kk in range(k + 1, km + 1))
+          attempts_left = max(1, later_at_k + later_widths)
+          now = time.perf_counter()
+          allocated = max(0.0, (deadline - now) / attempts_left)
+          window_deadline = min(deadline, now + allocated)
+        # Direct endpoint PDB: unlike the final-goal landmark difference, this reverse search
+        # is rooted at the exact projected splice state and restricted to the window's ideal
+        # chain. The strict incumbent bound caps its reverse radius. The last window retains
+        # the ordinary (possibly non-unique) assembly goal, so an exact endpoint would be too
+        # strong there and the global goal PDB is already direct.
+        endpoint_h = None
+        endpoint_lb = None
+        endpoint_stats = None
+        endpoint_wall = 0.0
+        endpoint_status = "goal-window" if is_last else "active"
+        if not is_last:
+          pdb_t0 = time.perf_counter()
+          chain = []
+          for st in states[i:i + k + 1]:
+            main = next(g for g in st.subassemblies() if assembly.base in g)
+            chain.append(_subasm_key(main))
+          try:
+            endpoint_h = _make_lns_endpoint_pdb(
+                states[i], states[i + k], chain, assembly, robots, grasp_table,
+                h_lab, old_cost)
+            if endpoint_h is None:
+              endpoint_status = "unsupported-h-ablation"
+            else:
+              endpoint_lb = endpoint_h.value(states[i])
+              endpoint_stats = endpoint_h.reverse_stats()
+              endpoint_status = "bounded-out" if endpoint_lb >= old_cost else "active"
+          except RuntimeError as exc:
+            if "exceeded 200000 states" not in str(exc):
+              raise
+            # A heuristic resource guard is not a feasibility result. Retain the historical
+            # differential lower bound and say so explicitly; the concrete window still runs.
+            endpoint_h = None
+            endpoint_status = "state-guard-fallback"
+          endpoint_wall = time.perf_counter() - pdb_t0
+          if verbose:
+            lb_text = ("inf" if endpoint_lb == float("inf") else
+                       "-" if endpoint_lb is None else f"{endpoint_lb:g}")
+            rs = endpoint_stats or {}
+            print(f"[lns-window-h] k={k} parts[{i}:{i + k}] {tuple(parts_mated)} "
+                  f"bound={old_cost:g} endpoint-h={lb_text} status={endpoint_status} "
+                  f"settled={rs.get('settled', 0)} discovered={rs.get('discovered', 0)} "
+                  f"reverse={rs.get('reverse_time', endpoint_wall):.2f}s", flush=True)
+          if endpoint_h is not None and endpoint_lb >= old_cost:
+            if verbose:
+              print(f"[lns-window] k={k} parts[{i}:{i + k}] {tuple(parts_mated)} "
+                    f"w={window_weight:g} bound={old_cost:g} "
+                    f"outcome=endpoint-bound endpoint-h={endpoint_lb:g} "
+                    f"pdb-wall={endpoint_wall:.2f}s", flush=True)
+            continue
+        refill_stats = {}
+        sub = _refill_window(states[i], touched_parts,
                              None if is_last else states[i + k], assembly, robots, checker,
-                             grasp_table, robot_ik, weight, max_nodes, h_lab,
+                             grasp_table, robot_ik, window_weight, max_nodes, h_lab,
                              gripper_kind=gripper_kind, handovers=handovers,
-                             allow_place=allow_place, bracing=bracing, deadline=deadline,
-                             cost_bound=old_cost)
+                             allow_place=allow_place, bracing=bracing,
+                             deadline=window_deadline, cost_bound=old_cost, stats=refill_stats,
+                             endpoint_h=endpoint_h)
+        # _refill_window's heap/repair graph is dead on return; return its allocator arenas
+        # before the next coordinate (or an accepted-plan restart) constructs another large
+        # graph under the process address-space guard. Live plan states/PDB/checker caches are
+        # untouched. This is the same cleanup contract used between ordinary local fills.
+        _release_fill_scratch(f"lns-k{k}-{i}", verbose=verbose)
+        if verbose:
+          slice_text = f" slice={allocated:.1f}s" if allocated is not None else ""
+          result_text = (f" result={cost(sub):g}" if sub is not None else "")
+          endpoint_text = ("" if endpoint_lb is None else
+                           f" endpoint-h={'inf' if endpoint_lb == float('inf') else f'{endpoint_lb:g}'}"
+                           f" pdb={endpoint_wall:.2f}s")
+          if endpoint_h is not None:
+            endpoint_stats = endpoint_h.reverse_stats()
+            endpoint_text += (f" pdb-settled={endpoint_stats['settled']}"
+                              f"/{endpoint_stats['discovered']}")
+          print(f"[lns-window] k={k} parts[{i}:{i + k}] {tuple(parts_mated)} "
+                f"w={window_weight:g} bound={old_cost:g} footprint={len(touched_parts)}"
+                f"{slice_text} outcome={refill_stats.get('outcome', 'unknown')}"
+                f"{result_text}{endpoint_text} wall={refill_stats.get('wall', 0.0):.2f}s "
+                f"searches={refill_stats.get('search_calls', 0)} "
+                f"expanded={refill_stats.get('expanded', 0)} "
+                f"peak-open={refill_stats.get('peak_frontier', 0)} "
+                f"succ={refill_stats.get('successors_scoped', 0)}/"
+                f"{refill_stats.get('successors_seen', 0)} "
+                f"h={refill_stats.get('heuristic_misses', 0)}/"
+                f"{refill_stats.get('heuristic_calls', 0)} "
+                f"cheap={refill_stats.get('cheap_checks', 0)}"
+                f"({refill_stats.get('cheap_cache_hits', 0)} cached) "
+                f"IK={refill_stats.get('ik_binds', 0)}"
+                f"({refill_stats.get('ik_failures', 0)}f)", flush=True)
+          if os.environ.get("FILL_SEARCH_PROFILE"):
+            ep = refill_stats.get("engine_profile", {})
+            print(f"[lns-prof] successor={refill_stats.get('successor_wall', 0.0):.2f}s/"
+                  f"{refill_stats.get('successor_calls', 0)} calls/"
+                  f"{refill_stats.get('successor_states', 0)} states/"
+                  f"{refill_stats.get('successor_cache_hits', 0)} hits "
+                  f"heuristic={refill_stats.get('heuristic_wall', 0.0):.2f}s/"
+                  f"{refill_stats.get('heuristic_misses', 0)} misses "
+                  f"cheap={refill_stats.get('cheap_wall', 0.0):.2f}s/"
+                  f"{refill_stats.get('cheap_checks', 0) - refill_stats.get('cheap_cache_hits', 0)}"
+                  f" misses IK={refill_stats.get('ik_wall', 0.0):.2f}s "
+                  f"queue={ep.get('queue_wall', 0.0):.2f}s/"
+                  f"{ep.get('queue_calls', 0)} alt={ep.get('alt_wall', 0.0):.2f}s/"
+                  f"{ep.get('alt_calls', 0)} pops={ep.get('heap_pops', 0)} "
+                  f"boundary={ep.get('boundary_wall', 0.0):.2f}s", flush=True)
         if sub is not None and cost(sub) < old_cost:
           cur = cur[:bnds[i]] + list(sub) + cur[bnds[i + k]:]
           if verbose:

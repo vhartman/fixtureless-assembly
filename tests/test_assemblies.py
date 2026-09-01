@@ -919,6 +919,22 @@ def test_fill_local_greedy_plans_a_sequence_without_global_oracle():
   assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
 
 
+def test_exact_search_initializes_useful_grasps_from_its_search_context(monkeypatch):
+  """Anytime's exact phase must not consume the grasp table before constructing it."""
+  import problem
+
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 2)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  monkeypatch.setattr(problem, "_USEFUL_FLAG", True)
+  plan = A.solve_assembly_problem(
+      C, asm, robots=robots, weight=1.0, verbose=False, wrench=False)
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+
+
 def test_fill_policy_edge_uses_bellman_equality_and_rejects_hidden_stutters():
   import solver as S
 
