@@ -131,7 +131,6 @@ class RunConfig:
   brace_for_assembly_only: bool = False
   vacuum_no_assemble: bool = False
   staged_mates: bool = False
-  mixed_wrench_h: bool = False
   allow_curved_grasps: bool = False
   dense_grasps: bool = False
 
@@ -290,6 +289,9 @@ class RunConfig:
     names the current format, so existing current-format artifacts remain readable without
     retaining any legacy generator."""
     d = dict(d)
+    # Removed no-op option. It never changed a saved plan's scene, action space, or search;
+    # discard the stale provenance key so existing artifacts remain usable as --config files.
+    d.pop("mixed_wrench_h", None)
     old_sampler_version = d.pop("grasp_sampler_version", None)
     if old_sampler_version not in (None, 4):
       raise ValueError(

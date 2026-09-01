@@ -1,14 +1,22 @@
-"""Regression tests for the clearance-floor witness ladder.
+"""Artifact-backed integration tests for the clearance-floor witness ladder.
 
 Both bugs these guard were shipped and only caught by hand: the emitted witnesses were
 RESTRICTED 6-vectors (every consumer indexes by full joint name -> KeyError), and they filled
 non-chosen arms from the DP's carried joint map, so a consumer that poses those arms
 (visualization._active_robots covers a wider set than witness_floor._involved) put robots
 visibly through each other. The suite ran green through both.
+
+These tests need a plan made by the same grasp-database version as the checkout.  Keeping an
+ignored root-level JSON as an implicit fixture made a clean checkout skip the tests while a
+developer's stale artifact failed them for unrelated reasons.  Set
+``ASSEMBLY_WITNESS_FLOOR_FIXTURE`` to a freshly generated Car Mini plan to run the integration
+tests deliberately.
 """
+import os
 import numpy as np
 import pytest
 import robotic as ry
+from pathlib import Path
 
 import assembly as A
 import replay as R
@@ -16,7 +24,12 @@ from plan_io import read_plan
 from solver import RobotIK, _replay_states, _search_context, involved_robots
 from witness_floor import optimize_witnesses_floor
 
-SCENE = "car-mini-new.json"
+SCENE = Path(os.environ.get(
+    "ASSEMBLY_WITNESS_FLOOR_FIXTURE",
+    Path(__file__).resolve().parent / "fixtures" / "witness-floor-car-mini-plan.json"))
+pytestmark = pytest.mark.skipif(
+    not SCENE.is_file(),
+    reason="set ASSEMBLY_WITNESS_FLOOR_FIXTURE to a current Car Mini plan")
 
 
 def _setup():

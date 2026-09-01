@@ -1498,12 +1498,6 @@ def build_parser():
            "must be settled at the endpoint. Standard off; ordinary completeness widening is "
            "controlled by --fill-scope-widening.",
   )
-  g_phys.add_argument(
-      "--mixed-wrench-h", action="store_true",
-      help="DEPRECATED compatibility flag: mixed-tool backward wrench facts are now implied "
-           "by --wrench, matching concrete search semantics. Use --no-wrench-aware-h only "
-           "for an explicit heuristic ablation.",
-  )
   g_search.add_argument(
       "--dominance", action="store_true",
       help="DOMINANCE pruning (spec 8.3, 'same node modulo free robots'): among currently-"
@@ -2039,7 +2033,7 @@ _SAVE_CONFIG_FIELDS = (
     "ignore_gravity",                                    # weightless stability: a plan searched
     # weightless contains releases/lateral mates that are UNSTABLE under gravity, so a rebuild
     # without it cannot reproduce the actions (user-hit: sim StopIteration on a cross-12 plan)
-    "mixed_wrench_h", "strict_collisions", "witness_robot_collisions", "plain_box",
+    "strict_collisions", "witness_robot_collisions", "plain_box",
     "stable_rest_poses", "placement_yaws",              # placement ids index the per-group
     # placement table, so this changes the ACTION SPACE, not only the geometry
     # SUCCESSOR-AFFECTING and previously UNSAVED: a plan solved with any of these replays
@@ -3045,9 +3039,6 @@ def run(cfg, explicit=None):
           "temporarily moved blockers must be settled. Local search may be much larger.")
   if cfg.lazy_edge_selector == "terminal-first" and not cfg.open_witness:
     raise SystemExit("--lazy-edge-selector terminal-first requires --open-witness")
-  if cfg.mixed_wrench_h:
-    print("[flag] --mixed-wrench-h is DEPRECATED and now a no-op: --wrench already enables "
-          "per-kind backward wrench facts. Use --no-wrench-aware-h for the ablation.")
   if cfg.dominance:
     from problem import set_dominance
     set_dominance(True)

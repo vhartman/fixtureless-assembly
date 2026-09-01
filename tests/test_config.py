@@ -73,8 +73,10 @@ def test_config_cli_layering(tmp_path):
 
 
 def test_current_sampler_marker_is_migrated_and_obsolete_markers_fail():
-  cfg = RunConfig.from_dict({"grasp_sampler": True, "grasp_sampler_version": 4})
+  cfg = RunConfig.from_dict({"grasp_sampler": True, "grasp_sampler_version": 4,
+                             "mixed_wrench_h": True})
   assert cfg.grasp_sampler and "grasp_sampler_version" not in cfg.to_dict()
+  assert "mixed_wrench_h" not in cfg.to_dict()
   with pytest.raises(ValueError, match="versions 1-3 are no longer supported"):
     RunConfig.from_dict({"grasp_sampler": True, "grasp_sampler_version": 3})
 
@@ -150,7 +152,6 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
   assert main.parse_args(["--no-fill-scope-widening"]).fill_scope_widening is False
   assert main.parse_args(["--fill-touch-all"]).fill_touch_all is True
   assert main.parse_args(["--no-fill-touch-all"]).fill_touch_all is False
-  assert main.parse_args(["--mixed-wrench-h"]).mixed_wrench_h is True
   assert main.parse_args(["--no-wrench-aware-h"]).wrench_aware_h is False
   assert main.parse_args([
       "--diagnose-plan-rank", "known.json"

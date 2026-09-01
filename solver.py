@@ -638,6 +638,7 @@ class RobotIK:
     self.precheck_eq_min = 3.0                            # residual gate (see above)
     self.precheck_rejects = 0                             # rejects caught by the precheck
     self._reach_bounds = {}                               # robot -> sound max-reach (lazy)
+    self._analytic_seed_cache = {}                        # exact target+hardware-box -> SSIK reps
     self.reach_rejects = 0                                # rejects by the reach-sphere bound
     self.analytic_rejects = 0                             # rejects by empty ssik solution sets
     # A1 INSTRUMENTATION (pure counters/timers; ZERO behavior change): where bind/_solve_ik
@@ -717,10 +718,10 @@ class RobotIK:
     self.ssik_seed_neighborhood = 0.0
     self.ssik_neighborhood_cap = 6
     self.action_stats = {}
-    # --empty-seed-refutes: treat an EMPTY calibrated analytic seed set as a sound
-    # unreachability proof (skip relaxed precheck + KOMO). Sound because q1..q5 are
-    # roll-independent and q6 spans >= 2pi in the rai models; OFF preserves the legacy
-    # tolerant-KOMO chance on exactly-unreachable poses.
+    # --empty-seed-refutes: treat an EMPTY calibrated analytic seed set as exact-pose
+    # unreachability (skip relaxed precheck + KOMO). 7R artifacts use the physical-limit
+    # swivel-interval resolver, not a finite-sample empty result. OFF preserves the tolerant-
+    # KOMO chance near the boundary of an exactly unreachable target.
     self.empty_seed_refutes = False
     # ANALYTIC-REFUTATION STUDY: classify each bind by exact-IK coverage vs outcome, so we can
     # decide whether ssik alone could replace KOMO acceptance/refutation. Coverage=True means
@@ -2278,11 +2279,10 @@ class RobotIK:
       return True, _seed_witness
     if self.harvest_branches:
       return True, self.harvest_branches[0]
-    if seeds:
-      # the analytic seed set ENUMERATES every exact pose branch (up to 8), so random restarts
-      # can only re-derive branches already tried -- their residual value is exploring the eq
-      # TOLERANCE slack (a nearby collision-free near-pose). A few tries cover that; the full
-      # budget is for UNSEEDED solves where restarts must find the branches themselves.
+    if seeds and all(np.asarray(q).size <= 6 for q in seeds):
+      # A non-redundant analytic set enumerates the exact-pose branches, so further random
+      # restarts mainly explore equality tolerance slack. A 7R set is only representatives of
+      # a continuous self-motion manifold and must retain the ordinary restart budget.
       restarts = min(restarts, self.seed_restart_cap)
     import time as _time
     r = None
@@ -2371,9 +2371,9 @@ class RobotIK:
   def _compose_full_seeds(self, C, arm_seeds, cap=8):
     # Full joint-vector warm starts for a MULTI-ARM KOMO from per-arm analytic solutions:
     # each attached arm's joints overwritten with one of its solutions (cartesian product,
-    # closest-to-current-config first, capped -- the product is the complete enumeration of
-    # the exact pose branches when it fits under the cap).  Do not assume 6R here: OpenArm
-    # and FR3 are 7R, and silently dropping their exact seeds is especially expensive for a
+    # closest-to-current-config first, capped. The product is exhaustive only for
+    # non-redundant arms; for 7R it combines representative self-motion basins. Do not assume
+    # 6R here: OpenArm and FR3 are 7R, and silently dropping their exact seeds is expensive for a
     # coupled place/assemble where the nonlinear solve otherwise has to discover every arm.
     import itertools
     q0 = np.asarray(C.getJointState(), dtype=float)
@@ -2396,14 +2396,14 @@ class RobotIK:
 
   @_timed_bind_stage("branch_probe")
   def _probe_branch_combos(self, C, arm_seeds, exclude=(), cap=8, probe_cap=256):
-    # DEPTH-GATED collision probe over the FULL cartesian product of the involved arms'
-    # exact analytic branches. Posing EVERY involved arm at one of its branches is a
+    # DEPTH-GATED collision probe over the cartesian product of the involved arms' analytic
+    # candidates. Posing every involved arm at one candidate is a
     # CONSISTENT candidate solution of the whole skill (each tool at its true pose, the
     # moved group at its true target) -- so ALL collision pairs are evaluated at real
     # geometry, INCLUDING ARM-ARM between the placer and its brace (the dominant failure
     # mode seen in practice). Returns (reject, seeds):
-    #   reject : every combo penetrates beyond its gate -> the bind has no near-pose rescue
-    #            (only claimed when the FULL product was probed);
+    #   reject : every combo penetrates beyond its gate -> the bind has no near-pose rescue,
+    #            claimed only for exhaustive non-redundant branch sets;
     #   seeds  : the `cap` best combos as full warm starts, shallowest penetration first
     #            (ties: closest to the current config) -- collision-INFORMED seeding.
     # Gates: `collision_reject_depth` vs the static scene (measured rescue ceiling ~10mm);
@@ -2456,7 +2456,8 @@ class RobotIK:
     # adjacent cylinder pinches are rescued by the soft KOMO from well beyond 15mm, so the
     # 15mm band must fall through to the solve (with the ranked seeds), never hard-reject --
     # the cheap layers must not reject what the full solve can do.
-    if all(s[3] > 0.0 for s in scored):
+    exhaustive = all(np.asarray(q).size <= 6 for seeds in arm_seeds.values() for q in seeds)
+    if exhaustive and all(s[3] > 0.0 for s in scored):
       self.collision_rejects += 1
       return True, []                                     # every exact combo VERY deeply colliding
     scored.sort(key=lambda t: (t[0], t[1]))
@@ -2561,8 +2562,17 @@ class RobotIK:
           lo = hi = None
     except Exception:
       lo = hi = None
+    limits = None if lo is None else np.vstack([lo, hi])
+    key = (self.robot_arm[robot], tool_kind,
+           tuple(np.round(T.ravel(), 12)),
+           None if limits is None else tuple(np.round(limits.ravel(), 12)))
+    cached = self._analytic_seed_cache.get(key)
+    if cached is None:
+      cached = tuple(np.asarray(q, dtype=float) for q in analytic_ik.seed_configs(
+          self.robot_arm[robot], T, tool_kind=tool_kind, joint_limits=limits))
+      self._analytic_seed_cache[key] = cached
     out = []
-    for q in analytic_ik.seed_configs(self.robot_arm[robot], T, tool_kind=tool_kind):
+    for q in cached:
       if lo is not None and len(q) == len(lo) and (np.any(q < lo) or np.any(q > hi)):
         continue                                            # outside rai's joint limits
       out.append(q)
@@ -2797,10 +2807,10 @@ class RobotIK:
     self._ctx_seeds = ("pick", bool(exact_count), self.tool_kind[robot])  # exact coverage
     if (self.empty_seed_refutes and self._pin_joints is None
         and self._analytic_reject_ok(robot) and not exact_count):
-      # --empty-seed-refutes: the calibrated closed-form solver enumerated EVERY joint branch
-      # at the EXACT grasp pose and found none within limits. This is a sound unreachability
-      # proof (q1..q5 are roll-independent; q6 spans >= 2pi, so no other vacuum roll helps
-      # either) -- skip relaxed precheck and KOMO entirely.
+      # --empty-seed-refutes: the calibrated solver found no physical-limit realization at the
+      # EXACT grasp pose (7R uses continuous feasible-swivel intervals, not just sampled
+      # representatives). This says nothing about KOMO's configured pose tolerance, hence the
+      # explicit opt-in -- skip relaxed precheck and KOMO entirely.
       self.analytic_rejects += 1
       self.ana_stats[f"pick/{self.tool_kind[robot]}/empty_refuted"] = \
           self.ana_stats.get(f"pick/{self.tool_kind[robot]}/empty_refuted", 0) + 1
@@ -6011,11 +6021,6 @@ def _fill_scope_passes(force_all=False, widen=False):
   if force_all:
     return (True,)
   return (False, True) if widen else (False,)
-
-
-def set_mixed_wrench_h(on=True):
-  """Deprecated compatibility hook; mixed wrench guidance follows gripper_kind directly."""
-  return None
 
 
 def set_sig_components(components):

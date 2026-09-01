@@ -168,7 +168,45 @@ def available(robot_type, tool_kind="two_finger"):
     return False
 
 
-def seed_configs(robot_type, T_ee_in_baselink, tool_kind="two_finger"):
+def _rai_limits_in_solver_coordinates(calibration, joint_limits):
+  """Map a ``(lo, hi)`` RAI hardware box through the calibrated joint signs.
+
+  The generated artifacts bake the limits from their source URDF.  Our runtime models may
+  deliberately use a different calibrated box (OpenArm's two wrist joints do), so asking the
+  artifact to respect its baked limits is not the same physical query as RobotIK's.  Keep the
+  geometry baked, but replace only the limit intervals used by the 7R swivel resolver.
+  """
+  limits = np.asarray(joint_limits, dtype=float)
+  if limits.shape != (2, len(calibration["sign"])):
+    return None
+  lo, hi = limits
+  a = calibration["sign"] * lo + calibration["offset"]
+  b = calibration["sign"] * hi + calibration["offset"]
+  return np.minimum(a, b), np.maximum(a, b)
+
+
+def _limit_aware_redundant_solutions(solver, T_target, solver_limits):
+  """Representatives of every feasible 7R swivel interval under runtime limits.
+
+  ``ssik`` intentionally exposes this resolver as the generated SRS solver's in-limit
+  fallback.  Calling it with a fresh KinBody avoids mutating the module-global baked model
+  and therefore remains safe if independent searches ever share one Python process.
+  """
+  if solver_limits is None or getattr(solver, "DOF", None) != 7:
+    return []
+  try:
+    kb = solver._build_kb()
+    for joint, lo, hi in zip(kb.joints, solver_limits[0], solver_limits[1]):
+      joint.limits = (float(lo), float(hi))
+    return solver._resolve_in_limits(
+        kb, np.asarray(T_target, dtype=float), policy=solver.DEFAULT_TOLERANCE_POLICY)
+  except Exception:
+    # Non-SRS/custom artifacts need not provide the generated resolver internals.  Their
+    # ordinary finite solution set is still useful as warm-start guidance below.
+    return []
+
+
+def seed_configs(robot_type, T_ee_in_baselink, tool_kind="two_finger", joint_limits=None):
   """Analytic RAI joint solutions placing the selected EE centre at a target 4x4 SE(3)
   pose in ``base_link``.  Vacuum uses the canonical aligned EE roll supplied by the grasp
   target; its physical roll symmetry does not require a second nonlinear variable here.
@@ -182,7 +220,24 @@ def seed_configs(robot_type, T_ee_in_baselink, tool_kind="two_finger"):
   c = _CAL[robot_type]
   T_tool0 = np.asarray(T_ee_in_baselink, dtype=float) @ c["tool_inv"][tool_kind]
   try:
-    sols = U.solve(T_tool0, respect_limits=False)
+    raw = U.solve(T_tool0, respect_limits=False)
   except Exception:
     return []
-  return [c["sign"] * (np.asarray(s.q, dtype=float) - c["offset"]) for s in sols]
+  solver_limits = _rai_limits_in_solver_coordinates(c, joint_limits) \
+      if joint_limits is not None else None
+  sols = list(raw)
+  # A 7R target has a one-dimensional self-motion manifold.  The artifact's ordinary solve
+  # samples that manifold at 16 swivel values; post-filtering those samples is not a complete
+  # physical-limit query.  Add representatives found by its interval-based resolver instead.
+  sols.extend(_limit_aware_redundant_solutions(U, T_tool0, solver_limits))
+
+  out = []
+  rai_limits = np.asarray(joint_limits, dtype=float) if joint_limits is not None else None
+  for s in sols:
+    q = c["sign"] * (np.asarray(s.q, dtype=float) - c["offset"])
+    if rai_limits is not None and rai_limits.shape == (2, len(q)) \
+        and (np.any(q < rai_limits[0] - 1e-9) or np.any(q > rai_limits[1] + 1e-9)):
+      continue
+    if not any(np.linalg.norm(q - old) < 1e-5 for old in out):
+      out.append(q)
+  return out

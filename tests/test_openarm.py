@@ -140,6 +140,38 @@ def test_openarm_exact_ik_seeds_are_seven_dof_and_limit_filtered():
     assert all(np.all(np.asarray(q) >= lo) and np.all(np.asarray(q) <= hi) for q in seeds)
 
 
+def test_openarm_ssik_resolves_runtime_limit_interval_between_coarse_swivel_samples():
+  """A known-reachable 7R pose must not disappear between the 16 default swivel samples."""
+  C = make_openarm_duo_env(1)
+  names = list(C.getJointNames())
+  lo, hi = (np.asarray(x, dtype=float) for x in C.getJointLimits())
+  idx = [i for i, name in enumerate(names) if name.startswith("a1_")]
+  limits = np.vstack([lo[idx], hi[idx]])
+  q = np.array([-1.2409216966589218, -1.737516632428059, 0.25913947275593974,
+                -1.3944498768318796, 1.5490833184797295, 1.7884215204366625,
+                -0.9227026103442852])
+  cal = analytic_ik._CAL["openarm_right"]
+  U = analytic_ik._solver("openarm_right")
+  target = U.fk(cal["sign"] * q + cal["offset"]) @ cal["tools"]["two_finger"]
+
+  # This target is the regression: none of the generated solver's coarse raw samples lies
+  # inside the runtime RAI box, although q itself proves that the continuous manifold does.
+  coarse = []
+  for solution in U.solve(target @ cal["tool_inv"]["two_finger"], respect_limits=False):
+    qr = cal["sign"] * (np.asarray(solution.q) - cal["offset"])
+    if np.all(qr >= limits[0]) and np.all(qr <= limits[1]):
+      coarse.append(qr)
+  assert not coarse
+
+  seeds = analytic_ik.seed_configs(
+      "openarm_right", target, tool_kind="two_finger", joint_limits=limits)
+  assert seeds
+  assert all(np.all(s >= limits[0]) and np.all(s <= limits[1]) for s in seeds)
+  for seed in seeds:
+    actual = U.fk(cal["sign"] * seed + cal["offset"]) @ cal["tools"]["two_finger"]
+    np.testing.assert_allclose(actual, target, atol=2e-5)
+
+
 def test_ssik_neighborhood_is_bounded_guidance_when_exact_target_is_empty(monkeypatch):
   """Nearby SSIK samples must seed the original KOMO, never become an empty-set refuter."""
   rik = S.RobotIK.__new__(S.RobotIK)
