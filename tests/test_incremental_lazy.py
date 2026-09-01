@@ -109,3 +109,49 @@ def test_compact_frontier_regenerates_after_a_cheap_edge_refutation():
       memoize_successors=False, compact_frontier=True)
   assert e.search(100) == [('good', 2), ('finish', 1)]
   assert ("S", ('bad', 1)) in blacklist
+
+
+def test_opt_in_forward_search_profile_counts_work(monkeypatch):
+  monkeypatch.setenv("FILL_SEARCH_PROFILE", "1")
+  graph = {
+      "S": [(('go', 1), "A")],
+      "A": [(('finish', 1), "G")],
+      "G": [],
+  }
+  e = _IncrementalLazySearch(
+      "S", goal_fn=lambda s: s == "G", succ_fn=lambda s: graph[s],
+      cost_fn=lambda a: a[1], h_fn=lambda _s: 0, weight=1, blacklist=set(),
+      cheap_gate=lambda _s, _a, _ns: True)
+  assert e.search(10) == [('go', 1), ('finish', 1)]
+  p = e.profile_snapshot()
+  assert p["search_calls"] == 1
+  assert p["search_wall"] >= 0
+  assert p["succ_calls"] == 2
+  assert p["succ_edges"] == 2
+  assert p["cheap_calls"] == 2
+  assert p["heap_pops"] == 3
+
+
+def test_heuristic_is_evaluated_once_per_value_state_across_repairs():
+  graph = {
+      "S": [(('left', 1), "A"), (('right', 1), "B")],
+      "A": [(('bad', 1), "X")],
+      "B": [(('good', 1), "X")],
+      "X": [(('finish', 1), "G")],
+      "G": [],
+  }
+  calls = {}
+
+  def h(state):
+    calls[state] = calls.get(state, 0) + 1
+    return 0
+
+  blacklist = set()
+  e = _IncrementalLazySearch(
+      "S", goal_fn=lambda s: s == "G", succ_fn=lambda s: graph[s],
+      cost_fn=lambda a: a[1], h_fn=h, weight=1, blacklist=blacklist)
+  assert e.search(20) == [('left', 1), ('bad', 1), ('finish', 1)]
+  blacklist.add(("A", ('bad', 1)))
+  e.delete_edge("A", ('bad', 1), "X")
+  assert e.search(20) == [('right', 1), ('good', 1), ('finish', 1)]
+  assert calls == {state: 1 for state in graph}

@@ -13,7 +13,7 @@ small adapters (construct engine, walk a plan, identify IK edges), keeping the e
 and default code path unchanged.
 """
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import time
 
 
@@ -33,9 +33,12 @@ class OpenWitnessReport:
   max_successor_states: int = 0
   max_successor_edges: int = 0
   max_tree_edges: int = 0
+  max_expanded: int = 0
+  max_heuristic_states: int = 0
   max_node_budget: int = 0
   reordered_paths: int = 0
   prior_failure_first: int = 0
+  search_profile: dict = field(default_factory=dict)
 
 
 class OpenWitnessPool:
@@ -229,6 +232,47 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
     report.max_successor_states = max(report.max_successor_states, f["successor_states"])
     report.max_successor_edges = max(report.max_successor_edges, f["successor_edges"])
     report.max_tree_edges = max(report.max_tree_edges, f["tree_edges"])
+    report.max_expanded = max(report.max_expanded, f.get("expanded", 0))
+    report.max_heuristic_states = max(
+        report.max_heuristic_states, f.get("heuristic_states", 0))
+    # Engines are rebuilt between fairness epochs. Merge only the delta since the previous
+    # sample of this particular engine, otherwise repeated candidate-plan samples would count
+    # the cumulative counters repeatedly.
+    snap = engine.profile_snapshot() if hasattr(engine, "profile_snapshot") else {}
+    if snap:
+      ident = id(engine)
+      prior = profile_seen.get(ident, {})
+      for key, value in snap.items():
+        report.search_profile[key] = report.search_profile.get(key, 0) + value - prior.get(key, 0)
+      profile_seen[ident] = snap
+
+  profile_seen = {}
+
+  def search_profile_tail():
+    p = report.search_profile
+    if not p:
+      return ""
+    # These named timers are children of search_wall except delete_wall, which runs between
+    # search calls. `other` is the exact residual inside search (hashing, state/tree updates,
+    # Python edge-loop control and goal checks), after subtracting non-overlapping children.
+    children = sum(float(p.get(k, 0.0)) for k in (
+        "succ_wall", "heuristic_wall", "cheap_wall", "queue_wall", "alt_wall"))
+    other = max(0.0, float(p.get("search_wall", 0.0)) - children)
+    return (f"; forward-prof search={p.get('search_wall', 0.0):.2f}s "
+            f"succ={p.get('succ_wall', 0.0):.2f}s/"
+            f"{int(p.get('succ_calls', 0))}x/{int(p.get('succ_edges', 0))}e "
+            f"h={p.get('heuristic_wall', 0.0):.2f}s/"
+            f"{int(p.get('heuristic_misses', 0))}miss/"
+            f"{int(p.get('heuristic_calls', 0))}x "
+            f"gate={p.get('cheap_wall', 0.0):.2f}s/{int(p.get('cheap_calls', 0))} "
+            f"queue={p.get('queue_wall', 0.0):.2f}s/"
+            f"{int(p.get('queue_added', 0))}+/{int(p.get('queue_dominated', 0))}- "
+            f"alts={p.get('alt_wall', 0.0):.2f}s/"
+            f"{int(p.get('alt_updates', 0))}+/{int(p.get('alt_calls', 0))}x "
+            f"other={other:.2f}s repair={p.get('delete_wall', 0.0):.2f}s/"
+            f"{int(p.get('delete_calls', 0))} "
+            f"pops={int(p.get('heap_pops', 0))} stale="
+            f"{int(p.get('superseded_pops', 0) + p.get('stale_parent_pops', 0))}")
 
   def storage_tail():
     select = (f"; selector={selector}, reordered={report.reordered_paths}, "
@@ -238,7 +282,9 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
     return (f"; search peak pending/heap={report.max_frontier}/{report.max_heap_entries}, "
             f"alts={report.max_alternates}, unique={report.max_unique_states}, "
             f"succ={succ}, "
-            f"tree={report.max_tree_edges}, node-cap={report.max_node_budget}" + select)
+            f"tree={report.max_tree_edges}, expanded={report.max_expanded}, "
+            f"h-states={report.max_heuristic_states}, node-cap={report.max_node_budget}" + select
+            + search_profile_tail())
 
   epoch = 0
   while max_epochs == 0 or epoch < max_epochs:

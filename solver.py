@@ -58,6 +58,25 @@ _ASSEMBLE_BIAS_ORIENTATIONS = [
 ]
 
 
+def _assemble_bias_pose(bias, position=None):
+  """Concrete ``onto`` pose represented by one existing soft assembly bias.
+
+  The old sweep specifies the desired world directions of the frame's local +z and +x and
+  separately pulls its origin to ``_ASSEMBLE_POS_BIAS_TARGET``.  This is the exact SE(3)
+  representative used only by the experimental SSIK initializer; the authoritative KOMO
+  keeps the historical soft objectives and may move away from it.
+  """
+  z = np.asarray(bias[0], dtype=float)
+  x = np.asarray(bias[1], dtype=float)
+  z /= np.linalg.norm(z)
+  x -= z * float(np.dot(z, x))
+  x /= np.linalg.norm(x)
+  y = np.cross(z, x)
+  R = np.column_stack([x, y, z])
+  p = _ASSEMBLE_POS_BIAS_TARGET if position is None else position
+  return np.concatenate([np.asarray(p, dtype=float), _mat_to_quat(R)])
+
+
 # Search-scoped setting, installed by main before any CollisionChecker is constructed.  Like
 # tight-fingers it changes feasibility/action semantics and is persisted with a plan.
 _GRASP_CLOSURE_CHECK = False
@@ -581,6 +600,18 @@ class RobotIK:
     self.robot_arm = {}                                # 'ur5' | 'ur10' -- picks the analytic solver
     self.base_link = {}                                # URDF base frame (ssik's reference)
     self.ik_seeding = False                            # warm-start KOMO with analytic (ssik) IK
+    self.assemble_ssik_pose_seeds = False               # opt-in canonical held-pose projection
+    self.assemble_ssik_pose_projection = False          # opt-in centre->current line projection
+    self.assemble_unbiased_first = False                 # opt-in neutral-before-bias ordering
+    self.assemble_basin_racing = False                  # opt-in collision-aware basin racing
+    self.assemble_race_probe_evals = 24
+    self.assemble_race_promote = 3
+    self._assemble_race_cache = {}                      # physical query -> probes/promotions
+    self.handover_basin_racing = False                  # opt-in random multistart racing
+    self.handover_race_probe_evals = 24
+    self.handover_race_starts = 6
+    self.handover_race_promote = 3
+    self._handover_race_cache = {}                      # physical query -> partial starts
     names = set(self.C.getFrameNames())
     for r in self.robots:
       tool_center, _base_rel, q_corr = _gripper_rest_transforms(self.C, r + "_")
@@ -1281,7 +1312,9 @@ class RobotIK:
         self.prof["bind_cache_hits"] += 1
         return hit
     _old_depth = getattr(self, "_bind_profile_depth", 0)
+    _old_query_key = getattr(self, "_cur_query_key", None)
     self._bind_profile_depth = _old_depth + 1
+    self._cur_query_key = key
     try:
       if kind == "pick":
         res = self._ik_pick(action, s0, s1, assembly, seed)
@@ -1293,6 +1326,7 @@ class RobotIK:
         res = self._ik_add_grasp(action, s0, s1, assembly, seed)
     finally:
       self._bind_profile_depth = _old_depth
+      self._cur_query_key = _old_query_key
     self.prof["bind_solves"] += 1
     self.prof["bind_success" if res[0] else "bind_fail"] += 1
     _dt = _time.perf_counter() - _bt0
@@ -1441,6 +1475,13 @@ class RobotIK:
             f"({100 * float(seconds) / max(p['bind_time'], 1e-9):4.1f}%)")
     print(f"[ik-prof]   {'other/control':18s} {'-':>6s}  {other:7.2f}s "
           f"({100 * other / max(p['bind_time'], 1e-9):4.1f}%)")
+    # This deliberately wraps analytic-seed + exact-branch-probe calls, so report it as an
+    # inclusive experiment cost rather than double-counting it in the exclusive accounting.
+    aps_n = int(p.get("assemble_pose_seed_calls", 0))
+    aps_t = float(p.get("assemble_pose_seed_time", 0.0))
+    if aps_n:
+      print(f"[ik-prof] assembly-pose initializer (inclusive): {aps_n}x in {aps_t:.2f}s "
+            "(contains its analytic-seed and exact-branch-probe stages)")
     if self.positive_ik_reuse:
       print(f"[ik-reuse] physical-query invariant: "
             f"{p['physical_query_collapses']} symbolic aliases collapsed across "
@@ -1472,6 +1513,91 @@ class RobotIK:
       wins = ", ".join(f"{k}={v}" for k, v in sorted(p["wins"].items()))
       print(f"[ik-prof] winning attempt distribution: {wins}")
     ba = p["by_action"]
+    if ba:
+      primitive = {}
+      for (kind, _robot, _part, _gid), (n, nf, seconds) in ba.items():
+        row = primitive.setdefault(kind, [0, 0, 0.0])
+        row[0] += int(n)
+        row[1] += int(nf)
+        row[2] += float(seconds)
+      nlp_primitive = {}
+      for (kind, context, stage), (n, seconds) in p.get("nlp_by_primitive", {}).items():
+        row = nlp_primitive.setdefault(kind, [0, 0.0, 0, 0.0])
+        off = 0 if context == "full" else 2
+        row[off] += int(n)
+        row[off + 1] += float(seconds)
+      print("[ik-prof] primitive totals "
+            "(binds/failed/bind-wall; full-NLP count/time; precheck-NLP count/time):")
+      for kind, (n, nf, seconds) in sorted(primitive.items(), key=lambda kv: -kv[1][2]):
+        fn, ft, pn, pt = nlp_primitive.get(kind, [0, 0.0, 0, 0.0])
+        print(f"[ik-prof]   {kind:9s} {n:4d}/{nf:<4d} {seconds:7.2f}s; "
+              f"full {fn:4d}/{ft:6.2f}s; precheck {pn:4d}/{pt:6.2f}s")
+    if p.get("nlp_by_primitive"):
+      print("[ik-prof] optimizer initialization effort by primitive/context:")
+      grouped = {}
+      for (kind, context, stage), (n, seconds) in p["nlp_by_primitive"].items():
+        grouped.setdefault((kind, context), []).append((stage, int(n), float(seconds)))
+      def _stage_rank(item):
+        stage = item[0]
+        if stage.startswith("seed") and stage[4:].isdigit(): return (0, int(stage[4:]))
+        if stage == "unseeded": return (1, 0)
+        if stage.startswith("restart"): return (2, int(stage[7:]))
+        if stage.startswith("nearseed") and stage[8:].isdigit(): return (3, int(stage[8:]))
+        if stage == "margin": return (4, 0)
+        return (5, str(stage))
+      for (kind, context), entries in sorted(grouped.items()):
+        detail = ", ".join(f"{stage}={n}/{seconds:.2f}s"
+                           for stage, n, seconds in sorted(entries, key=_stage_rank))
+        print(f"[ik-prof]   {kind:9s} {context:8s} {detail}")
+    if p.get("wins_by_primitive"):
+      print("[ik-prof] successful/failed terminal attempt by primitive:")
+      kinds = sorted({kind for kind, _stage in p["wins_by_primitive"]})
+      for kind in kinds:
+        detail = ", ".join(
+            f"{stage}={n}" for (kk, stage), n in sorted(p["wins_by_primitive"].items())
+            if kk == kind)
+        print(f"[ik-prof]   {kind:9s} {detail}")
+    if p.get("assemble_basin_stats"):
+      print("[ik-prof] held-assembly basin effort "
+            "(attempts/raw-solver-ok/accepted; wall; NLP solves/evals/time; mean eq/ineq):")
+      order = {"unbiased": -2, "fallback": 99}
+      for label, row in sorted(p["assemble_basin_stats"].items(),
+                               key=lambda item: (order.get(item[0], 0), item[0])):
+        nr = max(1, int(row["residual_samples"]))
+        print(f"[ik-prof]   {label:9s} {row['attempts']:4d}/{row['raw_success']:3d}/"
+              f"{row['accepted']:3d}; {row['wall']:6.2f}s; "
+              f"{row['nlp_solves']:4d}/{row['evals']:6d}/{row['nlp_time']:6.2f}s; "
+              f"{row['eq_sum']/nr:.3g}/{row['ineq_sum']/nr:.3g}"
+              + (f"; funnel-reject={row['funnel_rejects']}"
+                 if row["funnel_rejects"] else ""))
+    if p.get("assemble_race_probe_stats"):
+      print("[ik-prof] assembly-race shallow probes "
+            "(bias attempts/raw-ok; evaluations; wall; mean eq/ineq):")
+      for bi, row in sorted(p["assemble_race_probe_stats"].items()):
+        n = max(1, int(row["attempts"]))
+        print(f"[ik-prof]   bias{bi} {row['attempts']:4d}/{row['raw_success']:3d}; "
+              f"{row['evals']:6d}; {row['wall']:6.2f}s; "
+              f"{row['eq_sum']/n:.3g}/{row['ineq_sum']/n:.3g}")
+      promoted, successes, deferred = p.get("assemble_race_promotions", (0, 0, 0))
+      print(f"[ik-prof] assembly-race continuations: {promoted} promoted, "
+            f"{successes} solver-successful, {deferred} visit(s) returned with lower-ranked "
+            "basins still pending")
+    if p.get("handover_race_stats"):
+      row = p["handover_race_stats"]
+      n = max(1, int(row["probes"]))
+      print("[ik-prof] handover-race random starts "
+            "(generations/probes/raw-ok; evaluations/probe-wall; mean eq/ineq):")
+      print(f"[ik-prof]   {row['generations']:4d}/{row['probes']:4d}/"
+            f"{row['raw_success']:3d}; {row['probe_evals']:7d}/{row['probe_time']:6.2f}s; "
+            f"{row['eq_sum']/n:.3g}/{row['ineq_sum']/n:.3g}")
+      print(f"[ik-prof] handover-race continuations: {row['promoted']} promoted, "
+            f"{row['successes']} accepted; {row['deferred']} visit(s) deferred partial starts, "
+            f"{row['exhausted']} exhausted a generation")
+    if p.get("assemble_pose_seed_stats"):
+      poses, reachable, candidates, retained = p["assemble_pose_seed_stats"]
+      print(f"[ik-prof] canonical assembly-pose SSIK: {poses} poses projected, "
+            f"{reachable} jointly reachable, {candidates} collision-ranked full "
+            f"configuration(s), {retained} retained as KOMO seeds")
     if ba:
       print("[ik-prof] top actions by bind time (kind/robot/part/grasp: n (failed) time):")
       for (kind, robot, part, gid), (n, nf, t) in sorted(
@@ -1835,12 +1961,17 @@ class RobotIK:
     finally:
       C.setJointState(saved)
 
-  def _nlp(self, komo):
+  def _nlp(self, komo, stop_evals=None):
     """The ONE place an NLP_Solver is built, so `nlp_stop_tolerance` cannot be applied to some
     solve paths and not others (there are three inside _solve_ik alone)."""
     s = ry.NLP_Solver(komo.nlp(), verbose=0)
+    options = {}
     if self.nlp_stop_tolerance is not None:
-      s.setOptions(stopTolerance=float(self.nlp_stop_tolerance))
+      options["stopTolerance"] = float(self.nlp_stop_tolerance)
+    if stop_evals is not None:
+      options["stopEvals"] = max(1, int(stop_evals))
+    if options:
+      s.setOptions(**options)
     return s
 
   def _pen_ok(self, C, q):
@@ -2154,7 +2285,8 @@ class RobotIK:
                       [-self.col_weight], [float(lo[k] + target)])
     return (kind, str(fa))
 
-  def _solve_ik(self, komo, restarts=None, seeds=None, C=None, deferred_seeds=None):
+  def _solve_ik(self, komo, restarts=None, seeds=None, C=None, deferred_seeds=None,
+                skip_unseeded=False, race_random=False):
     # solve a skill KOMO, retrying from fresh inits until one converges. KOMO seeds its guess
     # with a little noise, so a borderline-reachable target flips feasible/infeasible run-to-
     # run; restarts make bind reliable -- a genuinely feasible action returns a witness (instead
@@ -2164,6 +2296,11 @@ class RobotIK:
     # ones (an exact analytic pose may collide, whereas the KOMO's tolerant pose eq can settle on
     # a nearby collision-free pose the discrete IK solutions don't cover), hence the fallback.
     import time as _time
+    # Per-call totals let the enclosing assembly-basin profiler attribute every seeded,
+    # ordinary, restart and lazy-margin solve to the bias that requested them. They are
+    # diagnostic only and deliberately separate from the cumulative self.prof buckets.
+    call_stats = self._last_solve_ik_stats = {
+        "solves": 0, "evals": 0, "nlp_time": 0.0}
     if restarts is None:
       restarts = self.restarts_full                       # --ik-restarts (default 12)
     # An open-witness query is revisited by construction.  Visit zero tries the finite analytic
@@ -2184,10 +2321,27 @@ class RobotIK:
       self.prof["calls_without_seeds"] += 1
 
     def _win(k):                                          # A1: winning-attempt histogram
+      kind = tuple(getattr(self, "_cur_action", ()) or ("unknown",))[0]
       if getattr(self, "_pc", False):
         k = "pc_" + k                                     # precheck-sourced (relaxed solve)
       self.prof["wins"][k] = self.prof["wins"].get(k, 0) + 1
+      wk = (kind, k)
+      wins_by_primitive = self.prof.setdefault("wins_by_primitive", {})
+      wins_by_primitive[wk] = wins_by_primitive.get(wk, 0) + 1
       self._last_win = k
+
+    def _record_nlp(stage, dt, result=None):
+      """Exclusive optimizer effort by primitive, solve context and initialization level."""
+      kind = tuple(getattr(self, "_cur_action", ()) or ("unknown",))[0]
+      context = "precheck" if getattr(self, "_pc", False) else "full"
+      key = (kind, context, stage)
+      bucket = self.prof.setdefault("nlp_by_primitive", {}).setdefault(key, [0, 0.0])
+      bucket[0] += 1
+      bucket[1] += float(dt)
+      call_stats["solves"] += 1
+      call_stats["nlp_time"] += float(dt)
+      if result is not None:
+        call_stats["evals"] += int(result.get("evals", 0) or 0)
 
     def _record_precheck_nlp(dt):
       if getattr(self, "_pc", False):
@@ -2232,6 +2386,7 @@ class RobotIK:
         self.prof["margin_refine_solves"] = self.prof.get("margin_refine_solves", 0) + 1
         self.prof["margin_refine_time"] = self.prof.get("margin_refine_time", 0.0) \
             + _ndt
+        _record_nlp("margin", _ndt, current)
         _record_precheck_nlp(_ndt)
       return None, current
 
@@ -2260,6 +2415,7 @@ class RobotIK:
         _ndt = _time.perf_counter() - _t0
         self.prof["seeded_solves"] += 1
         self.prof["seeded_time"] += _ndt
+        _record_nlp(f"{label}{_si}", _ndt, r_seed)
         _record_precheck_nlp(_ndt)
         if r_seed["feasible"]:
           q_seed, r_seed = _certify_with_margin_cuts(r_seed)
@@ -2286,12 +2442,13 @@ class RobotIK:
       restarts = min(restarts, self.seed_restart_cap)
     import time as _time
     r = None
-    if not _open_random_only:
+    if not _open_random_only and not skip_unseeded:
       _t0 = _time.perf_counter()
       r = self._nlp(komo).solve().dict()
       _ndt = _time.perf_counter() - _t0
       self.prof["unseeded_solves"] += 1
       self.prof["unseeded_time"] += _ndt
+      _record_nlp("unseeded", _ndt, r)
       _record_precheck_nlp(_ndt)
       if r["feasible"]:
         q_unseeded, r = _certify_with_margin_cuts(r)
@@ -2299,6 +2456,119 @@ class RobotIK:
           _win("unseeded")
           self._last_res = r
           return True, q_unseeded
+
+    # HANDOVER RANDOM-MULTISTART RACING (opt-in). Unlike held-target assembly there is no
+    # finite semantic orientation family here: the currently holding arm may continuously
+    # present the payload. The honest alternatives are therefore fresh optimizer basins.
+    # Give every basin a small solve with the REAL collision KOMO, cache its partial iterate
+    # under the physical query, and fully continue only the best few per visit. A shallow miss
+    # is ranking evidence only. It never becomes an infeasibility verdict, and an exhausted
+    # generation opens a fresh random generation on a later open-witness visit.
+    if race_random and not getattr(self, "_pc", False):
+      rkey = getattr(self, "_cur_query_key", None)
+      if rkey is None:
+        rkey = (tuple(getattr(self, "_cur_action", ("handover",))), "direct")
+      path0 = np.asarray(komo.getPath())
+      qwidth = int(path0.shape[-1]) if path0.ndim >= 2 and path0.size else -1
+      state = self._handover_race_cache.get(rkey)
+      if state is None or int(state.get("qwidth", -2)) != qwidth:
+        state = {"qwidth": qwidth, "generation": 0, "probes": [], "promoted": set()}
+        self._handover_race_cache[rkey] = state
+      elif state["probes"] and len(state["promoted"]) >= len(state["probes"]):
+        state = {"qwidth": qwidth, "generation": int(state["generation"]) + 1,
+                 "probes": [], "promoted": set()}
+        self._handover_race_cache[rkey] = state
+
+      race_prof = self.prof.setdefault("handover_race_stats", {
+          "generations": 0, "probes": 0, "raw_success": 0, "probe_evals": 0,
+          "probe_time": 0.0, "eq_sum": 0.0, "ineq_sum": 0.0,
+          "promoted": 0, "successes": 0, "deferred": 0, "exhausted": 0})
+
+      def _finite_result(rr, name, default=float("inf")):
+        value = float(rr.get(name, default))
+        return value if np.isfinite(value) else default
+
+      if not state["probes"]:
+        race_prof["generations"] += 1
+        for si in range(max(1, int(self.handover_race_starts))):
+          komo.initRandom()
+          _t0 = _time.perf_counter()
+          rr = self._nlp(komo, stop_evals=self.handover_race_probe_evals).solve().dict()
+          _ndt = _time.perf_counter() - _t0
+          self.prof["restart_solves"] += 1
+          self.prof["restart_time"] += _ndt
+          _record_nlp("race-probe", _ndt, rr)
+          q = np.asarray(komo.getPath()[-1], dtype=float).copy()
+          score = (0 if rr.get("feasible", False) else 1,
+                   max(0.0, _finite_result(rr, "ineq")),
+                   _finite_result(rr, "eq"), _finite_result(rr, "sos"), si)
+          state["probes"].append((score, q, rr))
+          race_prof["probes"] += 1
+          race_prof["raw_success"] += int(bool(rr.get("feasible", False)))
+          race_prof["probe_evals"] += int(rr.get("evals", 0) or 0)
+          race_prof["probe_time"] += _ndt
+          race_prof["eq_sum"] += _finite_result(rr, "eq", 0.0)
+          race_prof["ineq_sum"] += _finite_result(rr, "ineq", 0.0)
+
+      ordered = sorted((score, si, q, rr)
+                       for si, (score, q, rr) in enumerate(state["probes"])
+                       if si not in state["promoted"])
+      if self._open_probe_attempt is None:
+        promote_n = len(ordered)                         # legacy call remains exhaustive
+      else:
+        # Respect this visit's ordinary restart tier: visit zero has one post-neutral slot,
+        # revisit one has four, etc. The explicit cap can only LOWER that effort.
+        promote_n = min(len(ordered), max(1, int(restarts)),
+                        max(1, int(self.handover_race_promote)))
+      last_race_result = None
+      for _score, si, q, _probe_result in ordered[:promote_n]:
+        state["promoted"].add(si)
+        race_prof["promoted"] += 1
+        komo.initWithConstant(q)
+        # A bounded probe may already have reached RAI feasibility before its evaluation cap.
+        # That is a complete optimizer result, not merely a promising partial iterate: apply
+        # the exact penetration/clearance certificate immediately. Re-solving it first can
+        # perturb a valid basin and was measured to discard many cheap Chair handovers.
+        if _probe_result.get("feasible", False):
+          q_probe, certified = _certify_with_margin_cuts(_probe_result)
+          last_race_result = certified
+          if q_probe is not None:
+            race_prof["successes"] += 1
+            _win("race-probe")
+            self._last_res = certified
+            return True, q_probe
+          # An exact post-gate rejection does not prove the basin cannot move to a nearby
+          # certificate. Retain the ordinary full continuation below.
+        _t0 = _time.perf_counter()
+        rr = self._nlp(komo).solve().dict()
+        _ndt = _time.perf_counter() - _t0
+        last_race_result = rr
+        self.prof["restart_solves"] += 1
+        self.prof["restart_time"] += _ndt
+        _record_nlp("race-continue", _ndt, rr)
+        if rr.get("feasible", False):
+          q_race, rr = _certify_with_margin_cuts(rr)
+          last_race_result = rr
+          if q_race is not None:
+            race_prof["successes"] += 1
+            _win("race-continue")
+            self._last_res = rr
+            return True, q_race
+      if last_race_result is not None:
+        r = last_race_result
+      remaining = len(state["probes"]) - len(state["promoted"])
+      if self._open_probe_attempt is not None:
+        if remaining:
+          race_prof["deferred"] += 1
+        else:
+          race_prof["exhausted"] += 1
+        _win("none")
+        self._last_res = r or (ordered[0][3] if ordered else {})
+        return False, None
+      # A non-open legacy-sized solve has no revisit that could consume pending starts. It
+      # therefore continues every raced basin above, then retains the remainder of the old
+      # random-restart budget so enabling the experiment cannot reduce eventual effort.
+      restarts = max(0, int(restarts) - int(promote_n))
     # On a FAIR open-witness revisit, the historical exact/unseeded attempts were already
     # spent. Share this visit's fixed budget between finite near-target evidence and fresh
     # random basins; neighbours must REPLACE effort slots, not silently multiply them.
@@ -2317,6 +2587,7 @@ class RobotIK:
       _ndt = _time.perf_counter() - _t0
       self.prof["restart_solves"] += 1
       self.prof["restart_time"] += _ndt
+      _record_nlp(f"restart{_ri}", _ndt, r)
       _record_precheck_nlp(_ndt)
       if r["feasible"]:
         q_restart, r = _certify_with_margin_cuts(r)
@@ -2367,6 +2638,102 @@ class RobotIK:
       out[rr] = _pose_compose(pt_land, np.asarray(self.ee_target(rr, pt, gid, assembly),
                                                   dtype=float))
     return out
+
+  @_timed_bind_stage("assemble_pose_seed")
+  def _canonical_assemble_pose_seeds(self, C, s0, assembly, moving, part, onto,
+                                     rel_pos, rel_quat, mover, target_group, cap=8,
+                                     project_position=False):
+    """Project the six existing held-assembly biases through every participating arm.
+
+    Returns ``(per_bias, order)`` where each value is a complete joint configuration at the
+    corresponding concrete common pose.  Empty/penetrating candidates reject only that
+    finite seed, never the continuous assembly action.  The final KOMO still carries the
+    historical soft pose bias and all authoritative collision/clearance gates.
+    """
+    holders = self.holders(s0)
+    target_holders = sorted(r for r, (pt, _gid) in holders.items() if pt in target_group)
+    if not target_holders:
+      return {}, []                                      # table-fixed path is handled exactly
+
+    q0 = np.asarray(C.getJointState(), dtype=float).copy()
+    current_position = np.asarray(C.getFrame(onto).getPosition(), dtype=float).copy()
+    preferred_position = np.asarray(_ASSEMBLE_POS_BIAS_TARGET, dtype=float)
+    names = list(C.getJointNames())
+    try:
+      lo, hi = (np.asarray(v, dtype=float).ravel() for v in C.getJointLimits())
+    except Exception:
+      lo = hi = np.array([], dtype=float)
+    unrelated = [r for r in self.robots
+                 if r != mover and r not in target_holders
+                 and holders.get(r, (None, None))[0] not in moving]
+    entries = []                                         # (physical score, bias index, q)
+    stats = self.prof.setdefault("assemble_pose_seed_stats", [0, 0, 0, 0])
+
+    try:
+      for bi, bias in enumerate(_ASSEMBLE_BIAS_ORIENTATIONS):
+        # The exact-centre ablation has one representative. The projection variant searches
+        # the segment from that same preferred point toward the already realized target pose.
+        # Fractions are ordered by distance to the actual soft-objective minimizer, so stopping
+        # at the first jointly reachable sample is a discrete Euclidean projection, not an
+        # action-feasibility claim. The old continuous KOMO remains below in every case.
+        fractions = (1.0, 0.75, 0.5, 0.25, 0.0) if project_position else (1.0,)
+        for fraction in fractions:
+          stats[0] += 1                                  # concrete poses considered
+          position = (current_position
+                      + float(fraction) * (preferred_position - current_position))
+          onto_target = _assemble_bias_pose(bias, position)
+          part_target = _pose_compose(
+              onto_target, np.concatenate([np.asarray(rel_pos), np.asarray(rel_quat)]))
+          arm_targets = self._attached_arm_targets(
+              C, s0, assembly, moving, part, part_target, mover)
+          arm_targets.update(self._attached_arm_targets(
+              C, s0, assembly, target_group, onto, onto_target, target_holders[0]))
+
+          arm_seeds = {}
+          if any(not self._analytic_reject_ok(r) for r in arm_targets):
+            break                                       # incomplete projection: non-rejecting
+          for r, target in arm_targets.items():
+            sols = self._analytic_seeds(C, r, target, None)
+            if not sols:
+              arm_seeds = {}
+              break                                     # this finite pose is unreachable
+            arm_seeds[r] = sols
+          if len(arm_seeds) != len(arm_targets):
+            continue
+          stats[1] += 1                                  # jointly kinematically reachable pose
+
+          reject, candidates = self._probe_branch_combos(
+              C, arm_seeds, exclude=unrelated, cap=cap)
+          if reject or not candidates:
+            continue                                    # finite pose only; action remains open
+          stats[2] += len(candidates)
+          for q in candidates:
+            q = np.asarray(q, dtype=float).ravel()
+            if q.size != q0.size:
+              continue
+            C.setJointState(q)
+            C.computeCollisions()
+            depths = [-float(d) for _a, _b, d in C.getCollisions(0.0) if d < 0.0]
+            max_pen = max(depths, default=0.0)
+            total_pen = float(sum(depths))
+            slack = (float(np.min(np.minimum(q - lo, hi - q)))
+                     if lo.size == q.size else 0.0)
+            distance = float(np.linalg.norm(q - q0))
+            entries.append(((max_pen, total_pen, -slack, distance), bi, q.copy()))
+          break                                         # closest reachable point for this bias
+    finally:
+      C.setJointState(q0)
+
+    entries.sort(key=lambda item: item[0])
+    retained = entries[:max(1, int(cap))]
+    stats[3] += len(retained)
+    per_bias = {}
+    order = []
+    for _score, bi, q in retained:
+      per_bias.setdefault(bi, []).append(q)
+      if bi not in order:
+        order.append(bi)
+    return per_bias, order
 
   def _compose_full_seeds(self, C, arm_seeds, cap=8):
     # Full joint-vector warm starts for a MULTI-ARM KOMO from per-arm analytic solutions:
@@ -2909,9 +3276,12 @@ class RobotIK:
       return False, None                                  # clear reach failure (relaxed solve)
 
     komo = self._timed_stage_call("komo_build", build, True)
+    race_handover = (self.handover_basin_racing and action[0] == "handover"
+                     and backoff <= 0.0 and warm is None
+                     and self._opt_pull is None and self.harvest_branches is None)
     feasible, witness = self._solve_ik(          # `warm` (full config) couples pre-add-grasp to
         komo, seeds=([np.asarray(warm, dtype=float)] if warm is not None else None),  # the grasp
-        C=C)
+        C=C, race_random=race_handover)
     if feasible and witness is not None and self.grasp_pose_reject is not None \
         and backoff <= 0.0:                               # same freeze as picks: the handover/
       if self.grasp_pose_residual(C, witness, robot, gpart, ee_target) \
@@ -3141,12 +3511,13 @@ class RobotIK:
     # the adder + whoever holds the target (if held). If the target is on the table it is a
     # fixed target and only the adder is active (others held near home by the control cost).
     #
-    # STRUCTURED RESTARTS: instead of random inits, sweep the canonical assembly
-    # orientations (`_ASSEMBLE_BIAS_ORIENTATIONS`) -- each biases the held assembly toward a
-    # different sensible pose -- and accept the first that reaches the mate collision-free.
-    # If none do, fall back to a few unbiased random restarts. When the target rests on the
-    # table its orientation is fixed, so the first bias already succeeds (sweep is cheap).
-    # Pass an explicit `bias_axes` to force one orientation (skips the sweep).
+    # STRUCTURED RESTARTS: for a HELD target, sweep the canonical assembly orientations --
+    # each selects a different basin for the otherwise free common assembly pose. A target
+    # resting on the table has NO such freedom: all six orientation objectives act on a fixed
+    # frame and are the same IK problem. That case uses one unbiased KOMO; the open-witness
+    # scheduler moves on after its first deterministic visit and spends fresh random effort
+    # only if the physical query is revisited.
+    # Pass an explicit `bias_axes` to force one orientation (export/debug; skips the sweep).
     _, robot, part, onto = action
     C = self.scene_for(s0, assembly)                      # `part` is attached to robot's gripper
     part_name = part
@@ -3192,7 +3563,8 @@ class RobotIK:
     # reaches its fixed pose", no residual coupling -- is proven feasible and skipped.
     reachable_proven = False
     tgroup = next((g for g in s0.subassemblies() if onto in g), (onto,))
-    if not any(pt in tgroup for pt, _g in self.holders(s0).values()):
+    target_fixed = not any(pt in tgroup for pt, _g in self.holders(s0).values())
+    if target_fixed:
       opose = np.asarray(C.getFrame(onto).getPose(), dtype=float)
       part_target = _pose_compose(opose, np.concatenate([rel_pos, rel_quat]))
       # like place: the mate pose is fixed and the moving group rigid, so EVERY attached
@@ -3246,6 +3618,21 @@ class RobotIK:
         if reject:
           return False, None                              # every exact combo deeply colliding
 
+    _open_attempt = self._open_probe_attempt
+    pose_seed_bundles, pose_seed_order = {}, []
+    if ((self.assemble_ssik_pose_seeds or self.assemble_ssik_pose_projection)
+        and not target_fixed and bias_axes is None
+        and (_open_attempt is None or int(_open_attempt) == 0)):
+      pose_seed_bundles, pose_seed_order = self._canonical_assemble_pose_seeds(
+          C, s0, assembly, moving, part_name, onto, rel_pos, rel_quat, robot, tgroup,
+          project_position=self.assemble_ssik_pose_projection)
+      if pose_seed_bundles:
+        # A complete multi-arm analytical configuration at one concrete common pose is a
+        # constructive reachability proof for the collision-free relaxation. It may still
+        # collide, so only the expensive relaxed precheck is skipped--never the full KOMO.
+        reachable_proven = True
+        self._ctx_seeds = ("assemble", True, self.tool_kind[robot])
+
     if self.reach_precheck and not reachable_proven and self._pin_joints is None:
       # relaxed (collision-free) reach: can the mate pose be reached AT ALL? A clear relaxed
       # failure rejects instantly -- skipping the whole bias sweep + restart fallback (the
@@ -3256,9 +3643,27 @@ class RobotIK:
       if self._reach_precheck_reject(action, C, komo_nc):
         return False, None
 
-    _open_attempt = self._open_probe_attempt
+    fixed_single = target_fixed and bias_axes is None
+    racing = (self.assemble_basin_racing and not fixed_single and bias_axes is None
+              and backoff <= 0.0)
+    # Racing owns the seated solve below. Its recursively requested funnel-mouth solves use
+    # the already successful neutral-first order, but are not themselves raced/cached.
+    unbiased_first = ((self.assemble_unbiased_first or self.assemble_basin_racing)
+                      and not fixed_single
+                      and bias_axes is None)
     if bias_axes is not None:
       sweep = [(0, bias_axes)]                             # forced single orientation (export)
+    elif fixed_single:
+      # The target frame is fixed by table support: orientation biases are constants, not
+      # distinct basins. One unbiased problem is the exact quotient of the old six sweeps.
+      sweep = [(0, None)]
+    elif pose_seed_order:
+      # Seeded concrete poses first, ordered by complete-scene penetration, joint slack and
+      # current-configuration distance. Keep every unseeded soft bias afterwards: failure of
+      # one centre pose says nothing about the continuous held-assembly pose family.
+      indices = pose_seed_order + [i for i in range(len(_ASSEMBLE_BIAS_ORIENTATIONS))
+                                   if i not in pose_seed_order]
+      sweep = [(i, _ASSEMBLE_BIAS_ORIENTATIONS[i]) for i in indices]
     elif _open_attempt is not None:
       # Fair batched probe: a bounded SLICE of structured basins per visit, all in this one
       # scene/precheck setup.  Once the six canonical basins have had a turn, later visits use
@@ -3266,7 +3671,10 @@ class RobotIK:
       # rebuilding the scene and rerunning reach-precheck once PER bias.
       _oa = int(_open_attempt)
       _ob = max(1, int(self._open_probe_budget))
-      sweep = list(enumerate(_ASSEMBLE_BIAS_ORIENTATIONS))[_oa:_oa + _ob]
+      _candidates = list(enumerate(_ASSEMBLE_BIAS_ORIENTATIONS))
+      if unbiased_first:
+        _candidates.insert(0, (-1, None))                 # neutral continuous basin is slot zero
+      sweep = _candidates[_oa:_oa + _ob]
     elif self.fail_order:
       # --fail-order: sweep the biases never-tried-first, then ascending fail rate, then
       # canonical index (stable + deterministic). Pure reordering -- the sweep stays exhaustive,
@@ -3278,53 +3686,224 @@ class RobotIK:
       sweep = sorted(enumerate(_ASSEMBLE_BIAS_ORIENTATIONS), key=_bias_rank)
     else:
       sweep = list(enumerate(_ASSEMBLE_BIAS_ORIENTATIONS))  # canonical order (default)
+    if unbiased_first and _open_attempt is None:
+      sweep.insert(0, (-1, None))                         # legacy/exhaustive ordering ablation
     komo = None
     feasible, witness = False, None
+    _winning_basin_row = None
+
+    def _record_assemble_basin(label, raw_success, accepted, wall, funnel_reject=False):
+      """Attribute a complete _solve_ik call to its held-assembly initialization basin."""
+      rows = self.prof.setdefault("assemble_basin_stats", {})
+      row = rows.setdefault(label, {
+          "attempts": 0, "raw_success": 0, "accepted": 0, "funnel_rejects": 0,
+          "wall": 0.0, "nlp_solves": 0, "evals": 0, "nlp_time": 0.0,
+          "eq_sum": 0.0, "ineq_sum": 0.0, "residual_samples": 0})
+      row["attempts"] += 1
+      row["raw_success"] += int(bool(raw_success))
+      row["accepted"] += int(bool(accepted))
+      row["funnel_rejects"] += int(bool(funnel_reject))
+      row["wall"] += float(wall)
+      cs = getattr(self, "_last_solve_ik_stats", {}) or {}
+      row["nlp_solves"] += int(cs.get("solves", 0) or 0)
+      row["evals"] += int(cs.get("evals", 0) or 0)
+      row["nlp_time"] += float(cs.get("nlp_time", 0.0) or 0.0)
+      result = getattr(self, "_last_res", {}) or {}
+      if "eq" in result or "ineq" in result:
+        row["eq_sum"] += float(result.get("eq", 0.0) or 0.0)
+        row["ineq_sum"] += float(result.get("ineq", 0.0) or 0.0)
+        row["residual_samples"] += 1
+      return row
+
+    def _make_assemble_candidate(bias):
+      k = self._assemble_komo(C, part_name, onto, rel_pos, rel_quat, bias)
+      self._add_pull(k, C, robot)
+      self._add_pin(k, C)
+      self._add_grasp_maintenance(k, s0, assembly)
+      return k
+
+    race_state = None
+    race_seed = {}
+    race_pending = False
+
+    def _race_probe_all():
+      """One bounded real-KOMO probe per canonical basin, cached by physical query."""
+      import time as _time
+      if race_state["probes"]:
+        return
+      rows = self.prof.setdefault("assemble_race_probe_stats", {})
+      for rbi, rbias in enumerate(_ASSEMBLE_BIAS_ORIENTATIONS):
+        rk = _make_assemble_candidate(rbias)
+        t0 = _time.perf_counter()
+        rr = self._nlp(rk, stop_evals=self.assemble_race_probe_evals).solve().dict()
+        dt = _time.perf_counter() - t0
+        self.prof["unseeded_solves"] += 1
+        self.prof["unseeded_time"] += dt
+        nb = self.prof.setdefault("nlp_by_primitive", {}).setdefault(
+            ("assemble", "full", "race-probe"), [0, 0.0])
+        nb[0] += 1
+        nb[1] += dt
+        q = np.asarray(rk.getPath()[-1], dtype=float).copy()
+
+        def finite(name, default=float("inf")):
+          value = float(rr.get(name, default))
+          return value if np.isfinite(value) else default
+
+        # Lexicographic hard-feasibility score. No learned/manual weighting: RAI's own
+        # constraint aggregates decide first, and the soft objective only breaks ties.
+        score = (0 if rr.get("feasible", False) else 1,
+                 max(0.0, finite("ineq")), finite("eq"), finite("sos"), rbi)
+        race_state["probes"][rbi] = (score, q)
+        row = rows.setdefault(rbi, {
+            "attempts": 0, "evals": 0, "wall": 0.0,
+            "eq_sum": 0.0, "ineq_sum": 0.0, "raw_success": 0})
+        row["attempts"] += 1
+        row["evals"] += int(rr.get("evals", 0) or 0)
+        row["wall"] += dt
+        row["eq_sum"] += finite("eq", 0.0)
+        row["ineq_sum"] += finite("ineq", 0.0)
+        row["raw_success"] += int(bool(rr.get("feasible", False)))
+
+    def _race_next_promotions(limit):
+      _race_probe_all()
+      ordered = sorted((score, bi, q) for bi, (score, q) in race_state["probes"].items()
+                       if bi not in race_state["promoted"])
+      chosen = ordered[:max(1, int(limit))]
+      race_seed.update({bi: q for _score, bi, q in chosen})
+      return [(bi, _ASSEMBLE_BIAS_ORIENTATIONS[bi]) for _score, bi, _q in chosen]
+
+    if racing:
+      rkey = getattr(self, "_cur_query_key", None)
+      if rkey is None:                                    # direct library/debug call outside bind
+        rkey = (tuple(action), self._scene_sig(s0))
+      race_state = self._assemble_race_cache.setdefault(
+          rkey, {"probes": {}, "promoted": set(), "neutral_done": False})
+      if not race_state["neutral_done"]:
+        sweep = [(-1, None)]                              # cheap early exit before probing biases
+      else:
+        n_promote = (len(_ASSEMBLE_BIAS_ORIENTATIONS) if _open_attempt is None else
+                     self.assemble_race_promote)
+        sweep = _race_next_promotions(n_promote)
+
     for bi, bias in sweep:                                # deterministic orientation sweep
-      komo = self._assemble_komo(C, part_name, onto, rel_pos, rel_quat, bias)
-      self._add_pull(komo, C, robot)                    # witness-opt pull (no-op in search)
-      self._add_pin(komo, C)                            # pre-skill pin (no-op in search)
-      self._add_grasp_maintenance(komo, s0, assembly)     # braces pinned at their grasps
+      import time as _time
+      _basin_t0 = _time.perf_counter()
+      komo = _make_assemble_candidate(bias)
       if __import__("os").environ.get("MILESTONE_DEBUG"):
         _sk = arm_seeds.get(robot)
         print(f"[assm-seed] {robot} analytic_ok={self._analytic_reject_ok(robot)} "
               f"arm_seeds[{robot}]={0 if _sk is None else len(_sk)}", flush=True)
-      feasible, witness = self._solve_ik(              # `warm` (e.g. the mated witness for a
-          komo, restarts=0,                            # pre-insertion goto) warm-starts the solve
-          seeds=((([warm] if warm is not None else [])
-                  + list(arm_seeds.get(robot) or [])) or None),  # warm basin first, then the
-          deferred_seeds=(near_arm_seeds.get(robot) or None),
-          C=C)                                       # analytic insertion seeds (calibrated arms)
+      # A free target gets one deterministic solve per genuinely distinct orientation basin.
+      # For a fixed target there is only one deterministic basin. Under open-witness, visit
+      # zero tries it ONCE and moves on; a revisit skips it and uses fresh initRandom draws.
+      # The non-open legacy path retains its historical six-restart reliability budget.
+      _fixed_restarts = 0
+      _old_random = getattr(self, "_open_probe_random_only", False)
+      if fixed_single:
+        if _open_attempt is None:
+          _fixed_restarts = 6
+        elif int(_open_attempt) > 0:
+          self._open_probe_random_only = True
+      try:
+        seed_bundle = (([race_seed[bi]] if bi in race_seed else [])
+                       + ([warm] if warm is not None else [])
+                       + list(pose_seed_bundles.get(bi, ()))
+                       + list(arm_seeds.get(robot) or []))
+        # RAI's active KOMO width can be a restricted single arm or the complete multi-arm
+        # configuration depending on stable-joint reparenting. Never let one incompatible
+        # experimental full seed make _solve_ik abandon the compatible historical bundle.
+        path0 = np.asarray(komo.getPath())
+        expected = int(path0.shape[-1]) if path0.ndim >= 2 and path0.size else None
+        if expected is not None:
+          seed_bundle = [q for q in seed_bundle if np.asarray(q).size == expected]
+        _race_q = race_seed.get(bi)
+        _race_continuation = bool(
+            racing and _race_q is not None
+            and any(q is _race_q for q in seed_bundle))
+        feasible, witness = self._solve_ik(            # `warm` (e.g. the mated witness for a
+            komo, restarts=_fixed_restarts,             # pre-insertion goto) warm-starts solve
+            seeds=(seed_bundle or None),
+            deferred_seeds=(near_arm_seeds.get(robot) or None),
+            C=C, skip_unseeded=_race_continuation)
+      finally:
+        self._open_probe_random_only = _old_random
+      _raw_feasible = bool(feasible)
       if feasible and witness is not None and self.mate_residual_reject is not None:
         _mr = self.mate_residual(C, witness, part_name, onto, rel_pos)
         if _mr > self.mate_residual_reject:
           self.mate_rejects += 1                       # under-seated: try the next bias/restart
           feasible = False
-      if bias_axes is None:                            # evidence: canonical bias slot id `bi`
+      if bias_axes is None and bi >= 0:                # evidence: canonical bias slot id `bi`
         _st = self.action_stats.setdefault(("abias", part, onto, bi), [0, 0, 0.0])
         _st[0] += 1
         if not feasible:
           _st[1] += 1
           _st[2] += float((getattr(self, "_last_res", {}) or {}).get("eq", 0.0) or 0.0)
+      _neutral_funnel_reject = False
+      if (feasible and bi < 0 and backoff <= 0.0
+          and self.pre_insertion_delta > 0.0
+          and not self._funnel_witness_ok(action, s0, s1, assembly, witness)):
+        # A neutral slot that reaches the mate but has no insertion neighbourhood must not
+        # hide the structured basins that follow it. The historical biased path keeps its
+        # existing post-loop gate below.
+        feasible, witness = False, None
+        _neutral_funnel_reject = True
+      _basin_label = (("pre-" if backoff > 0.0 else "")
+                      + ("unbiased" if bi < 0 else f"bias{bi}"))
+      _basin_row = (_record_assemble_basin(
+          _basin_label, _raw_feasible, feasible,
+          _time.perf_counter() - _basin_t0, _neutral_funnel_reject)
+          if not fixed_single and bias_axes is None else None)
+      if racing:
+        if bi < 0:
+          race_state["neutral_done"] = True
+          if not feasible:
+            # Mutating the list is intentional: after the neutral candidate fails, probe all
+            # biases once and continue the best K in this SAME atomic visit.
+            n_promote = (len(_ASSEMBLE_BIAS_ORIENTATIONS) if _open_attempt is None else
+                         self.assemble_race_promote)
+            sweep.extend(_race_next_promotions(n_promote))
+        else:
+          race_state["promoted"].add(bi)
+          rp = self.prof.setdefault("assemble_race_promotions", [0, 0, 0])
+          rp[0] += 1
+          rp[1] += int(bool(feasible))
       if feasible:
+        _winning_basin_row = _basin_row
         break
     if (feasible and witness is not None and backoff <= 0.0
         and self.pre_insertion_delta > 0.0
         and not self._funnel_witness_ok(action, s0, s1, assembly, witness)):
       feasible, witness = False, None                     # -> the unbiased restart fallback
-    # Legacy bind: exhaustive structured sweep + six-restart fallback, bit-for-bit as before.
-    # Open batch: its first six effort slots are the structured biases; any slots LEFT AFTER
-    # that fund the unbiased fallback in the SAME scene/precheck setup.  Thus batch=7 means
-    # six canonical basins + one unbiased initialization, while a revisit starting at slot 7
-    # spends its whole batch on fresh random draws.
+      if _winning_basin_row is not None:
+        _winning_basin_row["accepted"] -= 1
+        _winning_basin_row["funnel_rejects"] += 1
+        _winning_basin_row = None
+      if racing and bi >= 0:
+        self.prof.setdefault("assemble_race_promotions", [0, 0, 0])[1] -= 1
+    # FREE-target legacy bind: exhaustive structured sweep + six-restart fallback. Open batch:
+    # its first six slots are the genuinely distinct free-pose biases; slots left after that
+    # fund the unbiased fallback in the same scene/precheck setup. Fixed targets took their
+    # single-basin path above and deliberately do not enter this fallback.
+    if racing and race_state is not None:
+      race_pending = len(race_state["promoted"]) < len(_ASSEMBLE_BIAS_ORIENTATIONS)
+      if race_pending:
+        self.prof.setdefault("assemble_race_promotions", [0, 0, 0])[2] += 1
     _open_fallback_budget = 0
-    if _open_attempt is not None:
+    if not fixed_single and _open_attempt is not None:
       _oa = int(_open_attempt)
       _ob = max(1, int(self._open_probe_budget))
-      _nb = len(_ASSEMBLE_BIAS_ORIENTATIONS)
+      _nb = len(_ASSEMBLE_BIAS_ORIENTATIONS) + int(unbiased_first)
       _open_fallback_budget = (_ob if _oa >= _nb else max(0, _oa + _ob - _nb))
+      if racing and not race_pending:
+        # Promotions consume ordinary effort slots. Spend only the remainder on fresh random
+        # initializations once all six structural basins have received full continuation.
+        _open_fallback_budget = max(0, _ob - len(sweep))
     _open_unbiased = _open_fallback_budget > 0
-    if not feasible and (_open_attempt is None or _open_unbiased):
+    if (not feasible and not fixed_single and not race_pending
+        and (_open_attempt is None or _open_unbiased)):
+      import time as _time
+      _basin_t0 = _time.perf_counter()
       komo = self._assemble_komo(C, part_name, onto, rel_pos, rel_quat, None)
       self._add_pull(komo, C, robot)                    # witness-opt pull (no-op in search)
       self._add_pin(komo, C)                            # pre-skill pin (no-op in search)
@@ -3341,18 +3920,27 @@ class RobotIK:
       try:
         feasible, witness = self._solve_ik(
             komo, restarts=_fb_restarts,
-            seeds=([warm] if warm is not None else None), C=C)
+            seeds=(None if unbiased_first and _open_attempt is None else
+                   ([warm] if warm is not None else None)), C=C,
+            skip_unseeded=bool(unbiased_first and _open_attempt is None))
       finally:
         self._open_probe_random_only = _old_random
         self._open_probe_budget = _old_budget
+      _raw_feasible = bool(feasible)
       if feasible and witness is not None and self.mate_residual_reject is not None:
         if self.mate_residual(C, witness, part_name, onto, rel_pos) > self.mate_residual_reject:
           self.mate_rejects += 1
           feasible, witness = False, None
+      _winning_basin_row = _record_assemble_basin(
+          ("pre-" if backoff > 0.0 else "") + "fallback",
+          _raw_feasible, feasible, _time.perf_counter() - _basin_t0)
     if (feasible and witness is not None and backoff <= 0.0
         and self.pre_insertion_delta > 0.0
         and not self._funnel_witness_ok(action, s0, s1, assembly, witness)):
       feasible, witness = False, None
+      if _winning_basin_row is not None:
+        _winning_basin_row["accepted"] -= 1
+        _winning_basin_row["funnel_rejects"] += 1
     if not feasible:
       self._log_failure(action, C, komo)
 
@@ -7994,6 +8582,7 @@ class _IncrementalLazySearch:
                cheap_gate=None, pop_observer=None, repairable=True,
                memoize_successors=True, compact_frontier=False):
     import itertools
+    import os
     self.goal_fn, self.cost_fn, self.h_fn = goal_fn, cost_fn, h_fn
     self.weight = weight
     self.blacklist = blacklist                            # shared, grows externally
@@ -8001,6 +8590,31 @@ class _IncrementalLazySearch:
     self.pop_observer = pop_observer                    # opt-in exact search-order diagnostic
     self.repairable = bool(repairable)
     self.compact_frontier = bool(compact_frontier)
+    # Per-operation timers are intentionally opt-in: the engine can process millions of
+    # entries, so even perf_counter() is observable in benchmark runs.  Set
+    # FILL_SEARCH_PROFILE=1 to split the forward-search wall into graph generation,
+    # heuristic, cheap-gate and frontier/repair work without changing search decisions.
+    self.profile_enabled = bool(os.environ.get("FILL_SEARCH_PROFILE"))
+    self.profile = {
+        "search_calls": 0, "search_wall": 0.0,
+        "queue_calls": 0, "queue_added": 0, "queue_dominated": 0,
+        "queue_wall": 0.0, "heap_rebuilds": 0,
+        "heap_pops": 0, "superseded_pops": 0, "claimed_pops": 0,
+        "stale_parent_pops": 0, "reprioritized_pops": 0,
+        "succ_calls": 0, "succ_cache_hits": 0, "succ_edges": 0,
+        "succ_wall": 0.0,
+        "heuristic_calls": 0, "heuristic_misses": 0, "heuristic_wall": 0.0,
+        "cheap_calls": 0, "cheap_rejects": 0, "cheap_wall": 0.0,
+        "alt_calls": 0, "alt_updates": 0, "alt_wall": 0.0,
+        "delete_calls": 0, "delete_wall": 0.0, "delete_removed": 0,
+        "boundary_calls": 0, "boundary_sources": 0, "boundary_edges": 0,
+        "boundary_wall": 0.0,
+    }
+    # A graph-search heuristic is a function of the value-state.  Lazy reverse-PDB queries
+    # settle the requested abstract state before returning, so their answer is immutable too.
+    # Repairs revisit the same targets millions of times; memoizing h once per concrete state
+    # removes pure repeated work without changing priorities, bounds, or completeness.
+    self._h_cache = {}
     # laziness follows the COST HIERARCHY -- ~ms cheap-collision checks prune the optimistic
     # tree exactly like the eager search (deferring them was measured to blow the search up
     # 200k+ expansions on dense floating scenes), while ~100ms IK binds stay plan-lazy.
@@ -8038,8 +8652,30 @@ class _IncrementalLazySearch:
     self._compact_alts = {}                               # state -> one best recovery entry
     self.expanded = 0
     self.budget_hit = False
-    h0 = h_fn(start)
+    h0 = self._h(start)
     self._queue((self._f(0.0, h0), h0, 0.0, next(self.tie), start, None, None))
+
+  def _h(self, state):
+    sentinel = self
+    hit = self._h_cache.get(state, sentinel)
+    if hit is not sentinel:
+      if self.profile_enabled:
+        self.profile["heuristic_calls"] += 1
+      return hit
+    if self.profile_enabled:
+      import time
+      t0 = time.perf_counter()
+    value = self.h_fn(state)
+    self._h_cache[state] = value
+    if self.profile_enabled:
+      self.profile["heuristic_calls"] += 1
+      self.profile["heuristic_wall"] += time.perf_counter() - t0
+      self.profile["heuristic_misses"] += 1
+    return value
+
+  def profile_snapshot(self):
+    """Return cumulative opt-in timings/counters (empty when profiling is disabled)."""
+    return dict(self.profile) if self.profile_enabled else {}
 
   def _queue(self, entry):
     """Queue at most one best pending entry per distinct incoming graph edge.
@@ -8049,22 +8685,35 @@ class _IncrementalLazySearch:
     changed parent cost may replace an entry; the superseded heap tuple is discarded lazily.
     """
     import heapq
+    import time
+    t0 = time.perf_counter() if self.profile_enabled else None
+    if self.profile_enabled:
+      self.profile["queue_calls"] += 1
     key = entry[4] if self.compact_frontier else (entry[4], entry[5], entry[6])
     old = self._pending.get(key)
     if old is not None and old[:3] <= entry[:3]:
       if self.compact_frontier:
         self._remember_compact_alt(entry[4], entry)
+      if self.profile_enabled:
+        self.profile["queue_dominated"] += 1
+        self.profile["queue_wall"] += time.perf_counter() - t0
       return False                                        # identical or dominated regeneration
     if old is not None and self.compact_frontier:
       self._remember_compact_alt(entry[4], old)
     self._pending[key] = entry
     heapq.heappush(self.pq, entry)
+    if self.profile_enabled:
+      self.profile["queue_added"] += 1
     # Decrease-key uses lazy invalidation. Repairs can otherwise leave many superseded tuples
     # in the heap even though `_pending` has only one authoritative entry per key. Rebuilding
     # from those authoritative entries is exact (including their original tie ids).
     if len(self.pq) > 2 * len(self._pending) + 1024:
       self.pq[:] = self._pending.values()
       heapq.heapify(self.pq)
+      if self.profile_enabled:
+        self.profile["heap_rebuilds"] += 1
+    if self.profile_enabled:
+      self.profile["queue_wall"] += time.perf_counter() - t0
     return True
 
   def _remember_alt(self, state, entry):
@@ -8075,16 +8724,28 @@ class _IncrementalLazySearch:
     if the edge is deleted, every copy is invalid. Distinct parent/action edges remain available
     for later repairs, preserving the incremental search's coverage.
     """
+    import time
+    t0 = time.perf_counter() if self.profile_enabled else None
+    if self.profile_enabled:
+      self.profile["alt_calls"] += 1
     if not self.repairable:
+      if self.profile_enabled:
+        self.profile["alt_wall"] += time.perf_counter() - t0
       return                                             # no deletion => alternates are dead weight
     if self.compact_frontier:
       self._remember_compact_alt(state, entry)
+      if self.profile_enabled:
+        self.profile["alt_wall"] += time.perf_counter() - t0
       return
     edge = (entry[5], entry[6])
     bucket = self.alts.setdefault(state, {})
     old = bucket.get(edge)
     if old is None or entry[:4] < old[:4]:
       bucket[edge] = entry
+      if self.profile_enabled:
+        self.profile["alt_updates"] += 1
+    if self.profile_enabled:
+      self.profile["alt_wall"] += time.perf_counter() - t0
 
   def _remember_compact_alt(self, state, entry):
     """Retain one best non-current incoming route for a value-state."""
@@ -8127,6 +8788,8 @@ class _IncrementalLazySearch:
         "successor_edges": (sum(len(v) for v in self._succ_cache.values())
                             if self._succ_cache is not None else 0),
         "tree_edges": sum(len(v) for v in self.children.values()),
+        "expanded": self.expanded,
+        "heuristic_states": len(self._h_cache),
         "compact_frontier": self.compact_frontier,
     }
 
@@ -8138,26 +8801,44 @@ class _IncrementalLazySearch:
     removed; successors are deterministic, so replaying those sources recovers exactly the
     same boundary on demand.  Interior edges are generated normally as targets are reclaimed.
     """
+    import time
+    t0 = time.perf_counter() if self.profile_enabled else None
     if not self.compact_frontier or not targets:
       return
+    if self.profile_enabled:
+      self.profile["boundary_calls"] += 1
     targets = set(targets)
     for parent, pg in tuple(self.claimed.items()):
+      if self.profile_enabled:
+        self.profile["boundary_sources"] += 1
       for action, state in self._succ(parent):
         if state not in targets or (parent, action) in self.blacklist:
           continue
         ng = pg + self.cost_fn(action)
-        hs = self.h_fn(state)
+        hs = self._h(state)
         if hs != float("inf"):
+          if self.profile_enabled:
+            self.profile["boundary_edges"] += 1
           self._queue((self._f(ng, hs), hs, ng, next(self.tie),
                        state, parent, action))
+    if self.profile_enabled:
+      self.profile["boundary_wall"] += time.perf_counter() - t0
 
   def _f(self, g, hval):
     import math
     return hval if math.isinf(self.weight) else g + self.weight * hval
 
   def _succ(self, s):
+    import time
+    t0 = time.perf_counter() if self.profile_enabled else None
+    if self.profile_enabled:
+      self.profile["succ_calls"] += 1
     hit = self._succ_cache.get(s) if self._succ_cache is not None else None
     if hit is not None:
+      if self.profile_enabled:
+        self.profile["succ_cache_hits"] += 1
+        self.profile["succ_edges"] += len(hit)
+        self.profile["succ_wall"] += time.perf_counter() - t0
       return hit
     generated = []
     for action, state in self._succ_raw(s):
@@ -8166,9 +8847,23 @@ class _IncrementalLazySearch:
       generated.append((action, state))
     if self._succ_cache is not None:
       self._succ_cache[s] = generated
+    if self.profile_enabled:
+      self.profile["succ_edges"] += len(generated)
+      self.profile["succ_wall"] += time.perf_counter() - t0
     return generated
 
   def search(self, max_nodes, deadline=None):
+    if not self.profile_enabled:
+      return self._search(max_nodes, deadline=deadline)
+    import time
+    t0 = time.perf_counter()
+    self.profile["search_calls"] += 1
+    try:
+      return self._search(max_nodes, deadline=deadline)
+    finally:
+      self.profile["search_wall"] += time.perf_counter() - t0
+
+  def _search(self, max_nodes, deadline=None):
     # run until a goal state is claimed (returns the Plan) or the frontier empties (None).
     import heapq
     import time
@@ -8177,13 +8872,19 @@ class _IncrementalLazySearch:
     _pops = 0
     while self.pq:
       entry = heapq.heappop(self.pq)
+      if self.profile_enabled:
+        self.profile["heap_pops"] += 1
       _f, _h, g, _, s, prev, action = entry
       pkey = s if self.compact_frontier else (s, prev, action)
       pending = self._pending.get(pkey)
       if pending is None or pending[3] != entry[3]:
+        if self.profile_enabled:
+          self.profile["superseded_pops"] += 1
         continue                                          # superseded pending entry
       del self._pending[pkey]
       if s in self.claimed and (not self.compact_frontier or self.claimed[s] <= g):
+        if self.profile_enabled:
+          self.profile["claimed_pops"] += 1
         self._remember_alt(s, entry)                      # keep each incoming route once
         continue
       if _dbg and _pops < 12:
@@ -8195,14 +8896,28 @@ class _IncrementalLazySearch:
       _pops += 1
       if prev is not None:
         if prev not in self.claimed or (prev, action) in self.blacklist:
+          if self.profile_enabled:
+            self.profile["stale_parent_pops"] += 1
           continue                                        # stale: parent gone / edge deleted
         g_true = self.claimed[prev] + self.cost_fn(action)
         if g_true != g:                                   # parent re-claimed at another g
-          hs = self.h_fn(s)
+          if self.profile_enabled:
+            self.profile["reprioritized_pops"] += 1
+          hs = self._h(s)
           self._queue((self._f(g_true, hs), hs, g_true, next(self.tie),
                        s, prev, action))
           continue
-        if self.cheap_gate is not None and not self.cheap_gate(prev, action, s):
+        cheap_ok = True
+        if self.cheap_gate is not None:
+          if self.profile_enabled:
+            t_gate = time.perf_counter()
+          cheap_ok = self.cheap_gate(prev, action, s)
+          if self.profile_enabled:
+            self.profile["cheap_calls"] += 1
+            self.profile["cheap_wall"] += time.perf_counter() - t_gate
+        if not cheap_ok:
+          if self.profile_enabled:
+            self.profile["cheap_rejects"] += 1
           self.blacklist.add((prev, action))              # cheap-infeasible: dead forever
           # A one-entry-per-state frontier may have discarded a more expensive route to the
           # same state. Regenerate its incoming cut from claimed nodes; future parents will
@@ -8239,7 +8954,7 @@ class _IncrementalLazySearch:
         if (s, a) in self.blacklist:
           continue
         ng = g + self.cost_fn(a)
-        hns = self.h_fn(ns)
+        hns = self._h(ns)
         if hns == float("inf"):
           continue
         entry = (self._f(ng, hns), hns, ng, next(self.tie), ns, s, a)
@@ -8251,6 +8966,19 @@ class _IncrementalLazySearch:
     return None
 
   def delete_edge(self, s, a, ns):
+    if not self.profile_enabled:
+      return self._delete_edge(s, a, ns)
+    import time
+    t0 = time.perf_counter()
+    before = len(self.claimed)
+    self.profile["delete_calls"] += 1
+    try:
+      return self._delete_edge(s, a, ns)
+    finally:
+      self.profile["delete_removed"] += max(0, before - len(self.claimed))
+      self.profile["delete_wall"] += time.perf_counter() - t0
+
+  def _delete_edge(self, s, a, ns):
     # (s, a) was just blacklisted (caller added it). If it is the tree edge of ns, un-claim
     # the SUBTREE rooted at ns (their g relied on the deleted edge) and re-inject each
     # un-claimed node's alternates; everything else is untouched. Queued entries THROUGH the

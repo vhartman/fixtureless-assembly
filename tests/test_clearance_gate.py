@@ -305,3 +305,78 @@ def test_ik_feeds_a_failed_margin_certificate_back_into_komo():
   assert len(komo.objectives) == 1
   assert len(komo.warm_starts) == 1
   assert rik.prof["margin_refine_solves"] == 1
+
+
+def test_handover_racing_continues_the_best_shallow_random_start():
+  """A shallow miss only ranks starts; the promoted full solve still owns acceptance."""
+  rik = object.__new__(S.RobotIK)
+  rik._cur_action = ("handover", "a2", "obj_0", 3)
+  rik._cur_query_key = (rik._cur_action, ("physical",))
+  rik.seed_init_incompatible = set()
+  rik.seed_init_skips = 0
+  rik.harvest_branches = None
+  rik.seed_restart_cap = 2
+  rik.restarts_full = 1
+  rik._open_probe_attempt = 0
+  rik._open_probe_budget = 2
+  rik._open_probe_random_only = False
+  rik._handover_race_cache = {}
+  rik.handover_race_probe_evals = 24
+  rik.handover_race_starts = 3
+  rik.handover_race_promote = 2
+  rik.prof = {
+      "calls_with_seeds": 0, "calls_without_seeds": 0, "wins": {},
+      "seeded_solves": 0, "seeded_time": 0.0,
+      "unseeded_solves": 0, "unseeded_time": 0.0,
+      "restart_solves": 0, "restart_time": 0.0,
+      "getpath_calls": 0, "post_calls": 0, "post_time": 0.0,
+  }
+  rik._pen_ok = lambda _C, _q: True
+  rik._clearance_ok = lambda _C, _q: True
+
+  # ordinary fail; three shallow probes (middle is best); promoted continuation succeeds.
+  results = iter([
+      {"feasible": False, "eq": 9.0, "ineq": 1.0, "sos": 0.0, "evals": 100},
+      {"feasible": False, "eq": 3.0, "ineq": 0.2, "sos": 0.0, "evals": 24},
+      {"feasible": False, "eq": 1.0, "ineq": 0.1, "sos": 0.0, "evals": 24},
+      {"feasible": False, "eq": 2.0, "ineq": 0.3, "sos": 0.0, "evals": 24},
+      {"feasible": True, "eq": 0.0, "ineq": 0.0, "sos": 0.0, "evals": 40},
+  ])
+
+  class _Result:
+    def __init__(self, value):
+      self.value = value
+
+    def dict(self):
+      return self.value
+
+  class _NLP:
+    def solve(self):
+      return _Result(next(results))
+
+  class _Komo:
+    def __init__(self):
+      self.q = np.zeros(1)
+      self.random_id = 0
+      self.continued = []
+
+    def getPath(self):
+      return self.q.reshape(1, -1)
+
+    def initRandom(self):
+      self.random_id += 1
+      self.q = np.asarray([float(self.random_id)])
+
+    def initWithConstant(self, q):
+      self.q = np.asarray(q, dtype=float).copy()
+      self.continued.append(float(self.q[0]))
+
+  komo = _Komo()
+  rik._nlp = lambda _komo, stop_evals=None: _NLP()
+  ok, q = rik._solve_ik(komo, restarts=1, C=object(), race_random=True)
+  assert ok
+  assert np.allclose(q, [2.0])
+  assert komo.continued == [2.0]
+  assert rik.prof["handover_race_stats"]["probes"] == 3
+  assert rik.prof["handover_race_stats"]["promoted"] == 1
+  assert rik.prof["handover_race_stats"]["successes"] == 1

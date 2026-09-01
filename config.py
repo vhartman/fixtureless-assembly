@@ -137,6 +137,16 @@ class RunConfig:
   # -- IK & feasibility --
   real_ik: bool = True
   ik_seeding: bool = True
+  assemble_ssik_pose_seeds: bool = False
+  assemble_ssik_pose_projection: bool = False
+  assemble_unbiased_first: bool = False
+  assemble_basin_racing: bool = False
+  assemble_race_probe_evals: int = 24
+  assemble_race_promote: int = 3
+  handover_basin_racing: bool = False
+  handover_race_probe_evals: int = 24
+  handover_race_starts: int = 6
+  handover_race_promote: int = 3
   ik_positive_reuse: bool = False
   ik_restarts: int = 12
   precheck_restarts: int = 12

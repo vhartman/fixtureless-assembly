@@ -536,6 +536,70 @@ def build_parser():
            "vacuum EEs; others keep the precheck.",
   )
   g_ik.add_argument(
+      "--assemble-ssik-pose-seeds", action=argparse.BooleanOptionalAction, default=False,
+      help="EXPERIMENTAL held-target assembly initializer: instantiate the existing six "
+           "canonical soft biases as exact poses at their existing centre target, run SSIK "
+           "for every participating robot, collision-rank the complete configurations, and "
+           "warm-start the matching KOMO biases from the best candidates. Candidate-pose "
+           "failure only removes that seed; it never rejects the continuous assembly action.",
+  )
+  g_ik.add_argument(
+      "--assemble-ssik-pose-projection", action=argparse.BooleanOptionalAction, default=False,
+      help="EXPERIMENTAL held-target assembly initializer: for every canonical orientation, "
+           "project the existing preferred centre toward the target subassembly's currently "
+           "realized position on a five-point line, closest-to-centre first. The first pose "
+           "with SSIK branches for every participating robot seeds the matching KOMO. This "
+           "is an ablation beside --assemble-ssik-pose-seeds and never rejects an action.",
+  )
+  g_ik.add_argument(
+      "--assemble-unbiased-first", action=argparse.BooleanOptionalAction, default=False,
+      help="EXPERIMENTAL ordering-only ablation for a held-target assemble: try the neutral "
+           "continuous KOMO before the six canonical soft-orientation basins, then retain "
+           "the same fresh-random fallback. No basin is removed and total eventual effort "
+           "is unchanged; only a successful neutral solve can end the sweep earlier.",
+  )
+  g_ik.add_argument(
+      "--assemble-basin-racing", action=argparse.BooleanOptionalAction, default=False,
+      help="EXPERIMENTAL collision-aware optimizer racing for held-target assembly. Try the "
+           "neutral KOMO first; if it fails, give all six canonical basins a bounded real-KOMO "
+           "probe, rank by their actual constraint residuals, and fully continue only a "
+           "bounded number per open-witness visit. Unpromoted basins remain pending and are "
+           "eventually widened; the historical policy is unchanged when this is off.",
+  )
+  g_ik.add_argument(
+      "--assemble-race-probe-evals", type=int, default=24, metavar="N",
+      help="NLP evaluation cap for each shallow canonical-basin probe under "
+           "--assemble-basin-racing (default 24, selected below the measured ~100-evaluation "
+           "cost of the repeatedly failing basins).",
+  )
+  g_ik.add_argument(
+      "--assemble-race-promote", type=int, default=3, metavar="N",
+      help="Number of shallow-ranked assembly basins continued to a full solve per open "
+           "witness visit (default 3, so the standard two epochs cover all six).",
+  )
+  g_ik.add_argument(
+      "--handover-basin-racing", action=argparse.BooleanOptionalAction, default=False,
+      help="EXPERIMENTAL collision-aware optimizer racing for handover. Preserve the ordinary "
+           "full solve; after it fails, shallow-probe fresh random initializations, "
+           "rank their actual constraint residuals, and fully continue only the best few per "
+           "open-witness visit. Unpromoted starts remain pending and never refute the action.",
+  )
+  g_ik.add_argument(
+      "--handover-race-probe-evals", type=int, default=24, metavar="N",
+      help="NLP evaluation cap for each shallow random handover probe under "
+           "--handover-basin-racing (default 24).",
+  )
+  g_ik.add_argument(
+      "--handover-race-starts", type=int, default=6, metavar="N",
+      help="Number of fresh handover initializations in one cached racing generation "
+           "(default 6). Exhausted generations widen to another fresh set on later visits.",
+  )
+  g_ik.add_argument(
+      "--handover-race-promote", type=int, default=3, metavar="N",
+      help="Maximum shallow-ranked handover starts continued to full convergence per visit "
+           "(default 3; the visit's ordinary restart budget may lower this further).",
+  )
+  g_ik.add_argument(
       "--ik-restarts", type=int, default=12, metavar="N",
       help="With --real-ik: random-restart budget of each FULL collision-aware KOMO solve "
            "when no analytic seeds warm-start it (seeded solves already cap at 2). MEASURED "
@@ -2106,7 +2170,10 @@ _SAVE_CONFIG_FIELDS = (
     "fill_window", "lazy_fills", "open_witness", "open_witness_batch",
     "open_witness_epochs", "lazy_edge_selector", "analytic_seed_cap", "ssik_seed_neighborhood",
     "ssik_neighborhood_cap", "fail_order", "empty_seed_refutes",
-    "ik_positive_reuse",
+    "ik_positive_reuse", "assemble_ssik_pose_seeds", "assemble_ssik_pose_projection",
+    "assemble_unbiased_first", "assemble_basin_racing", "assemble_race_probe_evals",
+    "assemble_race_promote", "handover_basin_racing", "handover_race_probe_evals",
+    "handover_race_starts", "handover_race_promote",
     "wrench_aware_h", "sig_collapsed_h", "sig_components",
 )
 
@@ -2137,7 +2204,11 @@ _WITNESS_FIELDS = (
     "witness_reconfig_thresh", "witness_clearance", "witness_robot_collisions",
     "strict_collisions", "mate_eq_weight", "place_eq_weight", "mate_accuracy",
     "grasp_accuracy", "grasp_eq_weight",
-    "ik_accuracy", "ik_seeding", "ssik_seed_neighborhood", "ssik_neighborhood_cap",
+    "ik_accuracy", "ik_seeding", "assemble_ssik_pose_seeds",
+    "assemble_ssik_pose_projection", "assemble_unbiased_first", "assemble_basin_racing",
+    "assemble_race_probe_evals", "assemble_race_promote", "handover_basin_racing",
+    "handover_race_probe_evals", "handover_race_starts", "handover_race_promote",
+    "ssik_seed_neighborhood", "ssik_neighborhood_cap",
     "seed", "bracing", "handovers", "allow_place",
     "tight_fingers", "openarm_real_finger_radius_scale", "part_float", "witness_margin",
     "witness_joint_margin", "witness_draw",
@@ -2780,6 +2851,21 @@ def run(cfg, explicit=None):
   # below reads a cfg field; the thin main() wrapper builds cfg from the parsed CLI args.
   # explicit: set of dests the caller put on the command line (main()'s argv scan); None for
   # library callers. The dead-flag warnings below fire only for explicit flags.
+  if cfg.assemble_ssik_pose_seeds and cfg.assemble_ssik_pose_projection:
+    raise ValueError("--assemble-ssik-pose-seeds and --assemble-ssik-pose-projection "
+                     "are alternative ablations; enable only one")
+  _assembly_ik_ablations = sum(bool(x) for x in (
+      cfg.assemble_unbiased_first, cfg.assemble_basin_racing,
+      cfg.assemble_ssik_pose_seeds, cfg.assemble_ssik_pose_projection))
+  if _assembly_ik_ablations > 1:
+    raise ValueError("the neutral-first, basin-racing, and assembly-pose SSIK policies are "
+                     "alternative ablations; enable only one")
+  if cfg.assemble_race_probe_evals < 1 or cfg.assemble_race_promote < 1:
+    raise ValueError("--assemble-race-probe-evals and --assemble-race-promote must be >= 1")
+  if (cfg.handover_race_probe_evals < 1 or cfg.handover_race_starts < 1
+      or cfg.handover_race_promote < 1):
+    raise ValueError("--handover-race-probe-evals, --handover-race-starts, and "
+                     "--handover-race-promote must be >= 1")
   if cfg.optimize_witnesses == "off":          # 'floor' is the default; 'off' is the escape
     cfg.optimize_witnesses = None
   explicit_set = set(explicit or ())
@@ -3457,9 +3543,45 @@ def run(cfg, explicit=None):
       robot_ik.fail_order = cfg.fail_order
       robot_ik.positive_ik_reuse = bool(cfg.ik_positive_reuse)
       robot_ik.analytic_seed_cap = cfg.analytic_seed_cap
+      robot_ik.assemble_ssik_pose_seeds = bool(cfg.assemble_ssik_pose_seeds)
+      robot_ik.assemble_ssik_pose_projection = bool(cfg.assemble_ssik_pose_projection)
+      robot_ik.assemble_unbiased_first = bool(cfg.assemble_unbiased_first)
+      robot_ik.assemble_basin_racing = bool(cfg.assemble_basin_racing)
+      robot_ik.assemble_race_probe_evals = int(cfg.assemble_race_probe_evals)
+      robot_ik.assemble_race_promote = int(cfg.assemble_race_promote)
+      robot_ik.handover_basin_racing = bool(cfg.handover_basin_racing)
+      robot_ik.handover_race_probe_evals = int(cfg.handover_race_probe_evals)
+      robot_ik.handover_race_starts = int(cfg.handover_race_starts)
+      robot_ik.handover_race_promote = int(cfg.handover_race_promote)
       robot_ik.ssik_seed_neighborhood = float(cfg.ssik_seed_neighborhood)
       robot_ik.ssik_neighborhood_cap = int(cfg.ssik_neighborhood_cap)
       robot_ik.empty_seed_refutes = cfg.empty_seed_refutes
+      if cfg.assemble_ssik_pose_seeds:
+        print("[flag] --assemble-ssik-pose-seeds ACTIVE: held-target canonical assembly "
+              "poses are projected through every participating arm's SSIK and complete "
+              "collision-ranked configurations seed the matching KOMO biases; finite pose "
+              "misses remain non-rejecting.")
+      if cfg.assemble_ssik_pose_projection:
+        print("[flag] --assemble-ssik-pose-projection ACTIVE: each canonical held-target "
+              "orientation searches a five-point line from the existing preferred centre "
+              "toward the currently realized target pose; the closest jointly SSIK-reachable "
+              "pose seeds KOMO and all finite misses remain non-rejecting.")
+      if cfg.assemble_unbiased_first:
+        print("[flag] --assemble-unbiased-first ACTIVE: held-target assembly tries the "
+              "neutral continuous KOMO before the same six canonical soft-orientation "
+              "basins; failures still widen through every basin and fresh random effort.")
+      if cfg.assemble_basin_racing:
+        print(f"[flag] --assemble-basin-racing ACTIVE: neutral continuous KOMO first; "
+              f"on failure all canonical basins receive {cfg.assemble_race_probe_evals} "
+              f"collision-aware NLP evaluations, then {cfg.assemble_race_promote} best "
+              "unpromoted basin(s) are fully continued per visit. Finite misses remain "
+              "pending and widening eventually covers every basin.")
+      if cfg.handover_basin_racing:
+        print(f"[flag] --handover-basin-racing ACTIVE: preserve the ordinary full handover "
+              f"solve; on failure {cfg.handover_race_starts} fresh random starts receive "
+              f"{cfg.handover_race_probe_evals} collision-aware NLP evaluations, then up to "
+              f"{cfg.handover_race_promote} best unpromoted start(s) are fully continued per "
+              "visit. Partial starts are cached by physical query; finite misses remain open.")
       if cfg.ik_positive_reuse:
         print("[flag] --ik-positive-reuse ACTIVE: identical skill-local physical queries "
               "(table scene or participating payload/grasps, as appropriate) share their "
