@@ -125,7 +125,9 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
 
   monkeypatch.setattr(main, "solve_assembly_problem_milestones", fake)
   cfg = RunConfig(milestones=True, milestone_oracle="structural",
-                  fill_local_h=True, fill_exact=True, fill_policy_first=True,
+                  fill_local_h=True, fill_exact=True, fill_greedy=True,
+                  fill_incumbent_first=True,
+                  fill_policy_first=True,
                   fill_policy_guide=True,
                   fill_skeleton_first=True,
                   fill_scope_widening=True, milestone_boundaries=3,
@@ -133,6 +135,8 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
   assert main._dispatch_solve(cfg, None, None, [], None) == []
   assert seen["milestone_oracle"] == "structural"
   assert seen["fill_local_h"] is True and seen["fill_exact"] is True
+  assert seen["fill_greedy"] is True
+  assert seen["fill_incumbent_first"] is True
   assert seen["fill_policy_first"] is True
   assert seen["fill_policy_guide"] is True
   assert seen["fill_skeleton_first"] is True
@@ -143,6 +147,9 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
   assert main.parse_args(["--milestone-oracle", "chain"]).milestone_oracle == "chain"
   assert main.parse_args(["--fill-local-h", "--fill-exact"]).fill_local_h is True
   assert main.parse_args(["--fill-local-h", "--fill-exact"]).fill_exact is True
+  assert main.parse_args(["--fill-greedy"]).fill_greedy is True
+  assert main.parse_args(["--no-fill-greedy"]).fill_greedy is False
+  assert main.parse_args(["--fill-incumbent-first"]).fill_incumbent_first is True
   assert main.parse_args(["--fill-skeleton-first"]).fill_skeleton_first is True
   assert main.parse_args(["--fill-policy-first"]).fill_policy_first is True
   assert main.parse_args(["--no-fill-policy-first"]).fill_policy_first is False
@@ -156,6 +163,57 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
   assert main.parse_args([
       "--diagnose-plan-rank", "known.json"
   ]).diagnose_plan_rank == "known.json"
+
+
+def test_incumbent_first_requires_exact_lazy_milestone_fills():
+  with pytest.raises(SystemExit, match="requires --fill-local-h"):
+    main._validate_solver_scoped_flags(RunConfig(
+        milestones=True, fill_incumbent_first=True, fill_exact=False))
+  with pytest.raises(SystemExit, match="requires --fill-local-h"):
+    main._validate_solver_scoped_flags(RunConfig(
+        milestones=True, fill_local_h=True, fill_incumbent_first=True,
+        fill_exact=True, lazy_fills=False))
+  assert main._validate_solver_scoped_flags(RunConfig(
+      milestones=True, fill_local_h=True, fill_incumbent_first=True,
+      fill_exact=True, lazy_fills=True)) == "milestones"
+
+
+def test_fill_greedy_is_a_lazy_milestone_policy():
+  with pytest.raises(SystemExit, match="implemented only by milestone local fills"):
+    main._validate_solver_scoped_flags(RunConfig(
+        milestones=False, fill_greedy=True, lazy_fills=True))
+  with pytest.raises(SystemExit, match="requires --lazy-fills"):
+    main._validate_solver_scoped_flags(RunConfig(
+        milestones=True, fill_greedy=True, lazy_fills=False))
+  assert main._validate_solver_scoped_flags(RunConfig(
+      milestones=True, fill_greedy=True, lazy_fills=True)) == "milestones"
+
+
+def test_standard_uses_greedy_local_fills_without_changing_global_weight():
+  cfg = main.parse_args(["--search-profile", "standard"])
+  assert cfg.fill_local_h is True
+  assert cfg.fill_greedy is True
+  assert cfg.fill_exact is False
+  assert cfg.weight == 1.0
+
+
+def test_milestone_anytime_receives_greedy_incumbent_policy(monkeypatch):
+  seen = {}
+
+  def fake(*_args, **kwargs):
+    seen.update(kwargs)
+    return []
+
+  monkeypatch.setattr(main, "solve_assembly_problem_milestones_anytime", fake)
+  cfg = RunConfig(milestones_anytime=30.0, milestones=True, fill_local_h=True,
+                  fill_greedy=True, fill_exact=False, lazy_fills=True, weight=1.0,
+                  placement_yaws=4, placement_yaw_widening=True)
+  assert main._validate_solver_scoped_flags(cfg) == "milestones-anytime"
+  assert main._dispatch_solve(cfg, None, None, [], None) == []
+  assert seen["fill_greedy"] is True
+  assert seen["fill_exact"] is False
+  assert seen["weight"] == 1.0
+  assert seen["placement_yaw_widening"] is True
 
 
 def test_solver_scoped_policy_flags_fail_closed_in_other_engines():

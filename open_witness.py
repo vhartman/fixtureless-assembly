@@ -252,12 +252,9 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
     p = report.search_profile
     if not p:
       return ""
-    # These named timers are children of search_wall except delete_wall, which runs between
-    # search calls. `other` is the exact residual inside search (hashing, state/tree updates,
-    # Python edge-loop control and goal checks), after subtracting non-overlapping children.
-    children = sum(float(p.get(k, 0.0)) for k in (
-        "succ_wall", "heuristic_wall", "cheap_wall", "queue_wall", "alt_wall"))
-    other = max(0.0, float(p.get("search_wall", 0.0)) - children)
+    # Heuristic time includes the initial h(start), which can trigger the lazy reverse-PDB
+    # build before search(), and queue/repair timers can likewise straddle search calls. Treat
+    # these as attributed cumulative buckets; they are not intended to sum to search_wall.
     return (f"; forward-prof search={p.get('search_wall', 0.0):.2f}s "
             f"succ={p.get('succ_wall', 0.0):.2f}s/"
             f"{int(p.get('succ_calls', 0))}x/{int(p.get('succ_edges', 0))}e "
@@ -269,7 +266,7 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
             f"{int(p.get('queue_added', 0))}+/{int(p.get('queue_dominated', 0))}- "
             f"alts={p.get('alt_wall', 0.0):.2f}s/"
             f"{int(p.get('alt_updates', 0))}+/{int(p.get('alt_calls', 0))}x "
-            f"other={other:.2f}s repair={p.get('delete_wall', 0.0):.2f}s/"
+            f"repair={p.get('delete_wall', 0.0):.2f}s/"
             f"{int(p.get('delete_calls', 0))} "
             f"pops={int(p.get('heap_pops', 0))} stale="
             f"{int(p.get('superseded_pops', 0) + p.get('stale_parent_pops', 0))}")

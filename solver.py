@@ -8580,11 +8580,14 @@ class _IncrementalLazySearch:
 
   def __init__(self, start, goal_fn, succ_fn, cost_fn, h_fn, weight, blacklist,
                cheap_gate=None, pop_observer=None, repairable=True,
-               memoize_successors=True, compact_frontier=False):
+               memoize_successors=True, compact_frontier=False, cost_bound=None):
     import itertools
     import os
     self.goal_fn, self.cost_fn, self.h_fn = goal_fn, cost_fn, h_fn
     self.weight = weight
+    # Strict incumbent bound.  Ordering may be greedy/weighted, but pruning always uses
+    # admissible g+h, so this changes neither completeness below the bound nor optimality.
+    self.cost_bound = cost_bound
     self.blacklist = blacklist                            # shared, grows externally
     self.cheap_gate = cheap_gate                          # EAGER pop-time gate (cheap checks):
     self.pop_observer = pop_observer                    # opt-in exact search-order diagnostic
@@ -8604,6 +8607,7 @@ class _IncrementalLazySearch:
         "succ_calls": 0, "succ_cache_hits": 0, "succ_edges": 0,
         "succ_wall": 0.0,
         "heuristic_calls": 0, "heuristic_misses": 0, "heuristic_wall": 0.0,
+        "bound_prunes": 0,
         "cheap_calls": 0, "cheap_rejects": 0, "cheap_wall": 0.0,
         "alt_calls": 0, "alt_updates": 0, "alt_wall": 0.0,
         "delete_calls": 0, "delete_wall": 0.0, "delete_removed": 0,
@@ -8653,7 +8657,10 @@ class _IncrementalLazySearch:
     self.expanded = 0
     self.budget_hit = False
     h0 = self._h(start)
-    self._queue((self._f(0.0, h0), h0, 0.0, next(self.tie), start, None, None))
+    if self.cost_bound is None or h0 < self.cost_bound:
+      self._queue((self._f(0.0, h0), h0, 0.0, next(self.tie), start, None, None))
+    elif self.profile_enabled:
+      self.profile["bound_prunes"] += 1
 
   def _h(self, state):
     sentinel = self
@@ -8816,7 +8823,8 @@ class _IncrementalLazySearch:
           continue
         ng = pg + self.cost_fn(action)
         hs = self._h(state)
-        if hs != float("inf"):
+        if (hs != float("inf")
+            and (self.cost_bound is None or ng + hs < self.cost_bound)):
           if self.profile_enabled:
             self.profile["boundary_edges"] += 1
           self._queue((self._f(ng, hs), hs, ng, next(self.tie),
@@ -8904,8 +8912,11 @@ class _IncrementalLazySearch:
           if self.profile_enabled:
             self.profile["reprioritized_pops"] += 1
           hs = self._h(s)
-          self._queue((self._f(g_true, hs), hs, g_true, next(self.tie),
-                       s, prev, action))
+          if self.cost_bound is None or g_true + hs < self.cost_bound:
+            self._queue((self._f(g_true, hs), hs, g_true, next(self.tie),
+                         s, prev, action))
+          elif self.profile_enabled:
+            self.profile["bound_prunes"] += 1
           continue
         cheap_ok = True
         if self.cheap_gate is not None:
@@ -8956,6 +8967,10 @@ class _IncrementalLazySearch:
         ng = g + self.cost_fn(a)
         hns = self._h(ns)
         if hns == float("inf"):
+          continue
+        if self.cost_bound is not None and ng + hns >= self.cost_bound:
+          if self.profile_enabled:
+            self.profile["bound_prunes"] += 1
           continue
         entry = (self._f(ng, hns), hns, ng, next(self.tie), ns, s, a)
         if ns in self.claimed and not (
@@ -9102,7 +9117,8 @@ def solve_assembly_problem_lazy(C, assembly, robots=None, max_nodes=200000, verb
       start, goal_fn=lambda s: s.is_goal(assembly),
       succ_fn=succ_raw, cost_fn=action_cost, h_fn=h_fn,
       weight=weight, blacklist=blacklist,
-      cheap_gate=lambda prev, a, ns: cheap_feasible(a, prev, ns, assembly, checker))
+      cheap_gate=lambda prev, a, ns: cheap_feasible(a, prev, ns, assembly, checker),
+      cost_bound=cost_bound)
   n_checks = 0
   for rounds in range(1, max_rounds + 1):
     plan = engine.search(max_nodes, deadline=deadline)    # INCREMENTAL: continues the frontier
@@ -9448,6 +9464,8 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
                   part_grasp_allow=None, brace_allow=None, deadline=None,
                   lazy_fill=False, cost_bound=None, forbid_assemble=None, settle_ref=None,
                   h_extra_shift=None, fill_h=None, exact_fill=False,
+                  fill_greedy=False,
+                  incumbent_first=False,
                   skeleton_only=False, policy_pdb=None,
                   grasp_active=None, placement_active=None, placement_active_prefix=None,
                   touch_all=None,
@@ -9488,6 +9506,18 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
       print(f"[fill-pdb {tag}] settled={ps['settled']} discovered={ps['discovered']} "
             f"reverse={ps['reverse_time']:.2f}s pick={ps['pick_facts']} "
             f"wrench={ps['wrench_facts']} exhausted={ps['exhausted']}")
+    if _succ_prof is not None:
+      raw = _succ_prof["raw"]
+      kept = _succ_prof["kept"]
+      rejects = _succ_prof["rejects"]
+      by_kind = ", ".join(
+          f"{kind}={kept.get(kind, 0)}/{count}"
+          for kind, count in sorted(raw.items(), key=lambda item: (-item[1], item[0])))
+      by_reject = ", ".join(
+          f"{gate}={count}" for gate, count in
+          sorted(rejects.items(), key=lambda item: (-item[1], item[0])))
+      print(f"[fill-succ-prof {tag}] kept/raw by primitive: {by_kind or 'none'}; "
+            f"filtered: {by_reject or 'none'}")
     if robot_ik is None or _fp0 is None:
       return
     pr, (f0, fba, fgates, fpairs) = robot_ik.prof, _fp0
@@ -9529,7 +9559,15 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
           + (f"; margin-refine={dmr} ({dmrt:.1f}s)" if dmr else "")
           + (f"; clearance-pairs: {pair_summary}" if pair_summary else ""))
   settle = settle_ref if settle_ref is not None else assembly.base
-  search_weight = 1.0 if exact_fill else weight
+  # Local feasibility ordering is deliberately independent of the outer/global weight.
+  # Greedy best-first pays attention only to the goal-conditioned fill heuristic; it changes
+  # neither successors nor validation and therefore remains a time-to-first-plan policy.
+  search_weight = float("inf") if fill_greedy else (1.0 if exact_fill else weight)
+  if _os.environ.get("FILL_SEARCH_PROFILE"):
+    from collections import Counter as _Counter
+    _succ_prof = {"raw": _Counter(), "kept": _Counter(), "rejects": _Counter()}
+  else:
+    _succ_prof = None
 
   def _comps(s):
     # (main, settle) components; identical when settle_ref is None/base (byte-identical
@@ -9630,18 +9668,28 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
     for a, ns in successors(s, assembly, robots, grasp_table=grasp_table,
                             gripper_kind=gripper_kind, handovers=handovers,
                             allow_place=allow_place, bracing=bracing):
+      if _succ_prof is not None:
+        _succ_prof["raw"][a[0]] += 1
       # RELEASE of an inherited grasp is always legal. The broad scope pass additionally admits
       # ordinary manipulation of future/blocking parts, but _fill_action_in_scope prevents an
       # unrelated assembly join from making the concrete state disagree with outer `ideal`.
       if not _fill_action_in_scope(a, relevant, p, touch_all=touch_all):
+        if _succ_prof is not None:
+          _succ_prof["rejects"]["scope"] += 1
         continue
       if grasp_active is not None:
         if not _grasp_action_in_columns(a, grasp_active):
+          if _succ_prof is not None:
+            _succ_prof["rejects"]["grasp-columns"] += 1
           continue                                        # policy-selected finite columns
       elif not _grasp_action_within_cap(a, grasp_cap):
+        if _succ_prof is not None:
+          _succ_prof["rejects"]["grasp-cap"] += 1
         continue                                          # only stable ids < this part's cap
       if not _placement_action_in_classes(
           a, ns, assembly, placement_active, prefix=placement_active_prefix):
+        if _succ_prof is not None:
+          _succ_prof["rejects"]["placement"] += 1
         continue                                          # policy-selected rest/yaw orbits
       if part_grasp_allow is not None and a[0] == "assemble" and a[2] == p:
         # the abstraction's viable-inserter-grasp hint applies to the MATE -- the grasp `p` is
@@ -9652,14 +9700,24 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
         # is the completeness net when the relaxed hint misses the concrete-viable grasp.
         g = _held_grasp(s, p)
         if g is not None and g not in part_grasp_allow:
+          if _succ_prof is not None:
+            _succ_prof["rejects"]["mate-hint"] += 1
           continue
       if (brace_allow is not None and a[0] == "add_grasp"
           and (a[2], a[3]) not in brace_allow):
+        if _succ_prof is not None:
+          _succ_prof["rejects"]["brace-hint"] += 1
         continue                                          # only the abstraction's known G2 braces
       if forbid_assemble is not None and a[0] == "assemble" and a[2] in forbid_assemble:
+        if _succ_prof is not None:
+          _succ_prof["rejects"]["forbid-assemble"] += 1
         continue                                          # e.g. the module JOIN belongs to the
       if policy_pdb is not None and not _fill_policy_edge(policy_pdb, s, a, ns):
+        if _succ_prof is not None:
+          _succ_prof["rejects"]["policy"] += 1
         continue                                          # proposal: Bellman-optimal PDB corridor
+      if _succ_prof is not None:
+        _succ_prof["kept"][a[0]] += 1
       yield a, ns
 
   def _diagnose_reference_rank():
@@ -9828,6 +9886,62 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
                                             allow_place=allow_place, bracing=bracing)
                if act == a)
     return s
+
+  if (incumbent_first and exact_fill and lazy_fill and robot_ik is not None
+      and not skeleton_only and not diagnostic_only):
+    # Anytime local fill: obtain a fully validated incumbent with greedy best-first search,
+    # then run the established weight-one lazy search up to its cost.  Admitting the incumbent
+    # itself is important: when A* pops a validated cost-U goal, every cheaper queue key has
+    # already been considered, without requiring the finite open-witness scheduler to claim a
+    # proof from mere repeated nonlinear failures.  Both calls
+    # share RobotIK's solve-scoped positive witnesses and open-failure effort; no IK result is
+    # promoted to a no-good merely because the greedy pass encountered it first.
+    common = dict(
+        gripper_kind=gripper_kind, handovers=handovers, allow_place=allow_place,
+        bracing=bracing, grasp_cap=grasp_cap, h_extra=h_extra,
+        part_grasp_allow=part_grasp_allow, brace_allow=brace_allow, deadline=deadline,
+        lazy_fill=lazy_fill, forbid_assemble=forbid_assemble, settle_ref=settle_ref,
+        h_extra_shift=h_extra_shift, fill_h=fill_h, skeleton_only=False,
+        policy_pdb=policy_pdb, grasp_active=grasp_active,
+        placement_active=placement_active, placement_active_prefix=placement_active_prefix,
+        touch_all=touch_all, excluded_end_states=excluded_end_states,
+        diagnostic_only=False, incumbent_first=False, fill_greedy=False)
+    if verbose:
+      print(f"[fill-incumbent {p}] greedy lazy pass", flush=True)
+    inc, inc_end = _add_one_part(
+        start, p, ideal, assembly, robots, checker, grasp_table, robot_ik,
+        float("inf"), max_nodes, verbose, exact_fill=False,
+        cost_bound=cost_bound, **common)
+    if inc is not None:
+      incumbent_cost = sum(action_cost(a) for a in inc)
+      import math
+      # The engine's bound is strict (g+h < bound); nextafter therefore implements <= U
+      # without making assumptions about integral action costs.
+      improve_bound = math.nextafter(float(incumbent_cost), float("inf"))
+      if cost_bound is not None:
+        improve_bound = min(cost_bound, improve_bound)
+      if verbose:
+        print(f"[fill-incumbent {p}] validated cost {incumbent_cost:g}; "
+              f"weight-one confirmation/improvement through cost {incumbent_cost:g}",
+              flush=True)
+      better, better_end = _add_one_part(
+          start, p, ideal, assembly, robots, checker, grasp_table, robot_ik,
+          weight, max_nodes, verbose, exact_fill=True,
+          cost_bound=improve_bound, **common)
+      if better is not None:
+        better_cost = sum(action_cost(a) for a in better)
+        if verbose:
+          verb = "improved" if better_cost < incumbent_cost else "confirmed"
+          print(f"[fill-incumbent {p}] {verb} {incumbent_cost:g} -> "
+                f"{better_cost:g}", flush=True)
+        return better, better_end
+      if verbose:
+        print(f"[fill-incumbent {p}] no cheaper validated fill returned; "
+              f"retaining cost {incumbent_cost:g} incumbent", flush=True)
+      return inc, inc_end
+    if verbose:
+      print(f"[fill-incumbent {p}] greedy pass found no validated fill; "
+            "continuing with weight one", flush=True)
 
   def _direct_skeleton_fill():
     """Probe the deliberately tiny reviewer-baseline manipulation family.
@@ -10011,6 +10125,7 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
           start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
           weight=search_weight, blacklist=suspended,
           cheap_gate=_open_cheap_gate,
+          cost_bound=cost_bound,
           # Open-witness repair can generate hundreds of thousands of graph edges while the
           # value-state set remains small.  Regenerate deterministic successors on repair
           # instead of retaining that entire edge graph for the lifetime of the epoch.
@@ -10067,14 +10182,16 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
     engine = _IncrementalLazySearch(
         start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
         weight=search_weight, blacklist=bl,
-        cheap_gate=lambda prev, act, ns: cheap_feasible(act, prev, ns, assembly, checker))
+        cheap_gate=lambda prev, act, ns: cheap_feasible(act, prev, ns, assembly, checker),
+        cost_bound=cost_bound)
 
-    # The established fast path caps LazySP repairs at 200 candidate plans. Exact local
-    # mode removes that arbitrary retry cutoff: every invalid candidate deletes at least
-    # one new edge, so repair continues until a valid optimum is popped, the finite
-    # frontier is exhausted, or the existing node/deadline budget is reached.
+    # The established weighted fast path caps LazySP repairs at 200 candidate plans. Exact
+    # and greedy local modes remove that arbitrary retry cutoff: every invalid candidate
+    # deletes at least one new edge, so repair continues until a valid goal is popped, the
+    # finite frontier is exhausted, or the existing node/deadline budget is reached. Only
+    # exact mode attaches an optimum claim to the popped goal.
     _round = 0
-    while exact_fill or _round < 200:
+    while exact_fill or fill_greedy or _round < 200:
       # INCREMENTAL repair (the global lazy search's engine, LPA*-style): the heap and the
       # claimed tree PERSIST across rounds; a blacklisted edge only un-claims its own
       # search-tree subtree and re-injects the recorded alternate entries. The old
@@ -10243,7 +10360,8 @@ def _add_parts(start, ps, ideal, assembly, robots, checker, grasp_table, robot_i
     engine = _IncrementalLazySearch(
         start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
         weight=weight, blacklist=bl,
-        cheap_gate=lambda prev, act, ns: cheap_feasible(act, prev, ns, assembly, checker))
+        cheap_gate=lambda prev, act, ns: cheap_feasible(act, prev, ns, assembly, checker),
+        cost_bound=cost_bound)
 
     for _round in range(200):
       subplan = engine.search(max_nodes, deadline=deadline)
@@ -10692,6 +10810,8 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
                                            fill_window=2, lazy_fills=True,
                                            cost_bound=None, milestone_oracle="global",
                                            fill_local_h=False, fill_exact=False,
+                                           fill_greedy=False,
+                                           fill_incumbent_first=False,
                                            fill_policy_first=False,
                                            fill_policy_guide=False,
                                            fill_skeleton_first=False,
@@ -10853,7 +10973,7 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
     if verbose:
       print("[fill-local-h] ACTIVE: one goal-conditioned PDB per fill "
             "(all grasps fact-signature projected); "
-            + f"concrete fill search weight={'1 (exact)' if fill_exact else weight}")
+            + f"concrete fill ordering={'greedy' if fill_greedy else ('weight 1 (exact)' if fill_exact else f'weight {weight:g}')}")
 
   def fill_pdb(s, q, settle):
     if not fill_local_h:
@@ -11023,7 +11143,9 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
               forbid_assemble=forbid, settle_ref=settle,
               h_extra_shift=shift,
               fill_h=(lpdb.value if lpdb is not None else None),
-              exact_fill=fill_exact, touch_all=rank_touch_all,
+              exact_fill=fill_exact, fill_greedy=fill_greedy,
+              incumbent_first=fill_incumbent_first,
+              touch_all=rank_touch_all,
               excluded_end_states=excluded_end_states, diagnostic_only=True)
           if (frozenset(ideal), q) in _FILL_REFERENCE_DONE:
             rank_done = True
@@ -11040,7 +11162,9 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
           deadline=deadline, lazy_fill=lazy_fills, cost_bound=fb,
           forbid_assemble=forbid, settle_ref=settle,
           h_extra=None, h_extra_shift=shift, fill_h=lpdb.value,
-          exact_fill=fill_exact, policy_pdb=lpdb,
+          exact_fill=fill_exact, fill_greedy=fill_greedy,
+          incumbent_first=fill_incumbent_first,
+          policy_pdb=lpdb,
           grasp_cap=grasp_caps,
           touch_all=scope_passes[0], excluded_end_states=excluded_end_states)
       _release_fill_scratch(f"{q}:policy", verbose)
@@ -11061,7 +11185,9 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
                    h_lab.value if h_lab is not None else None),
           h_extra_shift=shift,
           fill_h=(lpdb.value if lpdb is not None else None),
-          exact_fill=fill_exact, skeleton_only=True,
+          exact_fill=fill_exact, fill_greedy=fill_greedy,
+          incumbent_first=fill_incumbent_first,
+          skeleton_only=True,
           grasp_cap=grasp_caps,
           touch_all=scope_passes[0], excluded_end_states=excluded_end_states)
       _release_fill_scratch(f"{q}:skeleton", verbose)
@@ -11100,7 +11226,9 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
                 cost_bound=fb, forbid_assemble=forbid, settle_ref=settle,
               h_extra_shift=shift,
               fill_h=(lpdb.value if lpdb is not None else None),
-              exact_fill=fill_exact, touch_all=touch_all,
+              exact_fill=fill_exact, fill_greedy=fill_greedy,
+              incumbent_first=fill_incumbent_first,
+              touch_all=touch_all,
                 excluded_end_states=excluded_end_states)
             _release_fill_scratch(f"{q}:phase", verbose)
             if sub is not None:
@@ -11753,6 +11881,8 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
                                      fill_window=2, lazy_fills=True,
                                      cost_bound=None, milestone_oracle="global",
                                      fill_local_h=False, fill_exact=False,
+                                     fill_greedy=False,
+                                     fill_incumbent_first=False,
                                      fill_policy_first=False,
                                      fill_policy_guide=False,
                                      fill_skeleton_first=False,
@@ -11800,7 +11930,8 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
       max_repairs=max_repairs, geo_facts=geo_facts, sig_collapsed_h=sig_collapsed_h,
       deadline=deadline, fill_window=fill_window, lazy_fills=lazy_fills,
       cost_bound=cost_bound, milestone_oracle=milestone_oracle,
-      fill_local_h=fill_local_h, fill_exact=fill_exact,
+      fill_local_h=fill_local_h, fill_exact=fill_exact, fill_greedy=fill_greedy,
+      fill_incumbent_first=fill_incumbent_first,
       fill_policy_first=fill_policy_first, fill_policy_guide=fill_policy_guide,
       fill_skeleton_first=fill_skeleton_first,
       fill_scope_widening=fill_scope_widening,
@@ -11849,6 +11980,8 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
                                       fill_window=2, lazy_fills=True,
                                       cost_bound=None, milestone_oracle="global",
                                       fill_local_h=False, fill_exact=False,
+                                      fill_greedy=False,
+                                      fill_incumbent_first=False,
                                       fill_policy_first=False,
                                       fill_policy_guide=False,
                                       fill_skeleton_first=False,
@@ -11867,7 +12000,8 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
       max_repairs=max_repairs, geo_facts=geo_facts, sig_collapsed_h=sig_collapsed_h,
       deadline=deadline, fill_window=fill_window, lazy_fills=lazy_fills,
       cost_bound=cost_bound, milestone_oracle=milestone_oracle,
-      fill_local_h=fill_local_h, fill_exact=fill_exact,
+      fill_local_h=fill_local_h, fill_exact=fill_exact, fill_greedy=fill_greedy,
+      fill_incumbent_first=fill_incumbent_first,
       fill_policy_first=fill_policy_first,
       fill_policy_guide=fill_policy_guide,
       fill_skeleton_first=fill_skeleton_first,
@@ -11889,11 +12023,14 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
                                               grasp_collapsed_h=False, fill_window=2,
                                               milestone_oracle="global",
                                               fill_local_h=False, fill_exact=False,
+                                              fill_greedy=False,
+                                              fill_incumbent_first=False,
                                               fill_policy_first=False,
                                               fill_policy_guide=False,
                                               fill_skeleton_first=False,
                                               fill_scope_widening=False,
-                                              milestone_boundaries=1):
+                                              milestone_boundaries=1,
+                                              placement_yaw_widening=False):
   """THE SINGLE RECIPE (--milestones-anytime SEC): adaptive-width milestones under a hard
   deadline, then spend whatever budget remains on principled add-ons -- one algorithm plus
   its own refinements, not a solver lottery:
@@ -11942,11 +12079,14 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
         allow_place=allow_place, bracing=bracing, geo_facts=geo_facts,
         sig_collapsed_h=sig_collapsed_h, deadline=t_mile, fill_window=fill_window,
         milestone_oracle=milestone_oracle, fill_local_h=fill_local_h,
-        fill_exact=fill_exact, fill_policy_first=fill_policy_first,
+        fill_exact=fill_exact, fill_greedy=fill_greedy,
+        fill_incumbent_first=fill_incumbent_first,
+        fill_policy_first=fill_policy_first,
         fill_policy_guide=fill_policy_guide,
         fill_skeleton_first=fill_skeleton_first,
         fill_scope_widening=fill_scope_widening,
-        milestone_boundaries=milestone_boundaries)
+        milestone_boundaries=milestone_boundaries,
+        placement_yaw_widening=placement_yaw_widening)
   finally:
     if old_open_epochs is not None:
       robot_ik.open_witness_epochs = old_open_epochs

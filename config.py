@@ -94,6 +94,8 @@ class RunConfig:
   milestone_oracle: str = "global"
   fill_local_h: bool = False
   fill_exact: bool = False
+  fill_greedy: bool = False
+  fill_incumbent_first: bool = False
   fill_policy_first: bool = False
   fill_policy_guide: bool = False
   fill_skeleton_first: bool = False

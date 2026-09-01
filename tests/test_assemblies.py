@@ -904,6 +904,21 @@ def test_fill_local_exact_plans_a_sequence_without_global_oracle():
   assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
 
 
+def test_fill_local_greedy_plans_a_sequence_without_global_oracle():
+  """The standard local ordering is a real solver path, not only a profile spelling."""
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 3)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  plan = A.solve_assembly_problem_milestones(
+      C, asm, robots=robots, weight=1.0, verbose=False,
+      milestone_oracle="structural", fill_local_h=True,
+      fill_exact=False, fill_greedy=True)
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+
+
 def test_fill_policy_edge_uses_bellman_equality_and_rejects_hidden_stutters():
   import solver as S
 

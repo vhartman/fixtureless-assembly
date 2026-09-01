@@ -20,14 +20,15 @@ from config import RunConfig
 # an explicit request, so its named fields override a loaded config while unnamed scene fields
 # still come from that file.
 _STANDARD_SEARCH_PROFILE = {
-    # Three-seed four-robot stress result (Cross-7, mixed Chair-8, Fixture-rack-9): the
-    # principled weight-one local PDB + fair witness policy was 18% faster in aggregate,
-    # preserved/improved plan cost, and cut noisy Fixture peak RSS from 4.22 to 0.91 GiB.
+    # The local PDB is used greedily for time-to-first validated assembly.  The global
+    # weight remains one: --milestones-anytime can therefore hand the incumbent to its
+    # separate exact improvement phase without inheriting the local feasibility ordering.
     "weight": 1.0,
     "milestones": True,
     "milestone_oracle": "structural",
     "fill_local_h": True,
-    "fill_exact": True,
+    "fill_exact": False,
+    "fill_greedy": True,
     # Experimental CEGAR precursor: a strict shortest-PDB policy is often spurious under
     # fixed-base IK (OpenArm Car-mini needs an abstract-cost +5 presentation detour).  Keep
     # the probe available, but do not make a failed strict concretization part of standard
@@ -205,8 +206,8 @@ def build_parser():
   )
   parser.add_argument(
       "--search-profile", choices=tuple(_SEARCH_PROFILES), default=None, metavar="NAME",
-      help="Named fresh-search defaults: standard = robust 5mm witness contract + weight-one "
-           "structural milestones + exact uniform local-PDB fills + non-pruning useful-grasp "
+      help="Named fresh-search defaults: standard = robust 5mm witness contract + greedy "
+           "structural milestone fills with a uniform local PDB + non-pruning useful-grasp "
            "guidance + bounded fair open witnesses; "
            "open = compatibility alias for standard; fast-open = standard plus "
            "--analytic-seed-cap 3 (aggressive/experimental). A profile "
@@ -1219,7 +1220,23 @@ def build_parser():
       help="Run one-part concrete fill searches at weight 1, irrespective of the global "
            "--weight. Also removes the ordinary 200-plan lazy-repair cutoff; node/deadline "
            "limits still apply. IK remains lazy and fully validated. Enabled together with "
-           "--fill-local-h by --search-profile standard.",
+           "--fill-local-h for exact-fill ablations.",
+  )
+  g_search.add_argument(
+      "--fill-greedy", action=argparse.BooleanOptionalAction, default=False,
+      help="Order one-part lazy fills by h only (greedy best-first), independently of the "
+           "global --weight. Validation still repairs the finite frontier until a solution, "
+           "node/deadline limit, or exhaustion; it is not a pruning rule. This is the "
+           "time-to-first-plan policy used by --search-profile standard. Exact improvement "
+           "belongs to --milestones-anytime.",
+  )
+  g_search.add_argument(
+      "--fill-incumbent-first", action=argparse.BooleanOptionalAction, default=False,
+      help="Experimental anytime ordering for exact lazy milestone fills: first find a fully "
+           "validated incumbent with greedy best-first search, then run the usual weight-one "
+           "fill search with g+h bounded by the incumbent cost. Witness successes and "
+           "open-failure effort are reused. Requires --fill-local-h, --fill-exact and "
+           "--lazy-fills; not yet enabled by a profile.",
   )
   g_search.add_argument(
       "--fill-policy-first", action=argparse.BooleanOptionalAction, default=False,
@@ -2165,6 +2182,7 @@ _SAVE_CONFIG_FIELDS = (
     # resolved values rather than only a named-profile label: profiles may evolve, whereas a
     # paper artifact must keep the semantics it was actually solved under.
     "weight", "milestones", "goal_on_table", "milestone_oracle", "fill_local_h", "fill_exact",
+    "fill_greedy", "fill_incumbent_first",
     "fill_policy_first", "fill_policy_guide", "fill_skeleton_first", "milestone_boundaries",
     "fill_scope_widening", "fill_touch_all", "placement_yaw_widening",
     "fill_window", "lazy_fills", "open_witness", "open_witness_batch",
@@ -2299,9 +2317,22 @@ def _validate_solver_scoped_flags(cfg):
   if cfg.grasp_local_widen and engine != "milestones":
     raise SystemExit("--grasp-local-widen requires the ordinary --milestones solver; "
                      f"selected engine is {engine}")
-  if cfg.placement_yaw_widening and engine != "milestones":
-    raise SystemExit("--placement-yaw-widening is currently scheduled only by the ordinary "
-                     f"--milestones solver; selected engine is {engine}")
+  if cfg.placement_yaw_widening and engine not in ("milestones", "milestones-anytime"):
+    raise SystemExit("--placement-yaw-widening is currently scheduled only by milestone "
+                     f"solvers; selected engine is {engine}")
+  if cfg.fill_greedy:
+    if engine not in ("milestones", "milestones-anytime"):
+      raise SystemExit("--fill-greedy is implemented only by milestone local fills; "
+                       f"selected engine is {engine}")
+    if not cfg.lazy_fills:
+      raise SystemExit("--fill-greedy requires --lazy-fills")
+  if cfg.fill_incumbent_first:
+    if engine not in ("milestones", "milestones-anytime"):
+      raise SystemExit("--fill-incumbent-first is implemented only by milestone local fills; "
+                       f"selected engine is {engine}")
+    if not cfg.fill_local_h or not cfg.fill_exact or not cfg.lazy_fills:
+      raise SystemExit("--fill-incumbent-first requires --fill-local-h, --fill-exact, "
+                       "and --lazy-fills")
   if cfg.fill_policy_first:
     if not cfg.fill_local_h:
       raise SystemExit("--fill-policy-first requires --fill-local-h")
@@ -2354,11 +2385,14 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         collapsed_h=cfg.collapsed_h, grasp_collapsed_h=cfg.grasp_collapsed_h,
         fill_window=cfg.fill_window, milestone_oracle=cfg.milestone_oracle,
         fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
+        fill_greedy=cfg.fill_greedy,
+        fill_incumbent_first=cfg.fill_incumbent_first,
         fill_policy_first=cfg.fill_policy_first,
         fill_policy_guide=cfg.fill_policy_guide,
         fill_skeleton_first=cfg.fill_skeleton_first,
         fill_scope_widening=cfg.fill_scope_widening,
-        milestone_boundaries=cfg.milestone_boundaries)
+        milestone_boundaries=cfg.milestone_boundaries,
+        placement_yaw_widening=cfg.placement_yaw_widening)
   elif cfg.bounded or cfg.dfbnb:
     plan = solve_assembly_problem_bounded(
         C, assembly, robots=robots, robot_ik=robot_ik, weight=cfg.weight,
@@ -2423,6 +2457,8 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         sig_collapsed_h=cfg.sig_collapsed_h, fill_window=cfg.fill_window,
         lazy_fills=cfg.lazy_fills, milestone_oracle=cfg.milestone_oracle,
         fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
+        fill_greedy=cfg.fill_greedy,
+        fill_incumbent_first=cfg.fill_incumbent_first,
         fill_policy_first=cfg.fill_policy_first,
         fill_policy_guide=cfg.fill_policy_guide,
         fill_skeleton_first=cfg.fill_skeleton_first,
@@ -2462,6 +2498,8 @@ def _milestone_candidate_session(cfg, C, assembly, robots, robot_ik):
       sig_collapsed_h=cfg.sig_collapsed_h, fill_window=cfg.fill_window,
       lazy_fills=cfg.lazy_fills, milestone_oracle=cfg.milestone_oracle,
       fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
+      fill_greedy=cfg.fill_greedy,
+      fill_incumbent_first=cfg.fill_incumbent_first,
       fill_policy_first=cfg.fill_policy_first,
       fill_policy_guide=cfg.fill_policy_guide,
       fill_skeleton_first=cfg.fill_skeleton_first,
@@ -2882,7 +2920,8 @@ def run(cfg, explicit=None):
   if _profile:
     print(f"[profile] search '{_profile}' resolved: weight={cfg.weight:g}, "
           f"milestone-oracle={cfg.milestone_oracle}, "
-          f"local-PDB={'exact' if cfg.fill_local_h and cfg.fill_exact else ('weighted' if cfg.fill_local_h else 'off')}, "
+          f"local-PDB={'on' if cfg.fill_local_h else 'off'}, "
+          f"fill-order={'greedy->exact' if cfg.fill_incumbent_first else ('greedy' if cfg.fill_greedy else ('exact' if cfg.fill_exact else f'weighted({cfg.weight:g})'))}, "
           f"fill-scope={'all' if cfg.fill_touch_all else ('local->all' if cfg.fill_scope_widening else 'local-only')}, "
           f"milestone-boundaries={cfg.milestone_boundaries}, "
           f"witness-margin={float(cfg.witness_margin or 0.0)*1000:g}mm, "

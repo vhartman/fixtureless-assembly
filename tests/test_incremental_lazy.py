@@ -155,3 +155,27 @@ def test_heuristic_is_evaluated_once_per_value_state_across_repairs():
   e.delete_edge("A", ('bad', 1), "X")
   assert e.search(20) == [('right', 1), ('good', 1), ('finish', 1)]
   assert calls == {state: 1 for state in graph}
+
+
+def test_strict_cost_bound_is_independent_of_greedy_queue_order():
+  graph = {
+      "S": [(('cheap-start', 1), "A"), (('greedy-start', 3), "B")],
+      "A": [(('cheap-finish', 1), "G")],
+      "B": [(('greedy-finish', 1), "G")],
+      "G": [],
+  }
+  h = {"S": 1, "A": 1, "B": 0, "G": 0}
+  greedy = _IncrementalLazySearch(
+      "S", goal_fn=lambda s: s == "G", succ_fn=lambda s: graph[s],
+      cost_fn=lambda a: a[1], h_fn=h.__getitem__, weight=float("inf"), blacklist=set())
+  assert greedy.search(20) == [('greedy-start', 3), ('greedy-finish', 1)]
+
+  improve = _IncrementalLazySearch(
+      "S", goal_fn=lambda s: s == "G", succ_fn=lambda s: graph[s],
+      cost_fn=lambda a: a[1], h_fn=h.__getitem__, weight=1, blacklist=set(), cost_bound=4)
+  assert improve.search(20) == [('cheap-start', 1), ('cheap-finish', 1)]
+  # The bound is strict: asking for a plan cheaper than the optimum exhausts cleanly.
+  prove = _IncrementalLazySearch(
+      "S", goal_fn=lambda s: s == "G", succ_fn=lambda s: graph[s],
+      cost_fn=lambda a: a[1], h_fn=h.__getitem__, weight=1, blacklist=set(), cost_bound=2)
+  assert prove.search(20) is None
