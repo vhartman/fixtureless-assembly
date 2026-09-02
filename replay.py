@@ -13,6 +13,7 @@ A plan saved from a --real-ik run replays with its persisted witnesses by defaul
 silently resolves missing IK; ``--resolve-ik`` is the explicit one-time diagnostic escape hatch.
 """
 import argparse
+import numpy as np
 
 from assembly import *
 from env import make_four_robot_env
@@ -197,6 +198,11 @@ def build_scene(cfg):
                             vacuum=gripper_list if gripper_list is not None else _saved(cfg, "vacuum"),
                             robot_types=_saved(cfg, "robot_types") or _saved(cfg, "robot"))
   assembly = make_assembly(cfg["assembly"], cfg["parts"])
+  assembly.configure_screw_skills(
+      angle=(None if _saved(cfg, "screw_angle") is None
+             else np.deg2rad(float(_saved(cfg, "screw_angle")))),
+      depth=_saved(cfg, "screw_depth"), torque=_saved(cfg, "screw_torque"),
+      angular_speed=_saved(cfg, "screw_speed"), samples=_saved(cfg, "screw_samples"))
   # min_sep/grid/grid_gap MUST be passed too: they shape the initial scatter, so omitting them
   # rebuilt a different layout than the plan was solved in (FRAGILITY 1.8). Absent keys keep the
   # parser defaults, which is what a plan saved before they were persisted was solved with.

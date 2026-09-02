@@ -48,7 +48,7 @@ def require_complete_witnesses(plan, witnesses, *, who="witness export"):
   return witnesses
 
 
-def witness_block(joint_names, witnesses, alts=None, stage=None):
+def witness_block(joint_names, witnesses, alts=None, stage=None, skill_paths=None):
   """Pack per-action full-config witnesses for persistence. Entry i belongs to plan[i];
   None entries (actions without an IK keyframe) stay null. `joint_names` records the joint
   ORDER the vectors are expressed in -- readers must refuse the block if their scene's joint
@@ -66,6 +66,14 @@ def witness_block(joint_names, witnesses, alts=None, stage=None):
   if alts:
     out["wit_alts"] = {str(i): [[float(v) for v in m] for m in ms]
                        for i, ms in sorted(alts.items())}
+  if skill_paths:
+    # Path-valued skill witnesses (currently screw) are part of the certificate, not an
+    # export-time IK request.  Entry i is ordered entry->terminal and its last member must
+    # equal wit[i].  Keeping it in the same joint-order block gives readers one provenance
+    # check for endpoints and continuations alike.
+    out["skill_paths"] = {
+        str(i): [[float(v) for v in q] for q in path]
+        for i, path in sorted(skill_paths.items())}
   return out
 
 
@@ -142,4 +150,36 @@ def read_witness_sets(path, joint_names, n_actions):
             f"canonical witness -- dropped.")
       continue
     out[i] = members
+  return out or None
+
+
+def read_skill_paths(path, joint_names, n_actions, witnesses=None):
+  """Read aligned path-valued skill certificates, or ``None``.
+
+  A malformed path is a hard artifact error: unlike an optional witness set, silently
+  dropping it would authorize downstream IK re-solving and defeat replay reproducibility.
+  """
+  import numpy as np
+  with open(path) as f:
+    data = json.load(f)
+  blk = data.get("witnesses") or {}
+  raw = blk.get("skill_paths")
+  if not raw:
+    return None
+  if list(blk.get("joints") or []) != list(joint_names):
+    raise ValueError(f"{path}: skill-path joint order differs from the current scene")
+  out = {}
+  for key, rows in raw.items():
+    i = int(key)
+    if not (0 <= i < n_actions) or len(rows) < 2:
+      raise ValueError(f"{path}: invalid skill path index/length at {key}")
+    qs = [np.asarray(q, dtype=float) for q in rows]
+    if any(q.shape != (len(joint_names),) for q in qs):
+      raise ValueError(f"{path}: wrong-length skill-path member at step {i}")
+    if witnesses is not None:
+      if i >= len(witnesses) or witnesses[i] is None:
+        raise ValueError(f"{path}: skill path at step {i} has no canonical witness")
+      if not np.allclose(qs[-1], np.asarray(witnesses[i]), atol=1e-9, rtol=0.0):
+        raise ValueError(f"{path}: skill path at step {i} does not end at its witness")
+    out[i] = qs
   return out or None

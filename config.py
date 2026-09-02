@@ -208,6 +208,11 @@ class RunConfig:
 
   # -- skills / pre-insertion splits --
   skill: float = 0.0
+  screw_angle: Optional[float] = None
+  screw_depth: Optional[float] = None
+  screw_torque: Optional[float] = None
+  screw_speed: Optional[float] = None
+  screw_samples: Optional[int] = None
   pre_insertion: float = 0.05
   pre_pick: float = 0.05
   pre_place: float = 0.05

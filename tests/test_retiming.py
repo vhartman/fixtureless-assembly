@@ -250,6 +250,24 @@ def test_schedule_single_arm_matches_build_trajectory():
   assert np.allclose(sched.q, comp_path)
 
 
+def test_per_stretch_rate_slows_only_selected_skill_interval():
+  st = [([np.array([0.0]), np.array([1.0])], [10]),
+        ([np.array([1.0]), np.array([2.0])], [11])]
+  fast = retiming.build_trajectory(st, DT, RATE, RD, RM)
+  mixed = retiming.build_trajectory(st, DT, RATE, RD, RM,
+                                    stretch_rates=[RATE, RATE / 2.0])
+  assert mixed.fires[0][0] == fast.fires[0][0]
+  assert mixed.fires[1][0] > fast.fires[1][0]
+
+  dims = [np.array([0])]
+  sched_fast = retiming.plan_schedule(st, dims, [{0}, {0}], DT, RATE, RD, RM)
+  sched_mixed = retiming.plan_schedule(
+      st, dims, [{0}, {0}], DT, RATE, RD, RM,
+      stretch_rates=[RATE, RATE / 2.0])
+  assert sched_mixed.fires[0][0] == sched_fast.fires[0][0]
+  assert sched_mixed.fires[1][0] > sched_fast.fires[1][0]
+
+
 def test_schedule_priority_lower_arm_yields():
   # Shared 1-D lane: a "gate" forbids arm1 in (1.5,2.5) WHILE arm0 hasn't cleared (x0<3).
   # Yielding suffices: arm1 waits below the gate until arm0 passes 3, then proceeds.

@@ -565,6 +565,14 @@ def _backoff_mate(rel_pos, axis, delta):
   return rel_pos - delta * np.asarray(axis, dtype=float)
 
 
+def _axis_angle_quat(axis, angle):
+  """Unit wxyz quaternion for a signed rotation about ``axis`` (pure numpy/testable)."""
+  a = np.asarray(axis, dtype=float)
+  a = a / (np.linalg.norm(a) + 1e-12)
+  h = 0.5 * float(angle)
+  return np.concatenate([[np.cos(h)], np.sin(h) * a])
+
+
 class IKFailureLogDone(Exception):
   # raised by RobotIK._log_failure (only when fail_log_stop is set) once the failure-log
   # window or cap is reached: in debug mode the run's PURPOSE is the failure browser, so
@@ -3514,7 +3522,8 @@ class RobotIK:
       komo.addObjective([phase, phase], ry.FS.vectorZ, [onto], ry.OT.sos, [_ASSEMBLE_ORIENT_BIAS_W], list(z_dir))
       komo.addObjective([phase, phase], ry.FS.vectorX, [onto], ry.OT.sos, [_ASSEMBLE_ORIENT_BIAS_W], list(x_dir))
 
-  def _ik_assemble(self, action, s0, s1, assembly, seed, bias_axes=None, backoff=0.0, warm=None):
+  def _ik_assemble(self, action, s0, s1, assembly, seed, bias_axes=None, backoff=0.0,
+                   warm=None, skill_progress=None):
     self._cur_action = action                             # for PEN_VIEW_ACTION debug
     arm_seeds = {}                                        # exact per-arm ssik insertion seeds
     near_arm_seeds = {}                                   # deferred near-target factories
@@ -3540,6 +3549,19 @@ class RobotIK:
     # relative orientation is identity). relative_pose returns (parent, position_3vec).
     rel_pos = np.asarray(assembly.relative_pose(part)[1], dtype=float)
     rel_quat = np.array([1.0, 0.0, 0.0, 0.0])
+    screw = assembly.screw_skill(part)
+    if skill_progress is not None:
+      if screw is None:
+        raise ValueError("skill_progress is only defined for a screw mate")
+      s = float(skill_progress)
+      if not 0.0 <= s <= 1.0:
+        raise ValueError("screw skill progress must be in [0, 1]")
+      # The authored mate is the FINAL datum.  Entry is axially backed off and rotated by
+      # -angle; both advance linearly in the same scalar phase, giving a constant-pitch helix.
+      rel_pos = _backoff_mate(rel_pos, assembly.mate_axis(part),
+                              (1.0 - s) * float(screw.depth))
+      rel_quat = _axis_angle_quat(assembly.mate_axis(part),
+                                  -(1.0 - s) * float(screw.angle))
     # PRE-INSERTION backoff (export/replay only; `backoff`=0 in the search -> the SEARCH always
     # witnesses the REAL mated pose). When >0, solve the T_pre = T_mate shifted by -backoff*
     # mate_axis funnel-mouth keyframe (the seat direction is +mate_axis, so backing off is
@@ -3659,8 +3681,9 @@ class RobotIK:
         return False, None
 
     fixed_single = target_fixed and bias_axes is None
+    _pre_solve = backoff > 0.0 or skill_progress is not None
     racing = (self.assemble_basin_racing and not fixed_single and bias_axes is None
-              and backoff <= 0.0)
+              and not _pre_solve)
     # Racing owns the seated solve below. Its recursively requested funnel-mouth solves use
     # the already successful neutral-first order, but are not themselves raced/cached.
     unbiased_first = ((self.assemble_unbiased_first or self.assemble_basin_racing)
@@ -3855,15 +3878,15 @@ class RobotIK:
           _st[1] += 1
           _st[2] += float((getattr(self, "_last_res", {}) or {}).get("eq", 0.0) or 0.0)
       _neutral_funnel_reject = False
-      if (feasible and bi < 0 and backoff <= 0.0
-          and self.pre_insertion_delta > 0.0
+      if (feasible and bi < 0 and not _pre_solve
+          and (self.pre_insertion_delta > 0.0 or screw is not None)
           and not self._funnel_witness_ok(action, s0, s1, assembly, witness)):
         # A neutral slot that reaches the mate but has no insertion neighbourhood must not
         # hide the structured basins that follow it. The historical biased path keeps its
         # existing post-loop gate below.
         feasible, witness = False, None
         _neutral_funnel_reject = True
-      _basin_label = (("pre-" if backoff > 0.0 else "")
+      _basin_label = (("pre-" if _pre_solve else "")
                       + ("unbiased" if bi < 0 else f"bias{bi}"))
       _basin_row = (_record_assemble_basin(
           _basin_label, _raw_feasible, feasible,
@@ -3886,8 +3909,8 @@ class RobotIK:
       if feasible:
         _winning_basin_row = _basin_row
         break
-    if (feasible and witness is not None and backoff <= 0.0
-        and self.pre_insertion_delta > 0.0
+    if (feasible and witness is not None and not _pre_solve
+        and (self.pre_insertion_delta > 0.0 or screw is not None)
         and not self._funnel_witness_ok(action, s0, s1, assembly, witness)):
       feasible, witness = False, None                     # -> the unbiased restart fallback
       if _winning_basin_row is not None:
@@ -3947,10 +3970,10 @@ class RobotIK:
           self.mate_rejects += 1
           feasible, witness = False, None
       _winning_basin_row = _record_assemble_basin(
-          ("pre-" if backoff > 0.0 else "") + "fallback",
+          ("pre-" if _pre_solve else "") + "fallback",
           _raw_feasible, feasible, _time.perf_counter() - _basin_t0)
-    if (feasible and witness is not None and backoff <= 0.0
-        and self.pre_insertion_delta > 0.0
+    if (feasible and witness is not None and not _pre_solve
+        and (self.pre_insertion_delta > 0.0 or screw is not None)
         and not self._funnel_witness_ok(action, s0, s1, assembly, witness)):
       feasible, witness = False, None
       if _winning_basin_row is not None:
@@ -4008,9 +4031,12 @@ class RobotIK:
     cost at weight 1e0 lets the optimiser pay for the backoff by moving the cheaper body -- the
     target assembly -- instead of the actor. None => byte-identical to the un-pinned solve."""
     kind = action[0]
+    screw = (assembly.screw_skill(action[2])
+             if kind == "assemble" and len(action) >= 3 else None)
     delta = {"pick": self.pre_pick_delta, "place": self.pre_place_delta,
              "add_grasp": self.pre_add_grasp_delta,
-             "assemble": self.pre_insertion_delta}.get(kind, 0.0)
+             "assemble": (screw.depth if screw is not None else
+                          self.pre_insertion_delta)}.get(kind, 0.0)
     if delta <= 0.0:
       return None
     warm = None
@@ -4028,7 +4054,38 @@ class RobotIK:
     self.pin_applied = None
     self._pin_joints = pin
     self._funnel_solve = True
+    self.last_screw_path = None
     try:
+      if screw is not None:
+        # SINGLE-GRASP CONTINUATION.  Start at the already accepted final witness and solve
+        # the helix backwards in small, warm-started increments.  The state/grasp relation is
+        # unchanged in every solve; no regrasp action exists here or in the symbolic planner.
+        # Keeping every full joint vector makes this a portable execution certificate, not a
+        # promise to redo IK during replay.
+        if warm is None:
+          return None
+        reverse_path = [warm.copy()]
+        prev = warm.copy()
+        names = self.C.getJointNames()
+        actor_idx = [i for i, n in enumerate(names) if n.startswith(action[1] + "_")]
+        for k in range(int(screw.samples) - 1, -1, -1):
+          s = k / float(screw.samples)
+          ok, w = self._ik_assemble(action, s0, s1, assembly, None, warm=prev,
+                                    skill_progress=s)
+          if not ok or w is None:
+            return None
+          w = np.asarray(w, dtype=float)
+          # This is branch continuity, not a global motion limit.  Each requested increment
+          # is small; a larger jump means KOMO changed IK branch and the intervening helix is
+          # uncertified.  The final motion planner still collision-checks the retained edges.
+          dq = float(np.linalg.norm(w[actor_idx] - prev[actor_idx]))
+          if dq > self.pre_skill_max_dq:
+            return None
+          reverse_path.append(w.copy())
+          prev = w
+        self.last_screw_path = list(reversed(reverse_path))
+        return self.last_screw_path[0].copy()
+
       # DELTA is a REQUESTED MAXIMUM: the full backoff can point into a nearby obstacle (the
       # classic case: an insertion whose mate sits just above the tabletop -- backing off
       # along -mate_axis sinks the part into the table). Walk a deterministic fraction
@@ -5113,6 +5170,61 @@ def collect_plan_witnesses(C, assembly, plan, robots, robot_ik, *, gripper_kind=
     print(f"[witness-persist] release hoisting/state rewriting required {len(rebuilt)} "
           f"new IK certification(s): {ok_n} succeeded, {len(rebuilt) - ok_n} failed.")
   return out
+
+
+def certify_plan_skill_paths(C, assembly, plan, witnesses, robots, robot_ik, *,
+                             gripper_kind=None, handovers=True, allow_place=True,
+                             bracing=False, grasp_table=None, fallback_witnesses=None):
+  """Materialize path-valued execution certificates for atomic assembly skills.
+
+  A screw witness is not merely its seated endpoint: feasibility means that the same grasp
+  follows the complete entry-to-seat helix.  Return ``(witnesses, {step: full_q_path})``.
+  If a generic witness optimizer selected an endpoint whose continuation cannot be
+  reproduced, retain the already-certified search endpoint instead of weakening the skill or
+  inventing a task-level regrasp.  No other action is changed.
+  """
+  if grasp_table is None:
+    _checker, grasp_table = _search_context(C, assembly, robots)
+  states = _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
+                          bracing, grasp_table, "certify_plan_skill_paths")
+  out = list(witnesses)
+  paths = {}
+  for i, a0 in enumerate(plan):
+    a = tuple(a0)
+    screw = (assembly.screw_skill(a[2])
+             if a and a[0] == "assemble" and len(a) >= 3 else None)
+    if screw is None:
+      continue
+    choices = [("selected", out[i])]
+    if (fallback_witnesses is not None and fallback_witnesses[i] is not None
+        and (out[i] is None or
+             not np.allclose(fallback_witnesses[i], out[i], atol=1e-9, rtol=0.0))):
+      choices.append(("search", fallback_witnesses[i]))
+    accepted = None
+    for source, witness in choices:
+      if witness is None:
+        continue
+      q0 = robot_ik.pre_skill_witness(
+          a, states[i], states[i + 1], assembly, skill_witness=witness)
+      path = getattr(robot_ik, "last_screw_path", None)
+      if q0 is None or path is None or len(path) != int(screw.samples) + 1:
+        continue
+      path = [np.asarray(q, dtype=float).copy() for q in path]
+      if not np.allclose(path[-1], np.asarray(witness), atol=1e-7, rtol=0.0):
+        continue
+      accepted = (source, np.asarray(witness, dtype=float).copy(), path)
+      break
+    if accepted is None:
+      raise ValueError(
+          f"step {i} {a}: no continuous single-grasp screw certificate; refusing "
+          "task-level regrasp or endpoint-only export")
+    source, out[i], paths[i] = accepted
+    if source == "search":
+      print(f"[skill-cert] step {i} screw: optimized endpoint had no continuous helix; "
+            "restored the certified search endpoint")
+    print(f"[skill-cert] step {i} screw: persisted {len(paths[i])} single-grasp helix "
+          f"keyframes ({np.degrees(screw.angle):g}deg, {screw.depth*1000:g}mm)")
+  return out, paths
 
 
 def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,

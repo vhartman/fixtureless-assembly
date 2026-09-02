@@ -199,6 +199,44 @@ def test_car_mini_wheel_rims_rest_on_sim_table():
     assert abs(rim_bottom - table_top) < 5e-4, (part, rim_bottom, table_top)
 
 
+def test_chair_round_parts_do_not_roll_out_of_their_scatter_cells():
+  """The bench must give loose horizontal cylinders finite rolling resistance.
+
+  MuJoCo ignores a geom's third friction coefficient unless the contact has ``condim=6``.
+  The omission let numerical contact noise roll Chair legs/posts centimetres before their
+  scheduled picks. This checks actual free-body dynamics rather than the XML spelling.
+  """
+  import numpy as np
+  import mujoco
+
+  import assembly as A
+  from env import make_four_robot_env
+  import sim as S
+
+  asm = A.make_assembly("chair", 8)
+  C = make_four_robot_env(num_robots=1, floating_ee=True, vacuum=False)
+  A.add_disassembled_obj(C, asm, spacing=0.2, float_height=0.002)
+  state = A.get_initial_state(C, asm)
+  model = mujoco.MjModel.from_xml_string(S.build_mjcf(asm, state, []))
+  data = mujoco.MjData(model)
+
+  table_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "table")
+  assert model.geom_condim[table_id] == 6
+  starts = {}
+  for part in ("obj_1", "obj_2", "obj_3", "obj_4", "obj_6", "obj_7"):
+    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, part)
+    qadr = model.jnt_qposadr[model.body_jntadr[body_id]]
+    starts[part] = (qadr, data.qpos[qadr:qadr + 2].copy())
+
+  # Longer than the approach to the first pick in the phase-scheduled Chair replay.
+  for _ in range(int(6.4 / model.opt.timestep)):
+    mujoco.mj_step(model, data)
+
+  for part, (qadr, xy0) in starts.items():
+    drift = float(np.linalg.norm(data.qpos[qadr:qadr + 2] - xy0))
+    assert drift < 1e-3, (part, drift)
+
+
 def test_topple_error_respects_primitive_rotational_symmetry():
   """Rolling a round peg is not toppling it; tilting its axis still is."""
   import numpy as np

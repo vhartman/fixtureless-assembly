@@ -156,7 +156,7 @@ class _PairedGoal:
 def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
                 home_state, pre_witnesses=None, witness_sets=None,
                 resolved_pre_witnesses=None, resolve_missing_pre=True,
-                pre_pin_robots=None, exit_state=None):
+                pre_pin_robots=None, exit_state=None, skill_paths=None):
   """Map the plan+witnesses to (tasks, sequence_names). robot_idx: {r: [joint indices]}
   in the problem config's joint order; witnesses[i] is the full-config keyframe for plan[i]
   (None for non-IK actions -> skipped, no motion goal needed).
@@ -204,6 +204,16 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
   # Local cache because a cograsp rendezvous may need the following assemble's pre-witness
   # BEFORE the exporter reaches that assemble step. A supplied mapping remains caller-owned.
   pre_cache = dict(pre_witnesses or {})
+  screw_paths = {int(i): [np.asarray(q, dtype=float).copy() for q in path]
+                 for i, path in (skill_paths or {}).items()}
+
+  def screw_for(part):
+    """Return an optional path-valued mate skill.
+
+    Some exporter unit tests intentionally use ``assembly=None`` to exercise the generic task
+    plumbing in isolation.  That means no mate can carry assembly metadata.
+    """
+    return assembly.screw_skill(part) if assembly is not None else None
 
   def require_or_solve_pre(i, action, witness):
     """Return the exact pre-skill keyframe, solving only during a FRESH export.
@@ -211,6 +221,34 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
     A loaded final export sets ``resolve_missing_pre=False``.  In that mode a missing entry is
     corruption/incompatibility, never permission to call KOMO behind a viewer's back.
     """
+    screw = (screw_for(action[2])
+             if action[0] == "assemble" and len(action) >= 3 else None)
+    if screw is not None and i in screw_paths:
+      path = screw_paths[i]
+      if len(path) != int(screw.samples) + 1:
+        raise ValueError(
+            f"mp_export: screw step {i} certificate has {len(path)} states, expected "
+            f"{int(screw.samples) + 1}")
+      if not np.allclose(path[-1], np.asarray(witness), atol=1e-7, rtol=0.0):
+        raise ValueError(
+            f"mp_export: screw step {i} certificate endpoint differs from its witness")
+      pre_cache[i] = np.asarray(path[0], dtype=float).copy()
+    # A supplied generic pre-insertion witness contains only one endpoint.  A screw mate also
+    # needs its full single-grasp continuation certificate, so a fresh export materializes it
+    # once even when --fuse-pre-skill supplied qpre.  Final-export replay bypasses build_tasks
+    # entirely and restores the persisted task record, hence never reaches this solve.
+    if screw is not None and i not in screw_paths:
+      if not resolve_missing_pre:
+        raise ValueError(
+            f"mp_export: screw step {i} lacks a persisted task certificate; refusing IK")
+      qskill = robot_ik.pre_skill_witness(
+          action, states[i], states[i + 1], assembly, witness)
+      path = getattr(robot_ik, "last_screw_path", None)
+      if qskill is None or path is None or len(path) != int(screw.samples) + 1:
+        raise ValueError(
+            f"mp_export: screw step {i} has no continuous single-grasp IK certificate")
+      pre_cache[i] = np.asarray(qskill, dtype=float)
+      screw_paths[i] = [np.asarray(q, dtype=float).copy() for q in path]
     qpre = pre_cache.get(i, _SOLVE_IT)
     if qpre is _SOLVE_IT:
       if not resolve_missing_pre:
@@ -306,7 +344,10 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
   pre_pick = getattr(robot_ik, "pre_pick_delta", 0.0) > 0.0       # --pre-pick:      split pick
   pre_place = getattr(robot_ik, "pre_place_delta", 0.0) > 0.0     # --pre-place:     split place
   pre_add_grasp = getattr(robot_ik, "pre_add_grasp_delta", 0.0) > 0.0  # --pre-add-grasp: split brace reach
-  pre_ins = getattr(robot_ik, "pre_insertion_delta", 0.0) > 0.0   # --pre-insertion: split assemble
+  pre_ins = (getattr(robot_ik, "pre_insertion_delta", 0.0) > 0.0
+             or (assembly is not None
+                 and any(screw_for(p) is not None
+                         for p in assembly.assembly_relative_poses)))  # screw ALWAYS has an entry
   post_release = getattr(robot_ik, "post_release_delta", 0.0) > 0.0 # --post-release: split departure
   # An add_grasp that directly braces a later assemble is not an independent destination.
   # It is the start of one choreography: rendezvous/add brace -> short insertion -> release.
@@ -579,6 +620,17 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       emit = split_skill(a, i, wit, involved, name, kind, mk) if pre_ins else None
       if emit is None:
         t = mk(goal_for(involved, wit))
+      screw = screw_for(a[2])
+      if screw is not None:
+        if emit is None or i not in screw_paths:
+          raise ValueError(
+              f"mp_export: screw assemble {i} was not split into a certified entry->datum skill")
+        skill_task = emit[-1][1]
+        skill_task.skill_data = {
+            **screw.to_dict(), "part": a[2], "parent": a[3],
+            "joint_path": [q.tolist() for q in screw_paths[i]],
+            "contract": "single_grasp",
+        }
     elif kind == "inhand_reorient":
       # IN-PLACE skill: the arm KEEPS its config (goal_for with wit=None keeps cur[r]); the
       # part's pose IN the gripper snaps to the NEW grasp transform. mr_bench mechanics: the
@@ -1306,7 +1358,7 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
                  robot_robot_margin=0.0, robot_margin_ramp=0.0, table_margin=0.0,
                  table_float=0.0, witness_sets=None, resolved_pre_witnesses=None,
                  resolve_missing_pre=True, task_records=None, saved_step_names=None,
-                 saved_sequence_names=None, pre_pin_robots=None):
+                 saved_sequence_names=None, pre_pin_robots=None, skill_paths=None):
   """Build a live mr_bench problem from our solved plan. depgraph=False -> SequenceMixin (a
   fixed total order); depgraph=True -> DependencyGraphMixin (the partial order, so the planner
   may reorder independent actions). Same tasks/frames/witnesses either way."""
@@ -1347,7 +1399,8 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
             pre_witnesses=pre_witnesses, witness_sets=witness_sets,
             resolved_pre_witnesses=resolved_pre_witnesses,
             resolve_missing_pre=resolve_missing_pre,
-            pre_pin_robots=pre_pin_robots, exit_state=exit_state)
+            pre_pin_robots=pre_pin_robots, exit_state=exit_state,
+            skill_paths=skill_paths)
       else:
         # FINAL-EXPORT replay: task goals/effects are data, not something inferred again from
         # today's exporter. This closes the second drift channel after IK: a later change to
@@ -1733,6 +1786,7 @@ def task_signature(problem):
   different `bracing`/`handovers` flag changing which arms a task involves). Hash what the ids
   actually MEAN: name, type, involved robots, attach frames, in order."""
   import hashlib
+  import json
   h = hashlib.sha256()
   for t in problem.tasks:
     fields = [
@@ -1740,6 +1794,7 @@ def task_signature(problem):
         str(getattr(t, "type", "")),
         ",".join(str(r) for r in (getattr(t, "robots", None) or [])),
         ",".join(str(f) for f in (getattr(t, "frames", None) or [])),
+        json.dumps(getattr(t, "skill_data", None), sort_keys=True, separators=(",", ":")),
     ]
     h.update(("|".join(fields) + "\n").encode())
   return h.hexdigest()[:16]
@@ -1763,7 +1818,8 @@ def _task_record(task):
           "condition_indices": (goal.condition_indices.tolist() if paired else None),
           "side_effect": getattr(task, "side_effect", None),
           "side_effect_data": (None if getattr(task, "side_effect_data", None) is None else
-                               np.asarray(task.side_effect_data, dtype=float).ravel().tolist())}
+                               np.asarray(task.side_effect_data, dtype=float).ravel().tolist()),
+          "skill_data": getattr(task, "skill_data", None)}
 
 
 def _task_from_record(rec):
@@ -1783,6 +1839,8 @@ def _task_from_record(rec):
               type=rec.get("type"), frames=rec.get("frames"),
               side_effect=rec.get("side_effect"),
               side_effect_data=(None if side_data is None else np.asarray(side_data, dtype=float)))
+  if rec.get("skill_data") is not None:
+    task.skill_data = dict(rec["skill_data"])
   return task
 
 

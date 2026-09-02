@@ -904,8 +904,14 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
     <light pos="0.5 -0.5 2.5" dir="-0.2 0.2 -1" directional="true" castshadow="true"/>
     <geom name="floor" type="plane" size="4 4 0.1" material="grid" pos="0 0 0"
           group="{GROUP_ENV}"/>
+    <!-- condim=6 is required for MuJoCo to use the third (rolling) friction coefficient.
+         Without it, horizontally scattered chair legs/posts are ideal cylinders with no
+         rolling resistance: micron-scale contact noise makes them roll centimetres before
+         their pick. 2mm is modest relative to their 12.5mm radius and models a real bench's
+         finite rolling resistance without pinning or otherwise special-casing loose parts. -->
     <geom name="table" type="box" size="{table_half_x} {table_half_y} {table_half_z}"
-          pos="{table_x} {table_y} {table_z}" rgba="0.55 0.42 0.28 1" friction="{mu_table} 0.005 0.0001"
+          pos="{table_x} {table_y} {table_z}" rgba="0.55 0.42 0.28 1"
+          friction="{mu_table} 0.005 0.002" condim="6"
           group="{GROUP_ENV}"/>
     {''.join(parts_xml)}
   </worldbody>
@@ -2712,6 +2718,72 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           f"removed); arc {_compact['arc_after']:.2f} rad, change {_drift:.2e}. "
           f"Mode barriers and witness configurations preserved exactly.")
 
+  # CONTROLLER-OWNED SCREW STRETCHES.  The global planner only has to reach the persisted
+  # helical entry keyframe.  For the following assemble stretch, replace whatever free-space
+  # detour BiRRT happened to return with the warm-started, single-grasp IK continuation that
+  # was certified and embedded in the final export.  This does NOT add task actions or mode
+  # switches: entry and final datum remain the two ordinary pre-assemble/assemble barriers.
+  # The strict preflight immediately below collision-checks every interpolated edge of this
+  # replacement against the exact pre-attach mode, so a bad skill certificate fails before
+  # physics rather than silently falling back to the arbitrary planner segment.
+  _screw_stretches = []
+  for _k, (_wp, _done) in enumerate(stretches):
+    _skills = [(int(tid), getattr(problem.tasks[int(tid)], "skill_data", None))
+               for tid in _done
+               if getattr(problem.tasks[int(tid)], "skill_data", None)]
+    _skills = [(tid, sd) for tid, sd in _skills if sd.get("kind") == "screw"]
+    if not _skills:
+      continue
+    if len(_skills) != 1:
+      raise RuntimeError(f"[sim/mp] stretch {_k} completes multiple screw skills; v1 requires "
+                         "one atomic single-grasp skill per stretch")
+    _tid, _sd = _skills[0]
+    _task = problem.tasks[_tid]
+    _jp = [np.asarray(q, dtype=float).ravel() for q in (_sd.get("joint_path") or [])]
+    if len(_jp) < 3 or any(q.shape != np.asarray(_wp[0]).shape for q in _jp):
+      raise RuntimeError(f"[sim/mp] {getattr(_task, 'name', _tid)} has a malformed screw "
+                         "joint-path certificate")
+    _active = sorted({j for r in _task.robots for j in ridx[r]})
+    _inactive = [j for j in range(len(_jp[0])) if j not in set(_active)]
+    _w0, _w1 = np.asarray(_wp[0], dtype=float), np.asarray(_wp[-1], dtype=float)
+    if (np.max(np.abs(_jp[0][_active] - _w0[_active])) > 2e-3 or
+        np.max(np.abs(_jp[-1][_active] - _w1[_active])) > 2e-3):
+      raise RuntimeError(
+          f"[sim/mp] {getattr(_task, 'name', _tid)} screw certificate endpoints do not "
+          "match the saved motion path's entry/final task goals; regenerate the MP export")
+    if _inactive and np.max(np.abs(_w1[_inactive] - _w0[_inactive])) > 1e-6:
+      raise RuntimeError(
+          f"[sim/mp] {getattr(_task, 'name', _tid)} overlaps unrelated robot motion in one "
+          "stretch; v1 refuses to execute an uncertified composition")
+    # Idle full-q slices in an IK certificate are implementation detail (typically EXIT).
+    # Preserve the actual path's inactive-arm configuration and replace only task robots.
+    _owned = []
+    for _qskill in _jp:
+      _q = _w0.copy()
+      _q[_active] = _qskill[_active]
+      _owned.append(_q)
+    stretches[_k] = (_owned, _done)
+    _screw_stretches.append((_k, _tid, _sd))
+  for _k, _tid, _sd in _screw_stretches:
+    _arc = retiming.arc_length(stretches[_k][0])[1]
+    _angle = abs(float(_sd["angle"]))
+    _omega = float(_sd["angular_speed"])
+    # The IK certificate is parameterized linearly in screw angle. Convert requested object
+    # angular cruise into the equivalent composite joint-arc cruise, capped by the ordinary
+    # scene cruise. Acceleration ramps remain the standard smooth retimer's responsibility.
+    _rate = min(JOINT_RATE, _arc * _omega / max(_angle, 1e-12))
+    _sd["retime_rate"] = max(_rate, 1e-6)
+    print(f"[sim/mp] screw controller owns stretch {_k} ({problem.tasks[_tid].name}): "
+          f"{len(_sd['joint_path'])} certified single-grasp helix knots, "
+          f"angle {np.degrees(float(_sd['angle'])):.1f}deg, depth "
+          f"{float(_sd['depth'])*1000:.1f}mm, torque {float(_sd['torque']):.3f}Nm. "
+          f"Angular cruise {float(_sd['angular_speed']):.3f}rad/s -> joint-arc cruise "
+          f"{_sd['retime_rate']:.3f}rad/s. The free-space planner segment is ignored; "
+          "strict path preflight follows.")
+  _stretch_rates = [float(JOINT_RATE)] * len(stretches)
+  for _k, _tid, _sd in _screw_stretches:
+    _stretch_rates[_k] = float(_sd["retime_rate"])
+
   # ALIGNMENT BY MODE IDENTITY: the saved path's lightweight modes carry task_ids only, so
   # match each per-stretch path mode to the rebuilt chain mode with the SAME active-task set
   # (unique in a sequence problem -- progression is monotone). This is needed by both the
@@ -3708,7 +3780,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                 # Effectively zero cells: candidates are exact; cache only identical states
                 # revisited by a CEGAR restart.
                 collide_ds=1e-9, dwell=dwell, event_durations=_event_budget,
-                per_arm_rate=True)
+                per_arm_rate=True, stretch_rates=_stretch_rates)
           except RuntimeError as _e:
             _fallback_reason = f"{_pdt:g}s planning grid: {_e}"
             print(f"[sim/mp] --phase-schedule {_pdt:g}s search failed after "
@@ -3736,7 +3808,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                 f"{_fallback_reason}")
           traj = retiming.build_trajectory(
               _phase_stretches, DT, joint_rate=JOINT_RATE, ramp_dist=RAMP_DIST,
-              ramp_min=RAMP_MIN, dwell=dwell, event_durations=_event_budget)
+              ramp_min=RAMP_MIN, dwell=dwell, event_durations=_event_budget,
+              stretch_rates=_stretch_rates)
           _bad_phase = _phase_audit(traj)
           if _bad_phase is not None:
             # Distinguish a genuinely invalid synchronized sample from mutable collision-
@@ -4193,7 +4266,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         raise RuntimeError("[sim/mp] corridor scheduling produced no trajectory")
       if traj is not None:
         base = retiming.build_trajectory(stretches, DT, joint_rate=JOINT_RATE,
-                                         ramp_dist=RAMP_DIST, ramp_min=RAMP_MIN, dwell=DWELL_T)
+                                         ramp_dist=RAMP_DIST, ramp_min=RAMP_MIN, dwell=DWELL_T,
+                                         stretch_rates=_stretch_rates)
         _ff = getattr(traj, "force_floor", None) or {}
         if _ff:
           print("[sim/mp] !!! --force-limits: the wrench cap was BELOW the never-stall floor "
@@ -4258,7 +4332,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     # stream probe-verified identical) so every preprocessing mode funnels into ONE executor.
     traj = retiming.build_trajectory(stretches, DT, joint_rate=JOINT_RATE,
                                      ramp_dist=RAMP_DIST, ramp_min=RAMP_MIN, dwell=DWELL_T,
-                                     arm_dims=boost_dims, vmax=boost_vmax)
+                                     arm_dims=boost_dims, vmax=boost_vmax,
+                                     stretch_rates=_stretch_rates)
     fire_at = {}
     for idx, ev in traj.fires:
       fire_at.setdefault(int(idx), []).extend(int(t) for t in ev)

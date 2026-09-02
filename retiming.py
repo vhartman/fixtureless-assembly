@@ -311,7 +311,7 @@ def upsample_trajectory(traj, dt, q0=None):
 
 def build_trajectory(stretches, dt, joint_rate=DEFAULT_JOINT_RATE, ramp_dist=DEFAULT_RAMP_DIST,
                      ramp_min=DEFAULT_RAMP_MIN, dwell=0.0, settle=0.0, accel=None,
-                     arm_dims=None, vmax=None, event_durations=None):
+                     arm_dims=None, vmax=None, event_durations=None, stretch_rates=None):
   """Stitch per-mode stretches into one `TimedTrajectory` with v=0 (+ optional dwell)
   at every boundary where events fire, and a final settle hold.
 
@@ -332,9 +332,15 @@ def build_trajectory(stretches, dt, joint_rate=DEFAULT_JOINT_RATE, ramp_dist=DEF
       raise ValueError("event_durations must be non-negative")
     n_event = (np.rint(_event / dt).astype(int).tolist() if dt > 0
                else [0] * len(stretches))
+  if stretch_rates is None:
+    _rates = [float(joint_rate)] * len(stretches)
+  else:
+    _rates = np.asarray(stretch_rates, dtype=float).reshape(-1).tolist()
+    if len(_rates) != len(stretches) or any(r <= 0.0 for r in _rates):
+      raise ValueError("stretch_rates must contain one positive rate per stretch")
   goal = None
   for k, (qs, events) in enumerate(stretches):
-    for c in retime_stretch(qs, dt, joint_rate, ramp_dist, ramp_min, accel=accel,
+    for c in retime_stretch(qs, dt, _rates[k], ramp_dist, ramp_min, accel=accel,
                             arm_dims=arm_dims, vmax=vmax):
       q.append(c)
       phase.append("path")
@@ -578,7 +584,7 @@ def plan_schedule(stretches, arm_dims, acting, dt,
                   ramp_min=DEFAULT_RAMP_MIN, corner_dv=DEFAULT_CORNER_DV,
                   priority=None, collide=None, dwell=0.0, collide_ds=0.01,
                   settle=0.0, max_steps=None, stall_steps=None, rate_boost=False,
-                  event_durations=None, per_arm_rate=False):
+                  event_durations=None, per_arm_rate=False, stretch_rates=None):
   """PRIORITIZED, EVENT-DRIVEN retiming: arms desync so only the arm(s) ACTING at a
   barrier ramp to rest there; uninvolved arms CROSS the barrier without stopping.
   Events fire in DAG/sequence order, each once its acting arm(s) have arrived at rest
@@ -639,6 +645,17 @@ def plan_schedule(stretches, arm_dims, acting, dt,
   order = list(priority) if priority is not None else list(range(n))
   bar_s = [csum[bi] for bi in bidx]                          # barrier positions on the arc
   K = len(stretches)
+  if stretch_rates is None:
+    _stretch_rates = np.full(K, float(joint_rate))
+  else:
+    _stretch_rates = np.asarray(stretch_rates, dtype=float).reshape(-1)
+    if len(_stretch_rates) != K or np.any(_stretch_rates <= 0.0):
+      raise ValueError("stretch_rates must contain one positive rate per stretch")
+  # Segment i joins composite waypoints i->i+1. The first barrier waypoint at or beyond its
+  # endpoint identifies the owning source stretch.
+  _segment_stretch = np.asarray(
+      [min(int(np.searchsorted(bidx, i + 1, side="left")), K - 1)
+       for i in range(max(len(segs), 1))], dtype=int)
   done_ids = [sorted({int(t) for t in st[1]}) for st in stretches]
   act = [set(int(a) for a in acting[k]) for k in range(K)]
 
@@ -697,7 +714,8 @@ def plan_schedule(stretches, arm_dims, acting, dt,
 
   def rate_at(r, s):
     i = _seg_index(csum, segs, s)
-    base = joint_rate if _boost is None else joint_rate * _boost[i]
+    nominal = float(_stretch_rates[_segment_stretch[i]])
+    base = nominal if _boost is None else nominal * _boost[i]
     if not per_arm_rate:
       return base
     sh = _share[r][i]
@@ -745,7 +763,7 @@ def plan_schedule(stretches, arm_dims, acting, dt,
     return min(nxt, cur + rate_at(r, cur) * ramp_factor(r, cur) * dt)
 
   if max_steps is None:                                      # generous: n arms each may wait out
-    full = D / max(joint_rate * dt, 1e-9)                    # the others (10x margin for ramps/holds)
+    full = D / max(float(np.min(_stretch_rates)) * dt, 1e-9) # the others (10x margin for ramps/holds)
     max_steps = int(10 * n * full) + 10000
   if stall_steps is None:
     stall_steps = max(int(5.0 / dt), 1000) if dt > 0 else 1000

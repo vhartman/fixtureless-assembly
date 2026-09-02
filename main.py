@@ -430,7 +430,7 @@ def build_parser():
   g_scene.add_argument(
       "--assembly",
       choices=["cross", "cube", "arch", "arch-seq", "cube-plates", "cube-plates-2x2x3",
-               "cuboid-tower", "fixture-rack", "car", "car-mini", "slot-pin", "peg-hole", "peg-hole-chamfer",
+               "cuboid-tower", "fixture-rack", "car", "car-mini", "slot-pin", "peg-hole", "peg-hole-screw", "peg-hole-chamfer",
                "peg-stool",
                "peg-stool-4", "peg-stool-cuboid", "peg-stool-cuboid-4",
                "peg-stool-tight", "peg-stool-4-tight",
@@ -1627,6 +1627,30 @@ def build_parser():
            "already default to 0.05; this is mainly a convenient common retune.",
   )
   g_skills.add_argument(
+      "--screw-angle", type=float, default=None, metavar="DEG",
+      help="Override the signed rotation angle (degrees) of every screw mate authored by the "
+           "assembly. The default comes from the assembly (peg-hole-screw: 180deg). This "
+           "refines one atomic assemble action; it never adds task-level regrasp actions.",
+  )
+  g_skills.add_argument(
+      "--screw-depth", type=float, default=None, metavar="M",
+      help="Override screw axial travel in metres (peg-hole-screw default 0.020).",
+  )
+  g_skills.add_argument(
+      "--screw-torque", type=float, default=None, metavar="NM",
+      help="Override the pure fastening couple used by target and inserter wrench checks.",
+  )
+  g_skills.add_argument(
+      "--screw-speed", type=float, default=None, metavar="RAD_S",
+      help="Override nominal angular speed stored in the execution certificate.",
+  )
+  g_skills.add_argument(
+      "--screw-samples", type=int, default=None, metavar="N",
+      help="Override the number of warm-started IK intervals used to certify the continuous "
+           "single-grasp helix (minimum 2; default 16). Intermediate samples are execution "
+           "data, not symbolic actions.",
+  )
+  g_skills.add_argument(
       "--pre-insertion", type=float, nargs="?", const=0.05, default=0.05, metavar="DELTA",
       help="PRE-INSERTION funnel (EXPORT/REPLAY only; the SEARCH is unchanged): split every "
            "`assemble` into a GOTO to the funnel-mouth pose T_pre (the mate witness backed off "
@@ -2106,6 +2130,7 @@ _SAVE_CONFIG_FIELDS = (
     "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
     "bracing", "robust_mode", "dense_grasps", "random_init", "part_float", "inhand_reorient",
     "pre_insertion", "pre_pick", "pre_place", "pre_add_grasp", "post_release", "staged_mates",
+    "screw_angle", "screw_depth", "screw_torque", "screw_speed", "screw_samples",
     "allow_curved_grasps", "grippers", "grasp_compliance",
     "vacuum_scale", "two_finger_scale", "vacuum_engage_force",
     "vacuum_engage_friction", "tf_close_torque", "dominance",
@@ -3302,6 +3327,16 @@ def run(cfg, explicit=None):
       print(f"[flag] NOTE: --assembly {cfg.assembly} has at most {_maxp} parts; the default "
             f"--parts {cfg.parts} is clamped to {_maxp}.")
   assembly = make_assembly(cfg.assembly, cfg.parts)
+  assembly.configure_screw_skills(
+      angle=(None if cfg.screw_angle is None else np.deg2rad(cfg.screw_angle)),
+      depth=cfg.screw_depth, torque=cfg.screw_torque,
+      angular_speed=cfg.screw_speed, samples=cfg.screw_samples)
+  if assembly.mate_skills:
+    for _part, _skill_spec in assembly.mate_skills.items():
+      print(f"[skill] {_part} screw: angle={np.degrees(_skill_spec.angle):g}deg, "
+            f"depth={_skill_spec.depth*1000:g}mm, torque={_skill_spec.torque:g}Nm, "
+            f"speed={_skill_spec.angular_speed:g}rad/s, samples={_skill_spec.samples}; "
+            "single grasp, atomic assemble action")
 
   if cfg.ladder_lns is not None:
     print(f"[flag] --ladder-lns ACTIVE: budget {cfg.ladder_lns:g}s (k=1 -> LNS sweeps "
@@ -4032,10 +4067,11 @@ def run(cfg, explicit=None):
       # transaction *after* this source certificate exists: it can commit only if every changed
       # predecessor scene is re-certified, otherwise the original plan/witnesses are retained.
       # A loaded plan is read-only unless the user explicitly asks for --refresh-witnesses.
-      from plan_io import (read_witnesses, read_witness_stage, require_complete_witnesses,
-                           witness_block)
+      from plan_io import (read_skill_paths, read_witnesses, read_witness_stage,
+                           require_complete_witnesses, witness_block)
       joint_names = list(robot_ik.C.getJointNames()) if robot_ik is not None else []
       baseline_witnesses = None
+      skill_paths = None
       _saved_witness_stage = None
       _need_witnesses = bool(robot_ik is not None and not (
           cfg.motion_plan and cfg.mp_export_load))
@@ -4053,6 +4089,9 @@ def run(cfg, explicit=None):
         elif _witnesses_baseline_compatible(_saved_cfg, cfg):
           baseline_witnesses = read_witnesses(cfg.load_plan, joint_names, len(plan))
           _saved_witness_stage = read_witness_stage(cfg.load_plan)
+          if baseline_witnesses is not None:
+            skill_paths = read_skill_paths(
+                cfg.load_plan, joint_names, len(plan), baseline_witnesses)
         if baseline_witnesses is None and cfg.refresh_witnesses:
           from solver import collect_plan_witnesses
           baseline_witnesses = collect_plan_witnesses(
@@ -4123,6 +4162,7 @@ def run(cfg, explicit=None):
                              if baseline_witnesses is not None else None))
       opt_witnesses = baseline_witnesses
       witness_alts = None                                    # --witness-sets alternatives
+      _reuse_final = False
       if (plan is not None and cfg.optimize_witnesses is not None
           and not (cfg.motion_plan and cfg.mp_export_load)):
         if robot_ik is None:
@@ -4181,8 +4221,41 @@ def run(cfg, explicit=None):
                 bracing=cfg.bracing, clear_weight=cfg.witness_clearance,
                 robot_collisions=cfg.witness_robot_collisions,
                 baseline_witnesses=baseline_witnesses)
+      _has_path_skill = bool(plan and any(
+          a and a[0] == "assemble" and assembly.screw_skill(a[2]) is not None
+          for a in plan))
+      if _has_path_skill and opt_witnesses is not None:
+        _required_skill_steps = [i for i, a in enumerate(plan)
+                                 if a and a[0] == "assemble"
+                                 and assembly.screw_skill(a[2]) is not None]
+        _paths_match = bool(skill_paths) and all(
+            i in skill_paths for i in _required_skill_steps)
+        if _paths_match:
+          for _i in _required_skill_steps:
+            _path = skill_paths[_i]
+            if (_i >= len(opt_witnesses) or opt_witnesses[_i] is None or not _path
+                or not np.allclose(_path[-1], opt_witnesses[_i], atol=1e-9, rtol=0.0)):
+              _paths_match = False
+              break
+        if not _paths_match:
+          if cfg.load_plan and not cfg.refresh_witnesses and _reuse_final:
+            raise ValueError(
+                f"{cfg.load_plan} has endpoint witnesses for an atomic screw skill but no "
+                "matching path certificate. Refusing to redo skill IK implicitly; re-run "
+                "the original solve once with this version.")
+          from solver import certify_plan_skill_paths
+          opt_witnesses, skill_paths = certify_plan_skill_paths(
+              C, assembly, plan, opt_witnesses, robots, robot_ik,
+              gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
+              handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
+              fallback_witnesses=baseline_witnesses)
+          # A fallback may have restored the search endpoint, invalidating a set whose member
+          # zero was the optimized endpoint.  Drop only that step's optional alternatives.
+          if witness_alts:
+            witness_alts = {i: ms for i, ms in witness_alts.items()
+                            if np.allclose(ms[0], opt_witnesses[i], atol=1e-9, rtol=0.0)}
       if (cfg.save is not None and plan is not None and opt_witnesses is not None
-          and cfg.optimize_witnesses is not None):
+          and (cfg.optimize_witnesses is not None or _has_path_skill)):
         # RE-save with the optimized witnesses attached (the first save above is deliberately
         # EARLY so a witness-pass crash cannot lose the plan). With this block downstream
         # stages (main --load-plan --motion-plan, sim.py run) reuse the exact keyframes
@@ -4191,7 +4264,10 @@ def run(cfg, explicit=None):
                                    who="optimized witness export")
         save_plan(cfg.save, cfg, plan,
                   witnesses=witness_block(joint_names, opt_witnesses,
-                                          alts=witness_alts, stage="optimized"))
+                                          alts=witness_alts,
+                                          stage=("optimized" if cfg.optimize_witnesses is not None
+                                                 else "search"),
+                                          skill_paths=skill_paths))
       if plan is not None and cfg.utilization:
         from solver import utilization_report
         utilization_report(C, assembly, plan, robots, witnesses=opt_witnesses,
@@ -4394,7 +4470,8 @@ def run(cfg, explicit=None):
                                                    _loaded_export["step_names"]),
                                  saved_sequence_names=(None if _loaded_export is None else
                                                        _loaded_export["sequence_names"]),
-                                 pre_pin_robots=_pre_pin_robots)
+                                 pre_pin_robots=_pre_pin_robots,
+                                 skill_paths=skill_paths)
           print(f"[motion-plan] {'DEPGRAPH' if _export_depgraph else 'SEQUENCE'} problem, "
                 f"{len(prob.tasks)} tasks")
           if _loaded_export is not None:

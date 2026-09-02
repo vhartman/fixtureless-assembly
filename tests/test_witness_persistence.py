@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from plan_io import missing_required_witnesses, read_plan, read_witnesses, \
+from plan_io import missing_required_witnesses, read_plan, read_skill_paths, read_witnesses, \
     read_witness_stage, require_complete_witnesses, witness_block, write_plan
 import mp_export as MP
 import solver
@@ -46,6 +46,20 @@ def test_witness_stage_distinguishes_early_search_save_from_completed_optimizer(
   assert read_witness_stage(p) == "search"
   p = _write(tmp_path, witness_block(JOINTS, wit, stage="optimized"))
   assert read_witness_stage(p) == "optimized"
+
+
+def test_path_valued_skill_certificate_round_trips_and_checks_endpoint(tmp_path):
+  wit = [np.zeros(4), np.ones(4), None]
+  skill = {1: [np.zeros(4), np.full(4, 0.5), np.ones(4)]}
+  p = _write(tmp_path, witness_block(JOINTS, wit, stage="optimized", skill_paths=skill))
+  out = read_skill_paths(p, JOINTS, len(PLAN), wit)
+  assert list(out) == [1]
+  np.testing.assert_array_equal(out[1][-1], wit[1])
+
+  bad = {1: [np.zeros(4), np.full(4, 2.0)]}
+  p = _write(tmp_path, witness_block(JOINTS, wit, skill_paths=bad))
+  with pytest.raises(ValueError, match="does not end"):
+    read_skill_paths(p, JOINTS, len(PLAN), wit)
 
 
 def test_file_without_block_reads_as_none(tmp_path):

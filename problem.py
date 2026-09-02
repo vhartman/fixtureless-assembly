@@ -2,12 +2,55 @@
 search model (State + successors). No feasibility/solver or visualization code here."""
 
 import os
+from dataclasses import dataclass
 
 import robotic as ry
 import numpy as np
 
 from env import *
 import wrench
+
+
+@dataclass(frozen=True)
+class ScrewSkill:
+  """Execution contract for one helical mate.
+
+  The symbolic planner still sees one atomic ``assemble`` action.  This record only refines
+  how that action is executed: the already-grasped part moves from a backed-off,
+  counter-rotated entry pose to the ordinary authored mate pose without changing grasp.
+  ``angle`` is signed (radians), ``depth`` is axial travel (metres), and ``torque`` is the
+  nominal pure couple (Nm) that both the target and inserter wrench checks must sustain.
+
+  ``samples`` is a certification resolution, not a task-level discretisation: intermediate
+  poses never become symbolic actions or planner states.  A future controller may implement
+  internal release/rewind/re-engage while preserving this exact external contract; v1 sets
+  ``single_grasp`` and rejects any certificate that cannot maintain it continuously.
+  """
+  angle: float = np.pi
+  depth: float = 0.02
+  torque: float = 0.25
+  angular_speed: float = 0.75
+  samples: int = 16
+  single_grasp: bool = True
+
+  def __post_init__(self):
+    if not np.isfinite(self.angle) or abs(float(self.angle)) < 1e-9:
+      raise ValueError("screw angle must be finite and non-zero")
+    if not np.isfinite(self.depth) or float(self.depth) <= 0.0:
+      raise ValueError("screw depth must be finite and positive")
+    if not np.isfinite(self.torque) or float(self.torque) < 0.0:
+      raise ValueError("screw torque must be finite and non-negative")
+    if not np.isfinite(self.angular_speed) or float(self.angular_speed) <= 0.0:
+      raise ValueError("screw angular speed must be finite and positive")
+    if int(self.samples) < 2:
+      raise ValueError("screw certification needs at least two intervals")
+    if not self.single_grasp:
+      raise ValueError("only single-grasp screw skills are implemented")
+
+  def to_dict(self):
+    return {"kind": "screw", "angle": float(self.angle), "depth": float(self.depth),
+            "torque": float(self.torque), "angular_speed": float(self.angular_speed),
+            "samples": int(self.samples), "single_grasp": bool(self.single_grasp)}
 
 
 def set_seed(seed=0):
@@ -61,6 +104,11 @@ class Assembly:
     self.mate_axes = {}
     self.mate_interfaces = {}                # part -> PART-FRAME contact-patch offset (see
                                              # mate_interface); {} = geometric default
+    # EXECUTION REFINEMENTS: {mated_part: ScrewSkill|...}.  These do not add symbolic
+    # actions.  They refine one existing assemble edge into a certified controller-owned
+    # motion with the same pre/post symbolic state.  Keeping a typed per-mate map (rather
+    # than a global ``--screw`` boolean) lets ordinary insertion and screw mates coexist.
+    self.mate_skills = {}
     # PER-PART SHAPES: {part: (kind, params)} -- ("box", [sx, sy, sz, corner_r]),
     # ("cylinder", [length, radius]) (axis = local z), ("sphere", [radius]). Anything unset
     # defaults to the assembly's cube (cube_size/cube_radius) after define(), so classic
@@ -169,6 +217,28 @@ class Assembly:
     # part goes in; the planner does not get to choose. Subclasses may override in define().
     a = self.mate_axes.get(part)
     return None if a is None else np.asarray(a, dtype=float)
+
+  def mate_skill(self, part):
+    return self.mate_skills.get(part)
+
+  def screw_skill(self, part):
+    skill = self.mate_skill(part)
+    return skill if isinstance(skill, ScrewSkill) else None
+
+  def configure_screw_skills(self, *, angle=None, depth=None, torque=None,
+                             angular_speed=None, samples=None):
+    """Override fields of every authored screw mate without changing its symbolic schema."""
+    for part, old in list(self.mate_skills.items()):
+      if not isinstance(old, ScrewSkill):
+        continue
+      self.mate_skills[part] = ScrewSkill(
+          angle=old.angle if angle is None else float(angle),
+          depth=old.depth if depth is None else float(depth),
+          torque=old.torque if torque is None else float(torque),
+          angular_speed=(old.angular_speed if angular_speed is None
+                         else float(angular_speed)),
+          samples=old.samples if samples is None else int(samples),
+          single_grasp=True)
 
   def mate_contact_interface(self, part, n_axial=48, n_ang=32):
     """COMPUTED contact patch: the PART-FRAME point of `part`'s shape surface CLOSEST to its
@@ -302,6 +372,10 @@ class Assembly:
     for part, (parent, _pos) in self.assembly_relative_poses.items():
       assert part in self.objects, f"unknown part in relative poses: {part}"
       assert parent in self.objects, f"unknown parent {parent} for {part}"
+    for part, skill in self.mate_skills.items():
+      assert part in self.assembly_relative_poses, \
+          f"mate skill assigned to non-mated part {part}"
+      assert isinstance(skill, ScrewSkill), f"unsupported mate skill for {part}: {skill!r}"
 
   def dependencies_of(self, part):
     return self.assembly_dependencies.get(part, [])
@@ -1088,6 +1162,69 @@ class PegHoleAssembly(Assembly):
     self.masses = {"obj_0": 0.35, "obj_1": 0.10}
 
 
+class PegHoleScrewAssembly(PegHoleAssembly):
+  """Two-part screw-skill experiment derived from :class:`PegHoleAssembly`.
+
+  Geometry deliberately remains a generous real concavity so the first controller test is
+  about the helical motion rather than thread-mesh contact.  The peg carries a small
+  asymmetric head above the socket; its rotation is therefore visible, while its cylindrical
+  shaft can turn freely in the square pocket.  This is a *virtual-thread* experiment: the
+  authored :class:`ScrewSkill` imposes pitch/rotation and the wrench model prices axial force
+  plus torque.  It does not claim that smooth MuJoCo contact generates a physical thread lead.
+  """
+
+  def __init__(self, n_parts=2, screw_angle=np.pi, screw_depth=0.020,
+               screw_torque=0.25, screw_speed=0.75, screw_samples=16, **kwargs):
+    self._screw_spec = ScrewSkill(angle=screw_angle, depth=screw_depth,
+                                  torque=screw_torque, angular_speed=screw_speed,
+                                  samples=screw_samples)
+    super().__init__(n_parts=n_parts, chamfer=0.004, hole_chamfer=0.006, **kwargs)
+
+  def define(self):
+    super().define()
+    if self.n_parts < 2:
+      return
+    # A fixture-style side handle gives a second arm a realistic, REMOTE place to oppose
+    # screw torque.  Keeping the clamp hand away from the screw axis is important: a small
+    # lug directly on the socket makes the perfectly valid force closure unusable because
+    # the two robot wrists necessarily occupy the same space at the assembled keyframe.
+    # The thin rail is part of the same rigid target and ends in a vertical grip block.
+    socket_children = [
+        {"shape": sub, "pos": np.asarray(pos, dtype=float).tolist()}
+        for sub, pos in _compound_children(self.part_shapes["obj_0"])]
+    socket_children.extend([
+        {"shape": ("box", [0.120, 0.014, 0.014, 0.001]),
+         "pos": [self.outer / 2.0 + 0.060, 0.0, 0.012]},
+        {"shape": ("box", [0.025, 0.035, 0.050, 0.001]),
+         "pos": [self.outer / 2.0 + 0.120, 0.0, 0.030]},
+    ])
+    self.part_shapes["obj_0"] = ("compound", socket_children)
+    # A raised offset head makes a 180-degree turn observable and gives the fingers enough
+    # axial room to remain clear of the socket rim for the WHOLE helix.  The narrow neck is
+    # deliberately part of the screw, not a kinematic offset hidden in gripper calibration.
+    shaft = self.part_shapes["obj_1"]
+    head_z = self.peg_length / 2.0 + 0.030
+    # Compound children are deliberately flat throughout the geometry backend.  The
+    # chamfered peg is already a body+tip compound, so splice those children rather than
+    # nesting it under the head compound.
+    children = ([{"shape": sub, "pos": np.asarray(pos, dtype=float).tolist()}
+                 for sub, pos in _compound_children(shaft)]
+                if shaft[0] == "compound" else
+                [{"shape": shaft, "pos": [0.0, 0.0, 0.0]}])
+    children.extend([
+        {"shape": ("cylinder", [0.024, 0.008]),
+         "pos": [0.0, 0.0, self.peg_length / 2.0 + 0.012]},
+        {"shape": ("box", [0.050, 0.025, 0.012, 0.001]),
+         "pos": [0.010, 0.0, head_z]},
+    ])
+    self.part_shapes["obj_1"] = ("compound", children)
+    # The fixture handle enlarges obj_0 beyond the nominal 8cm scatter cell.  Move the loose
+    # screw one extra cell outward so the INITIAL pick scene is not artificially occluded by
+    # that handle; this is scene geometry, not a search-order or reachability heuristic.
+    self.scatter_offsets["obj_1"] = np.array([0.10, 0.0, 0.0])
+    self.mate_skills["obj_1"] = self._screw_spec
+
+
 class PegStoolAssembly(Assembly):
   """A three-legged stool whose legs really insert into blind sockets in the seat.
 
@@ -1437,6 +1574,7 @@ _ASSEMBLY_KINDS = {"cross": (CubeCrossAssembly, 7), "cube": (CubeGridAssembly, 8
                    "car-mini": (lambda n_parts: CarAssembly(n_parts=n_parts, width=0.03), 5),
                    "slot-pin": (SlotPinAssembly, 3),
                    "peg-hole": (PegHoleAssembly, 2),
+                   "peg-hole-screw": (PegHoleScrewAssembly, 2),
                    "peg-stool": (PegStoolAssembly, 4),
                    "peg-stool-4": (lambda n_parts: PegStoolAssembly(
                        n_parts=n_parts, legs=4), 5),
@@ -5716,15 +5854,20 @@ def _grounding_caps(state, assembly, group, gripper_kind, table_override=None):
 
 def _group_stable(state, assembly, group, gripper_kind, applied=(), table_override=None):
   # static-equilibrium feasibility for a subassembly: can its grounding contacts balance
-  # gravity plus any `applied` [(force_vec_world, point_world), ...] (e.g. insertion)? The
+  # gravity plus any `applied` [(force_vec_world, point_world[, pure_torque_world]), ...]
+  # (e.g. insertion or screwing)? The optional third vector is a FREE COUPLE, not a force at
+  # another invented lever arm. Keeping it explicit is essential for screw feasibility.
   # load-independent contacts come from _grounding_caps (cached); here we only add the applied
   # load to the gravity wrench and hit the LP cache / solve. table_override: scoped table
   # model for the engagement gate, see _grounding_caps.
   centroid, w_grav, G, ub, bounds, gbytes = _grounding_caps(
       state, assembly, group, gripper_kind, table_override=table_override)
   w_ext = w_grav
-  for f, pt in applied:
+  for load in applied:
+    f, pt = load[:2]
     w_ext = w_ext + wrench.point_force_wrench(f, np.asarray(pt, dtype=float) - centroid)
+    if len(load) >= 3:
+      w_ext = w_ext + np.concatenate([np.zeros(3), np.asarray(load[2], dtype=float)])
   geo_key = (gbytes[0], gbytes[1])
   key = (geo_key[0], geo_key[1], np.round(w_ext, 4).tobytes())
   hit = _WRENCH_CACHE.get(key)
@@ -5822,7 +5965,8 @@ def _group_stable_loaded(state, assembly, group, gripper_kind, load_variants):
              for lv in load_variants)
 
 
-def _group_stable_affine(state, assembly, group, gripper_kind, f0, point, gens):
+def _group_stable_affine(state, assembly, group, gripper_kind, f0, point, gens,
+                         pure_torque=None):
   # CONSERVATIVE robust check: one AFFINE contact-force policy must hold across the whole
   # uncertainty box (wrench.equilibrium_robust_affine), vs _group_stable_loaded's EXACT per-corner
   # test. Builds the nominal wrench w0 and the box's generator wrenches delta_j about the group
@@ -5833,6 +5977,8 @@ def _group_stable_affine(state, assembly, group, gripper_kind, f0, point, gens):
   centroid, w_grav, G, ub, bounds, _ = _grounding_caps(state, assembly, group, gripper_kind)
   f0 = np.asarray(f0, dtype=float); point = np.asarray(point, dtype=float)
   w0 = w_grav + wrench.point_force_wrench(f0, point - centroid)
+  if pure_torque is not None:
+    w0 = w0 + np.concatenate([np.zeros(3), np.asarray(pure_torque, dtype=float)])
   deltas = []
   for kind, axis, amt in gens:
     axis = np.asarray(axis, dtype=float)
@@ -5847,7 +5993,8 @@ def _group_stable_affine(state, assembly, group, gripper_kind, f0, point, gens):
 _AFFINE_FALLBACK_WARNED = [False]
 
 
-def _robust_stable(state, assembly, group, gripper_kind, f_world, point, mag, scale=1.0):
+def _robust_stable(state, assembly, group, gripper_kind, f_world, point, mag, scale=1.0,
+                   pure_torque=None):
   # dispatch the robust insertion-stability check by wrench.PARAMS['robust_mode']:
   #   'corners' (default, EXACT): every uncertainty-box corner must be balanceable, the contacts
   #             free to rechoose their force split per realization (fully-adjustable robustness).
@@ -5868,9 +6015,12 @@ def _robust_stable(state, assembly, group, gripper_kind, f_world, point, mag, sc
               "couple): using the exact 'corners' test instead.")
     else:
       f0, pt, gens = _insertion_uncertainty_gens(f_world, point, mag, scale=scale)
-      return _group_stable_affine(state, assembly, group, gripper_kind, f0, pt, gens)
-  return _group_stable_loaded(state, assembly, group, gripper_kind,
-                              _insertion_uncertainty_variants(f_world, point, mag, scale=scale))
+      return _group_stable_affine(state, assembly, group, gripper_kind, f0, pt, gens,
+                                  pure_torque=pure_torque)
+  variants = _insertion_uncertainty_variants(f_world, point, mag, scale=scale)
+  if pure_torque is not None:
+    variants = [(f, pt, np.asarray(pure_torque, dtype=float)) for f, pt in variants]
+  return _group_stable_loaded(state, assembly, group, gripper_kind, variants)
 
 
 def _cross3(a, b):
@@ -5978,6 +6128,26 @@ def _inserter_load(state, assembly, part, onto, d=None):
   return f_world, point
 
 
+def _screw_torque_load(state, assembly, part, onto, *, target_side):
+  """Pure world-frame couple for a screw mate, or ``None`` for ordinary insertion.
+
+  The signed rotation fixes the torque direction.  Target and inserted groups receive equal
+  and opposite couples.  The torque is independent of the contact point by definition; it
+  must therefore enter the 6-D equilibrium load explicitly rather than through a fake force
+  lever arm.
+  """
+  skill = assembly.screw_skill(part)
+  if skill is None or skill.torque <= 0.0:
+    return None
+  poses = _state_part_poses(state, assembly, lift=0.0)
+  frame = onto if target_side else part
+  R = _quat_to_R(np.asarray(poses[frame][3:], dtype=float))
+  axis = R @ np.asarray(assembly.mate_axis(part), dtype=float)
+  axis = axis / (np.linalg.norm(axis) + 1e-12)
+  direction = np.sign(skill.angle) * (-1.0 if target_side else 1.0)
+  return direction * float(skill.torque) * axis
+
+
 def _insertion_load_variants(state, assembly, part, onto, d=None, scale=1.0):
   # the target-side insertion reaction, as a list of worst-case realizations under the
   # insertion-uncertainty model (a singleton = the nominal load when the flag is off).
@@ -6052,7 +6222,9 @@ def _insertion_stable(state, assembly, group, gripper_kind, part, onto, d=None):
     return hit
   f_world, point = _insertion_load(state, assembly, part, onto, d)
   res = _robust_stable(state, assembly, group, gripper_kind, f_world, point,
-                       wrench.insert_force(part), scale=key[3])
+                       wrench.insert_force(part), scale=key[3],
+                       pure_torque=_screw_torque_load(
+                           state, assembly, part, onto, target_side=True))
   cache[key] = res
   return res
 
@@ -6072,7 +6244,9 @@ def _inserter_stable(state, assembly, group, gripper_kind, part, onto, d=None):
     return hit
   f_world, point = _inserter_load(state, assembly, part, onto, d)
   res = _robust_stable(state, assembly, group, gripper_kind, f_world, point,
-                       wrench.insert_force(part), scale=key[3])
+                       wrench.insert_force(part), scale=key[3],
+                       pure_torque=_screw_torque_load(
+                           state, assembly, part, onto, target_side=False))
   cache[key] = res
   return res
 
