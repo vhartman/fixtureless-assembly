@@ -155,6 +155,112 @@ def _mate_caps_from_args(a):
           float(a.mate_torque_cap) if a.mate_torque_cap is not None else float("inf"))
 
 
+def _transverse_basis(direction):
+  """Deterministic orthonormal basis of the plane normal to ``direction``."""
+  d = np.asarray(direction, dtype=float)
+  d /= np.linalg.norm(d) + 1e-12
+  ref = np.array([0.0, 0.0, 1.0]) if abs(d[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+  t1 = np.cross(ref, d)
+  t1 /= np.linalg.norm(t1) + 1e-12
+  return t1, np.cross(d, t1)
+
+
+def _process_wrench_pair(assembly, part, parent, part_pose, parent_pose, realization=None):
+  """One realized process load on both sides of a mate, in world coordinates.
+
+  The search checks these as two separate external loads: the receiving component sees the
+  insertion force along the mate axis, while the inserted component sees the opposite reaction.
+  A screw additionally contributes an equal-and-opposite pure couple.  Return the same physical
+  pair as ``{body: (force, pure_torque, application_point)}``. ``realization`` contains fixed
+  coefficients in the mate's transverse frame.  Keeping those coefficients constant for the
+  whole skill models a quasi-static alignment error; resampling every MuJoCo tick would instead
+  create timestep-dependent vibration that the planner never claimed to cover.
+
+  Both forces act at ONE world-space interface point and are exactly opposite.  The target's
+  current pose defines the mate frame; this preserves Newton's third law even after a failed
+  execution lets the two bodies drift apart.
+  """
+  import wrench as W
+  pp = np.asarray(part_pose, dtype=float)
+  pt = np.asarray(parent_pose, dtype=float)
+  Rp, Rt = _quat_to_R(pp[3:]), _quat_to_R(pt[3:])
+  axis = np.asarray(assembly.mate_axis(part), dtype=float)
+  axis = axis / (np.linalg.norm(axis) + 1e-12)
+  mag = float(W.insert_force(part))
+  d = Rt @ axis
+  t1, t2 = _transverse_basis(d)
+  realization = realization or {}
+  lat = float(realization.get("lateral", 0.0))
+  off = float(realization.get("offset", 0.0))
+  coeff = np.asarray(realization.get("coefficients", (0.0, 0.0, 0.0, 0.0)), dtype=float)
+  if coeff.shape != (4,):
+    raise ValueError("process-wrench realization needs four coefficients")
+  ft = mag * (d + lat * (coeff[0] * t1 + coeff[1] * t2))
+  fp = -ft
+  interface = np.asarray(assembly.mate_interface(part, axis), dtype=float)
+  rel = np.asarray(assembly.relative_pose(part)[1], dtype=float)
+  # One physical contact point. The optional point error is transverse to the mate axis.
+  xt = pt[:3] + Rt @ (rel + interface) + off * (coeff[2] * t1 + coeff[3] * t2)
+  xp = xt.copy()
+  tp, tt = np.zeros(3), np.zeros(3)
+  skill = assembly.screw_skill(part)
+  if skill is not None and float(skill.torque) > 0.0:
+    s = float(np.sign(skill.angle))
+    tp = s * float(skill.torque) * d
+    tt = -tp
+  return {part: (fp, tp, xp), parent: (ft, tt, xt)}
+
+
+def _process_interface_gap(assembly, part, part_pose, parent_pose):
+  """Distance between the two nominal mate-interface points at the current poses."""
+  pp = np.asarray(part_pose, dtype=float)
+  pt = np.asarray(parent_pose, dtype=float)
+  Rp, Rt = _quat_to_R(pp[3:]), _quat_to_R(pt[3:])
+  axis = np.asarray(assembly.mate_axis(part), dtype=float)
+  axis /= np.linalg.norm(axis) + 1e-12
+  interface = np.asarray(assembly.mate_interface(part, axis), dtype=float)
+  rel = np.asarray(assembly.relative_pose(part)[1], dtype=float)
+  xp = pp[:3] + Rp @ interface
+  xt = pt[:3] + Rt @ (rel + interface)
+  return float(np.linalg.norm(xp - xt))
+
+
+def _process_realizations(plan, mode="nominal", corner=0, seed=0):
+  """Plan-indexed, replayable insertion-uncertainty realizations.
+
+  The planner's set has two lateral-force axes and, when ``--insertion-offset`` is nonzero,
+  two contact-point axes. ``corner`` chooses one of its 4/16 vertices. ``sample`` draws once
+  per assemble action from the box and never redraws during execution.
+  """
+  import wrench as W
+  unc = W.PARAMS.get("insertion_uncertainty") or {}
+  lat = float(unc.get("lateral", 0.0) or 0.0)
+  off = float(unc.get("offset", 0.0) or 0.0)
+  if mode not in ("nominal", "corner", "sample"):
+    raise ValueError(f"unknown process-noise mode {mode!r}")
+  if mode != "nominal" and lat <= 0.0 and off <= 0.0:
+    raise ValueError(
+        f"--process-noise {mode} needs a plan saved with --insertion-noise and/or "
+        "--insertion-offset")
+  dims = (2 if lat > 0.0 else 0) + (2 if off > 0.0 else 0)
+  if mode == "corner" and not 0 <= int(corner) < (1 << dims):
+    raise ValueError(f"process-noise corner {corner} outside [0, {(1 << dims) - 1}]")
+  rng = np.random.default_rng(int(seed))
+  out = {}
+  for i, action in enumerate(plan):
+    if action[0] != "assemble":
+      continue
+    vals = np.zeros(4)
+    active = ([0, 1] if lat > 0.0 else []) + ([2, 3] if off > 0.0 else [])
+    if mode == "corner":
+      for bit, j in enumerate(active):
+        vals[j] = 1.0 if (int(corner) >> bit) & 1 else -1.0
+    elif mode == "sample":
+      vals[active] = rng.uniform(-1.0, 1.0, size=len(active))
+    out[i] = {"lateral": lat, "offset": off, "coefficients": vals.tolist()}
+  return out
+
+
 # ---------------------------------------------------------------------------------------------
 # report / failure taxonomy
 # ---------------------------------------------------------------------------------------------
@@ -273,9 +379,23 @@ def _compound_geoms_xml(spec, mu, mass, group, rgba):
   return "".join(out)
 
 
+def _contact_friction(mu, *, table=False):
+  """MuJoCo sliding/torsional/rolling coefficients with the historical mu=0.5 values.
+
+  The old generator changed only sliding friction: asking for ``mu=0`` silently retained
+  0.005 torsional and 0.002 rolling friction. Scale all three together so low-friction and
+  frictionless experiments mean what their saved configuration says, while mu=0.5 remains
+  byte-for-byte the established model.
+  """
+  mu = max(0.0, float(mu))
+  torsion = 0.01 * mu
+  rolling = (0.004 if table else 0.0002) * mu
+  return f"{mu:g} {torsion:g} {rolling:g}"
+
+
 def _geom_xml(spec, mu):
   kind, p = spec[0], list(spec[1]) if not isinstance(spec[1], dict) else spec[1]
-  fr = f'friction="{mu} 0.005 0.0001"'
+  fr = f'friction="{_contact_friction(mu)}"'
   if kind == "mesh":
     return f'<geom type="mesh" mesh="{_part_mesh_asset(p)[0]}" {fr} mass_placeholder/>'
   if kind == "compound":
@@ -743,6 +863,23 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
           f'mass="{mass}" group="{GROUP_PART}" rgba="{palette[i % len(palette)]}"{gq}').replace(
           "vis_placeholder",
           f'group="{GROUP_PART}" rgba="{palette[i % len(palette)]}"{gq}')
+    # Renderer-only motion indicators are not part of the collision/grasp/wrench model.
+    # Give them negligible mass and disable both contact masks; they remain rigid children
+    # of the part body and therefore expose rotation in recordings.
+    for marker in getattr(assembly, "visual_markers", {}).get(p, []):
+      mspec = marker["shape"]
+      mpos = marker.get("pos", (0.0, 0.0, 0.0))
+      mrgba = marker.get("rgba", "0.95 0.95 0.1 1")
+      mq = mspec[2] if len(mspec) > 2 else None
+      mquat = (' quat="1 0 0 0"' if mq is None else
+               f' quat="{mq[0]} {mq[1]} {mq[2]} {mq[3]}"')
+      mpose = f' pos="{mpos[0]} {mpos[1]} {mpos[2]}"{mquat}'
+      g += _geom_xml(mspec, mu_table).replace(
+          "mass_placeholder",
+          f'mass="1e-8" group="{GROUP_PART}" rgba="{mrgba}" '
+          f'contype="0" conaffinity="0"{mpose}').replace(
+          "vis_placeholder",
+          f'group="{GROUP_PART}" rgba="{mrgba}" contype="0" conaffinity="0"{mpose}')
     parts_xml.append(
         f'<body name="{p}" pos="{pose[0]} {pose[1]} {pose[2]}" '
         f'quat="{q[0]} {q[1]} {q[2]} {q[3]}"><freejoint/>{g}</body>')
@@ -911,7 +1048,7 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
          finite rolling resistance without pinning or otherwise special-casing loose parts. -->
     <geom name="table" type="box" size="{table_half_x} {table_half_y} {table_half_z}"
           pos="{table_x} {table_y} {table_z}" rgba="0.55 0.42 0.28 1"
-          friction="{mu_table} 0.005 0.002" condim="6"
+          friction="{_contact_friction(mu_table, table=True)}" condim="6"
           group="{GROUP_ENV}"/>
     {''.join(parts_xml)}
   </worldbody>
@@ -926,11 +1063,14 @@ class SimScene:
   def __init__(self, assembly, state, robots, gripper_kinds=None, gui=False,
                arms=None, arm_poses=None, ee_anchor=None, articulated_C=None,
                actuated=False, planner_table_top=None, weld_timeconst=None,
-               table_geometry=None):
+               table_geometry=None, table_mu=None, process_engagement_distance=0.01,
+               process_wrench_ramp=0.05):
     if not HAVE_MUJOCO:
       raise RuntimeError("mujoco not installed (pip install mujoco)")
     self.assembly = assembly
-    self.xml = build_mjcf(assembly, state, robots, arms=arms, arm_poses=arm_poses,
+    self.table_mu = 0.5 if table_mu is None else float(table_mu)
+    self.xml = build_mjcf(assembly, state, robots, mu_table=self.table_mu,
+                          arms=arms, arm_poses=arm_poses,
                           planner_table_top=planner_table_top, weld_timeconst=weld_timeconst,
                           table_geometry=table_geometry,
                           ee_anchor=ee_anchor, articulated_C=articulated_C,
@@ -957,6 +1097,14 @@ class SimScene:
     self.wrench_trace = None                               # SIM_WRENCH_TRACE hook, see
     self.trace_ctx = None                                  # _make_wrench_tracer (driver's
     self.step_i = 0                                        # sample index + the sim clock)
+    # Optional declared process loads. Each entry is (inserted part, receiving part). The
+    # executor activates them only over the final entry->seat stretch of an assemble action;
+    # ``step`` recomputes their world-frame forces from the current body poses every tick.
+    self.process_wrenches = []
+    self._process_wrench_bodies = set()
+    self._process_wrench_ticks = 0
+    self.process_engagement_distance = float(process_engagement_distance)
+    self.process_wrench_ramp = float(process_wrench_ramp)
     # per-robot geom ids of the rai contact=-2 wrist capsules (un-collided while holding)
     self._holdex = {r: [] for r in self.robots}
     if arms is not None:
@@ -1065,6 +1213,56 @@ class SimScene:
 
   def _body_id(self, name):
     return mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
+
+  def set_process_wrenches(self, pairs):
+    """Activate mate loads; entries are ``(inserted, parent[, realization])``."""
+    for bid in self._process_wrench_bodies:
+      self.data.xfrc_applied[bid] = 0.0
+    self.process_wrenches = [tuple(p) for p in pairs]
+    self._process_wrench_bodies = {
+        self._body_id(name) for pair in self.process_wrenches for name in pair[:2]}
+    self._process_wrench_ticks = 0
+
+  def _apply_process_wrenches(self):
+    """Write current-pose process forces into MuJoCo's body-COM wrench input."""
+    if not self._process_wrench_bodies:
+      return
+    for bid in self._process_wrench_bodies:
+      self.data.xfrc_applied[bid] = 0.0
+    ramp_u = 1.0 if self.process_wrench_ramp <= 0.0 else min(
+        1.0, self._process_wrench_ticks * DT / self.process_wrench_ramp)
+    ramp = ramp_u * ramp_u * (3.0 - 2.0 * ramp_u)          # smoothstep: no force impulse
+    for entry in self.process_wrenches:
+      part, parent = entry[:2]
+      realization = entry[2] if len(entry) > 2 else None
+      bp, bt = self._body_id(part), self._body_id(parent)
+      part_pose = np.concatenate([self.data.xpos[bp], self.data.xquat[bp]])
+      parent_pose = np.concatenate([self.data.xpos[bt], self.data.xquat[bt]])
+      loads = _process_wrench_pair(
+          self.assembly, part, parent, part_pose, parent_pose, realization=realization)
+      skill = self.assembly.screw_skill(part)
+      if skill is None:
+        # A press reaction exists only near contact, not throughout a potentially 50mm
+        # collision-free pre-insertion approach. Smoothly reach full load at the datum.
+        gap = _process_interface_gap(self.assembly, part, part_pose, parent_pose)
+        if self.process_engagement_distance <= 0.0:
+          engage = 1.0
+        else:
+          u = np.clip(1.0 - gap / self.process_engagement_distance, 0.0, 1.0)
+          engage = float(u * u * (3.0 - 2.0 * u))
+      else:
+        # A thread is engaged throughout its certified helix; only suppress the turn-on impulse.
+        engage = 1.0
+      scale = ramp * engage
+      for body, (force, torque, point) in loads.items():
+        bid = self._body_id(body)
+        # xfrc_applied is a world-frame force/couple at the body's inertial COM. Translate
+        # the interface force to that point; the pure screw couple is origin-independent.
+        couple = np.asarray(torque) + np.cross(
+            np.asarray(point) - np.asarray(self.data.xipos[bid]), np.asarray(force))
+        self.data.xfrc_applied[bid, :3] += scale * force
+        self.data.xfrc_applied[bid, 3:] += scale * couple
+    self._process_wrench_ticks += 1
 
   def part_pose(self, p):
     b = self._body_id(p)
@@ -1551,6 +1749,7 @@ class SimScene:
     an overloaded grasp DROPS (deactivates) and is recorded as the LP-predicted failure."""
     sustain = max(1, int(BREAK_SUSTAIN / DT))
     for _ in range(n):
+      self._apply_process_wrenches()
       mujoco.mj_step(self.model, self.data)
       self._phys += 1
       if self._grasp_trace and self.step_i % self._grasp_trace == 0:
@@ -2224,6 +2423,10 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         corridor_margin=0.0, weld_timeconst=None, limit_rate=False,
                         path_preflight=True, path_preflight_tolerance=PATH_PREFLIGHT_TOL,
                         path_preflight_resolution=None,
+                        apply_process_wrench=False, table_mu=None,
+                        process_noise_mode="nominal", process_noise_corner=0,
+                        process_noise_seed=0, process_engagement_distance=0.01,
+                        process_wrench_ramp=0.05,
                         skill_servo=False, servo_force=6.0, servo_max_dev=0.010,
                         servo_tol=0.002, servo_torque_guard=None,
                         servo_place_seat=False, compliant_follow=False,
@@ -2301,7 +2504,22 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                    actuated=actuated,
                    planner_table_top=(planner_table_top(C) if use_planner_table else None),
                    table_geometry=planner_table_geometry(C),
-                   weld_timeconst=weld_timeconst)
+                   weld_timeconst=weld_timeconst, table_mu=table_mu,
+                   process_engagement_distance=process_engagement_distance,
+                   process_wrench_ramp=process_wrench_ramp)
+  print(f"[sim/mp] table contact friction from saved plan: mu={scene.table_mu:g} "
+        f"(MuJoCo sliding/torsional/rolling={_contact_friction(scene.table_mu, table=True)}).")
+  if record_metadata is not None:
+    # Persist the RESOLVED value, not the nullable plan field.  Legacy plans omit table_mu
+    # and therefore intentionally use 0.5; recording null here made that physical choice
+    # ambiguous even though the compiled XML happened to contain the right coefficient.
+    record_metadata["table_mu"] = float(scene.table_mu)
+    record_metadata["directional_caps"] = bool(directional_caps)
+  if scene.table_mu == 0.0:
+    print("[sim/mp] WARNING: exactly zero table friction is an idealized stress test; loose "
+          "round parts can drift from micron-scale contact noise before they are picked. "
+          "Prefer a small measured value such as --table-friction 0.05 for a reproducible "
+          "low-friction counterfactual.")
   scene.verify_efc_cache = bool(verify_efc_cache)
   scene.directional_caps = bool(directional_caps)
   scene.mate_caps = mate_caps
@@ -2618,6 +2836,26 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     for k, nm in enumerate(nms):
       name_of[nm] = (i, k == len(nms) - 1)
 
+  try:
+    process_realizations = _process_realizations(
+        plan, mode=process_noise_mode, corner=process_noise_corner,
+        seed=process_noise_seed)
+  except ValueError as e:
+    raise SystemExit(f"[sim/process-wrench] {e}")
+  if record_metadata is not None and apply_process_wrench:
+    import wrench as _Wproc
+    _unc = _Wproc.PARAMS.get("insertion_uncertainty") or {}
+    record_metadata["process_wrench"] = {
+        "noise_mode": process_noise_mode,
+        "noise_corner": int(process_noise_corner),
+        "noise_seed": int(process_noise_seed),
+        "lateral": float(_unc.get("lateral", 0.0) or 0.0),
+        "offset": float(_unc.get("offset", 0.0) or 0.0),
+        "engagement_distance": float(process_engagement_distance),
+        "ramp_time": float(process_wrench_ramp),
+        "realizations": {str(i): v for i, v in process_realizations.items()},
+    }
+
   import os as _os
   _trace = bool(_os.environ.get("SIM_MP_TRACE"))
 
@@ -2690,6 +2928,54 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       mp_path, q_of=lambda st: full_q(st.q),
       mode_of=lambda st: st.mode,
       taskids_of=lambda m: np.atleast_1d(m.task_ids))
+
+  def _process_pairs(done_ids):
+    """Mate loads owned by the stretch ending in ``done_ids`` (pre-skill GOTOs own none)."""
+    if not apply_process_wrench:
+      return []
+    out = []
+    for tid in done_ids:
+      task = problem.tasks[int(tid)]
+      lbl = name_of.get(task.name)
+      if lbl is None or not lbl[1]:                         # pre-assemble / unnamed task
+        continue
+      action = tuple(plan[lbl[0]])
+      if action[0] == "assemble":
+        out.append((action[2], action[3], process_realizations.get(lbl[0], {})))
+    # A barrier can list the same completed task for several robots. Deduplicate by mate,
+    # retaining its plan-indexed realization (dicts themselves are deliberately unhashable).
+    unique = {}
+    for entry in out:
+      unique[(entry[0], entry[1])] = entry
+    return list(unique.values())
+
+  _active_process_pairs = [None]
+  def _set_process_for(done_ids):
+    pairs = _process_pairs(done_ids)
+    if pairs == _active_process_pairs[0]:
+      return
+    scene.set_process_wrenches(pairs)
+    _active_process_pairs[0] = pairs
+    if pairs:
+      import wrench as W
+      desc = []
+      for part, parent, realization in pairs:
+        skill = assembly.screw_skill(part)
+        tau = 0.0 if skill is None else float(skill.torque)
+        c = np.asarray(realization.get("coefficients", np.zeros(4)), dtype=float)
+        noise = ("" if not np.any(c) else
+                 f" noise=[{','.join(f'{x:+.2f}' for x in c)}]")
+        desc.append(f"{part}->{parent} {W.insert_force(part):g}N/{tau:g}Nm{noise}")
+      print("[sim/process-wrench] ACTIVE over entry-to-seat stretch: " + ", ".join(desc))
+
+  if apply_process_wrench:
+    print("[sim/mp] --apply-process-wrench ACTIVE: nominal equal-and-opposite mate loads "
+          "are applied directly at both interface bodies; ordinary insertions engage over "
+          f"the final {process_engagement_distance*1000:g}mm, screws remain loaded over the "
+          f"helix, and turn-on is ramped over {process_wrench_ramp*1000:g}ms. Holders, grasp "
+          "welds, and arm servos must physically react them. "
+          f"Insertion realization={process_noise_mode}. Relative noise coefficients are "
+          "fixed per action and persisted in the NPZ.")
   # FIRE-COVERAGE GUARD: every task's completion must land in some stretch's done set -- a
   # task in none of them simply never fires, and its attach/release side effects are skipped
   # SILENTLY (the dropped-holder-release failure class: the arm keeps its weld and drags the
@@ -2751,20 +3037,19 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       raise RuntimeError(
           f"[sim/mp] {getattr(_task, 'name', _tid)} screw certificate endpoints do not "
           "match the saved motion path's entry/final task goals; regenerate the MP export")
-    if _inactive and np.max(np.abs(_w1[_inactive] - _w0[_inactive])) > 1e-6:
-      raise RuntimeError(
-          f"[sim/mp] {getattr(_task, 'name', _tid)} overlaps unrelated robot motion in one "
-          "stretch; v1 refuses to execute an uncertified composition")
     # Idle full-q slices in an IK certificate are implementation detail (typically EXIT).
-    # Preserve the actual path's inactive-arm configuration and replace only task robots.
-    _owned = []
-    for _qskill in _jp:
-      _q = _w0.copy()
-      _q[_active] = _qskill[_active]
-      _owned.append(_q)
+    # Preserve unrelated robots' ORIGINAL planner geometry while replacing only task-owned
+    # joints.  A long multi-robot plan may advance another robot in the same mode stretch;
+    # requiring it to be stationary made valid atomic skills spuriously unexecutable.  The
+    # merged knots preserve both projected polylines exactly.  Their synchronization is new,
+    # so the strict interpolated-edge preflight below is the actual safety certificate (and
+    # fails rather than falling back if the composition is unsafe).
+    _owned = retiming.compose_owned_path(_wp, _jp, _active)
+    _inactive_motion = (np.max(np.abs(_w1[_inactive] - _w0[_inactive]))
+                        if _inactive else 0.0)
     stretches[_k] = (_owned, _done)
-    _screw_stretches.append((_k, _tid, _sd))
-  for _k, _tid, _sd in _screw_stretches:
+    _screw_stretches.append((_k, _tid, _sd, _inactive_motion))
+  for _k, _tid, _sd, _inactive_motion in _screw_stretches:
     _arc = retiming.arc_length(stretches[_k][0])[1]
     _angle = abs(float(_sd["angle"]))
     _omega = float(_sd["angular_speed"])
@@ -2779,9 +3064,10 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           f"{float(_sd['depth'])*1000:.1f}mm, torque {float(_sd['torque']):.3f}Nm. "
           f"Angular cruise {float(_sd['angular_speed']):.3f}rad/s -> joint-arc cruise "
           f"{_sd['retime_rate']:.3f}rad/s. The free-space planner segment is ignored; "
-          "strict path preflight follows.")
+          f"unrelated-arm endpoint motion {_inactive_motion:.3g}rad follows its saved "
+          "planner polyline; strict composed-path preflight follows.")
   _stretch_rates = [float(JOINT_RATE)] * len(stretches)
-  for _k, _tid, _sd in _screw_stretches:
+  for _k, _tid, _sd, _inactive_motion in _screw_stretches:
     _stretch_rates[_k] = float(_sd["retime_rate"])
 
   # ALIGNMENT BY MODE IDENTITY: the saved path's lightweight modes carry task_ids only, so
@@ -4367,6 +4653,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     _n_gate = 0                                            # ticks the gate held an arm
     _n_servo_gate = 0                                      # violations introduced by adjustment
     _stall_fire, _stall_tick = online_stepper.fired, 0
+    if online_fire_tids:
+      _set_process_for(online_fire_tids[0])
     def _safe(fq):
       nonlocal _n_checks, _n_gate, _n_servo_gate
       if _n_tick % _VCHK:
@@ -4487,6 +4775,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           fire(tid)
         _pre_fire = (online_stepper.steps - _fw0) * DT
         online_stepper.confirm_fire(defer_pace_replan=True)
+        _set_process_for(online_fire_tids[online_stepper.fired]
+                         if online_stepper.fired < len(online_fire_tids) else [])
         for tid in online_fire_tids[fire_k]:
           lift_after_fire(tid, qc0, flow_drive=_flow_drive, flow_tick=_flow_tick)
         # Hold the old constant rates through cleanup, then plan the next stretch ONCE from
@@ -4549,6 +4839,13 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     # is REMOVED. The GLOBAL pacing/guard below is the offline modes' blunt instrument; the
     # per-arm version lives in the --corridor-online stepper above.
     _fire_samples = sorted(fire_at)
+
+    def _process_after(sample):
+      nxt = next((j for j in _fire_samples if j > sample), None)
+      _set_process_for(fire_at[nxt] if nxt is not None else [])
+
+    if _fire_samples:
+      _set_process_for(fire_at[_fire_samples[0]])
 
     def _pending_place(i):
       """If the NEXT fire is a lone PLACE of a currently-PRESSED cargo, return
@@ -4630,6 +4927,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             servo.place_seat(qc, _part, _exp, problem.tasks[_tid].name, drive_q,
                              lambda: scene.step(1, report, ("servo",)), settle_max)
             fire(_tid)                                     # capture the TOUCHED pose
+            _process_after(_j)
             i = _j + 1
             continue
       drive_q(qc)
@@ -4646,9 +4944,12 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         settle_before_fire(traj.q[i], _touch_robots(fire_at[i]), owned=_owned)
         for tid in fire_at[i]:
           seat_before_fire(tid, traj.q[i])
-          fire(tid)                                          # acting arms rest through the
+          fire(tid)
+        _process_after(i)                                   # the completed mate no longer loads
+        for tid in fire_at[i]:
           lift_after_fire(tid, traj.q[i])                    # schedule's own post-fire dwell
       i += 1
+  scene.set_process_wrenches([])
   scene.step(int(SETTLE_T / DT), report, ("settle",))
   servo_summary()
 
@@ -4921,44 +5222,15 @@ def _restore_saved_wrench_config(cfg):
   ``sim.py`` historically imported ``wrench.PARAMS`` at module defaults.  A plan carrying a
   non-default grasp model, insertion load, gravity policy, or calibrated cap was therefore
   re-derived and executed under different mechanics (car-mini persisted T_close=0.5 Nm while
-  MuJoCo still broke it at the 0.4 Nm default).  Keep this small mirror next to the replay call;
-  search-only printing remains in main.py.
+  MuJoCo still broke it at the 0.4 Nm default).  Scene construction and simulation now share
+  replay's one idempotent reset-and-apply path; search-only printing remains in main.py.
   """
   import wrench as W
-  W.PARAMS["grasp_model"] = _saved(cfg, "grasp_model")
-  W.PARAMS["vacuum_engage_force"] = float(_saved(cfg, "vacuum_engage_force") or 0.0)
-  W.PARAMS["vacuum_engage_friction"] = float(
-      _saved(cfg, "vacuum_engage_friction") or 0.0)
-  if _saved(cfg, "table_mu") is not None:
-    W.PARAMS["table_model"] = "friction"
-    W.PARAMS["table_mu"] = float(_saved(cfg, "table_mu"))
-  for field, kind in (("vacuum_scale", "vacuum"),
-                      ("two_finger_scale", "two_finger")):
-    scale = _saved(cfg, field)
-    if scale is None:
-      continue
-    for model in W.PARAMS["grasp"].values():
-      caps = model.get(kind)
-      if caps:
-        for name in caps:
-          if name != "mu":
-            caps[name] *= float(scale)
-  close = _saved(cfg, "tf_close_torque")
-  if close is not None:
-    W.PARAMS["grasp"]["asymmetric"]["two_finger"]["T_close"] = float(close)
-  compliance = _saved(cfg, "grasp_compliance")
-  if compliance is not None:
-    W.PARAMS["grasp_compliance"] = {
-        "two_finger": 1.0, "vacuum": float(compliance)}
-  W.PARAMS["check_inserter"] = _saved(cfg, "inserter_check")
-  W.PARAMS["insert_force"]["_default"] = float(_saved(cfg, "insert_force") or 0.0)
-  W.PARAMS["curved_grasp_torque_scale"] = _saved(cfg, "curved_torque_scale")
-  noise = _saved(cfg, "insertion_noise")
-  W.PARAMS["insertion_uncertainty"] = (
-      None if noise is None else {
-          "lateral": float(noise), "offset": _saved(cfg, "insertion_offset")})
-  W.PARAMS["robust_mode"] = _saved(cfg, "robust_mode")
-  W.PARAMS["ignore_gravity"] = bool(_saved(cfg, "ignore_gravity"))
+  # replay.build_scene has already applied this configuration once. Reuse its idempotent
+  # reset-and-apply implementation rather than multiplying saved cap scales a second time
+  # (e.g. --two-finger-scale 4 used to become x16 in simulation).
+  from replay import apply_wrench_params
+  apply_wrench_params(cfg)
 
   print(f"[sim] restored saved wrench model: {_saved(cfg, 'grasp_model')}, "
         f"two-finger T_close={W.PARAMS['grasp']['asymmetric']['two_finger']['T_close']:g}Nm, "
@@ -5001,6 +5273,12 @@ def _cli_run(a):
     raise SystemExit("[sim] --phase-intent-rate must be positive")
   if a.phase_audit_resolution < 0.0:
     raise SystemExit("[sim] --phase-audit-resolution must be non-negative")
+  if a.process_engagement_distance < 0.0:
+    raise SystemExit("[sim] --process-engagement-distance must be non-negative")
+  if a.process_wrench_ramp < 0.0:
+    raise SystemExit("[sim] --process-wrench-ramp must be non-negative")
+  if a.process_noise != "nominal" and not a.apply_process_wrench:
+    raise SystemExit("[sim] --process-noise requires --apply-process-wrench")
   if a.c2_samples_per_seg < 1:
     raise SystemExit("[sim] --c2-samples-per-seg must be at least 1")
   if not 0.0 < a.c2_control_ratio <= 1.0:
@@ -5291,6 +5569,8 @@ def _cli_run(a):
                                 "motion_path": a.mp_path,
                                 "dt": DT,
                                 "record_every": RECORD_EVERY,
+                                "apply_process_wrench": bool(a.apply_process_wrench),
+                                "table_mu": _saved(cfg, "table_mu", legacy=None),
                                 "resolved_profile": {
                                     k: getattr(a, k) for k in _STANDARD_SIM_PROFILE},
                             },
@@ -5350,7 +5630,14 @@ def _cli_run(a):
                                 a.path_preflight_tolerance
                                 if a.path_preflight_tolerance is not None else
                                 PATH_PREFLIGHT_TOL),
-                            path_preflight_resolution=a.path_preflight_resolution)
+                            path_preflight_resolution=a.path_preflight_resolution,
+                            apply_process_wrench=a.apply_process_wrench,
+                            table_mu=_saved(cfg, "table_mu", legacy=None),
+                            process_noise_mode=a.process_noise,
+                            process_noise_corner=a.process_noise_corner,
+                            process_noise_seed=a.process_noise_seed,
+                            process_engagement_distance=a.process_engagement_distance,
+                            process_wrench_ramp=a.process_wrench_ramp)
   print(rep.summary())
   if a.require_success and not rep.success:
     raise SystemExit(3)
@@ -5409,6 +5696,35 @@ def _build_cli():
                       "is ATOMIC discretely (giver holds before, receiver after, never both), so "
                       "the state-scan coupling misses it entirely -- yet both grippers are on "
                       "the part in execution. OFF = byte-identical.")
+  r.add_argument("--apply-process-wrench", action=argparse.BooleanOptionalAction, default=False,
+                 help="Apply the planner's nominal mate process load during every final "
+                      "entry-to-seat assemble stretch, even when collision contact does not "
+                      "generate it. Equal-and-opposite forces act at the inserted and receiving "
+                      "interfaces; screw skills also receive their declared pure torque. This "
+                      "physically tests holders, grasp breakaway, and arm tracking. The robust "
+                      "--insertion-noise set stays nominal unless --process-noise explicitly "
+                      "selects a corner or seeded sample. Opt-in; use "
+                      "--no-apply-process-wrench to reproduce the historical contact-only sim.")
+  r.add_argument("--process-noise", choices=("nominal", "corner", "sample"),
+                 default="nominal", metavar="MODE",
+                 help="Realization of the saved --insertion-noise uncertainty set when "
+                      "--apply-process-wrench is active. nominal uses its centre; corner uses "
+                      "--process-noise-corner; sample draws once per assemble action from the "
+                      "box using --process-noise-seed. A realization is fixed throughout its "
+                      "skill and stored in the NPZ; it is never white noise per physics tick.")
+  r.add_argument("--process-noise-corner", type=int, default=0, metavar="N",
+                 help="Zero-based robust-box corner: 0..3 for lateral-only uncertainty, 0..15 "
+                      "when a saved --insertion-offset is also active (default 0).")
+  r.add_argument("--process-noise-seed", type=int, default=0, metavar="S",
+                 help="Seed for --process-noise sample; one independent, persisted draw per "
+                      "assemble action (default 0).")
+  r.add_argument("--process-engagement-distance", type=float, default=0.01, metavar="M",
+                 help="Ordinary insertion force ramps from zero to full as the mate-interface "
+                      "gap closes through the final M metres (default 0.01). Screw torque is "
+                      "active over the whole certified helix.")
+  r.add_argument("--process-wrench-ramp", type=float, default=0.05, metavar="S",
+                 help="Smooth process-load turn-on time in seconds (default 0.05); avoids an "
+                      "unphysical one-tick force impulse.")
   r.add_argument("--mate-force-cap", type=float, default=None, metavar="N",
                  help="FINITE MATE STRENGTH: max force a mate weld transmits before it breaks "
                       "(mate_broke, same sustained-overload rule as grasps). Default None = "

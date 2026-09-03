@@ -31,7 +31,7 @@ def test_kind_forbid_actor_holder_brace():
 def test_kind_forbid_needs_kinds_and_scope():
     P.set_kind_forbid(("vacuum:assemble",))
     s = _FakeState({})
-    # no kind information (wrench off) -> passes everything (the flag is a no-op there)
+    # No physical kind information anywhere cannot identify the arm.
     assert not P._kind_forbidden(("assemble", "a1", "obj_1", "obj_0"), s, None)
     # uniform scalar kind: every arm is the forbidden kind -> the acting arm triggers
     assert P._kind_forbidden(("assemble", "a2", "obj_1", "obj_0"), s, "vacuum")
@@ -40,3 +40,13 @@ def test_kind_forbid_needs_kinds_and_scope():
     # cleared -> everything passes
     P.set_kind_forbid(())
     assert not P._kind_forbidden(("assemble", "a1", "obj_1", "obj_0"), s, KINDS)
+
+
+def test_kind_forbid_retains_physical_kinds_when_wrench_is_off():
+    P.set_kind_forbid(("vacuum:assemble",), KINDS)
+    s = _FakeState({"obj_0": {("grasp", "a1", 3)}})
+    # The successor's gripper_kind=None means geometry-only statics, not unknown hardware.
+    assert P._kind_forbidden(("assemble", "a2", "obj_1", "obj_0"), s, None)
+    assert not P._kind_forbidden(("assemble", "a2", "obj_1", "obj_0"),
+                                _FakeState({}), None)
+    P.set_kind_forbid(())

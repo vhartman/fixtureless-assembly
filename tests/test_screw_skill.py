@@ -10,7 +10,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import mp_export as MP
 import problem as P
+import sim
 import solver as S
+import wrench as W
 
 
 def test_peg_hole_screw_is_one_atomic_mate_with_typed_skill():
@@ -34,6 +36,32 @@ def test_screw_overrides_are_validated_and_robot_independent():
     asm.configure_screw_skills(samples=1)
   # Ordinary mates remain ordinary under the same generic API.
   assert P.make_assembly("peg-hole", 2).screw_skill("obj_1") is None
+
+
+def test_four_leg_screw_stool_has_four_atomic_single_grasp_mates():
+  asm = P.make_assembly("peg-stool-4-screw", 5)
+  assert asm.objects == ["obj_0", "obj_1", "obj_2", "obj_3", "obj_4"]
+  assert asm.masses["obj_0"] == pytest.approx(0.50)
+  assert sorted(abs(asm.relative_pose(leg)[1][1]) for leg in asm.objects[1:]) == \
+      pytest.approx([0.0425] * 4)
+  for leg in asm.objects[1:]:
+    assert asm.relative_pose(leg)[0] == "obj_0"
+    assert asm.dependencies_of(leg) == ["obj_0"]
+    assert asm.screw_skill(leg) == P.ScrewSkill(
+        np.pi, 0.020, 0.05, 0.75, 16, single_grasp=True)
+    children = P._compound_children(asm.part_shapes[leg])
+    shaft = next((shape for shape, _ in children if shape[0] == "cylinder"), None)
+    assert shaft is not None and 2.0 * shaft[1][1] < asm.socket_hole
+    assert not any(shape[0] == "box" for shape, _ in children)
+    marker = asm.visual_markers[leg][0]
+    # The eccentric marker stays at the exposed foot, outside the top screw-depth band.
+    assert marker["pos"][2] + marker["shape"][1][2] / 2.0 < \
+        asm.leg_length / 2.0 - 0.020
+    assert asm.masses[leg] == pytest.approx(0.08)
+    leg_top = asm.relative_pose(leg)[1][2] + asm.leg_length / 2.0
+    assert leg_top == pytest.approx(
+        -asm.seat_thickness / 2.0 - (asm.socket_depth - asm.screw_skill(leg).depth))
+  assert len(asm.mate_skills) == 4
 
 
 def test_screw_entry_is_backed_off_and_counter_rotated():
@@ -89,3 +117,56 @@ def test_task_signature_and_export_persist_screw_certificate():
   assert MP.task_signature(p0) == MP.task_signature(p1)
   restored.skill_data["angle"] = np.pi / 2
   assert MP.task_signature(p0) != MP.task_signature(p1)
+
+
+def test_sim_process_wrench_matches_planner_force_and_screw_couple():
+  asm = P.make_assembly("peg-hole-screw", 2)
+  parent_pose = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+  part_pose = np.concatenate([
+      np.asarray(asm.relative_pose("obj_1")[1], dtype=float),
+      np.array([1.0, 0.0, 0.0, 0.0])])
+  loads = sim._process_wrench_pair(
+      asm, "obj_1", "obj_0", part_pose, parent_pose)
+  fp, tp, xp = loads["obj_1"]
+  ft, tt, xt = loads["obj_0"]
+  axis = np.asarray(asm.mate_axis("obj_1"), dtype=float)
+  axis /= np.linalg.norm(axis)
+  skill = asm.screw_skill("obj_1")
+
+  np.testing.assert_allclose(ft, W.insert_force("obj_1") * axis)
+  np.testing.assert_allclose(fp, -ft)
+  np.testing.assert_allclose(tt, -np.sign(skill.angle) * skill.torque * axis)
+  np.testing.assert_allclose(tp, -tt)
+  np.testing.assert_allclose(xp, xt)
+  # The declared pair is internal to the two-part system: zero resultant and zero net moment.
+  np.testing.assert_allclose(fp + ft, 0.0, atol=1e-12)
+  np.testing.assert_allclose(tp + np.cross(xp, fp) + tt + np.cross(xt, ft),
+                             0.0, atol=1e-12)
+
+
+def test_sim_process_noise_is_fixed_mate_frame_load_not_white_noise():
+  asm = P.make_assembly("peg-hole-screw", 2)
+  parent_pose = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+  part_pose = np.concatenate([
+      np.asarray(asm.relative_pose("obj_1")[1], dtype=float),
+      np.array([1.0, 0.0, 0.0, 0.0])])
+  realization = {"lateral": 0.2, "offset": 0.004,
+                 "coefficients": [1.0, -1.0, -1.0, 1.0]}
+  loads = sim._process_wrench_pair(
+      asm, "obj_1", "obj_0", part_pose, parent_pose, realization)
+  fp, tp, xp = loads["obj_1"]
+  ft, tt, xt = loads["obj_0"]
+
+  np.testing.assert_allclose(fp, -ft)
+  np.testing.assert_allclose(tp, -tt)
+  np.testing.assert_allclose(xp, xt)
+  # Axial load stays nominal; each requested transverse corner has 0.2 F magnitude.
+  axis = np.asarray(asm.mate_axis("obj_1"), dtype=float)
+  axis /= np.linalg.norm(axis)
+  assert np.dot(ft, axis) == pytest.approx(W.insert_force("obj_1"))
+  transverse = ft - np.dot(ft, axis) * axis
+  assert np.linalg.norm(transverse) == pytest.approx(
+      np.sqrt(2.0) * 0.2 * W.insert_force("obj_1"))
+  np.testing.assert_allclose(fp + ft, 0.0, atol=1e-12)
+  np.testing.assert_allclose(tp + np.cross(xp, fp) + tt + np.cross(xt, ft),
+                             0.0, atol=1e-12)

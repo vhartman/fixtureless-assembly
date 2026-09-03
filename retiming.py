@@ -61,6 +61,51 @@ def config_at(qs, csum, segs, s):
   return (1 - a) * np.asarray(qs[i], float) + a * np.asarray(qs[i + 1], float)
 
 
+def compose_owned_path(base_waypoints, owned_waypoints, owned_dims):
+  """Replace selected joints while preserving both piecewise-linear paths exactly.
+
+  ``base_waypoints`` is a collision-free composite-arm stretch and ``owned_waypoints`` is
+  an execution skill certificate with the same full configuration dimension.  The owned
+  joints follow the skill's authored phase (its knots are uniformly spaced in skill
+  progress); every other joint follows its original base-path arc progress.  The union of
+  both knot sets prevents either polyline from being shortcut accidentally.
+
+  The synchronized composition itself is new geometry and therefore is *not* claimed safe
+  here.  Callers must collision-check its interpolated edges in the exact task mode.
+  """
+  base = [np.asarray(q, dtype=float).ravel() for q in base_waypoints]
+  owned = [np.asarray(q, dtype=float).ravel() for q in owned_waypoints]
+  if len(base) < 2 or len(owned) < 2:
+    raise ValueError("path composition needs at least two waypoints in each path")
+  if any(q.shape != base[0].shape for q in base + owned):
+    raise ValueError("base and owned paths must share one configuration dimension")
+  dims = np.unique(np.asarray(owned_dims, dtype=int).ravel())
+  if np.any(dims < 0) or np.any(dims >= len(base[0])):
+    raise ValueError("owned joint index is outside the configuration")
+
+  bseg, btotal = arc_length(base)
+  if btotal <= 1e-12:
+    bphase = np.linspace(0.0, 1.0, len(base))
+  else:
+    bphase = np.r_[0.0, np.cumsum(bseg)] / btotal
+  ophase = np.linspace(0.0, 1.0, len(owned))
+  phases = np.unique(np.r_[bphase, ophase])
+
+  def at_phase(qs, knots, phase):
+    j = min(int(np.searchsorted(knots, phase, side="right")) - 1, len(qs) - 2)
+    j = max(j, 0)
+    width = float(knots[j + 1] - knots[j])
+    alpha = 1.0 if width <= 1e-12 else (phase - knots[j]) / width
+    return (1.0 - alpha) * qs[j] + alpha * qs[j + 1]
+
+  result = []
+  for phase in phases:
+    q = at_phase(base, bphase, float(phase))
+    q[dims] = at_phase(owned, ophase, float(phase))[dims]
+    result.append(q)
+  return result
+
+
 def arm_rate_boost(qs, arm_dims, max_boost=None):
   """Per-segment rate multiplier that makes the BUSIEST arm travel at `joint_rate`.
 

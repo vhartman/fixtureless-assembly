@@ -116,6 +116,10 @@ class Assembly:
     # wrench-contact computation reads shapes through part_shape() -- ONE source of truth,
     # so the cheap scenes, IK scenes and real env always agree.
     self.part_shapes = {}
+    # Optional renderer-only child shapes, deliberately absent from collision, grasp sampling,
+    # mass and wrench geometry. Used for indicators/decals whose only job is to expose motion
+    # of a symmetric body in recorded simulation. {part: [{"shape", "pos", "rgba"}, ...]}.
+    self.visual_markers = {}
     # SCATTER ORIENTATIONS: {part: quat} -- how a part initially LIES on the table (default
     # identity). E.g. the car's wheels rest FLAT (cap down) in the scatter although their
     # assembled orientation is axle-sideways; the anchor pose carries the rotation, and the
@@ -1184,21 +1188,6 @@ class PegHoleScrewAssembly(PegHoleAssembly):
     super().define()
     if self.n_parts < 2:
       return
-    # A fixture-style side handle gives a second arm a realistic, REMOTE place to oppose
-    # screw torque.  Keeping the clamp hand away from the screw axis is important: a small
-    # lug directly on the socket makes the perfectly valid force closure unusable because
-    # the two robot wrists necessarily occupy the same space at the assembled keyframe.
-    # The thin rail is part of the same rigid target and ends in a vertical grip block.
-    socket_children = [
-        {"shape": sub, "pos": np.asarray(pos, dtype=float).tolist()}
-        for sub, pos in _compound_children(self.part_shapes["obj_0"])]
-    socket_children.extend([
-        {"shape": ("box", [0.120, 0.014, 0.014, 0.001]),
-         "pos": [self.outer / 2.0 + 0.060, 0.0, 0.012]},
-        {"shape": ("box", [0.025, 0.035, 0.050, 0.001]),
-         "pos": [self.outer / 2.0 + 0.120, 0.0, 0.030]},
-    ])
-    self.part_shapes["obj_0"] = ("compound", socket_children)
     # A raised offset head makes a 180-degree turn observable and gives the fingers enough
     # axial room to remain clear of the socket rim for the WHOLE helix.  The narrow neck is
     # deliberately part of the screw, not a kinematic offset hidden in gripper calibration.
@@ -1218,10 +1207,6 @@ class PegHoleScrewAssembly(PegHoleAssembly):
          "pos": [0.010, 0.0, head_z]},
     ])
     self.part_shapes["obj_1"] = ("compound", children)
-    # The fixture handle enlarges obj_0 beyond the nominal 8cm scatter cell.  Move the loose
-    # screw one extra cell outward so the INITIAL pick scene is not artificially occluded by
-    # that handle; this is scene geometry, not a search-order or reachability heuristic.
-    self.scatter_offsets["obj_1"] = np.array([0.10, 0.0, 0.0])
     self.mate_skills["obj_1"] = self._screw_spec
 
 
@@ -1300,7 +1285,9 @@ class PegStoolAssembly(Assembly):
     # diagonal). FOUR legs sit in the full symmetric rectangle -- the COM is strictly
     # interior again, and four contacts give the classic non-wobbling stool.
     if self.legs == 4:
-      socket_centres = [(0.055, 0.035), (-0.055, 0.035), (0.055, -0.035), (-0.055, -0.035)]
+      socket_centres = getattr(
+          self, "_socket_centres_override",
+          [(0.055, 0.035), (-0.055, 0.035), (0.055, -0.035), (-0.055, -0.035)])
     else:
       socket_centres = [(0.055, 0.035), (-0.055, 0.035), (0.0, -0.045)]
     assert all(abs(x) + outer / 2.0 <= sx / 2.0 and
@@ -1403,6 +1390,68 @@ class PegStoolAssembly(Assembly):
       self.assembly_dependencies[part] = ["obj_0"]
       self.mate_axes[part] = np.array([0.0, 0.0, 1.0])
       self.masses[part] = leg_mass
+
+
+class PegStoolScrewAssembly(PegStoolAssembly):
+  """Four-leg tight stool whose four ordinary mate edges are atomic screw skills.
+
+  The screw legs use a round 19mm shaft, which clears the 30mm square pocket at every yaw.
+  A small eccentric indicator tab near the exposed foot makes its half-turn visible but never
+  enters the socket.  This remains the same virtual-thread abstraction as
+  :class:`PegHoleScrewAssembly`: real concave/chamfered socket geometry, a prescribed helix
+  and screw wrench, but no thread mesh.
+  """
+
+  def __init__(self, n_parts=5, screw_angle=np.pi, screw_depth=0.020,
+               screw_torque=0.05, screw_speed=0.75, screw_samples=16, **kwargs):
+    self._screw_spec = ScrewSkill(angle=screw_angle, depth=screw_depth,
+                                  torque=screw_torque, angular_speed=screw_speed,
+                                  samples=screw_samples)
+    # Leave a visible and collision-clear corridor around each rotating gripper.  The
+    # 180x140mm seat has room for this 110x85mm socket rectangle without moving a collar
+    # close to an edge; ordinary press-fit stool scenes retain their original 110x70mm grid.
+    self._socket_centres_override = [
+        (0.055, 0.0425), (-0.055, 0.0425),
+        (0.055, -0.0425), (-0.055, -0.0425)]
+    super().__init__(n_parts=n_parts, legs=4, leg_kind="cylinder", leg_radius=0.0095,
+                     peg_clearance=None, chamfer=0.003, hole_chamfer=0.004, **kwargs)
+
+  def define(self):
+    super().define()
+    # The virtual-thread experiment applies only a 0.1N axial insertion load (plus the
+    # explicit 0.05Nm couple), unlike the stock peg stool's 20N press benchmark.  Use a
+    # volume-plausible 0.50kg fixture here: the stock scene's deliberately conservative
+    # 0.75kg seat caused a nominal 25N vacuum cup to break under free-space acceleration,
+    # before any screw mechanics were exercised.  Existing stool masses remain unchanged.
+    self.masses["obj_0"] = 0.50
+    # The physical/search shape is purely round. A renderer-only eccentric indicator at the
+    # EXPOSED (-z) end visualizes rotation without changing grasps, collision or inertia.
+    leg = ("cylinder", [self.leg_length, self.leg_radius])
+    body, tip = _chamfer_tip(leg, self.chamfer, 1.0)
+    indicator_z = -self.leg_length / 2.0 + 0.014
+    screw_leg = ("compound", [
+        {"shape": body[0], "pos": list(body[1])},
+        {"shape": tip[0], "pos": list(tip[1])},
+    ])
+    assert 2.0 * self.leg_radius < self.socket_hole
+    for part in self.objects[1:]:
+      self.part_shapes[part] = screw_leg
+      self.masses[part] = 0.08
+      self.visual_markers[part] = [{
+          "shape": ("box", [0.006, 0.006, 0.020, 0.001]),
+          "pos": [self.leg_radius, 0.0, indicator_z],
+          "rgba": "0.95 0.95 0.1 1",
+      }]
+      # Match the authored helix to the socket geometry: a 25mm-deep collar and a 20mm
+      # screw stroke put the seated tip 5mm below the plate underside.  Consequently the
+      # backed-off entry tip is exactly at the socket mouth, rather than already 4mm inside
+      # it as it was when this scene inherited the ordinary stool's 0.5mm blind-end gap.
+      # Existing peg-stool variants retain that ordinary press-fit seating convention.
+      blind_end_gap = self.socket_depth - self._screw_spec.depth
+      assert blind_end_gap >= 0.0, "screw stroke exceeds the socket depth"
+      inherited_gap = 0.0005
+      self.assembly_relative_poses[part][1][2] -= blind_end_gap - inherited_gap
+      self.mate_skills[part] = self._screw_spec
 
 
 class SlotPinAssembly(Assembly):
@@ -1575,6 +1624,7 @@ _ASSEMBLY_KINDS = {"cross": (CubeCrossAssembly, 7), "cube": (CubeGridAssembly, 8
                    "slot-pin": (SlotPinAssembly, 3),
                    "peg-hole": (PegHoleAssembly, 2),
                    "peg-hole-screw": (PegHoleScrewAssembly, 2),
+                   "peg-stool-4-screw": (PegStoolScrewAssembly, 5),
                    "peg-stool": (PegStoolAssembly, 4),
                    "peg-stool-4": (lambda n_parts: PegStoolAssembly(
                        n_parts=n_parts, legs=4), 5),
@@ -3349,14 +3399,16 @@ def _action_banned(a, state=None):
 # drops every assemble whose acting arm, inserted-part holder, target holder or brace contact
 # is a vacuum -- the vacuum may pick and hand over but never touch a mate. Reset per scene by
 # replay.build_scene; NEVER applied to replay walks (a plan saved under the forbid contains no
-# forbidden action anyway). Needs the gripper_kind map, which the search threads only under
-# --wrench (mixed EEs) -- without it the filter has no kind information and passes everything.
+# forbidden action anyway). Explicit role restrictions are independent of the wrench model:
+# ``set_kind_forbid`` may retain the scene's robot-kind map even when continuous wrench checks
+# are disabled, so a geometry-only counterfactual changes statics and nothing else.
 _KIND_FORBID = {}
+_KIND_FORBID_ROBOT_KINDS = {}
 
 
-def set_kind_forbid(patterns):
-  """patterns: 'kind:action' strings ('*' wildcard per field)."""
-  global _KIND_FORBID
+def set_kind_forbid(patterns, robot_kinds=None):
+  """patterns: 'kind:action' strings; optional physical ``{robot: kind}`` map."""
+  global _KIND_FORBID, _KIND_FORBID_ROBOT_KINDS
   out = {}
   for pat in patterns or ():
     kind, act = str(pat).split(":", 1)
@@ -3364,13 +3416,18 @@ def set_kind_forbid(patterns):
       continue                                          # no per-kind blanket yet
     out.setdefault(act, set()).add(kind)
   _KIND_FORBID = {k: frozenset(v) for k, v in out.items()}
+  _KIND_FORBID_ROBOT_KINDS = dict(robot_kinds or {})
 
 
 def _kind_forbidden(a, state, gripper_kind):
-  if not _KIND_FORBID or a[0] not in _KIND_FORBID or gripper_kind is None:
+  if not _KIND_FORBID or a[0] not in _KIND_FORBID:
+    return False
+  kind_source = gripper_kind if gripper_kind is not None else _KIND_FORBID_ROBOT_KINDS
+  if not kind_source:
     return False
   kinds = _KIND_FORBID[a[0]]
-  kind_of = gripper_kind.get if isinstance(gripper_kind, dict) else (lambda _r: gripper_kind)
+  kind_of = (kind_source.get if isinstance(kind_source, dict)
+             else (lambda _r: kind_source))
   if kind_of(a[1]) in kinds:
     return True                                          # the acting arm itself
   touched = {p for p in a[2:] if isinstance(p, str)}
@@ -3611,13 +3668,16 @@ def _chamfer_tip(spec, chamfer, end):
   e = float(end)
   assert 0.0 < c < L / 2.0, f"chamfer {c:g} is impossible on a peg of length {L:g}"
   if kind == "box":
-    s = float(p[0])
-    assert abs(float(p[1]) - s) < 1e-12, "chamfered box pegs need a square cross-section"
-    assert 2.0 * c < s, f"chamfer {c:g} consumes a square peg of side {s:g}"
+    sx, sy = float(p[0]), float(p[1])
+    assert 2.0 * c < min(sx, sy), \
+        f"chamfer {c:g} consumes a {sx:g} x {sy:g} box peg"
     corners = np.array([[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]])
-    base = np.column_stack([corners * (s / 2.0), np.full(4, -e * c / 2.0)])
-    endc = np.column_stack([corners * ((s - 2.0 * c) / 2.0), np.full(4, e * c / 2.0)])
-    body = (("box", [s, s, L - c, float(p[3])]), np.array([0.0, 0.0, -e * c / 2.0]))
+    base = np.column_stack([corners * np.array([sx, sy]) / 2.0,
+                            np.full(4, -e * c / 2.0)])
+    endc = np.column_stack([corners * np.array([sx - 2.0 * c, sy - 2.0 * c]) / 2.0,
+                            np.full(4, e * c / 2.0)])
+    body = (("box", [sx, sy, L - c, float(p[3])]),
+            np.array([0.0, 0.0, -e * c / 2.0]))
   else:
     r = float(p[1])
     assert c < r, f"chamfer {c:g} consumes a peg of radius {r:g}"

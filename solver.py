@@ -818,6 +818,11 @@ class RobotIK:
     # enforced in pre_skill_witness itself so it also covers single-arm pick/place scenes where
     # every other arm has already been frozen out and the pin pass has no joint left to pin.
     self.pre_skill_max_dq = 0.35
+    # Successful path-valued skill witnesses are stronger than their endpoint witness. Keep
+    # them as soon as the endpoint acceptance gate certifies them: a later witness pass must
+    # not depend on stochastically reproducing a continuation that search already proved.
+    # The exact discrete pre/post states prevent reuse across different support contexts.
+    self._screw_path_cache = {}
     # DEPTH-GATED collision reject on the exact analytic branches (None = off). The full
     # solve's tolerant pose eq can rescue a GRAZING branch (measured: rescues sat at <=10mm
     # penetration) but never a deep one (unrescued failures >=14mm, median 55mm) -- so if
@@ -4084,6 +4089,8 @@ class RobotIK:
           reverse_path.append(w.copy())
           prev = w
         self.last_screw_path = list(reversed(reverse_path))
+        key = self._screw_path_key(action, s0, s1, warm)
+        self._screw_path_cache[key] = [q.copy() for q in self.last_screw_path]
         return self.last_screw_path[0].copy()
 
       # DELTA is a REQUESTED MAXIMUM: the full backoff can point into a nearby obstacle (the
@@ -4116,6 +4123,18 @@ class RobotIK:
       self._funnel_solve = False
       self._opt_pull = None
       self._pin_joints = None
+
+  @staticmethod
+  def _screw_path_key(action, s0, s1, witness):
+    q = np.asarray(witness, dtype=np.float64)
+    return (tuple(action), s0.key(), s1.key(), np.round(q, 10).tobytes())
+
+  def cached_screw_path(self, action, s0, s1, witness):
+    """Exact certificate previously established by the endpoint acceptance gate."""
+    if witness is None:
+      return None
+    path = self._screw_path_cache.get(self._screw_path_key(action, s0, s1, witness))
+    return None if path is None else [q.copy() for q in path]
 
   def post_release_witness(self, action, s0, s1, assembly, release_witness=None):
     """EXPORT helper for the missing second half of a contact funnel: RELEASE -> RETRACT.
@@ -5204,9 +5223,13 @@ def certify_plan_skill_paths(C, assembly, plan, witnesses, robots, robot_ik, *,
     for source, witness in choices:
       if witness is None:
         continue
-      q0 = robot_ik.pre_skill_witness(
-          a, states[i], states[i + 1], assembly, skill_witness=witness)
-      path = getattr(robot_ik, "last_screw_path", None)
+      path = robot_ik.cached_screw_path(a, states[i], states[i + 1], witness)
+      if path is None:
+        q0 = robot_ik.pre_skill_witness(
+            a, states[i], states[i + 1], assembly, skill_witness=witness)
+        path = getattr(robot_ik, "last_screw_path", None)
+      else:
+        q0 = path[0]
       if q0 is None or path is None or len(path) != int(screw.samples) + 1:
         continue
       path = [np.asarray(q, dtype=float).copy() for q in path]

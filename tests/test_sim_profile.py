@@ -32,6 +32,52 @@ def test_standard_profile_refuses_an_implicit_motion_plan_before_scene_build():
     sim._cli_run(a)
 
 
+def test_process_wrench_application_is_explicit_and_reversible():
+  assert not sim.parse_args(["run", "plan.json"]).apply_process_wrench
+  assert sim.parse_args(
+      ["run", "plan.json", "--apply-process-wrench"]).apply_process_wrench
+  assert not sim.parse_args([
+      "run", "plan.json", "--apply-process-wrench",
+      "--no-apply-process-wrench"]).apply_process_wrench
+
+
+def test_process_noise_cli_is_explicit_and_replayable():
+  a = sim.parse_args([
+      "run", "plan.json", "--apply-process-wrench", "--process-noise", "sample",
+      "--process-noise-seed", "17", "--process-engagement-distance", "0.006",
+      "--process-wrench-ramp", "0.08"])
+  assert a.process_noise == "sample" and a.process_noise_seed == 17
+  assert a.process_engagement_distance == pytest.approx(0.006)
+  assert a.process_wrench_ramp == pytest.approx(0.08)
+
+
+def test_process_noise_realizations_cover_exact_box_corners_and_seeded_samples():
+  old = copy.deepcopy(wrench.PARAMS)
+  plan = [("assemble", "a1", "obj_1", "obj_0"),
+          ("release", "a1", "obj_1"),
+          ("assemble", "a2", "obj_2", "obj_0")]
+  try:
+    wrench.PARAMS["insertion_uncertainty"] = {"lateral": 0.2, "offset": 0.004}
+    c0 = sim._process_realizations(plan, mode="corner", corner=0)
+    c15 = sim._process_realizations(plan, mode="corner", corner=15)
+    assert c0[0]["coefficients"] == [-1.0, -1.0, -1.0, -1.0]
+    assert c15[0]["coefficients"] == [1.0, 1.0, 1.0, 1.0]
+    assert set(c0) == {0, 2}
+    s1 = sim._process_realizations(plan, mode="sample", seed=23)
+    s2 = sim._process_realizations(plan, mode="sample", seed=23)
+    assert s1 == s2
+    assert s1[0] != s1[2]                                  # one fixed draw per action
+  finally:
+    wrench.PARAMS.clear()
+    wrench.PARAMS.update(old)
+
+
+def test_low_table_friction_scales_all_mujoco_contact_coefficients():
+  assert sim._contact_friction(0.5, table=True) == "0.5 0.005 0.002"
+  assert sim._contact_friction(0.02, table=True) == "0.02 0.0002 8e-05"
+  assert sim._contact_friction(0.0, table=True) == "0 0 0"
+
+
 def test_saved_wrench_model_is_restored_before_sim_replay():
   old = copy.deepcopy(wrench.PARAMS)
   try:
@@ -46,6 +92,24 @@ def test_saved_wrench_model_is_restored_before_sim_replay():
     assert wrench.PARAMS["insertion_uncertainty"] == {
         "lateral": 0.003, "offset": 0.004}
     assert wrench.PARAMS["ignore_gravity"] is True
+  finally:
+    wrench.PARAMS.clear()
+    wrench.PARAMS.update(old)
+
+
+def test_saved_wrench_cap_scales_are_idempotent_not_squared():
+  old = copy.deepcopy(wrench.PARAMS)
+  try:
+    base_tf = old["grasp"]["asymmetric"]["two_finger"]["T_close"]
+    base_vac = old["grasp"]["asymmetric"]["vacuum"]["T_axis"]
+    cfg = {"grasp_model": "asymmetric", "two_finger_scale": 4.0,
+           "vacuum_scale": 2.0}
+    sim._restore_saved_wrench_config(cfg)
+    sim._restore_saved_wrench_config(cfg)                    # build_scene + sim restoration
+    assert wrench.PARAMS["grasp"]["asymmetric"]["two_finger"]["T_close"] == \
+        pytest.approx(4.0 * base_tf)
+    assert wrench.PARAMS["grasp"]["asymmetric"]["vacuum"]["T_axis"] == \
+        pytest.approx(2.0 * base_vac)
   finally:
     wrench.PARAMS.clear()
     wrench.PARAMS.update(old)

@@ -430,7 +430,7 @@ def build_parser():
   g_scene.add_argument(
       "--assembly",
       choices=["cross", "cube", "arch", "arch-seq", "cube-plates", "cube-plates-2x2x3",
-               "cuboid-tower", "fixture-rack", "car", "car-mini", "slot-pin", "peg-hole", "peg-hole-screw", "peg-hole-chamfer",
+               "cuboid-tower", "fixture-rack", "car", "car-mini", "slot-pin", "peg-hole", "peg-hole-screw", "peg-stool-4-screw", "peg-hole-chamfer",
                "peg-stool",
                "peg-stool-4", "peg-stool-cuboid", "peg-stool-cuboid-4",
                "peg-stool-tight", "peg-stool-4-tight",
@@ -3281,9 +3281,8 @@ def run(cfg, explicit=None):
     set_kind_forbid(("vacuum:assemble",))
     print("[flag] --vacuum-no-assemble ACTIVE: no assemble may involve a vacuum arm "
           "(actor, inserted-part/target holder, or brace) -- the vacuum may pick and hand "
-          "over only."
-          + ("" if cfg.wrench else " NOTE: needs --wrench (the per-robot kind map only "
-             "flows under it); without it the forbid has NO effect."))
+          "over only. This explicit tool-role restriction remains active with --no-wrench; "
+          "that ablation disables equilibrium/capacity checks, not the declared action set.")
   if cfg.ignore_gravity:
     print("[flag] --ignore-gravity ACTIVE: parts weightless in the wrench check "
           "(only insertion/applied loads must be resisted).")
@@ -3396,6 +3395,13 @@ def run(cfg, explicit=None):
                            float_height=cfg.part_float, min_sep=cfg.min_sep,
                            grid=cfg.grid_init, grid_gap=cfg.grid_gap,
                            center_scatter=cfg.center_scatter)
+  if cfg.vacuum_no_assemble:
+    # Role restrictions describe the physical tool roster, not whether the wrench LP is on.
+    # Install that roster only after the actual scene exists; successor calls deliberately
+    # keep gripper_kind=None in a --no-wrench ablation so all statics/capacity checks stay off.
+    from problem import set_kind_forbid
+    _role_robots = get_robots(C)
+    set_kind_forbid(("vacuum:assemble",), robot_gripper_kinds(C, _role_robots))
 
   if cfg.grasp_sampler_scenes:
     from problem import install_sampled_scene_ctx

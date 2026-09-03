@@ -152,6 +152,23 @@ def test_compact_polyline_preserves_corners_and_collinear_backtracking():
   assert after == pytest.approx(before)
 
 
+def test_compose_owned_path_preserves_both_polylines_and_endpoints():
+  # Joint 0 is controller-owned. Joint 1 has an off-diagonal planner corner which must not
+  # be shortcut when the denser skill path replaces joint 0.
+  base = [np.array([0.0, 0.0]), np.array([0.4, 2.0]), np.array([1.0, 1.0])]
+  skill = [np.array([0.0, 99.0]), np.array([0.2, 99.0]),
+           np.array([0.7, 99.0]), np.array([1.0, 99.0])]
+  got = retiming.compose_owned_path(base, skill, [0])
+  np.testing.assert_allclose(got[0], [0.0, 0.0])
+  np.testing.assert_allclose(got[-1], [1.0, 1.0])
+  # Every owned skill knot survives at uniform skill phase.
+  np.testing.assert_allclose([got[0][0], got[1][0], got[3][0], got[-1][0]],
+                             [0.0, 0.2, 0.7, 1.0])
+  # The base corner survives at its normalized composite arc phase.
+  assert any(np.allclose(q[1], 2.0) for q in got)
+  assert all(q[1] != 99.0 for q in got)
+
+
 def test_audit_path_checks_interpolated_configs_in_their_exact_mode():
   modes = [object(), object()]
   stretches = [([np.array([0.0]), np.array([1.0])], [1]),
