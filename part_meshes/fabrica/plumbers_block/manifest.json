@@ -1,0 +1,1100 @@
+{
+  "centering": "axis-aligned bounding-box centre",
+  "output_units": "metres",
+  "parts": {
+    "0": {
+      "center_cm": [
+        5.999999999950489e-06,
+        0.0,
+        5.190838
+      ],
+      "collision": {
+        "asset_sha256": "344a7f4cf1b79da0da8ceb9f47fb4e6d3f5b86d662fbf23c96ec7f55c12d89b6",
+        "convex_hull_volume_ratio": 1.2815131014429268,
+        "decomposed_volume_ratio": 0.8248718636731445,
+        "hull_count": 1,
+        "hulls": [
+          {
+            "file": "collision/0.glb",
+            "geometry": "hull_000",
+            "pos": [
+              0.0,
+              -0.0002500000000000002,
+              0.0
+            ]
+          }
+        ],
+        "method": "primitive-approved",
+        "settings": {
+          "approximation_reason": "reviewed semantic male insertion feature",
+          "axis": 1,
+          "clearance_scope": "male insertion feature only; visual/body/head unchanged",
+          "explicit_approximation": true,
+          "manufacturing_clearance_m": {
+            "axial": 0.0005,
+            "radial": 0.001
+          },
+          "minimum_cell_volume_m3": 1e-14,
+          "minimum_volume_fraction": 0.05,
+          "nominal_spec": {
+            "axis": 1,
+            "kind": "stepped_pin",
+            "segments": [
+              [
+                -0.0395,
+                0.0395,
+                0.0205,
+                32
+              ]
+            ]
+          },
+          "primitive": "stepped_pin"
+        }
+      },
+      "extents_cm": [
+        4.272292,
+        8.0,
+        4.950004
+      ],
+      "faces": 968,
+      "file": "0.obj",
+      "source_sha256": "40f4526acafe491f0bb5ca527717dda37dec127d3f78682ee81292bd63e8070f",
+      "vertices": 484
+    },
+    "1": {
+      "center_cm": [
+        -4.0,
+        0.12658000000000003,
+        7.0
+      ],
+      "collision": {
+        "asset_sha256": "d8169e3ba4169f94105904f2335e446ce462fbe4a2feaeb7291e2eac48e3ab49",
+        "convex_hull_volume_ratio": 1.533746474742829,
+        "decomposed_volume_ratio": 0.7729185589647477,
+        "hull_count": 2,
+        "hulls": [
+          {
+            "file": "collision/1.glb",
+            "geometry": "hull_000",
+            "pos": [
+              0.0,
+              0.0,
+              -0.011500000000000003
+            ]
+          },
+          {
+            "file": "collision/1.glb",
+            "geometry": "hull_001",
+            "pos": [
+              0.0,
+              0.0,
+              0.022500000000000003
+            ]
+          }
+        ],
+        "method": "primitive-approved",
+        "settings": {
+          "approximation_reason": "reviewed semantic male insertion feature",
+          "axis": 2,
+          "clearance_scope": "male insertion feature only; visual/body/head unchanged",
+          "explicit_approximation": true,
+          "manufacturing_clearance_m": {
+            "axial": 0.0005,
+            "radial": 0.001
+          },
+          "minimum_cell_volume_m3": 1e-14,
+          "minimum_volume_fraction": 0.05,
+          "nominal_spec": {
+            "axis": 2,
+            "head": [
+              0.0105,
+              0.0345,
+              0.012,
+              32
+            ],
+            "kind": "headed_pin",
+            "stem": [
+              -0.0345,
+              0.011,
+              0.0045,
+              32
+            ]
+          },
+          "primitive": "headed_pin"
+        }
+      },
+      "extents_cm": [
+        2.8832799999999996,
+        2.50012,
+        7.0
+      ],
+      "faces": 622,
+      "file": "1.obj",
+      "source_sha256": "bd9692d99fe3e39e7bc4b2f0164e7417d0ae0726d1ab099468d3026d5b989fb0",
+      "vertices": 313
+    },
+    "2": {
+      "center_cm": [
+        0.0,
+        0.12658000000000003,
+        3.25
+      ],
+      "collision": {
+        "asset_sha256": "250fb7484699c7d702c8f5682e84c8d2bb6657cd91c38548de88f45ed207d418",
+        "convex_hull_volume_ratio": 1.5087081703113157,
+        "decomposed_volume_ratio": 1.306215358295746,
+        "hull_count": 51,
+        "hulls": [
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_000",
+            "pos": [
+              -0.07499885931611061,
+              0.0,
+              -0.02249951846897602
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_001",
+            "pos": [
+              -0.07409834116697311,
+              0.010205539030721411,
+              -0.027228682301938534
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_002",
+            "pos": [
+              -0.06914635933935642,
+              -0.012495504226535559,
+              -0.022499433252960443
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_003",
+            "pos": [
+              -0.07081504538655281,
+              -0.0016029122925829142,
+              -0.02263356652110815
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_004",
+            "pos": [
+              -0.07058110460639,
+              0.00826620077714324,
+              -0.0171575671993196
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_005",
+            "pos": [
+              -0.06650562956929207,
+              0.005211342591792345,
+              -0.022499974817037582
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_006",
+            "pos": [
+              -0.06325581483542919,
+              0.013333333656191826,
+              -0.022499974351376295
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_007",
+            "pos": [
+              -0.041814434342086315,
+              0.0,
+              -0.008480990771204233
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_008",
+            "pos": [
+              -0.058428339660167694,
+              -0.0016080850036814809,
+              -0.01848989026620984
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_009",
+            "pos": [
+              -0.029954297933727503,
+              -0.005807417910546064,
+              -0.009359647054225206
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_010",
+            "pos": [
+              -0.02981065330095589,
+              0.0,
+              -0.007691487269767094
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_011",
+            "pos": [
+              -0.01880693342536688,
+              0.0,
+              -0.0076937985577387735
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_012",
+            "pos": [
+              -0.037528201937675476,
+              0.0,
+              -0.013124318327754736
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_013",
+            "pos": [
+              -0.046279316768050194,
+              0.001228192268172279,
+              0.015911984257400036
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_014",
+            "pos": [
+              -0.0461551770567894,
+              0.008033136371523142,
+              0.021395349875092506
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_015",
+            "pos": [
+              -0.03747453261166811,
+              -0.012403047643601894,
+              0.016435451922006905
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_016",
+            "pos": [
+              -0.03747993800789118,
+              0.01244048960506916,
+              0.01643541653174907
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_017",
+            "pos": [
+              -0.04112009331583977,
+              0.007178587140515447,
+              0.017291799187660217
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_018",
+            "pos": [
+              -0.034947763197124004,
+              0.00825194944627583,
+              0.014011627528816462
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_019",
+            "pos": [
+              -0.03185098711401224,
+              0.010126431297976524,
+              0.025118823163211346
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_020",
+            "pos": [
+              -0.032360211946070194,
+              -0.004312966746510938,
+              0.025133498944342136
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_021",
+            "pos": [
+              -0.02926518488675356,
+              0.0,
+              0.010070228483527899
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_022",
+            "pos": [
+              -0.026098485104739666,
+              0.0,
+              0.025111586786806583
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_023",
+            "pos": [
+              -0.02252293936908245,
+              0.0,
+              0.03024744614958763
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_024",
+            "pos": [
+              0.026210595737211406,
+              0.0,
+              -0.008781270822510123
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_025",
+            "pos": [
+              0.029175318137276918,
+              -0.0025850897654891014,
+              -0.010234785033389926
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_026",
+            "pos": [
+              0.017824672162532806,
+              0.0,
+              -0.016073949765996076
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_027",
+            "pos": [
+              0.026490870746783912,
+              0.0,
+              -0.003480443308944814
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_028",
+            "pos": [
+              0.036205769050866365,
+              0.0,
+              -0.015225415263557807
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_029",
+            "pos": [
+              0.023274162784218788,
+              0.0,
+              0.005299101932905614
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_030",
+            "pos": [
+              0.029970625415444374,
+              0.0,
+              0.014890441787429154
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_031",
+            "pos": [
+              0.026507743634283543,
+              0.0,
+              0.013857892248779535
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_032",
+            "pos": [
+              0.02679375931620598,
+              -0.00012281537055969238,
+              0.02944003324955702
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_033",
+            "pos": [
+              0.029839594848454,
+              -0.00011075381189584732,
+              0.0220691729336977
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_034",
+            "pos": [
+              0.03741202503442764,
+              0.004739576135762036,
+              0.024714565835893154
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_035",
+            "pos": [
+              0.037486482411623,
+              -0.012495504226535559,
+              0.016435443263617344
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_036",
+            "pos": [
+              0.037486482411623,
+              0.012338195694610476,
+              0.016435443263617344
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_037",
+            "pos": [
+              0.04322798363864422,
+              0.004515932174399495,
+              0.0039463050197809935
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_038",
+            "pos": [
+              0.04592343606054783,
+              0.002482089854311198,
+              0.019051278941333294
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_039",
+            "pos": [
+              0.04673982597887516,
+              -0.0014382324952748604,
+              0.017675017938017845
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_040",
+            "pos": [
+              0.04749610088765621,
+              0.003494701610179618,
+              0.021398520562797785
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_041",
+            "pos": [
+              0.04726920463144779,
+              0.0017038999358192086,
+              0.0053314406832214445
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_042",
+            "pos": [
+              0.06333383545279503,
+              -0.005635083885863423,
+              -0.013972049579024315
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_043",
+            "pos": [
+              0.0637010931968689,
+              0.0052648859564214945,
+              -0.022499974817037582
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_044",
+            "pos": [
+              0.06511472910642624,
+              -0.006433989852666855,
+              -0.022122547961771488
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_045",
+            "pos": [
+              0.07100307568907738,
+              -0.012387442169710994,
+              -0.022498846519738436
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_046",
+            "pos": [
+              0.07100372388958931,
+              0.013331629103049636,
+              -0.022499433252960443
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_047",
+            "pos": [
+              0.0689927190542221,
+              0.0037424047477543354,
+              -0.022499975748360157
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_048",
+            "pos": [
+              0.07405674457550049,
+              -0.003947965073166415,
+              -0.0215629069134593
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_049",
+            "pos": [
+              0.0747654028236866,
+              -0.011057278839871287,
+              -0.017227575182914734
+            ]
+          },
+          {
+            "file": "collision/2.glb",
+            "geometry": "hull_050",
+            "pos": [
+              0.07499409094452858,
+              1.091882586479187e-05,
+              -0.022496523335576057
+            ]
+          }
+        ],
+        "method": "vhacd-inner",
+        "settings": {
+          "asyncACD": false,
+          "boundary_method": "triangle-convex-halfspace-clipping",
+          "boundary_tolerance_m": 1e-12,
+          "containment": "inside centre plus nonintersecting triangle boundaries",
+          "face_budget": 6000,
+          "fillMode": "flood",
+          "maxConvexHulls": 96,
+          "maxNumVerticesPerCH": 64,
+          "maxRecursionDepth": 12,
+          "minimumVolumePercentErrorAllowed": 0.5,
+          "minimum_cell_volume_m3": 1e-14,
+          "minimum_volume_fraction": 0.8,
+          "premerge_cell_volume_sum_fraction": 0.8494662834672964,
+          "proposal_faces": 2756,
+          "resolution": 750000,
+          "shrinkWrap": true
+        }
+      },
+      "extents_cm": [
+        16.0,
+        4.0,
+        6.5
+      ],
+      "faces": 2756,
+      "file": "2.obj",
+      "source_sha256": "58e89ee69d328904350366f0b54fec2393f2aacea15d458cb6ae911bb0e5e9de",
+      "vertices": 1376
+    },
+    "3": {
+      "center_cm": [
+        0.0,
+        0.12658000000000003,
+        7.807365
+      ],
+      "collision": {
+        "asset_sha256": "0e26d0a3195e46be7ccaabc9ef52cbff15bdd275e37f689e3cefb04312395f38",
+        "convex_hull_volume_ratio": 1.4186891748275487,
+        "decomposed_volume_ratio": 1.8214494876589407,
+        "hull_count": 38,
+        "hulls": [
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_000",
+            "pos": [
+              -0.047868216410279274,
+              0.00131782959215343,
+              -0.005573650123551488
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_001",
+            "pos": [
+              -0.04321647249162197,
+              0.012339037377387285,
+              -0.005573650123551488
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_002",
+            "pos": [
+              -0.04481817036867142,
+              -0.0017826501280069351,
+              -0.005573650007136166
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_003",
+            "pos": [
+              -0.04426613077521324,
+              0.0036800249363295734,
+              -0.005573650210862979
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_004",
+            "pos": [
+              -0.03701492305845022,
+              -0.01222353707998991,
+              -0.0055766908917576075
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_005",
+            "pos": [
+              -0.043162789195775986,
+              -0.003872104804031551,
+              -0.00557365020904399
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_006",
+            "pos": [
+              -0.03755212016403675,
+              -0.006501360097900033,
+              -0.005573649948928505
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_007",
+            "pos": [
+              -0.03744116611778736,
+              0.005396805237978697,
+              -0.005573649803409353
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_008",
+            "pos": [
+              -0.03054115455597639,
+              -0.009725734882522374,
+              -0.005572235735598952
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_009",
+            "pos": [
+              -0.027317006140947342,
+              3.7364661693573e-06,
+              -0.003630751627497375
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_010",
+            "pos": [
+              -0.02501958841457963,
+              0.0,
+              -0.005573650181759149
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_011",
+            "pos": [
+              -0.02359962649643421,
+              0.0,
+              -0.0031542449723929167
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_012",
+            "pos": [
+              -0.025193890556693077,
+              0.0,
+              -0.005572235910221934
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_013",
+            "pos": [
+              -0.015494462102651596,
+              0.0,
+              0.0035320015158504248
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_014",
+            "pos": [
+              -0.019820773974061012,
+              0.0,
+              -0.01068837707862258
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_015",
+            "pos": [
+              -0.004260919755324721,
+              -1.22804194688797e-05,
+              0.004079971229657531
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_016",
+            "pos": [
+              -0.009796088095754385,
+              0.0,
+              -0.0023944207350723445
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_017",
+            "pos": [
+              -0.001935392152518034,
+              0.0,
+              0.005166819435544312
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_018",
+            "pos": [
+              -0.0011039599776268005,
+              0.0002933824434876442,
+              0.005443152389489114
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_019",
+            "pos": [
+              0.0020987936295568943,
+              -1.1854805052280426e-05,
+              0.005798122379928827
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_020",
+            "pos": [
+              -0.0015451193321496248,
+              0.015667698811739683,
+              0.002686628489755094
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_021",
+            "pos": [
+              0.012441286235116422,
+              0.0,
+              0.0041842234204523265
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_022",
+            "pos": [
+              0.015537576982751489,
+              1.026596873998642e-05,
+              0.0037008499493822455
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_023",
+            "pos": [
+              0.02212397800758481,
+              0.0,
+              -0.005573650181759149
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_024",
+            "pos": [
+              0.022855383809655905,
+              0.0,
+              -0.005450007854960859
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_025",
+            "pos": [
+              0.015234182588756084,
+              0.0,
+              -0.006348075577989221
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_026",
+            "pos": [
+              0.02015590574592352,
+              0.0,
+              -0.003576557384803891
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_027",
+            "pos": [
+              0.01860344409942627,
+              0.0,
+              -0.007259783800691366
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_028",
+            "pos": [
+              0.022503775544464588,
+              0.0,
+              -0.005573650123551488
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_029",
+            "pos": [
+              0.01954376045614481,
+              0.0,
+              -0.010576310101896524
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_030",
+            "pos": [
+              0.03691844455897808,
+              0.003937570261768997,
+              -0.005573650181759149
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_031",
+            "pos": [
+              0.03817829396575689,
+              0.012337388703599572,
+              -0.005573650123551488
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_032",
+            "pos": [
+              0.03817829396575689,
+              -0.012495737988501787,
+              -0.005573650123551488
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_033",
+            "pos": [
+              0.04306409880518913,
+              0.004824603209272027,
+              -0.005573650218138937
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_034",
+            "pos": [
+              0.04406154155731201,
+              -0.003004975034855306,
+              -0.005573649832513183
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_035",
+            "pos": [
+              0.04453042522072792,
+              0.0021211845451034606,
+              -0.005573649890720844
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_036",
+            "pos": [
+              0.044837767258286476,
+              -0.001272856374271214,
+              -0.005573650007136166
+            ]
+          },
+          {
+            "file": "collision/3.glb",
+            "geometry": "hull_037",
+            "pos": [
+              0.04748062044382095,
+              0.0009302324615418911,
+              -0.00557365023996681
+            ]
+          }
+        ],
+        "method": "vhacd-inner",
+        "settings": {
+          "asyncACD": false,
+          "boundary_method": "triangle-convex-halfspace-clipping",
+          "boundary_tolerance_m": 1e-12,
+          "containment": "inside centre plus nonintersecting triangle boundaries",
+          "face_budget": 6000,
+          "fillMode": "flood",
+          "maxConvexHulls": 96,
+          "maxNumVerticesPerCH": 64,
+          "maxRecursionDepth": 12,
+          "minimumVolumePercentErrorAllowed": 0.5,
+          "minimum_cell_volume_m3": 1e-14,
+          "minimum_volume_fraction": 0.8,
+          "premerge_cell_volume_sum_fraction": 0.9472467576961285,
+          "proposal_faces": 1520,
+          "resolution": 750000,
+          "shrinkWrap": true
+        }
+      },
+      "extents_cm": [
+        10.0,
+        4.0,
+        2.6147299999999998
+      ],
+      "faces": 1520,
+      "file": "3.obj",
+      "source_sha256": "755819cd94145622361c5c24d2a682747d314e16cec9c2a249e59809cb76223e",
+      "vertices": 758
+    },
+    "4": {
+      "center_cm": [
+        4.0,
+        0.12658000000000003,
+        7.0
+      ],
+      "collision": {
+        "asset_sha256": "d8169e3ba4169f94105904f2335e446ce462fbe4a2feaeb7291e2eac48e3ab49",
+        "convex_hull_volume_ratio": 1.5337466006683549,
+        "decomposed_volume_ratio": 0.772918622423851,
+        "hull_count": 2,
+        "hulls": [
+          {
+            "file": "collision/4.glb",
+            "geometry": "hull_000",
+            "pos": [
+              0.0,
+              0.0,
+              -0.011500000000000003
+            ]
+          },
+          {
+            "file": "collision/4.glb",
+            "geometry": "hull_001",
+            "pos": [
+              0.0,
+              0.0,
+              0.022500000000000003
+            ]
+          }
+        ],
+        "method": "primitive-approved",
+        "settings": {
+          "approximation_reason": "reviewed semantic male insertion feature",
+          "axis": 2,
+          "clearance_scope": "male insertion feature only; visual/body/head unchanged",
+          "explicit_approximation": true,
+          "manufacturing_clearance_m": {
+            "axial": 0.0005,
+            "radial": 0.001
+          },
+          "minimum_cell_volume_m3": 1e-14,
+          "minimum_volume_fraction": 0.05,
+          "nominal_spec": {
+            "axis": 2,
+            "head": [
+              0.0105,
+              0.0345,
+              0.012,
+              32
+            ],
+            "kind": "headed_pin",
+            "stem": [
+              -0.0345,
+              0.011,
+              0.0045,
+              32
+            ]
+          },
+          "primitive": "headed_pin"
+        }
+      },
+      "extents_cm": [
+        2.8832799999999996,
+        2.50012,
+        7.0
+      ],
+      "faces": 622,
+      "file": "4.obj",
+      "source_sha256": "71f5874be268c476b736b30e66c120797ef6d404fcbb8b9f348301c1805eeb73",
+      "vertices": 313
+    }
+  },
+  "scale": 0.01,
+  "source": "https://github.com/yunshengtian/Fabrica",
+  "source_model": "assets/fabrica/plumbers_block",
+  "source_units": "centimetres"
+}
