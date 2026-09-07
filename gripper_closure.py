@@ -287,6 +287,17 @@ def _contact_aperture(C: ry.Config, prefix: str, target: str):
     return res, (model, groups, axis, positions, signs)
 
 
+def contact_aperture(C: ry.Config, receiver_prefix: str, target: str) -> ClosureResult:
+    """Return the object-dependent terminal aperture without checking the environment sweep.
+
+    This is the geometry-only half of :func:`certify`.  Simulation uses it to render a planned
+    grasp at the same object-dependent closure while leaving the certified collision proxies
+    fixed.  The source configuration is never mutated.
+    """
+    result, _meta = _contact_aperture(C, receiver_prefix, target)
+    return result
+
+
 def certify(C: ry.Config, receiver_prefix: str, target: str) -> ClosureResult:
     """Certify a virtual parallel-jaw closure in an already posed collision scene.
 

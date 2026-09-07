@@ -33,6 +33,95 @@ HINGE_AXES = {"hingeX": (1, 0, 0), "hingeY": (0, 1, 0), "hingeZ": (0, 0, 1)}
 _NO_GEOM = (None, "marker", "mesh")
 
 
+def _quat_mul(a, b):
+  """Hamilton product for the wxyz convention shared by RAI and MuJoCo."""
+  aw, ax, ay, az = np.asarray(a, dtype=float)
+  bw, bx, by, bz = np.asarray(b, dtype=float)
+  return np.asarray([
+      aw * bw - ax * bx - ay * by - az * bz,
+      aw * bx + ax * bw + ay * bz - az * by,
+      aw * by - ax * bz + ay * bw + az * bx,
+      aw * bz + ax * by - ay * bx + az * bw,
+  ])
+
+
+def _quat_to_R(q):
+  """Rotation matrix for a unit wxyz quaternion (kept local to avoid a scipy dependency)."""
+  w, x, y, z = np.asarray(q, dtype=float)
+  return np.asarray([
+      [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+      [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+      [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+  ])
+
+
+def _relative_pose(parent, child):
+  """World poses -> child pose in parent coordinates, both as (position, wxyz)."""
+  pp, qp = parent
+  pc, qc = child
+  qpi = np.asarray([qp[0], -qp[1], -qp[2], -qp[3]], dtype=float)
+  return _quat_to_R(qp).T @ (pc - pp), _quat_mul(qpi, qc)
+
+
+def gripper_sim_joints(C, prefix):
+  """Simulation-only finger hinges for a planner-frozen parallel-jaw gripper.
+
+  Returns ``{frame: (axis, closure_gain, max_angle, side)}``. ``closure_gain`` maps the
+  gripper's common non-negative closure angle onto that joint's q. These are the joints from
+  the manufacturers' kinematic descriptions, not cosmetic mesh translations. They are added
+  only while exporting MuJoCo, so RAI/search/MP joint vectors remain unchanged.
+
+  Robotiq 2F-85 is a six-hinge mimic linkage: four knuckles follow the motor and both inner
+  fingers counter-rotate, keeping the pads approximately parallel. OpenArm uses two opposed
+  local x axes and a handed closing sign recovered from the imported model convention.
+  The OpenArm hinge is placed on the ``*_origin`` body so its simplified collision capsules
+  (siblings of the visual link in the RAI model) articulate with the finger as well.
+  """
+  names = set(str(n) for n in C.getFrameNames() if str(n).startswith(prefix))
+  if not names or any("vacuum" in n for n in names):
+    return {}
+
+  def present(suffix):
+    matches = sorted(n for n in names if n.endswith(suffix))
+    return matches[0] if len(matches) == 1 else None
+
+  # OpenArm v2 pinch-gripper hinges. The DAE-to-RAI import adds a -90deg mesh transform and
+  # mirrors the two arm variants; the frozen source q annotations preserve the corresponding
+  # closing sign (right positive, left negative). Both hinges receive that same signed q,
+  # while their opposite axes make the fingers close symmetrically.
+  oa1 = present("finger_joint1_origin")
+  oa2 = present("finger_joint2_origin")
+  if oa1 and oa2 and any("openarm_" in n for n in names):
+    right = any("openarm_right_" in n for n in names)
+    sign = 1.0 if right else -1.0
+    return {
+        oa1: ((-1.0, 0.0, 0.0), sign, 0.7854, 0),
+        oa2: ((1.0, 0.0, 0.0), sign, 0.7854, 1),
+    }
+
+  # Robotiq 2F-85 official mimic map. The right branches have a pi-rotated origin, so all
+  # four base knuckles use the same local +x axis and positive master angle.
+  suffixes = (
+      ("finger_joint", 1.0, 0),
+      ("left_inner_knuckle_joint", 1.0, 0),
+      ("right_outer_knuckle_joint", 1.0, 1),
+      ("right_inner_knuckle_joint", 1.0, 1),
+      ("left_inner_finger_joint", -1.0, 0),
+      ("right_inner_finger_joint", -1.0, 1),
+  )
+  found = {}
+  for suffix, gain, side in suffixes:
+    if suffix == "finger_joint":
+      matches = sorted(n for n in names if n.endswith("finger_joint")
+                       and "inner_finger_joint" not in n and "openarm_" not in n)
+      frame = matches[0] if len(matches) == 1 else None
+    else:
+      frame = present(suffix)
+    if frame is not None:
+      found[frame] = ((1.0, 0.0, 0.0), gain, 0.8, side)
+  return found if len(found) == len(suffixes) else {}
+
+
 def _zeroed(C):
   """A copy of `C` with every joint at 0, because a rai joint frame's relative transform has
   the CURRENT joint value baked into it -- read the tree at home and the mounting offsets come
@@ -243,15 +332,28 @@ def openarm_base_prefixes(C):
   return sorted(set(out))
 
 
+def husky_base_prefixes(C):
+  """Prefixes of calibrated Husky carrier trees outside their ``aN_`` arm subtrees."""
+  out = []
+  for name in C.getFrameNames():
+    if name.startswith("husky") and name.endswith("_world_link"):
+      index = name[len("husky"):-len("_world_link")]
+      if index.isdigit():
+        out.append(f"husky{index}_")
+  return sorted(set(out))
+
+
 def carrier_base_prefixes(C):
   """All separately-prefixed fixed carriers that accompany ordinary ``aN_`` arm trees."""
-  return sorted(set(fr3_base_prefixes(C) + openarm_base_prefixes(C)))
+  return sorted(set(fr3_base_prefixes(C) + openarm_base_prefixes(C)
+                    + husky_base_prefixes(C)))
 
 
 def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, indent=4,
                    collide_fn=None, contype="2", conaffinity="1", link_mass=1e-3,
                    link_inertia=1e-6, armature=0.0, limits=True, static_mass=None,
-                   meshes=False, assets=None, mesh_group=1, frame_colors=False):
+                   meshes=False, assets=None, mesh_group=1, frame_colors=False,
+                   animate_grippers=False):
   """MJCF <body> tree for one articulated arm, read out of rai at q=0.
 
   Returns (xml, joint_names) with joint_names in MuJoCo's own qpos order for this arm -- the
@@ -267,7 +369,45 @@ def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, inde
   that swamps the payload; the value stops being a free choice only when actuators arrive."""
   Z = _zeroed(C)
   root, kids = arm_frames(Z, prefix)
+  gripper_joints = gripper_sim_joints(Z, prefix) if animate_grippers else {}
   jnames, out = [], []
+
+  # The planner freezes the finger joints and certifies collision using their open-pose
+  # primitive proxies.  The simulation-only linkage is deliberately a PRESENTATION model:
+  # letting those approximate capsules close on an already weld-attached payload creates a
+  # second, uncalibrated grasp controller.  Its internal pinch reaction then appears in the
+  # weld wrench and can break a perfectly valid planned grasp.  Keep the real mesh descendants
+  # on the moving hinge, but transplant each colliding primitive to the nearest rigid ancestor
+  # above the whole linkage.  Thus obstacle geometry is exactly the model used by IK/MP while
+  # the rendered fingers are genuine actuated joints whose qpos is recorded in the NPZ.
+  parent_of = {}
+  for parent, children in kids.items():
+    for child in children:
+      parent_of[child] = parent
+  moving_collision = set()
+  fixed_collision = {}
+  if gripper_joints and collide:
+    for name in parent_of:
+      info = Z.getFrame(name).info()
+      kind = info.get("shape")
+      if kind in _NO_GEOM or not (collide_fn(name) if collide_fn else True):
+        continue
+      cur, top_hinge = name, None
+      while cur in parent_of:
+        if cur in gripper_joints:
+          top_hinge = cur
+        cur = parent_of[cur]
+      if top_hinge is None:
+        continue
+      stable_parent = parent_of.get(top_hinge)
+      if stable_parent is None:
+        continue
+      sf, cf = Z.getFrame(stable_parent), Z.getFrame(name)
+      rel = _relative_pose(
+          (np.asarray(sf.getPosition(), float), np.asarray(sf.getQuaternion(), float)),
+          (np.asarray(cf.getPosition(), float), np.asarray(cf.getQuaternion(), float)))
+      moving_collision.add(name)
+      fixed_collision.setdefault(stable_parent, []).append((name, rel))
 
   def emit(name, depth):
     f = Z.getFrame(name)
@@ -299,21 +439,38 @@ def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, inde
       out.append(f'{pad}  <joint name="{name}" type="hinge" '
                  f'axis="{axis[0]} {axis[1]} {axis[2]}"{lim}{arm}/>')
       jnames.append(name)
+    elif name in gripper_joints:
+      # Simulation-only ACTUAL linkage hinge. Do NOT append to ``jnames``: that list is the
+      # RAI arm-q mapping and must remain exactly the planner's joint vector.
+      axis, gain, max_angle, side = gripper_joints[name]
+      lo, hi = ((-max_angle, 0.0) if gain < 0.0 else (0.0, max_angle))
+      out.append(f'{pad}  <joint name="sim_grip__{name}" type="hinge" '
+                 f'axis="{axis[0]:.9g} {axis[1]:.9g} {axis[2]:.9g}" '
+                 f'range="{lo:.9g} {hi:.9g}" limited="true" '
+                 f'user="{gain:.9g} {max_angle:.9g} {side}"/>')
     # MASS BELONGS ON THE MOVING LINKS, NOT ON EVERY FRAME. rai has ~69 frames per arm
     # (joint origins, collision capsules, finger meshes); giving each one `link_mass` builds a
     # ~276 kg arm with fictitious inertia. That is invisible while the arm is driven
     # kinematically, and fatal once actuators have to move it -- measured 3.6-6.5 rad of
     # tracking error that got WORSE with higher gain, i.e. divergence. Only DOF-carrying bodies
     # get real mass; the rigidly-attached rest get a token one.
-    _m = link_mass if (j is not None or static_mass is None) else static_mass
-    _i = link_inertia if (j is not None or static_mass is None) else static_mass
+    if name in gripper_joints:
+      # Imported finger joints were rigid planner helpers and otherwise inherit the 1e-4 kg
+      # token mass used for fixed decoration. Once they become dynamic that makes even a mild
+      # position servo numerically stiff at 2 ms. A 100 g / 1e-4 kg m^2 finger is in the scale
+      # of both source grippers and keeps the simulation-only DOF well conditioned.
+      _m, _i = 0.1, 1e-4
+    else:
+      _m = link_mass if (j is not None or static_mass is None) else static_mass
+      _i = link_inertia if (j is not None or static_mass is None) else static_mass
     out.append(f'{pad}  <inertial pos="0 0 0" mass="{_m:g}" '
                f'diaginertia="{_i:g} {_i:g} {_i:g}"/>')
     info = f.info()
     kind = info.get("shape")
     geom_rgba = (_rgba_string(info.get("color"), rgba) if frame_colors else rgba)
     if kind not in _NO_GEOM:
-      on = collide and (collide_fn(name) if collide_fn else True)
+      on = (collide and (collide_fn(name) if collide_fn else True)
+            and name not in moving_collision)
       g = _geom_xml(kind, info.get("size", []), geom_rgba, group,
                     contype if on else "0", conaffinity if on else "0")
       if g:
@@ -339,10 +496,46 @@ def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, inde
                    f'group="{mesh_group}" contype="0" conaffinity="0"/>')
     for c in sorted(kids.get(name, [])):
       emit(c, depth + 1)
+    for source, (proxy_pos, proxy_quat) in sorted(fixed_collision.get(name, [])):
+      pinfo = Z.getFrame(source).info()
+      proxy_rgba = (_rgba_string(pinfo.get("color"), rgba) if frame_colors else rgba)
+      proxy_geom = _geom_xml(pinfo.get("shape"), pinfo.get("size", []), proxy_rgba,
+                             group, contype, conaffinity)
+      if proxy_geom:
+        proxy_name = f"{prefix}sim_grip_fixed__{source[len(prefix):]}"
+        # This is rigid decoration just like the source collision frame, not another arm
+        # link.  In actuated mode ``link_mass`` is 4 kg; accidentally assigning that here
+        # added 16 kg per OpenArm hand and made a certified handover shove its current holder
+        # apart.  Match the ordinary rigid-frame mass policy exactly.
+        proxy_mass = link_mass if static_mass is None else static_mass
+        proxy_inertia = link_inertia if static_mass is None else static_mass
+        out.append(
+            f'{pad}  <body name="{proxy_name}" '
+            f'pos="{proxy_pos[0]:.9g} {proxy_pos[1]:.9g} {proxy_pos[2]:.9g}" '
+            f'quat="{proxy_quat[0]:.9g} {proxy_quat[1]:.9g} '
+            f'{proxy_quat[2]:.9g} {proxy_quat[3]:.9g}">')
+        out.append(f'{pad}    <inertial pos="0 0 0" mass="{proxy_mass:g}" '
+                   f'diaginertia="{proxy_inertia:g} {proxy_inertia:g} {proxy_inertia:g}"/>')
+        out.append(f'{pad}    {proxy_geom}')
+        out.append(f'{pad}  </body>')
     out.append(f'{pad}</body>')
 
   emit(root, 0)
   return "\n".join(out), jnames
+
+
+def gripper_actuator_mjcf(C, prefixes, kp=5.0, indent=4):
+  """Position actuators for :func:`gripper_sim_joints` (one per physical hinge)."""
+  pad, out, names = " " * indent, [], []
+  for prefix in prefixes:
+    specs = gripper_sim_joints(C, prefix)
+    effort = 7.0 if any("openarm_" in n for n in specs) else 50.0
+    for frame in specs:
+      name = "sim_grip__" + frame
+      out.append(f'{pad}<position name="{name}" joint="{name}" kp="{kp:g}" '
+                 f'dampratio="1" forcerange="{-effort:g} {effort:g}"/>')
+      names.append(name)
+  return "\n".join(out), names
 
 
 def build_arms_mjcf(C, prefixes, contact_masks=None, **kw):

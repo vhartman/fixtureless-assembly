@@ -26,9 +26,60 @@ MODE = {"seed": 3, "candidates": 64, "keep": 8}
 def _clean_sampler_state():
   yield
   S.set_grasp_closure_check(False)
+  P.set_component_grasp_keep(0)
   P.clear_sampled_scene_ctx()
   P.set_sampled_grasps(None)
   P.reset_grasp_pose_cache()
+
+
+def test_component_grasp_pool_is_bounded_stable_subset_of_full_union():
+  """Component columns are an ordering over, not a replacement for, raw part grasps."""
+  from problem import make_assembly
+
+  asm = make_assembly("cross", 3)
+  group = ("obj_0", "obj_1", "obj_2")
+  P.set_sampled_grasps({"seed": 3, "candidates": 64, "keep": 12,
+                        "margin": 0.008, "pad_support": 0.75, "wrap": 0.015})
+  P.set_component_grasp_keep(0)
+  full = P.compute_cube_grasps(asm, group, return_labeled=True)
+  P.set_component_grasp_keep(5)
+  compact = P.compute_cube_grasps(asm, group, return_labeled=True)
+
+  rank = {p: i for i, p in enumerate(group)}
+  expected = sorted(full, key=lambda row: (row[1], rank[row[0]]))[:5]
+  assert [(p, g) for p, g, _pose in compact] == [(p, g) for p, g, _pose in expected]
+  assert len(compact) == min(5, len(full))
+
+  # Singletons are acquisition databases and are never truncated by this schedule.
+  P.set_component_grasp_keep(0)
+  single_full = P.compute_cube_grasps(asm, ("obj_0",), return_labeled=True)
+  P.set_component_grasp_keep(1)
+  single_compact = P.compute_cube_grasps(asm, ("obj_0",), return_labeled=True)
+  assert [(p, g) for p, g, _pose in single_compact] == [
+      (p, g) for p, g, _pose in single_full]
+
+
+def test_component_grasp_tables_are_lazy_but_full_iteration_is_explicit(monkeypatch):
+  from problem import make_assembly
+
+  asm = make_assembly("cross", 3)
+  calls = []
+
+  def fake(_assembly, key, _offset, _gripper_path, return_labeled=False):
+    assert return_labeled
+    calls.append(key)
+    return [(key[0], 0, np.zeros(7))]
+
+  monkeypatch.setattr(P, "compute_cube_grasps", fake)
+  P.set_component_grasp_keep(4)
+  table = P.precompute_grasps(asm)
+  assert isinstance(table, P.LazyGraspTable)
+  assert len(table) == len(P.get_subassemblies(asm)) and table.materialized == 0
+  assert table[("obj_0",)]
+  assert table[("obj_0",)]
+  assert calls == [("obj_0",)] and table.materialized == 1
+  list(table.items())
+  assert table.materialized == len(table)
 
 
 def test_flag_off_is_byte_identical():
@@ -83,6 +134,36 @@ def test_frame_conventions():
     assert np.linalg.norm(pos + 0.01 * z) < np.linalg.norm(pos)
     # the tool centre stands OFF the surface, outside the box
     assert np.max(np.abs(pos) - h) > 0.0
+
+
+def test_wrap_support_uses_trimesh_outside_negative_convention():
+  """Pad overhang must not become support through a signed-distance sign error."""
+  import trimesh
+
+  mesh = trimesh.creation.box(extents=[1.0, 1.0, 1.0])
+  p = np.array([0.48, 0.0, 0.5])
+  n = np.array([0.0, 0.0, 1.0])
+  u = np.array([1.0, 0.0, 0.0])
+  v = np.array([0.0, 1.0, 0.0])
+  offsets = np.array([[0.0, 0.0], [0.1, 0.0], [0.2, 0.0]])
+
+  # Only the first point lies within 6 mm of the nearest material. The two
+  # overhanging samples are roughly 80 and 180 mm away from the box.
+  assert P._pad_support_wrap(mesh, p, n, u, v, offsets, lift=0.002,
+                             wrap=0.006) == pytest.approx(1.0 / 3.0)
+
+
+def test_wrap_support_treats_points_inside_material_as_contact():
+  """A slightly pressed-in pad sample needs no additional deformation."""
+  import trimesh
+
+  mesh = trimesh.creation.box(extents=[1.0, 1.0, 1.0])
+  offsets = np.array([[0.0, 0.0], [0.1, 0.0]])
+  got = P._pad_support_wrap(
+      mesh, np.array([0.0, 0.0, 0.497]), np.array([0.0, 0.0, 1.0]),
+      np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]), offsets,
+      lift=0.002, wrap=0.0)
+  assert got == pytest.approx(1.0)
 
 
 def test_antipodal_width_within_aperture():

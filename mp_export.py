@@ -452,7 +452,8 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
     chain_goal_cache[j] = q
     return q
 
-  def split_skill(a, i, wit, involved, name, kind, mk_skill, members=None):
+  def split_skill(a, i, wit, involved, name, kind, mk_skill, members=None,
+                  complete_place_funnel=False):
     # --pre-*: prepend a GOTO to the pre-skill FUNNEL pose (skill witness backed off along its
     # approach axis) before the REAL skill task. Pure motion first (the collision-free approach
     # the free-space planner connects to), then the unchanged skill at the real witness -- so the
@@ -475,12 +476,30 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       # keyframes, say it -- a None here exports a pre GOTO whose goal EQUALS the skill goal.
       print(f"  [pre] {i:02d} {kind}: NO pre keyframe -- the goto goal equals the skill goal "
             f"(zero-length funnel)")
+    post_name = f"{i:02d}_post_place_{'_'.join(str(x) for x in a[1:])}"
     if not members:
+      pre_member = pre_wit if pre_wit is not None else wit
       pre_involved = list(involved)
       pre_goal = goal_for(pre_involved,
-                          pre_wit if pre_wit is not None else wit)           # cur := T_pre
-      return [(pan, Task(pan, pre_involved, pre_goal, type="goto")),
-              (name, mk_skill(goal_for(involved, wit)))]                     # cur := real witness
+                          pre_member)                                        # cur := T_pre
+      out = [(pan, Task(pan, pre_involved, pre_goal, type="goto")),
+             (name, mk_skill(goal_for(involved, wit)))]                      # cur := real witness
+      if complete_place_funnel:
+        # A place DETACHES the payload at the contact-rich skill endpoint.  Certify the other
+        # half of the funnel in the POST-place scene, where the object remains on its support
+        # while the releasing hand retreats.  The pre-place configuration cannot simply be
+        # reused: it was certified while the object moved WITH the hand and may still overlap
+        # the stationary object after detachment.  Only the placing robot retracts; a brace
+        # that continues holding the now-supported object stays at the set-down witness.
+        post_member = robot_ik.post_release_witness(
+            a, states[i], states[i + 1], assembly, wit)
+        if post_member is None:
+          print(f"  [post-place] {i:02d}: no retract keyframe -- departure goal equals "
+                "place goal (zero-length funnel)")
+          post_member = wit
+        post_goal = goal_for([a[1]], post_member)
+        out.append((post_name, Task(post_name, [a[1]], post_goal, type="goto")))
+      return out
 
     # GoalSets used to be silently discarded by every pre-skill split. Solve one funnel mouth
     # per skill member so the planner keeps both branch diversity and a short, branch-consistent
@@ -516,8 +535,24 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
     else:
       pre_goal = goal_for(involved, pre_members[0])
       skill_goal = goal_for(involved, skill_members[0])
-    return [(pan, Task(pan, involved, pre_goal, type="goto")),
-            (name, mk_skill(skill_goal))]
+    out = [(pan, Task(pan, involved, pre_goal, type="goto")),
+           (name, mk_skill(skill_goal))]
+    if complete_place_funnel:
+      post_members = []
+      for m, member in enumerate(skill_members):
+        qpost = robot_ik.post_release_witness(
+            a, states[i], states[i + 1], assembly, member)
+        if qpost is None:
+          print(f"  [post-place] {i:02d} member {m}: no retract keyframe -- departure "
+                "goal equals place goal (zero-length funnel)")
+          qpost = member
+        post_members.append(np.asarray(qpost, dtype=float))
+      if len(skill_members) >= 2:
+        post_goal = goal_for_paired([a[1]], skill_members, post_members, i)
+      else:
+        post_goal = goal_for([a[1]], post_members[0])
+      out.append((post_name, Task(post_name, [a[1]], post_goal, type="goto")))
+    return out
 
   tasks, seq, step_names = [], [], []                             # step_names[i] = names of plan step i
   # HOME and EXIT deliberately belong to different layers. RobotIK parks otherwise-idle arms
@@ -608,7 +643,8 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       # --pre-place splits into a goto to the lifted pre-place + the real place (set-down+attach).
       frames = ["table", _root_of(states[i], a[2], mate_parent)]
       mk = lambda g: Task(name, involved, g, type="place", frames=frames)
-      emit = (split_skill(a, i, wit, involved, name, kind, mk, smembers)
+      emit = (split_skill(a, i, wit, involved, name, kind, mk, smembers,
+                          complete_place_funnel=True)
               if pre_place and bridge_j is None else None)
       if emit is None:
         t = mk(goal_for_set(involved, smembers, i) if smembers
@@ -716,10 +752,17 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       task_robots = [rA, rB] if rA is not None and rA != rB else [rB]
       if bridge_j is not None:
         task_robots = list(dict.fromkeys(task_robots + shared_robots))
-      t = Task(name, task_robots,
-               goal_for_set(task_robots, smembers, i) if smembers
-               else goal_for(task_robots, wit), type="handover",
-               frames=[robot_ik.gripper_frame[rB], _root_of(states[i], a[2], mate_parent)])
+      frames = [robot_ik.gripper_frame[rB], _root_of(states[i], a[2], mate_parent)]
+      mk = lambda g: Task(name, task_robots, g, type="handover", frames=frames)
+      # Handover and add_grasp share the same incoming-hand geometry.  The former was
+      # accidentally omitted from --pre-add-grasp, which let the receiver sit at the
+      # interfering grasp endpoint while a slower giver was still approaching.  Split it
+      # into the already certified standoff and the real ownership switch, just like pick.
+      emit = (split_skill(a, i, goal_wit, task_robots, name, kind, mk, smembers)
+              if pre_add_grasp else None)
+      if emit is None:
+        t = mk(goal_for_set(task_robots, smembers, i) if smembers
+               else goal_for(task_robots, wit))
     else:
       step_names.append([])                                   # non-exported: keep index alignment
       continue
@@ -1300,12 +1343,81 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
     reason["slack"] = -violation
     return reason
 
+  # Once an assemble task fires, mr_bench reparents the inserted part below the target part.
+  # Collision proxies within that resulting rigid body may overlap slightly by construction
+  # (fitted pegs are the common case).  RAI still reports those child/ancestor contacts even
+  # though they are neither avoidable by motion planning nor contacts between independent
+  # bodies.  Search already exempts the intended mate pair.  Apply the equivalent physical
+  # rule to every subsequently accumulated rigid component, without muting contacts between
+  # two separately held/resting parts.
+  _part_names = set()
+  for _a in getattr(env, "plan_actions", ()):
+    if len(_a) >= 3 and isinstance(_a[2], str):
+      _part_names.add(_a[2])
+    if len(_a) >= 4 and _a[0] == "assemble" and isinstance(_a[3], str):
+      _part_names.add(_a[3])
+
+  def _rigid_part_root(frame_name):
+    try:
+      f, root, seen = env.C.getFrame(str(frame_name)), None, set()
+      while f is not None and f.name not in seen:
+        seen.add(f.name)
+        if f.name in _part_names:
+          root = f.name
+        f = f.getParent()
+      return root
+    except Exception:
+      return None
+
+  def _nearest_part(frame_name):
+    try:
+      f, seen = env.C.getFrame(str(frame_name)), set()
+      while f is not None and f.name not in seen:
+        seen.add(f.name)
+        if f.name in _part_names:
+          return f.name
+        f = f.getParent()
+    except Exception:
+      pass
+    return None
+
+  def _internal_rigid_pair(fa, fb):
+    ra, rb = _rigid_part_root(fa), _rigid_part_root(fb)
+    return ra is not None and ra == rb
+
+  def _intended_active_mate_pair(fa, fb, m):
+    task = _task_of(m)
+    frames = tuple(getattr(task, "frames", ()) or ()) if task is not None else ()
+    if "assemble" not in str(getattr(task, "name", "")) or len(frames) < 2:
+      return False
+    pa, pb = _nearest_part(fa), _nearest_part(fb)
+    return pa is not None and pb is not None and {pa, pb} == {str(frames[0]), str(frames[1])}
+
+  env.is_internal_rigid_pair = _internal_rigid_pair
+  env.is_intended_active_mate_pair = _intended_active_mate_pair
+
+  def _base_accepts_after_internal_filter(args, kw):
+    tol = kw.get("collision_tolerance", args[2] if len(args) > 2 else None)
+    if tol is None:
+      tol = float(getattr(env, "collision_tolerance", 0.0) or 0.0)
+    m = kw.get("m", args[1] if len(args) > 1 else None)
+    try:
+      collisions = env.C.getCollisions()
+    except TypeError:  # lightweight test adapters expose the older explicit-margin form
+      collisions = env.C.getCollisions(0.0)
+    external_pen = sum(
+        -float(d) for fa, fb, d in collisions
+        if float(d) < 0.0 and not _internal_rigid_pair(fa, fb)
+        and not _intended_active_mate_pair(fa, fb, m))
+    return external_pen <= float(tol)
+
   def _wrap(fn):
     def patched(*a, **kw):
       m = kw.get("m", a[1] if len(a) > 1 else None)
       mode = _mode_key(m)
       _stats["calls"] += 1
-      if not fn(*a, **kw):                               # poses C at (mode, q) as a side effect
+      _base_ok = fn(*a, **kw)                            # poses C at (mode, q) as a side effect
+      if not _base_ok and not _base_accepts_after_internal_filter(a, kw):
         _stats["base_rejects"] += 1
         _bump(_stats["base_by_mode"], mode)
         _record_base_pairs(m)
@@ -2152,8 +2264,13 @@ def validate_nominal_keyframes(problem, tolerance=None, verbose=True):
     active = set(task.robots)
     all_pairs = [(str(c[0]), str(c[1]), float(c[2])) for c in env.C.getCollisions()
                  if float(c[2]) < 0.0]
+    _internal = getattr(env, "is_internal_rigid_pair", lambda _a, _b: False)
+    _intended = getattr(env, "is_intended_active_mate_pair",
+                        lambda _a, _b, _m: False)
     pairs = sorted((p for p in all_pairs
-                    if owner(p[0]) in active | {None} and owner(p[1]) in active | {None}),
+                    if not _internal(p[0], p[1])
+                    and not _intended(p[0], p[1], m)
+                    and owner(p[0]) in active | {None} and owner(p[1]) in active | {None}),
                    key=lambda x: x[2])
     pen = sum(-d for _fa, _fb, d in pairs)
     if pen > float(tolerance):

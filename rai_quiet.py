@@ -5,13 +5,11 @@
 
 rai prints these from C++ (pairCollision.cpp) straight to fd 1, so `contextlib.redirect_stdout`
 and every other Python-level trick is blind to them -- Python never sees the bytes. The only
-place to intercept is the DESCRIPTOR, so we splice a pipe onto it and run one daemon thread that
-forwards every line except the matched ones.
-
-WHY THIS IS NOT SLOWER: the spam's cost is the terminal write itself (a blocking syscall per
-line, worse over ssh/tmux). Dropping a line in the reader is strictly cheaper than writing it,
-so filtering a noisy run is FASTER than not filtering it. A quiet run pays one extra pipe copy
-per line of real output, which is noise next to any actual work. Measured in self_test().
+place to intercept is the DESCRIPTOR, so we splice a pipe onto it and use a small independent
+process to forward every line except the matched ones. A Python reader THREAD is unsafe:
+native solvers may hold the GIL while writing more than a pipe buffer, deadlocking the writer
+against the reader waiting for that same GIL. The filter process imports only the standard
+library and does not share the solver's GIL.
 
 Ordering is preserved: Python's own prints go down the same pipe, so they cannot be reordered
 relative to rai's.
@@ -21,10 +19,14 @@ Usage:
     with rai_quiet.quiet():  ...                   # scoped
 """
 import atexit
+import json
+import mmap
 import os
 import re
+import struct
+import subprocess
 import sys
-import threading
+import tempfile
 
 # Substrings that identify the spam. Deliberately NARROW: this must never eat a real message.
 # mp_export's own "[mp-export] WARNING: step N has NO witness" is a genuine diagnostic that a
@@ -35,16 +37,24 @@ DEFAULT_PATTERNS = (
     "libccd",
 )
 
-_state = {"installed": False, "threads": [], "saved": {}, "dropped": 0}
+_state = {"installed": False, "pumps": [], "saved": {}, "dropped": 0}
 
 
 def dropped():
   """How many lines have been suppressed so far (0 is a good hint the filter isn't matching)."""
-  return _state["dropped"]
+  return _state["dropped"] + sum(struct.unpack("<Q", counter[:8])[0]
+                                for _proc, _file, counter in _state["pumps"])
 
 
-def _pump(read_fd, out_fd, matcher):
+def _pump(read_fd, out_fd, matcher, counter):
   buf = b""
+  count = 0
+
+  def write_all(data):
+    # os.write is allowed to complete only part of a buffer.
+    while data:
+      data = data[os.write(out_fd, data):]
+
   while True:
     try:
       chunk = os.read(read_fd, 65536)
@@ -59,17 +69,18 @@ def _pump(read_fd, out_fd, matcher):
     out = []
     for ln in lines:
       if matcher(ln):
-        _state["dropped"] += 1
+        count += 1
       else:
         out.append(ln)
     if out:
       try:
-        os.write(out_fd, b"\n".join(out) + b"\n")
+        write_all(b"\n".join(out) + b"\n")
       except OSError:
         break
+    counter[:8] = struct.pack("<Q", count)
   if buf:                                    # flush whatever was left un-terminated
     try:
-      os.write(out_fd, buf)
+      write_all(buf)
     except OSError:
       pass
 
@@ -78,8 +89,6 @@ def install(patterns=DEFAULT_PATTERNS, fds=(1, 2)):
   """Filter `fds` for the rest of the process. Idempotent; restores at interpreter exit."""
   if _state["installed"]:
     return
-  rx = re.compile(b"|".join(re.escape(p.encode()) for p in patterns))
-  matcher = rx.search
   for fd in fds:
     try:
       sys.stdout.flush() if fd == 1 else sys.stderr.flush()
@@ -87,13 +96,27 @@ def install(patterns=DEFAULT_PATTERNS, fds=(1, 2)):
       pass
     saved = os.dup(fd)                       # the REAL terminal, kept for the pump to write to
     r, w = os.pipe()
+    counter_file = tempfile.TemporaryFile()
+    counter_file.truncate(8)
+    counter = mmap.mmap(counter_file.fileno(), 8)
+    try:
+      proc = subprocess.Popen(
+          [sys.executable, os.path.abspath(__file__), "--pump", json.dumps(list(patterns)),
+           str(counter_file.fileno())], stdin=r, stdout=saved, stderr=saved,
+          pass_fds=(counter_file.fileno(),))
+    except BaseException:
+      for handle in (r, w, saved):
+        os.close(handle)
+      counter.close()
+      counter_file.close()
+      uninstall()
+      raise
     os.dup2(w, fd)                           # everything aimed at fd now lands in the pipe
     os.close(w)
-    t = threading.Thread(target=_pump, args=(r, saved, matcher), daemon=True)
-    t.start()
-    _state["threads"].append(t)
-    _state["saved"][fd] = (saved, r)
-  _state["installed"] = True
+    os.close(r)
+    _state["pumps"].append((proc, counter_file, counter))
+    _state["saved"][fd] = saved
+    _state["installed"] = True
   atexit.register(uninstall)
 
 
@@ -108,20 +131,28 @@ def uninstall():
   # so the pump's final write lands, and only THEN close the saved fd. Closing before the join
   # -- as this first did -- destroys the pump's output target mid-drain, and the tail of the
   # run is lost: it silently swallowed a traceback, which is far worse than the spam.
-  for fd, (saved, _r) in _state["saved"].items():
+  for fd, saved in _state["saved"].items():
     try:
       sys.stdout.flush() if fd == 1 else sys.stderr.flush()
     except Exception:
       pass
     os.dup2(saved, fd)                       # last writer gone -> the pump sees EOF
-  for t in _state["threads"]:
-    t.join(timeout=2.0)                      # bounded: never hang an exit on a wedged pump
-  for _fd, (saved, _r) in _state["saved"].items():
+  for proc, counter_file, counter in _state["pumps"]:
+    try:
+      proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+      proc.terminate()
+      proc.wait(timeout=5)
+      os.write(2, b"[rai-quiet] filter failed to drain; trailing output may be missing\n")
+    _state["dropped"] += struct.unpack("<Q", counter[:8])[0]
+    counter.close()
+    counter_file.close()
+  for _fd, saved in _state["saved"].items():
     try:
       os.close(saved)                        # only now -- the pump is done writing to it
     except OSError:
       pass
-  _state["threads"].clear()
+  _state["pumps"].clear()
   _state["installed"] = False
   _state["saved"].clear()
 
@@ -182,4 +213,10 @@ def self_test():
 
 
 if __name__ == "__main__":
-  self_test()
+  if len(sys.argv) > 1 and sys.argv[1] == "--pump":
+    patterns = json.loads(sys.argv[2])
+    rx = re.compile(b"|".join(re.escape(p.encode()) for p in patterns))
+    with mmap.mmap(int(sys.argv[3]), 8) as counter:
+      _pump(0, 1, rx.search, counter)
+  else:
+    self_test()

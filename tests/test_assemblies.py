@@ -436,6 +436,26 @@ def test_part_shapes():
   assert abs(flat - 0.025) < 1e-9 and abs(upright - 0.05) < 1e-9, (flat, upright)
 
 
+def test_piecewise_cube_is_one_face_adjacent_sequence_without_modules():
+  """The scaling control keeps the 2x2x3 geometry but removes every plate/connect choice."""
+  import numpy as np
+
+  asm = A.make_assembly("cube-sequence-2x2x3", 12)
+  assert not asm.connect_parts and not asm.connect_requires
+  assert asm.assembly_dependencies == {
+      f"obj_{i}": [f"obj_{i - 1}"] for i in range(1, 12)
+  }
+  for i in range(1, 12):
+    parent, offset = asm.assembly_relative_poses[f"obj_{i}"]
+    assert parent == f"obj_{i - 1}"
+    assert np.count_nonzero(np.abs(offset) > 1e-12) == 1
+    assert np.linalg.norm(offset) == pytest.approx(asm.spacing)
+
+  cells = {tuple(np.round(asm.position_in_base(f"obj_{i}") / asm.spacing).astype(int))
+           for i in range(12)}
+  assert cells == {(x, y, z) for x in range(2) for y in range(2) for z in range(3)}
+
+
 def test_module_connect():
   """The two-plate build folded into `assemble`: the top plate {obj_4..7} is an independent
   module, and mating it onto the built bottom plate is a single `assemble` on the module
@@ -764,6 +784,10 @@ def test_structural_milestones_skip_the_global_database(monkeypatch):
       C, asm, robots=robots, weight=5.0, verbose=False,
       milestone_oracle="structural", milestone_boundaries=4)
   assert plan is not None
+  assert plan.states is not None
+  assert len(plan.states) == len(plan) + 1
+  assert plan.states[0] == A.get_initial_state(C, asm)
+  assert plan.states[-1].is_goal(asm)
   assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
 
 
@@ -915,6 +939,21 @@ def test_fill_local_greedy_plans_a_sequence_without_global_oracle():
       C, asm, robots=robots, weight=1.0, verbose=False,
       milestone_oracle="structural", fill_local_h=True,
       fill_exact=False, fill_greedy=True)
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+
+
+def test_fill_target_support_quotient_plans_without_wrench():
+  """Anonymous target holders retain a valid concrete fill on a growing component."""
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 3)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  plan = A.solve_assembly_problem_milestones(
+      C, asm, robots=robots, weight=1.0, verbose=False, wrench=False,
+      milestone_oracle="structural", fill_local_h=True,
+      fill_target_support_quotient=True, fill_greedy=True)
   assert plan is not None
   assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
 
@@ -1646,6 +1685,108 @@ def test_fill_scope_widening_is_local_first_and_force_all_skips_the_fast_pass():
   assert S._fill_scope_passes(False, True) == (False, True)
   assert S._fill_scope_passes(True, False) == (True,)
   assert S._fill_scope_passes(True, True) == (True,)
+
+
+def test_scope_aware_successors_equal_ordered_legacy_postfilter():
+  """Early local scoping is exactly the old ordered global-generator subsequence.
+
+  Walk enough of a mixed-tool, bracing-enabled Cross graph to exercise picks, places,
+  handovers, add-grasps, assemblies and inherited releases.  The comparison includes each
+  successor's value key, not only its action label, so moving the filter before State copying
+  cannot silently change either transition semantics or ordering.
+  """
+  import solver as S
+
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 4)
+  C = make_four_robot_env(
+      num_robots=3, floating_ee=True, vacuum=[True, False, True])
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  _checker, gt = S._search_context(C, asm, robots)
+  start = A.get_initial_state(C, asm)
+  relevant, requested = {"obj_0", "obj_1"}, "obj_1"
+
+  # Explicitly retain a two-holder state. Breadth limiting below otherwise tends to keep
+  # the earlier pick variants and may not visit the state whose inherited-holder release is
+  # the critical unconditional-scope case.
+  held = next(successor for action, successor in A.successors(start, asm, robots, gt)
+              if action[0] == "pick" and action[2] == requested)
+  coheld = next(successor for action, successor in A.successors(
+      held, asm, robots, gt, handovers=True, bracing=True)
+                if action[0] == "add_grasp")
+
+  states, frontier, seen = [coheld], [start], {start, coheld}
+  for _depth in range(3):
+    nxt = []
+    for state in frontier:
+      states.append(state)
+      for _action, successor in A.successors(
+          state, asm, robots, gt, handovers=True, bracing=True):
+        if successor not in seen and len(seen) < 80:
+          seen.add(successor)
+          nxt.append(successor)
+    frontier = nxt
+
+  observed = set()
+  for state in states:
+    legacy = [
+        (action, successor.key())
+        for action, successor in A.successors(
+            state, asm, robots, gt, handovers=True, bracing=True)
+        if S._fill_action_in_scope(action, relevant, requested, touch_all=False)
+    ]
+    scoped = [
+        (action, successor.key())
+        for action, successor in A.successors(
+            state, asm, robots, gt, handovers=True, bracing=True,
+            manipulation_parts=relevant, assembly_parts={requested})
+        if S._fill_action_in_scope(action, relevant, requested, touch_all=False)
+    ]
+    assert scoped == legacy
+    observed.update(action[0] for action, _key in legacy)
+
+  assert {"pick", "place", "handover", "add_grasp", "assemble", "release"} <= observed
+
+
+@pytest.mark.parametrize("kind,n", [
+    ("car-mini", 5),
+    ("chair", 8),
+    ("cube-plates-2x2x3", 6),
+])
+def test_scope_aware_successors_match_families(kind, n):
+  """The same ordered-subsequence invariant covers chains, a DAG and modules."""
+  import solver as S
+
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly(kind, n)
+  C = make_four_robot_env(
+      num_robots=3, floating_ee=True, vacuum=[True, False, True])
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  _checker, gt = S._search_context(C, asm, robots)
+  start = A.get_initial_state(C, asm)
+  requested = next(p for p in A.assembly_order(asm) if p != asm.base)
+  relevant = {asm.base, requested}
+  states = [start]
+  states.extend(successor for _action, successor in list(A.successors(
+      start, asm, robots, gt, handovers=True, bracing=True))[:24])
+
+  for state in states:
+    legacy = [
+        (action, successor.key())
+        for action, successor in A.successors(
+            state, asm, robots, gt, handovers=True, bracing=True)
+        if S._fill_action_in_scope(action, relevant, requested, touch_all=False)
+    ]
+    scoped = [
+        (action, successor.key())
+        for action, successor in A.successors(
+            state, asm, robots, gt, handovers=True, bracing=True,
+            manipulation_parts=relevant, assembly_parts={requested})
+        if S._fill_action_in_scope(action, relevant, requested, touch_all=False)
+    ]
+    assert scoped == legacy
 
 
 def test_direct_fill_skeleton_plans_a_simple_join():

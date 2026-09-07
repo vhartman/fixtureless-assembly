@@ -262,6 +262,7 @@ OPENARM_TORSO_PATH = "./src/rai/openarm/openarm_torso.g"
 OPENARM_ARM_PATHS = {"right": "./src/rai/openarm/right_openarm.g",
                      "left": "./src/rai/openarm/left_openarm.g"}
 OPENARM_FLOATING_EE_PATH = "./src/rai/openarm/openarm_pinch_floating.g"
+HUSKY_CALIBRATED_PATH = "./src/rai/husky/calibrated/husky_calibrated.g"
 
 # The physical trajectory starts and ends at HOME.  Manipulation witnesses park every
 # currently-uninvolved arm at EXIT instead: with four OpenArms the visually natural home pose
@@ -313,6 +314,12 @@ def is_openarm_scene(C):
     names = C.getFrameNames()
     return any("_openarm_left_base_link" in n or "_openarm_right_base_link" in n
                or n.endswith("_openarm_floating_marker") for n in names)
+
+
+def is_husky_scene(C):
+    """Whether ``C`` contains the calibrated dual-UR5e Husky workcell."""
+    return any(n.endswith("_husky_right_arm") or n.endswith("_husky_left_arm")
+               for n in C.getFrameNames())
 
 
 def _configure_openarm_table(C):
@@ -518,6 +525,59 @@ def make_openarm_duo_env(num_duos=1):
                 full[i] = HOMES[side][bi]
             C.setJointState(full)
 
+    return C
+
+
+def make_husky_duo_env():
+    """Calibrated Husky with its two embedded UR5e/Robotiq arms as ``a1``/``a2``.
+
+    The calibrated file is the single source of truth for the carrier, arm mount transforms,
+    joint calibration and grippers.  We rename only the two arm subtrees at load time so the
+    ordinary assembly/search/motion code sees the same robot contract as every other scene;
+    the carrier remains a separately-prefixed fixed tree, as for FR3 and OpenArm.
+    """
+    C = make_world()
+    # The carrier's front bumper ends at x~=0.48.  Keep a 20mm gap, but use a compact
+    # tabletop whose centre is in the two UR5e arms' shared reach volume; inheriting the
+    # generic 1.1m-deep standalone table put centred parts 0.93--1.06m from the shoulders.
+    C.getFrame("table").setShape(
+        ry.ST.ssBox, size=[0.64, 1.10, 0.08, 0.02]).setPosition(
+        [0.82, 0.0, 0.50]).setColor([0.55, 0.55, 0.58, 1.0]).setContact(1)
+
+    carrier = C.addFile(os.path.join(HERE, HUSKY_CALIBRATED_PATH), namePrefix="husky0_")
+    carrier.setParent(C.getFrame("floor")).setJoint(ry.JT.rigid)
+
+    # Rename complete subtrees, including joints, collision proxies and Robotiq frames.
+    # Frame.name is RAI's supported runtime rename operation and keeps parent/child links
+    # intact.  Loading the carrier with its own prefix prevents collisions with world/table.
+    old_names = list(C.getFrameNames())
+    mapping = {}
+    for side, robot in (("right", "a1"), ("left", "a2")):
+        old_prefix = f"husky0_{side}_ur_arm_"
+        new_prefix = f"{robot}_ur_"
+        mapping.update({n: new_prefix + n[len(old_prefix):]
+                        for n in old_names if n.startswith(old_prefix)})
+    untouched = set(old_names) - set(mapping)
+    duplicates = sorted(set(mapping.values()) & untouched)
+    if duplicates or len(set(mapping.values())) != len(mapping):
+        raise RuntimeError(f"Husky arm-prefix adaptation has duplicate frames: {duplicates}")
+    for old, new in mapping.items():
+        C.getFrame(old).name = new
+
+    names = set(C.getFrameNames())
+    for i, (robot, side) in enumerate((("a1", "right"), ("a2", "left"))):
+        prefix = robot + "_"
+        base = C.getFrame(prefix + "ur_base_link")
+        tool0 = C.getFrame(prefix + "ur_tool0")
+        if base is None or tool0 is None or prefix + "ur_gripper_center" not in names:
+            raise RuntimeError(f"calibrated Husky model is missing the {robot} arm/tool contract")
+        # Generic tool calibration measures the approach vector from ur_ee_link to the
+        # gripper centre.  On this URDF tool0 is already the physical mounting flange.
+        C.addFrame(prefix + "ur_ee_link").setParent(tool0)
+        C.addFrame(prefix + "ur_arm_ur5").setParent(base)
+        C.addFrame(prefix + f"husky_{side}_arm").setParent(base)
+        maybe_tighten_fingers(C, prefix)
+        color_gripper(C, prefix, GRIPPER_COLORS[i])
     return C
 
 

@@ -81,6 +81,38 @@ def test_backoff_mate_moves_against_the_mate_axis_and_a_missing_axis_is_a_zero_l
   assert S._backoff_mate(rel, None, 0.05) is rel
 
 
+def test_assemble_funnel_gate_checks_the_edge_not_only_its_endpoints():
+  """Regression: a clear pre-insertion pose and clear seat do not imply a clear skill."""
+  class Config:
+    def getJointNames(self):
+      return ["a1_joint"]
+
+  class State:
+    def subassemblies(self):
+      return [{"obj_0"}, {"obj_1"}]
+
+  rik = object.__new__(S.RobotIK)
+  rik.skill_funnel_collision_res = 0.1
+  rik.funnel_edge_rejects = 0
+  rik.last_funnel_edge_reject = None
+  rik._cur_action = None
+  rik._mate_exempt = None
+  rik._funnel_solve = False
+  rik.scene_for = lambda _state, _assembly: Config()
+  samples = []
+
+  def pen_ok(_C, q):
+    samples.append(float(q[0]))
+    return not 0.45 <= q[0] <= 0.55
+
+  rik._pen_ok = pen_ok
+  action = ("assemble", "a1", "obj_1", "obj_0")
+  assert not rik._funnel_edge_ok(action, State(), object(), np.array([0.0]), np.array([1.0]))
+  assert samples[0] == 0.0 and samples[-1] == pytest.approx(0.5)
+  assert rik.funnel_edge_rejects == 1
+  assert rik.last_funnel_edge_reject[:2] == (action, "collision")
+
+
 # --------------------------------------------------------------------------- the gate
 _GOOD = {"dq": 0.05, "hold": 0.0, "stat_mm": 0.01, "stat_deg": 0.0,
          "dev": 0.03, "pos": 1e-5, "ang": 0.01, "pen": 0.0}
@@ -246,6 +278,30 @@ def test_pre_pick_never_returns_a_different_actor_ik_branch():
   got = rik.pre_skill_witness(("pick", "a1", "obj_0", 0), None, None, None,
                               skill_witness=warm)
   np.testing.assert_allclose(got, [0.1, 0.0])
+
+
+def test_pre_add_grasp_funnel_dispatches_handovers_to_the_same_geometry_solver():
+  """A handover differs from add_grasp only after acquisition, so it must not bypass the
+  incoming-hand standoff controlled by --pre-add-grasp."""
+  rik = object.__new__(S.RobotIK)
+  rik.pre_pick_delta = rik.pre_place_delta = rik.pre_insertion_delta = 0.0
+  rik.pre_add_grasp_delta = 0.05
+  rik.pre_insertion_pull = 1.0
+  rik.pre_skill_max_dq = 0.35
+  rik.C = type("C", (), {"getJointNames": lambda _self: ["a1_j0", "a2_j0"]})()
+  calls = []
+
+  def solve(action, *_args, **kwargs):
+    calls.append((tuple(action), kwargs["backoff"]))
+    return True, np.array([0.0, 0.1])
+
+  rik._ik_add_grasp = solve
+  warm = np.zeros(2)
+  got = rik.pre_skill_witness(
+      ("handover", "a2", "obj_0", 3), None, None, None, skill_witness=warm)
+  np.testing.assert_allclose(got, [0.0, 0.1])
+  assert calls == [(('handover', 'a2', 'obj_0', 3), 0.05)]
+  assert rik._pin_joints is None and rik._opt_pull is None
 
 
 def test_a_pinned_arms_grasp_maintenance_is_dropped(arms):
@@ -479,6 +535,75 @@ class _ChainIK:
 def _task_goal_by_robot(task, width=6):
   q = np.asarray(task.goal.goal)
   return {r: q[k * width:(k + 1) * width] for k, r in enumerate(task.robots)}
+
+
+def test_handover_uses_the_pre_add_grasp_funnel():
+  MP._ensure_mrbench()
+  robots = ["a1", "a2"]
+  idx = {"a1": list(range(6)), "a2": list(range(6, 12))}
+  plan = [("handover", "a2", "obj_0", 4)]
+  s0 = _ChainState([{"obj_0"}], [("a1", "obj_0", 3)],
+                   {"obj_0": ("gripper", "a1")})
+  s1 = _ChainState([{"obj_0"}], [("a2", "obj_0", 4)],
+                   {"obj_0": ("gripper", "a2")})
+  q_skill = np.concatenate([np.full(6, 1.0), np.full(6, 2.0)])
+  q_pre = np.concatenate([np.full(6, 1.0), np.full(6, 1.8)])
+  rik = _ChainIK(robots)
+  rik.pre_add_grasp_delta = 0.05
+
+  tasks, seq, names = MP.build_tasks(
+      None, plan, [q_skill], [s0, s1], robots, idx, rik, np.zeros(12),
+      pre_witnesses={0: q_pre})
+
+  assert rik.solved == 0
+  assert seq == ["00_pre_handover_a2_obj_0_4", "00_handover_a2_obj_0_4", "terminal"]
+  assert names[0] == seq[:2]
+  assert tasks[0].robots == ["a1", "a2"]
+  assert tasks[1].robots == ["a1", "a2"]
+  np.testing.assert_allclose(tasks[0].goal.goal, q_pre)
+  np.testing.assert_allclose(tasks[1].goal.goal, q_skill)
+
+
+def test_place_gets_a_certified_post_detach_departure():
+  """Set-down is a complete contact funnel, not a one-sided approach.
+
+  Once the place task detaches the payload, the free-space planner must not be asked to
+  discover an escape from the contact boundary.  The departure is certified in the new scene,
+  with the payload left on its support. Only the placing arm retracts; an unrelated robot
+  stays out of the departure task.
+  """
+  MP._ensure_mrbench()
+  robots = ["a1", "a2"]
+  idx = {"a1": list(range(6)), "a2": list(range(6, 12))}
+  plan = [("place", "a1", "obj_0", 0, 0)]
+  s0 = _ChainState([{"obj_0"}], [("a1", "obj_0", 3)],
+                   {"obj_0": ("gripper", "a1")})
+  s1 = _ChainState([{"obj_0"}], [], {"obj_0": ("table",)})
+  q_place = np.concatenate([np.full(6, 1.0), np.full(6, 2.0)])
+  q_pre = np.concatenate([np.full(6, 1.25), np.full(6, 2.0)])
+  class _PostPlaceIK(_ChainIK):
+    def post_release_witness(self, action, before, after, assembly, q):
+      out = np.asarray(q, dtype=float).copy()
+      out[idx[action[1]]] += 0.4
+      return out
+
+  rik = _PostPlaceIK(robots)
+  rik.pre_place_delta = 0.05
+  rik.pre_insertion_delta = 0.0
+
+  tasks, seq, names = MP.build_tasks(
+      None, plan, [q_place], [s0, s1], robots, idx, rik, np.zeros(12),
+      pre_witnesses={0: q_pre})
+
+  assert rik.solved == 0
+  assert seq == ["00_pre_place_a1_obj_0_0_0", "00_place_a1_obj_0_0_0",
+                 "00_post_place_a1_obj_0_0_0", "terminal"]
+  assert names[0] == seq[:3]
+  pre, place, post = tasks[:3]
+  assert pre.goal.goal == pytest.approx(q_pre[idx["a1"]])
+  assert place.goal.goal == pytest.approx(q_place[idx["a1"]])
+  assert post.robots == ["a1"]
+  assert post.goal.goal == pytest.approx(q_place[idx["a1"]] + 0.4)
 
 
 def test_add_grasp_assembly_release_is_one_coupled_keyframe_chain():

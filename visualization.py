@@ -293,8 +293,9 @@ def visualize_grasps_viser(C, assembly, recorder=None, view=True, useful=None):
     # only: None = every grasp; "useful" = the mate-viable set; else a scene-set tag.
     Cv = make_world()
     add_part_frame(Cv, part, assembly.part_shape(part))
+    add_part_visual(Cv, part, assembly.visual_meshes.get(part))
     Cv.getFrame(part).setPosition(base[:3]); Cv.getFrame(part).setQuaternion(base[3:])
-    spec = assembly.part_shape(part)
+    spec = assembly.grasp_shape(part)
     surf = _p.part_grasp_surfaces(spec, part=part)
     ids = list(range(len(_p.part_grasp_poses(spec, part=part))))
     U = (useful or {}).get(part)
@@ -338,7 +339,7 @@ def visualize_grasps_viser(C, assembly, recorder=None, view=True, useful=None):
       show(part, only="useful")
     # the scene-aware sets (--grasp-sampler-scenes): one frame per purpose, so 'which grasp
     # can pick / hand over / assemble' is visible directly instead of implied by useful.
-    mets = _p.sampled_grasp_meta(assembly.part_shape(part), part=part)
+    mets = _p.sampled_grasp_meta(assembly.grasp_shape(part), part=part)
     if any(m and "set" in m for m in mets):
       for tag in ("pick", "asm", "free"):
         show(part, only=tag)
@@ -375,7 +376,7 @@ def visualize_initial_grasps_viser(C, assembly, checker, grasp_table, robots,
   for p in parts:
     isolated = _solver.isolated_pick_state(s0, assembly, p)
     rows = [(gp, gid, pose) for gp, gid, pose in grasp_table.get((p,), ()) if gp == p]
-    meta = sampled_grasp_meta(assembly.part_shape(p), part=p)
+    meta = sampled_grasp_meta(assembly.grasp_shape(p), part=p)
     summary[p] = {}
     part_pass = 0
     for kind, robot in representatives.items():
@@ -489,6 +490,7 @@ def visualize_rest_poses_viser(C, assembly, recorder=None, view=True, groups=Non
       poses = _rest_layout_poses(assembly, grp, ref, f, anchor_q)
       for p, pose in poses.items():
         add_part_frame(Cv, p, assembly.part_shape(p))
+        add_part_visual(Cv, p, assembly.visual_meshes.get(p))
         Cv.getFrame(p).setPosition(np.asarray(pose[:3]) + [0, 0, ttop])
         Cv.getFrame(p).setQuaternion(pose[3:])
       label = f"{name} ({len(grp)}p): rest face {f} of {faces}"

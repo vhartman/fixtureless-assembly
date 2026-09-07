@@ -61,6 +61,31 @@ def test_replay_restores_vacuum_engagement_successor_gate():
   assert wrench.PARAMS["vacuum_engage_force"] == 0.0
 
 
+def test_replay_restores_orientation_robust_wrench_gate():
+  import wrench
+
+  R.apply_wrench_params({"orientation_robust_wrench": True})
+  assert wrench.PARAMS["orientation_robust_gravity"] is True
+  R.apply_wrench_params({})
+  assert wrench.PARAMS["orientation_robust_gravity"] is False
+
+
+def test_replay_restores_max_robotiq_profile_and_then_resets_it():
+  import wrench
+
+  R.apply_wrench_params({"wrench_profile": "max_robotiq", "grasp_model": "asymmetric"})
+  assert wrench.PARAMS["grasp"]["asymmetric"]["two_finger"] == {
+      "F_push": 50.0, "F_pull": 50.0, "mu": 1.0,
+      "T_axis": 3.0, "T_lat": 5.0, "T_close": 5.0,
+  }
+  assert wrench.PARAMS["grasp"]["directional"]["two_finger"] == {
+      "F_axial": 50.0, "mu": 1.0, "T_axis": 3.0, "T_lat": 5.0,
+  }
+  R.apply_wrench_params({})
+  assert wrench.PARAMS["grasp"]["asymmetric"]["two_finger"]["T_close"] == 0.4
+  assert wrench.PARAMS["grasp"]["asymmetric"]["two_finger"]["F_pull"] == 25.0
+
+
 def test_build_scene_roundtrips_centered_scatter_and_legacy_layout():
   """Replay must rebuild the saved world poses, not today's profile-owned layout.
 

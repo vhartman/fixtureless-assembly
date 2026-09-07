@@ -48,7 +48,8 @@ def require_complete_witnesses(plan, witnesses, *, who="witness export"):
   return witnesses
 
 
-def witness_block(joint_names, witnesses, alts=None, stage=None, skill_paths=None):
+def witness_block(joint_names, witnesses, alts=None, stage=None, skill_paths=None,
+                  pre_witnesses=None):
   """Pack per-action full-config witnesses for persistence. Entry i belongs to plan[i];
   None entries (actions without an IK keyframe) stay null. `joint_names` records the joint
   ORDER the vectors are expressed in -- readers must refuse the block if their scene's joint
@@ -74,6 +75,14 @@ def witness_block(joint_names, witnesses, alts=None, stage=None, skill_paths=Non
     out["skill_paths"] = {
         str(i): [[float(v) for v in q] for q in path]
         for i, path in sorted(skill_paths.items())}
+  if pre_witnesses:
+    # Short execution funnels are certificates too. In particular, an assemble witness is
+    # only useful when the exact pre-insertion mouth which search collision-checked against it
+    # survives serialization. Re-solving this endpoint in an MP/replay process changes the
+    # certified edge and reintroduces stochastic IK into artifact consumption.
+    out["pre_wit"] = {
+        str(i): [float(v) for v in q]
+        for i, q in sorted(pre_witnesses.items()) if q is not None}
   return out
 
 
@@ -182,4 +191,33 @@ def read_skill_paths(path, joint_names, n_actions, witnesses=None):
       if not np.allclose(qs[-1], np.asarray(witnesses[i]), atol=1e-9, rtol=0.0):
         raise ValueError(f"{path}: skill path at step {i} does not end at its witness")
     out[i] = qs
+  return out or None
+
+
+def read_pre_witnesses(path, joint_names, n_actions, witnesses=None):
+  """Read exact pre-skill endpoint certificates aligned to persisted witnesses.
+
+  Unlike optional witness-set diversity, malformed pre-witness data is a hard artifact error:
+  silently dropping it would cause export to redo IK and certify a different local edge.
+  """
+  import numpy as np
+  with open(path) as f:
+    data = json.load(f)
+  blk = data.get("witnesses") or {}
+  raw = blk.get("pre_wit")
+  if not raw:
+    return None
+  if list(blk.get("joints") or []) != list(joint_names):
+    raise ValueError(f"{path}: pre-witness joint order differs from the current scene")
+  out = {}
+  for key, row in raw.items():
+    i = int(key)
+    if not (0 <= i < n_actions):
+      raise ValueError(f"{path}: invalid pre-witness index {key}")
+    q = np.asarray(row, dtype=float)
+    if q.shape != (len(joint_names),):
+      raise ValueError(f"{path}: wrong-length pre-witness at step {i}")
+    if witnesses is not None and (i >= len(witnesses) or witnesses[i] is None):
+      raise ValueError(f"{path}: pre-witness at step {i} has no canonical skill witness")
+    out[i] = q
   return out or None

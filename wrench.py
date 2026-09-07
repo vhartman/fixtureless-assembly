@@ -23,6 +23,7 @@ force f applied at world point p is the wrench [f, p x f]. Quasi-static, gravity
 
 import numpy as np
 from collections import OrderedDict
+from itertools import combinations
 from scipy.optimize import linprog
 
 try:
@@ -103,6 +104,12 @@ PARAMS = {
     #             falls back to 'corners' when both box axes are nonzero). Ignored when
     #             insertion_uncertainty is None.
     "robust_mode": "corners",
+    # ORIENTATION-ROBUST GRAVITY: for every freely held group, require the same contacts to
+    # balance gravity for every possible rigid-body orientation. This is a continuous robust
+    # zonotope-containment test, not an orientation sample grid. Table-resting groups retain
+    # their authored discrete rest orientation. Opt-in while its deliberate conservatism is
+    # evaluated on the benchmark suite.
+    "orientation_robust_gravity": False,
     # GRASP COMPLIANCE (--grasp-compliance): per-kind multiplier on the INSERTION-UNCERTAINTY
     # box when that kind holds a body in the press's load path. A suction cup is a COMPLIANT
     # contact -- it deflects under contact loads, so the same commanded seating wanders more:
@@ -134,6 +141,42 @@ PARAMS = {
     # grasp unbounded capability ("a very high value") -- the target-side check stays on.
     "check_inserter": True,
 }
+
+
+# Named hardware envelopes are deliberately orthogonal to the grasp-model family.  They are
+# not empirical slip calibrations: these numbers are the gripper manufacturer's absolute
+# structural limits, before the integrator's safety factor and before object/pad friction.
+# Keeping this separate from main.py's search profiles lets one run the same search algorithm
+# with either the historical provisional caps or a declared hardware ceiling.
+WRENCH_PROFILES = {
+    "max_robotiq": {
+        # Robotiq 2F-85 manual section 6.2.4.  The model's grasp-frame columns are
+        # [t1, t2, n] == gripper-local [x, y, z]; z is the approach axis.  Mx/My are specified
+        # at the fingertip base.  Our current box represents the corresponding free-couple
+        # components at the grasp datum; coupling the base moment to contact-force lever arms
+        # is intentionally left to the later measured calibration.
+        "isotropic": {"F_max": 50.0, "T_max": 3.0},  # conservative: one scalar torque cap
+        "directional": {"F_axial": 50.0, "mu": 1.0,
+                        "T_axis": 3.0, "T_lat": 5.0},
+        "asymmetric": {"F_push": 50.0, "F_pull": 50.0, "mu": 1.0,
+                       "T_axis": 3.0, "T_lat": 5.0, "T_close": 5.0},
+    },
+}
+
+
+def apply_wrench_profile(name):
+  """Install a named two-finger hardware envelope into every grasp-model family.
+
+  Scaling/axis-specific CLI overrides are intentionally applied by callers *after* this
+  function, giving the usual explicit-flag > profile precedence.  ``None`` is a no-op so old
+  plans retain the historical provisional caps.
+  """
+  if name is None:
+    return
+  if name not in WRENCH_PROFILES:
+    raise ValueError(f"unknown wrench profile {name!r}; choose from {sorted(WRENCH_PROFILES)}")
+  for model, caps in WRENCH_PROFILES[name].items():
+    PARAMS["grasp"][model]["two_finger"].update(caps)
 
 
 def insert_force(part):
@@ -361,6 +404,168 @@ def point_force_wrench(force_vec, point):
   # wrench about the origin of a force applied at a world point (e.g. insertion reaction).
   f = np.asarray(force_vec, float)
   return np.concatenate([f, _cross3(np.asarray(point, float), f)])
+
+
+def gravity_wrench_map(masses_points):
+  """Return ``A`` such that ``A @ d`` is gravity for body-frame direction ``d``.
+
+  ``masses_points`` uses the same reference point convention as :func:`gravity_wrench`.
+  The direction is dimensionless and has ``||d|| <= 1``; ``GRAVITY`` is included in ``A``.
+  Letting ``d`` range over the unit ball is exactly the convex hull of every possible gravity
+  direction under a rigid-body orientation.  Since the contact wrench set is convex, containing
+  this ball image is equivalent to supporting the group at every orientation.
+  """
+  A = np.zeros((6, 3), dtype=float)
+  for mass, point in masses_points:
+    m = float(mass)
+    p = np.asarray(point, dtype=float)
+    # cross(p, f) = [p]_x f
+    px = np.array([[0.0, -p[2], p[1]],
+                   [p[2], 0.0, -p[0]],
+                   [-p[1], p[0], 0.0]])
+    A[:3] += m * GRAVITY * np.eye(3)
+    A[3:] += m * GRAVITY * px
+  return A
+
+
+_ZONOTOPE_NORMALS = OrderedDict()                         # rounded G -> (Q, facet normals, bytes)
+_ZONOTOPE_NORMALS_BYTES = 0
+# A facet set grows combinatorially with the number of distinct contact-generator directions.
+# An entry-count LRU is therefore not a memory bound: 256 four-grasp entries can occupy many
+# hundreds of MiB.  Bound the actual ndarray payload instead.  Oversize one-off entries remain
+# usable for their caller but are deliberately not retained.
+_ZONOTOPE_NORMALS_BYTE_CAP = 64 * 1024 * 1024
+
+
+def _cache_zonotope_normals(key, Q, H):
+  global _ZONOTOPE_NORMALS_BYTES
+  nbytes = int(Q.nbytes + H.nbytes)
+  if nbytes > _ZONOTOPE_NORMALS_BYTE_CAP:
+    return Q, H
+  while (_ZONOTOPE_NORMALS
+         and _ZONOTOPE_NORMALS_BYTES + nbytes > _ZONOTOPE_NORMALS_BYTE_CAP):
+    _, (_, _, old_bytes) = _ZONOTOPE_NORMALS.popitem(last=False)
+    _ZONOTOPE_NORMALS_BYTES -= old_bytes
+  _ZONOTOPE_NORMALS[key] = (Q, H, nbytes)
+  _ZONOTOPE_NORMALS_BYTES += nbytes
+  return Q, H
+
+
+def _zonotope_facet_normals(G, ub, tol=1e-10):
+  """Affine-hull basis and all facet-normal directions of ``G [0, ub]``.
+
+  A bounded contact generator is a line segment, hence their Minkowski sum is a zonotope.
+  In an ``r``-dimensional zonotope every facet normal is orthogonal to at least ``r-1``
+  independent generator directions.  Enumerating those direction sets gives an exact finite
+  halfspace certificate.  Collinear +/- wrench generators are collapsed for enumeration only;
+  their distinct bounds remain in the support-function calculation.
+  """
+  G = np.asarray(G, dtype=float)
+  ub = np.asarray(ub, dtype=float)
+  if G.ndim != 2 or ub.shape != (G.shape[1],):
+    raise ValueError("zonotope needs G[d,k] and ub[k]")
+  if np.any(ub < 0.0) or not np.all(np.isfinite(ub)):
+    raise ValueError("all-orientation gravity requires finite non-negative contact bounds")
+  active = (ub > tol) & (np.linalg.norm(G, axis=0) > tol)
+  Ga = G[:, active]
+  key = (G.shape[0], Ga.shape[1], np.round(Ga, 10).tobytes())
+  hit = _ZONOTOPE_NORMALS.get(key)
+  if hit is not None:
+    _ZONOTOPE_NORMALS.move_to_end(key)
+    return hit[:2]
+  if Ga.shape[1] == 0:
+    ans = (np.zeros((G.shape[0], 0)), np.zeros((0, 0)))
+    return _cache_zonotope_normals(key, *ans)
+
+  U, s, _ = np.linalg.svd(Ga, full_matrices=True)
+  rank_tol = tol * max(Ga.shape) * max(float(s[0]), 1.0)
+  r = int(np.sum(s > rank_tol))
+  Q = U[:, :r]                                           # orthonormal affine-hull basis
+  Gr = Q.T @ Ga
+
+  # One representative of every unoriented generator line. Facets depend on directions,
+  # not segment lengths or on whether a paired column spells +v or -v.
+  directions = []
+  seen = set()
+  for col in Gr.T:
+    d = col / np.linalg.norm(col)
+    nz = np.flatnonzero(np.abs(d) > tol)
+    if nz.size and d[nz[0]] < 0.0:
+      d = -d
+    k = np.round(d, 10).tobytes()
+    if k not in seen:
+      seen.add(k)
+      directions.append(d)
+
+  normals = []
+  nseen = set()
+
+  def add_normal(h):
+    h = np.asarray(h, dtype=float)
+    h /= np.linalg.norm(h)
+    nz = np.flatnonzero(np.abs(h) > tol)
+    if nz.size and h[nz[0]] < 0.0:
+      h = -h
+    k = np.round(h, 9).tobytes()
+    if k not in nseen:
+      nseen.add(k)
+      normals.append(h)
+
+  if r == 1:
+    add_normal(np.ones(1))
+  else:
+    for ids in combinations(range(len(directions)), r - 1):
+      M = np.asarray([directions[i] for i in ids], dtype=float)
+      _, ss, vh = np.linalg.svd(M, full_matrices=True)
+      if int(np.sum(ss > tol * max(M.shape))) != r - 1:
+        continue
+      add_normal(vh[-1])
+
+  H = np.asarray(normals, dtype=float)
+  return _cache_zonotope_normals(key, Q, H)
+
+
+def equilibrium_all_orientations(G, ub, w_non_gravity, gravity_map, tol=1e-7):
+  """Can bounded contacts balance ``w_non_gravity + A d`` for every ``||d|| <= 1``?
+
+  This is an exact continuous robust test, not an orientation grid.  For each facet normal
+  ``h`` of the contact zonotope, the worst gravity direction is analytic:
+
+      max_d h'(-w0 - A d - centre) = h'(-w0-centre) + ||A' h||_2.
+
+  Checking that value against the zonotope support function at every facet is necessary and
+  sufficient for containment. Contacts may redistribute load for each orientation, matching
+  the fully-adjustable static-equilibrium semantics of the existing corner robustness test.
+  """
+  G = np.asarray(G, dtype=float)
+  ub = np.asarray(ub, dtype=float)
+  w0 = np.asarray(w_non_gravity, dtype=float)
+  A = np.asarray(gravity_map, dtype=float)
+  if w0.shape != (G.shape[0],) or A.shape != (G.shape[0], 3):
+    raise ValueError("wrench centre must be [d] and gravity map [d,3]")
+  Q, H = _zonotope_facet_normals(G, ub)
+  if Q.shape[1] == 0:
+    return bool(np.linalg.norm(w0) <= tol and np.linalg.norm(A) <= tol)
+
+  # The contact set has no extent normal to span(G). Every point of the gravity ellipsoid
+  # must therefore have zero component there, not merely its nominal centre.
+  w_perp = w0 - Q @ (Q.T @ w0)
+  A_perp = A - Q @ (Q.T @ A)
+  if np.linalg.norm(w_perp) > tol or np.linalg.norm(A_perp, ord=2) > tol:
+    return False
+
+  Gr = Q.T @ G
+  wr = Q.T @ w0
+  Ar = Q.T @ A
+  Z = 0.5 * Gr * ub[None, :]
+  centre = np.sum(Z, axis=1)
+  for h0 in H:
+    for h in (h0, -h0):
+      required = float(h @ (-wr - centre) + np.linalg.norm(Ar.T @ h))
+      available = float(np.sum(np.abs(h @ Z)))
+      if required > available + tol:
+        return False
+  return True
 
 
 def equilibrium_feasible(caps, w_external, tol=1e-6):

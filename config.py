@@ -93,6 +93,7 @@ class RunConfig:
   fill_window: int = 2
   milestone_oracle: str = "global"
   fill_local_h: bool = False
+  fill_target_support_quotient: bool = False
   fill_exact: bool = False
   fill_greedy: bool = False
   fill_incumbent_first: bool = False
@@ -113,6 +114,7 @@ class RunConfig:
 
   # -- physics / wrench model --
   wrench: bool = True
+  wrench_profile: Optional[str] = None
   grasp_model: str = "asymmetric"
   table_mu: Optional[float] = None
   vacuum_scale: Optional[float] = None
@@ -126,6 +128,7 @@ class RunConfig:
   insertion_offset: float = 0.0
   insert_force: float = 10.0
   ignore_gravity: bool = False
+  orientation_robust_wrench: bool = False
   robust_mode: str = "corners"
   inserter_check: bool = True
   bracing: bool = True
@@ -164,6 +167,7 @@ class RunConfig:
   always_contact: bool = True
   ik_accuracy: Optional[float] = None
   mate_accuracy: Optional[float] = None
+  mate_angular_accuracy: Optional[float] = None
   grasp_accuracy: Optional[float] = None
   grasp_eq_weight: Optional[float] = None
   mate_eq_weight: Optional[float] = 100.0
@@ -180,6 +184,7 @@ class RunConfig:
   grasp_widen_max: int = 96
   grasp_local_widen: bool = False
   grasp_local_caps: Optional[dict] = None
+  component_grasp_keep: int = 0
   grasp_sampler_margin: float = 0.008
   grasp_sampler_pad_support: float = 0.75
   grasp_sampler_wrap: Optional[float] = None
@@ -214,6 +219,7 @@ class RunConfig:
   screw_speed: Optional[float] = None
   screw_samples: Optional[int] = None
   pre_insertion: float = 0.05
+  skill_funnel_collision_res: Optional[float] = None
   pre_pick: float = 0.05
   pre_place: float = 0.05
   pre_add_grasp: float = 0.05

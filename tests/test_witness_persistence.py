@@ -11,8 +11,9 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from plan_io import missing_required_witnesses, read_plan, read_skill_paths, read_witnesses, \
-    read_witness_stage, require_complete_witnesses, witness_block, write_plan
+from plan_io import missing_required_witnesses, read_plan, read_pre_witnesses, \
+    read_skill_paths, read_witnesses, read_witness_stage, require_complete_witnesses, \
+    witness_block, write_plan
 import mp_export as MP
 import solver
 
@@ -60,6 +61,20 @@ def test_path_valued_skill_certificate_round_trips_and_checks_endpoint(tmp_path)
   p = _write(tmp_path, witness_block(JOINTS, wit, skill_paths=bad))
   with pytest.raises(ValueError, match="does not end"):
     read_skill_paths(p, JOINTS, len(PLAN), wit)
+
+
+def test_pre_insertion_certificate_round_trips_and_fails_closed(tmp_path):
+  wit = [np.zeros(4), np.ones(4), None]
+  pre = {1: np.array([0.9, 0.8, 0.7, 0.6])}
+  p = _write(tmp_path, witness_block(JOINTS, wit, pre_witnesses=pre))
+  out = read_pre_witnesses(p, JOINTS, len(PLAN), wit)
+  assert list(out) == [1]
+  np.testing.assert_array_equal(out[1], pre[1])
+
+  bad = {1: np.ones(3)}
+  p = _write(tmp_path, witness_block(JOINTS, wit, pre_witnesses=bad))
+  with pytest.raises(ValueError, match="wrong-length pre-witness"):
+    read_pre_witnesses(p, JOINTS, len(PLAN), wit)
 
 
 def test_file_without_block_reads_as_none(tmp_path):

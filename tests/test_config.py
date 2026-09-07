@@ -146,6 +146,9 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
   assert main.parse_args(["--milestone-oracle", "structural"]).milestone_oracle == "structural"
   assert main.parse_args(["--milestone-oracle", "chain"]).milestone_oracle == "chain"
   assert main.parse_args(["--fill-local-h", "--fill-exact"]).fill_local_h is True
+  assert main.parse_args([
+      "--fill-target-support-quotient"
+  ]).fill_target_support_quotient is True
   assert main.parse_args(["--fill-local-h", "--fill-exact"]).fill_exact is True
   assert main.parse_args(["--fill-greedy"]).fill_greedy is True
   assert main.parse_args(["--no-fill-greedy"]).fill_greedy is False
@@ -160,6 +163,8 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
   assert main.parse_args(["--fill-touch-all"]).fill_touch_all is True
   assert main.parse_args(["--no-fill-touch-all"]).fill_touch_all is False
   assert main.parse_args(["--no-wrench-aware-h"]).wrench_aware_h is False
+  assert main.parse_args(["--lazy-edge-selector", "defer-failed"]).lazy_edge_selector == \
+      "defer-failed"
   assert main.parse_args([
       "--diagnose-plan-rank", "known.json"
   ]).diagnose_plan_rank == "known.json"
@@ -187,6 +192,20 @@ def test_fill_greedy_is_a_lazy_milestone_policy():
         milestones=True, fill_greedy=True, lazy_fills=False))
   assert main._validate_solver_scoped_flags(RunConfig(
       milestones=True, fill_greedy=True, lazy_fills=True)) == "milestones"
+
+
+def test_target_support_quotient_is_a_no_wrench_local_pdb_ablation():
+  with pytest.raises(SystemExit, match="requires --fill-local-h"):
+    main._validate_solver_scoped_flags(RunConfig(
+        milestones=True, fill_target_support_quotient=True, fill_local_h=False,
+        wrench=False))
+  with pytest.raises(SystemExit, match="requires --fill-local-h"):
+    main._validate_solver_scoped_flags(RunConfig(
+        milestones=True, fill_target_support_quotient=True, fill_local_h=True,
+        wrench=True))
+  assert main._validate_solver_scoped_flags(RunConfig(
+      milestones=True, fill_target_support_quotient=True, fill_local_h=True,
+      wrench=False, geo_facts=False)) == "milestones"
 
 
 def test_standard_uses_greedy_local_fills_without_changing_global_weight():
@@ -262,11 +281,42 @@ def test_saved_plan_persists_milestone_anytime_budget(tmp_path):
   assert loaded.weight == 1.0
 
 
+def test_saved_plan_persists_target_support_quotient(tmp_path):
+  cfg = RunConfig.from_namespace(main.parse_args([
+      "--search-profile", "standard", "--no-wrench",
+      "--fill-target-support-quotient",
+  ]))
+  out = tmp_path / "target-support-quotient-plan.json"
+  main.save_plan(str(out), cfg, [])
+  loaded = RunConfig.from_file(str(out))
+  assert loaded.fill_target_support_quotient is True
+  assert loaded.wrench is False
+
+
 def test_every_nonpresentation_standard_setting_is_persisted():
   """A profile change must not silently create a replay/re-solve semantic gap."""
   presentation_only = {"quiet_rai", "view"}
   assert set(main._STANDARD_SEARCH_PROFILE) - presentation_only <= \
       set(main._SAVE_CONFIG_FIELDS)
+
+
+def test_orientation_robust_wrench_cli_and_plan_roundtrip(tmp_path):
+  cfg = RunConfig.from_namespace(main.parse_args(["--orientation-robust-wrench"]))
+  assert cfg.orientation_robust_wrench is True
+  out = tmp_path / "orientation-robust-plan.json"
+  main.save_plan(str(out), cfg, [])
+  assert RunConfig.from_file(str(out)).orientation_robust_wrench is True
+
+
+def test_max_robotiq_wrench_profile_cli_and_plan_roundtrip(tmp_path):
+  cfg = RunConfig.from_namespace(main.parse_args([
+      "--search-profile", "standard", "--wrench-profile", "max_robotiq",
+  ]))
+  assert cfg.wrench_profile == "max_robotiq"
+  assert cfg.grasp_model == "asymmetric"
+  out = tmp_path / "max-robotiq-plan.json"
+  main.save_plan(str(out), cfg, [])
+  assert RunConfig.from_file(str(out)).wrench_profile == "max_robotiq"
 
 
 def test_open_plan_motion_loop_cli_and_config_roundtrip():
@@ -290,10 +340,22 @@ def test_open_plan_loop_suspends_then_fairly_reopens(tmp_path, monkeypatch):
 
   plan_a = [("pick", "a1", "obj_1", 0)]
   plan_b = [("pick", "a2", "obj_1", 1)]
-  monkeypatch.setattr(main, "_milestone_candidate_session",
-                      lambda *_args, **_kwargs: iter((plan_a, plan_b)))
+  session_caps = []
+
+  def candidate_session(cfg, *_args, **_kwargs):
+    session_caps.append(cfg.component_grasp_keep)
+    # First exhaust the standard restricted component alphabet, then enumerate from its
+    # exact full-union completion. The fair MP behavior below is otherwise unchanged.
+    return iter(()) if len(session_caps) == 1 else iter((plan_a, plan_b))
+
+  monkeypatch.setattr(main, "_milestone_candidate_session", candidate_session)
+  import problem
+  installed_component_caps = []
+  monkeypatch.setattr(problem, "set_component_grasp_keep",
+                      installed_component_caps.append)
   monkeypatch.setattr(solver, "hoist_releases", lambda *_args, **_kwargs: list(_args[2]))
   monkeypatch.setattr(solver, "collect_plan_witnesses", lambda *_args, **_kwargs: {})
+  monkeypatch.setattr(solver, "collect_plan_pre_witnesses", lambda *_args, **_kwargs: {})
   monkeypatch.setattr(plan_io, "require_complete_witnesses", lambda *_args, **_kwargs: None)
   monkeypatch.setattr(plan_io, "witness_block", lambda *_args, **_kwargs: {})
 
@@ -337,10 +399,13 @@ def test_open_plan_loop_suspends_then_fairly_reopens(tmp_path, monkeypatch):
       mp_export_save=str(tmp_path / "selected-export.json"),
       mp_open_plans=True, mp_plan_candidates=2, mp_plan_epochs=2,
       mp_plan_initial_runtime=1.0, mp_runtime=2.0, mp_seed=17,
+      component_grasp_keep=32, grasp_sampler=True,
       hoist_releases=False, view=False, quiet_rai=True,
   )
   result = main._run_open_plan_loop(cfg, object(), object(), ["a1", "a2"], DummyIK())
   assert result["plan_id"]
+  assert session_caps == [32, 0]
+  assert installed_component_caps == [0]
   assert len(calls) == 3
   seeds = [int(c[c.index("--mp-seed") + 1]) for c in calls]
   assert seeds == [17, 18, 100020]
@@ -375,12 +440,13 @@ def test_profile_values_are_reversible_by_explicit_cli():
       "--search-profile", "fast-open", "--weight", "5", "--no-open-witness",
       "--analytic-seed-cap", "9", "--witness-margin", "0.002", "--view",
       "--no-quiet-rai", "--no-grasp-sampler", "--no-grasp-sampler-scenes",
-      "--no-grasp-refine", "--no-grasp-widen",
+      "--no-grasp-refine", "--no-grasp-widen", "--component-grasp-keep", "0",
   ])
   assert a.weight == 5.0 and not a.open_witness and a.analytic_seed_cap == 9
   assert a.witness_margin == 0.002 and a.view and not a.quiet_rai
   assert (not a.grasp_sampler and not a.grasp_sampler_scenes and not a.grasp_refine
           and not a.grasp_widen)
+  assert a.component_grasp_keep == 0
 
 
 def test_profile_wins_over_config_and_individual_cli_wins_over_both(tmp_path):
@@ -543,3 +609,10 @@ def test_group_lever_adds_only_the_centroid_offset():
   assert pair > solo                                    # a group: plus the centroid offset
   assert m2 > m1                                        # and the mass is the whole group's
   assert 0.0 < com[0] <= 0.4
+
+def test_isolated_pick_preflight_does_not_require_fixed_assembly_root():
+  """The root may remain on the table while incoming parts are acquired."""
+  asm = type("Assembly", (), {"base": "obj_0"})()
+  report = {"obj_0": {"ok": False}, "obj_1": {"ok": True},
+            "obj_2": {"ok": False}}
+  assert main._unpickable_required_parts(asm, report) == ["obj_2"]

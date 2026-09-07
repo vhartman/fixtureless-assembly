@@ -84,6 +84,22 @@ def test_query_key_includes_successor_target_and_counts_only_symbolic_aliases():
   assert rik.prof["physical_query_collapses"] == 1
 
 
+def test_pure_physical_query_key_has_no_alias_instrumentation_side_effects():
+  rik = _bare_rik()
+  legacy_calls = []
+  rik._scene_sig = MethodType(lambda self, s: legacy_calls.append(s) or ("legacy", id(s)), rik)
+  rik._physical_query_sig = MethodType(
+      lambda self, _act, before, after, _a: (before.marker, after.marker), rik)
+  action = ("place", "a1", "obj_0", 0)
+  before, after = _State(marker="pre"), _State(marker="landing")
+
+  assert rik._physical_query_key(action, before, after, object()) == (
+      action, ("pre", "landing"))
+  assert legacy_calls == []
+  assert rik._physical_query_legacy == {}
+  assert rik.prof["physical_query_collapses"] == 0
+
+
 def test_identical_physical_query_directly_reuses_witness_without_recheck_or_ik():
   rik = _bare_rik()
   action = ("handover", "a2", "obj_1", 7)

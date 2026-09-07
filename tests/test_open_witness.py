@@ -723,6 +723,86 @@ def test_fail_first_unseen_tie_is_reverse_and_cached_success_is_skipped():
   assert report.successes == 1
 
 
+def test_defer_failed_probes_one_physical_alias_per_epoch_then_moves_on():
+  s = _State("s")
+  n1, n2, ng = _State("n1"), _State("n2"), _State("ng")
+  a1 = ("pick", "a1", "obj", 0)
+  a2 = ("pick", "a2", "obj", 0)
+  good = ("pick", "a3", "other", 0)
+  edges = {a1: (s, a1, n1), a2: (s, a2, n2), good: (s, good, ng)}
+  calls = []
+
+  class RIK:
+    lazy_edge_selector = "defer-failed"
+
+    def _query_key(self, action, _state, _successor, _assembly):
+      return "same-failed-pick" if action in (a1, a2) else "good-pick"
+
+    def probe_bind_once(self, action, _state, _successor, _assembly, attempt):
+      calls.append((action, attempt))
+      return (action == good), ("witness" if action == good else None)
+
+  class Engine:
+    def __init__(self, suspended):
+      self.suspended = suspended
+
+    def search(self, _max_nodes, deadline=None):
+      for action in (a1, a2, good):
+        if (s, action) not in self.suspended:
+          return [action]
+      return None
+
+    def delete_edge(self, state, action, successor):
+      assert (state, action, successor) == edges[action]
+
+  def walk(plan):
+    yield edges[plan[0]]
+
+  plan, end, report = run_open_lazy_fill(
+      robot_ik=RIK(), assembly=object(), make_engine=Engine, walk_plan=walk,
+      is_ik=lambda _a: True, max_nodes=10, max_epochs=1)
+  assert (plan, end) == ([good], ng)
+  assert calls == [(a1, 0), (good, 0)]       # a2 aliases a1 and receives no second IK call
+  assert report.open_failures == 1 and report.successes == 1
+  assert report.physical_deferrals == 1 and report.deferred_physical_queries == 1
+
+
+def test_defer_failed_reopens_the_physical_query_in_the_next_epoch():
+  s, n = _State("s"), _State("n")
+  action = ("pick", "a1", "obj", 0)
+  calls = []
+
+  class RIK:
+    lazy_edge_selector = "defer-failed"
+
+    def _query_key(self, _action, _state, _successor, _assembly):
+      return "physical-pick"
+
+    def probe_bind_once(self, _action, _state, _successor, _assembly, attempt):
+      calls.append(attempt)
+      return attempt == 1, ("witness" if attempt == 1 else None)
+
+  class Engine:
+    def __init__(self, suspended):
+      self.suspended = suspended
+
+    def search(self, _max_nodes, deadline=None):
+      return None if (s, action) in self.suspended else [action]
+
+    def delete_edge(self, state, act, successor):
+      assert (state, act, successor) == (s, action, n)
+
+  def walk(_plan):
+    yield s, action, n
+
+  plan, end, report = run_open_lazy_fill(
+      robot_ik=RIK(), assembly=object(), make_engine=Engine, walk_plan=walk,
+      is_ik=lambda _a: True, max_nodes=10, max_epochs=2)
+  assert (plan, end) == ([action], n)
+  assert calls == [0, 1]
+  assert report.epochs == 2 and report.open_failures == 1
+
+
 def test_skill_specific_effort_ladders_keep_assemble_bundle_atomic():
   calls = []
 

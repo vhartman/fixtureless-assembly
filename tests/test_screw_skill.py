@@ -77,6 +77,14 @@ def test_screw_entry_is_backed_off_and_counter_rotated():
   assert abs(q[0]) < 1e-9
 
 
+def test_quaternion_mate_error_uses_shortest_rotation():
+  identity = np.array([1.0, 0.0, 0.0, 0.0])
+  ten_deg = S._axis_angle_quat([0.0, 0.0, 1.0], np.deg2rad(10.0))
+  assert S._quat_angle_deg(identity, ten_deg) == pytest.approx(10.0)
+  # q and -q encode the same orientation.
+  assert S._quat_angle_deg(identity, -identity) == pytest.approx(0.0)
+
+
 def test_group_equilibrium_receives_pure_torque_without_fake_lever(monkeypatch):
   captured = {}
   monkeypatch.setattr(

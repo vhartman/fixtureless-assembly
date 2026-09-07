@@ -573,6 +573,18 @@ def _axis_angle_quat(axis, angle):
   return np.concatenate([[np.cos(h)], np.sin(h) * a])
 
 
+def _quat_angle_deg(a, b):
+  """Shortest angular distance between two wxyz quaternions, in degrees."""
+  a = np.asarray(a, dtype=float)
+  b = np.asarray(b, dtype=float)
+  na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+  if na == 0.0 or nb == 0.0:
+    raise ValueError("cannot compare a zero quaternion")
+  a = a / na
+  b = b / nb
+  return float(np.degrees(2.0 * np.arccos(np.clip(abs(float(np.dot(a, b))), 0.0, 1.0))))
+
+
 class IKFailureLogDone(Exception):
   # raised by RobotIK._log_failure (only when fail_log_stop is set) once the failure-log
   # window or cap is reached: in debug mode the run's PURPOSE is the failure browser, so
@@ -657,6 +669,16 @@ class RobotIK:
         self.base_link[r] = r + ("_openarm_right_base_link" if
                                  (r + "_openarm_right_base_link") in names
                                  else "_openarm_left_base_link")
+      elif (r + "_husky_right_arm") in names or (r + "_husky_left_arm") in names:
+        # The calibrated Husky embeds two UR5e chains in one carrier.  The env renames each
+        # physical subtree to aN_ but does not insert a fictitious parent between the carrier
+        # and its calibrated base link, so single-arm IK roots at that real base frame.
+        # Separate generated SSIK artifacts preserve the small right/left calibration
+        # differences; neither aliases nor mutates the generic tabletop UR5 calibration.
+        self.robot_arm[r] = ("husky_right" if (r + "_husky_right_arm") in names
+                             else "husky_left")
+        self.base_link[r] = r + "_ur_base_link"
+        self.robot_base[r] = r + "_ur_base_link"
       elif (r + "_right_fr3v2_link0") in names or (r + "_left_fr3v2_link0") in names:
         # FR3 duo: the env's ur_base_link alias marks the arm, but there is NO ssik
         # calibration for franka yet -> robot_arm="fr3" keeps every analytic path disabled
@@ -717,6 +739,13 @@ class RobotIK:
         "calls_with_seeds": 0, "calls_without_seeds": 0,  # why so few analytic solves?
         "wins": {},                                       # winning attempt histogram
     }
+    # PICK-SCALING INSTRUMENTATION.  ``by_family`` deliberately drops the surrounding
+    # obstacle scene while retaining the acting robot and exact world tool target; ``by_query``
+    # adds RobotIK's ordinary physical-query key.  Their ratio answers whether extra robots
+    # merely add actor choices, or whether the search reaches the same pick target through many
+    # distinct table/support scenes.  Numeric rows are [binds, failures, wall_seconds].  This is
+    # observational only: no entry is consulted by search, caching, or IK.
+    self.pick_prof = {"by_family": {}, "by_query": {}}
     self._bind_profile_depth = 0
     self.mate_eq_weight = None                            # None = 1e1 (rai default here)
     self.place_eq_weight = None                           # same, for _ik_place's object-pose eq
@@ -726,6 +755,7 @@ class RobotIK:
     self.closure_rejects = {}
     self.last_closure_reject = None
     self.mate_residual_reject = None                      # None = off; metres (--mate-accuracy)
+    self.mate_angular_residual_reject = None              # None = off; degrees
       # THE acceptance criterion for an assemble. rai's `feasible` verdict accepts an eq
       # constraint that is still MILLIMETRES out, and tightening stopTolerance does NOT change
       # what it ACCEPTS -- measured: bind returns the same 4.5mm mate at stopTolerance 1e-2 and
@@ -797,13 +827,19 @@ class RobotIK:
     self._open_probe_budget = 1
     self._open_probe_random_only = False
     self.braced_analytic = True                           # per-arm analytic for BRACED place/assemble
-    # PRE-INSERTION funnel (--pre-insertion), EXPORT/REPLAY ONLY: metres to back off along the
-    # mate axis for the pre-assemble GOTO waypoint. 0.0 = off. The SEARCH is untouched -- the
-    # mate is still verified/witnessed at the real seated pose (`_ik_assemble` backoff defaults
-    # to 0). The exporter splits each assemble into (pre_assemble goto -> T_pre) + (assemble ->
-    # mated witness), so MP plans the free approach to the funnel mouth and the short seating
-    # mode (which the mr_bench skills branch replaces with the real insertion skill).
+    # PRE-INSERTION funnel (--pre-insertion): metres to back off along the mate axis for the
+    # pre-assemble GOTO waypoint. 0.0 = off. The mate witness remains the real seated pose;
+    # when skill_funnel_collision_res is active, SEARCH additionally requires and caches the
+    # matching mouth and collision-checks their short held-object edge. Export persists that
+    # exact pair. MP still plans the free approach to the mouth and the mr_bench skills branch
+    # replaces the short seating mode with the real insertion skill.
     self.pre_insertion_delta = 0.0
+    # Endpoint feasibility is insufficient for a short execution skill: a held gripper can
+    # cut through the socket between two clear endpoints. None/0 preserves the historical
+    # endpoint-only contract; the standard profile installs the certified MP resolution.
+    self.skill_funnel_collision_res = None
+    self.funnel_edge_rejects = 0
+    self.last_funnel_edge_reject = None
     # sibling pre-skill backoffs (same export-split mechanism, own flags): pick retracts the
     # gripper along -approach (its +z tool axis points INTO the object), place LIFTS the object
     # +z (world) off its rest pose. 0.0 = that skill is not split.
@@ -823,6 +859,10 @@ class RobotIK:
     # not depend on stochastically reproducing a continuation that search already proved.
     # The exact discrete pre/post states prevent reuse across different support contexts.
     self._screw_path_cache = {}
+    # Same contract for ordinary insertion funnels: endpoint acceptance certifies the exact
+    # (pre-insertion, seated) pair. Keep the mouth keyed by action, exact discrete states and
+    # seated vector so plan persistence never has to rediscover it stochastically.
+    self._funnel_witness_cache = {}
     # DEPTH-GATED collision reject on the exact analytic branches (None = off). The full
     # solve's tolerant pose eq can rescue a GRAZING branch (measured: rescues sat at <=10mm
     # penetration) but never a deep one (unrescued failures >=14mm, median 55mm) -- so if
@@ -845,6 +885,7 @@ class RobotIK:
     self.strict_rejects = 0
     self.last_strict_reject = None                       # (total penetration, deepest pairs)
     self.mate_rejects = 0                               # diagnostics: dirty witnesses vetoed
+    self.mate_angular_rejects = 0                       # diagnostics: rotated mates vetoed
     self.grasp_pose_reject = None                       # None = off; metres (--grasp-accuracy)
     self.grasp_rejects = 0                              # diagnostics: off-pose grasps vetoed
     self.grasp_eq_weight = None                         # None = 1e1: NEW-grasp tool-pose pin
@@ -1281,13 +1322,42 @@ class RobotIK:
     legacy = (action, self._scene_sig(s0))
     if not getattr(self, "positive_ik_reuse", False):
       return legacy
-    key = (action, self._physical_query_sig(action, s0, s1, assembly))
+    key = self._physical_query_key(action, s0, s1, assembly)
     aliases = self._physical_query_legacy.setdefault(key, set())
     if legacy not in aliases:
       if aliases:
         self.prof["physical_query_collapses"] += 1
       aliases.add(legacy)
     return key
+
+  def _physical_query_key(self, action, s0, s1, assembly):
+    """Pure physical key for search filtering, without alias/profiler side effects.
+
+    Candidate validation uses :meth:`_query_key`, which additionally records how symbolic
+    histories collapse.  Calling that instrumented path from a dynamic successor filter made
+    bookkeeping proportional to every generated graph edge (857k calls on Chair) rather than
+    to candidate IK queries.  The filter needs only equality with already-failed keys.
+    """
+    action = tuple(action)
+    if not getattr(self, "positive_ik_reuse", False):
+      return action, self._scene_sig(s0)
+    return action, self._physical_query_sig(action, s0, s1, assembly)
+
+  def _pick_profile_family(self, action, state, assembly):
+    """Scene-independent identity of one fixed-world pick target for diagnostics."""
+    robot, part, grasp_id = action[1:4]
+    try:
+      part_pose = _state_part_poses(state, assembly, lift=0.0)[part]
+      grasp = grasp_pose(assembly, part, grasp_id)
+      ee_rel = np.concatenate(
+          [grasp[:3], _quat_mul(grasp[3:], self.q_correction[robot])])
+      ee_world = _pose_compose(np.asarray(part_pose, dtype=float), ee_rel)
+      target = self._physical_pose_key(ee_world)
+    except Exception:
+      # Diagnostics must never make an otherwise valid search fail.  The action remains a
+      # useful coarse family if a future state representation cannot materialize the pose.
+      target = ("unavailable",)
+    return robot, part, grasp_id, target
 
   def _timed_stage_call(self, name, fn, *args, **kwargs):
     """Time a dynamically defined stage (the per-skill nested KOMO builders)."""
@@ -1331,6 +1401,8 @@ class RobotIK:
     # verdict), which the search prefers anyway.
     _qkt0 = _time.perf_counter()
     key = self._query_key(action, s0, s1, assembly)
+    pick_family = (self._pick_profile_family(action, s0, assembly)
+                   if kind == "pick" else None)
     self.prof["query_key_calls"] = self.prof.get("query_key_calls", 0) + 1
     self.prof["query_key_time"] = self.prof.get("query_key_time", 0.0) \
         + (_time.perf_counter() - _qkt0)
@@ -1371,6 +1443,18 @@ class RobotIK:
     if not res[0]:
       _e[1] += 1
     _e[2] += _dt
+    if pick_family is not None:
+      # Retain only a compact in-process identity for the (potentially deeply nested) table
+      # signature.  The canonical full key already lives in the ordinary IK/open-witness
+      # caches; keeping a second reference here unnecessarily extends its lifetime through
+      # fill cleanup. Python's tuple hash is sufficient for observational cardinalities.
+      query_id = hash(key)
+      for table, pkey in ((self.pick_prof["by_family"], pick_family),
+                          (self.pick_prof["by_query"], (pick_family, query_id))):
+        row = table.setdefault(pkey, [0, 0, 0.0])
+        row[0] += 1
+        row[1] += int(not res[0])
+        row[2] += _dt
     if self._ctx_seeds is not None:                       # analytic-refutation study
       _ck, _cov, _ctool = self._ctx_seeds
       _k = f"{_ck}/{_ctool}"
@@ -1528,9 +1612,13 @@ class RobotIK:
             f"cumulative prior-slot offset={pool.prior_slots_not_replayed}.")
       print(f"[ik-reuse] positive pool: {len(pool.success)} exact certificates retained; "
             f"{pool.candidate_success_skips} candidate-path bind(s) skipped before RobotIK, "
-            f"{pool.direct_success_hits} direct pool hit(s). Failed-query suspension remains "
-            "symbolic-edge-local; physical aliases share only the fresh-effort cursor, and "
-            "only that cursor persists across sessions.")
+            f"{pool.direct_success_hits} direct pool hit(s). "
+            + ("The defer-failed selector additionally limits each failed physical query "
+               "to one batch per fairness epoch; all aliases reopen next epoch."
+               if getattr(self, "lazy_edge_selector", "forward") == "defer-failed"
+               else "Failed-query suspension remains symbolic-edge-local; physical aliases "
+                    "share only the fresh-effort cursor, and only that cursor persists across "
+                    "sessions."))
       if pool.success_visit_hist:
         visits = ", ".join(f"visit{k}={v}" for k, v in sorted(pool.success_visit_hist.items()))
         print(f"[ik-reuse] successful-query effort tier: {visits}")
@@ -1636,6 +1724,35 @@ class RobotIK:
       print("[ik-prof] analytic-coverage outcomes (decides ssik-refutation viability):")
       for k in sorted(self.ana_stats):
         print(f"[ik-prof]   {k}: {self.ana_stats[k]}")
+    families = self.pick_prof["by_family"]
+    queries = self.pick_prof["by_query"]
+    if families:
+      binds = sum(v[0] for v in families.values())
+      failures = sum(v[1] for v in families.values())
+      reprobes = sum(max(0, v[0] - 1) for v in queries.values())
+      by_robot = {}
+      for family, row in families.items():
+        rr = by_robot.setdefault(family[0], [0, 0, 0.0, 0, 0])
+        rr[0] += row[0]
+        rr[1] += row[1]
+        rr[2] += row[2]
+        rr[3] += 1
+      for family, _key in queries:
+        by_robot.setdefault(family[0], [0, 0, 0.0, 0, 0])[4] += 1
+      detail = ", ".join(
+          f"{r}={n}/{nf}f,{nfamily} targets/{nquery} scenes"
+          for r, (n, nf, _t, nfamily, nquery) in sorted(by_robot.items()))
+      print(f"[pick-prof] {binds} binds/{failures} failed over {len(families)} exact "
+            f"robot-grasp targets and {len(queries)} physical table scenes; "
+            f"exact-query reprobes={reprobes}; by robot: {detail}")
+      top = []
+      for family, row in families.items():
+        nq = sum(1 for f, _key in queries if f == family)
+        top.append((row[0], row[2], family, row[1], nq))
+      for n, seconds, (robot, part, gid, _target), nf, nq in sorted(
+          top, key=lambda x: (-x[0], -x[1]))[:8]:
+        print(f"[pick-prof]   {robot}/{part}/g{gid}: {n} binds/{nf} failed, "
+              f"{nq} table scenes, {seconds:.2f}s")
     if self.closure_check:
       total = sum(self.closure_rejects.values())
       detail = ", ".join(f"{k}={v}" for k, v in sorted(self.closure_rejects.items()))
@@ -1986,6 +2103,16 @@ class RobotIK:
       C.setJointState(np.asarray(q, dtype=float))
       v, _ = C.eval(ry.FS.positionRel, [part_name, onto])
       return float(np.linalg.norm(np.asarray(v, dtype=float) - np.asarray(rel_pos, dtype=float)))
+    finally:
+      C.setJointState(saved)
+
+  def mate_angular_residual(self, C, q, part_name, onto, rel_quat):
+    """Shortest quaternionRel error in degrees; see :meth:`mate_residual`."""
+    saved = C.getJointState()
+    try:
+      C.setJointState(np.asarray(q, dtype=float))
+      v, _ = C.eval(ry.FS.quaternionRel, [part_name, onto])
+      return _quat_angle_deg(v, rel_quat)
     finally:
       C.setJointState(saved)
 
@@ -3876,6 +4003,11 @@ class RobotIK:
         if _mr > self.mate_residual_reject:
           self.mate_rejects += 1                       # under-seated: try the next bias/restart
           feasible = False
+      if feasible and witness is not None and self.mate_angular_residual_reject is not None:
+        _ma = self.mate_angular_residual(C, witness, part_name, onto, rel_quat)
+        if _ma > self.mate_angular_residual_reject:
+          self.mate_angular_rejects += 1
+          feasible = False
       if bias_axes is None and bi >= 0:                # evidence: canonical bias slot id `bi`
         _st = self.action_stats.setdefault(("abias", part, onto, bi), [0, 0, 0.0])
         _st[0] += 1
@@ -3974,6 +4106,11 @@ class RobotIK:
         if self.mate_residual(C, witness, part_name, onto, rel_pos) > self.mate_residual_reject:
           self.mate_rejects += 1
           feasible, witness = False, None
+      if feasible and witness is not None and self.mate_angular_residual_reject is not None:
+        if (self.mate_angular_residual(C, witness, part_name, onto, rel_quat)
+            > self.mate_angular_residual_reject):
+          self.mate_angular_rejects += 1
+          feasible, witness = False, None
       _winning_basin_row = _record_assemble_basin(
           ("pre-" if _pre_solve else "") + "fallback",
           _raw_feasible, feasible, _time.perf_counter() - _basin_t0)
@@ -4006,21 +4143,85 @@ class RobotIK:
     REQUESTED MAXIMUM (the ladder accepts the largest feasible rung), so the search never
     rejects a witness the exporter could have used. Only for the REAL mate solve (backoff==0);
     the funnel solves themselves must not recurse."""
+    key = self._funnel_witness_key(action, s0, s1, witness)
+    if key in self._funnel_witness_cache:
+      return True
     part = action[2]
     moving = next((g for g in s0.subassemblies() if part in g), (part,))
     movers = {action[1]} | {r for r, (pt, _g) in self.holders(s0).items() if pt in moving}
     names = self.C.getJointNames()
     pin = {n: float(witness[k]) for r in self.robots if r not in movers
            for k, n in enumerate(names) if n.startswith(r + "_")}
-    return self.pre_skill_witness(action, s0, s1, assembly,
-                                  skill_witness=witness, pin=pin) is not None
+    pre = self.pre_skill_witness(action, s0, s1, assembly,
+                                 skill_witness=witness, pin=pin)
+    if pre is not None:
+      self._funnel_witness_cache[key] = np.asarray(pre, dtype=float).copy()
+    return pre is not None
+
+  @staticmethod
+  def _funnel_witness_key(action, s0, s1, witness):
+    q = np.asarray(witness, dtype=np.float64)
+    return (tuple(action), s0.key(), s1.key(), np.round(q, 10).tobytes())
+
+  def cached_funnel_witness(self, action, s0, s1, witness):
+    """Exact funnel mouth previously certified together with ``witness``."""
+    if witness is None:
+      return None
+    q = self._funnel_witness_cache.get(
+        self._funnel_witness_key(action, s0, s1, witness))
+    return None if q is None else q.copy()
+
+  def _funnel_edge_ok(self, action, s0, assembly, pre, seat):
+    """Sample the exact local held-gripper continuation certified by an assemble witness.
+
+    This is deliberately narrower than motion planning: it checks only the short skill edge
+    from the already solved funnel mouth to the already solved seat.  The rest of the transit
+    remains free to detour.  The moving/target part pair is the intended mate and is exempt in
+    the same way as at the seated IK; every hand/target, arm/part, arm/arm and table collision
+    remains active.
+    """
+    resolution = getattr(self, "skill_funnel_collision_res", None)
+    if resolution is None or resolution <= 0.0:
+      return True
+    q0 = np.asarray(pre, dtype=float).ravel()
+    q1 = np.asarray(seat, dtype=float).ravel()
+    C = self.scene_for(s0, assembly)
+    if q0.size != q1.size or q0.size != len(C.getJointNames()):
+      self.funnel_edge_rejects += 1
+      self.last_funnel_edge_reject = (tuple(action), "joint-vector-shape", q0.size, q1.size)
+      return False
+    steps = max(1, int(np.ceil(float(np.max(np.abs(q1 - q0))) / resolution)))
+    part, onto = action[2], action[3]
+    moving = next((g for g in s0.subassemblies() if part in g), (part,))
+    target = next((g for g in s0.subassemblies() if onto in g), (onto,))
+    old_action, old_exempt, old_funnel = self._cur_action, self._mate_exempt, self._funnel_solve
+    self._cur_action = tuple(action)
+    self._mate_exempt = (frozenset(moving), frozenset(target))
+    self._funnel_solve = True
+    try:
+      # Endpoints were already accepted by their own IK calls. Sampling them again is useful:
+      # it validates the exact common scene/contact convention used for the connecting edge.
+      for index in range(steps + 1):
+        alpha = index / steps
+        q = (1.0 - alpha) * q0 + alpha * q1
+        if not self._pen_ok(C, q):
+          self.funnel_edge_rejects += 1
+          self.last_funnel_edge_reject = (
+              tuple(action), "collision", index, steps, float(alpha),
+              getattr(self, "last_strict_reject", None))
+          return False
+    finally:
+      self._cur_action, self._mate_exempt, self._funnel_solve = \
+          old_action, old_exempt, old_funnel
+    return True
 
   def pre_skill_witness(self, action, s0, s1, assembly, skill_witness=None, pin=None):
     """EXPORT/REPLAY helper for --pre-pick/--pre-place/--pre-insertion: the PRE-skill GOTO
     keyframe -- the skill witness backed off along its approach axis (pick: -z_EE retract;
     place: +z lift; assemble: -mate_axis). Returns the full-config witness, or None (skill not
-    split / IK failed -- caller falls back to the skill witness). Solved on demand; NOT used by
-    the search (whose witness is always the real skill pose).
+    split / IK failed -- caller falls back to the skill witness). Solved on demand. Assemble
+    search invokes it when the funnel certificate is active; other skill kinds remain export
+    helpers. The canonical skill witness itself is always the real contact/seated pose.
 
     COUPLED to the skill witness: the pre-skill solve is WARM-STARTED from `skill_witness` and
     given a full-config qItself pull toward it.  A hard post-solve actor-joint corridor then
@@ -4039,7 +4240,11 @@ class RobotIK:
     screw = (assembly.screw_skill(action[2])
              if kind == "assemble" and len(action) >= 3 else None)
     delta = {"pick": self.pre_pick_delta, "place": self.pre_place_delta,
+             # A handover is the same geometric acquisition as add_grasp; only its
+             # ownership update differs.  Both therefore use the same incoming-hand
+             # funnel and calibration flag.
              "add_grasp": self.pre_add_grasp_delta,
+             "handover": self.pre_add_grasp_delta,
              "assemble": (screw.depth if screw is not None else
                           self.pre_insertion_delta)}.get(kind, 0.0)
     if delta <= 0.0:
@@ -4106,7 +4311,7 @@ class RobotIK:
           ok, w = self._ik_pick(action, s0, s1, assembly, None, backoff=d, warm=warm)
         elif kind == "place":
           ok, w = self._ik_place(action, s0, s1, assembly, None, backoff=d, warm=warm)
-        elif kind == "add_grasp":
+        elif kind in ("add_grasp", "handover"):
           ok, w = self._ik_add_grasp(action, s0, s1, assembly, None, backoff=d, warm=warm)
         else:
           ok, w = self._ik_assemble(action, s0, s1, assembly, None, backoff=d, warm=warm)
@@ -4117,6 +4322,9 @@ class RobotIK:
             dq = float(np.linalg.norm(np.asarray(w, dtype=float)[actor_idx] - warm[actor_idx]))
             if dq > self.pre_skill_max_dq:
               continue                                  # feasible pose, wrong IK branch
+          if (kind == "assemble" and warm is not None
+              and not self._funnel_edge_ok(action, s0, assembly, w, warm)):
+            continue
           return w
       return None
     finally:
@@ -4137,13 +4345,14 @@ class RobotIK:
     return None if path is None else [q.copy() for q in path]
 
   def post_release_witness(self, action, s0, s1, assembly, release_witness=None):
-    """EXPORT helper for the missing second half of a contact funnel: RELEASE -> RETRACT.
+    """EXPORT helper for the missing second half of a detach funnel: DETACH -> RETRACT.
 
-    A release itself has no IK witness; it fires at the configuration inherited from the
-    preceding grasp/assemble task. After the re-parent, solve a 5cm (configurable) departure
-    along the released grasp's -approach axis while every other arm is hard-pinned at that
-    release configuration. This makes the narrow contact exit explicit instead of asking a
-    random free-space sampler to discover it from a measure-near-zero boundary state.
+    A release fires at the configuration inherited from the preceding grasp/assemble task;
+    a place has its own set-down witness.  After either action reparents the object, solve a
+    5cm (configurable) departure along the released grasp's -approach axis while every other
+    arm is hard-pinned at that detach configuration. This makes the narrow contact exit
+    explicit instead of asking a random free-space sampler to discover it from a
+    measure-near-zero boundary state.
 
     The same full RobotIK clearance predicate used by search gates this solve. DELTA is a
     requested maximum: if the full departure is unreachable in the contact pocket, retry a
@@ -4152,7 +4361,8 @@ class RobotIK:
     task. Failure of the whole ladder returns None; mp_export retains deterministic structure.
     """
     self.post_release_used_delta = None
-    if self.post_release_delta <= 0.0 or release_witness is None or action[0] != "release":
+    if (self.post_release_delta <= 0.0 or release_witness is None
+        or action[0] not in ("release", "place")):
       return None
     robot = action[1]
     held = self.holders(s0).get(robot)
@@ -5063,6 +5273,27 @@ def _quat_err_deg(v, target):
   return float(np.degrees(2.0 * np.arccos(dot)))
 
 
+def _apply_known_action(state, action, assembly, robots, grasp_table, *,
+                        gripper_kind=None, handovers=True, allow_place=True,
+                        bracing=False):
+  """Apply one already-selected action without enumerating unrelated primitives.
+
+  This is only a lookup optimization for fixed-plan replay/post-processing. The
+  successor generator already supports generation-time local scopes, and every
+  non-release primitive is keyed by ``action[2]`` (the manipulated/incoming part).
+  Releases deliberately ignore these scopes. We still match the complete action
+  tuple and accept the generator's real successor, so applicability and every
+  generator-level gate remain authoritative.
+  """
+  part_scope = ({action[2]} if len(action) > 2 else None)
+  return next((ns for act, ns in successors(
+      state, assembly, robots, grasp_table=grasp_table,
+      gripper_kind=gripper_kind, handovers=handovers,
+      allow_place=allow_place, bracing=bracing,
+      manipulation_parts=part_scope, assembly_parts=part_scope)
+      if act == action), None)
+
+
 def _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
                    bracing, grasp_table, who):
   # states[i] = the discrete state plan[i] is applied IN (len = len(plan)+1), re-derived by
@@ -5072,10 +5303,10 @@ def _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_pla
   # search that produced the plan.
   states = [get_initial_state(C, assembly)]
   for a in plan:
-    ns = next((ns for act, ns in successors(
-        states[-1], assembly, robots, grasp_table=grasp_table,
-        gripper_kind=gripper_kind, handovers=handovers, allow_place=allow_place,
-        bracing=bracing) if act == a), None)
+    ns = _apply_known_action(
+        states[-1], a, assembly, robots, grasp_table,
+        gripper_kind=gripper_kind, handovers=handovers,
+        allow_place=allow_place, bracing=bracing)
     if ns is None:                                          # successor flags don't match the plan
       raise ValueError(
           f"{who}: cannot reproduce action {tuple(a)} from the successor set "
@@ -5188,6 +5419,39 @@ def collect_plan_witnesses(C, assembly, plan, robots, robot_ik, *, gripper_kind=
     ok_n = sum(ok for _, _, ok in rebuilt)
     print(f"[witness-persist] release hoisting/state rewriting required {len(rebuilt)} "
           f"new IK certification(s): {ok_n} succeeded, {len(rebuilt) - ok_n} failed.")
+  return out
+
+
+def collect_plan_pre_witnesses(C, assembly, plan, witnesses, robots, robot_ik, *,
+                               gripper_kind=None, handovers=True, allow_place=True,
+                               bracing=False, grasp_table=None, resolve_missing=False):
+  """Materialize exact search-certified mouths for split assemble skills.
+
+  The seated witness is part of the cache key: an optimized or replaced endpoint cannot
+  inherit a mouth certified for another endpoint. ``resolve_missing`` is reserved for an
+  explicit recertification path; ordinary artifact loading must remain read-only.
+  """
+  if grasp_table is None:
+    _checker, grasp_table = _search_context(C, assembly, robots)
+  states = _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
+                          bracing, grasp_table, "collect_plan_pre_witnesses")
+  out = {}
+  for i, a0 in enumerate(plan):
+    a = tuple(a0)
+    if (not a or a[0] != "assemble" or robot_ik.pre_insertion_delta <= 0.0
+        or assembly.screw_skill(a[2]) is not None):
+      continue
+    w = witnesses[i] if witnesses is not None and i < len(witnesses) else None
+    if w is None:
+      continue
+    q = robot_ik.cached_funnel_witness(a, states[i], states[i + 1], w)
+    if q is None and resolve_missing:
+      # Re-certify the pair through the same acceptance path used by search. This is called
+      # only for fresh/explicitly refreshed witnesses, never because a loaded artifact is old.
+      if robot_ik._funnel_witness_ok(a, states[i], states[i + 1], assembly, w):
+        q = robot_ik.cached_funnel_witness(a, states[i], states[i + 1], w)
+    if q is not None:
+      out[i] = np.asarray(q, dtype=float).copy()
   return out
 
 
@@ -5451,6 +5715,16 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
   add-grasp/pre-insertion keyframe."""
   import time
   t0 = time.perf_counter()
+  # The pairing relation always starts at an add_grasp action. Most plans do not
+  # brace at all, so do not reconstruct the complete discrete state trace (and
+  # enumerate global successors for every fixed action) merely to discover an
+  # empty pair set. This is an exact structural test, not a heuristic.
+  if not any(a and a[0] == "add_grasp" for a in plan):
+    if verbose:
+      print("[fuse] 0/0 (add_grasp, assemble) pair(s) fused in "
+            f"{time.perf_counter() - t0:.1f}s; the rest keep BOTH original witnesses.")
+    return list(witnesses), {"pairs": 0, "fused": 0, "rows": [],
+                             "pre_witnesses": {}}
   if grasp_table is None:
     _checker, grasp_table = _search_context(C, assembly, robots)
   states = _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
@@ -5731,7 +6005,8 @@ def _pre_gate(o, n, pen_gate, max_dq, hold_dq, hold_mm, pos_tol, ang_tol):
 def fuse_pre_skill_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
                              gripper_kind=None, handovers=True, allow_place=True,
                              bracing=False, grasp_table=None, max_dq=0.35, hold_dq=0.02,
-                             hold_mm=2.0, pos_tol=1e-3, ang_tol=1.0, verbose=True):
+                             hold_mm=2.0, pos_tol=1e-3, ang_tol=1.0, verbose=True,
+                             certified_pre_witnesses=None):
   """PRE-SKILL WITNESS CONSISTENCY -- a post-pass over a FIXED discrete plan, run AFTER
   optimize_witnesses / fuse_cograsp_witnesses and BEFORE mp_export.
 
@@ -5769,6 +6044,7 @@ def fuse_pre_skill_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
   t0 = time.perf_counter()
   deltas = {"pick": robot_ik.pre_pick_delta, "place": robot_ik.pre_place_delta,
             "add_grasp": robot_ik.pre_add_grasp_delta,
+            "handover": robot_ik.pre_add_grasp_delta,
             "assemble": robot_ik.pre_insertion_delta}
   split = [i for i, a in enumerate(plan) if deltas.get(a[0], 0.0) > 0.0]
   if not split:
@@ -5786,13 +6062,24 @@ def fuse_pre_skill_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
   # floor. Either way the repaired keyframe may never be dirtier than the one it replaces.
   pen_gate = robot_ik.penetration_reject if robot_ik.penetration_reject is not None else 1e-4
 
-  pre, rows, pin_robots = {}, [], {}
+  # Search-certified assemble mouths are authoritative. They were solved with the same pin
+  # rule and collision-checked as an edge against this exact seated witness. Re-solving one
+  # here would replace a certificate with a new stochastic query. Other split skills still
+  # use this post-pass because their mouths are not part of search feasibility.
+  pre = {int(i): np.asarray(q, dtype=float).copy()
+         for i, q in (certified_pre_witnesses or {}).items() if q is not None}
+  rows, pin_robots = [], {}
   for i in split:
     a = plan[i]
     kind, actor, delta = a[0], a[1], deltas[a[0]]
     s0, s1 = states[i], states[i + 1]
     w = witnesses[i]
     tag = f"[pre] {i:02d} {kind} {' '.join(str(x) for x in a[1:])}"
+    if i in pre:
+      rows.append((i, kind, True, "persisted search certificate", None, None))
+      if verbose:
+        print(f"  {tag}: REUSED exact search-certified funnel mouth")
+      continue
     # BEFORE is today's export-time call, verbatim -- both the measurement baseline AND the
     # fallback, so a rejected split exports exactly what it exports today.
     before = robot_ik.pre_skill_witness(a, s0, s1, assembly, w)
@@ -6029,22 +6316,35 @@ def hoist_releases(C, assembly, plan, robots, gripper_kind=None, handovers=True,
   after the release, (c) both re-ordered edges pass the search's own cheap geometric check,
   and (d) the state after the pair is IDENTICAL (key) to before -- so the plan suffix and
   final state are untouched. Returns a new Plan with a consistent .states trajectory."""
+  import time
+  t0 = time.perf_counter()
   checker, grasp_table = _search_context(C, assembly, robots)
+  t_context = time.perf_counter()
 
   def apply(s, a):
-    return next((ns for act, ns in successors(
-        s, assembly, robots, grasp_table=grasp_table, gripper_kind=gripper_kind,
-        handovers=handovers, allow_place=allow_place, bracing=bracing) if act == a), None)
+    return _apply_known_action(
+        s, a, assembly, robots, grasp_table, gripper_kind=gripper_kind,
+        handovers=handovers, allow_place=allow_place, bracing=bracing)
 
   acts = list(plan)
-  states = [get_initial_state(C, assembly)]
-  for a in acts:                                           # re-simulate (don't trust payloads)
-    ns = apply(states[-1], a)
-    if ns is None:
-      if verbose:
-        print("[hoist] plan does not re-simulate under these successor flags; skipped.")
-      return plan
-    states.append(ns)
+  recorded = getattr(plan, "states", None)
+  initial = get_initial_state(C, assembly)
+  if (recorded is not None and len(recorded) == len(acts) + 1
+      and recorded[0] == initial):
+    # A Plan returned directly by graph search carries the exact successor
+    # trajectory that produced it. Preserve that work. Deserialized/re-written
+    # lists have no trace and still take the validating replay path below.
+    states = list(recorded)
+  else:
+    states = [initial]
+    for a in acts:
+      ns = apply(states[-1], a)
+      if ns is None:
+        if verbose:
+          print("[hoist] plan does not re-simulate under these successor flags; skipped.")
+        return plan
+      states.append(ns)
+  t_replay = time.perf_counter()
 
   moved, shifts = 0, 0
   for j in range(len(acts)):
@@ -6055,11 +6355,17 @@ def hoist_releases(C, assembly, plan, robots, gripper_kind=None, handovers=True,
       rel, prev_a = acts[i], acts[i - 1]
       s0 = states[i - 1]
       s_mid = apply(s0, rel)
-      if s_mid is None or not cheap_feasible(rel, s0, s_mid, assembly, checker):
+      if s_mid is None:
         break
       s_after = apply(s_mid, prev_a)
-      if s_after is None or s_after != states[i + 1] or \
-         not cheap_feasible(prev_a, s_mid, s_after, assembly, checker):
+      # Test the exact symbolic diamond before either collision query. Most attempted
+      # bubbles stop because the release and preceding action share a robot/component;
+      # paying two CAD/FCL scene builds before discovering that non-commutativity made
+      # postprocessing dominate Fabrica runs. This only reorders the existing predicates.
+      if s_after is None or s_after != states[i + 1]:
+        break
+      if (not cheap_feasible(rel, s0, s_mid, assembly, checker)
+          or not cheap_feasible(prev_a, s_mid, s_after, assembly, checker)):
         break
       acts[i - 1], acts[i] = rel, prev_a
       states[i] = s_mid                                    # states[i+1] proven identical
@@ -6069,7 +6375,9 @@ def hoist_releases(C, assembly, plan, robots, gripper_kind=None, handovers=True,
       moved += 1
   if verbose:
     print(f"[hoist] releases: {moved} moved earlier ({shifts} positions total) "
-          f"of {sum(1 for a in acts if a[0] == 'release')}.")
+          f"of {sum(1 for a in acts if a[0] == 'release')}; "
+          f"context={t_context - t0:.2f}s replay={t_replay - t_context:.2f}s "
+          f"swaps={time.perf_counter() - t_replay:.2f}s.")
   out = Plan(acts)
   out.states = states
   return out
@@ -7008,7 +7316,8 @@ class CollapsedLabeledHeuristic:
                collapse_grasps=False, geo_checker=None, grasp_classes=None,
                labeled_loose=False, dist_cap=None, ideal_chain=None,
                component_root=None, fill_goal=False, lazy_build=False,
-               goal_states=None):
+               goal_states=None, target_support_quotient=False,
+               reverse_deadline=None):
     import heapq
     import time as _time
 
@@ -7034,6 +7343,12 @@ class CollapsedLabeledHeuristic:
     self._fill_goal = bool(fill_goal)
     self._lazy_build = bool(lazy_build)
     self._goal_states = tuple(goal_states or ())
+    # Optional cooperative wall deadline for a query-driven reverse table.  This is used by
+    # bounded LNS windows: constructing their endpoint PDB is part of the window's fair time
+    # slice, not unmetered preprocessing.  A deadline pause is deliberately NOT exhaustion;
+    # callers must treat an unsettled query as unknown and retain their other admissible bound.
+    self._reverse_deadline = reverse_deadline
+    self._reverse_deadline_hit = False
     if self._goal_states and self._fill_goal:
       raise ValueError("goal_states and fill_goal are mutually exclusive")
     # A chain projection retains the FULL remaining-order signal but restricts the abstract
@@ -7052,6 +7367,22 @@ class CollapsedLabeledHeuristic:
       all_parts = chain[-1]
     self._tracked_loose = (None if chain is None else
                            frozenset(all_parts) - frozenset(chain[0]))
+    # In a wrench/geometry-free *local* fill, the identities of grasps on the already-built
+    # target component have no effect on any abstract transition. Retaining them nevertheless
+    # creates a growing alphabet as the component grows. This optional quotient replaces
+    # those labels by anonymous holder tokens, while preserving multiplicity and the complete
+    # gripper-kind usability mask. The moving component remains labeled: its grasp is the
+    # interface carried through inverse ASSEMBLE.
+    self._target_support_quotient = bool(target_support_quotient)
+    if self._target_support_quotient:
+      if not (self._fill_goal and chain is not None and len(chain) == 2):
+        raise ValueError("target_support_quotient requires a two-level fill-goal chain")
+      if gripper_kind is not None or geo_checker is not None:
+        raise ValueError("target_support_quotient is only defined without wrench/geo facts")
+      if getattr(assembly, "staged_mates", None):
+        raise ValueError("target_support_quotient does not yet represent staged mates")
+    self._target_parts = frozenset(chain[0]) if self._target_support_quotient else frozenset()
+    self._target_token_tag = "__fill_target_holder__"
     self._closure = {p: frozenset(_mate_closure(assembly, p)) for p in objs}
 
     def tadd(t, x):
@@ -7120,19 +7451,54 @@ class CollapsedLabeledHeuristic:
             m |= set(_kmask.get(((q,), q, g), ()))
           self._label_kinds[(q, lbl)] = frozenset(m)
 
-    def gvariants(S_key, pg):                              # raw variants of a collapsed label
+    # Build the anonymous target-holder alphabet after kind masks are known. Tokens are
+    # distinguished only when different robot tool populations can realize them. For a
+    # uniform/untagged grasp table this is exactly one token, independent of target size.
+    self._target_pairs = {}
+    self._target_capacity = {}
+    self._target_token_for = {}
+    if self._target_support_quotient:
+      for S in ideal_keys:
+        grouped = {}
+        ordinary = []
+        for pg in self.valid[S]:
+          p, gb = pg
+          if p not in self._target_parts:
+            ordinary.append(pg)
+            continue
+          mask = self._label_kinds.get(pg, frozenset({"*"}))
+          token = (self._target_token_tag, tuple(sorted(mask)))
+          self._target_token_for[pg] = token
+          grouped.setdefault(token, []).extend((p, g) for g in self._vgroups[S][pg])
+        self._target_pairs[S] = {
+            token: tuple(sorted(set(pairs))) for token, pairs in grouped.items()}
+        self._target_capacity[S] = {
+            token: len(pairs) for token, pairs in self._target_pairs[S].items()}
+        for token in grouped:
+          self._label_kinds[token] = frozenset(token[1]) - {"*"}
+        self.valid[S] = tuple(sorted(ordinary + list(grouped), key=repr))
+
+    def is_target_token(pg):
+      return bool(pg and pg[0] == self._target_token_tag)
+
+    def grasp_pairs(S_key, pg):                           # concrete (part, raw grasp) variants
+      if is_target_token(pg):
+        return self._target_pairs.get(S_key, {}).get(pg, ())
       m = self._vgroups.get(S_key)
       if m is not None and pg in m:
-        return m[pg]
-      return self._svgroups.get(pg[0], {}).get(pg[1], (pg[1],))
+        return tuple((pg[0], g) for g in m[pg])
+      return tuple((pg[0], g) for g in self._svgroups.get(
+          pg[0], {}).get(pg[1], (pg[1],)))
+
+    def gvariants(S_key, pg):                              # raw variants of a collapsed label
+      return tuple(g for _p, g in grasp_pairs(S_key, pg))
 
     import itertools as _it
 
     def gcombos(S_key, G):                                 # every raw-variant assignment of G
       if not G:
         return [()]
-      return _it.product(*[[(p, g) for g in gvariants(S_key, (p, gb))]
-                           for p, gb in G])
+      return _it.product(*[grasp_pairs(S_key, pg) for pg in G])
 
     self._ee_path = gripper_path
     self._pick_cache = {}
@@ -7152,10 +7518,16 @@ class CollapsedLabeledHeuristic:
       hit = self._pick_cache.get(key)
       if hit is None:
         hit = self._pick_cache[key] = any(
-            _table_aware_pick_fact(assembly, S_key, face, pg[0], g, pth,
+            _table_aware_pick_fact(assembly, S_key, face, part, g, pth,
                                    clearance=self._clearance)
-            for g in gvariants(S_key, pg) for pth in fact_paths(S_key, pg[0], g))
+            for part, g in grasp_pairs(S_key, pg)
+            for pth in fact_paths(S_key, part, g))
       return hit
+
+    def can_add_label(ideal_key, G, pg):
+      if is_target_token(pg):
+        return G.count(pg) < self._target_capacity.get(ideal_key, {}).get(pg, 0)
+      return pg not in G
 
     # placement faces are now looked up PER SUBASSEMBLY in the stable rest-pose table
     # (rest_faces) instead of the old global 0..5 -- so the abstraction offers exactly the
@@ -7365,7 +7737,7 @@ class CollapsedLabeledHeuristic:
       # inverse PLACE-ASSEMBLY: on table now -> was held by one more grasp in the air
       if face is not Hf and cap_used < self.R:
         for pg in self.valid[ideal]:
-          if pg not in G:
+          if can_add_label(ideal, G, pg):
             yield (ideal, tadd(G, pg), Hf, L), 1.0
         # SAME-LABEL variant: the placing holder shared its label with a remaining one, so
         # the forward place leaves G UNCHANGED (Hf -> face) -- the distinct-label edge
@@ -7377,7 +7749,7 @@ class CollapsedLabeledHeuristic:
       # inverse RELEASE: some grasp was just opened (wrench-gated on t staying supported)
       if cap_used < self.R and w_hold_ok(ideal, G, face):
         for pg in self.valid[ideal]:
-          if pg not in G:
+          if can_add_label(ideal, G, pg):
             yield (ideal, tadd(G, pg), face, L), 1.0
       # inverse ADD_GRASP (bracing only): pre-state held the assembly with one FEWER grasp --
       # forms the >=2-grasp brace offset horizontal mates need (see LabeledDisassemblyHeuristic
@@ -7431,8 +7803,19 @@ class CollapsedLabeledHeuristic:
       main = next(g for g in state.subassemblies() if self._component_root in g)
       ideal = _subasm_key(main)
       if self._collapse:
-        G = tuple(sorted({(c[2], self._gcollapse(c[2], c[3])) for p in main
-                          for c in state.supports.get(p, ()) if c[0] == "grasp"}))
+        concrete_G = [(c[2], self._gcollapse(c[2], c[3])) for p in main
+                      for c in state.supports.get(p, ()) if c[0] == "grasp"]
+        if self._target_support_quotient:
+          # Preserve anonymous-holder multiplicity. Non-target signature labels keep their
+          # historical set semantics. A prior widened fill can leave a raw grasp outside this
+          # PDB's compact table; map it to an optimistic all-tool token rather than raising.
+          target_G = [self._target_token_for.get(
+              pg, (self._target_token_tag, tuple(self._all_kinds) or ("*",)))
+              for pg in concrete_G if pg[0] in self._target_parts]
+          mover_G = set(pg for pg in concrete_G if pg[0] not in self._target_parts)
+          G = tuple(sorted(target_G + list(mover_G), key=repr))
+        else:
+          G = tuple(sorted(set(concrete_G)))
       else:
         G = tuple(sorted((c[2], c[3]) for p in main
                          for c in state.supports.get(p, ()) if c[0] == "grasp"))
@@ -7511,6 +7894,10 @@ class CollapsedLabeledHeuristic:
       ta = _time.perf_counter()
       try:
         while pq:
+          if (self._reverse_deadline is not None
+              and _time.perf_counter() >= self._reverse_deadline):
+            self._reverse_deadline_hit = True
+            return False
           d, _, t = heapq.heappop(pq)
           if d > self.dist.get(t, float("inf")) or t in self._settled:
             continue
@@ -7609,6 +7996,8 @@ class CollapsedLabeledHeuristic:
       # the appropriate atomic thing to try.  Context participates in the key because the
       # same collapsed label can expand to different raw rows before and after a join.
       for p, gb in G:
+        if p == getattr(self, "_target_token_tag", None):
+          continue                                        # anonymous label has no raw column
         raw = frozenset(self._vgroups.get(ideal, {}).get(
             (p, gb), self._svgroups.get(p, {}).get(gb, (gb,))))
         atom_key = ("grasp", "support", ideal, p, gb)
@@ -7672,6 +8061,8 @@ class CollapsedLabeledHeuristic:
       seen_states.add(key)
       ideal, G, face, L = key
       for p, gb in G:
+        if p == getattr(self, "_target_token_tag", None):
+          continue                                        # anonymous label has no raw column
         raw = frozenset(self._vgroups.get(ideal, {}).get(
             (p, gb), self._svgroups.get(p, {}).get(gb, (gb,))))
         if raw:
@@ -7705,6 +8096,7 @@ class CollapsedLabeledHeuristic:
         "pick_facts": len(self._pick_cache),
         "wrench_facts": len(self._wfacts),
         "exhausted": self._reverse_exhausted,
+        "deadline_hit": self._reverse_deadline_hit,
     }
 
 
@@ -8484,12 +8876,10 @@ def _search_context(C, assembly, robots, build_table=True):
   if not build_table:
     return checker, None
   per_kind = {k: precompute_grasps(assembly, gripper_path=ee_path[k]) for k in distinct}
-  table = GraspTable()
-  table.kinds_of = {}
-  table.robot_kinds = dict(kinds)
   rolls = _problem._ROLLS_PER_FACE
   dense = _problem._DENSE_GRASPS
-  for key in set().union(*(t.keys() for t in per_kind.values())):
+
+  def merge_key(key, table):
     merged = {}
     for k in distinct:
       for p, g, pose in per_kind[k].get(key, ()):
@@ -8504,8 +8894,30 @@ def _search_context(C, assembly, robots, build_table=True):
         merged.setdefault((p, g), (p, g, pose))
         table.kinds_of.setdefault((key, p, g), set())
         table.kinds_of[(key, p, g)].add(k)
-    table[key] = sorted(merged.values(), key=lambda t: (t[0], t[1]))
-  table.kinds_of = {kk: frozenset(v) for kk, v in table.kinds_of.items()}
+    rows = sorted(merged.values(), key=lambda t: (t[0], t[1]))
+    # Freeze only this key's masks now. Other keys may still be lazily absent.
+    for p, g, _pose in rows:
+      kk = (key, p, g)
+      table.kinds_of[kk] = frozenset(table.kinds_of[kk])
+    return rows
+
+  lazy_component_table = any(isinstance(t, LazyGraspTable) for t in per_kind.values())
+  ordered_keys = (tuple(per_kind[distinct[0]].keys()) if lazy_component_table else
+                  tuple(set().union(*(t.keys() for t in per_kind.values()))))
+  if lazy_component_table:
+    table = None
+
+    def factory(key):
+      return merge_key(key, table)
+
+    table = LazyGraspTable(ordered_keys, factory)
+  else:
+    table = GraspTable()
+  table.kinds_of = {}
+  table.robot_kinds = dict(kinds)
+  if not isinstance(table, LazyGraspTable):
+    for key in ordered_keys:
+      table[key] = merge_key(key, table)
   return checker, table
 
 
@@ -8768,7 +9180,8 @@ class _IncrementalLazySearch:
 
   def __init__(self, start, goal_fn, succ_fn, cost_fn, h_fn, weight, blacklist,
                cheap_gate=None, pop_observer=None, repairable=True,
-               memoize_successors=True, compact_frontier=False, cost_bound=None):
+               memoize_successors=True, compact_frontier=False, cost_bound=None,
+               edge_filter=None):
     import itertools
     import os
     self.goal_fn, self.cost_fn, self.h_fn = goal_fn, cost_fn, h_fn
@@ -8777,6 +9190,10 @@ class _IncrementalLazySearch:
     # admissible g+h, so this changes neither completeness below the bound nor optimality.
     self.cost_bound = cost_bound
     self.blacklist = blacklist                            # shared, grows externally
+    # Optional dynamic family-level filter.  Unlike ``blacklist`` (one symbolic edge), this
+    # can suppress every alias of the same physical query for a fairness epoch.  It is checked
+    # at every point where a queued/recovery/generated edge can enter the live tree.
+    self.edge_filter = edge_filter
     self.cheap_gate = cheap_gate                          # EAGER pop-time gate (cheap checks):
     self.pop_observer = pop_observer                    # opt-in exact search-order diagnostic
     self.repairable = bool(repairable)
@@ -8851,6 +9268,33 @@ class _IncrementalLazySearch:
       self._queue((self._f(0.0, h0), h0, 0.0, next(self.tie), start, None, None))
     elif self.profile_enabled:
       self.profile["bound_prunes"] += 1
+
+  def _edge_allowed(self, prev, action, state):
+    return ((prev, action) not in self.blacklist
+            and (self.edge_filter is None or self.edge_filter(prev, action, state)))
+
+  def set_edge_filter(self, edge_filter):
+    """Install a dynamic edge-family filter before search begins."""
+    self.edge_filter = edge_filter
+
+  def invalidate_filtered_edges(self):
+    """Repair the current tree after a dynamic filter gains new exclusions.
+
+    Return the number of currently claimed tree edges directly rejected by the new filter.
+    Pending and alternate routes need no eager scan: the ordinary live-edge checks discard
+    them when they are considered.  Deleting only the highest rejected roots also avoids
+    repeatedly walking an already removed subtree.
+    """
+    rejected = [(state, prev, action)
+                for state, (prev, action) in tuple(self.came_from.items())
+                if prev is not None and not self._edge_allowed(prev, action, state)]
+    removed_roots = 0
+    for state, prev, action in rejected:
+      if self.came_from.get(state, (None, None)) != (prev, action):
+        continue
+      self._delete_edge(prev, action, state)
+      removed_roots += 1
+    return len(rejected), removed_roots
 
   def _h(self, state):
     sentinel = self
@@ -8968,7 +9412,7 @@ class _IncrementalLazySearch:
     if entry is None:
       return False
     prev, action = entry[5], entry[6]
-    if prev not in self.claimed or (prev, action) in self.blacklist:
+    if prev not in self.claimed or not self._edge_allowed(prev, action, state):
       return False
     self._queue(entry)
     return True
@@ -9013,7 +9457,7 @@ class _IncrementalLazySearch:
       if self.profile_enabled:
         self.profile["boundary_sources"] += 1
       for action, state in self._succ(parent):
-        if state not in targets or (parent, action) in self.blacklist:
+        if state not in targets or not self._edge_allowed(parent, action, state):
           continue
         ng = pg + self.cost_fn(action)
         hs = self._h(state)
@@ -9097,7 +9541,7 @@ class _IncrementalLazySearch:
         print(f"[fill-debug] pop{_pops} act={action} gate={gate} h_env={_h:.2f}", flush=True)
       _pops += 1
       if prev is not None:
-        if prev not in self.claimed or (prev, action) in self.blacklist:
+        if prev not in self.claimed or not self._edge_allowed(prev, action, s):
           if self.profile_enabled:
             self.profile["stale_parent_pops"] += 1
           continue                                        # stale: parent gone / edge deleted
@@ -9156,7 +9600,7 @@ class _IncrementalLazySearch:
         self.budget_hit = True
         return None
       for a, ns in self._succ(s):
-        if (s, a) in self.blacklist:
+        if not self._edge_allowed(s, a, ns):
           continue
         ng = g + self.cost_fn(a)
         hns = self._h(ns)
@@ -9597,7 +10041,7 @@ def _finite_grasp_caps(grasp_table, objects, maximum):
 def _make_fill_local_pdb(start, assembly, robots, checker, grasp_table, p,
                          grasp_classes, gripper_kind=None, bracing=False,
                          component_root=None, geo_facts=False, verbose=False,
-                         lazy_build=True):
+                         lazy_build=True, target_support_quotient=False):
   """Build the backward pattern database for one settled fill goal.
 
   Every grasp label uses the same shared fact-signature projection. This uniform abstraction
@@ -9623,7 +10067,7 @@ def _make_fill_local_pdb(start, assembly, robots, checker, grasp_table, p,
         bracing=bracing, geo_checker=checker if geo_facts else None,
         grasp_classes=grasp_classes, labeled_loose=True,
         ideal_chain=(before, after), component_root=root, fill_goal=True,
-        lazy_build=lazy_build)
+        lazy_build=lazy_build, target_support_quotient=target_support_quotient)
   except RuntimeError as exc:
     if "exceeded 200000 states" not in str(exc):
       raise
@@ -9689,7 +10133,9 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
             {k: int(getattr(robot_ik, k, 0)) for k in (
                 "reach_rejects", "analytic_rejects", "collision_rejects",
                 "precheck_rejects", "strict_rejects", "margin_rejects")},
-            dict(getattr(robot_ik, "margin_reject_pairs", {})))
+            dict(getattr(robot_ik, "margin_reject_pairs", {})),
+            {name: {k: tuple(v) for k, v in rows.items()}
+             for name, rows in getattr(robot_ik, "pick_prof", {}).items()})
 
   def _fill_prof(tag):
     if not verbose:
@@ -9712,9 +10158,16 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
           sorted(rejects.items(), key=lambda item: (-item[1], item[0])))
       print(f"[fill-succ-prof {tag}] kept/raw by primitive: {by_kind or 'none'}; "
             f"filtered: {by_reject or 'none'}")
+      pick_raw_robot = _succ_prof.get("pick_raw_robot", {})
+      pick_kept_robot = _succ_prof.get("pick_kept_robot", {})
+      if pick_raw_robot:
+        detail = ", ".join(
+            f"{robot}={pick_kept_robot.get(robot, 0)}/{count}"
+            for robot, count in sorted(pick_raw_robot.items()))
+        print(f"[fill-succ-prof {tag}] pick successors kept/raw by robot: {detail}")
     if robot_ik is None or _fp0 is None:
       return
-    pr, (f0, fba, fgates, fpairs) = robot_ik.prof, _fp0
+    pr, (f0, fba, fgates, fpairs, fpick) = robot_ik.prof, _fp0
     db = pr["bind_solves"] - f0["bind_solves"]
     if not db:
       return
@@ -9752,6 +10205,42 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
           + (f"; gates: {', '.join(gates)}" if gates else "")
           + (f"; margin-refine={dmr} ({dmrt:.1f}s)" if dmr else "")
           + (f"; clearance-pairs: {pair_summary}" if pair_summary else ""))
+    # Split repeated visible action labels into (a) exact world pick targets, (b) distinct
+    # physical table scenes, and (c) repeat effort on an identical physical query.  This is
+    # the diagnostic needed for the R=2 -> R=4 scaling question: target growth is the direct
+    # actor multiplier, scene growth comes from the enlarged symbolic support/holder graph,
+    # and reprobes expose finite open-witness effort rather than new geometry.
+    pick = getattr(robot_ik, "pick_prof", {})
+    fam_now, query_now = pick.get("by_family", {}), pick.get("by_query", {})
+    fam0, query0 = fpick.get("by_family", {}), fpick.get("by_query", {})
+    fam_delta = {k: (v[0] - fam0.get(k, (0, 0, 0.0))[0],
+                     v[1] - fam0.get(k, (0, 0, 0.0))[1],
+                     v[2] - fam0.get(k, (0, 0, 0.0))[2])
+                 for k, v in fam_now.items()
+                 if v[0] > fam0.get(k, (0, 0, 0.0))[0]}
+    query_delta = {k: (v[0] - query0.get(k, (0, 0, 0.0))[0],
+                       v[1] - query0.get(k, (0, 0, 0.0))[1],
+                       v[2] - query0.get(k, (0, 0, 0.0))[2])
+                   for k, v in query_now.items()
+                   if v[0] > query0.get(k, (0, 0, 0.0))[0]}
+    if fam_delta:
+      pb = sum(v[0] for v in fam_delta.values())
+      pf = sum(v[1] for v in fam_delta.values())
+      repeats = sum(max(0, v[0] - 1) for v in query_delta.values())
+      by_robot = {}
+      for family, row in fam_delta.items():
+        rr = by_robot.setdefault(family[0], [0, 0, 0, 0])
+        rr[0] += row[0]
+        rr[1] += row[1]
+        rr[2] += 1
+      for family, _key in query_delta:
+        by_robot.setdefault(family[0], [0, 0, 0, 0])[3] += 1
+      detail = ", ".join(
+          f"{r}={n}/{nf}f,{nt}t/{nq}s"
+          for r, (n, nf, nt, nq) in sorted(by_robot.items()))
+      print(f"[pick-prof {tag}] binds={pb}/{pf}f targets={len(fam_delta)} "
+            f"table-scenes={len(query_delta)} exact-query-reprobes={repeats}; "
+            f"robots: {detail}")
   settle = settle_ref if settle_ref is not None else assembly.base
   # Local feasibility ordering is deliberately independent of the outer/global weight.
   # Greedy best-first pays attention only to the goal-conditioned fill heuristic; it changes
@@ -9759,7 +10248,8 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
   search_weight = float("inf") if fill_greedy else (1.0 if exact_fill else weight)
   if _os.environ.get("FILL_SEARCH_PROFILE"):
     from collections import Counter as _Counter
-    _succ_prof = {"raw": _Counter(), "kept": _Counter(), "rejects": _Counter()}
+    _succ_prof = {"raw": _Counter(), "kept": _Counter(), "rejects": _Counter(),
+                  "pick_raw_robot": _Counter(), "pick_kept_robot": _Counter()}
   else:
     _succ_prof = None
 
@@ -9859,11 +10349,22 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
     return None
 
   def succ_fn(s):
+    # Push the existing local scope into the primitive loops so irrelevant pick/place/
+    # handover/brace states are never allocated. The post-filter immediately below remains
+    # the executable specification and safety net; scoped generation must be an ordered
+    # subsequence of the historical global generator, never a new pruning rule.
+    effective_touch_all = _FILL_TOUCH_ALL if touch_all is None else bool(touch_all)
+    manipulation_parts = None if effective_touch_all else relevant
+    requested_parts = {p}
     for a, ns in successors(s, assembly, robots, grasp_table=grasp_table,
                             gripper_kind=gripper_kind, handovers=handovers,
-                            allow_place=allow_place, bracing=bracing):
+                            allow_place=allow_place, bracing=bracing,
+                            manipulation_parts=manipulation_parts,
+                            assembly_parts=requested_parts):
       if _succ_prof is not None:
         _succ_prof["raw"][a[0]] += 1
+        if a[0] == "pick":
+          _succ_prof["pick_raw_robot"][a[1]] += 1
       # RELEASE of an inherited grasp is always legal. The broad scope pass additionally admits
       # ordinary manipulation of future/blocking parts, but _fill_action_in_scope prevents an
       # unrelated assembly join from making the concrete state disagree with outer `ideal`.
@@ -9912,6 +10413,8 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
         continue                                          # proposal: Bellman-optimal PDB corridor
       if _succ_prof is not None:
         _succ_prof["kept"][a[0]] += 1
+        if a[0] == "pick":
+          _succ_prof["pick_kept_robot"][a[1]] += 1
       yield a, ns
 
   def _diagnose_reference_rank():
@@ -10522,9 +11025,12 @@ def _add_parts(start, ps, ideal, assembly, robots, checker, grasp_table, robot_i
     return left + _num_loose_held(s, assembly) + max(0, _assembly_holders(s, assembly) - 1)
 
   def succ_fn(s):
+    effective_touch_all = _FILL_TOUCH_ALL if touch_all is None else bool(touch_all)
     for a, ns in successors(s, assembly, robots, grasp_table=grasp_table,
                             gripper_kind=gripper_kind, handovers=handovers,
-                            allow_place=allow_place, bracing=bracing):
+                            allow_place=allow_place, bracing=bracing,
+                            manipulation_parts=(None if effective_touch_all else relevant),
+                            assembly_parts=set(ps)):
       if _fill_action_in_scope(a, relevant, ps, touch_all=touch_all):
         if _grasp_action_within_cap(a, grasp_cap):
           yield a, ns                                     # inherited release always legal;
@@ -11004,6 +11510,7 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
                                            fill_window=2, lazy_fills=True,
                                            cost_bound=None, milestone_oracle="global",
                                            fill_local_h=False, fill_exact=False,
+                                           fill_target_support_quotient=False,
                                            fill_greedy=False,
                                            fill_incumbent_first=False,
                                            fill_policy_first=False,
@@ -11050,6 +11557,9 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
   milestone_boundaries = int(milestone_boundaries)
   if (fill_policy_first or fill_policy_guide) and not fill_local_h:
     raise ValueError("fill_policy_first/fill_policy_guide requires fill_local_h")
+  if fill_target_support_quotient and (wrench or geo_facts or not fill_local_h):
+    raise ValueError("fill_target_support_quotient requires fill_local_h without "
+                     "wrench or geo facts")
   if fill_policy_guide and not (grasp_local_widen or placement_yaw_widening):
     raise ValueError("fill_policy_guide requires grasp_local_widen or "
                      "placement_yaw_widening; otherwise it has no fibre to widen")
@@ -11168,6 +11678,9 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
       print("[fill-local-h] ACTIVE: one goal-conditioned PDB per fill "
             "(all grasps fact-signature projected); "
             + f"concrete fill ordering={'greedy' if fill_greedy else ('weight 1 (exact)' if fill_exact else f'weight {weight:g}')}")
+      if fill_target_support_quotient:
+        print("[fill-target-support-quotient] ACTIVE: target-component holders are "
+              "anonymous counts partitioned by tool-kind mask; mover grasps stay labeled")
 
   def fill_pdb(s, q, settle):
     if not fill_local_h:
@@ -11182,7 +11695,8 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
       hit = _make_fill_local_pdb(
           s, assembly, robots, checker, local_pdb_grasp_table, q, fill_classes,
           gripper_kind=hgk, bracing=bracing, component_root=root,
-          geo_facts=geo_facts, verbose=verbose)
+          geo_facts=geo_facts, verbose=verbose,
+          target_support_quotient=fill_target_support_quotient)
       fill_pdb_cache[key] = hit
     return hit
 
@@ -11791,6 +12305,25 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
 
   objs = frozenset(assembly.objects)
   plan = []
+  initial_state = get_initial_state(C, assembly)
+  plan_states = [initial_state]
+  trace_valid = True
+
+  def commit_subplan(plen, sub):
+    """Commit actions and retain the exact A* trajectory when one is available."""
+    nonlocal trace_valid, plan_states
+    del plan[plen:]
+    plan.extend(sub)
+    if not trace_valid:
+      return
+    states = getattr(sub, "states", None)
+    if states is None or len(states) != len(sub) + 1 \
+        or states[0] != plan_states[plen]:
+      trace_valid = False
+      plan_states = []
+      return
+    del plan_states[plen + 1:]
+    plan_states.extend(states[1:])
   # MODULE support (proper-DAG assemblies, e.g. cube-plates): a connect ROOT q stands for
   # its whole module -- the order ideal {p : q in closure(p)} that must be built DETACHED
   # and joined as a unit (assembles() already does the join; only this sequencer was
@@ -11846,7 +12379,7 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
   # distinct endpoints fail. The parent State is essential: the same next part may fail from
   # boundary A and succeed from boundary B.
   # This is lazy K-boundary retention: ordinary successful runs still pay for one fill.
-  stack = [(get_initial_state(C, assembly), frozenset({assembly.base}), 0, None)]
+  stack = [(initial_state, frozenset({assembly.base}), 0, None)]
   blacklist = set()                                       # transitions exhausted in every endpoint
   boundary_rejects = {}                                   # transition -> {settled State endpoints}
   repairs = 0
@@ -11882,7 +12415,9 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
       return None
     s, ideal, plen, _via = stack[-1]
     if ideal == objs:
-      final = plan[:plen]
+      final = Plan(plan[:plen])
+      if trace_valid:
+        final.states = list(plan_states[:plen + 1])
       s_final = s
       if not s.is_goal(assembly):
         # FINAL SETTLE (set_goal on_table): all parts mated but the assembly is not yet at
@@ -11913,11 +12448,20 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
             reject_via(via, "final settle failure")
             repairs += 1
           continue
-        final = final + sub
+        combined = Plan([*final, *sub])
+        sub_states = getattr(sub, "states", None)
+        if final.states is not None and sub_states is not None \
+            and len(sub_states) == len(sub) + 1 and sub_states[0] == final.states[-1]:
+          combined.states = [*final.states, *sub_states[1:]]
+        final = combined
         s_final = s2
       if verbose:
         print(f"[milestones] complete: {len(final)} actions in "
               f"{time.perf_counter() - t0:.2f}s ({repairs} repairs)")
+        if hasattr(grasp_table, "materialized"):
+          print(f"[component-grasps/search] materialized {grasp_table.materialized}/"
+                f"{len(grasp_table)} component tables "
+                f"({grasp_table.materialized_rows} rows).")
       # Stopping iteration here is the historical first-plan behavior. Resuming means an
       # EXTERNAL consumer suspended this complete realization (normally after finite MP
       # failure): keep all search/IK/PDB state, exclude this incumbent's final checkpoint for
@@ -11962,8 +12506,7 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
         sub, s2 = fill(s, q, ideal, fb=fb, excluded_end_states=excluded)
       grown = (ideal | modules[q]) if q in connect else (ideal | {q})
       if sub is not None:
-        del plan[plen:]
-        plan.extend(sub)
+        commit_subplan(plen, sub)
         stack.append((s2, grown, len(plan), (decision, s2)))
         progressed = True
         if verbose:
@@ -12030,8 +12573,7 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
             if sub is not None:
               break
           if sub is not None:
-            del plan[plen:]
-            plan.extend(sub)
+            commit_subplan(plen, sub)
             stack.append((s2, ideal | set(t), len(plan), (decision, s2)))
             progressed = True
             if verbose:
@@ -12075,6 +12617,7 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
                                      fill_window=2, lazy_fills=True,
                                      cost_bound=None, milestone_oracle="global",
                                      fill_local_h=False, fill_exact=False,
+                                     fill_target_support_quotient=False,
                                      fill_greedy=False,
                                      fill_incumbent_first=False,
                                      fill_policy_first=False,
@@ -12125,6 +12668,7 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
       deadline=deadline, fill_window=fill_window, lazy_fills=lazy_fills,
       cost_bound=cost_bound, milestone_oracle=milestone_oracle,
       fill_local_h=fill_local_h, fill_exact=fill_exact, fill_greedy=fill_greedy,
+      fill_target_support_quotient=fill_target_support_quotient,
       fill_incumbent_first=fill_incumbent_first,
       fill_policy_first=fill_policy_first, fill_policy_guide=fill_policy_guide,
       fill_skeleton_first=fill_skeleton_first,
@@ -12174,6 +12718,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
                                       fill_window=2, lazy_fills=True,
                                       cost_bound=None, milestone_oracle="global",
                                       fill_local_h=False, fill_exact=False,
+                                      fill_target_support_quotient=False,
                                       fill_greedy=False,
                                       fill_incumbent_first=False,
                                       fill_policy_first=False,
@@ -12195,6 +12740,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
       deadline=deadline, fill_window=fill_window, lazy_fills=lazy_fills,
       cost_bound=cost_bound, milestone_oracle=milestone_oracle,
       fill_local_h=fill_local_h, fill_exact=fill_exact, fill_greedy=fill_greedy,
+      fill_target_support_quotient=fill_target_support_quotient,
       fill_incumbent_first=fill_incumbent_first,
       fill_policy_first=fill_policy_first,
       fill_policy_guide=fill_policy_guide,
@@ -12217,6 +12763,7 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
                                               grasp_collapsed_h=False, fill_window=2,
                                               milestone_oracle="global",
                                               fill_local_h=False, fill_exact=False,
+                                              fill_target_support_quotient=False,
                                               fill_greedy=False,
                                               fill_incumbent_first=False,
                                               fill_policy_first=False,
@@ -12270,6 +12817,7 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
         allow_place=allow_place, bracing=bracing, geo_facts=geo_facts,
         sig_collapsed_h=sig_collapsed_h, deadline=t_mile, fill_window=fill_window,
         milestone_oracle=milestone_oracle, fill_local_h=fill_local_h,
+        fill_target_support_quotient=fill_target_support_quotient,
         fill_exact=fill_exact, fill_greedy=fill_greedy,
         fill_incumbent_first=fill_incumbent_first,
         fill_policy_first=fill_policy_first,
@@ -12338,7 +12886,7 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
 
 
 def _make_lns_endpoint_pdb(start, target, ideal_chain, assembly, robots, grasp_table,
-                           h_landmark, cost_bound):
+                           h_landmark, cost_bound, deadline=None):
   """Retarget the incumbent's projected model at one exact LNS boundary.
 
   The ordinary milestone fill and this endpoint heuristic now share the same reverse-Dijkstra
@@ -12360,7 +12908,7 @@ def _make_lns_endpoint_pdb(start, target, ideal_chain, assembly, robots, grasp_t
       grasp_classes=h_landmark._grasp_classes,
       labeled_loose=h_landmark._labeled_loose, dist_cap=cap,
       ideal_chain=ideal_chain, component_root=h_landmark._component_root,
-      lazy_build=True, goal_states=(target,))
+      lazy_build=True, goal_states=(target,), reverse_deadline=deadline)
 
 
 def _refill_window(start, touched_parts, target, assembly, robots, checker, grasp_table,
@@ -12753,13 +13301,32 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
           try:
             endpoint_h = _make_lns_endpoint_pdb(
                 states[i], states[i + k], chain, assembly, robots, grasp_table,
-                h_lab, old_cost)
+                h_lab, old_cost, window_deadline)
             if endpoint_h is None:
               endpoint_status = "unsupported-h-ablation"
             else:
               endpoint_lb = endpoint_h.value(states[i])
               endpoint_stats = endpoint_h.reverse_stats()
-              endpoint_status = "bounded-out" if endpoint_lb >= old_cost else "active"
+              if endpoint_stats.get("deadline_hit"):
+                # The endpoint abstraction used its fair slice without settling the query.
+                # This is UNKNOWN, not an infinite lower bound.  Discard the partial endpoint
+                # oracle and let the existing landmark heuristic guide any remaining slice.
+                endpoint_h = None
+                endpoint_lb = None
+                endpoint_status = "deadline-fallback"
+              else:
+                endpoint_status = "bounded-out" if endpoint_lb >= old_cost else "active"
+          except ValueError as exc:
+            if "ideal_chain contains a repeated prefix" not in str(exc):
+              raise
+            # An assembly event inside a secondary dependency module need not grow the
+            # base-containing component.  The endpoint chain abstraction deliberately models
+            # monotone growth of one component, so it cannot represent that window.  This is
+            # not a feasibility result: retain the ordinary global-landmark bound and run the
+            # concrete refill exactly as before.
+            endpoint_h = None
+            endpoint_lb = None
+            endpoint_status = "secondary-module-fallback"
           except RuntimeError as exc:
             if "exceeded 200000 states" not in str(exc):
               raise

@@ -88,6 +88,10 @@ _STANDARD_SEARCH_PROFILE = {
     # Shared planner/simulator table datum. Keep this small: every millimetre is certified
     # free space that the simulator turns into raised table geometry.
     "part_float": 0.002,
+    # A pre-insertion endpoint pair is not yet a skill certificate: the held gripper may
+    # intersect the socket between two individually clear endpoints. Sample that short local
+    # continuation at the same 0.002-rad resolution used by certified MP shortcuts.
+    "skill_funnel_collision_res": 0.002,
     # A finite IK miss remains reopenable instead of becoming a false infeasibility verdict.
     # Two epochs are the measured operational budget, not a continuous completeness proof.
     "open_witness": True,
@@ -106,6 +110,11 @@ _STANDARD_SEARCH_PROFILE = {
     "grasp_sampler_keep": 20,
     "grasp_sampler_candidates": 96,
     "grasp_sampler_scenes": True,
+    # Multi-part components inherit candidate contacts from all constituent parts. Build
+    # those tables only when first queried and expose a stable constituent-balanced prefix.
+    # Exhaustion monotonically reopens the exact historical full union, so this is an anytime
+    # ordering layer rather than an infeasibility claim.
+    "component_grasp_keep": 32,
     # The compliant two-finger pads can wrap ordinary curved surfaces. Besides admitting
     # those contacts, this emits the complementary side-approach roll that tight insertions
     # often need. Vacuum curvature remains governed separately by --allow-curved-grasps.
@@ -173,8 +182,9 @@ _STANDARD_MOTION_PROFILE = {
     "mp_shortcut_iters": 100,
     "mp_shortcut_strategy": "native",
     # OpenArm's thin finger/object passages exposed a real swept collision inside a 0.01-rad
-    # edge (the endpoint and neighbouring coarse samples were free).  Certify accepted
-    # shortcuts five times more finely; the simulator repeats the same scale fail-closed.
+    # edge (the endpoint and neighbouring coarse samples were free).  Use one resolution for
+    # BiRRT edges, accepted shortcuts, and simulator preflight; a plan cannot become invalid
+    # merely because the next stage samples the same edge more finely.
     "mp_shortcut_res": 0.002,
     # Collision/clearance certificate shared by every current robust MP artifact. A positive
     # table margin remains scene-specific: no successful general artifact has validated one.
@@ -193,6 +203,12 @@ def _rss_mb():
   # A1/A6 instrumentation probe: peak RSS of THIS process in MB (ru_maxrss is KiB on Linux).
   import resource
   return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
+
+
+def _unpickable_required_parts(assembly, report):
+  """Non-root parts lacking the necessary isolated acquisition certificate."""
+  return [p for p, result in report.items()
+          if p != assembly.base and not result["ok"]]
 
 def build_parser():
   parser = argparse.ArgumentParser(
@@ -239,7 +255,7 @@ def build_parser():
       help="Number of robots to spawn (max 6). Default: 4",
   )
   g_scene.add_argument(
-      "--floating-ee", action="store_true",
+      "--floating-ee", action=argparse.BooleanOptionalAction, default=False,
       help="Use free-floating end-effectors instead of the full arm.",
   )
   g_scene.add_argument(
@@ -257,15 +273,17 @@ def build_parser():
            "topological under mixed). Incompatible with --anon-robots (identity matters).",
   )
   g_scene.add_argument(
-      "--robot", choices=["ur10", "ur10_limited", "ur5", "ur5_limited", "fr3", "openarm"], default="ur10",
+      "--robot", choices=["ur10", "ur10_limited", "ur5", "ur5_limited", "fr3", "openarm", "husky"], default="ur10",
       help="Robot arm for all robots: ur10 (default), ur10_limited (ur10 with a tighter "
            "shoulder-lift/elbow workspace), ur5, ur5_limited (ur5 with the same "
            "restricted workspace), fr3 -- TWO static Franka FR3 arms with robotiq "
            "two-finger grippers on the table's -y edge (--num-robots is forced to 2; "
            "EXPERIMENTAL: no analytic IK yet, validation runs the precheck+KOMO path). "
-           "or openarm -- static OpenArm v2 humanoid duo(s) with pinch grippers "
+           "openarm -- static OpenArm v2 humanoid duo(s) with pinch grippers "
            "(fingers deactivated open; --num-robots 2 or 4). With --floating-ee this keeps "
            "the native OpenArm pinch/tool geometry but replaces each arm by six free joints; "
+           "or husky -- the calibrated fixed Husky workcell with its two embedded UR5e arms "
+           "and Robotiq grippers (--num-robots must be 2; no calibrated SSIK yet). "
            "the arm choice matters for the real arm (no --floating-ee "
            "/ --real-ik) -- note the ur5 has a much shorter reach (~0.85 m vs ~1.3 m).",
   )
@@ -430,7 +448,11 @@ def build_parser():
   g_scene.add_argument(
       "--assembly",
       choices=["cross", "cube", "arch", "arch-seq", "cube-plates", "cube-plates-2x2x3",
-               "cuboid-tower", "fixture-rack", "car", "car-mini", "slot-pin", "peg-hole", "peg-hole-screw", "peg-stool-4-screw", "peg-hole-chamfer",
+               "cube-sequence-2x2x3",
+               "cuboid-tower", "fixture-rack", "car", "car-mini", "fabrica-car", "fabrica-beam",
+               "fabrica-cooling-manifold", "fabrica-duct", "fabrica-gamepad",
+               "fabrica-plumbers-block", "fabrica-circular-stool",
+               "slot-pin", "peg-hole", "peg-hole-screw", "peg-stool-4-screw", "peg-hole-chamfer",
                "peg-stool",
                "peg-stool-4", "peg-stool-cuboid", "peg-stool-cuboid-4",
                "peg-stool-tight", "peg-stool-4-tight",
@@ -439,18 +461,25 @@ def build_parser():
                "peg-stool-cuboid-chamfer", "peg-stool-cuboid-4-chamfer",
                "peg-stool-tight-chamfer", "peg-stool-4-tight-chamfer",
                "peg-stool-cuboid-tight-chamfer", "peg-stool-cuboid-4-tight-chamfer",
-               "mesh-demo", "compound-demo", "chair"],
+               "mesh-demo", "compound-demo", "real-stool", "real-bench",
+               "yandv-stool", "yandv-bench", "chair"],
       default="cross",
       help="Assembly to build: cross (cube cross, 7), cube (2x2x2 grid, 8), "
            "arch (two pillars + lintel, 7 -- known-flawed star model), "
            "arch-seq (arch shape built as a sequential chain, 7), "
            "cube-plates (2x2x2 cube as two stacked 2x2 plates, faithful DAG), "
            "cube-plates-2x2x3 (three stacked 2x2 plates, 12 cubes -- use --parts 12), "
+           "cube-sequence-2x2x3 (the same 12-cell lattice assembled in one strict, "
+           "face-adjacent piece-by-piece sequence), "
            "cuboid-tower (jenga-style: 2 laid cuboids per level, levels rotated 90deg, up to 8), "
            "fixture-rack (scalable base rail + repeated top-down posts and lateral brackets, "
            "up to 13 parts), "
            "car (cuboid body + 4 sideways cylinder wheels, 5), "
            "car-mini (car scaled to w=0.03: wheels fit ACROSS the two-finger gap), "
+           "fabrica-car (five-part Fabrica CAD car; source fixture part 2 excluded), "
+           "fabrica-beam, fabrica-cooling-manifold, fabrica-duct, fabrica-gamepad, "
+           "fabrica-plumbers-block, and fabrica-circular-stool (exact Fabrica visuals plus "
+           "reviewed collision proxies and proximity-tree mate annotations), "
            "slot-pin (base + cantilever bar + fastening pin -- the --staged-mates testbed), "
            "peg-hole (compound blind socket + top-down cylindrical peg, 2 -- concavity smoke "
            "test; use --grasp-sampler), peg-stool (compound seat with three real downward "
@@ -467,9 +496,12 @@ def build_parser():
            "catching the rim. The -chamfer kinds ALSO bevel every socket mouth with a "
            "45-degree ENTRY chamfer of its own (peg-hole 6mm, stool 4mm): each hole rim "
            "widens into a funnel, so tip and mouth facets guide the insertion together. "
-           "All stool variants: "
+           "All peg-stool variants: "
            "use --grasp-sampler and a vacuum "
            "gripper; the clearance is a constructor parameter (PegStoolAssembly peg_clearance). "
+           "real-stool (Y&V CAD 4-hole 170mm seat + 4 handed legs, 5; faithful compound "
+           "blind pockets and rear upstand) and real-bench (the 2-hole 85mm variant, 3). "
+           "The legacy yandv-stool/yandv-bench names are aliases. "
            "Default: cross.",
   )
   g_solver.add_argument(
@@ -731,6 +763,16 @@ def build_parser():
   )
   g_ik.add_argument("--grasp-local-caps", default=None, help=argparse.SUPPRESS)
   g_ik.add_argument(
+      "--component-grasp-keep", type=int, default=0, metavar="N",
+      help="Component-level grasp-column generation (built-in default 0; standard profile "
+           "uses 32). Single parts retain their full "
+           "sampled database; each multi-part rigid component exposes at most N collision-"
+           "free rows from a stable round-robin merge of its constituent databases. If the "
+           "restricted search returns no plan, one automatic retry restores the exact historical "
+           "full union, so this orders finite search effort rather than pruning grasps. "
+           "Zero restores the historical eager full union.",
+  )
+  g_ik.add_argument(
       "--grasp-sampler-candidates", type=int, default=200, metavar="M",
       help="--grasp-sampler: raw surface samples per shape before downsampling (default 200).",
   )
@@ -907,6 +949,14 @@ def build_parser():
            "--no-wrench = topological baseline.",
   )
   g_phys.add_argument(
+      "--wrench-profile", choices=["max_robotiq"], default=None, metavar="NAME",
+      help="Named gripper-capability envelope. max_robotiq installs the Robotiq 2F-85 "
+           "section 6.2.4 absolute limits (50N on each force axis, 5Nm about local x/y, "
+           "3Nm about local z/approach). This is a hardware maximum, NOT a measured slip "
+           "calibration or safety-rated working envelope. It affects two-finger grasps only; "
+           "explicit --two-finger-scale/--tf-close-torque are applied afterwards.",
+  )
+  g_phys.add_argument(
       "--grasp-model", choices=["isotropic", "directional", "asymmetric"],
       default="asymmetric",
       help="Grasp wrench-capability model (with --wrench): isotropic = the original "
@@ -1020,6 +1070,13 @@ def build_parser():
       help="With --wrench: WEIGHTLESS parts -- drop the gravity load from every stability "
            "check, so a hold must only resist the INSERTION reaction (and other applied "
            "loads), not part weight. Isolates insertion/bracing feasibility from gravity.",
+  )
+  g_phys.add_argument(
+      "--orientation-robust-wrench", action="store_true",
+      help="With --wrench: every freely held component must balance gravity for EVERY rigid-"
+           "body orientation, using an exact continuous contact-zonotope containment test "
+           "(no SO(3) sampling and no IK). Table-resting components retain their discrete "
+           "rest orientation. Conservative by design and opt-in; may force extra bracing.",
   )
   g_phys.add_argument(
       "--curved-torque-scale", type=float, default=None, metavar="S",
@@ -1170,15 +1227,19 @@ def build_parser():
            "immediately; later edges are not speculatively probed.",
   )
   g_search.add_argument(
-      "--lazy-edge-selector", choices=("forward", "terminal-first", "reverse", "fail-first"),
+      "--lazy-edge-selector", choices=("forward", "terminal-first", "reverse", "fail-first",
+                                        "defer-failed"),
       default="forward", metavar="POLICY",
       help="IK-edge selection inside an optimistic lazy-fill candidate: forward preserves "
            "the historical prefix-first order; terminal-first certifies the candidate's "
            "last concrete assemble mode, then validates its prefix forward; reverse validates "
            "the whole path suffix-first; "
            "fail-first validates previously failed exact (action, scene) queries first and "
-           "otherwise falls back to reverse. This changes validation order only, never "
-           "successors, costs, or failure semantics. Standard keeps measured forward order.",
+           "otherwise falls back to reverse; defer-failed scans the whole candidate and gives "
+           "each physical query at most one failed effort batch per fairness epoch, temporarily "
+           "deferring later symbolic aliases until the next epoch. These policies change only "
+           "validation scheduling, never costs or failure semantics. Standard keeps measured "
+           "forward order.",
   )
   g_search.add_argument(
       "--lns-segments", action="store_true",
@@ -1214,6 +1275,14 @@ def build_parser():
            "support face/holders, free tool capacity and wrench facts, but ignores robot "
            "joint configurations. Independent of sequence/DAG/module structure. Standard "
            "on; --no-fill-local-h is the counting-only guidance ablation.",
+  )
+  g_search.add_argument(
+      "--fill-target-support-quotient", action=argparse.BooleanOptionalAction, default=False,
+      help="Experimental no-wrench local-PDB quotient: replace grasp identities on the "
+           "already-built target component by anonymous holder counts, preserving tool-kind "
+           "masks and keeping mover grasps labeled. This removes target-size growth that is "
+           "irrelevant when wrench and geometric facts are disabled. Requires "
+           "--fill-local-h --no-wrench; not enabled by a profile.",
   )
   g_search.add_argument(
       "--fill-exact", action=argparse.BooleanOptionalAction, default=False,
@@ -1502,6 +1571,14 @@ def build_parser():
            "exported assembly disagree with ours and the acting arm hit an already-mated part.",
   )
   g_search.add_argument(
+      "--mate-angular-accuracy", type=float, default=None, metavar="DEG",
+      help="ACCEPTANCE CRITERION for an assemble's quaternionRel, in degrees. This is the "
+           "rotational counterpart of --mate-accuracy: reject a witness whose achieved "
+           "relative orientation misses the authored mate by more than DEG. Particularly "
+           "important for long, tight insertion features, where a small angular residual "
+           "becomes contact after the achieved attachment transform is accumulated.",
+  )
+  g_search.add_argument(
       "--grasp-eq-weight", type=float, default=None, metavar="W",
       help="Weight of the NEW-grasp tool-pose eq in pick/add_grasp IK (rai default 1e1). "
            "Raise to 100 (like --mate-eq-weight) so the solve LANDS ON the grasp-DB pose "
@@ -1663,6 +1740,13 @@ def build_parser():
            "0 = single un-split assemble.",
   )
   g_skills.add_argument(
+      "--skill-funnel-collision-res", type=float, default=None, metavar="RAD",
+      help="SEARCH/WITNESS certificate for each assemble funnel: sample the full held-object "
+           "joint interpolation from the pre-insertion keyframe to the seated witness at "
+           "most RAD per joint, rejecting any non-intended collision before motion planning. "
+           "The standard search profile uses 0.002rad; unset/0 keeps endpoint-only behavior.",
+  )
+  g_skills.add_argument(
       "--pre-pick", type=float, nargs="?", const=0.05, default=0.05, metavar="DELTA",
       help="Like --pre-insertion, for PICK (EXPORT/REPLAY only): split each pick into a GOTO to "
            "the pre-grasp pose (gripper retracted DELTA m along its -approach axis, default "
@@ -1676,9 +1760,10 @@ def build_parser():
   )
   g_skills.add_argument(
       "--pre-add-grasp", type=float, nargs="?", const=0.05, default=0.05, metavar="DELTA",
-      help="Like --pre-pick, for ADD_GRASP (the brace/handover reach; EXPORT/REPLAY only): split "
-           "each add_grasp into a GOTO to the pre-grasp (gripper retracted DELTA m along its "
-           "-approach axis, default 0.05) + the real brace reach. Default 0.05; 0 disables.",
+      help="Like --pre-pick, for ADD_GRASP and HANDOVER (EXPORT/REPLAY only): split each "
+           "incoming-hand acquisition into a GOTO to the pre-grasp (gripper retracted DELTA "
+           "m along its -approach axis, default 0.05) + the real grasp/ownership switch. "
+           "Default 0.05; 0 disables.",
   )
   g_skills.add_argument(
       "--post-release", type=float, nargs="?", const=0.05, default=0.05, metavar="DELTA",
@@ -2126,17 +2211,19 @@ def parse_args(argv=None):
 _SAVE_CONFIG_FIELDS = (
     "assembly", "parts", "num_robots", "vacuum", "floating_ee", "robot", "robot_types",
     "scatter_spacing", "center_scatter", "perturb_start_pose", "seed", "wrench",
-    "grasp_model", "insert_force",
+    "wrench_profile", "grasp_model", "insert_force",
     "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
     "bracing", "robust_mode", "dense_grasps", "random_init", "part_float", "inhand_reorient",
-    "pre_insertion", "pre_pick", "pre_place", "pre_add_grasp", "post_release", "staged_mates",
+    "pre_insertion", "skill_funnel_collision_res", "pre_pick", "pre_place", "pre_add_grasp",
+    "post_release", "staged_mates",
     "screw_angle", "screw_depth", "screw_torque", "screw_speed", "screw_samples",
     "allow_curved_grasps", "grippers", "grasp_compliance",
     "vacuum_scale", "two_finger_scale", "vacuum_engage_force",
     "vacuum_engage_friction", "tf_close_torque", "dominance",
     "table_mu",
     "useful_grasps", "brace_resting",
-    "ignore_gravity",                                    # weightless stability: a plan searched
+    "ignore_gravity", "orientation_robust_wrench",      # gravity semantics change the
+    # successor set and must survive replay/config round-trips
     # weightless contains releases/lateral mates that are UNSTABLE under gravity, so a rebuild
     # without it cannot reproduce the actions (user-hit: sim StopIteration on a cross-12 plan)
     "strict_collisions", "witness_robot_collisions", "plain_box",
@@ -2146,7 +2233,8 @@ _SAVE_CONFIG_FIELDS = (
     # against a DIFFERENT successor set than the search that made it, and the first symptom is
     # optimize_witnesses*/replay failing with "cannot reproduce action ... from the successor
     # set". min_sep and place_cells change the place cells, the rest change the action space.
-    "strict_mate_collisions", "always_contact", "ik_accuracy", "mate_accuracy", "grasp_accuracy",
+    "strict_mate_collisions", "always_contact", "ik_accuracy", "mate_accuracy",
+    "mate_angular_accuracy", "grasp_accuracy",
     "mate_eq_weight", "grasp_eq_weight",
     "place_eq_weight",                                   # a place is the DATUM later mates are
     # measured against, so its residual is not local (measured: body 3.91mm high, wheels then
@@ -2156,7 +2244,7 @@ _SAVE_CONFIG_FIELDS = (
     "grasp_sampler_candidates", "grasp_sampler_seed",    # replay under identical settings
     "grasp_sampler_db_hash",                              # positional DB content identity
     "grasp_refine", "grasp_widen", "grasp_widen_batch", "grasp_widen_max",
-    "grasp_local_widen", "grasp_local_caps",
+    "grasp_local_widen", "grasp_local_caps", "component_grasp_keep",
     # search provenance; replay reconstructs the final widened prefix recorded in `keep`
     "grasp_sampler_margin", "grasp_sampler_pad_support",
     "grasp_sampler_wrap",                                 # curvature-fair support metric (None = legacy)
@@ -2207,7 +2295,7 @@ _SAVE_CONFIG_FIELDS = (
     # resolved values rather than only a named-profile label: profiles may evolve, whereas a
     # paper artifact must keep the semantics it was actually solved under.
     "weight", "milestones", "milestones_anytime", "goal_on_table", "milestone_oracle",
-    "fill_local_h", "fill_exact",
+    "fill_local_h", "fill_target_support_quotient", "fill_exact",
     "fill_greedy", "fill_incumbent_first",
     "fill_policy_first", "fill_policy_guide", "fill_skeleton_first", "milestone_boundaries",
     "fill_scope_widening", "fill_touch_all", "placement_yaw_widening",
@@ -2247,6 +2335,7 @@ _WITNESS_FIELDS = (
     "optimize_witnesses", "witness_branch_budget", "witness_branch_metric",
     "witness_reconfig_thresh", "witness_clearance", "witness_robot_collisions",
     "strict_collisions", "mate_eq_weight", "place_eq_weight", "mate_accuracy",
+    "mate_angular_accuracy",
     "grasp_accuracy", "grasp_eq_weight",
     "ik_accuracy", "ik_seeding", "assemble_ssik_pose_seeds",
     "assemble_ssik_pose_projection", "assemble_unbiased_first", "assemble_basin_racing",
@@ -2256,7 +2345,7 @@ _WITNESS_FIELDS = (
     "seed", "bracing", "handovers", "allow_place",
     "tight_fingers", "openarm_real_finger_radius_scale", "part_float", "witness_margin",
     "witness_joint_margin", "witness_draw",
-    "witness_sets", "witness_set_spread",
+    "witness_sets", "witness_set_spread", "pre_insertion", "skill_funnel_collision_res",
     "grasp_sampler", "grasp_sampler_keep", "grasp_sampler_candidates", "grasp_sampler_seed",
     "grasp_sampler_db_hash",
     "grasp_sampler_margin", "grasp_sampler_pad_support", "grasp_sampler_wrap",
@@ -2365,6 +2454,13 @@ def _validate_solver_scoped_flags(cfg):
     if engine not in ("milestones", "milestones-anytime", "optimistic"):
       raise SystemExit("--fill-policy-first is implemented only by milestone/optimistic "
                        f"local fills; selected engine is {engine}")
+  if cfg.fill_target_support_quotient:
+    if engine not in ("milestones", "milestones-anytime"):
+      raise SystemExit("--fill-target-support-quotient is implemented only by milestone "
+                       f"local fills; selected engine is {engine}")
+    if not cfg.fill_local_h or cfg.wrench or cfg.geo_facts:
+      raise SystemExit("--fill-target-support-quotient requires --fill-local-h, "
+                       "--no-wrench, and --no-geo-facts")
   if cfg.fill_policy_guide:
     if engine != "milestones":
       raise SystemExit("--fill-policy-guide is implemented only by the ordinary "
@@ -2411,6 +2507,7 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         collapsed_h=cfg.collapsed_h, grasp_collapsed_h=cfg.grasp_collapsed_h,
         fill_window=cfg.fill_window, milestone_oracle=cfg.milestone_oracle,
         fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
+        fill_target_support_quotient=cfg.fill_target_support_quotient,
         fill_greedy=cfg.fill_greedy,
         fill_incumbent_first=cfg.fill_incumbent_first,
         fill_policy_first=cfg.fill_policy_first,
@@ -2483,6 +2580,7 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         sig_collapsed_h=cfg.sig_collapsed_h, fill_window=cfg.fill_window,
         lazy_fills=cfg.lazy_fills, milestone_oracle=cfg.milestone_oracle,
         fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
+        fill_target_support_quotient=cfg.fill_target_support_quotient,
         fill_greedy=cfg.fill_greedy,
         fill_incumbent_first=cfg.fill_incumbent_first,
         fill_policy_first=cfg.fill_policy_first,
@@ -2524,6 +2622,7 @@ def _milestone_candidate_session(cfg, C, assembly, robots, robot_ik):
       sig_collapsed_h=cfg.sig_collapsed_h, fill_window=cfg.fill_window,
       lazy_fills=cfg.lazy_fills, milestone_oracle=cfg.milestone_oracle,
       fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
+      fill_target_support_quotient=cfg.fill_target_support_quotient,
       fill_greedy=cfg.fill_greedy,
       fill_incumbent_first=cfg.fill_incumbent_first,
       fill_policy_first=cfg.fill_policy_first,
@@ -2607,6 +2706,7 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
       "grasp_refinement": bool(cfg.grasp_sampler and cfg.grasp_refine),
       "grasp_widening": bool(cfg.grasp_sampler and cfg.grasp_widen),
       "grasp_local_widening": bool(cfg.grasp_local_widen),
+      "component_grasp_keep": int(cfg.component_grasp_keep),
   }
   seen_plan_ids = set()
 
@@ -2649,9 +2749,22 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
     prefix = _os.path.join(work, f"candidate-{index:03d}-{pid}")
     pfile, efile = prefix + "-plan.json", prefix + "-export.json"
     require_complete_witnesses(plan, witnesses, who="open-plan search certificate")
+    from solver import collect_plan_pre_witnesses
+    pre_witnesses = collect_plan_pre_witnesses(
+        C, assembly, plan, witnesses, robots, robot_ik,
+        gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
+        handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
+        resolve_missing=True)
+    required_pre = [j for j, a in enumerate(plan)
+                    if a and a[0] == "assemble" and cfg.pre_insertion > 0.0
+                    and assembly.screw_skill(a[2]) is None]
+    missing_pre = [j for j in required_pre if j not in pre_witnesses]
+    if missing_pre:
+      raise ValueError("open-plan candidate lacks certified pre-insertion endpoints at "
+                       + ", ".join(map(str, missing_pre)))
     save_plan(pfile, cfg, plan,
               witnesses=witness_block(list(robot_ik.C.getJointNames()), witnesses,
-                                      stage="search"))
+                                      stage="search", pre_witnesses=pre_witnesses))
     rec = {"index": index, "plan_id": pid, "actions": len(plan),
            "plan_path": pfile, "export_path": efile, "attempts": [],
            "status": "suspended"}
@@ -2764,6 +2877,7 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
 
   session = _milestone_candidate_session(cfg, C, assembly, robots, robot_ik)
   widened_grasps = False
+  widened_component_grasps = False
   staged_grasps = bool(cfg.grasp_sampler and cfg.grasp_refine)
   widen_keep = int(cfg.grasp_sampler_keep)
   widen_hash = cfg.grasp_sampler_db_hash
@@ -2782,6 +2896,24 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
         write_manifest()
         print("[grasp-refine/mp-open] compact complete-plan stream exhausted -> reopening "
               "search with the full hybrid grasp DB; duplicate plans are skipped.")
+        session = _milestone_candidate_session(cfg, C, assembly, robots, robot_ik)
+        continue
+      if cfg.component_grasp_keep and not widened_component_grasps:
+        from problem import set_component_grasp_keep
+        previous_keep = int(cfg.component_grasp_keep)
+        widened_component_grasps = True
+        set_component_grasp_keep(0)
+        # Persist the alphabet which produces any later candidate. Stable grasp ids mean all
+        # exact witnesses discovered under the restricted prefix remain reusable.
+        cfg.component_grasp_keep = 0
+        manifest["component_grasp_completion"] = {
+            "from_keep": previous_keep, "to_keep": 0,
+            "meaning": "exact full constituent-grasp union",
+        }
+        write_manifest()
+        print(f"[component-grasps/mp-open] restricted K={previous_keep} complete-plan "
+              "stream exhausted -> reopening with the exact full constituent-grasp union; "
+              "suspended plans and witness evidence remain valid.")
         session = _milestone_candidate_session(cfg, C, assembly, robots, robot_ik)
         continue
       if (cfg.grasp_widen and cfg.grasp_sampler
@@ -3013,7 +3145,8 @@ def run(cfg, explicit=None):
   any_two_finger = (gripper_list is not None and not all(gripper_list)) or not cfg.vacuum
   set_rolls_per_face(2 if any_two_finger else 1)
   set_dense_grasps(cfg.dense_grasps and any_two_finger)
-  from problem import set_sampled_grasps, clear_sampled_scene_ctx
+  from problem import (set_sampled_grasps, clear_sampled_scene_ctx,
+                       set_component_grasp_keep)
   if cfg.grasp_sampler_scenes and not cfg.grasp_sampler:
     raise SystemExit("--grasp-sampler-scenes requires --grasp-sampler")
   if cfg.grasp_local_widen and cfg.grasp_widen:
@@ -3042,6 +3175,16 @@ def run(cfg, explicit=None):
       raise SystemExit("--grasp-widen-batch must be >= 1")
     if cfg.grasp_widen_max < cfg.grasp_sampler_keep:
       raise SystemExit("--grasp-widen-max must be >= --grasp-sampler-keep")
+  if cfg.component_grasp_keep < 0:
+    raise SystemExit("--component-grasp-keep must be >= 0")
+  if cfg.component_grasp_keep and not cfg.grasp_sampler:
+    raise SystemExit("--component-grasp-keep requires --grasp-sampler")
+  set_component_grasp_keep(cfg.component_grasp_keep)
+  if cfg.component_grasp_keep:
+    print(f"[flag] --component-grasp-keep {cfg.component_grasp_keep} ACTIVE: singleton "
+          "databases stay complete; every multi-part rigid component uses a stable "
+          "round-robin pool of at most this many whole-component-clear grasps. A no-plan "
+          "return automatically widens once to the exact historical full union.")
   # a previous in-process run's scene filter must not leak into THIS run's assembly
   # definition (define() queries the grasp DB, which raises under a stale part-less ctx).
   clear_sampled_scene_ctx()
@@ -3214,6 +3357,12 @@ def run(cfg, explicit=None):
           "Labeled/collapsed h model the inverse-reorient edge (cost 1) -> h stays admissible.")
   import wrench
   wrench.PARAMS["grasp_model"] = cfg.grasp_model  # capability model (used when --wrench)
+  wrench.apply_wrench_profile(cfg.wrench_profile)
+  if cfg.wrench_profile is not None:
+    _tf = wrench.PARAMS["grasp"][cfg.grasp_model]["two_finger"]
+    print(f"[flag] --wrench-profile {cfg.wrench_profile} ACTIVE: two-finger absolute "
+          f"hardware envelope installed for {cfg.grasp_model}: {_tf}. This is a maximum, "
+          "not a slip calibration; explicit cap overrides are applied afterwards.")
   if cfg.table_mu is not None:
     wrench.PARAMS["table_model"] = "friction"
     wrench.PARAMS["table_mu"] = float(cfg.table_mu)
@@ -3270,6 +3419,12 @@ def run(cfg, explicit=None):
       else {"lateral": cfg.insertion_noise, "offset": cfg.insertion_offset})
   wrench.PARAMS["robust_mode"] = cfg.robust_mode
   wrench.PARAMS["ignore_gravity"] = cfg.ignore_gravity
+  wrench.PARAMS["orientation_robust_gravity"] = cfg.orientation_robust_wrench
+  if cfg.wrench and cfg.orientation_robust_wrench:
+    print("[flag] --orientation-robust-wrench ACTIVE: every freely held component must "
+          "balance gravity for the complete continuous orientation sphere; exact cached "
+          "contact-zonotope containment, no orientation samples or IK. Table-resting "
+          "components keep their discrete rest orientation.")
   from problem import set_banned_actions
   set_banned_actions([x.strip() for x in cfg.ban_actions.split(",") if x.strip()]
                      if cfg.ban_actions else ())
@@ -3308,6 +3463,14 @@ def run(cfg, explicit=None):
         print(f"[flag] openarm duos: --num-robots {cfg.num_robots} -> {2 * num_duos} "
               f"({num_duos} duo(s))")
       C = make_openarm_duo_env(num_duos=num_duos)
+  elif cfg.robot == "husky":
+    if cfg.num_robots != 2:
+      raise SystemExit("--robot husky contains exactly two calibrated arms; use --num-robots 2")
+    if cfg.floating_ee:
+      raise SystemExit("--robot husky does not yet have a calibrated --floating-ee model")
+    if cfg.vacuum or (gripper_list is not None and any(gripper_list)):
+      raise SystemExit("--robot husky currently has two fixed Robotiq grippers; do not request vacuum")
+    C = make_husky_duo_env()
   else:
     C = make_four_robot_env(
         num_robots=cfg.num_robots,
@@ -3419,7 +3582,14 @@ def run(cfg, explicit=None):
     from problem import sampled_grasp_db_signature
     _db_hash = sampled_grasp_db_signature(assembly)
     if cfg.grasp_sampler_db_hash is not None and cfg.grasp_sampler_db_hash != _db_hash:
-      if cfg.load_plan and cfg.refresh_witnesses:
+      if not cfg.load_plan:
+        # A saved plan is also a convenient, complete scene/configuration file for
+        # a fresh solve.  Its old DB hash identifies the plan's grasp indices; it
+        # must not prevent regenerating those indices when no plan is loaded.
+        print("[grasp-db-regenerate] sampled grasp database differs from the config "
+              f"({cfg.grasp_sampler_db_hash} != {_db_hash}); fresh --solve records "
+              "the current database identity.", flush=True)
+      elif cfg.refresh_witnesses:
         print("[grasp-db-refresh] sampled grasp database differs from the saved plan "
               f"({cfg.grasp_sampler_db_hash} != {_db_hash}). Explicit --refresh-witnesses "
               "treats its actions as a symbolic skeleton: every successor and every IK "
@@ -3756,6 +3926,11 @@ def run(cfg, explicit=None):
       print(f"[flag] --mate-accuracy {cfg.mate_accuracy:g}m: assemble witnesses REJECTED when "
             f"the achieved mate misses by more than that (rai's own feasibility verdict does "
             f"not enforce it).")
+    if robot_ik is not None and cfg.mate_angular_accuracy is not None:
+      robot_ik.mate_angular_residual_reject = float(cfg.mate_angular_accuracy)
+      print(f"[flag] --mate-angular-accuracy {cfg.mate_angular_accuracy:g}deg: assemble "
+            f"witnesses REJECTED when quaternionRel misses the authored mate by more than "
+            f"that.")
     # RESIDUAL BUDGET. Both witness gates bound an error that ends up as PENETRATION in the
     # exported problem, and motion planning rejects a goal that penetrates more than its own
     # tolerance -- as "no path" at that mode, with nothing pointing at the cause.
@@ -3809,7 +3984,16 @@ def run(cfg, explicit=None):
       robot_ik.pre_insertion_delta = cfg.pre_insertion
       print(f"[flag] --pre-insertion ACTIVE: MP export splits each assemble into a goto to the "
             f"funnel mouth ({cfg.pre_insertion:g}m back along the mate axis) + the real mate at "
-            "the seated witness. Search/plan/wrench unchanged.")
+            "the seated witness. With --skill-funnel-collision-res, search also certifies the "
+            "short held-gripper edge between them.")
+    if robot_ik is not None and cfg.skill_funnel_collision_res is not None:
+      if cfg.skill_funnel_collision_res < 0.0:
+        raise SystemExit("--skill-funnel-collision-res must be nonnegative")
+      robot_ik.skill_funnel_collision_res = float(cfg.skill_funnel_collision_res)
+      if cfg.skill_funnel_collision_res > 0.0:
+        print(f"[flag] --skill-funnel-collision-res {cfg.skill_funnel_collision_res:g}rad "
+              "ACTIVE: assemble IK is accepted only when its exact held-gripper "
+              "pre-insertion-to-seat edge passes the strict collision gate.")
     if robot_ik is not None and cfg.pre_pick > 0.0:
       robot_ik.pre_pick_delta = cfg.pre_pick
       print(f"[flag] --pre-pick ACTIVE: MP export splits each pick into a goto to the pre-grasp "
@@ -3820,9 +4004,9 @@ def run(cfg, explicit=None):
             f"({cfg.pre_place:g}m lift) + the real set-down. Search/plan unchanged.")
     if robot_ik is not None and cfg.pre_add_grasp > 0.0:
       robot_ik.pre_add_grasp_delta = cfg.pre_add_grasp
-      print(f"[flag] --pre-add-grasp ACTIVE: MP export splits each add_grasp into a goto to the "
-            f"pre-grasp ({cfg.pre_add_grasp:g}m gripper retract) + the real brace reach. "
-            "Search/plan unchanged.")
+      print(f"[flag] --pre-add-grasp ACTIVE: MP export splits each add_grasp/handover into "
+            f"a goto to the pre-grasp ({cfg.pre_add_grasp:g}m gripper retract) + the real "
+            "grasp/ownership switch. Search/plan unchanged.")
     if robot_ik is not None and cfg.post_release > 0.0:
       robot_ik.post_release_delta = cfg.post_release
       print(f"[flag] --post-release ACTIVE: MP export appends a departure GOTO after each "
@@ -3863,7 +4047,8 @@ def run(cfg, explicit=None):
       _new_m = 0.0 if cfg.witness_margin is None else float(cfg.witness_margin)
       # A final export contains all keyframes/tasks and --mp-export-load performs no IK at
       # all, so no new gate is applied in that exact-replay path.
-      if not (cfg.motion_plan and cfg.mp_export_load) and _new_m > _old_m + 1e-12:
+      if (not (cfg.motion_plan and cfg.mp_export_load)
+          and not cfg.refresh_witnesses and _new_m > _old_m + 1e-12):
         raise ValueError(
             f"--witness-margin {_new_m:g}m is stricter than the {_old_m:g}m gate used by "
             f"the search saved in {cfg.load_plan}. Because --load-plan skips search, applying "
@@ -3884,6 +4069,9 @@ def run(cfg, explicit=None):
       _pre = isolated_graspability_report(
           C, assembly, robots, _pre_checker, _pre_table,
           require_closure=bool(cfg.grasp_closure_check), robot_ik=robot_ik, verbose=True)
+      if hasattr(_pre_table, "materialized"):
+        print(f"[component-grasps/preflight] materialized {_pre_table.materialized}/"
+              f"{len(_pre_table)} component tables ({_pre_table.materialized_rows} rows).")
       if cfg.grasp_local_widen:
         for _p, _result in _pre.items():
           _accepted = {gid for _kind, _robot, gid in _result["accepted"]}
@@ -3891,7 +4079,14 @@ def run(cfg, explicit=None):
           print(f"[grasp-funnel {_p}] isolated-pick active/master="
                 f"{_active}/{len(_accepted)} (K={cfg.grasp_sampler_keep}); closure and "
                 "open-hand geometry are already included in this count.")
-      _unpickable = [p for p, result in _pre.items() if not result["ok"]]
+      # The assembly root may remain at its initial table pose while every incoming
+      # part is assembled onto it; valid plans routinely do exactly this. Therefore
+      # isolated pickability of the root is not a necessary condition. Treating it
+      # as one caused pointless full grasp-widening epochs (and could ultimately
+      # reject a solvable task) for broad bases such as Fabrica's cooling manifold.
+      # Every non-root object must cross an assemble edge and hence must first be
+      # acquired, so the necessary-condition abort remains sound for those parts.
+      _unpickable = _unpickable_required_parts(assembly, _pre)
       if _unpickable and not cfg.grasp_widen:
         layer = "open-hand collision + virtual closure" if cfg.grasp_closure_check \
             else "open-hand collision"
@@ -3947,6 +4142,18 @@ def run(cfg, explicit=None):
           cfg.fill_scope_widening = True
           print("[grasp-refine] local epochs exhausted -> final completeness epoch: full "
                 "grasps + configured bracing + all-part scope widening.")
+          plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
+        if plan is None and cfg.component_grasp_keep:
+          from problem import set_component_grasp_keep
+          _component_keep = int(cfg.component_grasp_keep)
+          set_component_grasp_keep(0)
+          # Save/replay must rebuild the alphabet which actually produced the plan. The
+          # requested compact value remains in the command and raw benchmark provenance;
+          # zero here records that this completion attempt used the historical full table.
+          cfg.component_grasp_keep = 0
+          print(f"[component-grasps] restricted K={_component_keep} search returned no plan -> "
+                "completion retry with the exact full constituent-grasp union. Existing "
+                "witness cache entries remain valid because grasp ids never changed.")
           plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
         if plan is None and cfg.grasp_widen:
           from problem import (set_sampled_canonical_only, set_sampled_grasp_keep,
@@ -4055,6 +4262,9 @@ def run(cfg, explicit=None):
               f"(> {cfg.grasp_accuracy:g}m tool residual).")
       print(f"[mate-accuracy] vetoed {robot_ik.mate_rejects} under-seated mates "
             f"(> {cfg.mate_accuracy:g}m residual).")
+    if robot_ik is not None and cfg.mate_angular_accuracy is not None:
+      print(f"[mate-angular-accuracy] vetoed {robot_ik.mate_angular_rejects} rotated mates "
+            f"(> {cfg.mate_angular_accuracy:g}deg residual).")
     if robot_ik is not None:
       # A1 INSTRUMENTATION: where the real-IK time went + a peak-RSS checkpoint (A6).
       robot_ik.prof_report()
@@ -4073,10 +4283,12 @@ def run(cfg, explicit=None):
       # transaction *after* this source certificate exists: it can commit only if every changed
       # predecessor scene is re-certified, otherwise the original plan/witnesses are retained.
       # A loaded plan is read-only unless the user explicitly asks for --refresh-witnesses.
-      from plan_io import (read_skill_paths, read_witnesses, read_witness_stage,
+      from plan_io import (read_pre_witnesses, read_skill_paths, read_witnesses,
+                           read_witness_stage,
                            require_complete_witnesses, witness_block)
       joint_names = list(robot_ik.C.getJointNames()) if robot_ik is not None else []
       baseline_witnesses = None
+      baseline_pre_witnesses = None
       skill_paths = None
       _saved_witness_stage = None
       _need_witnesses = bool(robot_ik is not None and not (
@@ -4097,6 +4309,8 @@ def run(cfg, explicit=None):
           _saved_witness_stage = read_witness_stage(cfg.load_plan)
           if baseline_witnesses is not None:
             skill_paths = read_skill_paths(
+                cfg.load_plan, joint_names, len(plan), baseline_witnesses)
+            baseline_pre_witnesses = read_pre_witnesses(
                 cfg.load_plan, joint_names, len(plan), baseline_witnesses)
         if baseline_witnesses is None and cfg.refresh_witnesses:
           from solver import collect_plan_witnesses
@@ -4122,6 +4336,15 @@ def run(cfg, explicit=None):
       if baseline_witnesses is not None:
         require_complete_witnesses(plan, baseline_witnesses,
                                    who="source search-witness persistence")
+        if cfg.load_plan and cfg.refresh_witnesses:
+          # Explicit refresh has just rebuilt every IK-bearing edge under today's complete
+          # feasibility gate. It is therefore a genuine certificate upgrade, unlike an
+          # ordinary loaded-plan post-pass (which remains forbidden above). Persist it so
+          # subsequent motion planning/replay can reuse the witnesses without another solve.
+          cfg._search_witness_margin = (0.0 if cfg.witness_margin is None
+                                        else float(cfg.witness_margin))
+          print(f"[witness-refresh] fixed plan recertified at "
+                f"{1000.0 * cfg._search_witness_margin:.1f}mm witness margin.")
 
       # A saved plan already contains every post-pass that ran before save_plan. Reapplying
       # the non-idempotent hoist on --load-plan can move releases a SECOND time, so the motion
@@ -4160,13 +4383,35 @@ def run(cfg, explicit=None):
       if baseline_witnesses is not None:
         require_complete_witnesses(plan, baseline_witnesses,
                                    who="search-witness persistence")
+        _required_pre = [i for i, a in enumerate(plan)
+                         if a and a[0] == "assemble" and cfg.pre_insertion > 0.0
+                         and assembly.screw_skill(a[2]) is None]
+        if not cfg.load_plan or cfg.refresh_witnesses or _hoist_applied:
+          from solver import collect_plan_pre_witnesses
+          baseline_pre_witnesses = collect_plan_pre_witnesses(
+              C, assembly, plan, baseline_witnesses, robots, robot_ik,
+              gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
+              handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
+              resolve_missing=True)
+        _missing_pre = [i for i in _required_pre
+                        if i not in (baseline_pre_witnesses or {})]
+        if _missing_pre:
+          detail = ", ".join(f"{i}:{tuple(plan[i])}" for i in _missing_pre[:8])
+          raise ValueError(
+              "search witness certificate is missing its certified pre-insertion endpoint "
+              f"at {detail}. Refusing export-time IK reconstruction; rerun/refresh the "
+              "search with this version.")
         print(f"[witness-persist] {sum(w is not None for w in baseline_witnesses)} exact "
-              "search witnesses aligned to the final plan; later stages need not redo IK.")
+              f"search witnesses and {len(baseline_pre_witnesses or {})} insertion mouths "
+              "aligned to the final plan; later stages need not redo IK.")
       if cfg.save is not None:
         save_plan(cfg.save, cfg, plan,
-                  witnesses=(witness_block(joint_names, baseline_witnesses, stage="search")
+                  witnesses=(witness_block(
+                      joint_names, baseline_witnesses, stage="search",
+                      pre_witnesses=baseline_pre_witnesses)
                              if baseline_witnesses is not None else None))
       opt_witnesses = baseline_witnesses
+      opt_pre_witnesses = baseline_pre_witnesses
       witness_alts = None                                    # --witness-sets alternatives
       _reuse_final = False
       if (plan is not None and cfg.optimize_witnesses is not None
@@ -4260,6 +4505,19 @@ def run(cfg, explicit=None):
           if witness_alts:
             witness_alts = {i: ms for i, ms in witness_alts.items()
                             if np.allclose(ms[0], opt_witnesses[i], atol=1e-9, rtol=0.0)}
+      if opt_witnesses is not None and _required_pre and not _reuse_final:
+        from solver import collect_plan_pre_witnesses
+        opt_pre_witnesses = collect_plan_pre_witnesses(
+            C, assembly, plan, opt_witnesses, robots, robot_ik,
+            gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
+            handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
+            resolve_missing=True)
+        _missing_pre = [i for i in _required_pre if i not in opt_pre_witnesses]
+        if _missing_pre:
+          raise ValueError(
+              "optimized witness lacks a matching certified pre-insertion endpoint at "
+              + ", ".join(map(str, _missing_pre)) + "; retaining/re-solving it later would "
+              "change the IK certificate")
       if (cfg.save is not None and plan is not None and opt_witnesses is not None
           and (cfg.optimize_witnesses is not None or _has_path_skill)):
         # RE-save with the optimized witnesses attached (the first save above is deliberately
@@ -4273,7 +4531,8 @@ def run(cfg, explicit=None):
                                           alts=witness_alts,
                                           stage=("optimized" if cfg.optimize_witnesses is not None
                                                  else "search"),
-                                          skill_paths=skill_paths))
+                                          skill_paths=skill_paths,
+                                          pre_witnesses=opt_pre_witnesses))
       if plan is not None and cfg.utilization:
         from solver import utilization_report
         utilization_report(C, assembly, plan, robots, witnesses=opt_witnesses,
@@ -4304,7 +4563,7 @@ def run(cfg, explicit=None):
           _export_margin_ramp = cfg.mp_margin_ramp
           _export_table_margin = cfg.mp_table_margin
           _export_table_float = cfg.part_float if cfg.mp_table_margin else 0.0
-          mp_pre = None
+          mp_pre = dict(opt_pre_witnesses or {})
           _pre_pin_robots = {}
           _cograsp_pre = {}
           if cfg.mp_export_load:
@@ -4366,6 +4625,10 @@ def run(cfg, explicit=None):
                   C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
                   handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing)
               _cograsp_pre = dict(_frep.get("pre_witnesses") or {})
+              if _cograsp_pre:
+                mp_pre.update(_cograsp_pre)
+                print(f"[cograsp-chain] using {len(_cograsp_pre)} fused add_grasp/pre-assemble "
+                      "rendezvous keyframe(s).")
           require_complete_witnesses(plan, mp_wit,
                                      who="motion-plan witness export")
           # LAST GATE: re-check EVERY IK keyframe we are about to SHIP. Every earlier gate ran
@@ -4375,10 +4638,26 @@ def run(cfg, explicit=None):
           # subassembly through the table and fail later as an unexplained "no path".
           if robot_ik.penetration_reject is not None:
             from solver import validate_export_witnesses
+            _pre_gate_input_wit = list(mp_wit)
             mp_wit, _bad = validate_export_witnesses(
                 C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
                 handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
                 baseline_witnesses=(baseline_witnesses if _loaded_export is None else mp_wit))
+            # A collision-gate rollback changes the seated half of the certificate. Restore
+            # the matching baseline mouth with it; never retain a mouth tied to the rejected
+            # optimized/fused endpoint.
+            if _loaded_export is None:
+              for _i in _required_pre:
+                if (not np.allclose(_pre_gate_input_wit[_i], mp_wit[_i],
+                                    atol=1e-9, rtol=0.0)):
+                  if (_i in (baseline_pre_witnesses or {})
+                      and np.allclose(mp_wit[_i], baseline_witnesses[_i],
+                                      atol=1e-9, rtol=0.0)):
+                    mp_pre[_i] = np.asarray(baseline_pre_witnesses[_i], dtype=float).copy()
+                    print(f"  [export-gate] step {_i}: restored its paired search-certified "
+                          "pre-insertion mouth as well")
+                  else:
+                    mp_pre.pop(_i, None)
             if _bad:
               print(f"[export-gate] FAILURE: {len(_bad)} IK keyframe(s) exceed the search "
                     f"collision gate; motion planning was NOT started:")
@@ -4404,8 +4683,8 @@ def run(cfg, explicit=None):
                     "(only intended skill contacts exempt).")
           # AFTER fusing: this pass never re-solves a SKILL witness, so a fused pair survives
           # untouched -- it only replaces the pre-* GOTO keyframes the exporter would solve.
-          if _loaded_export is None:
-            mp_pre = None
+          # ``mp_pre`` already contains the exact mouths certified with the selected seated
+          # witnesses.  Do not discard them and ask an export process to redo IK.
           # DEFAULT ON where the pin can actually bite. It cannot for `pick` or a solo
           # `place` (_ik_pick/_ik_place already restrict the scene to the acting arm, so
           # pin_applied == 0 and the pass rejects) -- that is 6/14 splits on car-mini and 16/22
@@ -4432,19 +4711,22 @@ def run(cfg, explicit=None):
                   "structure never changes.")
             mp_pre, _prep = fuse_pre_skill_witnesses(
                 C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
-                handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing)
+                handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
+                certified_pre_witnesses=mp_pre)
             _pre_pin_robots = dict(_prep.get("pin_robots") or {})
             if _pre_pin_robots:
               print(f"[pre] {len(_pre_pin_robots)} accepted funnel solve(s) used idle-arm IK "
                     "pins. They remain transition hints; idle arms are not task participants.")
+          if _loaded_export is None:
+            _missing_mp_pre = [i for i in _required_pre if i not in (mp_pre or {})]
+            if _missing_mp_pre:
+              raise ValueError(
+                  "final motion witness lacks its paired certified pre-insertion endpoint at "
+                  + ", ".join(map(str, _missing_mp_pre))
+                  + "; refusing to reconstruct IK during export")
           # The generic pre-skill pass knows how to pin an ordinary funnel, but the cograsp
           # pass solves the stronger three-arm rendezvous. Its accepted keyframes therefore
           # win for the paired assemble indices.
-          if _loaded_export is None and _cograsp_pre:
-            mp_pre = dict(mp_pre or {})
-            mp_pre.update(_cograsp_pre)
-            print(f"[cograsp-chain] using {len(_cograsp_pre)} fused add_grasp/pre-assemble "
-                  "rendezvous keyframe(s).")
           if _export_collision_tolerance != 0.01:
             print(f"[flag] --mp-collision-tolerance={_export_collision_tolerance:g}: exported "
                   f"problem validates configs at this total-penetration budget.")
@@ -4548,6 +4830,19 @@ def run(cfg, explicit=None):
             print(f"[motion-plan] serving MODES on http://localhost:{cfg.viser_port}")
             visualize_modes(prob, use_viser=True)
             return
+          # One edge certificate, end to end.  mr_bench's RAI environment defaults to a
+          # coarse 0.01-rad interpolation step, while standard shortcutting and simulation
+          # preflight use 0.002 rad.  A narrow collision can therefore be accepted by BiRRT
+          # and rejected only after an expensive successful run (Fabrica Beam: 1.46mm at
+          # alpha=.989 of the approach-to-funnel edge).  The configured certified shortcut
+          # resolution is also the planner's edge resolution; endpoint tolerances remain
+          # unchanged.  This is a sampling-resolution consistency fix, not a stricter gate.
+          if cfg.mp_shortcut_res is not None:
+            _old_res = float(getattr(prob, "collision_resolution", cfg.mp_shortcut_res))
+            prob.collision_resolution = float(cfg.mp_shortcut_res)
+            if abs(_old_res - prob.collision_resolution) > 1e-15:
+              print(f"[motion-plan] unified edge resolution: {_old_res:g} -> "
+                    f"{prob.collision_resolution:g}rad (BiRRT, shortcut, sim preflight)")
           mp_path, _ = MP.run_birrt(
               prob, runtime=cfg.mp_runtime, shortcut=not cfg.mp_no_shortcut,
               shortcut_iters=cfg.mp_shortcut_iters, shortcut_resolution=cfg.mp_shortcut_res,

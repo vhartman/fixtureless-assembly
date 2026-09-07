@@ -44,6 +44,32 @@ def test_distinct_alternates_survive_successive_edge_deletions():
   assert all(isinstance(v, set) for v in e.children.values())
 
 
+def test_dynamic_edge_family_filter_invalidates_all_symbolic_aliases():
+  graph = {
+      "S": [(('to-a', 1), "A"), (('to-b', 1), "B"), (('to-c', 1), "C")],
+      "A": [(('alias-a', 1), "X")],
+      "B": [(('alias-b', 1), "X")],
+      "C": [(('different', 5), "Y")],
+      "X": [(('finish-x', 1), "G")],
+      "Y": [(('finish-y', 1), "G")],
+      "G": [],
+  }
+  blocked_families = set()
+  e = _IncrementalLazySearch(
+      "S", goal_fn=lambda s: s == "G", succ_fn=lambda s: graph[s],
+      cost_fn=lambda a: a[1], h_fn=lambda _s: 0, weight=1, blacklist=set(),
+      edge_filter=lambda _s, action, _ns: (
+          "alias" not in blocked_families or not action[0].startswith("alias-")))
+  assert e.search(100) == [('to-a', 1), ('alias-a', 1), ('finish-x', 1)]
+
+  blocked_families.add("alias")
+  rejected, roots = e.invalidate_filtered_edges()
+  assert rejected >= 1 and roots >= 1
+  # The alternate B->X aliases the rejected A->X physical query. It must be skipped without
+  # adding either concrete edge to the symbolic blacklist.
+  assert e.search(100) == [('to-c', 1), ('different', 5), ('finish-y', 1)]
+
+
 def test_regenerated_successors_preserve_incremental_repair_result():
   graph = {
       "S": [(('s-a', 1), "A"), (('s-b', 1), "B")],

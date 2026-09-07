@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from benchmarks import plot_cube_scaling as C
 from benchmarks import search_runner as B
 
 
@@ -90,7 +91,8 @@ def test_manifest_rejects_ambiguous_variant_and_matrix_products():
                                    "paper_search_matrix.json",
                                    "paper_search_stress_4r.json",
                                    "search_finalists_4r.json",
-                                   "search_manipulation_scope_ablation.json"])
+                                   "search_manipulation_scope_ablation.json",
+                                   "cube_scaling.json", "cube_scaling_piecewise.json"])
 def test_repository_manifests_validate_and_expand(name):
   path = B.ROOT / "benchmarks" / "manifests" / name
   data = B.validate_manifest(json.loads(path.read_text()))
@@ -107,6 +109,9 @@ def test_runner_rejects_flags_that_would_escape_or_pollute_search_measurement():
 def test_log_parser_extracts_backward_and_ik_work():
   log = """
 [sig-h] 45509 coreachable states, 812 pick facts, built in 12.50s
+[fill-pdb obj_1:open-effort] settled=20 discovered=30 reverse=0.40s pick=2 wrench=3 exhausted=False
+[fill-pdb obj_1:ok-open] settled=30 discovered=35 reverse=0.75s pick=2 wrench=4 exhausted=False
+[fill-pdb obj_2:ok-open] settled=40 discovered=45 reverse=1.25s pick=3 wrench=5 exhausted=False
 [fill-prof obj_1:ok-open] binds=6 failed=1 bind_time=2.2s
 [fill-skeleton obj_1] VALIDATED 4-action direct schema after 3 candidate path(s), 2 failed IK edge(s), 1.25s
 [fill-skeleton obj_2] assignment probe budget 12 reached, 9 failed IK edge(s), 2.50s -> complete local fallback
@@ -115,12 +120,20 @@ def test_log_parser_extracts_backward_and_ik_work():
 [strict-collisions] vetoed 4 dirty KOMO witnesses (> 0.0001m total penetration).
 [ik-clearance] vetoed 3 IK candidate(s) below the shared 5.0mm search/witness margin.
 [ik-prof] binds: 432 called, 7 cache hits (2%), 425 solved (158 ok / 267 failed), bind wall 272.2s
+[ik-prof] primitive totals (binds/failed/bind-wall; full-NLP count/time; precheck-NLP count/time):
+[ik-prof]   pick       300/250    200.00s; full 4000/180.00s; precheck    0/  0.00s
+[ik-prof]   handover    80/10      12.00s; full  120/ 10.00s; precheck   80/  1.00s
+[ik-prof]   add_grasp   12/2        3.00s; full   20/  2.50s; precheck   12/  0.20s
+[ik-prof]   place       30/5        5.00s; full   50/  4.00s; precheck    0/  0.00s
+[ik-prof]   assemble    10/0        1.00s; full   12/  0.80s; precheck    2/  0.10s
 [ik-prof] bind outcome time: successes 31.7s (12%), failures 240.5s (88%)
 [ik-prof] NLP solves: 5655 in 244.1s (seeded 869/31.9s, unseeded 1587/77.3s, restarts 3199/134.9s)
 [ik-prof] reach precheck: 402 relaxed solves in 96.5s (179 rejects caught); post-solve gates 513x in 0.6s; getPath calls 513
 [ik-reuse] positive certificates: 44 accepted / 47 tried in 0.13s; library=143 vectors over 143 kinematic cores.
 [ik-reuse] negative diagnostic ONLY (no pruning): 3 repeated exact-scene failures / 0.4s; 428 cross-scene same-core repeats / 16.6s optimistic nogood upper bound.
 [ik-reuse] physical-query invariant: 37 symbolic aliases collapsed across 211 physical queries; exact witnesses and open failure effort are shared under the skill-local equivalence.
+[pick-prof obj_1:ok-open] binds=120/100f targets=30 table-scenes=40 exact-query-reprobes=80; robots: a1=60/50f,15t/20s, a2=60/50f,15t/20s
+[pick-prof] 300 binds/250 failed over 70 exact robot-grasp targets and 95 physical table scenes; exact-query reprobes=205; by robot: a1=150/125f,35 targets/48 scenes, a2=150/125f,35 targets/47 scenes
 [fill-policy-widen obj_2] Bellman frontier adds one grasp batch (loose, context=('obj_2',), part=obj_2, class=1) ids [20, 21]; 1 demand batch(es) remain. One bounded forward-IK epoch; activated columns remain available to later policy branches.
 [fill-policy-widen obj_2] grasp batch did not validate; retaining its finite column and advancing to the next Bellman demand.
 [fill-policy-widen obj_2] Bellman frontier adds one rest/yaw orbit (group=('obj_0',), class=2); activated orbits and raw columns remain available to later policy branches. One bounded forward-IK epoch.
@@ -129,10 +142,16 @@ def test_log_parser_extracts_backward_and_ik_work():
   got = B.parse_log(log)
   assert got["backward_states"] == 45509
   assert got["backward_build_s"] == 12.5
+  assert got["fill_pdb_reverse_s"] == 2.0       # max(obj_1 retries) + obj_2
+  assert got["backward_search_s"] == 14.5
   assert got["milestone_search_s"] == 49.12
   assert got["milestone_repairs"] == 2
   assert got["ik_bind_calls"] == 432 and got["ik_bind_fail"] == 267
   assert got["ik_bind_success_s"] == 31.7 and got["ik_bind_fail_s"] == 240.5
+  assert got["ik_pick_binds"] == 300 and got["ik_pick_bind_fail"] == 250
+  assert got["ik_handover_binds"] == 80 and got["ik_handover_nlp_solves"] == 120
+  assert got["ik_add_grasp_binds"] == 12 and got["ik_add_grasp_precheck_solves"] == 12
+  assert got["ik_assemble_bind_s"] == 1.0
   assert got["ik_nlp_solves"] == 5655 and got["ik_restart_solves"] == 3199
   assert got["ik_precheck_rejects"] == 179
   assert got["ik_reuse_hits"] == 44 and got["ik_reuse_trials"] == 47
@@ -142,6 +161,12 @@ def test_log_parser_extracts_backward_and_ik_work():
   assert got["ik_negative_core_repeats"] == 428
   assert got["ik_negative_core_repeat_s"] == 16.6
   assert got["ik_physical_aliases"] == 37 and got["ik_physical_queries"] == 211
+  assert got["pick_profile_binds"] == 300
+  assert got["pick_profile_failures"] == 250
+  assert got["pick_profile_targets"] == 70
+  assert got["pick_profile_table_scenes"] == 95
+  assert got["pick_profile_exact_reprobes"] == 205
+  assert got["pick_profile_complete"] is True
   assert got["strict_collision_rejects"] == 4
   assert got["clearance_rejects"] == 3
   assert got["peak_rss_reported_mb"] == 1712
@@ -168,6 +193,20 @@ def test_plan_parser_reports_cost_kinds_and_witness_coverage(tmp_path):
   assert got["plan_cost"] == 4
   assert got["plan_action_kinds"] == {"pick": 1, "handover": 1, "release": 1}
   assert got["witness_count"] == 2 and got["witness_stage"] == "search"
+
+
+def test_log_parser_sums_completed_pick_profiles_for_timeout():
+  got = B.parse_log("""
+[pick-prof obj_1:ok-open] binds=20/15f targets=8 table-scenes=10 exact-query-reprobes=10; robots: a1=10/7f,4t/5s
+[pick-prof obj_2:ok-open] binds=30/24f targets=12 table-scenes=15 exact-query-reprobes=15; robots: a1=15/12f,6t/8s
+[open-witness obj_3] epoch 1 ended on the node budget 20000 (not exhaustion)
+""")
+  assert got["pick_profile_binds"] == 50
+  assert got["pick_profile_failures"] == 39
+  assert got["pick_profile_targets"] == 20
+  assert got["pick_profile_table_scenes"] == 25
+  assert got["pick_profile_exact_reprobes"] == 25
+  assert got["pick_profile_complete"] is False
 
 
 def test_aggregate_keeps_failures_in_success_rate_but_not_numeric_means():
@@ -218,3 +257,77 @@ def test_matrix_suite_writes_markdown_csv_and_json(tmp_path):
   data = json.loads((tmp_path / "matrix.json").read_text())
   assert data["groups"][0]["method"] == "counting"
   assert data["groups"][0]["physics"] == "geometry"
+
+
+def test_cube_scaling_manifest_is_the_requested_12_by_3_product():
+  path = B.ROOT / "benchmarks" / "manifests" / "cube_scaling.json"
+  runs = B.expand_runs(B.validate_manifest(json.loads(path.read_text())))
+  assert len(runs) == 36
+  assert {int(C._flag_value(r["args"], "--parts")) for r in runs} == set(range(1, 13))
+  assert {int(C._flag_value(r["args"], "--num-robots")) for r in runs} == {2, 3, 4}
+  assert all("--vacuum" in r["args"] for r in runs)
+  assert all(r["max_address_space_gb"] == 6.0 for r in runs)
+
+
+def test_piecewise_cube_scaling_manifest_changes_only_the_assembly_family():
+  path = B.ROOT / "benchmarks" / "manifests" / "cube_scaling_piecewise.json"
+  runs = B.expand_runs(B.validate_manifest(json.loads(path.read_text())))
+  assert len(runs) == 36
+  assert all(C._flag_value(r["args"], "--assembly") == "cube-sequence-2x2x3"
+             for r in runs)
+  assert {int(C._flag_value(r["args"], "--parts")) for r in runs} == set(range(1, 13))
+  assert {int(C._flag_value(r["args"], "--num-robots")) for r in runs} == {2, 3, 4}
+
+
+def test_cube_scaling_summary_does_not_turn_timeout_into_solution_time():
+  def sample(parts, robots, success, **extra):
+    return {
+        "run_id": f"p{parts}-r{robots}",
+        "planner_command": ["python", "main.py", "--parts", str(parts),
+                            "--num-robots", str(robots)],
+        "success": success,
+        **extra,
+    }
+
+  rows = C.summarize([
+      sample(2, 3, True, milestone_search_s=4.0),
+      sample(2, 3, True, milestone_search_s=6.0),
+      sample(3, 3, False, timed_out=True, wall_s=90.0),
+  ])
+  assert rows[0]["milestone_search_s_mean"] == 5.0
+  assert rows[0]["milestone_search_s_sd"] == 1.0
+  assert rows[1]["milestone_search_s_mean"] is None
+  assert rows[1]["failures"] == 1 and rows[1]["timeouts"] == 1
+
+
+def test_cube_scaling_per_part_normalizes_times_and_censored_markers():
+  metric, rows = C._per_part_rows([{
+      "parts": 4,
+      "milestone_search_s_mean": 10.0,
+      "milestone_search_s_sd": 2.0,
+      "failed_elapsed_s_max": 20.0,
+  }], "milestone_search_s")
+  assert metric == "milestone_search_s_per_part"
+  assert rows[0]["milestone_search_s_per_part_mean"] == 2.5
+  assert rows[0]["milestone_search_s_per_part_sd"] == 0.5
+  assert rows[0]["failed_elapsed_s_max"] == 5.0
+
+
+def test_cube_scaling_component_residual_comes_from_raw_log(tmp_path):
+  log = tmp_path / "run.log"
+  log.write_text("""
+[fill-pdb obj_1:open-effort] settled=2 discovered=3 reverse=0.50s pick=1 wrench=1 exhausted=False
+[fill-pdb obj_1:ok-open] settled=3 discovered=3 reverse=0.75s pick=1 wrench=1 exhausted=False
+[fill-pdb obj_2:ok-open] settled=4 discovered=5 reverse=1.25s pick=1 wrench=1 exhausted=False
+[milestones] complete: 10 actions in 10.00s (0 repairs)
+[ik-prof] binds: 8 called, 0 cache hits (0%), 8 solved (2 ok / 6 failed), bind wall 6.0s
+""")
+  result = {
+      "run_id": "p3-r2", "success": True, "milestone_search_s": 10.0,
+      "planner_command": ["python", "main.py", "--parts", "3", "--num-robots", "2"],
+      "artifacts": {"log": "run.log"},
+  }
+  got = C._with_component_metrics(tmp_path, [result])[0]
+  assert got["ik_bind_wall_s"] == 6.0
+  assert got["backward_search_s"] == 2.0
+  assert got["residual_search_s"] == 2.0

@@ -53,6 +53,7 @@ def apply_wrench_params(cfg):
   else:
     _restore_in_place(wrench.PARAMS, _WRENCH_PARAMS0)
   wrench.PARAMS["grasp_model"] = _saved(cfg, "grasp_model")
+  wrench.apply_wrench_profile(_saved(cfg, "wrench_profile"))
   tm = cfg.get("table_mu")                                  # friction-cone table model
   if tm is not None:
     wrench.PARAMS["table_model"] = "friction"
@@ -64,6 +65,8 @@ def apply_wrench_params(cfg):
       None if _saved(cfg, "insertion_noise") is None
       else {"lateral": _saved(cfg, "insertion_noise"), "offset": _saved(cfg, "insertion_offset")})
   wrench.PARAMS["robust_mode"] = _saved(cfg, "robust_mode")
+  wrench.PARAMS["orientation_robust_gravity"] = bool(
+      _saved(cfg, "orientation_robust_wrench"))
   # Vacuum sealing is a successor gate, so replay must restore it before walking the saved
   # action list. Missing in an old plan means the compatibility default (0 N).
   wrench.PARAMS["vacuum_engage_force"] = float(_saved(cfg, "vacuum_engage_force"))
@@ -193,6 +196,13 @@ def build_scene(cfg):
     C = (make_openarm_floating_env(num_robots=cfg["num_robots"])
          if _saved(cfg, "floating_ee") else
          make_openarm_duo_env(num_duos=max(1, cfg["num_robots"] // 2)))
+  elif (_saved(cfg, "robot_types") or _saved(cfg, "robot")) == "husky":
+    from env import make_husky_duo_env
+    if int(cfg["num_robots"]) != 2:
+      raise ValueError("saved Husky scene must contain exactly two robots")
+    if _saved(cfg, "floating_ee"):
+      raise ValueError("saved Husky scene requests unsupported floating end effectors")
+    C = make_husky_duo_env()
   else:
     C = make_four_robot_env(num_robots=cfg["num_robots"], floating_ee=cfg["floating_ee"],
                             vacuum=gripper_list if gripper_list is not None else _saved(cfg, "vacuum"),

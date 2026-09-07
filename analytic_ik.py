@@ -82,6 +82,33 @@ _CAL = {
         },
         "load": lambda: _artifact("ur10_ik"),
     },
+    "husky_right": {
+        # Generated directly from the live calibrated RAI subtree by
+        # calibrate_husky_ssik.py.  The calibrated right and left UR5e chains differ by
+        # millimetres/milliradians and therefore intentionally use separate artifacts.
+        "sign": np.ones(6),
+        "offset": np.zeros(6),
+        "tools": {
+            # calibrated tool0 is the Robotiq mounting flange; gripper_center is 130mm
+            # along its +z axis (measured from the same loaded RAI scene).
+            "two_finger": np.array([[1.0, 0.0, 0.0, 0.0],
+                                     [0.0, 1.0, 0.0, 0.0],
+                                     [0.0, 0.0, 1.0, 0.13],
+                                     [0.0, 0.0, 0.0, 1.0]]),
+        },
+        "load": lambda: _artifact("husky_right_ik"),
+    },
+    "husky_left": {
+        "sign": np.ones(6),
+        "offset": np.zeros(6),
+        "tools": {
+            "two_finger": np.array([[1.0, 0.0, 0.0, 0.0],
+                                     [0.0, 1.0, 0.0, 0.0],
+                                     [0.0, 0.0, 1.0, 0.13],
+                                     [0.0, 0.0, 0.0, 1.0]]),
+        },
+        "load": lambda: _artifact("husky_left_ik"),
+    },
     "fr3": {
         # built via: ssik build franka_description/robots/fr3/fr3.urdf.xacro
         #   (--xacro-arg hand:=false --base fr3_link0 --ee fr3_link8)
@@ -235,9 +262,27 @@ def seed_configs(robot_type, T_ee_in_baselink, tool_kind="two_finger", joint_lim
   rai_limits = np.asarray(joint_limits, dtype=float) if joint_limits is not None else None
   for s in sols:
     q = c["sign"] * (np.asarray(s.q, dtype=float) - c["offset"])
-    if rai_limits is not None and rai_limits.shape == (2, len(q)) \
-        and (np.any(q < rai_limits[0] - 1e-9) or np.any(q > rai_limits[1] + 1e-9)):
-      continue
+    if rai_limits is not None and rai_limits.shape == (2, len(q)):
+      # Analytic solvers may return a revolute angle in an equivalent 2pi winding outside
+      # RAI's interval (the generated Husky solvers commonly return q-2pi).  That is not a
+      # physical-limit rejection. Canonicalize each revolute solution into the runtime box;
+      # reject only when no equivalent winding lies inside. All currently calibrated SSIK
+      # arms are revolute-only, so this does not reinterpret any prismatic coordinate.
+      q_fit = np.asarray(q, dtype=float).copy()
+      valid = True
+      for i, (qi, qlo, qhi) in enumerate(zip(q_fit, rai_limits[0], rai_limits[1])):
+        if qi < qlo - 1e-9 or qi > qhi + 1e-9:
+          k0 = int(np.ceil((qlo - qi - 1e-9) / (2.0 * np.pi)))
+          k1 = int(np.floor((qhi - qi + 1e-9) / (2.0 * np.pi)))
+          if k0 > k1:
+            valid = False
+            break
+          centre = 0.5 * (qlo + qhi)
+          k = min(range(k0, k1 + 1), key=lambda kk: abs(qi + 2.0 * np.pi * kk - centre))
+          q_fit[i] = qi + 2.0 * np.pi * k
+      if not valid:
+        continue
+      q = q_fit
     if not any(np.linalg.norm(q - old) < 1e-5 for old in out):
       out.append(q)
   return out

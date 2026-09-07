@@ -3,10 +3,11 @@
 The legacy LazySP path asks one edge for its full IK budget and permanently blacklists it on
 failure.  Here a failure means only "not on this visit": each blocking symbolic edge receives a
 bounded BATCH and is suspended for the rest of that epoch, while physically equivalent aliases
-share one effort cursor.  An alias revisit therefore skips already-spent deterministic slots but
-may invest genuinely new stochastic effort; it is not a cached negative verdict.  Successes
-persist, failures never enter a permanent cache, and all attempts in a batch share scene
-construction and reach-precheck setup.
+share one effort cursor.  With the physical-deferral selector, one failed query also filters all
+of its symbolic aliases for the remainder of that epoch.  The filter is cleared at the fairness
+boundary, so an alias revisit may invest genuinely new stochastic effort; it is not a cached
+negative verdict.  Successes persist, failures never enter a permanent cache, and all attempts
+in a batch share scene construction and reach-precheck setup.
 
 This module is intentionally search-engine agnostic.  ``solver._add_one_part`` supplies three
 small adapters (construct engine, walk a plan, identify IK edges), keeping the existing engine
@@ -38,6 +39,8 @@ class OpenWitnessReport:
   max_node_budget: int = 0
   reordered_paths: int = 0
   prior_failure_first: int = 0
+  physical_deferrals: int = 0
+  deferred_physical_queries: int = 0
   search_profile: dict = field(default_factory=dict)
 
 
@@ -83,6 +86,14 @@ class OpenWitnessPool:
     # Backward-compatible adapter for tiny external/test RobotIK-like objects. Real search
     # always supplies successor+assembly and therefore uses the skill-local physical query.
     return action, self.robot_ik._scene_sig(state)
+
+  def filter_key(self, state, action, successor=None, assembly=None):
+    """Pure key lookup used on generated graph edges by a physical-family filter."""
+    assembly = self.assembly if assembly is None else assembly
+    if (successor is not None and assembly is not None
+        and hasattr(self.robot_ik, "_physical_query_key")):
+      return self.robot_ik._physical_query_key(action, state, successor, assembly)
+    return self.key(state, action, successor, assembly)
 
   def known(self, state, action, successor=None, assembly=None):
     return self.key(state, action, successor, assembly) in self.success
@@ -177,9 +188,10 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
   pool.begin_session(tag)
   report = OpenWitnessReport()
   selector = getattr(robot_ik, "lazy_edge_selector", "forward")
-  if selector not in ("forward", "terminal-first", "reverse", "fail-first"):
+  if selector not in ("forward", "terminal-first", "reverse", "fail-first",
+                      "defer-failed"):
     raise ValueError("lazy edge selector must be 'forward', 'terminal-first', 'reverse', "
-                     "or 'fail-first'")
+                     "'fail-first', or 'defer-failed'")
 
   def validation_order(walked):
     """Return unresolved IK edges in the requested LazySP validation order.
@@ -188,10 +200,15 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
     order need not follow execution order.  ``fail-first`` uses only failures of the SAME
     skill-local physical query.  An unseen tie falls back to reverse path order,
     putting the contact-critical suffix in front without inventing cross-scene evidence.
+
+    BIG TODO(search): symbolic aliases currently decide immediate retry frequency under forward,
+    while defer-failed postpones every retry for a full epoch. Replace both accidental extremes
+    with a fair physical-query retry/diversify scheduler; mixed-gripper Chair is the regression
+    test where useful second-tier retries must not be buried behind the full alternative graph.
     """
     unresolved = [(i, edge) for i, edge in enumerate(walked)
                   if is_ik(edge[1]) and not pool.known(*edge, assembly=assembly)]
-    if selector == "forward":
+    if selector in ("forward", "defer-failed"):
       return [edge for _i, edge in unresolved]
     if selector == "terminal-first":
       # Concrete disassembly proposal without a duplicate inverse action model: a complete
@@ -273,7 +290,10 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
 
   def storage_tail():
     select = (f"; selector={selector}, reordered={report.reordered_paths}, "
-              f"prior-failure-first={report.prior_failure_first}")
+              f"prior-failure-first={report.prior_failure_first}"
+              + (f", physical-deferrals={report.physical_deferrals}/"
+                 f"{report.deferred_physical_queries}q"
+                 if selector == "defer-failed" else ""))
     succ = (f"{report.max_successor_states}/{report.max_successor_edges}"
             if report.max_successor_states else "regenerated")
     return (f"; search peak pending/heap={report.max_frontier}/{report.max_heap_entries}, "
@@ -298,7 +318,33 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
     epoch_nodes = int(max_nodes) * (1 << (epoch - 1))
     report.max_node_budget = max(report.max_node_budget, epoch_nodes)
     suspended = set()                                    # cleared at the next fairness epoch
+    # ``defer-failed`` gives each PHYSICAL query at most one failed batch per epoch. The
+    # ordinary suspended set is symbolic-edge-local, so without this set many aliases of one
+    # table-scene pick can successively advance the same stochastic effort cursor. Resetting at
+    # the epoch boundary is the fairness guarantee: every recurring query receives its next
+    # tier in the next epoch and no finite miss becomes a permanent nogood.
+    failed_physical_this_epoch = set()
+    failed_actions_this_epoch = set()
+    deferred_physical_this_epoch = set()
+    filter_key_cache = {}
     engine = make_engine(suspended)
+    physical_filter_in_engine = (selector == "defer-failed"
+                                 and hasattr(engine, "set_edge_filter"))
+    if physical_filter_in_engine:
+      def _physical_edge_allowed(state, action, successor):
+        # A physical key always retains the complete action tuple.  Most generated actions can
+        # therefore be accepted without constructing any scene signature. Cache only the small
+        # matching-action slice that could alias an already failed query.
+        action = tuple(action)
+        if not is_ik(action) or action not in failed_actions_this_epoch:
+          return True
+        edge = (state, action, successor)
+        key = filter_key_cache.get(edge)
+        if key is None:
+          key = filter_key_cache[edge] = pool.filter_key(
+              state, action, successor, assembly=assembly)
+        return key not in failed_physical_this_epoch
+      engine.set_edge_filter(_physical_edge_allowed)
     while True:
       if deadline is not None and time.perf_counter() >= deadline:
         report.deadline = True
@@ -336,6 +382,35 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
                             and not pool.known(*edge, assembly=assembly)]
       if ordered != forward_unresolved:
         report.reordered_paths += 1
+      if selector == "defer-failed":
+        # Inspect metadata for the WHOLE candidate before spending IK. If any unresolved edge
+        # aliases a query already failed this epoch, this candidate cannot be certified under
+        # the epoch's one-batch allowance. Temporarily suspend that concrete alias and replan;
+        # do not waste work on its other edges or advance the failed query again.
+        blocked = []
+        for i, edge in enumerate(ordered):
+          key = pool.key(*edge, assembly=assembly)
+          if key in failed_physical_this_epoch:
+            visits, slots = pool.failed_effort(*edge, assembly=assembly)
+            blocked.append((visits, slots, -i, key, edge))
+        if blocked:
+          _visits, _slots, _neg_i, physical_key, (state, action, successor) = max(
+              blocked, key=lambda row: row[:3])
+          if physical_filter_in_engine:
+            rejected, _roots = engine.invalidate_filtered_edges()
+            # This is a defensive path: normally the tree was invalidated immediately when
+            # the physical query first failed.  Count aliases removed here if a custom engine
+            # admitted one in the interim.
+            report.physical_deferrals += max(1, rejected)
+          else:
+            # Backward-compatible path for small external/test engines without a family filter.
+            suspended.add((state, action))
+            engine.delete_edge(state, action, successor)
+            report.physical_deferrals += 1
+          if physical_key not in deferred_physical_this_epoch:
+            report.deferred_physical_queries += 1
+          deferred_physical_this_epoch.add(physical_key)
+          continue
       for state, action, successor in ordered:
         ok, _witness, spent = pool.probe(action, state, successor, assembly)
         report.probes += spent
@@ -343,8 +418,24 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
           report.successes += 1
           continue
         report.open_failures += 1
-        suspended.add((state, action))
-        engine.delete_edge(state, action, successor)
+        if selector == "defer-failed":
+          physical_key = pool.key(state, action, successor, assembly=assembly)
+          failed_physical_this_epoch.add(physical_key)
+          failed_actions_this_epoch.add(tuple(action))
+          if physical_key not in deferred_physical_this_epoch:
+            report.deferred_physical_queries += 1
+          deferred_physical_this_epoch.add(physical_key)
+          if physical_filter_in_engine:
+            rejected, _roots = engine.invalidate_filtered_edges()
+            # One rejected edge is the failed candidate itself; the rest are aliases removed
+            # without another candidate-plan round or optimizer call.
+            report.physical_deferrals += max(0, rejected - 1)
+          else:
+            suspended.add((state, action))
+            engine.delete_edge(state, action, successor)
+        else:
+          suspended.add((state, action))
+          engine.delete_edge(state, action, successor)
         valid = False
         break                                            # incumbent is invalid: replan NOW
       if valid:

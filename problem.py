@@ -11,6 +11,45 @@ from env import *
 import wrench
 
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Exact renderer-only part meshes. These stay separate from ``part_shapes``: planning and
+# MuJoCo collide with that spec (which may be a convex decomposition of the same CAD), while
+# RAI/Viser/MuJoCo render this authored surface without duplicating mass or contact.
+_VISUAL_MESH_CACHE = {}
+
+
+def _visual_mesh_data(spec):
+  """Load one part-local visual mesh as (vertices, uint32 triangles)."""
+  prm = {"file": spec} if isinstance(spec, str) else dict(spec)
+  path = prm["file"]
+  path = path if os.path.isabs(path) else os.path.join(HERE, path)
+  path = os.path.realpath(path)
+  hit = _VISUAL_MESH_CACHE.get(path)
+  if hit is None:
+    if not os.path.exists(path):
+      raise FileNotFoundError(f"visual part mesh does not exist: {path}")
+    import trimesh
+    mesh = trimesh.load(path, force="mesh", process=False)
+    hit = (np.ascontiguousarray(mesh.vertices, dtype=float),
+           np.ascontiguousarray(mesh.faces, dtype=np.uint32))
+    _VISUAL_MESH_CACHE[path] = hit
+  return hit
+
+
+def add_part_visual(C, name, spec):
+  """Attach an exact, non-colliding mesh child to an existing rai part frame."""
+  if not spec:
+    return None
+  prm = {"file": spec} if isinstance(spec, str) else dict(spec)
+  V, T = _visual_mesh_data(prm)
+  f = C.addFrame(f"{name}__visual", name).setMesh(V, T)
+  f.setRelativePosition(prm.get("pos", [0.0, 0.0, 0.0]))
+  f.setRelativeQuaternion(prm.get("quat", [1.0, 0.0, 0.0, 0.0]))
+  f.setColor(prm.get("color", [0.82, 0.66, 0.42, 1.0])).setContact(0)
+  return f
+
+
 @dataclass(frozen=True)
 class ScrewSkill:
   """Execution contract for one helical mate.
@@ -116,10 +155,18 @@ class Assembly:
     # wrench-contact computation reads shapes through part_shape() -- ONE source of truth,
     # so the cheap scenes, IK scenes and real env always agree.
     self.part_shapes = {}
+    # Optional per-part geometry used only to generate local grasp candidates. Normally this
+    # is identical to collision geometry. An inserted CAD part can need a socket-safe trimmed
+    # collision proxy at the final state while its loose, full shank remains a valid grasping
+    # surface. Keeping that distinction explicit avoids weakening any scene collision check.
+    self.grasp_shapes = {}
     # Optional renderer-only child shapes, deliberately absent from collision, grasp sampling,
     # mass and wrench geometry. Used for indicators/decals whose only job is to expose motion
     # of a symmetric body in recorded simulation. {part: [{"shape", "pos", "rgba"}, ...]}.
     self.visual_markers = {}
+    # Optional exact renderer-only mesh per part. Each value is a relative path or a dict with
+    # ``file`` plus optional part-local ``pos``, ``quat`` and ``color``. It is never collision.
+    self.visual_meshes = {}
     # SCATTER ORIENTATIONS: {part: quat} -- how a part initially LIES on the table (default
     # identity). E.g. the car's wheels rest FLAT (cap down) in the scatter although their
     # assembled orientation is axle-sideways; the anchor pose carries the rotation, and the
@@ -167,6 +214,9 @@ class Assembly:
   def part_shape(self, part):
     # (kind, params) collision/appearance shape of `part` -- see part_shapes in __init__.
     return self.part_shapes[part]
+
+  def grasp_shape(self, part):
+    return self.grasp_shapes.get(part, self.part_shape(part))
 
   def mass(self, part):
     return self.masses.get(part, self.DEFAULT_MASS)
@@ -491,6 +541,7 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
       shape_f.setColor(_col)                               # np.random stream is id-bearing
       for _s in _extra_shape_fs:                           # downstream (scatter layout)
         _s.setColor(_col)
+      add_part_visual(C, name, assembly.visual_meshes.get(name))
 
       # ORIENTATION MARKER: a rai axis-triad marker per cube, so rotations of the
       # uniformly-colored cubes are visible. A child frame -> follows the part wherever
@@ -819,6 +870,53 @@ class CubePlatesAssembly(Assembly):
         self.connect_requires[f"obj_{root}"] = {f"obj_{last_own}", f"obj_{last_below}"}
 
 
+class CubeSequenceAssembly(Assembly):
+  """A width x depth x height cube lattice assembled strictly one cube at a time.
+
+  This is the sequence control for :class:`CubePlatesAssembly`: it has the same final lattice
+  geometry but no detached plate modules or ``connect`` joins.  A serpentine Hamiltonian path
+  traverses one layer, reverses on the next layer, and therefore crosses each layer boundary by
+  one vertical face-adjacent step.  Every object mates to its immediate predecessor and the
+  dependency graph fixes that same global order.
+
+  Truncation keeps a prefix of this path, so every ``--parts`` value is a nested task instance.
+  """
+
+  def __init__(self, width=2, depth=2, height=3, n_parts=None,
+               spacing=0.055, cube_size=0.05, cube_radius=0.005):
+    total = width * depth * height
+    self.width, self.depth, self.height = width, depth, height
+    self.n_parts = total if n_parts is None else min(n_parts, total)
+    assert self.n_parts >= 1
+    self.spacing = spacing
+    self.cube_size = cube_size
+    self.cube_radius = cube_radius
+    super().__init__()
+
+  def define(self):
+    self.objects = [f"obj_{i}" for i in range(self.n_parts)]
+    self.base = "obj_0"
+
+    layer = []
+    for y in range(self.depth):
+      xs = range(self.width) if y % 2 == 0 else range(self.width - 1, -1, -1)
+      layer.extend((x, y) for x in xs)
+    cells = []
+    for z in range(self.height):
+      traversal = layer if z % 2 == 0 else reversed(layer)
+      cells.extend(np.array([x, y, z], dtype=float) * self.spacing
+                   for x, y in traversal)
+    cells = cells[:self.n_parts]
+
+    self.assembly_dependencies = {
+        f"obj_{i}": [f"obj_{i - 1}"] for i in range(1, self.n_parts)
+    }
+    self.assembly_relative_poses = {
+        f"obj_{i}": [f"obj_{i - 1}", cells[i] - cells[i - 1]]
+        for i in range(1, self.n_parts)
+    }
+
+
 class CuboidTowerAssembly(Assembly):
   """A JENGA-STYLE tower of laid-down 2:1:1 cuboids: TWO per level, side by side, each
   level rotated 90 degrees against the one below.
@@ -1006,6 +1104,229 @@ class CarAssembly(Assembly):
       self.mate_axes[f"obj_{i}"] = np.array([0.0, -np.sign(y), 0.0])  # axial, onto the axle
       self.no_hold.add(f"obj_{i}")                          # a wheel would rotate -> can't brace
     self.assembly_dependencies = {}
+
+
+class FabricaAssembly(Assembly):
+  """Reviewed imports of assemblies from the Fabrica mesh benchmark.
+
+  Fabrica's OBJ files are authored in centimetres in one common assembled frame. The
+  reproducible importer in ``part_meshes/fabrica/import_assets.py`` converts each file to
+  metres and recentres it on its own AABB centre. Consequently the relative translations
+  below are just differences of centres from the generated manifests; no CAD pose is fitted.
+
+  The exact meshes are renderer-only, but collision is no longer a hand-authored primitive
+  proxy.  The offline importer decomposes each authored surface into convex components and
+  records them in the manifest.  RAI and MuJoCo instantiate that identical component list as
+  children/geoms of one rigid part body.  This preserves wheel bores, mortises, pins and duct
+  concavities while respecting both engines' convex collision requirement.
+
+  ``fabrica-car`` deliberately excludes source part 2: that part is the benchmark fixture,
+  not an assembled car component. It maps [1,0,3,4,5] to obj_0..obj_4: body and four
+  wheels. The remaining orders are reviewed spanning trees of the final-pose proximity
+  graph. They are deliberately data below rather than inferred afresh at every run, so a
+  benchmark name has stable object IDs and prefix truncation always remains connected.
+  """
+
+  _SOURCE_ORDER = {
+      "car": ("1", "0", "3", "4", "5"),
+      "beam": ("6", "2", "0", "3", "1"),
+      "cooling_manifold": ("1", "0", "4", "2", "3", "5", "6"),
+      "duct": ("0", "1", "2", "3", "4", "5", "6", "7"),
+      "gamepad": ("3", "1", "2", "4", "0", "5"),
+      "plumbers_block": ("2", "3", "0", "1", "4"),
+      "stool_circular": ("2", "1", "0", "3", "6", "5", "8", "7", "4"),
+  }
+  _PARENT = {
+      "car": {"0": "1", "3": "1", "4": "1", "5": "1"},
+      "beam": {"2": "6", "0": "2", "3": "6", "1": "3"},
+      "cooling_manifold": {"0": "1", "4": "1", "2": "1", "3": "1",
+                           "5": "1", "6": "1"},
+      "duct": {"1": "0", "2": "0", "3": "0", "4": "0", "5": "0",
+               "6": "0", "7": "0"},
+      "gamepad": {"1": "3", "2": "3", "4": "3", "0": "3", "5": "3"},
+      "plumbers_block": {"3": "2", "0": "2", "1": "2", "4": "2"},
+      "stool_circular": {"1": "2", "0": "1", "3": "2", "6": "3",
+                         "5": "2", "8": "5", "7": "2", "4": "7"},
+  }
+
+  def __init__(self, n_parts, model):
+    if model not in self._SOURCE_ORDER:
+      raise ValueError(f"unsupported Fabrica model {model!r}")
+    self.model = model
+    self.n_parts = min(max(1, int(n_parts)), len(self._SOURCE_ORDER[model]))
+    self.cube_radius = 0.0
+    self._manifest = self._load_manifest(model)
+    self.cube_size = max(max(self._manifest["parts"][p]["extents_cm"])
+                         for p in self._SOURCE_ORDER[model]) * .01
+    super().__init__()
+
+  @staticmethod
+  def _load_manifest(model):
+    import json
+    path = os.path.join(HERE, "part_meshes", "fabrica", model, "manifest.json")
+    if not os.path.exists(path):
+      raise FileNotFoundError(
+          f"missing imported Fabrica assets for {model}: run "
+          "python3 part_meshes/fabrica/import_assets.py")
+    with open(path, encoding="utf-8") as f:
+      return json.load(f)
+
+  def _center(self, source_id):
+    return np.asarray(self._manifest["parts"][source_id]["center_cm"], dtype=float) * .01
+
+  def _extents(self, source_id):
+    return np.asarray(self._manifest["parts"][source_id]["extents_cm"], dtype=float) * .01
+
+  @staticmethod
+  def _box(size, pos=(0.0, 0.0, 0.0)):
+    return {"shape": ("box", [*map(float, size), 0.0]), "pos": list(map(float, pos))}
+
+  def _collision_shape(self, source_id):
+    part = self._manifest["parts"][source_id]
+    collision = part.get("collision")
+    if not collision or not collision.get("hulls"):
+      raise ValueError(
+          f"Fabrica manifest {self.model}/{source_id} has no convex collision decomposition; "
+          "rerun python3 part_meshes/fabrica/import_assets.py")
+    root = os.path.join("part_meshes", "fabrica", self.model)
+    return ("compound", [
+        {"shape": ("mesh", {"file": os.path.join(root, hull["file"]),
+                             "geometry": hull["geometry"]}),
+         "pos": list(map(float, hull["pos"]))}
+        for hull in collision["hulls"]])
+
+  def _grasp_shape(self, source_id):
+    """Authored loose-part surface used by the mesh grasp sampler.
+
+    Collision uses convex children because the engines require them.  Sampling their union
+    would expose artificial internal ACD seams as grasp surfaces, so grasp generation reads
+    the original watertight CAD mesh directly.  Scene and closure gates still collide with
+    the decomposed physical body.
+    """
+    return ("mesh", {"file": os.path.join(
+        "part_meshes", "fabrica", self.model, f"{source_id}.obj")})
+
+  def define(self):
+    order = self._SOURCE_ORDER[self.model][:self.n_parts]
+    source_to_part = {source: f"obj_{i}" for i, source in enumerate(order)}
+    self.objects = [f"obj_{i}" for i in range(self.n_parts)]
+    self.base = "obj_0"
+    for source, part in source_to_part.items():
+      self.part_shapes[part] = self._collision_shape(source)
+      self.visual_meshes[part] = f"part_meshes/fabrica/{self.model}/{source}.obj"
+      self.grasp_shapes[part] = self._grasp_shape(source)
+      # Uniform light-plastic density: plausible demonstrators while preserving the source
+      # volume ratios. Mesh volume is m^3 after import; density is 700 kg/m^3.
+      volume = abs(float(_load_mesh({"file": self.visual_meshes[part]})["mesh"].volume))
+      self.masses[part] = max(.005, volume * 700.0)
+    for source, parent_source in self._PARENT[self.model].items():
+      if source not in source_to_part or parent_source not in source_to_part:
+        continue
+      part, parent = source_to_part[source], source_to_part[parent_source]
+      self.assembly_relative_poses[part] = [
+          parent, self._center(source) - self._center(parent_source)]
+      self.assembly_dependencies[part] = [parent]
+
+    if self.model in ("beam", "gamepad", "stool_circular", "cooling_manifold"):
+      # Every member is seated vertically: uprights down onto the rail, caps down onto
+      # uprights. Long uprights lie down in the initial scatter for reachable end grasps.
+      for p in self.objects[1:]:
+        self.mate_axes[p] = np.array([0.0, 0.0, -1.0])
+      if self.model == "gamepad" and "4" in source_to_part:
+        # Rear connector slides into the housing along -Y, not through its roof.
+        self.mate_axes[source_to_part["4"]] = np.array([0.0, -1.0, 0.0])
+      q_lie = np.array([np.sqrt(.5), 0.0, np.sqrt(.5), 0.0])
+      lie_sources = (("2", "3") if self.model == "beam" else
+                     ("2", "3", "5", "6") if self.model == "cooling_manifold" else
+                     ("4",) if self.model == "gamepad" else
+                     ())
+      for source in lie_sources:
+        if source in source_to_part:
+          q_rest = q_lie
+          if self.model == "cooling_manifold":
+            # These fasteners have a six-sided head.  Ry(90deg) alone leaves one hex
+            # vertex directly below the centre, so a dynamic replay correctly rolls the
+            # loose fastener by 30deg even though task planning treats the table pose as a
+            # fixed datum.  Compose a 30deg local-axis roll before laying it down; two head
+            # vertices then share the lowest height and a full hex face rests on the table.
+            q_rest = np.array([0.6830127019, 0.1830127019,
+                               0.6830127019, 0.1830127019])
+          self.scatter_orientations[source_to_part[source]] = q_rest
+      if self.model == "stool_circular":
+        # The four 95mm uprights have broad, flat end faces and are stable standing on the
+        # table.  Laying them on their side leaves less than one finger radius below the
+        # centreline: an open Robotiq hand then has no physically collision-free side grasp
+        # after the source fixture is removed.  Keep the authored upright orientation so the
+        # fixture-free initial scene remains both dynamically stable and two-finger pickable.
+        for source in ("1", "3", "5", "7"):
+          if source in source_to_part:
+            self.scatter_orientations[source_to_part[source]] = np.array(
+                [1.0, 0.0, 0.0, 0.0])
+    elif self.model == "car":
+      # Wheels slide axially into the body. The wheel collision proxy's
+      # inner tread face is +/-2.5mm from the authored part origin (the bore/hub is ignored).
+      q_flat = np.array([np.sqrt(.5), np.sqrt(.5), 0.0, 0.0])
+      for source in ("0", "3", "4", "5"):
+        if source not in source_to_part:
+          continue
+        p = source_to_part[source]
+        side = 1.0 if self._center(source)[1] > 0 else -1.0
+        self.mate_axes[p] = np.array([0.0, -side, 0.0])
+        self.mate_interfaces[p] = np.array([0.0, side * .0025, 0.0])
+        self.scatter_orientations[p] = q_flat
+        self.no_hold.add(p)
+    elif self.model == "duct":
+      for source, p in source_to_part.items():
+        if source != "0":
+          # Cover and six fasteners enter normal to the common tilted flange.
+          # The CAD flange normal is (sin(30deg), 0, cos(30deg)); radial XY
+          # directions intersect even the exact meshes before reaching the bores.
+          self.mate_axes[p] = np.array([-0.5, 0.0, -np.sqrt(0.75)])
+          # The source is authored at its tilted assembled orientation. Loose cover
+          # and fasteners must instead rest with their flange/head planes horizontal.
+          # Rotate the common flange normal onto world +Z (minus 30 degrees about Y).
+          self.scatter_orientations[p] = np.array([
+              np.cos(np.pi / 12), 0.0, -np.sin(np.pi / 12), 0.0])
+    else:  # plumbers_block: top block and fasteners descend; shaft slides through Y bore.
+      for p in self.objects[1:]:
+        self.mate_axes[p] = np.array([0.0, 0.0, -1.0])
+      if "0" in source_to_part:
+        self.mate_axes[source_to_part["0"]] = np.array([0.0, 1.0, 0.0])
+
+
+class FabricaCarAssembly(FabricaAssembly):
+  def __init__(self, n_parts=5):
+    super().__init__(n_parts=n_parts, model="car")
+
+
+class FabricaBeamAssembly(FabricaAssembly):
+  def __init__(self, n_parts=5):
+    super().__init__(n_parts=n_parts, model="beam")
+
+
+class FabricaCoolingManifoldAssembly(FabricaAssembly):
+  def __init__(self, n_parts=7):
+    super().__init__(n_parts=n_parts, model="cooling_manifold")
+
+
+class FabricaDuctAssembly(FabricaAssembly):
+  def __init__(self, n_parts=8):
+    super().__init__(n_parts=n_parts, model="duct")
+
+
+class FabricaGamepadAssembly(FabricaAssembly):
+  def __init__(self, n_parts=6):
+    super().__init__(n_parts=n_parts, model="gamepad")
+
+
+class FabricaPlumbersBlockAssembly(FabricaAssembly):
+  def __init__(self, n_parts=5):
+    super().__init__(n_parts=n_parts, model="plumbers_block")
+
+
+class FabricaCircularStoolAssembly(FabricaAssembly):
+  def __init__(self, n_parts=9):
+    super().__init__(n_parts=n_parts, model="stool_circular")
 
 
 class MeshDemoAssembly(Assembly):
@@ -1454,6 +1775,130 @@ class PegStoolScrewAssembly(PegStoolAssembly):
       self.mate_skills[part] = self._screw_spec
 
 
+class YandVStoolAssembly(Assembly):
+  """Real stool / bench imported from the 260904 Y&V CAD set.
+
+  CAD provenance (mm, Rhino Y-up, verified with trimesh 2026-09-04): four handed
+  legs (~30.15 x 105 x 22, long axis CAD Y) plus two seat options -- a 4-hole seat
+  (170 x 35 x 170 plate, hole pitch 108, square mortises ~32 wide x 25 deep)
+  and a 2-hole bench seat (~85 x 35 x 170, the right half of the 4-hole seat with
+  one column of two mortises). Both seat meshes carry a rear upstand lip (~170 x
+  10 x 75 in CAD XYZ, rising ~40 above the plate top). Leg CAD centroids match
+  the inner mortise centres to <0.1mm, so all four legs are the SAME part.
+
+  Simplified v1 (this class): everything is axis-aligned boxes in metres
+  (mm -> m, CAD Y-up -> rai Z-up, part frames at their own centres):
+
+  * seat (obj_0): an 11-box, non-overlapping compound: a full 10mm blind-hole
+    floor, nine boxes tiling the lower 25mm slab around the four pockets, and
+    the 40mm rear upstand. Thus the visible back and the physical back agree,
+    while the mortises remain genuine concavities instead of a convex hull.
+  * legs (obj_1..): 30 x 22 x 105mm collision boxes and four distinct visual
+    meshes (LF/RF/LB/RB). This retains the authored handed details in MuJoCo.
+  * mates: legs press UP (+z) into the 25mm blind pockets and stop 0.5mm short
+    of their floors. The resulting part transforms agree with the source CAD
+    assembly to 0.25mm.
+
+  Variants: ``seat="4hole"`` (default, 5 parts: seat + 4 legs) and
+  ``seat="2hole"`` (3 parts: narrow bench + the CAD's +11.5mm-offset leg column).
+  Canonical registry names are ``real-stool`` and ``real-bench``; the original
+  ``yandv-*`` names remain aliases so saved plans and commands keep loading.
+  Compound seat => ``--grasp-sampler`` is required, as for the peg stools.
+  """
+
+  def __init__(self, n_parts=5, seat="4hole", seat_thickness=0.035,
+               socket_hole=0.032, socket_depth=0.025,
+               leg_x=0.030, leg_y=0.022, leg_length=0.105):
+    assert seat in ("4hole", "2hole"), f"Y&V seat {seat!r}: '4hole' or '2hole'"
+    self.seat = seat
+    self.legs = 4 if seat == "4hole" else 2
+    assert 1 <= int(n_parts) <= self.legs + 1, \
+        f"yandv-{seat} is one seat and up to {self.legs} legs"
+    self.n_parts = int(n_parts)
+    self.seat_thickness = float(seat_thickness)
+    self.socket_hole = float(socket_hole)
+    self.socket_depth = float(socket_depth)
+    self.leg_x = float(leg_x)
+    self.leg_y = float(leg_y)
+    self.leg_length = float(leg_length)
+    if self.seat == "4hole":
+      self.seat_x, self.seat_y = 0.170, 0.170
+      self._centres = [(0.054, 0.054), (-0.054, 0.054),
+                       (0.054, -0.054), (-0.054, -0.054)]
+      self._leg_corners = ["lf", "rf", "lb", "rb"]
+      seat_mesh = "part_meshes/yandv_stool/seat_4hole_visual.obj"
+    else:
+      self.seat_x, self.seat_y = 0.085, 0.170
+      self._centres = [(0.0115, 0.054), (0.0115, -0.054)]
+      self._leg_corners = ["lf", "lb"]
+      seat_mesh = "part_meshes/yandv_stool/seat_2hole_visual.obj"
+    self._seat_visual_mesh = seat_mesh
+    self.cube_size = max(self.seat_x, self.seat_y)   # scatter pitch only
+    self.cube_radius = 0.0
+    super().__init__()
+
+  def define(self):
+    sx, sy, st = self.seat_x, self.seat_y, self.seat_thickness
+    hole, depth = self.socket_hole, self.socket_depth
+    assert self.leg_x < hole and self.leg_y < hole, \
+        f"leg section {(self.leg_x, self.leg_y)} does not fit socket {hole}"
+    assert 0.0 < depth < st, "blind pocket must leave a positive floor"
+    assert all(abs(x) + hole / 2.0 <= sx / 2.0 and
+               abs(y) + hole / 2.0 <= sy / 2.0 for x, y in self._centres), \
+        "sockets must sit fully inside the plate"
+    # Tile the pocketed lower slab with disjoint boxes. Full-height plate boxes would fill
+    # the holes; overlapping wall boxes would distort compound mass and MuJoCo inertia.
+    floor = st - depth
+    children = [{"shape": ("box", [sx, sy, floor, 0.0]),
+                 "pos": [0.0, 0.0, st / 2.0 - floor / 2.0]}]
+    x_holes = sorted(set(cx for cx, _cy in self._centres))
+    y_holes = sorted(set(cy for _cx, cy in self._centres))
+    x_intervals = [(-sx / 2.0, x_holes[0] - hole / 2.0)]
+    for left, right in zip(x_holes, x_holes[1:]):
+      x_intervals.append((left + hole / 2.0, right - hole / 2.0))
+    x_intervals.append((x_holes[-1] + hole / 2.0, sx / 2.0))
+    # Strips outside every pocket's x span run across the complete depth.
+    for lo, hi in x_intervals:
+      if hi > lo:
+        children.append({"shape": ("box", [hi - lo, sy, depth, 0.0]),
+                         "pos": [(lo + hi) / 2.0, 0.0, -st / 2.0 + depth / 2.0]})
+    # Inside each occupied x span, fill only the y intervals between/outside pockets.
+    y_intervals = [(-sy / 2.0, y_holes[0] - hole / 2.0)]
+    for low, high in zip(y_holes, y_holes[1:]):
+      y_intervals.append((low + hole / 2.0, high - hole / 2.0))
+    y_intervals.append((y_holes[-1] + hole / 2.0, sy / 2.0))
+    for cx in x_holes:
+      for lo, hi in y_intervals:
+        if hi > lo:
+          children.append({"shape": ("box", [hole, hi - lo, depth, 0.0]),
+                           "pos": [cx, (lo + hi) / 2.0,
+                                   -st / 2.0 + depth / 2.0]})
+    # Authored rear upstand: rear is local -y after Rhino Y-up -> planner Z-up conversion.
+    children.append({"shape": ("box", [sx, 0.010, 0.040, 0.0]),
+                     "pos": [0.0, -sy / 2.0 + 0.005, st / 2.0 + 0.020]})
+    self.objects = [f"obj_{i}" for i in range(self.n_parts)]
+    self.base = "obj_0"
+    self.part_shapes["obj_0"] = ("compound", children)
+    self.visual_meshes["obj_0"] = self._seat_visual_mesh
+    self.masses["obj_0"] = 0.75
+    leg_spec = ("box", [self.leg_x, self.leg_y, self.leg_length, 0.0])
+    # Lie each leg flat: its local +z (long axis) becomes world +x. This matches the
+    # established peg-stool convention and leaves both end faces reachable.
+    leg_scatter = np.array([np.sqrt(0.5), 0.0, -np.sqrt(0.5), 0.0])
+    leg_top = -st / 2.0 + depth - 0.0005           # 0.5mm short of blind-hole floor
+    leg_z = leg_top - self.leg_length / 2.0
+    for i, ((cx, cy), corner) in enumerate(zip(
+        self._centres[:max(0, self.n_parts - 1)], self._leg_corners), start=1):
+      part = f"obj_{i}"
+      self.part_shapes[part] = leg_spec
+      self.visual_meshes[part] = f"part_meshes/yandv_stool/leg_{corner}_visual.obj"
+      self.scatter_orientations[part] = leg_scatter
+      self.assembly_relative_poses[part] = ["obj_0", np.array([cx, cy, leg_z])]
+      self.assembly_dependencies[part] = ["obj_0"]
+      self.mate_axes[part] = np.array([0.0, 0.0, 1.0])
+      self.masses[part] = 0.08
+
+
 class SlotPinAssembly(Assembly):
   """STAGED-MATE test assembly (A11): base + a CANTILEVER bar slotted into its side + a PIN
   that fastens the bar. The bar's mate is staged (a slot until the pin lands): unheld and
@@ -1613,9 +2058,18 @@ _ASSEMBLY_KINDS = {"cross": (CubeCrossAssembly, 7), "cube": (CubeGridAssembly, 8
                    "arch": (ArchAssembly, 7), "arch-seq": (ArchSequentialAssembly, 7),
                    "cube-plates": (CubePlatesAssembly, 8),
                    "cube-plates-2x2x3": (lambda n_parts: CubePlatesAssembly(2, 2, 3, n_parts=n_parts), 12),
+                   "cube-sequence-2x2x3": (lambda n_parts: CubeSequenceAssembly(
+                       2, 2, 3, n_parts=n_parts), 12),
                    "cuboid-tower": (CuboidTowerAssembly, 8),
                    "fixture-rack": (FixtureRackAssembly, 13),
                    "car": (CarAssembly, 5),
+                   "fabrica-car": (FabricaCarAssembly, 5),
+                   "fabrica-beam": (FabricaBeamAssembly, 5),
+                   "fabrica-cooling-manifold": (FabricaCoolingManifoldAssembly, 7),
+                   "fabrica-duct": (FabricaDuctAssembly, 8),
+                   "fabrica-gamepad": (FabricaGamepadAssembly, 6),
+                   "fabrica-plumbers-block": (FabricaPlumbersBlockAssembly, 5),
+                   "fabrica-circular-stool": (FabricaCircularStoolAssembly, 9),
                    # mini car: whole car scaled to width=0.03 -> wheels are discs of diameter
                    # 0.8w*2 = 0.048, comfortably inside the two-finger's ~0.078 inner gap, so the
                    # fingers can take a wheel ACROSS THE DIAMETER (radial side grasp) -- the
@@ -1674,6 +2128,14 @@ _ASSEMBLY_KINDS = {"cross": (CubeCrossAssembly, 7), "cube": (CubeGridAssembly, 8
                        chamfer=0.004, hole_chamfer=0.004), 5),
                    "mesh-demo": (MeshDemoAssembly, 3),
                    "compound-demo": (CompoundDemoAssembly, 3),
+                   "yandv-stool": (lambda n_parts: YandVStoolAssembly(
+                       n_parts=n_parts, seat="4hole"), 5),
+                   "yandv-bench": (lambda n_parts: YandVStoolAssembly(
+                       n_parts=n_parts, seat="2hole"), 3),
+                   "real-stool": (lambda n_parts: YandVStoolAssembly(
+                       n_parts=n_parts, seat="4hole"), 5),
+                   "real-bench": (lambda n_parts: YandVStoolAssembly(
+                       n_parts=n_parts, seat="2hole"), 3),
                    "chair": (ChairAssembly, 8)}
 
 
@@ -1686,10 +2148,15 @@ def make_assembly(kind, n_parts):
   """Assembly factory for the CLI: cross (cube cross), cube (2x2x2 grid), arch (bridge --
   known-flawed star, see class doc), arch-seq (arch shape built as a sequential chain),
   cube-plates (2x2x2 as two stacked 2x2 plates), cube-plates-2x2x3 (three stacked 2x2
-  plates, 12 cubes), cuboid-tower (laid-down 2:1:1 cuboids stacked along z -- the first
+  plates, 12 cubes), cube-sequence-2x2x3 (the same lattice in one strict piece-by-piece
+  sequence), cuboid-tower (laid-down 2:1:1 cuboids stacked along z -- the first
   non-cube assembly), fixture-rack (a scalable rail with post/bracket station branches),
+  the fabrica-* family (metre-scale Fabrica CAD imports with exact visuals, explicit
+  proximity-tree dependencies, and concavity-preserving collision/grasp proxies),
   peg-stool / peg-stool-cuboid (three-legged stool with round or square legs into real blind
-  sockets). The plates family generalizes to any WxDxH via CubePlatesAssembly."""
+  sockets), real-stool / real-bench (Y&V CAD stool/bench with compound blind-pocket
+  collision geometry and exact visual meshes; yandv-stool / yandv-bench are aliases).
+  The plates family generalizes to any WxDxH via CubePlatesAssembly."""
   cls, max_n = _ASSEMBLY_KINDS[kind]
   return cls(n_parts=min(n_parts, max_n))
 
@@ -1810,6 +2277,7 @@ def make_subassembly_scene(assembly, subassembly, contact=1):
     obj_in_ref = assembly.position_in_base(obj) - ref_pos
     (add_part_frame(C, obj, assembly.part_shape(obj), contact=contact)
         .setPosition(obj_in_ref))
+    add_part_visual(C, obj, assembly.visual_meshes.get(obj))
   return C
 
 
@@ -2271,6 +2739,7 @@ _SAMPLED_VIEWS_CACHE = {}
 _SAMPLED_META_CACHE = {}          # same key: per-candidate gate diagnostics (not the DB)
 _SAMPLED_SCENE_CTX = None         # --grasp-sampler-scenes: pick/assembly filter context
 _SAMPLED_CANONICAL_ONLY = False   # staged search refinement; IDs/DB itself never changes
+_COMPONENT_GRASP_KEEP = 0         # 0 = historical full constituent-grasp union
 _MAX_GRASP_WIDTH = 0.078       # two-finger max pinch width. The fixed-open robotiq pads
   # measure ~82mm inner gap (robotiq_tight.g capsules); 78mm keeps a seating margin. The EE
   # collision filter stays the final arbiter -- this only prunes hopeless candidates early.
@@ -2308,6 +2777,19 @@ def set_sampled_canonical_only(on=False):
   """
   global _SAMPLED_CANONICAL_ONLY
   _SAMPLED_CANONICAL_ONLY = bool(on)
+
+
+def set_component_grasp_keep(keep=0):
+  """Bound each multi-part rigid component's grasp alphabet.
+
+  The finite per-part databases remain immutable.  A positive ``keep`` exposes only the
+  first ``keep`` whole-component collision-free rows from a stable round-robin merge of
+  those databases; singletons are deliberately unchanged.  Zero restores the historical
+  complete constituent-grasp union.  Because raw ``(part, grasp_id)`` labels are retained,
+  changing this search schedule never rebinds a saved grasp or an IK-cache key.
+  """
+  global _COMPONENT_GRASP_KEEP
+  _COMPONENT_GRASP_KEEP = max(0, int(keep))
 
 
 def install_sampled_scene_ctx(C, assembly, robots=None):
@@ -2497,7 +2979,12 @@ def _pad_support_wrap(mesh, p, n, u, v, offsets, lift=0.002, wrap=0.006):
        + offsets[:, 1:2] * np.asarray(v, dtype=float)[None, :]
        + float(lift) * np.asarray(n, dtype=float)[None, :])
   try:
-    d = np.asarray(mesh.nearest.signed_distance(O), dtype=float)
+    # trimesh's convention is POSITIVE inside/on the mesh and NEGATIVE outside.
+    # The deformation needed by a pad sample is the opposite: its positive
+    # distance while outside, and zero once the sample reaches material.
+    # Keeping the raw sign here used to clamp every outside sample to zero and
+    # therefore report full support even when most of a pad overhung an edge.
+    d = -np.asarray(mesh.nearest.signed_distance(O), dtype=float)
   except Exception:                                        # non-watertight mesh
     D = np.repeat(-np.asarray(n, dtype=float)[None, :], len(O), axis=0)
     loc, idx_ray, _tri = mesh.ray.intersects_location(O, D, multiple_hits=False)
@@ -3545,6 +4032,7 @@ def _shape_quat(spec):
 # poses against that centre. Grasps for mesh parts REQUIRE --grasp-sampler: the 6-face
 # enumerator's ids are cube-face semantics and would silently mis-model a free-form part.
 _MESH_CACHE = {}
+_MESH_SCENE_CACHE = {}       # multi-geometry GLB path -> trimesh.Scene (Fabrica ACD assets)
 
 
 def _mesh_key(prm):
@@ -3556,7 +4044,7 @@ def _mesh_key(prm):
   path = prm["file"]
   if not os.path.isabs(path):
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), path)
-  return (os.path.normpath(path), float(prm.get("scale", 1.0)))
+  return (os.path.normpath(path), float(prm.get("scale", 1.0)), prm.get("geometry"))
 
 
 # --- compound shape kind: ("compound", [{"shape": spec, "pos": [x,y,z]}, ...]) -------------
@@ -3585,7 +4073,8 @@ def _compound_children(spec):
 
 def _spec_key(spec):
   """Canonical hashable identity of a shape spec, for memo keys. Meshes key on their
-  (path, scale) -- NOT the kind string, two meshes are two surfaces; compounds key on the
+  (path, scale, optional geometry name) -- NOT the kind string, two meshes are two surfaces;
+  compounds key on the
   child keys plus offsets."""
   kind = spec[0]
   if kind == "compound":
@@ -3640,7 +4129,16 @@ def _load_mesh(prm):
       m = trimesh.PointCloud(v - (lo + hi) / 2.0).convex_hull
       hull = m
     else:
-      m = trimesh.load(key[0], force="mesh")
+      if key[2] is None:
+        m = trimesh.load(key[0], force="mesh")
+      else:
+        scene = _MESH_SCENE_CACHE.get(key[0])
+        if scene is None:
+          scene = trimesh.load(key[0], force="scene", process=False)
+          _MESH_SCENE_CACHE[key[0]] = scene
+        if key[2] not in scene.geometry:
+          raise KeyError(f"mesh geometry {key[2]!r} not found in {key[0]}")
+        m = scene.geometry[key[2]].copy()
       if key[1] != 1.0:
         m.apply_scale(key[1])
       lo, hi = np.asarray(m.bounds, dtype=float)
@@ -4009,7 +4507,7 @@ def part_grasp_poses(spec, rolls=None, offset=0.01, part=None):
 def grasp_pose(assembly, part, grasp_id, offset=0.01):
   # grasp `grasp_id` of `part`, in the part's own frame (the shape-aware replacement for
   # raw cube_grasp_pose(gid, cube_size) -- identical values for cube parts).
-  return part_grasp_poses(assembly.part_shape(part), offset=offset, part=part)[grasp_id]
+  return part_grasp_poses(assembly.grasp_shape(part), offset=offset, part=part)[grasp_id]
 
 
 def part_grasp_surfaces(spec, rolls=None, part=None):
@@ -4118,14 +4616,83 @@ class GraspTable(dict):
     return kind in self.kinds_of.get((S_key, part, gid), ())
 
 
+class LazyGraspTable(GraspTable):
+  """Finite-key grasp table whose rows are constructed on first access.
+
+  This is intentionally a ``dict``-compatible view because the search has a long-standing
+  read-only table API. Iterating ``items``/``values`` explicitly asks for the entire finite
+  table and therefore materializes it; ordinary indexed local fills only pay for components
+  they actually encounter. The historical uncapped path continues to return a plain eager
+  dict, so this class cannot perturb its ordering or setup behavior.
+  """
+
+  def __init__(self, keys, factory):
+    super().__init__()
+    # Unlike the historical uniform plain dict, inheriting GraspTable makes these class
+    # attributes visible. Keep the uniform contract explicit: no kind masks, empty robot
+    # map. Mixed _search_context replaces both after construction.
+    self.kinds_of = None
+    self.robot_kinds = {}
+    self._ordered_keys = tuple(keys)
+    self._key_set = frozenset(self._ordered_keys)
+    self._factory = factory
+
+  def __getitem__(self, key):
+    key = _subasm_key(key)
+    if not dict.__contains__(self, key):
+      if key not in self._key_set:
+        raise KeyError(key)
+      dict.__setitem__(self, key, self._factory(key))
+    return dict.__getitem__(self, key)
+
+  def get(self, key, default=None):
+    key = _subasm_key(key)
+    return self[key] if key in self._key_set else default
+
+  def __contains__(self, key):
+    try:
+      key = _subasm_key(key)
+    except (TypeError, ValueError):
+      return False
+    return key in self._key_set
+
+  def __iter__(self):
+    return iter(self._ordered_keys)
+
+  def __len__(self):
+    return len(self._ordered_keys)
+
+  def keys(self):
+    return self._ordered_keys
+
+  def items(self):
+    return ((key, self[key]) for key in self._ordered_keys)
+
+  def values(self):
+    return (self[key] for key in self._ordered_keys)
+
+  @property
+  def materialized(self):
+    return dict.__len__(self)
+
+  @property
+  def materialized_rows(self):
+    return sum(len(rows) for rows in dict.values(self))
+
+
 def precompute_grasps(assembly, offset=0.01, gripper_path=None):
   """Pregenerate the reachable grasps for EVERY subassembly that can arise, once, up
   front (design doc: G = pregenerate_grasps). Returns {subassembly_key: labeled grasps}.
   The result is independent of the search state and of which robot grasps (all EEs are
   identical), so the search just looks it up -- no grasp computation in the hot loop."""
+  subs = [_subasm_key(sub) for sub in get_subassemblies(assembly)]
+  if _COMPONENT_GRASP_KEEP:
+    return LazyGraspTable(
+        subs,
+        lambda key: compute_cube_grasps(assembly, key, offset, gripper_path,
+                                        return_labeled=True))
   table = {}
-  for sub in get_subassemblies(assembly):        # all reachable subassemblies + singletons
-    key = _subasm_key(sub)
+  for key in subs:                              # historical eager, part-major full union
     table[key] = compute_cube_grasps(assembly, key, offset, gripper_path,
                                      return_labeled=True)
   return table
@@ -4205,21 +4772,30 @@ def compute_cube_grasps(assembly, subassembly, offset=0.01,
   # thin cylinder legs a real cup could not seal on).
   vacuum = "vacuum" in os.path.basename(gripper_path) and not _ALLOW_CURVED_GRASPS
 
-  labeled = []
+  # A rigid component historically inherited the concatenation of every constituent
+  # part's complete database. That makes its action alphabet grow linearly with component
+  # size (and repeatedly reconstructs/checks rows which a local fill will never inspect).
+  # Under the opt-in component budget, make one stable assembly-level pool instead: merge
+  # the already diversity-ranked per-part masters round-robin by raw rank, then stop once K
+  # rows clear the whole-component collision test. Extending any per-part master only
+  # appends higher ids, so an earlier component prefix never changes. The zero/full tier
+  # below is byte-for-byte the historical part-major traversal and is the completeness net.
+  candidates = []
   for obj in subassembly:
     # obj origin expressed in the reference (first obj) frame
     obj_in_ref = assembly.position_in_base(obj) - ref_pos
     # candidate grasps come from the part's own grasp DB (shape-aware; grasp_id indexes
     # the part's set). The DB pose is in the part frame; shift it into the subassembly
     # ref frame (parts are axis-aligned, so translation only).
-    surfaces = part_grasp_surfaces(assembly.part_shape(obj), part=obj)
-    face_dims = part_grasp_face_min_dims(assembly.part_shape(obj), part=obj)
-    sample_meta = sampled_grasp_meta(assembly.part_shape(obj), part=obj)
+    grasp_spec = assembly.grasp_shape(obj)
+    surfaces = part_grasp_surfaces(grasp_spec, part=obj)
+    face_dims = part_grasp_face_min_dims(grasp_spec, part=obj)
+    sample_meta = sampled_grasp_meta(grasp_spec, part=obj)
     seal = wrench.PARAMS.get("vacuum_seal_diameter", 0.0)
-    for grasp_id, local in enumerate(part_grasp_poses(assembly.part_shape(obj),
+    for grasp_id, local in enumerate(part_grasp_poses(grasp_spec,
                                                       offset=offset, part=obj)):
       if (_SAMPLED_CANONICAL_ONLY and sample_meta
-          and assembly.part_shape(obj)[0] not in ("mesh", "compound")
+          and grasp_spec[0] not in ("mesh", "compound")
           and sample_meta[grasp_id].get("origin") != "canonical"):
         continue                                          # staged search: samples reopen later
       if vacuum and (surfaces[grasp_id] == "curved" or face_dims[grasp_id] < seal):
@@ -4228,8 +4804,19 @@ def compute_cube_grasps(assembly, subassembly, offset=0.01,
       grasp = np.concatenate([obj_in_ref + local[:3], local[3:]])
 
       conventional = bool(sample_meta and sample_meta[grasp_id].get("origin") == "canonical")
-      if grasp_is_collision_free(grasp, obj, conventional=conventional):
-        labeled.append((obj, grasp_id, grasp))
+      candidates.append((obj, grasp_id, grasp, conventional))
+
+  component_keep = _COMPONENT_GRASP_KEEP if len(subassembly) > 1 else 0
+  if component_keep:
+    part_rank = {p: i for i, p in enumerate(subassembly)}
+    candidates.sort(key=lambda row: (row[1], part_rank[row[0]]))
+
+  labeled = []
+  for obj, grasp_id, grasp, conventional in candidates:
+    if grasp_is_collision_free(grasp, obj, conventional=conventional):
+      labeled.append((obj, grasp_id, grasp))
+      if component_keep and len(labeled) >= component_keep:
+        break
 
   return labeled if return_labeled else [g[2] for g in labeled]
 
@@ -4504,6 +5091,13 @@ def get_initial_state(C, assembly):
   # without the restore, a classic re-place after a cell placement would alias two different
   # worlds under one key).
   assembly._initial_anchor = {p: np.asarray(v, dtype=float).copy() for p, v in poses.items()}
+  # Extra placement cells are offsets about the PHYSICAL table centre, not absolute world
+  # coordinates.  The historical workcells put the table at world (0, 0), which hid this
+  # distinction.  A mobile carrier uses an offset table (Husky: x=0.82); writing the raw cell
+  # offsets there placed completed assemblies on the carrier body instead of on the table.
+  table = C.getFrame("table")
+  assembly._table_xy = np.asarray(table.getPosition()[:2] if table is not None else [0.0, 0.0],
+                                  dtype=float)
   return State(parent=parent, place=place, supports=supports, poses=poses)
 
 
@@ -4638,7 +5232,8 @@ def _vacuum_engagement_stable(state, assembly, group, robot, gpart, grasp_id,
   return res
 
 
-def picks(state, assembly, robots, grasp_table=None, canonical=False, gripper_kind=None):
+def picks(state, assembly, robots, grasp_table=None, canonical=False, gripper_kind=None,
+          manipulation_parts=None):
   # a free robot grabs an on-table, not-yet-held subassembly on a collision-free face of
   # ANY of its parts, and lifts it (that part -> gripper; the tree is re-rooted there).
   #
@@ -4658,6 +5253,8 @@ def picks(state, assembly, robots, grasp_table=None, canonical=False, gripper_ki
     free = free[:1]
   free = _canonical_free(free, grasp_table)               # --dominance: one twin per kind
   for group in state.subassemblies():
+    if manipulation_parts is not None and manipulation_parts.isdisjoint(group):
+      continue                                            # skip the entire irrelevant grasp table
     if not _group_is_on_table(state, group) or _group_holders(state, group):
       continue
     key = _subasm_key(group)
@@ -4666,6 +5263,8 @@ def picks(state, assembly, robots, grasp_table=None, canonical=False, gripper_ki
     labeled = _useful_first(labeled)                      # --useful-grasps: mate-viable first
     for r in free:
       for gpart, grasp_id, _pose in labeled:              # grasp ANY part of the group
+        if manipulation_parts is not None and gpart not in manipulation_parts:
+          continue                                        # local fill: skip before State copying
         if not _grasp_usable(grasp_table, key, gpart, grasp_id, r):
           continue                                        # mixed EEs: not this robot's gripper
         if not _vacuum_engagement_stable(
@@ -4682,7 +5281,7 @@ def picks(state, assembly, robots, grasp_table=None, canonical=False, gripper_ki
         yield ("pick", r, gpart, grasp_id), ns
 
 
-def places(state, assembly, robots):
+def places(state, assembly, robots, manipulation_parts=None):
   # a robot sets a held subassembly back on the table and opens (its root -> table).
   #
   # CANONICALIZATION: the resulting on-table group is re-rooted at its reference part
@@ -4693,6 +5292,8 @@ def places(state, assembly, robots):
   # identical) revisit -- the search then walks orbits of representations.
   for group in state.subassemblies():
     root = _group_root(state, group)
+    if manipulation_parts is not None and root not in manipulation_parts:
+      continue                                            # action is keyed by the held root
     if state.parent.get(root, (None,))[0] != "gripper":
       continue
     r = state.parent[root][1]
@@ -4725,7 +5326,8 @@ def places(state, assembly, robots):
         # k -- the anchor override rides the pose payload, the cell id the slot tag.
         ns = landed(("cell", k))
         anchor = np.asarray(state.poses[ref], dtype=float).copy()
-        anchor[0], anchor[1] = _PLACE_CELL_XY[k]
+        table_xy = np.asarray(getattr(assembly, "_table_xy", (0.0, 0.0)), dtype=float)
+        anchor[0], anchor[1] = table_xy + np.asarray(_PLACE_CELL_XY[k], dtype=float)
         ns.poses = dict(ns.poses)
         ns.poses[ref] = anchor
         return ("place", r, root, face, k), ns
@@ -4741,7 +5343,7 @@ def places(state, assembly, robots):
           yield cell(k)
 
 
-def assembles(state, assembly, robots, gripper_kind=None):
+def assembles(state, assembly, robots, gripper_kind=None, assembly_parts=None):
   # Mate a HELD subassembly onto a supported target per the manual: the group's SEAM part (the
   # one whose mate parent lies in the target) welds on. A single held part is the size-1 case;
   # a whole MODULE (a finished plate) is the general case -- ONE action either way (`assemble`),
@@ -4763,6 +5365,8 @@ def assembles(state, assembly, robots, gripper_kind=None):
     if len(external) != 1:
       continue
     p = external[0]
+    if assembly_parts is not None and p not in assembly_parts:
+      continue                                            # local fill: only its requested seam
     onto = assembly.relative_pose(p)[0]
     target = next((g for g in state.subassemblies() if onto in g), None)
     if target is None:
@@ -4845,7 +5449,8 @@ def _on_table_mateable_cached(assembly, part, face=_IDENTITY_FACE):
   return cache[key]
 
 
-def add_grasps(state, assembly, robots, grasp_table=None, gripper_kind=None):
+def add_grasps(state, assembly, robots, grasp_table=None, gripper_kind=None,
+               manipulation_parts=None):
   # a free robot adds a SECOND grasp (a brace) to an already-HELD subassembly -- the unfused
   # primitive behind HANDOVERS (add_grasp; release) and bracing. The new grasp is a SUPPORT
   # contact only; the kinematic `parent` is unchanged (the group stays rooted at its current
@@ -4855,6 +5460,8 @@ def add_grasps(state, assembly, robots, grasp_table=None, gripper_kind=None):
   if not free:
     return
   for group in state.subassemblies():
+    if manipulation_parts is not None and manipulation_parts.isdisjoint(group):
+      continue                                            # skip the entire irrelevant grasp table
     if not _group_holders(state, group):
       # --brace-resting: a TABLE-RESTING group may also be braced (steadied); without the
       # flag, only an already-held group (the historical model).
@@ -4866,6 +5473,8 @@ def add_grasps(state, assembly, robots, grasp_table=None, gripper_kind=None):
     taken = {(c[2], c[3]) for p in group for c in state.supports[p] if c[0] == "grasp"}
     for r in free:
       for gpart, grasp_id, _pose in labeled:              # grasp ANY free face of the group
+        if manipulation_parts is not None and gpart not in manipulation_parts:
+          continue                                        # local fill: skip before State copying
         if (gpart, grasp_id) in taken:
           continue                                        # that grasp is already occupied
         if not _grasp_usable(grasp_table, key, gpart, grasp_id, r):
@@ -4878,7 +5487,8 @@ def add_grasps(state, assembly, robots, grasp_table=None, gripper_kind=None):
         yield ("add_grasp", r, gpart, grasp_id), ns
 
 
-def fused_handovers(state, assembly, robots, grasp_table=None, gripper_kind=None):
+def fused_handovers(state, assembly, robots, grasp_table=None, gripper_kind=None,
+                    manipulation_parts=None):
   # FUSED handover: a free robot B takes a singly-held group from its holder A in ONE step
   # (B grasps a free face, A releases, the tree re-roots to B). Net holder count is UNCHANGED,
   # so unlike the unfused add_grasp;release it introduces no higher-h two-holder intermediate
@@ -4888,6 +5498,8 @@ def fused_handovers(state, assembly, robots, grasp_table=None, gripper_kind=None
   if not free:
     return
   for group in state.subassemblies():
+    if manipulation_parts is not None and manipulation_parts.isdisjoint(group):
+      continue                                            # skip the entire irrelevant grasp table
     if len(_group_holders(state, group)) != 1:
       continue                                              # clean 1->1 take-over only
     root = _group_root(state, group)
@@ -4901,6 +5513,8 @@ def fused_handovers(state, assembly, robots, grasp_table=None, gripper_kind=None
     taken = {(c[2], c[3]) for p in group for c in state.supports[p] if c[0] == "grasp"}
     for rB in free:
       for gpart, grasp_id, _pose in labeled:                # B grabs any free face...
+        if manipulation_parts is not None and gpart not in manipulation_parts:
+          continue                                          # local fill: skip before State copying
         if (gpart, grasp_id) in taken:
           continue
         if not _grasp_usable(grasp_table, key, gpart, grasp_id, rB):
@@ -4994,7 +5608,8 @@ def set_inhand_reorient(on=True):
   _INHAND_REORIENT = bool(on)
 
 
-def inhand_reorients(state, assembly, robots, grasp_table=None):
+def inhand_reorients(state, assembly, robots, grasp_table=None,
+                     manipulation_parts=None):
   # a robot rotates its held LONE part onto another grasp of the same part (v1 assumptions
   # in the flag doc above). Only when the part is SOLO-held (its single grasp contact is the
   # kinematic holder's) -- a second grasp (brace) would be torn by the rotation.
@@ -5002,6 +5617,8 @@ def inhand_reorients(state, assembly, robots, grasp_table=None):
     if len(group) != 1:
       continue                                             # (C) lone parts only
     p = next(iter(group))
+    if manipulation_parts is not None and p not in manipulation_parts:
+      continue                                             # local fill: irrelevant singleton
     carrier = state.parent.get(p)
     if carrier is None or carrier[0] != "gripper":
       continue
@@ -5189,7 +5806,7 @@ def _staged_press_stable(state, assembly, q, gripper_kind, load_variants):
   for c in sorted(state.supports.get(q, ())):
     if c[0] == "grasp":
       gp, n, t1, t2 = _grasp_frame(assembly, c[2], poses[c[2]], c[3])
-      surf = _grasp_surface(assembly.part_shape(c[2]), c[3]) if derate else "flat"
+      surf = _grasp_surface(assembly.grasp_shape(c[2]), c[3]) if derate else "flat"
       caps.append(wrench.grasp_capability(gp - pos, n, t1, t2, kind_of(c[1]), surface=surf))
   if ("table",) in state.supports.get(q, ()):
     fp = _table_footprint(assembly, poses, [q])
@@ -5233,7 +5850,8 @@ def _staged_ok(state, assembly):
 
 
 def successors(state, assembly, robots, grasp_table=None, canonical=False,
-               gripper_kind=None, handovers=True, allow_place=True, bracing=False):
+               gripper_kind=None, handovers=True, allow_place=True, bracing=False,
+               manipulation_parts=None, assembly_parts=None):
   # handovers=True (default) enables regrasp-in-air via the FUSED `handover`: a free robot
   # takes a held group from its holder in ONE heuristically-neutral edge (no higher-h
   # two-holder intermediate). That covers regrasp; the unfused `add_grasp` (a 2nd grasp you
@@ -5241,6 +5859,16 @@ def successors(state, assembly, robots, grasp_table=None, canonical=False,
   # `bracing=` (off by default: it just adds branching everywhere). `release` reparents onto a
   # remaining holder either way. allow_place=False FORBIDS setting a held group back on the
   # table -> the search holds + regrasps in the air (no forced regime; just fewer options).
+  # ``manipulation_parts`` and ``assembly_parts`` are generation-time versions of the local
+  # fill's long-standing post-filter. They only skip primitive loop iterations before a
+  # successor State is copied: picks/places/handovers/add-grasps/in-hand reorientation are
+  # keyed by ``manipulation_parts``; assembly seams by ``assembly_parts``. Releases deliberately
+  # remain global so an inherited holder can never be stranded. None retains the historical
+  # global generator exactly, including its emission order.
+  if manipulation_parts is not None and not isinstance(manipulation_parts, (set, frozenset)):
+    manipulation_parts = frozenset(manipulation_parts)
+  if assembly_parts is not None and not isinstance(assembly_parts, (set, frozenset)):
+    assembly_parts = frozenset(assembly_parts)
   if _LRU_ROBOTS:
     _last = getattr(state, "_lru_last", {})
     robots = sorted(robots, key=lambda r: _last.get(r, -1))  # stable: ties keep roster order
@@ -5251,19 +5879,23 @@ def successors(state, assembly, robots, grasp_table=None, canonical=False,
     # -- diving into the first workable mate commits before better variants are seen). Keep
     # picks-first; emission order is a tie-break lottery, don't retune it.
     yield from picks(state, assembly, robots, grasp_table=grasp_table, canonical=canonical,
-                     gripper_kind=gripper_kind)
-    yield from assembles(state, assembly, robots, gripper_kind=gripper_kind)  # incl. module joins
+                     gripper_kind=gripper_kind, manipulation_parts=manipulation_parts)
+    yield from assembles(state, assembly, robots, gripper_kind=gripper_kind,
+                         assembly_parts=assembly_parts)     # incl. module joins
     if handovers:
       yield from fused_handovers(state, assembly, robots, grasp_table=grasp_table,
-                                 gripper_kind=gripper_kind)
+                                 gripper_kind=gripper_kind,
+                                 manipulation_parts=manipulation_parts)
     if bracing:
       yield from add_grasps(state, assembly, robots, grasp_table=grasp_table,
-                            gripper_kind=gripper_kind)
+                            gripper_kind=gripper_kind,
+                            manipulation_parts=manipulation_parts)
     if _INHAND_REORIENT:
-      yield from inhand_reorients(state, assembly, robots, grasp_table=grasp_table)
+      yield from inhand_reorients(state, assembly, robots, grasp_table=grasp_table,
+                                  manipulation_parts=manipulation_parts)
     yield from releases(state, assembly, robots, gripper_kind=gripper_kind)
     if allow_place:
-      yield from places(state, assembly, robots)
+      yield from places(state, assembly, robots, manipulation_parts=manipulation_parts)
     # deferred (unfused): set_downs
 
   def _filtered():
@@ -5900,7 +6532,7 @@ def _grounding_caps(state, assembly, group, gripper_kind, table_override=None):
         if not _grasp_holds(assembly, members, c[2]):
           continue                                          # no_hold part can't brace a group
         gp, n, t1, t2 = _grasp_frame(assembly, c[2], poses[c[2]], c[3])  # c=(grasp,r,gpart,gid)
-        surf = _grasp_surface(assembly.part_shape(c[2]), c[3]) if derate else "flat"
+        surf = _grasp_surface(assembly.grasp_shape(c[2]), c[3]) if derate else "flat"
         caps.append(wrench.grasp_capability(gp - centroid, n, t1, t2, kind_of(c[1]),
                                             surface=surf))
   G = np.hstack([c[0] for c in caps]) if caps else np.zeros((6, 0))
@@ -5922,18 +6554,44 @@ def _group_stable(state, assembly, group, gripper_kind, applied=(), table_overri
   # model for the engagement gate, see _grounding_caps.
   centroid, w_grav, G, ub, bounds, gbytes = _grounding_caps(
       state, assembly, group, gripper_kind, table_override=table_override)
-  w_ext = w_grav
+  w_applied = np.zeros(6)
   for load in applied:
     f, pt = load[:2]
-    w_ext = w_ext + wrench.point_force_wrench(f, np.asarray(pt, dtype=float) - centroid)
+    w_applied = w_applied + wrench.point_force_wrench(
+        f, np.asarray(pt, dtype=float) - centroid)
     if len(load) >= 3:
-      w_ext = w_ext + np.concatenate([np.zeros(3), np.asarray(load[2], dtype=float)])
+      w_applied = w_applied + np.concatenate(
+          [np.zeros(3), np.asarray(load[2], dtype=float)])
   geo_key = (gbytes[0], gbytes[1])
-  key = (geo_key[0], geo_key[1], np.round(w_ext, 4).tobytes())
+  # A freely held component can be rotated by the continuous witness even though the
+  # discrete state retains its last table orientation. Under the opt-in robust model, keep
+  # contacts and process wrench fixed in that body frame and let gravity range over the
+  # complete unit sphere. The convex hull is the unit ball, so wrench.py's exact zonotope
+  # containment test proves every orientation without sampling SO(3). A table support fixes
+  # the authored rest orientation and therefore keeps the ordinary one-load LP.
+  orientation_requested = bool(
+      wrench.PARAMS.get("orientation_robust_gravity")
+      and not wrench.PARAMS.get("ignore_gravity"))
+  orientation_robust = bool(
+      orientation_requested
+      and not any(("table",) in state.supports.get(p, ()) for p in group))
+  if orientation_robust:
+    poses = _state_part_poses(state, assembly, lift=0.0)
+    gravity_map = wrench.gravity_wrench_map([
+        (assembly.mass(p), np.asarray(poses[p][:3], dtype=float) - centroid)
+        for p in group])
+    key = ("orientation", geo_key[0], geo_key[1],
+           np.round(w_applied, 4).tobytes(), np.round(gravity_map, 4).tobytes())
+  else:
+    w_ext = w_grav + w_applied
+    key = (geo_key[0], geo_key[1], np.round(w_ext, 4).tobytes())
   hit = _WRENCH_CACHE.get(key)
   if hit is not None:
     return hit
-  res = wrench.equilibrium_feasible_matrices(G, ub, w_ext, bounds=bounds, geo_key=geo_key)
+  if orientation_robust:
+    res = wrench.equilibrium_all_orientations(G, ub, w_applied, gravity_map)
+  else:
+    res = wrench.equilibrium_feasible_matrices(G, ub, w_ext, bounds=bounds, geo_key=geo_key)
   _WRENCH_CACHE[key] = res
   return res
 
@@ -6257,6 +6915,7 @@ def _wrench_params_sig():
           wrench.PARAMS.get("table_model"), wrench.PARAMS.get("table_mu"),
           _sigv(wrench.PARAMS.get("grasp_compliance")),
           wrench.PARAMS.get("robust_mode"),
+          wrench.PARAMS.get("orientation_robust_gravity"),
           wrench.PARAMS.get("ignore_gravity"),
           _sigv(wrench.PARAMS.get("insert_force", {})),
           wrench.PARAMS.get("vacuum_engage_force"),

@@ -80,6 +80,34 @@ CAPS = (40.0, float("inf"))                                # between 20 N (own p
 
 
 @pytest.mark.skipif(not _have("car-mini-new.json"), reason="car-mini plan not present")
+def test_active_mate_weld_suppresses_only_its_internal_contact_pair():
+  """A weld and a contact constraint between the same bodies are contradictory.
+
+  Collision stays live before insertion and returns if a breakable mate deactivates; only an
+  active direct mate pair is filtered.
+  """
+  scene, _robots = _assembled_scene(None)
+  eq, _parent = scene._mate_eqs["obj_1"]
+  geom = {}
+  for gid in range(scene.model.ngeom):
+    owner = scene._part_owner_by_body[int(scene.model.geom_bodyid[gid])]
+    if owner in ("obj_0", "obj_1") and owner not in geom:
+      geom[owner] = gid
+  assert set(geom) == {"obj_0", "obj_1"}
+  scene.data.eq_active[eq] = 0
+  assert scene._filter_active_mate_contact(
+      scene.data, geom["obj_0"], geom["obj_1"]) == 0
+  scene.data.eq_active[eq] = 1
+  assert scene._filter_active_mate_contact(
+      scene.data, geom["obj_0"], geom["obj_1"]) == 1
+  # Collision against another, independently welded child is not hidden by obj_1's weld.
+  assert scene._filter_active_mate_contact(
+      scene.data, geom["obj_1"], next(g for g in range(scene.model.ngeom)
+                                     if scene._part_owner_by_body[
+                                         int(scene.model.geom_bodyid[g])] == "obj_2")) == 0
+
+
+@pytest.mark.skipif(not _have("car-mini-new.json"), reason="car-mini plan not present")
 def test_hang_by_wheel_breaks_the_wheel_mate():
   scene, robots = _assembled_scene(CAPS)
   broke, body_z = _hang(scene, robots, "obj_1")

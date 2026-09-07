@@ -13,7 +13,8 @@ mujoco = pytest.importorskip("mujoco")
 
 import arm_model
 import fk_compare
-from env import make_four_robot_env, make_fr3_duo_env, make_openarm_duo_env
+from env import (make_four_robot_env, make_fr3_duo_env, make_husky_duo_env,
+                 make_openarm_duo_env)
 import assembly as A
 
 
@@ -40,6 +41,81 @@ def test_joints_are_exactly_rais_joints():
   _xml, jnames = arm_model.build_arms_mjcf(C, prefixes)
   rai = [j for j in C.getJointNames() if any(j.startswith(p) for p in prefixes)]
   assert sorted(jnames) == sorted(rai)
+
+
+@pytest.mark.parametrize("robot", ["ur5", "openarm"])
+def test_articulated_gripper_hinges_are_sim_only_and_actuated(robot):
+  """Finger export uses real hinges/actuators without entering the planner arm vector."""
+  C = _env(robot) if robot != "openarm" else make_openarm_duo_env()
+  prefix = A.get_robots(C)[0]
+  assets = []
+  body, arm_joints = arm_model.build_arm_mjcf(
+      C, prefix, meshes=True, assets=assets, animate_grippers=True, armature=1.0,
+      link_mass=4.0, link_inertia=0.4, static_mass=1e-4)
+  acts, _ = arm_model.gripper_actuator_mjcf(C, [prefix])
+  xml = (f'<mujoco><compiler angle="radian"/><option gravity="0 0 0"/>'
+         f'<asset>{"".join(assets)}</asset><worldbody>{body}'
+         f'</worldbody><actuator>{acts}</actuator></mujoco>')
+  model = mujoco.MjModel.from_xml_string(xml)
+  data = mujoco.MjData(model)
+  mujoco.mj_forward(model, data)
+  sim_joints = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j)
+                for j in range(model.njnt)
+                if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j) or "").startswith(
+                    "sim_grip__")]
+  assert len(sim_joints) >= 2
+  assert all(j not in arm_joints for j in sim_joints)
+  assert sorted(arm_joints) == sorted(j for j in C.getJointNames() if j.startswith(prefix))
+  assert len(sim_joints) == (2 if robot == "openarm" else 6)
+  fixed_geoms = []
+  for gi in range(model.ngeom):
+    body_name = mujoco.mj_id2name(
+        model, mujoco.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[gi])) or ""
+    if "sim_grip_fixed__" in body_name:
+      assert model.geom_contype[gi] != 0
+      assert model.body_mass[int(model.geom_bodyid[gi])] == pytest.approx(1e-4)
+      fixed_geoms.append(gi)
+  assert fixed_geoms, "animated export dropped the planner's fixed finger collision proxies"
+  fixed_before = [(np.asarray(data.geom_xpos[g], dtype=float).copy(),
+                   np.asarray(data.geom_xmat[g], dtype=float).copy()) for g in fixed_geoms]
+  before = {}
+  for name in sim_joints:
+    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+    assert model.jnt_type[jid] == mujoco.mjtJoint.mjJNT_HINGE
+    assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name) >= 0
+    body_id = int(model.jnt_bodyid[jid])
+    before[name] = np.asarray(data.xmat[body_id], dtype=float).copy()
+    gain, max_angle = model.jnt_user[jid, :2]
+    data.qpos[int(model.jnt_qposadr[jid])] = 0.5 * gain * max_angle
+  mujoco.mj_forward(model, data)
+  changed = 0
+  for name in sim_joints:
+    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+    body_id = int(model.jnt_bodyid[jid])
+    assert abs(float(data.qpos[int(model.jnt_qposadr[jid])])) > 1e-3
+    changed += np.linalg.norm(np.asarray(data.xmat[body_id]) - before[name]) > 1e-3
+  # Robotiq's counter-rotating inner links deliberately keep their WORLD orientation; the
+  # driven knuckles (and both OpenArm fingers) must still rotate.
+  assert changed >= 2
+  for g, (pos, mat) in zip(fixed_geoms, fixed_before):
+    assert np.allclose(data.geom_xpos[g], pos, atol=1e-10)
+    assert np.allclose(data.geom_xmat[g], mat, atol=1e-10)
+
+  # Reset and reach the same half-closed state through MuJoCo's actuators, rather than by
+  # qpos assignment. This catches a cosmetic-joint regression even if its XML still loads.
+  data.qpos[:] = 0.0
+  data.qvel[:] = 0.0
+  for name in sim_joints:
+    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+    aid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+    gain, max_angle = model.jnt_user[jid, :2]
+    data.ctrl[aid] = 0.5 * gain * max_angle
+  for _ in range(250):
+    mujoco.mj_step(model, data)
+  for name in sim_joints:
+    jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+    gain, max_angle = model.jnt_user[jid, :2]
+    assert abs(float(data.qpos[int(model.jnt_qposadr[jid])]) - 0.5 * gain * max_angle) < 0.02
 
 
 def test_tree_is_read_at_zero_not_at_home():
@@ -120,3 +196,26 @@ def test_openarm_duo_fk_and_static_torso_export():
                            "oa0_openarm_body_link0_0") >= 0
   assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "oa0_torso_base") >= 0
   assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "oa0_torso_column") >= 0
+
+
+def test_husky_duo_fk_and_static_carrier_export():
+  """Calibrated embedded arms use generic FK; the carrier is exported separately."""
+  C = make_husky_duo_env()
+  robots = A.get_robots(C)
+  rows, (wp, wa, wf) = fk_compare.compare(C, robots, n=4, seed=0)
+  assert len(rows) > 20
+  assert wp < 1e-6, f"Husky: {wf} position error {wp * 1000:.6f} mm"
+  assert wa < 1e-6, f"Husky: {wf} orientation error {np.degrees(wa):.6f} deg"
+  assert arm_model.husky_base_prefixes(C) == ["husky0_"]
+  assert arm_model.carrier_base_prefixes(C) == ["husky0_"]
+
+  assets = []
+  body, joints = arm_model.build_arm_mjcf(
+      C, "husky0_", collide=False, meshes=True, assets=assets, frame_colors=True,
+      static_mass=1e-4)
+  xml = f'''<mujoco><asset>{"".join(assets)}</asset><worldbody>{body}</worldbody></mujoco>'''
+  model = mujoco.MjModel.from_xml_string(xml)
+  assert joints == []
+  assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "husky0_base_link") >= 0
+  assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,
+                           "husky0_dual_arm_bulkhead_link") >= 0
