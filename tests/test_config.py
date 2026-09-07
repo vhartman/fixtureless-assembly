@@ -48,6 +48,12 @@ def test_namespace_roundtrip():
     assert a.get(k) == b.get(k), f"roundtrip changed {k}: {a.get(k)!r} -> {b.get(k)!r}"
 
 
+def test_mate_symmetry_flag_is_opt_in():
+  assert main.parse_args([]).mate_symmetry is False
+  assert main.parse_args(["--mate-symmetry"]).mate_symmetry is True
+  assert main.parse_args(["--mate-symmetry", "--no-mate-symmetry"]).mate_symmetry is False
+
+
 def test_dict_roundtrip_and_unknown_key():
   rc = RunConfig(assembly="chair", parts=8, milestones=True, insert_force=25.0)
   assert RunConfig.from_dict(rc.to_dict()) == rc

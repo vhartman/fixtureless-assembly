@@ -1687,6 +1687,14 @@ def build_parser():
            "identical behavior).",
   )
   g_search.add_argument(
+      "--mate-symmetry", action=argparse.BooleanOptionalAction, default=False,
+      help="Enable finite, assembly-authored sets of functionally equivalent mate "
+           "orientations. One symbolic assemble edge tries the discrete relative "
+           "quaternions in IK; the successful realization is retained by its witness. "
+           "Currently authored only for real-stool/yandv-stool legs (four quarter turns "
+           "about the long axis). Default off for exact compatibility.",
+  )
+  g_search.add_argument(
       "--lru-robots", action="store_true",
       help="Order robots LEAST-RECENTLY-USED first in successor generation (utilization "
            "knob): the greedy/milestone searches take the first feasible successor, so the "
@@ -2215,7 +2223,7 @@ _SAVE_CONFIG_FIELDS = (
     "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
     "bracing", "robust_mode", "dense_grasps", "random_init", "part_float", "inhand_reorient",
     "pre_insertion", "skill_funnel_collision_res", "pre_pick", "pre_place", "pre_add_grasp",
-    "post_release", "staged_mates",
+    "post_release", "staged_mates", "mate_symmetry",
     "screw_angle", "screw_depth", "screw_torque", "screw_speed", "screw_samples",
     "allow_curved_grasps", "grippers", "grasp_compliance",
     "vacuum_scale", "two_finger_scale", "vacuum_engage_force",
@@ -2342,7 +2350,7 @@ _WITNESS_FIELDS = (
     "assemble_race_probe_evals", "assemble_race_promote", "handover_basin_racing",
     "handover_race_probe_evals", "handover_race_starts", "handover_race_promote",
     "ssik_seed_neighborhood", "ssik_neighborhood_cap",
-    "seed", "bracing", "handovers", "allow_place",
+    "seed", "bracing", "handovers", "allow_place", "mate_symmetry",
     "tight_fingers", "openarm_real_finger_radius_scale", "part_float", "witness_margin",
     "witness_joint_margin", "witness_draw",
     "witness_sets", "witness_set_spread", "pre_insertion", "skill_funnel_collision_res",
@@ -3489,6 +3497,11 @@ def run(cfg, explicit=None):
       print(f"[flag] NOTE: --assembly {cfg.assembly} has at most {_maxp} parts; the default "
             f"--parts {cfg.parts} is clamped to {_maxp}.")
   assembly = make_assembly(cfg.assembly, cfg.parts)
+  assembly.configure_mate_symmetry(cfg.mate_symmetry)
+  if cfg.mate_symmetry:
+    _sets = {p: len(qs) for p, qs in assembly.mate_symmetry_quats.items()}
+    print("[flag] --mate-symmetry ACTIVE: one symbolic assemble edge tries each authored "
+          f"discrete relative orientation in IK; sets={_sets or '{}'}.")
   assembly.configure_screw_skills(
       angle=(None if cfg.screw_angle is None else np.deg2rad(cfg.screw_angle)),
       depth=cfg.screw_depth, torque=cfg.screw_torque,

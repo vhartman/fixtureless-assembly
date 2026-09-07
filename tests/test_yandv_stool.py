@@ -65,6 +65,68 @@ def test_real_stool_cad_alignment_and_legacy_alias():
   assert any(np.allclose(sub[1][:3], [0.170, 0.010, 0.040]) for sub, _ in children)
 
 
+def test_real_stool_discrete_mate_symmetry_is_explicit_and_opt_in():
+  asm = P.make_assembly("real-stool", 5)
+  identity = np.array([1.0, 0.0, 0.0, 0.0])
+  for part in asm.objects[1:]:
+    assert len(asm.mate_symmetry_quats[part]) == 2       # authored representation exists
+    assert len(asm.mate_quaternions(part)) == 1          # historical behavior until enabled
+    assert np.allclose(asm.mate_quaternions(part)[0], identity)
+  asm.configure_mate_symmetry(True)
+  for part in asm.objects[1:]:
+    quats = asm.mate_quaternions(part)
+    assert len(quats) == 2
+    # Two distinct rotations modulo quaternion's q == -q double cover.
+    assert all(abs(float(np.dot(quats[i], quats[j]))) < 1.0 - 1e-8
+               for i in range(2) for j in range(i))
+    assert np.allclose(asm.closest_mate_quaternion(part, -quats[1]), quats[1])
+
+
+def test_assemble_bind_tries_symmetry_members_inside_one_symbolic_action():
+  import solver as S
+
+  asm = P.make_assembly("real-stool", 2)
+  asm.configure_mate_symmetry(True)
+  rik = object.__new__(S.RobotIK)
+  tried = []
+
+  def one(action, s0, s1, assembly, seed, **kw):
+    q = np.asarray(kw["mate_symmetry_quat"])
+    tried.append(q.copy())
+    return (len(tried) == 2), (np.array([42.0]) if len(tried) == 2 else None)
+
+  rik._ik_assemble_single = one
+  action = ("assemble", "a1", "obj_1", "obj_0")
+  ok, witness = rik._ik_assemble(action, object(), object(), asm, None)
+  assert ok and np.array_equal(witness, [42.0])
+  assert len(tried) == 2
+  assert all(np.allclose(a, b) for a, b in zip(tried, asm.mate_quaternions("obj_1")))
+
+
+def test_mujoco_mate_weld_keeps_the_achieved_discrete_member():
+  """The mode switch must not erase the member selected by the IK witness."""
+  from types import SimpleNamespace
+  import sim as S
+
+  asm = P.make_assembly("real-stool", 2)
+  asm.configure_mate_symmetry(True)
+  q180 = asm.mate_quaternions("obj_1")[1]
+
+  scene = object.__new__(S.SimScene)
+  scene.assembly = asm
+  scene.active_grasps = {}
+  scene._body_id = lambda name: {"obj_0": 0, "obj_1": 1}[name]
+  scene._eq_id = lambda name: 0
+  scene.model = SimpleNamespace(eq_data=np.zeros((1, 11), dtype=float))
+  scene.data = SimpleNamespace(
+      xquat=np.asarray([[1.0, 0.0, 0.0, 0.0], q180], dtype=float),
+      eq_active=np.zeros(1, dtype=np.int32))
+
+  scene.weld_mate("obj_1")
+  assert scene.data.eq_active[0] == 1
+  assert np.allclose(scene.model.eq_data[0, 6:10], q180)
+
+
 def test_yandv_normal_mujoco_view_enables_visual_group():
   import sim as S
 

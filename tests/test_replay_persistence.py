@@ -104,3 +104,15 @@ def test_build_scene_roundtrips_centered_scatter_and_legacy_layout():
   C_old, assembly_old = R.build_scene(legacy)
   old_xy = [C_old.getFrame(p).getRelativePosition()[:2] for p in assembly_old.objects]
   np.testing.assert_allclose(old_xy, [[-0.5, 0.0], [-0.3, 0.0], [-0.1, 0.0]])
+
+
+def test_build_scene_restores_discrete_mate_symmetry_and_legacy_off():
+  cfg = RunConfig(assembly="real-stool", parts=2, num_robots=1, floating_ee=True,
+                  mate_symmetry=True).to_dict()
+  _C, assembly = R.build_scene(cfg)
+  assert len(assembly.mate_quaternions("obj_1")) == 2
+
+  legacy = dict(cfg)
+  legacy.pop("mate_symmetry")
+  _C_old, assembly_old = R.build_scene(legacy)
+  assert len(assembly_old.mate_quaternions("obj_1")) == 1

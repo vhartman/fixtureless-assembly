@@ -3,6 +3,7 @@ import json
 import pytest
 
 from benchmarks import plot_cube_scaling as C
+from benchmarks import plot_cube_wrench_envelope_scaling as W
 from benchmarks import search_runner as B
 
 
@@ -92,7 +93,12 @@ def test_manifest_rejects_ambiguous_variant_and_matrix_products():
                                    "paper_search_stress_4r.json",
                                    "search_finalists_4r.json",
                                    "search_manipulation_scope_ablation.json",
-                                   "cube_scaling.json", "cube_scaling_piecewise.json"])
+                                   "cube_scaling.json", "cube_scaling_piecewise.json",
+                                   "cube_wrench_envelope_scaling.json",
+                                   "cube_wrench_x100_high_friction.json",
+                                   "cross_wrench_envelope_scaling.json",
+                                   "cross_wrench_x100_high_friction.json",
+                                   "cross_no_wrench_scaling.json"])
 def test_repository_manifests_validate_and_expand(name):
   path = B.ROOT / "benchmarks" / "manifests" / name
   data = B.validate_manifest(json.loads(path.read_text()))
@@ -277,6 +283,84 @@ def test_piecewise_cube_scaling_manifest_changes_only_the_assembly_family():
              for r in runs)
   assert {int(C._flag_value(r["args"], "--parts")) for r in runs} == set(range(1, 13))
   assert {int(C._flag_value(r["args"], "--num-robots")) for r in runs} == {2, 3, 4}
+
+
+@pytest.mark.parametrize("name,n_runs,parts,assembly", [
+    ("cube_piecewise_process_wrench_full_matrix.json", 231, range(2, 13),
+     "cube-sequence-2x2x3"),
+    ("cross_process_wrench_full_matrix.json", 126, range(2, 8), "cross"),
+])
+def test_full_process_wrench_manifests_have_requested_product(name, n_runs, parts, assembly):
+  path = B.ROOT / "benchmarks" / "manifests" / name
+  runs = B.expand_runs(B.validate_manifest(json.loads(path.read_text())))
+  assert len(runs) == n_runs
+  assert {int(C._flag_value(r["args"], "--parts")) for r in runs} == set(parts)
+  assert {int(C._flag_value(r["args"], "--num-robots")) for r in runs} == {2, 3, 4}
+  assert {float(C._flag_value(r["args"], "--insert-force")) / 10.0
+          for r in runs} == {0.0, 0.01, 0.1, 0.5, 1.0, 2.0, 10.0}
+  assert all(C._flag_value(r["args"], "--assembly") == assembly for r in runs)
+  assert all("--no-wrench" not in r["args"] and "--ignore-gravity" not in r["args"]
+             for r in runs)
+  assert all(r["max_address_space_gb"] == 6.0 for r in runs)
+  if assembly == "cross":
+    assert all(C._flag_value(r["args"], "--grippers").split(",")
+               == ["two_finger"] * int(C._flag_value(r["args"], "--num-robots"))
+               for r in runs)
+  else:
+    assert all("--vacuum" in r["args"] and "--grippers" not in r["args"] for r in runs)
+
+
+@pytest.mark.parametrize("name,n_runs,parts,assembly", [
+    ("cube_piecewise_process_wrench_full_no_wrench.json", 33, range(2, 13),
+     "cube-sequence-2x2x3"),
+    ("cross_process_wrench_full_no_wrench.json", 18, range(2, 8), "cross"),
+])
+def test_full_process_wrench_controls_are_not_duplicated_per_lambda(
+    name, n_runs, parts, assembly):
+  path = B.ROOT / "benchmarks" / "manifests" / name
+  runs = B.expand_runs(B.validate_manifest(json.loads(path.read_text())))
+  assert len(runs) == n_runs
+  assert {int(C._flag_value(r["args"], "--parts")) for r in runs} == set(parts)
+  assert {int(C._flag_value(r["args"], "--num-robots")) for r in runs} == {2, 3, 4}
+  assert all(C._flag_value(r["args"], "--assembly") == assembly for r in runs)
+  assert all("--no-wrench" in r["args"] and "--insert-force" not in r["args"]
+             for r in runs)
+
+
+def test_wrench_envelope_scaling_is_12_by_5_and_changes_all_vacuum_caps():
+  path = B.ROOT / "benchmarks" / "manifests" / "cube_wrench_envelope_scaling.json"
+  runs = B.expand_runs(B.validate_manifest(json.loads(path.read_text())))
+  assert len(runs) == 60
+  assert {int(C._flag_value(r["args"], "--parts")) for r in runs} == set(range(1, 13))
+  assert {int(C._flag_value(r["args"], "--num-robots")) for r in runs} == {2}
+  assert {float(C._flag_value(r["args"], "--vacuum-scale")) for r in runs} == set(W.SCALES)
+  assert all("--vacuum" in r["args"] and "--no-wrench" not in r["args"] for r in runs)
+
+
+def test_cross_wrench_envelope_is_7_by_5_and_two_finger_only():
+  path = B.ROOT / "benchmarks" / "manifests" / "cross_wrench_envelope_scaling.json"
+  runs = B.expand_runs(B.validate_manifest(json.loads(path.read_text())))
+  assert len(runs) == 35
+  assert {int(C._flag_value(r["args"], "--parts")) for r in runs} == set(range(1, 8))
+  assert {int(C._flag_value(r["args"], "--num-robots")) for r in runs} == {2}
+  assert {float(C._flag_value(r["args"], "--two-finger-scale"))
+          for r in runs} == set(W.SCALES)
+  assert all(C._flag_value(r["args"], "--grippers") == "two_finger,two_finger"
+             for r in runs)
+  assert all("--vacuum" not in r["args"] and "--no-wrench" not in r["args"] for r in runs)
+
+
+@pytest.mark.parametrize("name,parts,scale_flag", [
+    ("cube_wrench_x100_high_friction.json", range(1, 11), "--vacuum-scale"),
+    ("cross_wrench_x100_high_friction.json", range(1, 8), "--two-finger-scale"),
+])
+def test_high_friction_diagnostic_changes_only_finite_support_model(name, parts, scale_flag):
+  path = B.ROOT / "benchmarks" / "manifests" / name
+  runs = B.expand_runs(B.validate_manifest(json.loads(path.read_text())))
+  assert {int(C._flag_value(r["args"], "--parts")) for r in runs} == set(parts)
+  assert all(float(C._flag_value(r["args"], scale_flag)) == 100 for r in runs)
+  assert all(float(C._flag_value(r["args"], "--table-friction")) == 10 for r in runs)
+  assert all("--no-wrench" not in r["args"] for r in runs)
 
 
 def test_cube_scaling_summary_does_not_turn_timeout_into_solution_time():

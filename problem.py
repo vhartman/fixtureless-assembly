@@ -141,6 +141,14 @@ class Assembly:
     self.masses = {}
     self.mate_types = {}
     self.mate_axes = {}
+    # DISCRETE, FUNCTIONALLY-EQUIVALENT MATE ORIENTATIONS.  Each authored quaternion is the
+    # orientation of the mated part in its parent's frame (wxyz); identity is implicit for
+    # ordinary mates.  The finite set is deliberately metadata until the opt-in runtime flag
+    # calls configure_mate_symmetry(True): existing searches, grasp ids and saved plans then
+    # remain byte-identical.  These alternatives belong to one symbolic assemble edge--they
+    # are IK realizations, not task-level choices.
+    self.mate_symmetry_quats = {}
+    self.mate_symmetry_enabled = False
     self.mate_interfaces = {}                # part -> PART-FRAME contact-patch offset (see
                                              # mate_interface); {} = geometric default
     # EXECUTION REFINEMENTS: {mated_part: ScrewSkill|...}.  These do not add symbolic
@@ -271,6 +279,31 @@ class Assembly:
     # part goes in; the planner does not get to choose. Subclasses may override in define().
     a = self.mate_axes.get(part)
     return None if a is None else np.asarray(a, dtype=float)
+
+  def configure_mate_symmetry(self, enabled=False):
+    """Enable authored finite mate-orientation sets without changing the symbolic schema."""
+    self.mate_symmetry_enabled = bool(enabled)
+    # The on-table feasibility cache depends on the active orientation set.
+    if hasattr(self, "_otm_cache"):
+      self._otm_cache.clear()
+
+  def mate_quaternions(self, part):
+    """Finite relative-orientation realizations for one symbolic mate (wxyz)."""
+    identity = np.array([1.0, 0.0, 0.0, 0.0])
+    if not self.mate_symmetry_enabled:
+      return (identity,)
+    values = self.mate_symmetry_quats.get(part)
+    if not values:
+      return (identity,)
+    return tuple(np.asarray(q, dtype=float).copy() for q in values)
+
+  def closest_mate_quaternion(self, part, quat):
+    """Declared realization nearest ``quat`` (quaternion sign is immaterial)."""
+    q = np.asarray(quat, dtype=float)
+    q = q / max(float(np.linalg.norm(q)), 1e-12)
+    options = self.mate_quaternions(part)
+    return min(options, key=lambda x: 1.0 - abs(float(np.dot(
+        q, np.asarray(x, dtype=float) / max(float(np.linalg.norm(x)), 1e-12)))))
 
   def mate_skill(self, part):
     return self.mate_skills.get(part)
@@ -430,6 +463,16 @@ class Assembly:
       assert part in self.assembly_relative_poses, \
           f"mate skill assigned to non-mated part {part}"
       assert isinstance(skill, ScrewSkill), f"unsupported mate skill for {part}: {skill!r}"
+    for part, quats in self.mate_symmetry_quats.items():
+      assert part in self.assembly_relative_poses, \
+          f"mate symmetry assigned to non-mated part {part}"
+      assert quats, f"mate symmetry for {part} must contain at least one quaternion"
+      for q in quats:
+        q = np.asarray(q, dtype=float)
+        assert q.shape == (4,) and np.all(np.isfinite(q)), \
+            f"invalid mate-symmetry quaternion for {part}: {q!r}"
+        assert abs(float(np.linalg.norm(q)) - 1.0) < 1e-8, \
+            f"mate-symmetry quaternion for {part} is not normalized: {q!r}"
 
   def dependencies_of(self, part):
     return self.assembly_dependencies.get(part, [])
@@ -1896,6 +1939,13 @@ class YandVStoolAssembly(Assembly):
       self.assembly_relative_poses[part] = ["obj_0", np.array([cx, cy, leg_z])]
       self.assembly_dependencies[part] = ["obj_0"]
       self.mate_axes[part] = np.array([0.0, 0.0, 1.0])
+      # The rectangular leg/collision proxy has one exact nontrivial symmetry: a half-turn
+      # about its long local z axis.  These are alternative geometric realizations of this
+      # SAME mate, never two symbolic actions.  The runtime --mate-symmetry flag decides
+      # whether IK sees both or only the historical identity representative.
+      self.mate_symmetry_quats[part] = tuple(
+          np.array([np.cos(k * np.pi / 2.0), 0.0, 0.0,
+                    np.sin(k * np.pi / 2.0)]) for k in range(2))
       self.masses[part] = 0.08
 
 
@@ -7057,18 +7107,26 @@ def _on_table_mateable(assembly, part, tol=None, face=_IDENTITY_FACE):
   # real scene only has MORE obstacles. This is what forces base-lifts / reorientations.
   if tol is None:
     tol = _CHEAP_PENETRATION_TOL
-  C = make_world()
-  table = C.getFrame("table")
-  top = table.getPosition()[2] + table.getSize()[2] / 2.0
   # the CONTEXT group (everything that must already be assembled) rests on the table per
   # the placement rule: rotated so `face` points down, lifted so ITS lowest part touches
-  # the table. `part` is then posed at its rotated mate offset -- does the mate fit?
+  # the table. `part` is then posed at its rotated mate offset -- does the mate fit?  A
+  # discrete symmetry set is an existential realization of this ONE edge: reject only when
+  # every authored relative orientation collides.  This is the only backward/cheap-layer
+  # accounting required; the symbolic state and reverse-search goal set do not multiply.
   context = _mate_closure(assembly, part)
   q = placement_quat(assembly, context or {assembly.base}, assembly.base, face)
   R = _quat_to_R(q)
   rest = _group_rest_height(assembly, context or {assembly.base}, assembly.base, face)
-  base_pos = np.array([0.0, 0.0, top + rest])
-  for p in sorted(context | {part}, key=_part_index):
-    add_part_frame(C, p, assembly.part_shape(p)).setPosition(
-        base_pos + R @ assembly.position_in_base(p)).setQuaternion(q)
-  return all(d >= -tol for _a, _b, d in C.getCollisions())
+  options = assembly.mate_quaternions(part)
+  for rel_quat in options:
+    C = make_world()
+    table = C.getFrame("table")
+    top = table.getPosition()[2] + table.getSize()[2] / 2.0
+    base_pos = np.array([0.0, 0.0, top + rest])
+    for p in sorted(context | {part}, key=_part_index):
+      pq = _quat_mul(q, rel_quat) if p == part else q
+      add_part_frame(C, p, assembly.part_shape(p)).setPosition(
+          base_pos + R @ assembly.position_in_base(p)).setQuaternion(pq)
+    if all(d >= -tol for _a, _b, d in C.getCollisions()):
+      return True
+  return False

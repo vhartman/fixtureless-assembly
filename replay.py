@@ -208,6 +208,7 @@ def build_scene(cfg):
                             vacuum=gripper_list if gripper_list is not None else _saved(cfg, "vacuum"),
                             robot_types=_saved(cfg, "robot_types") or _saved(cfg, "robot"))
   assembly = make_assembly(cfg["assembly"], cfg["parts"])
+  assembly.configure_mate_symmetry(bool(_saved(cfg, "mate_symmetry", legacy=False)))
   assembly.configure_screw_skills(
       angle=(None if _saved(cfg, "screw_angle") is None
              else np.deg2rad(float(_saved(cfg, "screw_angle")))),

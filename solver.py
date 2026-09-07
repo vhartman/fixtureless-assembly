@@ -3654,8 +3654,49 @@ class RobotIK:
       komo.addObjective([phase, phase], ry.FS.vectorZ, [onto], ry.OT.sos, [_ASSEMBLE_ORIENT_BIAS_W], list(z_dir))
       komo.addObjective([phase, phase], ry.FS.vectorX, [onto], ry.OT.sos, [_ASSEMBLE_ORIENT_BIAS_W], list(x_dir))
 
+  def mate_quaternion_from_witness(self, action, s0, assembly, witness):
+    """Closest authored mate realization achieved by a full-config witness.
+
+    The symbolic state intentionally carries no symmetry label.  Whenever a later stage
+    (pre-skill certification, cograsp fusion, simulation export) needs the concrete member,
+    recover it from the exact witness rather than re-solving or silently choosing identity.
+    """
+    options = assembly.mate_quaternions(action[2])
+    if len(options) == 1 or witness is None:
+      return np.asarray(options[0], dtype=float).copy()
+    C = self.scene_for(s0, assembly)
+    try:
+      C.setJointState(np.asarray(witness, dtype=float).ravel())
+      value, _ = C.eval(ry.FS.quaternionRel, [action[2], action[3]])
+      return np.asarray(assembly.closest_mate_quaternion(action[2], value),
+                        dtype=float).copy()
+    except Exception as exc:
+      raise ValueError(
+          f"cannot recover the discrete mate realization for {tuple(action)} from its "
+          "persisted witness; refusing to replace it with identity") from exc
+
   def _ik_assemble(self, action, s0, s1, assembly, seed, bias_axes=None, backoff=0.0,
                    warm=None, skill_progress=None):
+    """Try the finite authored mate-orientation set inside one symbolic bind."""
+    options = list(assembly.mate_quaternions(action[2]))
+    if warm is not None and len(options) > 1:
+      # Pre-insertion and witness-refinement calls must remain on the seated witness's
+      # discrete member.  Rank by the achieved relative quaternion; sign-equivalent
+      # quaternion encodings naturally collapse through _quat_angle_deg.
+      target = self.mate_quaternion_from_witness(action, s0, assembly, warm)
+      options.sort(key=lambda q: _quat_angle_deg(q, target))
+    last = (False, None)
+    for rel_quat in options:
+      last = self._ik_assemble_single(
+          action, s0, s1, assembly, seed, bias_axes=bias_axes, backoff=backoff,
+          warm=warm, skill_progress=skill_progress, mate_symmetry_quat=rel_quat)
+      if last[0]:
+        return last
+    return last
+
+  def _ik_assemble_single(self, action, s0, s1, assembly, seed, bias_axes=None,
+                          backoff=0.0, warm=None, skill_progress=None,
+                          mate_symmetry_quat=None):
     self._cur_action = action                             # for PEN_VIEW_ACTION debug
     arm_seeds = {}                                        # exact per-arm ssik insertion seeds
     near_arm_seeds = {}                                   # deferred near-target factories
@@ -3680,7 +3721,9 @@ class RobotIK:
     # mate pose of `part` in `onto`'s frame: a pure OFFSET (parts stay axis-aligned, so the
     # relative orientation is identity). relative_pose returns (parent, position_3vec).
     rel_pos = np.asarray(assembly.relative_pose(part)[1], dtype=float)
-    rel_quat = np.array([1.0, 0.0, 0.0, 0.0])
+    rel_quat = np.asarray(
+        [1.0, 0.0, 0.0, 0.0] if mate_symmetry_quat is None else mate_symmetry_quat,
+        dtype=float)
     screw = assembly.screw_skill(part)
     if skill_progress is not None:
       if screw is None:
@@ -3692,8 +3735,9 @@ class RobotIK:
       # -angle; both advance linearly in the same scalar phase, giving a constant-pitch helix.
       rel_pos = _backoff_mate(rel_pos, assembly.mate_axis(part),
                               (1.0 - s) * float(screw.depth))
-      rel_quat = _axis_angle_quat(assembly.mate_axis(part),
-                                  -(1.0 - s) * float(screw.angle))
+      rel_quat = _quat_mul(
+          rel_quat, _axis_angle_quat(assembly.mate_axis(part),
+                                     -(1.0 - s) * float(screw.angle)))
     # PRE-INSERTION backoff (export/replay only; `backoff`=0 in the search -> the SEARCH always
     # witnesses the REAL mated pose). When >0, solve the T_pre = T_mate shifted by -backoff*
     # mate_axis funnel-mouth keyframe (the seat direction is +mate_axis, so backing off is
@@ -5776,7 +5820,10 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
     part, onto = plan[j][2], plan[j][3]
     ee_t = robot_ik.ee_target(rb, gpart, gid, assembly)
     rel_pos = np.asarray(assembly.relative_pose(part)[1], dtype=float)
-    rel_quat = np.array([1.0, 0.0, 0.0, 0.0])
+    # Preserve the discrete mate realization selected by the original assemble witness.
+    # Reverting to identity here would make --fuse-cograsp silently undo --mate-symmetry.
+    rel_quat = robot_ik.mate_quaternion_from_witness(
+        tuple(plan[j]), states[j], assembly, witnesses[j])
     axis = assembly.mate_axis(part)
     pre_delta = float(getattr(robot_ik, "pre_insertion_delta", 0.0) or 0.0)
     chain_active = pre_delta > 0.0 and axis is not None

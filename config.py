@@ -136,6 +136,7 @@ class RunConfig:
   brace_for_assembly_only: bool = False
   vacuum_no_assemble: bool = False
   staged_mates: bool = False
+  mate_symmetry: bool = False
   allow_curved_grasps: bool = False
   dense_grasps: bool = False
 

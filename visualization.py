@@ -952,10 +952,15 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
       # stow -- _seat_rest reads the recorded pose).
       _seat_rest(nxt, next(g for g in nxt.subassemblies() if action[2] in g))
     elif action[0] == "assemble":
-      # exact mate: the added part sits exactly at its offset under `onto` ...
+      # Exact mate: the added part sits exactly at its offset under `onto`.  Its relative
+      # orientation is the nearest declared member to the witnessed keyframe; forcing the
+      # historical identity representative here would erase an opt-in discrete symmetry
+      # realization during ordinary plan replay.
       f = Cv.getFrame(action[2])                                # mated part (child of onto)
+      achieved_rel_q = np.asarray(f.getRelativeQuaternion(), dtype=float)
       f.setRelativePosition(assembly.relative_pose(action[2])[1])
-      f.setRelativeQuaternion([1.0, 0.0, 0.0, 0.0])
+      f.setRelativeQuaternion(
+          assembly.closest_mate_quaternion(action[2], achieved_rel_q).tolist())
       # ... and, ONLY when the merged group is kinematically HELD (root gripper-parented),
       # the whole group aligns to its KINEMATIC HOLDER's gripper -- that is the group's
       # actual bond; the actor's arm comes to the group, never the group to the actor

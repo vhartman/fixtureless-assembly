@@ -553,11 +553,31 @@ def _save_recording(path, scene, rec, report, metadata=None):
       mpos=np.asarray(rec["mpos"]), mquat=np.asarray(rec["mquat"]),
       forces=np.asarray(rec["forces"]), robots=np.array(scene.robots),
       parts=np.array(scene.assembly.objects), marks=json.dumps(rec["marks"]),
+      controller_mode=np.asarray(rec.get("controller_mode", []), dtype="U24"),
+      physics_tick=np.asarray(rec.get("physics_tick", []), dtype=np.int64),
+      gripper_events=json.dumps(rec.get("gripper_events", []), sort_keys=True),
       results=json.dumps([repr(r) for r in report.results]),
       success=np.asarray(bool(report.success)),
       final_pose_err=json.dumps(report.final_pose_err or {}),
       metadata=json.dumps(metadata or {}, sort_keys=True))
   print(f"[sim] recording ({len(rec['qpos'])} frames) -> {path}")
+
+
+def _record_controller_mode(action):
+  """Stable annotation for the control law owning one recorded physics sample.
+
+  Ordinary retimed-path tracking is the open-loop reference.  The named modes below are
+  feedback/event hooks that a downstream executor must either implement or deliberately
+  replace.  Phase vectors and other non-string trace payloads are ordinary trajectory samples.
+  """
+  head = action[0] if isinstance(action, (tuple, list)) and action else action
+  return {
+      "servo": "skill_servo",
+      "settle": "settle",
+      "approach": "approach",
+      "guard": "wrench_guard",
+      "path": "trajectory",
+  }.get(head, "trajectory") if isinstance(head, str) else "trajectory"
 
 
 # viewer geom GROUPS (toggled by number keys 0-5 in the MuJoCo viewer / replay window):
@@ -1903,7 +1923,15 @@ class SimScene:
     eq = self._eq_id(f"mate_{part}")
     self.model.eq_data[eq][:3] = 0.0                       # anchor
     self.model.eq_data[eq][3:6] = np.asarray(rel[1], dtype=float)
-    self.model.eq_data[eq][6:10] = [1.0, 0.0, 0.0, 0.0]    # identity relative rotation
+    parent = rel[0]
+    # The search keeps symmetry quotienting out of the symbolic state.  Recover the concrete
+    # finite member from the bodies at the certified seat and snap to that declared datum,
+    # rather than erasing it with the historical identity weld.
+    qp = np.asarray(self.data.xquat[self._body_id(parent)], dtype=float)
+    qc = np.asarray(self.data.xquat[self._body_id(part)], dtype=float)
+    achieved = _quat_mul(_quat_conj(qp), qc)
+    chosen = self.assembly.closest_mate_quaternion(part, achieved)
+    self.model.eq_data[eq][6:10] = np.asarray(chosen, dtype=float)
     self.model.eq_data[eq][10] = 1.0                       # torquescale
     self.data.eq_active[eq] = 1
 
@@ -1930,13 +1958,7 @@ class SimScene:
     if parent_frame == "table":
       return                                               # free body -> gravity + contact
     if parent_frame in self.assembly.objects:              # part-part MATE at the datum
-      rel = self.assembly.relative_pose(child)
-      eq = self._eq_id(f"mate_{child}")
-      self.model.eq_data[eq][:3] = 0.0
-      self.model.eq_data[eq][3:6] = np.asarray(rel[1], dtype=float)
-      self.model.eq_data[eq][6:10] = [1.0, 0.0, 0.0, 0.0]
-      self.model.eq_data[eq][10] = 1.0
-      self.data.eq_active[eq] = 1
+      self.weld_mate(child)
     else:                                                  # gripper GRASP (frozen relpose)
       # recover the GRASP ID so the breakaway can use the planner's directional caps: the
       # frame-based replay only carries [parent, child], but the discrete state knows which
@@ -2318,6 +2340,8 @@ class SimScene:
           self.recorder["mpos"].append(self.data.mocap_pos.copy())
           self.recorder["mquat"].append(self.data.mocap_quat.copy())
           self.recorder["forces"].append(fr)
+          self.recorder["controller_mode"].append(_record_controller_mode(action))
+          self.recorder["physics_tick"].append(int(self._phys))
       if self.viewer is not None:
         self.viewer.sync()
 
@@ -3550,7 +3574,9 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     return scene.visual_contact_aperture(robot, target, fallback)
   rec = None
   if record is not None:
-    rec = scene.recorder = {"qpos": [], "mpos": [], "mquat": [], "forces": [], "marks": []}
+    rec = scene.recorder = {
+        "qpos": [], "mpos": [], "mquat": [], "forces": [], "marks": [],
+        "controller_mode": [], "physics_tick": [], "gripper_events": []}
   report = SimReport()
 
   servo = None
@@ -3649,6 +3675,15 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     _before_grasps = {r: g[1] for r, g in scene.active_grasps.items()}
     _incoming = (None if parent == "table" or parent in assembly.objects
                  else parent.split("_", 1)[0])
+    if rec is not None and _incoming is not None:
+      # Logical hardware event, independent of whether --animate-grippers adds simulation-only
+      # finger joints.  It occurs at the same instant the grasp/transfer task fires.  Preserve
+      # the exact physics time as well as the next recording-frame index: RECORD_EVERY may be
+      # greater than one, so a frame index alone loses sub-frame event timing.
+      rec["gripper_events"].append({
+          "event": "close_start", "robot": _incoming, "part": child,
+          "physics_tick": int(scene._phys), "time_s": float(scene._phys * DT),
+          "frame": int(len(rec["qpos"])), "animated": bool(animate_grippers)})
     if animate_grippers and _incoming is not None:
       _command_gripper_targets({_incoming: _closing_aperture(_incoming, child)})
     # seat check BEFORE the datum weld (part-part attach only) -- report a genuine miss.
@@ -3672,11 +3707,19 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             f"welded, gripper released; expect downstream failures.")
     else:
       scene.attach(parent, child)
+    # Transfers close the receiver before the weld changes hands, then open every giver.
+    # Releases and mates simply open the former holder(s). This is a LOGICAL hardware event
+    # even when finger animation is disabled; older code accidentally omitted every open event
+    # from ordinary standard-profile recordings because it logged them inside the visual flag.
+    _open = {r: 0.0 for r, p in _before_grasps.items()
+             if p == child and r not in scene.active_grasps}
+    if rec is not None:
+      for _r in sorted(_open):
+        rec["gripper_events"].append({
+            "event": "open_start", "robot": _r, "part": child,
+            "physics_tick": int(scene._phys), "time_s": float(scene._phys * DT),
+            "frame": int(len(rec["qpos"])), "animated": bool(animate_grippers)})
     if animate_grippers:
-      # Transfers close the receiver before the weld changes hands, then open every giver.
-      # Releases and mates simply open the former holder(s). Multiple fingers move together.
-      _open = {r: 0.0 for r, p in _before_grasps.items()
-               if p == child and r not in scene.active_grasps}
       _command_gripper_targets(_open)
     # Every framed task is the physical side effect of its plan action. Usually that is the
     # final split task; --post-release deliberately appends a frame-less departure AFTER the
