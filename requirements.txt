@@ -1,0 +1,23 @@
+# Isolated environment for the assembly planner (own .venv, separate from the shared
+# ../robotic-venv). Versions pinned to the known-good shared-env baseline; bump `robotic`
+# here to test a rai upgrade for this module only.
+robotic==0.2.2
+numpy==1.26.4
+scipy==1.11.4
+matplotlib==3.10.1
+mujoco==3.10.0  # MuJoCo physics execution and NPZ replay (`sim.py`)
+numba==0.66.0   # mr_bench motion-planner kernels; keep its cache writable
+networkx==3.4.2
+pydot==1.4.2
+numpy-stl==3.2.0
+viser==1.0.30
+pytest==6.2.5
+highspy==1.15.1   # OPTIONAL: warm-startable LP backend for the wrench check (~22x faster
+                  # same-geometry re-solves). wrench.py degrades gracefully to scipy if absent.
+trimesh==4.12.2  # --grasp-sampler: mesh tessellation + seeded surface sampling
+rtree==1.4.1     # trimesh ray/proximity backend -- mesh part shapes need it
+vhacdx==0.0.10   # optional legacy approximate decomposition; can bridge mating holes
+meshpy==2026.1.1  # offline Fabrica contained-cell importer (TetGen)
+fast-simplification==0.2.0  # offline CAD boundary proposals
+python-fcl==0.7.0.11       # offline triangle-boundary containment validation
+embreex==4.4.0            # accelerates offline exact-CAD inside tests
