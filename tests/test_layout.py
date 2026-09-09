@@ -27,24 +27,65 @@ pytestmark = pytest.mark.skipif(
 # ! settings -- the stale-global hazard of FRAGILITY 1.10. Left unhandled, this file made
 # ! tests/test_mesh_parts.py fail purely because it runs after it. So snapshot every private
 # ! module global these scenes touch and put them back afterwards.
-_STATEFUL_MODULES = ("problem", "solver", "env")
+# `wrench` is in the list because a --wrench-profile rewrites its PARAMS dict, and that dict
+# is UPPERCASE rather than underscore-prefixed -- which is why the name filter below takes
+# both spellings. Missing it left the max_robotiq profile installed for the whole session.
+_STATEFUL_MODULES = ("problem", "solver", "env", "wrench")
+_SIMPLE = (bool, int, float, str, tuple, frozenset, dict, list, type(None))
+
+
+def _safe_copy(value):
+  """Copy a setting as deeply as it allows.
+
+  ! Some of these module dicts are geometry CACHES holding rai objects, which cannot be
+  ! deep-copied (PyCapsule is unpicklable). Nested settings like wrench.PARAMS do need a deep
+  ! copy to be restorable, so try deep, fall back to shallow, and keep the reference if even
+  ! that fails -- a cache we cannot copy is one we also do not need to restore.
+  """
+  import copy as _copy
+  for attempt in (_copy.deepcopy, _copy.copy):
+    try:
+      return attempt(value)
+    except Exception:
+      continue
+  return value
 
 
 def _snapshot():
+  """Every module-level setting these scenes write, deep enough to put back."""
   import importlib
   snap = {}
   for name in _STATEFUL_MODULES:
     mod = importlib.import_module(name)
-    snap[name] = {k: (v.copy() if isinstance(v, dict) else v)
-                  for k, v in vars(mod).items()
-                  if k.startswith("_")
-                  and isinstance(v, (bool, int, float, str, tuple, frozenset, dict, type(None)))}
+    snap[name] = {k: _safe_copy(v) for k, v in vars(mod).items()
+                  if (k.startswith("_") or k.isupper()) and isinstance(v, _SIMPLE)}
   return snap
 
 
 @pytest.fixture(autouse=True, scope="module")
 def _restore_scene_globals():
   before = _snapshot()
+  # ! The staleness probe below builds a scene, so it MUST run inside this snapshot window.
+  # ! Doing it at import time (in a skipif) leaks the fixture scene's globals into every
+  # ! other test module during collection, long before any restore can happen.
+  #
+  # The fixture is an UNTRACKED experiment artifact, so it can predate the current grasp
+  # sampler: build_scene then refuses it rather than reinterpreting its grasp ids under a
+  # different database. That guard working correctly is not a defect in the layout code, so
+  # skip with the reason -- re-solve the plan to run these tests.
+  try:
+    cfg, _ = read_plan(PLAN)
+    R.build_scene(cfg)
+    stale = None
+  except ValueError as exc:
+    stale = f"the plan fixture predates the current scene/grasp code: {exc}"
+  if stale:
+    for name, values in before.items():
+      import importlib
+      mod = importlib.import_module(name)
+      for key, value in values.items():
+        setattr(mod, key, value)
+    pytest.skip(stale, allow_module_level=True)
   yield
   import importlib
   for name, values in before.items():
