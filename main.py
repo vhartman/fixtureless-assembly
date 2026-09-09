@@ -333,6 +333,18 @@ def build_parser():
            "and persisted with saved plans.",
   )
   g_scene.add_argument(
+      "--layout-json", type=str, default=None, metavar="PATH",
+      help="Solve for the MEASURED cell instead of a synthetic scatter. PATH is a layout "
+           "file written by the teleop package's pickup_calib tool (schema "
+           "assembly-pickup-layout-v1): it gives every part's real x/y and yaw plus the real "
+           "table position, size and top height, all in the robot base frame. It OVERRIDES "
+           "--center-scatter / --scatter-spacing / --random-init / --grid-init / "
+           "--perturb-start-pose and the scene's table geometry. The layout is stored inside "
+           "the saved plan, so later --load-plan / motion-plan / sim / export stages rebuild "
+           "the same physical cell without repeating the flag; passing it explicitly wins "
+           "over the stored one.",
+  )
+  g_scene.add_argument(
       "--grid-init", type=int, nargs="?", const=2, default=None, metavar="COLS",
       help="Initial-state layout: pack the parts in a grid COLS wide (default 2 when given "
            "bare), centred on the table, instead of the scatter line. (cross --parts 7 "
@@ -2218,7 +2230,7 @@ def parse_args(argv=None):
 # fields persisted by --save so replay.py can reconstruct the EXACT scene (see plan_io.py).
 _SAVE_CONFIG_FIELDS = (
     "assembly", "parts", "num_robots", "vacuum", "floating_ee", "robot", "robot_types",
-    "scatter_spacing", "center_scatter", "perturb_start_pose", "seed", "wrench",
+    "scatter_spacing", "center_scatter", "layout_json", "perturb_start_pose", "seed", "wrench",
     "wrench_profile", "grasp_model", "insert_force",
     "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
     "bracing", "robust_mode", "dense_grasps", "random_init", "part_float", "inhand_reorient",
@@ -2331,6 +2343,12 @@ def save_plan(path, cfg, plan, witnesses=None):
     _cert = (cfg.witness_margin if cfg.solve and cfg.real_ik
              and cfg.witness_margin is not None else 0.0)
   config["_search_witness_margin"] = float(_cert)
+  # The measured layout is scene GEOMETRY, so the plan carries the content and not merely the
+  # path: the file it came from may move, and a replay that silently fell back to the
+  # synthetic scatter would put every part somewhere else.
+  _layout = getattr(cfg, "_layout", None)
+  if _layout is not None:
+    config["layout"] = _layout
   write_plan(path, config, plan, witnesses=witnesses)
   print(f"[save] wrote {len(plan)}-action plan + scene config"
         + (" + witnesses" if witnesses is not None else "") + f" to {path}")
@@ -3566,11 +3584,36 @@ def run(cfg, explicit=None):
   if cfg.center_scatter and cfg.grid_init is None and cfg.random_init is None:
     print("[flag] --center-scatter ACTIVE: parts use a compact centred lattice; spacing and "
           "part order are unchanged, layout span grows as sqrt(part count).")
+  # MEASURED CELL. Three sources, in this order:
+  #   1. --layout-json TYPED ON THIS COMMAND LINE -- the operator is deliberately re-measuring.
+  #   2. the layout STORED INSIDE a loaded plan -- the certificate of the cell that plan was
+  #      actually solved for. It beats the saved `layout_json` PATH, because that file may
+  #      have been re-measured or moved since; re-reading it would silently rebuild the plan
+  #      against different geometry, which is the whole hazard this block exists to avoid.
+  #   3. a `layout_json` path inherited from a --config file, for a fresh solve.
+  _layout = getattr(cfg, "_layout", None)
+  if _layout is None:
+    from plan_io import load_layout_file, read_plan_layout
+    _typed = bool(explicit and "layout_json" in explicit)
+    _stored = read_plan_layout(cfg.load_plan) if cfg.load_plan else None
+    if cfg.layout_json and (_typed or _stored is None):
+      _layout = load_layout_file(cfg.layout_json)
+      _layout_src = cfg.layout_json
+    elif _stored is not None:
+      _layout = _stored
+      _layout_src = f"the layout stored in {cfg.load_plan}"
+    if _layout is not None:
+      cfg._layout = _layout
+      _tbl = _layout["table"]
+      print(f"[flag] --layout-json ACTIVE: {len(_layout['parts'])} measured part pose(s) from "
+            f"{_layout_src}; table {_tbl['size_xy'][0]:g}x{_tbl['size_xy'][1]:g} m centred at "
+            f"({_tbl['center_xy'][0]:g}, {_tbl['center_xy'][1]:g}) with its top at "
+            f"z={_tbl['top_z']:g} m. Every scatter flag is ignored.")
   C = add_disassembled_obj(C, assembly, perturb_start_pose=cfg.perturb_start_pose,
                            spacing=cfg.scatter_spacing, random_init=cfg.random_init,
                            float_height=cfg.part_float, min_sep=cfg.min_sep,
                            grid=cfg.grid_init, grid_gap=cfg.grid_gap,
-                           center_scatter=cfg.center_scatter)
+                           center_scatter=cfg.center_scatter, layout=_layout)
   if cfg.vacuum_no_assemble:
     # Role restrictions describe the physical tool roster, not whether the wrench LP is on.
     # Install that roster only after the actual scene exists; successor calls deliberately

@@ -221,3 +221,51 @@ def read_pre_witnesses(path, joint_names, n_actions, witnesses=None):
       raise ValueError(f"{path}: pre-witness at step {i} has no canonical skill witness")
     out[i] = q
   return out or None
+
+
+# --- Measured pickup layout ------------------------------------------------
+# A layout file records where the parts and the table REALLY are, as measured on the robot
+# by the teleop package's pickup_calib tool. It replaces the synthetic scatter so the plan is
+# solved for the physical cell. Coordinates are metres/radians in the robot base frame, which
+# is the same frame as the rai world of env.make_husky_duo_env (z=0 floor).
+LAYOUT_SCHEMA = "assembly-pickup-layout-v1"
+
+
+def load_layout_file(path):
+  """Read a measured pickup layout and check that it is one.
+
+  Args:
+    path (str): Path to the layout JSON.
+
+  Returns:
+    dict: The layout, with "table" and "parts" guaranteed present.
+
+  Raises:
+    ValueError: If the schema marker or a required block is missing.
+  """
+  with open(path) as f:
+    layout = json.load(f)
+  schema = layout.get("schema")
+  if schema != LAYOUT_SCHEMA:
+    raise ValueError(f"{path}: schema {schema!r} is not {LAYOUT_SCHEMA!r}")
+  for key in ("table", "parts"):
+    if key not in layout:
+      raise ValueError(f"{path}: layout has no {key!r} block")
+  return layout
+
+
+def read_plan_layout(path):
+  """The layout block a saved plan carries, or None if it was solved without one.
+
+  The block travels inside the plan's config so that --load-plan reproduces the measured
+  scene without the operator having to pass the layout file again.
+
+  Args:
+    path (str): Path to a saved plan JSON.
+
+  Returns:
+    dict or None: The layout block.
+  """
+  with open(path) as f:
+    data = json.load(f)
+  return (data.get("config") or {}).get("layout")

@@ -230,7 +230,10 @@ def build_scene(cfg):
                            # every part at a different world pose during replay.  Plans that
                            # predate the persisted field retain the historical left-anchored
                            # layout rather than inheriting today's profile default.
-                           center_scatter=bool(_saved(cfg, "center_scatter", legacy=False)))
+                           center_scatter=bool(_saved(cfg, "center_scatter", legacy=False)),
+                           # MEASURED cell geometry, stored in the plan by main.save_plan. A
+                           # plan solved without one has no key and keeps the synthetic scatter.
+                           layout=cfg.get("layout"))
   if _saved(cfg, "grasp_sampler_scenes", legacy=False):
     # the scene-filtered DB is per PART INSTANCE and its ids are what the plan indexes: the
     # replay scene must install the same filter context or every saved grasp id misreads.

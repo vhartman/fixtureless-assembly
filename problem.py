@@ -490,9 +490,41 @@ class Assembly:
     parent, rel_pos = rel
     return self.position_in_base(parent) + np.asarray(rel_pos, dtype=float)
 
+def _apply_table_layout(C, table):
+  """Move and resize the rai table frame to the MEASURED work surface.
+
+  The table is the parent of every scattered part and the surface the whole pipeline reasons
+  about: the motion planner collides against this frame and the MuJoCo sim rebuilds its own
+  table from it (sim.planner_table_geometry). Writing the measurement here is therefore the
+  only edit needed to make every later stage use the real surface.
+
+  Args:
+    C: The rai configuration, which must already carry a "table" frame.
+    table (dict): Layout table block with "center_xy", "size_xy", "thickness" and "top_z"
+      (metres, in the robot base frame).
+
+  Raises:
+    ValueError: If the scene has no table frame.
+  """
+  f = C.getFrame("table")
+  if f is None:
+    raise ValueError("a measured layout needs a scene with a 'table' frame")
+  cx, cy = (float(v) for v in table["center_xy"])
+  sx, sy = (float(v) for v in table["size_xy"])
+  thickness, top_z = float(table["thickness"]), float(table["top_z"])
+  # Keep the corner radius the scene was built with: it is collision geometry, not a
+  # measurement. getSize on an ssBox returns [x, y, z, corner radius].
+  size = np.asarray(f.getSize(), dtype=float)
+  radius = float(size[3]) if size.size > 3 else 0.0
+  f.setShape(ry.ST.ssBox, [sx, sy, thickness, radius])
+  # A rai box is centred on its frame, so the frame sits half a thickness below the top.
+  f.setPosition([cx, cy, top_z - thickness / 2.0])
+
+
 def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, max_tries=200,
                          spacing=1.0 / 7.0, per_row=8, random_init=None, float_height=0.015,
-                         min_sep=None, grid=None, grid_gap=0.1, center_scatter=False):
+                         min_sep=None, grid=None, grid_gap=0.1, center_scatter=False,
+                         layout=None):
   # scatter the assembly's parts on the table as loose cubes (test scene). Geometry
   # (cube_size / cube_radius) comes from the assembly, not a global. `spacing` = the x-pitch
   # of the scatter line (default = historical 1/7 m ~ 0.143); a knob for analysing how much
@@ -511,9 +543,17 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
   #                       cubes sit shoulder-to-shoulder, so interior cubes are not directly
   #                       graspable -- the planner must RELOCATE perimeter cubes to reach the
   #                       ones the assembly needs. (cross-7, cols=2 -> a 2x3 block + 1.)
+  #   layout=<dict>    -- MEASURED poses from the real cell (plan_io.load_layout_file). It
+  #                       overrides every mode above, including the table geometry.
   cs = assembly.cube_size
 
+  # ! The table must be moved BEFORE its half thickness is read: every part's height is
+  # ! measured from this frame, so a later move would leave the parts at the old height.
+  if layout is not None:
+      _apply_table_layout(C, layout["table"])
+
   table_half = C.getFrame("table").getSize()[2] / 2.0
+  table_world_z = float(C.getFrame("table").getPosition()[2])
 
   for i, name in enumerate(assembly.objects):
       # scatter orientation (how the part initially LIES, e.g. wheels flat) and a
@@ -593,7 +633,24 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
       C.addFrame(f"{name}_marker", name).setShape(ry.ST.marker, [cs * 1.0])
 
       base_q = scatter_q if scatter_q is not None else np.array([1.0, 0.0, 0.0, 0.0])
-      if grid is not None:
+      if layout is not None:
+          # MEASURED pose: the operator touched this part (or an anchor part) with the punch
+          # tip, so its x/y and yaw come from the real cell. Only the turn about world z is
+          # measured -- the part still LIES the way the assembly says it does, so the measured
+          # yaw is composed ONTO the scatter orientation. The height stays the computed one:
+          # a part rests on the measured table, it does not float at a measured height.
+          if name not in layout["parts"]:
+              raise KeyError(f"measured layout has no pose for part {name!r}; "
+                             f"it lists {sorted(layout['parts'])}")
+          entry = layout["parts"][name]
+          xy = np.asarray(entry["xy"], dtype=float)
+          yaw = float(entry["yaw"])
+          yaw_q = np.array([np.cos(yaw / 2.0), 0.0, 0.0, np.sin(yaw / 2.0)])
+          # setPosition/setQuaternion take WORLD poses; rai recomputes the relative pose that
+          # keeps this part parented to the table.
+          obj.setPosition([xy[0], xy[1], table_world_z + z])
+          obj.setQuaternion(list(_quat_mul(yaw_q, base_q)))
+      elif grid is not None:
           pass                                             # tight grid: keep the nominal grid pose
       elif random_init:
           # FULL randomization (seeded, hence reproducible): uniform x/y in the central

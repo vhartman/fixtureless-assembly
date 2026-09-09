@@ -46,6 +46,7 @@ class RunConfig:
   random_init: Optional[float] = None
   scatter_spacing: float = 1.0 / 7.0
   center_scatter: bool = False
+  layout_json: Optional[str] = None
   grid_init: Optional[int] = None
   grid_gap: float = 0.1
   min_sep: Optional[float] = None
@@ -368,6 +369,11 @@ class RunConfig:
       # witness-only --witness-margin).  main.py reads it from the raw plan before loading;
       # RunConfig must ignore it so a saved plan remains usable as --config.
       d.pop("_search_witness_margin", None)
+      # Persistence-only too: the MEASURED part/table poses the plan was solved for
+      # (plan_io.LAYOUT_SCHEMA). main.py reads it from the raw plan so --load-plan rebuilds
+      # the same physical cell; RunConfig must ignore it so a saved plan stays a valid
+      # --config file. The `layout_json` path is a plain field and survives normally.
+      d.pop("layout", None)
       for key, value in legacy.items():
         d.setdefault(key, value)
     return cls.from_dict(d)
