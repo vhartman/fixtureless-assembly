@@ -913,10 +913,11 @@ class RobotIK:
     # zero-measure goal for BiRRT (OpenArm car-mini: 3e-9 rad slack on joint 7); reject it in
     # search so another branch/witness/plan is tried, rather than diagnosing it after export.
     self.joint_margin_reject = None
-    # Optional held-object workcell contract. Every part datum whose kinematic ancestry
-    # reaches a gripper must remain inside the table's LOCAL x/y footprint. This is installed
-    # in KOMO before optimization and repeated as an endpoint certificate; a post-only gate
-    # would waste restarts on a condition the optimizer had never been told about.
+    # Optional held-object workcell contract. Every carried-component datum moved by the
+    # current skill must remain inside the table's LOCAL x/y footprint. Payloads of uninvolved
+    # arms are excluded because isolated IK parks them at an artificial EXIT configuration.
+    # This is installed in KOMO before optimization and repeated as an endpoint certificate;
+    # a post-only gate would waste restarts on a condition the optimizer had never seen.
     self.object_over_table = False
     self.object_over_table_margin = 0.0
     self.workspace_rejects = 0
@@ -2252,7 +2253,7 @@ class RobotIK:
       return False
     if self._part_is_payload_of(C, part, robot):
       return True
-    action = tuple(self._cur_action or ())
+    action = tuple(getattr(self, "_cur_action", None) or ())
     return (len(action) >= 3 and action[0] in ("pick", "add_grasp", "handover")
             and action[1] == robot and action[2] == part)
 
@@ -2295,7 +2296,7 @@ class RobotIK:
     # search already applies elsewhere rather than accepting a table-skimming keyframe. On
     # OpenArm car-mini the nominal wheel gap was 0.10mm; accumulated achieved-grasp residuals
     # turned it into 1.22mm penetration in mr_bench's real attachment chain.
-    action = tuple(self._cur_action or ())
+    action = tuple(getattr(self, "_cur_action", None) or ())
     if action and action[0] in ("handover", "add_grasp"):
       part = pb if fa == "table" else pa if fb == "table" else None
       if part is not None and any(self._part_is_payload_of(C, part, r) for r in self.robots):
@@ -2361,7 +2362,28 @@ class RobotIK:
           f"for table size {size[:2].tolist()}")
     return half
 
-  def _held_object_frames(self, C):
+  def _workspace_participant_robots(self, C):
+    """Robots whose carried payload is moved/constrained by the current skill.
+
+    ``scene_for`` deliberately parks every uninvolved arm at EXIT.  A payload held by one of
+    those arms is therefore only background geometry for the isolated IK program; treating
+    its artificial EXIT pose as a workspace decision makes ``--object-over-table`` reject an
+    otherwise unrelated pick.  Include the actor plus every holder of a part touched by this
+    action.  With no current action (standalone diagnostics/tests), retain the historical
+    all-held-components interpretation.
+    """
+    action = tuple(getattr(self, "_cur_action", None) or ())
+    if len(action) < 2:
+      return None
+    out = {action[1]} if action[1] in self.robots else set()
+    touched = [p for p in action[2:]
+               if isinstance(p, str) and p.startswith("obj_")]
+    for robot in self.robots:
+      if any(self._part_is_payload_of(C, part, robot) for part in touched):
+        out.add(robot)
+    return out
+
+  def _held_object_frames(self, C, robots=None):
     """Reference datum of each component kinematically carried by a gripper.
 
     A held assembly is represented as one object frame attached to the gripper with the
@@ -2370,6 +2392,8 @@ class RobotIK:
     assembly wider than the table).  The workcell guard is meant to bound the carried
     component, so use its kinematic root -- the datum attached directly below the gripper.
     """
+    allowed_grippers = (set(self.gripper_frame.values()) if robots is None else
+                        {self.gripper_frame[r] for r in robots if r in self.gripper_frame})
     grippers = set(self.gripper_frame.values())
     objects = set(self.object_frames)
     held = []
@@ -2379,7 +2403,7 @@ class RobotIK:
       object_ancestor = False
       while f is not None and f.name not in seen:
         if f.name in grippers:
-          if not object_ancestor:
+          if not object_ancestor and f.name in allowed_grippers:
             held.append(name)
           break
         seen.add(f.name)
@@ -2393,7 +2417,8 @@ class RobotIK:
     if not getattr(self, "object_over_table", False):
       return None
     half = self._table_workcell_half_extents(C)
-    for part in self._held_object_frames(C):
+    participants = self._workspace_participant_robots(C)
+    for part in self._held_object_frames(C, participants):
       rel, _ = C.eval(ry.FS.positionRel, [part, "table"])
       xy = np.asarray(rel, dtype=float).ravel()[:2]
       excess = np.abs(xy) - half
@@ -2412,7 +2437,8 @@ class RobotIK:
     if np.any(target_half <= 0.0):
       target_half = half * 0.999
     times = [] if times is None else times
-    for part in self._held_object_frames(C):
+    participants = self._workspace_participant_robots(C)
+    for part in self._held_object_frames(C, participants):
       for axis in range(2):
         target = np.zeros(3, dtype=float)
         target[axis] = target_half[axis]
