@@ -8416,7 +8416,7 @@ class SignatureCollapsedHeuristic(CollapsedLabeledHeuristic):
 
 
 _TABLE_PICK_FACT_CACHE = {}
-_FACT_TEMPLATES = {}                                       # (ee_path, id(assembly)) -> template
+_FACT_TEMPLATES = {}                                       # (ee_path, assembly identity) -> template
 
 
 def _fact_template(gripper_path, assembly):
@@ -8424,7 +8424,11 @@ def _fact_template(gripper_path, assembly):
   # + the EE pre-parsed. Per fact we COPY it (rai ~0.4ms) and reposition -- profiling showed
   # place_floating_ee's addFile (re-parsing the gripper .g per fact) was a third of the
   # whole heuristic build. Frames are named by PART (shape-correct per part).
-  key = (gripper_path, id(assembly))
+  # Keep the assembly OBJECT in the key. ``id(assembly)`` can be reused after a short-lived
+  # assembly (for example an exported model) is collected, which used to serve a template
+  # containing another assembly's part frames. The identity-hashed object both distinguishes
+  # the geometry and keeps that identity alive for as long as the cache entry exists.
+  key = (gripper_path, assembly)
   hit = _FACT_TEMPLATES.get(key)
   if hit is not None:
     return hit
@@ -8452,7 +8456,7 @@ def _table_aware_pick_fact(assembly, S_key, face, gpart, gid, gripper_path,
   # the table, so the real pick gate is more tolerant than an exactly-resting scene -- an
   # abstraction fact must be AT LEAST as permissive as any real context (over-permissive
   # only weakens the heuristic; over-strict breaks admissibility).
-  key = (id(assembly), S_key, face, gpart, gid, gripper_path, round(clearance, 4))
+  key = (assembly, S_key, face, gpart, gid, gripper_path, round(clearance, 4))
   hit = _TABLE_PICK_FACT_CACHE.get(key)
   if hit is not None:
     return hit

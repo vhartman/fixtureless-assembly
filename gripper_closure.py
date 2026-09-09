@@ -21,9 +21,9 @@ import numpy as np
 import robotic as ry
 
 
-# Bump whenever the calibrated proxy semantics change. It keys the cheap-check cache; this
-# first version intentionally does not alter replay semantics or persisted witness data.
-VERSION = 1
+# Bump whenever the calibrated proxy semantics change. It keys the cheap-check cache and the
+# sampled grasp database provenance, so a saved grasp id cannot silently acquire new meaning.
+VERSION = 2
 
 # These are physical/proxy calibration constants, not search-tuning knobs.  Both current
 # models expose an approximately 80--115 mm open jaw gap and have about 40 mm inward travel
@@ -35,7 +35,11 @@ _MAX_INWARD = {
 }
 
 _CONTACT_EPS = 7.5e-4       # numerical/mesh contact tolerance (metres)
-_MISALIGN_PENETRATION = 1.5e-1
+# At the common mechanically-coupled aperture, the jaw that touched first may penetrate the
+# target only by this small collision-query allowance.  The old value was 0.15m, effectively
+# disabling the bilateral-centering certificate and letting a jaw close centimetres through an
+# off-centre part while waiting for the opposite jaw to make contact.
+_MISALIGN_PENETRATION = 1.5e-3
 _HARD_PENETRATION = 1.0e-4
 _SCAN_STEPS = 7             # coarse brackets; bisection refines each contact afterwards
 _BISECTION_STEPS = 4
@@ -275,7 +279,15 @@ def _contact_aperture(C: ry.Config, prefix: str, target: str):
             _APERTURE_CACHE[key] = res
         return res, None
     if any(d < -_MISALIGN_PENETRATION for d in ds):
-        res = ClosureResult(False, reason="miscentred-contact", model=model)
+        # ``ds`` is evaluated at the later of the two individual first contacts.  A deep
+        # negative value on the earlier side is therefore exactly the error we care about:
+        # the fixed grasp transform is not centred between a pair of coupled jaws.  Rejecting
+        # it here handles sampled/canonical candidates cheaply and is repeated on the achieved
+        # IK witness, so optimizer residual cannot reintroduce the same defect.
+        side = int(np.argmin(ds))
+        res = ClosureResult(False, reason="miscentred-contact",
+                            detail=(f"finger-side-{side}", target, float(ds[side])),
+                            model=model)
         if key is not None:
             _APERTURE_CACHE[key] = res
         return res, None
