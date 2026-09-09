@@ -42,7 +42,15 @@ def check_containment(asm):
     approved_primitive = collision.get("settings", {}).get("explicit_approximation", False)
     approximated = 0
     for shape, offset in P._compound_children(asm.part_shape(part)):
-      hull = P._load_mesh(shape[1])["hull_mesh"].copy()
+      if shape[0] == "mesh":
+        hull = P._load_mesh(shape[1])["hull_mesh"].copy()
+      elif shape[0] == "box":
+        # Reviewed primitive inner approximations (currently Fabrica Beam) share the same
+        # compound representation as imported hulls.  Audit their actual eight-corner box,
+        # rather than assuming every compound child names a mesh file.
+        hull = trimesh.creation.box(extents=np.asarray(shape[1][:3], dtype=float))
+      else:
+        raise ValueError(f"{part}: containment audit does not support {shape[0]!r}")
       hull.apply_translation(offset)
       if approved_primitive:
         approximated += 1

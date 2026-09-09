@@ -86,6 +86,8 @@ def main():
                                               cfg.get("mp_robot_margin", 0.0))),
         robot_margin_ramp=float(settings.get("robot_margin_ramp",
                                              cfg.get("mp_margin_ramp", 0.0))),
+        robot_margin_mode=str(settings.get("robot_margin_mode",
+                                           cfg.get("mp_margin_mode", "linear"))),
         table_margin=float(settings.get("table_margin",
                                         cfg.get("mp_table_margin", 0.0))),
         table_float=float(settings.get("table_float", cfg.get("part_float", 0.002))),

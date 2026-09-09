@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from plan_io import missing_required_witnesses, read_plan, read_pre_witnesses, \
+from plan_io import PRE_WITNESS_CONTRACT, missing_required_witnesses, read_plan, read_pre_witnesses, \
     read_skill_paths, read_witnesses, read_witness_stage, require_complete_witnesses, \
     witness_block, write_plan
 import mp_export as MP
@@ -77,11 +77,30 @@ def test_pre_insertion_certificate_round_trips_and_fails_closed(tmp_path):
   out = read_pre_witnesses(p, JOINTS, len(PLAN), wit)
   assert list(out) == [1]
   np.testing.assert_array_equal(out[1], pre[1])
+  assert witness_block(JOINTS, wit, pre_witnesses=pre)["pre_wit_contract"] == \
+      PRE_WITNESS_CONTRACT
 
   bad = {1: np.ones(3)}
   p = _write(tmp_path, witness_block(JOINTS, wit, pre_witnesses=bad))
   with pytest.raises(ValueError, match="wrong-length pre-witness"):
     read_pre_witnesses(p, JOINTS, len(PLAN), wit)
+
+
+def test_full_pre_insertion_contract_rejects_legacy_fractional_funnels(tmp_path):
+  wit = [np.zeros(4), np.ones(4), None]
+  pre = {1: np.array([0.9, 0.8, 0.7, 0.6])}
+  blk = witness_block(JOINTS, wit, pre_witnesses=pre)
+  p = _write(tmp_path, blk)
+  assert read_pre_witnesses(
+      p, JOINTS, len(PLAN), wit, require_full_assemble=True) is not None
+
+  # The old fractional endpoint is indistinguishable by vector shape alone. Missing semantic
+  # provenance therefore fails closed instead of silently authorizing it during replay.
+  blk.pop("pre_wit_contract")
+  p = _write(tmp_path, blk)
+  with pytest.raises(ValueError, match="collapsed funnel"):
+    read_pre_witnesses(
+        p, JOINTS, len(PLAN), wit, require_full_assemble=True)
 
 
 def test_file_without_block_reads_as_none(tmp_path):

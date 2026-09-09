@@ -21,6 +21,19 @@ FABRICA_MODELS = (
 )
 
 
+def _collision_child_mesh(shape):
+  """Trimesh equivalent of one convex collision child (in its child frame)."""
+  import trimesh
+  if shape[0] == "mesh":
+    return P._load_mesh(shape[1])["hull_mesh"]
+  if shape[0] == "box":
+    return trimesh.creation.box(extents=np.asarray(shape[1][:3], dtype=float))
+  if shape[0] == "cylinder":
+    return trimesh.creation.cylinder(
+        radius=float(shape[1][1]), height=float(shape[1][0]), sections=32)
+  raise AssertionError(f"unsupported collision child {shape[0]!r}")
+
+
 def _assembled_scene(kind, n_parts):
   asm = P.make_assembly(kind, n_parts)
   C = P.add_disassembled_obj(
@@ -65,6 +78,10 @@ def test_fabrica_source_mapping_and_dependencies():
       "obj_1": ["obj_0"], "obj_2": ["obj_1"],
       "obj_3": ["obj_0"], "obj_4": ["obj_3"]}
   assert all(np.allclose(beam.mate_axis(p), [0, 0, -1]) for p in beam.objects[1:])
+  # Manufactured mortised beams do not need hundreds of generic convex cells.  The exact
+  # CAD remains the visual/grasp surface; the reviewed proxy retains every insertion hole.
+  assert [len(P._compound_children(beam.part_shape(p)))
+          for p in beam.objects] == [7, 3, 10, 3, 10]
 
   expected_sources = {
       "fabrica-cooling-manifold": ["1", "0", "4", "2", "3", "5", "6"],
@@ -103,7 +120,7 @@ def test_fabrica_scattered_collision_and_mate_openings():
       point = asm.position_in_base(part) - asm.position_in_base(parent)
       parent_shape = asm.part_shape(parent)
       assert parent_shape[0] == "compound"
-      imported_inside = any(P._load_mesh(sub[1])["hull_mesh"].contains([point - pos])[0]
+      imported_inside = any(_collision_child_mesh(sub).contains([point - pos])[0]
                             for sub, pos in P._compound_children(parent_shape))
       import trimesh
       exact = trimesh.load(os.path.join(P.HERE, asm.visual_meshes[parent]),
@@ -146,7 +163,7 @@ def test_fabrica_collision_decomposition_retains_authored_extents():
           visual_axial_half = (exact_projection.max() - exact_projection.min()) / 2
           points = []
           for shape, offset in P._compound_children(asm.part_shape(part)):
-            points.append(P._load_mesh(shape[1])["hull_mesh"].vertices + offset)
+            points.append(_collision_child_mesh(shape).vertices + offset)
           collision_projection = np.concatenate(points) @ direction
           collision_axial_half = (collision_projection.max()
                                   - collision_projection.min()) / 2

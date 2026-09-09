@@ -140,6 +140,28 @@ def test_participant_margin_ramp_relaxes_at_both_segment_anchors():
   assert env.is_collision_free_np(None, mode)
 
 
+def test_binary_margin_relaxation_is_zero_inside_endpoint_neighbourhood():
+  env = _Env()
+  env.C = _MovingConfig()
+  env.task = _CoupledTask()
+  env.tasks = [env.task]
+  env.robot_idx = {"a1": np.array([0]), "a2": np.array([1])}
+  env.C.collisions = [("a1_link", "a2_link", 0.02)]
+  mode = _Mode()
+  mode.task_ids = [0, 0]
+  MP._install_robot_margin(
+      env, 0.1, ["a1", "a2"], {"a1": "a1_ee", "a2": "a2_ee"},
+      ramp=0.05, margin_mode="binary")
+
+  # Full 10cm shell in transit; no auxiliary shell within 5cm of either keyframe.
+  env.C.setJointState([0.04, 0.04])
+  assert env.is_collision_free_np(None, mode)
+  env.C.setJointState([0.051, 0.051])
+  assert not env.is_collision_free_np(None, mode)
+  env.C.setJointState([0.96, 0.96])
+  assert env.is_collision_free_np(None, mode)
+
+
 def test_margin_audit_distinguishes_base_rejection_from_our_gate(capsys):
   env = _Env()
   env.base_ok = False

@@ -306,6 +306,16 @@ def test_every_nonpresentation_standard_setting_is_persisted():
       set(main._SAVE_CONFIG_FIELDS)
 
 
+def test_execution_motion_margin_policy_is_persisted(tmp_path):
+  cfg = RunConfig.from_namespace(main.parse_args(["--motion-profile", "execution"]))
+  out = tmp_path / "execution-plan.json"
+  main.save_plan(str(out), cfg, [])
+  loaded = RunConfig.from_file(str(out))
+  assert loaded.mp_robot_margin == 0.05
+  assert loaded.mp_margin_ramp == 0.05
+  assert loaded.mp_margin_mode == "binary"
+
+
 def test_orientation_robust_wrench_cli_and_plan_roundtrip(tmp_path):
   cfg = RunConfig.from_namespace(main.parse_args(["--orientation-robust-wrench"]))
   assert cfg.orientation_robust_wrench is True
@@ -451,7 +461,32 @@ def test_motion_profile_is_reversible_by_explicit_cli():
   assert a.mp_collision_tolerance == 0.002 and a.mp_optimize
   assert a.mp_runtime == 12.0 and a.mp_stall_timeout == 3.0
   assert a.mp_shortcut_iters == 17 and a.mp_table_margin == 0.004
+  assert a.mp_robot_margin == 0.0 and a.mp_margin_ramp == 0.0
+  assert a.mp_margin_mode == "linear"
   assert not a.fuse_cograsp and not a.fuse_pre_skill
+
+
+def test_execution_motion_profile_differs_only_in_clearance_policy():
+  standard = main.parse_args(["--motion-profile", "standard"])
+  execution = main.parse_args(["--motion-profile", "execution"])
+  assert execution.mp_robot_margin == 0.05
+  assert execution.mp_margin_ramp == 0.05
+  assert execution.mp_margin_mode == "binary"
+  differing = {
+      key for key in main._STANDARD_MOTION_PROFILE
+      if getattr(standard, key) != getattr(execution, key)
+  }
+  assert differing == {"mp_robot_margin", "mp_margin_ramp", "mp_margin_mode"}
+
+
+def test_execution_margin_policy_is_reversible_by_explicit_cli():
+  a = main.parse_args([
+      "--motion-profile", "execution", "--mp-robot-margin", "0.02",
+      "--mp-margin-ramp", "0.03", "--mp-margin-mode", "linear",
+  ])
+  assert a.mp_robot_margin == 0.02
+  assert a.mp_margin_ramp == 0.03
+  assert a.mp_margin_mode == "linear"
 
 
 def test_profile_values_are_reversible_by_explicit_cli():
@@ -560,9 +595,11 @@ def test_placement_yaws_are_parsed_persisted_and_invalidate_witnesses(tmp_path):
 def test_mp_export_clearance_settings_default_to_saved_artifact():
   """Zero-IK export replay is exact unless this invocation explicitly retunes planning."""
   cfg = RunConfig(mp_collision_tolerance=0.7, mp_robot_margin=0.6,
-                  mp_margin_ramp=0.5, mp_table_margin=0.4, part_float=0.03)
+                  mp_margin_ramp=0.5, mp_margin_mode="binary",
+                  mp_table_margin=0.4, part_float=0.03)
   saved = {"collision_tolerance": 1e-4, "robot_robot_margin": 0.1,
-           "robot_margin_ramp": 0.1, "table_margin": 0.02, "table_float": 0.007}
+           "robot_margin_ramp": 0.1, "robot_margin_mode": "linear",
+           "table_margin": 0.02, "table_float": 0.007}
   values, sources = main._merge_mp_export_clearance_settings(cfg, saved, explicit=set())
   assert values == saved
   assert set(sources.values()) == {"export"}
@@ -571,16 +608,20 @@ def test_mp_export_clearance_settings_default_to_saved_artifact():
 def test_explicit_cli_overrides_mp_export_clearance_settings_independently():
   """A named CLI knob wins without accidentally replacing the other saved defaults."""
   cfg = RunConfig(mp_collision_tolerance=0.2, mp_robot_margin=0.0,
-                  mp_margin_ramp=0.03, mp_table_margin=0.04, part_float=0.012)
+                  mp_margin_ramp=0.03, mp_margin_mode="binary",
+                  mp_table_margin=0.04, part_float=0.012)
   saved = {"collision_tolerance": 1e-4, "robot_robot_margin": 0.1,
-           "robot_margin_ramp": 0.1, "table_margin": 0.02, "table_float": 0.007}
+           "robot_margin_ramp": 0.1, "robot_margin_mode": "linear",
+           "table_margin": 0.02, "table_float": 0.007}
   values, sources = main._merge_mp_export_clearance_settings(
       cfg, saved, explicit={"mp_collision_tolerance", "mp_robot_margin", "mp_table_margin"})
   assert values == {"collision_tolerance": 0.2, "robot_robot_margin": 0.0,
-                    "robot_margin_ramp": 0.1, "table_margin": 0.04,
+                    "robot_margin_ramp": 0.1, "robot_margin_mode": "linear",
+                    "table_margin": 0.04,
                     "table_float": 0.012}
   assert sources == {"collision_tolerance": "CLI", "robot_robot_margin": "CLI",
-                     "robot_margin_ramp": "export", "table_margin": "CLI",
+                     "robot_margin_ramp": "export", "robot_margin_mode": "export",
+                     "table_margin": "CLI",
                      "table_float": "CLI/scene"}
 
 

@@ -253,6 +253,7 @@ class RunConfig:
   mp_collision_tolerance: float = 1e-4
   mp_robot_margin: float = 0.1
   mp_margin_ramp: float = 0.1
+  mp_margin_mode: str = "linear"
   mp_table_margin: float = 0.0
   mp_seed: Optional[int] = None
   mp_fake_clock: bool = False

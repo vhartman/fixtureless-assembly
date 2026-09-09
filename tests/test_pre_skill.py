@@ -280,6 +280,49 @@ def test_pre_pick_never_returns_a_different_actor_ik_branch():
   np.testing.assert_allclose(got, [0.1, 0.0])
 
 
+def test_pre_assemble_requires_the_full_configured_backoff():
+  """An insertion mouth is a hard controller boundary, not a best-effort approach hint.
+
+  Regression from Real Bench: the 50mm solve failed, the shared fallback ladder accepted its
+  5mm rung, and BiRRT could reach that almost-seated keyframe only with centimetres of allowed
+  penetration. A failed full mouth must reject this witness so search can try another one.
+  """
+  rik = object.__new__(S.RobotIK)
+  rik.pre_pick_delta = rik.pre_place_delta = rik.pre_add_grasp_delta = 0.0
+  rik.pre_insertion_delta = 0.05
+  rik.pre_insertion_pull = 1.0
+  rik.pre_skill_max_dq = 0.35
+  rik.C = type("C", (), {"getJointNames": lambda _self: ["a1_j0", "a2_j0"]})()
+  assembly = type("Assembly", (), {
+      "screw_skill": lambda _self, _part: None,
+      "mate_axis": lambda _self, _part: np.array([1.0, 0.0, 0.0]),
+  })()
+  calls = []
+
+  def fail_full(*_args, **kwargs):
+    calls.append(kwargs["backoff"])
+    # This would have succeeded at the next, shorter ladder rung before the fix.
+    return (kwargs["backoff"] < 0.05, np.array([0.1, 0.0]))
+
+  rik._ik_assemble = fail_full
+  rik._funnel_edge_ok = lambda *_a, **_k: True
+  got = rik.pre_skill_witness(
+      ("assemble", "a1", "obj_1", "obj_0"), None, None, assembly,
+      skill_witness=np.zeros(2))
+  assert got is None
+  assert calls == [0.05]
+  assert rik._pin_joints is None and rik._opt_pull is None
+
+  calls.clear()
+  rik._ik_assemble = lambda *_a, **k: (
+      calls.append(k["backoff"]) or True, np.array([0.1, 0.0]))
+  got = rik.pre_skill_witness(
+      ("assemble", "a1", "obj_1", "obj_0"), None, None, assembly,
+      skill_witness=np.zeros(2))
+  np.testing.assert_allclose(got, [0.1, 0.0])
+  assert calls == [0.05]
+
+
 def test_pre_add_grasp_funnel_dispatches_handovers_to_the_same_geometry_solver():
   """A handover differs from add_grasp only after acquisition, so it must not bypass the
   incoming-hand standoff controlled by --pre-add-grasp."""
