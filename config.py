@@ -138,6 +138,7 @@ class RunConfig:
   vacuum_no_assemble: bool = False
   staged_mates: bool = False
   mate_symmetry: bool = False
+  mate_wrench_limits: bool = True
   allow_curved_grasps: bool = False
   dense_grasps: bool = False
 
@@ -190,6 +191,7 @@ class RunConfig:
   grasp_sampler_margin: float = 0.008
   grasp_sampler_pad_support: float = 0.75
   grasp_sampler_wrap: Optional[float] = None
+  grasp_sampler_strict: bool = False
   grasp_sampler_scenes: bool = False
   stable_rest_poses: bool = False
   placement_yaws: int = 1
@@ -207,6 +209,8 @@ class RunConfig:
   ban_actions: Optional[str] = None
   witness_margin: Optional[float] = 0.005
   witness_joint_margin: Optional[float] = None
+  object_over_table: bool = False
+  object_over_table_margin: float = 0.0
   witness_branch_budget: int = 5
   witness_branch_metric: str = "sign"
   witness_reconfig_thresh: float = 1.5707963267948966
@@ -223,6 +227,7 @@ class RunConfig:
   pre_insertion: float = 0.05
   skill_funnel_collision_res: Optional[float] = None
   pre_pick: float = 0.05
+  post_pick: float = 0.05
   pre_place: float = 0.05
   pre_add_grasp: float = 0.05
   post_release: float = 0.05
@@ -362,7 +367,10 @@ class RunConfig:
       # a stronger IK gate merely because today's default changed.
       legacy = {"witness_margin": None, "witness_sets": 0,
                 "pre_pick": 0.0, "pre_place": 0.0, "pre_add_grasp": 0.0,
-                "post_release": 0.0}
+                "post_pick": 0.0, "post_release": 0.0,
+                # Plans before finite internal mate transmission treated every seated mate
+                # as an ideal weld.  Never silently strengthen their replay/search model.
+                "mate_wrench_limits": False}
       d = dict(d)
       # Persistence-only provenance, deliberately not a RunConfig/CLI field.  It certifies
       # the clearance gate that was active DURING SEARCH (as opposed to the historical

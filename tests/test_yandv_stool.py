@@ -28,6 +28,12 @@ def test_yandv_rai_visuals_and_lying_legs():
   assert all(d >= -1e-6 for _a, _b, d in C.getCollisions())
 
 
+def test_yandv_authored_lightweight_masses():
+  asm = P.make_assembly("real-stool", 5)
+  assert asm.masses["obj_0"] == pytest.approx(0.10)
+  assert all(asm.masses[p] == pytest.approx(0.05) for p in asm.objects[1:])
+
+
 def test_yandv_mujoco_uses_exact_visual_meshes_but_box_contacts():
   import mujoco
   import sim as S

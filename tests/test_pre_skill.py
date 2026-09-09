@@ -340,10 +340,18 @@ class _StubIK:
     self.pre_place_delta = self.pre_add_grasp_delta = self.pre_insertion_delta = 0.0
     self.gripper_frame = {r: r + "_tool" for r in self.robots}
     self.solved = 0
+    self.post_solved = 0
 
   def pre_skill_witness(self, *a, **k):
     self.solved += 1
     return np.full(6 * len(self.robots), 0.5)
+
+  def post_pick_witness(self, action, before, after, assembly, q):
+    self.post_solved += 1
+    out = np.asarray(q, dtype=float).copy()
+    robot_index = self.robots.index(action[1])
+    out[6 * robot_index:6 * (robot_index + 1)] += 0.3
+    return out
 
 
 class _State:
@@ -375,6 +383,27 @@ def test_build_tasks_consumes_supplied_keyframes_and_solves_nothing():
                  "01_pre_pick_a2_obj_1_0", "01_pick_a2_obj_1_0", "terminal"]
   assert tasks[0].goal.goal[:6] == pytest.approx(np.full(6, 0.7))   # T_pre, from `pre`
   assert tasks[1].goal.goal[:6] == pytest.approx(np.full(6, 0.1))   # the skill witness
+
+
+def test_pick_gets_a_solved_held_object_departure_after_attachment():
+  """The pick funnel has two geometric scenes around one attachment event.
+
+  PRE uses the empty-hand standoff while the object rests on the table. POST is solved in the
+  attached scene and need not return to that pre-grasp configuration.
+  """
+  pre = {0: np.full(12, 0.7), 1: np.full(12, 0.8)}
+  rik = _StubIK(["a1", "a2"], 0.05)
+  rik.post_pick_delta = 0.05
+  (tasks, seq, step_names), rik = _tasks(pre, ik=rik)
+  assert rik.solved == 0
+  assert seq[:3] == ["00_pre_pick_a1_obj_0_0", "00_pick_a1_obj_0_0",
+                     "00_post_pick_a1_obj_0_0"]
+  assert step_names[0] == seq[:3]
+  assert tasks[0].goal.goal == pytest.approx(np.full(6, 0.7))
+  assert tasks[1].goal.goal == pytest.approx(np.full(6, 0.1))
+  assert tasks[2].goal.goal == pytest.approx(np.full(6, 0.4))
+  assert tasks[2].robots == ["a1"]
+  assert rik.post_solved == 2       # one independently solved departure per pick action
 
 
 def test_build_tasks_keeps_search_exit_out_of_the_physical_task_sequence():

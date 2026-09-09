@@ -255,3 +255,18 @@ def test_topple_error_respects_primitive_rotational_symmetry():
   # The compound seat has no declared rotational symmetry.
   assert S._part_orientation_error(asm, "obj_0", identity, axial_roll) == pytest.approx(
       np.pi / 2)
+
+
+def test_topple_error_respects_enabled_discrete_mate_symmetry():
+  """A concrete symmetry member retained by the mate weld is not a toppled part."""
+  import numpy as np
+
+  import assembly as A
+  import sim as S
+
+  asm = A.make_assembly("real-stool", 5)
+  identity = np.array([1.0, 0.0, 0.0, 0.0])
+  halfturn = np.array([0.0, 0.0, 0.0, 1.0])
+  assert S._part_orientation_error(asm, "obj_1", halfturn, identity) == pytest.approx(np.pi)
+  asm.configure_mate_symmetry(True)
+  assert S._part_orientation_error(asm, "obj_1", halfturn, identity) < 1e-12

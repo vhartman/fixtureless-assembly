@@ -223,6 +223,32 @@ def cap_rigid_weld(point):
   return np.array(G).T, np.full(len(G), np.inf)
 
 
+def cap_mate_box(point, rotation, force, torque):
+  """Finite bilateral mate wrench box expressed in the mate parent's local frame.
+
+  ``force=[Fx,Fy,Fz]`` and ``torque=[Mx,My,Mz]`` are independent component bounds.  The
+  returned columns are the wrench *on the child* about the caller's common reference point;
+  a multi-body equilibrium matrix installs their negatives on the parent.  Component limits
+  keep the model polyhedral and therefore preserve the planner's LP formulation exactly.
+  """
+  R = np.asarray(rotation, dtype=float)
+  fcap = np.asarray(force, dtype=float).ravel()
+  tcap = np.asarray(torque, dtype=float).ravel()
+  if R.shape != (3, 3) or fcap.shape != (3,) or tcap.shape != (3,):
+    raise ValueError("mate box needs rotation [3,3] and force/torque [3]")
+  if (not np.all(np.isfinite(R)) or not np.all(np.isfinite(fcap))
+      or not np.all(np.isfinite(tcap)) or np.any(fcap < 0.0) or np.any(tcap < 0.0)):
+    raise ValueError("mate box values must be finite and non-negative")
+  G, ub = [], []
+  for i in range(3):
+    for s in (+1.0, -1.0):
+      G.append(_force_gen(s * R[:, i], point)); ub.append(float(fcap[i]))
+  for i in range(3):
+    for s in (+1.0, -1.0):
+      G.append(_couple_gen(s * R[:, i])); ub.append(float(tcap[i]))
+  return np.asarray(G, dtype=float).T, np.asarray(ub, dtype=float)
+
+
 def cap_slot(point, press_axis, depth=0.0, F_wall=np.inf):
   # PARTIAL (staged) mate -- a SLOT/pocket. Default (depth=0) is the v1 POINT-CONTACT model:
   # the walls constrain the part LATERALLY (bilateral, both walls), the seat bottom pushes
@@ -590,7 +616,7 @@ _WARM = [0, 0, 0]                                           # [warm/hs solves, s
 
 
 def _hs_model(geo_key, G, ub):
-  # a persistent HiGHS model per geometry: 0 objective, K vars in [0,ub], 6 equality rows Glam=b
+  # a persistent HiGHS model per geometry: 0 objective, K vars in [0,ub], D equality rows Glam=b
   # whose RHS we overwrite per load. Keeping the model alive lets HiGHS DUAL-SIMPLEX WARM-START
   # from the previous load's basis -- an RHS-only change re-solves in ~0.04ms vs ~0.85ms cold.
   m = _HS_MODELS.get(geo_key)
@@ -604,7 +630,7 @@ def _hs_model(geo_key, G, ub):
   empty_i = np.array([], dtype=np.int32)
   h.addCols(K, np.zeros(K), np.zeros(K), upper, 0, empty_i, empty_i, np.array([]))
   idx = np.arange(K, dtype=np.int32)
-  for i in range(6):
+  for i in range(G.shape[0]):
     h.addRow(0.0, 0.0, K, idx, np.ascontiguousarray(G[i, :], dtype=float))
   _HS_MODELS[geo_key] = m = [h, K]
   if len(_HS_MODELS) > _HS_CAP:
@@ -614,7 +640,7 @@ def _hs_model(geo_key, G, ub):
 
 def _hs_feasible(geo_key, G, ub, beq):
   h, _ = _hs_model(geo_key, G, ub)
-  for i in range(6):
+  for i in range(G.shape[0]):
     h.changeRowBounds(i, float(beq[i]), float(beq[i]))
   h.run()
   return h.getModelStatus() == _HS_OPTIMAL                  # 0-objective LP: optimal <=> feasible
@@ -622,13 +648,13 @@ def _hs_feasible(geo_key, G, ub, beq):
 
 def _extract_basis(G, ub, x, tol=1e-7):
   # Turn a HiGHS basic-feasible vertex `x` into a reusable warm basis. A feasibility BFS of a
-  # 6-row system has (generically) exactly 6 variables strictly between their bounds -- the
-  # BASIC columns, an invertible 6x6 -- with the rest pinned at 0 or ub (NONBASIC). We store the
+  # D-row system has (generically) exactly D variables strictly between their bounds -- the
+  # BASIC columns, an invertible DxD -- with the rest pinned at 0 or ub (NONBASIC). We store the
   # basic columns' inverse and the constant wrench the pinned nonbasics contribute, so a later
-  # load w' on the SAME geometry is tested by one 6x6 back-substitution instead of a fresh LP.
+  # load w' on the SAME geometry is tested by one back-substitution instead of a fresh LP.
   ubv = np.where(np.isfinite(ub), ub, np.inf)
   basic = np.where((x > tol) & (x < ubv - tol))[0]
-  if basic.size != 6:
+  if basic.size != G.shape[0]:
     return None                                             # degenerate/non-vertex -> don't warm
   B = G[:, basic]
   try:
@@ -658,7 +684,7 @@ def equilibrium_solution(G, ub, w_external, bounds=None):
 
 
 def equilibrium_feasible_matrices(G, ub, w_external, tol=1e-6, bounds=None, geo_key=None):
-  """The LP feasibility test on the already-assembled generator matrix (G [6xK], ub [K]).
+  """The LP feasibility test on the already-assembled generator matrix (G [DxK], ub [K]).
   The contact-INDEPENDENT parts (G, ub, and the derived `bounds` list) can be built ONCE and
   reused across many external loads -- e.g. the corners of an insertion-uncertainty box --
   so the caller (`_group_stable`/`_grounding_caps`) hoists them out of the per-load loop.

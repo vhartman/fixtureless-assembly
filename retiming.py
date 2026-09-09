@@ -629,7 +629,8 @@ def plan_schedule(stretches, arm_dims, acting, dt,
                   ramp_min=DEFAULT_RAMP_MIN, corner_dv=DEFAULT_CORNER_DV,
                   priority=None, collide=None, dwell=0.0, collide_ds=0.01,
                   settle=0.0, max_steps=None, stall_steps=None, rate_boost=False,
-                  event_durations=None, per_arm_rate=False, stretch_rates=None):
+                  event_durations=None, per_arm_rate=False, stretch_rates=None,
+                  locked=()):
   """PRIORITIZED, EVENT-DRIVEN retiming: arms desync so only the arm(s) ACTING at a
   barrier ramp to rest there; uninvolved arms CROSS the barrier without stopping.
   Events fire in DAG/sequence order, each once its acting arm(s) have arrived at rest
@@ -843,6 +844,28 @@ def plan_schedule(stretches, arm_dims, acting, dt,
   MAX_RESTARTS = 60   # disjoint windows => more, smaller couplings than one merged span
   REWIND = 0.5                                               # couple from this far before wedge
   couplings = {}                                             # frozenset{i,j} -> [a, b]
+  # Attachment-derived intervals are known to require the certified diagonal before a
+  # collision search begins: a payload is not an independently movable obstacle.
+  for row in locked:
+    if len(row) != 4:
+      raise ValueError("locked phase interval must be (arm_i, arm_j, start, end)")
+    i, j, a, b = int(row[0]), int(row[1]), float(row[2]), float(row[3])
+    if not (0 <= i < n and 0 <= j < n):
+      raise ValueError(f"locked phase arm index out of range: {(i, j)} for {n} arms")
+    if i == j:
+      continue
+    a, b = max(0.0, a), min(D, b)
+    if b > a + 1e-9:
+      couplings.setdefault(frozenset((i, j)), []).append([a, b])
+  for G, wins in list(couplings.items()):
+    wins.sort()
+    merged = []
+    for a, b in wins:
+      if merged and a <= merged[-1][1] + 1e-9:
+        merged[-1][1] = max(merged[-1][1], b)
+      else:
+        merged.append([a, b])
+    couplings[G] = merged
   cache = {}                                                 # (mover, cells, fired) -> verdict
 
   def _verdict(res, r):
@@ -935,7 +958,7 @@ def plan_schedule(stretches, arm_dims, acting, dt,
         s_try = list(s)
         for r in comp:
           s_try[r] = g_new
-        if _verdict(collide(assemble(s_try), fired), -1) is None:
+        if collide is None or _verdict(collide(assemble(s_try), fired), -1) is None:
           for r in comp:
             progressed = progressed or g_new > s[r]
             s[r] = g_new

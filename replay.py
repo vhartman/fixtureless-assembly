@@ -146,7 +146,10 @@ def build_scene(cfg):
                       "pad_support": float(_saved(cfg, "grasp_sampler_pad_support")),
                       # None = the legacy support metric; a value switches to the
                       # curvature-fair wrap metric (rebinds ids -> saved with the plan).
-                      "wrap": _saved(cfg, "grasp_sampler_wrap")}
+                      "wrap": _saved(cfg, "grasp_sampler_wrap"),
+                      # Strict quality gating changes which sampled rows exist; restore it
+                      # before recomputing the persisted positional-DB hash.
+                      "strict": bool(_saved(cfg, "grasp_sampler_strict", legacy=False))}
                      if _saved(cfg, "grasp_sampler") else None)  # sampled ids: same hazard class
   set_plain_box(bool(_saved(cfg, "plain_box")))                # cube collision geometry must match
   from problem import set_placement_yaw_prefix, set_placement_yaws, set_stable_rest_poses
@@ -275,6 +278,7 @@ def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=T
     # These funnels now default ON for fresh runs.  A missing key in an old plan means they
     # were OFF; silently adding split tasks would invalidate every saved task id.
     rik.pre_pick_delta = float(_saved(cfg, "pre_pick", legacy=0.0))
+    rik.post_pick_delta = float(_saved(cfg, "post_pick", legacy=0.0))
     rik.pre_place_delta = float(_saved(cfg, "pre_place", legacy=0.0))
     rik.pre_add_grasp_delta = float(_saved(cfg, "pre_add_grasp", legacy=0.0))
     rik.post_release_delta = float(_saved(cfg, "post_release", 0.0))

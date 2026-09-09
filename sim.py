@@ -86,6 +86,7 @@ SEAT_POS_TOL = 0.010            # m   : seated when relative pose within these o
                                 # (= the pre-insertion funnel's CAPTURE tolerance; the datum
                                 # weld then enforces the exact manual pose. Residual carry
                                 # sag of the grasp weld is ~2-3mm after stiffening.)
+SEAT_ANG_TOL = np.deg2rad(2.0)  # rad : relative orientation at a successful mate
 DROP_Z = 0.05                   # m   : below expected by this much => "dropped"
 SLIDE_TOL = 0.015               # m   : xy drift of a NON-actor part during an action => "slid"
 TOPPLE_ANG = np.deg2rad(20.0)   # rad : orientation change of a resting group => "toppled"
@@ -119,6 +120,13 @@ KINK_TAU = 2.0 * WELD_TIMECONST # s   : time the grasp interface takes to absorb
 CAPTURE_RANGE = 0.05            # m   : a part-part mate datum-welds only within this of the
                                 # seat (the funnel mouth); a larger miss = the part never
                                 # arrived -> fail cleanly instead of snapping it in (explodes).
+CAPTURE_ANG_RANGE = np.deg2rad(10.0)  # same anti-snap guard for relative orientation
+INSERT_ALIGN_TOL = 0.0005      # m   : funnel centering required before axial motion
+INSERT_ALIGN_ANG_TOL = np.deg2rad(0.5)
+INSERT_CONTACT_SPEED = 0.020   # m/s : axial rate after intended guide/socket contact
+INSERT_STALL_TIME = 0.12       # s   : commanded insertion without 0.2mm progress => jam
+INSERT_PROGRESS = 0.0002       # m   : progress quantum resetting the stall timer
+INSERT_SKILL_BUDGET = 2.5      # s   : lower bound; funnel reach derives the real budget
 RAMP_DIST = 0.2                 # rad : trapezoid -- ramp to/from ~rest over this much joint
                                 # arc at each per-mode stretch boundary (task goals), so every
                                 # attach event happens quasi-statically. Interim stand-in for
@@ -1974,42 +1982,61 @@ class SimScene:
       self.grasp(parent_frame.split("_", 1)[0], child, gid=_gid,
                  grasp_part=_grasp_part)
 
+  def _active_mate_component(self, part):
+    """Parts rigidly connected to ``part`` by the currently active mate welds.
+
+    A table place may carry an already assembled subassembly.  Contact on any member is
+    contact on the rigid component, even when the motion-plan attach event names only its
+    root.  Derive that component from the live equality state rather than from the final
+    assembly DAG: later mates may not have fired yet and broken finite-strength mates must
+    stop contributing immediately.
+    """
+    component = {part}
+    changed = True
+    while changed:
+      changed = False
+      for child, (eq, parent) in self._mate_eqs.items():
+        if not self.data.eq_active[eq]:
+          continue
+        if child in component and parent not in component:
+          component.add(parent)
+          changed = True
+        elif parent in component and child not in component:
+          component.add(child)
+          changed = True
+    return component
+
   def net_contact_force(self, part):
-    """Net world-frame CONTACT force ON `part` (N). This is the admittance trigger for
+    """Net world-frame CONTACT force ON `part`'s live rigid component (N).
+
+    This is the admittance trigger for
     --skill-servo: it points AWAY from whatever is pressing (the direction to yield), unlike
     the grasp-weld wrench, whose efc rows live in the weld frame. mj_contactForce returns the
     wrench in the CONTACT frame (contact.frame rows are the axes, normal first); MuJoCo's
     convention has the positive normal force acting on geom2, so the sign flips when `part`
     is geom1. NOTE the sign convention was VALIDATED EMPIRICALLY (a flip makes the admittance
-    press harder instead of yielding, which the seeded A/B shows immediately as rising force)."""
-    bid = self._body_id(part)
-    # EXCLUDE partners welded to `part` (active mate/grasp eqs): intra-assembly contact is not
-    # "the environment pressing". Counting it made the admittance yield a holder away from its
-    # OWN subassembly during a two-arm hold -- the controller itself built the 1.28Nm that
-    # broke the grasp (measured, seed 2 online: obj_0~obj_3, mated pair, both holders lost).
-    welded = set()
-    for e in range(int(self.model.neq)):
-      if not self.data.eq_active[e] or self.model.eq_type[e] != mujoco.mjtEq.mjEQ_WELD:
-        continue
-      b1, b2 = int(self.model.eq_obj1id[e]), int(self.model.eq_obj2id[e])
-      if b1 == bid:
-        welded.add(b2)
-      elif b2 == bid:
-        welded.add(b1)
+    press harder instead of yielding, which the seeded A/B shows immediately as rising force).
+
+    Imported parts may themselves contain child collision bodies, and an active mate can make
+    several parts one rigid component.  Looking only at the named root silently missed both
+    cases.  That made ``place(table, root)`` continue descending after an attached leg touched
+    the table, eventually breaking the grasp weld despite the absence of root-body contact.
+    """
+    component = self._active_mate_component(part)
     F = np.zeros(3)
     for i in range(int(self.data.ncon)):
       c = self.data.contact[i]
       b1 = int(self.model.geom_bodyid[c.geom1])
       b2 = int(self.model.geom_bodyid[c.geom2])
-      if bid != b1 and bid != b2:
-        continue
-      other = b2 if b1 == bid else b1
-      if other in welded:
+      p1 = self._part_owner_by_body[b1]
+      p2 = self._part_owner_by_body[b2]
+      in1, in2 = p1 in component, p2 in component
+      if in1 == in2:                                      # internal contact or wholly foreign
         continue
       f6 = np.zeros(6)
       mujoco.mj_contactForce(self.model, self.data, i, f6)
       fw = np.asarray(c.frame, dtype=float).reshape(3, 3).T @ f6[:3]
-      F += fw if b2 == bid else -fw
+      F += fw if in2 else -fw
     return F
 
   def part_pair_contact_force(self, part_a, part_b):
@@ -2377,19 +2404,63 @@ def _part_orientation_error(assembly, part, q1, q2):
   also accounts for its identical end caps.
   """
   kind = assembly.part_shape(part)[0]
-  if kind == "sphere":
-    return 0.0
-  if kind == "cylinder":
-    a1 = _quat_to_R(np.asarray(q1, dtype=float))[:, 2]
-    a2 = _quat_to_R(np.asarray(q2, dtype=float))[:, 2]
-    d = abs(float(np.dot(a1, a2)))
-    return float(np.arccos(np.clip(d, -1.0, 1.0)))
-  return _quat_angle(q1, q2)
+
+  def intrinsic_error(a, b):
+    if kind == "sphere":
+      return 0.0
+    if kind == "cylinder":
+      a1 = _quat_to_R(np.asarray(a, dtype=float))[:, 2]
+      a2 = _quat_to_R(np.asarray(b, dtype=float))[:, 2]
+      d = abs(float(np.dot(a1, a2)))
+      return float(np.arccos(np.clip(d, -1.0, 1.0)))
+    return _quat_angle(a, b)
+
+  # A symbolic mate intentionally quotients out its declared equivalent orientations.  The
+  # simulator restores the concrete member in weld_mate(); the resting judge must use the
+  # same quotient or a half-turned rectangular tenon is falsely reported as "toppled" when
+  # the assembly next touches the table.  Compose in the expected part-local frame.
+  if assembly.relative_pose(part) is not None:
+    return min(intrinsic_error(q1, _quat_mul(np.asarray(q2, dtype=float), sym))
+               for sym in assembly.mate_quaternions(part))
+  return intrinsic_error(q1, q2)
 
 
 def _rel_pos(pose_a, pose_b):
   return _quat_to_R(np.asarray(pose_a[3:])).T @ (np.asarray(pose_b[:3])
                                                  - np.asarray(pose_a[:3]))
+
+
+def _mate_pose_error(parent_pose, child_pose, relative_target, insertion_axis):
+  """Decompose a mate residual in the measured parent's frame.
+
+  ``relative_target`` is the complete child-in-parent transform selected by the witness.
+  Positive ``axial`` means the child still has to advance along the authored insertion axis;
+  ``lateral`` is the orthogonal correction. Servoing and outcome checks share this convention.
+  """
+  parent_pose = np.asarray(parent_pose, dtype=float)
+  child_pose = np.asarray(child_pose, dtype=float)
+  relative_target = np.asarray(relative_target, dtype=float)
+  desired = _pose_compose(parent_pose, relative_target)
+  ep_world = desired[:3] - child_pose[:3]
+  ep_parent = _quat_to_R(parent_pose[3:]).T @ ep_world
+  axis = np.asarray(insertion_axis, dtype=float)
+  n = float(np.linalg.norm(axis))
+  if n < 1e-12:
+    raise ValueError("an insertion controller needs a nonzero authored mate axis")
+  axis = axis / n
+  axial = float(ep_parent @ axis)
+  lateral_vec = ep_parent - axial * axis
+  return {
+      "desired": desired,
+      "world": ep_world,
+      "parent": ep_parent,
+      "axis": axis,
+      "axial": axial,
+      "lateral_vec": lateral_vec,
+      "position": float(np.linalg.norm(ep_parent)),
+      "lateral": float(np.linalg.norm(lateral_vec)),
+      "angle": float(_quat_angle(desired[3:], child_pose[3:])),
+  }
 
 
 def _held_grasp_id(state, part, robot=None):
@@ -2455,6 +2526,8 @@ class _SkillServo:
     # bulldoze freeze could react; a normalized wrench guard uses the same force/torque and
     # caps as the breakage monitor and therefore has an actual safety margin.
     self.torque_guard = None if torque_guard is None else float(torque_guard)
+    self._trace_guard = bool(os.environ.get("SIM_SERVO_TRACE"))
+    self._trace_guard_state = {}
     self.wrench_holds = 0                                  # normalized-wrench-triggered ticks
     # --compliant-follow: WHOLE-BRANCH admittance (arm links + gripper + cargo) with its own
     # LOWER deadband -- compliant following as the default tracking law, not a held-cargo-only
@@ -2476,6 +2549,7 @@ class _SkillServo:
     self.peak = {}                                         # robot -> peak |offset| (diagnostic)
     self.seat_log = []                                     # (task name, before m, after m)
     self.seat_touch = set()                                # contact-terminated mate skills
+    self.seat_outcome = {}                                 # task -> relative-pose skill verdict
     # per-robot (MuJoCo dof addresses, commanded-q indices), from the scene's own joint table
     # so the mapping cannot drift from what drive_q commands.
     self.dofs, self.qidx = {}, {}
@@ -2562,6 +2636,14 @@ class _SkillServo:
           break
         vp = self.kp * ep
         wp = self.kp * er
+        if pair_force >= 0.5 and self.torque_guard is not None and util > self.torque_guard:
+          # Smoothly spend the certified wrench reserve instead of jumping from the transport
+          # yield threshold straight to the hard insertion guard. This is a velocity damper in
+          # normalized wrench space: 100% speed at the soft guard, zero at the 90% hard guard.
+          den = max(guard_fraction - self.torque_guard, 1e-6)
+          wrench_scale = float(np.clip((guard_fraction - util) / den, 0.0, 1.0))
+          vp_parent *= wrench_scale
+          wp *= wrench_scale
         npv, nw = float(np.linalg.norm(vp)), float(np.linalg.norm(wp))
         if npv > self.vmax:
           vp *= self.vmax / npv
@@ -2588,6 +2670,10 @@ class _SkillServo:
     fire-flow window uses it to keep integrating ONLY the flowing arms, so a window spent at
     a contact barrier cannot silently integrate yield offsets on the arms pinned there."""
     self._hot = 0.0
+    # Optional controller diagnostics.  This is deliberately environment-gated so normal
+    # replays remain byte-for-byte unchanged; when enabled it reports the transition into/out
+    # of the force guard together with the *actual* contact context, rather than making a
+    # persistent ``wrench_guard`` recording look like a collision by itself.
     if only is None:
       self._hot_by = {}
     if self.compliant:
@@ -2620,6 +2706,18 @@ class _SkillServo:
           excess = max(excess, (util - 1.0) * self.f0)
           self.wrench_holds += 1
       self._hot_by[r] = hot
+      if self._trace_guard:
+        _on = bool(hot > self.f0)
+        _was = bool(self._trace_guard_state.get(r, False))
+        if _on != _was:
+          _part = None if g is None else g[1]
+          _extra = (self.scene._contact_context(r, _part)
+                    if _part is not None else "  [no active grasp]")
+          print(f"[sim/servo-trace] {r}: guard {'ON' if _on else 'OFF'} "
+                f"hot={hot:.2f}N threshold={self.f0:.2f}N "
+                f"branch={np.linalg.norm(self.scene.branch_contact_force(r)):.2f}N "
+                f"part={_part or '-'}{_extra}", flush=True)
+        self._trace_guard_state[r] = _on
       if hot > self._hot:
         self._hot = hot
       o = self.off.get(r)
@@ -2931,56 +3029,134 @@ class _SkillServo:
         self.scene.net_contact_force(part))), ticks * self.dt))
 
   def seat(self, q_ref, parent, child, name, drive, tick, budget,
-           relative_target=None):
-    """Servo `child` to its ideal datum on `parent` before the mate weld fires.
+           relative_target, insertion_axis, min_steps=0, posture_target=None):
+    """Guarded, parent-relative insertion of ``child`` into ``parent``.
 
-    Nominal execution retains the historical position-only contraction. An observed placement
-    perturbation supplies the saved full relative target and contracts orientation as well, so
-    an initially yawed parent is not snapped back by the weld. Force-guarded: pressing past 4x
-    the admittance threshold stops the approach.
+    This is a small hybrid skill rather than a world-position correction. It first removes
+    lateral and angular error while holding insertion depth, then advances along the authored
+    mate axis. A premature intended-pair contact gets one bounded axial backoff/re-alignment
+    attempt; repeated early contact is a jam, never a successful seat. The desired world pose
+    is recomputed from the measured parent pose every tick, so a supported or actively-held
+    target may move without invalidating the controller reference.
     """
     holder = next((r for r, g in self.scene.active_grasps.items() if g[1] == child), None)
     if holder is None:
       return
-    target_off = np.asarray(self.scene.assembly.relative_pose(child)[1], dtype=float)
-    relative_target = (None if relative_target is None else
-                       np.asarray(relative_target, dtype=float))
+    target_holders = [r for r, g in self.scene.active_grasps.items()
+                      if g[1] == parent and r != holder]
+    controlled = [holder] + target_holders
+    relative_target = np.asarray(relative_target, dtype=float)
+    insertion_axis = np.asarray(insertion_axis, dtype=float)
     q_ref = np.asarray(q_ref, dtype=float).copy()
-    err0 = err = None
+    # Continue from the plant, not from a nominal endpoint which may still be several
+    # millimetres away after actuated tracking and contact. Re-commanding that endpoint before
+    # applying a differential correction creates exactly the plunge the servo is meant to avoid.
+    jn = self.scene._rai_joints
+    for robot in controlled:
+      for j in self.qidx[robot]:
+        q_ref[j] = float(self.scene.data.qpos[self.scene._qadr[jn[j]]])
+
+    err0 = metrics = None
+    phase, status = "align", "budget"
+    retried = False
+    backoff_axial = None
+    contact_free = 0
+    progress_best = None
+    stalled = 0
+    phases = []
     for _ in range(int(budget / self.dt)):
       pp = self.scene.part_pose(parent)
       cp = self.scene.part_pose(child)
-      desired = (_pose_compose(pp, relative_target) if relative_target is not None else
-                 np.r_[pp[:3] + _quat_to_R(pp[3:]) @ target_off, cp[3:]])
-      e = desired[:3] - cp[:3]
-      err = float(np.sqrt(e @ e))
+      metrics = _mate_pose_error(pp, cp, relative_target, insertion_axis)
+      err = metrics["position"]
       if err0 is None:
         err0 = err
-      ang = _quat_angle(desired[3:], cp[3:]) if relative_target is not None else 0.0
-      if err < self.tol and ang < np.deg2rad(2.0):
+      ang = metrics["angle"]
+      pair_force = self.scene.part_pair_contact_force(parent, child)
+      if err < self.tol and ang < SEAT_ANG_TOL and _ >= min_steps:
+        status = "converged"
         break
-      # A mate is a CONTACT skill, not a Cartesian position regulator.  Tight CAD often
-      # touches a fraction of a millimetre before its nominal datum because the planning and
-      # MuJoCo collision backends have finite tolerances.  Continuing to integrate toward the
-      # datum then bulldozes the table-supported parent (duct: 33N and 16mm of base slide).
-      # Once the *intended pair* is physically loaded inside the already-existing capture
-      # neighbourhood, stop the servo and let the datum weld complete the constrained mate.
-      # Unrelated collisions do not trigger this, and a distant accidental touch cannot turn
-      # into an attach.
-      if (err <= CAPTURE_RANGE and
-          self.scene.part_pair_contact_force(parent, child) >= 0.5):
+      # Contact is a valid terminal only inside the real seat tolerance. CAPTURE_RANGE is a
+      # numerical anti-explosion range for the later weld, not an insertion acceptance region.
+      if (pair_force >= 0.5 and err <= SEAT_POS_TOL and ang <= SEAT_ANG_TOL
+          and _ >= min_steps):
         self.seat_touch.add(name)
+        status = "seated_contact"
         break
-      F = self.scene.net_contact_force(child)
-      if float(np.sqrt(F @ F)) > 4.0 * self.f0:
-        break                                              # guarded: do not bulldoze the seat
-      vp = self.kp * e
-      npv = float(np.linalg.norm(vp))
-      if npv > self.vmax:
-        vp *= self.vmax / npv
-      if relative_target is None:
-        J, step = self._jac(holder, child), vp * self.dt
+
+      # Guide/socket contact before full depth is normal. Slow the axial motion and call it a
+      # jam only if commanded insertion makes no measurable axial progress, or if the measured
+      # grasp wrench reaches the configured safety guard. This distinguishes useful wall
+      # contact from a blocked insertion without recognizing scene-specific collision pairs.
+      if phase == "insert" and pair_force >= 0.5:
+        remaining = abs(metrics["axial"])
+        if progress_best is None or progress_best - remaining >= INSERT_PROGRESS:
+          progress_best, stalled = remaining, 0
+        else:
+          stalled += 1
       else:
+        progress_best, stalled = None, 0
+      jammed = stalled * self.dt >= INSERT_STALL_TIME
+
+      F = self.scene.net_contact_force(child)
+      # Net part force is a useful bulldoze guard before intended contact. During an actual
+      # insertion, judge the same normalized grasp wrench used by the break monitor; a large
+      # but well-supported axial guide reaction is not itself a failure.
+      util = 0.0
+      if pair_force >= 0.5:
+        # A cooperative mate is limited by EITHER side of the support chain. Looking only at
+        # the incoming grasp missed failures at the target holder (real-stool: base grasp hit
+        # T_axis while the leg grasp remained comfortable). Use the exact same normalized
+        # weld quantities/caps as the break monitor for every grasp directly supporting the
+        # two bodies; the first side to approach breakaway triggers the bounded retreat.
+        for _g in self.scene.active_grasps.values():
+          if _g[1] not in (parent, child):
+            continue
+          fmag, tmag = self.scene._weld_wrench(_g[0])
+          util = max(util,
+                     fmag / max(float(_g[2]), 1e-9),
+                     tmag / max(float(_g[3]), 1e-9))
+      guard_fraction = self.torque_guard if self.torque_guard is not None else 0.8
+      overloaded = ((pair_force < 0.5 and float(np.sqrt(F @ F)) > 4.0 * self.f0)
+                    or (pair_force >= 0.5 and util > guard_fraction))
+      if (jammed or overloaded) and phase != "backoff":
+        if retried:
+          status = "stalled" if jammed else "wrench_guard"
+          break
+        retried = True
+        phase = "backoff"
+        backoff_axial = metrics["axial"]
+        contact_free = 0
+        progress_best, stalled = None, 0
+
+      if phase == "backoff":
+        # Measure retreat in the moving parent's frame. A holder may compliantly yield during
+        # this skill; a world-fixed origin would mistake parent motion for child retreat.
+        retreated = metrics["axial"] - backoff_axial
+        contact_free = contact_free + 1 if pair_force < 0.2 else 0
+        if retreated >= 0.003 and contact_free * self.dt >= 0.02:
+          phase = "align"
+          continue
+        # Clear a breakaway-scale contact within its 20ms sustain window. The former 0.3x
+        # retreat could move only 0.36mm in that window and allowed a shallow guide touch to
+        # tear out the target holder before the controller had physically unloaded it.
+        vp_parent = -self.vmax * metrics["axis"]
+        wp = np.zeros(3)                                  # do not rotate while scraping free
+      else:
+        if (phase == "align" and metrics["lateral"] <= INSERT_ALIGN_TOL
+            and ang <= INSERT_ALIGN_ANG_TOL):
+          phase = "insert"
+        # In ALIGN, project out the insertion-axis component: correct the funnel mouth without
+        # advancing into it. In INSERT, regulate the complete residual, with the same lateral
+        # and angular feedback continuously active.
+        vp_parent = self.kp * (metrics["lateral_vec"] if phase == "align"
+                               else metrics["parent"])
+        if phase == "insert" and pair_force >= 0.5:
+          axial_speed = float(vp_parent @ metrics["axis"])
+          contact_speed = INSERT_CONTACT_SPEED * (0.5 if retried else 1.0)
+          if axial_speed > contact_speed:
+            vp_parent += (contact_speed - axial_speed) * metrics["axis"]
+        desired = metrics["desired"]
         qe = _quat_mul(desired[3:], _quat_conj(cp[3:]))
         if qe[0] < 0.0:
           qe = -qe
@@ -2988,16 +3164,51 @@ class _SkillServo:
         er = (np.zeros(3) if nv < 1e-12 else
               qe[1:] * (2.0 * np.arctan2(nv, max(float(qe[0]), 0.0)) / nv))
         wp = self.kp * er
-        nw = float(np.linalg.norm(wp))
-        if nw > 0.75:
-          wp *= 0.75 / nw
-        J, step = self._part_pose_jac(holder, child), np.r_[vp, wp] * self.dt
-      dq = np.linalg.lstsq(J, step, rcond=None)[0]
-      q_ref[self.qidx[holder]] += np.clip(dq, -0.02, 0.02)
+      phases.append(phase)
+
+      vp = _quat_to_R(pp[3:]) @ vp_parent
+      npv = float(np.linalg.norm(vp))
+      if npv > self.vmax:
+        vp *= self.vmax / npv
+      nw = float(np.linalg.norm(wp))
+      if nw > 0.75:
+        wp *= 0.75 / nw
+      J_blocks = [self._part_pose_jac(holder, child)]
+      q_blocks = [np.asarray(self.qidx[holder], dtype=int)]
+      for target_holder in target_holders:
+        J_blocks.append(-self._part_pose_jac(target_holder, parent))
+        q_blocks.append(np.asarray(self.qidx[target_holder], dtype=int))
+      J = np.hstack(J_blocks)
+      q_control = np.concatenate(q_blocks)
+      step = np.r_[vp, wp] * self.dt
+      Jpinv = np.linalg.pinv(J, rcond=1e-5)
+      dq = Jpinv @ step
+      if posture_target is not None and phase != "backoff":
+        # The relative task leaves six global/redundant directions unconstrained when both
+        # sides are held. Select the persisted assembly witness in that nullspace; it is a
+        # known feasible posture, while N makes the bias first-order invisible to the mate.
+        q_goal = np.asarray(posture_target, dtype=float)[q_control]
+        q_now = q_ref[q_control]
+        qerr = q_goal - q_now
+        for k, qi in enumerate(q_control):
+          if self.scene._rai_hinge[int(qi)]:
+            qerr[k] = (qerr[k] + np.pi) % (2.0 * np.pi) - np.pi
+        null = np.eye(len(q_control)) - Jpinv @ J
+        dq += null @ (1.0 * qerr * self.dt)
+      q_ref[q_control] += np.clip(dq, -0.02, 0.02)
       drive(q_ref)
       tick()
     if err0 is not None:
-      self.seat_log.append((name, err0, err))
+      # Re-evaluate after the last driven tick so outcome reporting is not one sample stale.
+      metrics = _mate_pose_error(self.scene.part_pose(parent), self.scene.part_pose(child),
+                                 relative_target, insertion_axis)
+      self.seat_log.append((name, err0, metrics["position"]))
+      self.seat_outcome[name] = {
+          "status": status, "position": metrics["position"],
+          "lateral": metrics["lateral"], "axial": metrics["axial"],
+          "angle": metrics["angle"], "retried": retried,
+          "phases": tuple(dict.fromkeys(phases)),
+      }
 
 
 def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kinds=None,
@@ -3034,6 +3245,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         process_noise_mode="nominal", process_noise_corner=0,
                         process_noise_seed=0, process_engagement_distance=0.01,
                         process_wrench_ramp=0.05,
+                        pre_insertion=0.05,
                         skill_servo=False, servo_force=6.0, servo_max_dev=0.010,
                         servo_tol=0.002, servo_torque_guard=None,
                         servo_place_seat=False, compliant_follow=False,
@@ -3270,7 +3482,15 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         (its * DT, _err0, scene.tracking_error(q, owned), _touch, _errs,
          list(owned) if owned is not None else None, _jerrs, _plateau, _mate_touch))
 
-  def seat_before_fire(tid, q_ref, flow_drive=None, flow_tick=None):
+  def mate_relative_target(parent, child):
+    """Concrete symmetric mate member nearest the executed configuration."""
+    pp, cp = scene.part_pose(parent), scene.part_pose(child)
+    cur_rel = _pose_compose(_pose_invert(pp), cp)
+    rq = np.asarray(assembly.closest_mate_quaternion(child, cur_rel[3:]), dtype=float)
+    return np.r_[np.asarray(assembly.relative_pose(child)[1], dtype=float), rq]
+
+  def seat_before_fire(tid, q_ref, flow_drive=None, flow_tick=None, min_steps=0,
+                       posture_target=None):
     """--skill-servo: contract the seat error toward the mate datum BEFORE the weld fires,
     so attach()'s ideal-datum snap starts from millimetres instead of the tracking residual.
 
@@ -3303,17 +3523,20 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       return
     if fr[0] not in assembly.objects:
       return                                               # grasps/releases: no datum to seat
-    _relative_target = None
-    if (_object_perturb_active and object_perturb_observation == "observed"):
-      _l = name_of.get(t.name)
-      if _l is not None:
-        _nom = _state_part_poses(states[min(_l[0] + 1, len(states) - 1)], assembly,
-                                 lift=CARRY_LIFT)
-        _relative_target = _pose_compose(
-            _pose_invert(np.asarray(_nom[fr[0]], dtype=float)),
-            np.asarray(_nom[fr[1]], dtype=float))
-    servo.seat(q_ref, fr[0], fr[1], t.name, _drv, _tck, settle_max,
-               relative_target=_relative_target)
+    # The symbolic assembly stores a position plus a finite set of truly equivalent relative
+    # orientations. Recover the member closest to the *executed* witness rather than defaulting
+    # to identity; the state intentionally carries no symmetry label. This target remains
+    # relative to the measured parent, so observed placement error does not become inherited
+    # error in the next mate.
+    _relative_target = mate_relative_target(fr[0], fr[1])
+    servo.seat(q_ref, fr[0], fr[1], t.name, _drv, _tck,
+               max(settle_max, INSERT_SKILL_BUDGET,
+                   2.0 * max(float(pre_insertion), CAPTURE_RANGE) /
+                   INSERT_CONTACT_SPEED + 1.0,
+                   min_steps * DT + INSERT_SKILL_BUDGET),
+               relative_target=_relative_target,
+               insertion_axis=np.asarray(assembly.mate_axis(fr[1]), dtype=float),
+               min_steps=min_steps, posture_target=posture_target)
     _hook_log["seat"].append(_cnt[0] * DT)
 
   def _touch_robots(tids):
@@ -3358,6 +3581,10 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     if not fr or len(fr) < 2 or fr[1] not in assembly.objects:
       return None
     return fr[1]
+
+  _planned_post_pick = {
+      int(t.name.split("_", 1)[0]) for t in problem.tasks
+      if "_post_pick_" in (getattr(t, "name", "") or "")}
 
   _pick_capture = {}
   _object_perturb_active = bool(object_perturbation and
@@ -3417,6 +3644,12 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     `flow_tick`: FIRE-FLOW pair, as in seat_before_fire."""
     if servo is None or not servo.pick_ok:
       return
+    _label = name_of.get(problem.tasks[tid].name)
+    if _label is not None and _label[0] in _planned_post_pick:
+      # The exported mode chain owns this retreat and collision-checks it with the payload
+      # attached. Injecting a second execution-only lift here would put the plant ahead of the
+      # saved segment, after which its early samples pull the arm back toward contact.
+      return
     part = _pick_task(tid)
     if part is None:
       return
@@ -3442,7 +3675,13 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             f"(no held-part contact above {servo.f0:g}N).")
     for nm, e0, e1 in servo.seat_log:
       why = " (contact-terminated)" if nm in servo.seat_touch else ""
-      print(f"[sim/mp] --skill-servo seat {nm}: {e0*1000:.1f}mm -> {e1*1000:.1f}mm{why}")
+      out = servo.seat_outcome.get(nm, {})
+      detail = (f", lateral {out.get('lateral', float('nan'))*1000:.1f}mm, "
+                f"angle {np.rad2deg(out.get('angle', float('nan'))):.1f}deg, "
+                f"{out.get('status', 'unknown')}"
+                + (", retry" if out.get("retried") else ""))
+      print(f"[sim/mp] --skill-servo seat {nm}: {e0*1000:.1f}mm -> "
+            f"{e1*1000:.1f}mm{detail}{why}")
     if _hook_log.get("settle"):
       _n = len(_hook_log["settle"])
       _ms = [s[0] for s in _hook_log["settle"]]
@@ -3592,8 +3831,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       servo.pick_ok = bool(servo_pick)
       if servo_pick:
         print("[sim/mp] --servo-pick ACTIVE: pick/handover acquisition settles terminate on "
-              "touch; after each pick fire the arm RISES until the fresh cargo is contact-"
-              "free instead of tracking through the pressing grasp keyframe.")
+              "touch; exported post-pick tasks own the collision-checked held-object retreat "
+              "(legacy paths retain the execution-only contact-free rise).")
       if compliant_follow:
         print(f"[sim/mp] --compliant-follow ACTIVE: whole-branch admittance -- arm links, "
               f"bare gripper AND cargo forces all yield the reference above "
@@ -3687,24 +3926,27 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     if animate_grippers and _incoming is not None:
       _command_gripper_targets({_incoming: _closing_aperture(_incoming, child)})
     # seat check BEFORE the datum weld (part-part attach only) -- report a genuine miss.
-    seat_miss = None
+    seat_miss = seat_angle = None
     if parent in assembly.objects:
-      got = _rel_pos(scene.part_pose(parent), scene.part_pose(child))
-      err = float(np.linalg.norm(got - np.asarray(assembly.relative_pose(child)[1])))
-      if err > SEAT_POS_TOL:
-        seat_miss = err
+      _sm = _mate_pose_error(scene.part_pose(parent), scene.part_pose(child),
+                             mate_relative_target(parent, child),
+                             assembly.mate_axis(child))
+      if _sm["position"] > SEAT_POS_TOL or _sm["angle"] > SEAT_ANG_TOL:
+        seat_miss, seat_angle = _sm["position"], _sm["angle"]
     # only DATUM-WELD when the part is within CAPTURE range -- snapping a far part in would
     # fire a huge constraint impulse (measured 4000N) and explode the scene. But the KINEMATIC
     # side of the attach must ALWAYS be replayed: after this transition the path assumes the
     # gripper is free (mr_bench re-parents the part), so the grasp weld must go even on a
     # missed seat -- keeping it made the arm keep holding through the "assemble" and shove the
     # target around (user-reported: 'not releasing when the assembly should happen').
-    if seat_miss is not None and seat_miss > CAPTURE_RANGE:
+    if (seat_miss is not None and
+        (seat_miss > CAPTURE_RANGE or seat_angle > CAPTURE_ANG_RANGE)):
       scene._detach(child)                                 # gripper lets go; no datum snap
       # ALWAYS loud (user ask): a skipped datum weld must be unmistakable, not a trace line.
       print(f"[sim] !!! {t.name}: {child} MISSED its seat on {parent} by "
-            f"{seat_miss*1000:.0f}mm (> {CAPTURE_RANGE*1000:.0f}mm capture range) -- mate NOT "
-            f"welded, gripper released; expect downstream failures.")
+            f"{seat_miss*1000:.0f}mm/{np.rad2deg(seat_angle):.1f}deg (capture limits "
+            f"{CAPTURE_RANGE*1000:.0f}mm/{np.rad2deg(CAPTURE_ANG_RANGE):.1f}deg) -- mate NOT "
+            "welded, gripper released; expect downstream failures.")
     else:
       scene.attach(parent, child)
     # Transfers close the receiver before the weld changes hands, then open every giver.
@@ -3733,11 +3975,24 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           if parent != "table" else None)
       d = float(np.linalg.norm(pp - pj)) * 1000 if pj is not None else -1
       print(f"  [fire] task{task_id} {t.name} attach[{parent}<-{child}] "
-            f"child-to-parent={d:.0f}mm seat_miss={seat_miss}")
+            f"child-to-parent={d:.0f}mm seat_miss={seat_miss} seat_angle={seat_angle}")
+      if phase_schedule and getattr(traj, "progress", None) is not None:
+        _ii = min(max(int(scene.trace_ctx if scene.trace_ctx is not None else 0), 0),
+                  len(traj.progress) - 1)
+        print("    [phase] " + ", ".join(
+            f"{rn}@{float(traj.progress[_ii, ri]):.2f}" for ri, rn in enumerate(robots)))
     if rec is not None:
       rec["marks"].append((len(rec["qpos"]), repr(act)))
+    # Inside CAPTURE_RANGE we install the datum weld so execution can continue without a
+    # destructive snap.  That does not make an early contact a successful insertion:
+    # ``seat_miss`` is only set when the physical relative-pose error exceeds
+    # SEAT_POS_TOL, and must remain a loud failure even if the kinematic chain is repaired.
     if seat_miss is not None:
-      report.results.append(ActionResult(act, False, "not_seated", f"{seat_miss*1000:.1f}mm"))
+      _out = servo.seat_outcome.get(t.name, {}) if servo is not None else {}
+      _why = _out.get("status", "pose_residual")
+      report.results.append(ActionResult(
+          act, False, "not_seated",
+          f"{seat_miss*1000:.1f}mm/{np.rad2deg(seat_angle):.1f}deg ({_why})"))
     elif lbl:
       report.results.append(_judge_resting(scene, assembly, act, states[lbl[0] + 1]))
 
@@ -4409,6 +4664,37 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         _ls = sorted({(i, j, round(a, 2), round(b, 2)) for i, j, a, b in _locked})
         print(f"[sim/mp] rigid-coupling lock spans ({len(_ls)}): " +
               ", ".join(f"arm{i}-arm{j}[{a},{b}]" for i, j, a, b in _ls))
+      _payload_locks = []
+      if phase_schedule:
+        # The MP certifies the diagonal composite path under the current attachment state.
+        # During any stretch with a carried group, that holder and another arm moving through
+        # the *same symbolic state* must therefore share the diagonal.  Letting the holder
+        # arrive first manufactures a payload configuration which is neither a keyframe nor a
+        # point on the certified MP path (real-stool: base holder met a loose leg and broke its
+        # grasp).  Empty arms and stationary arms retain independent phase everywhere else.
+        for k, st_idx in enumerate(_stretch_plan):
+          if st_idx is None:
+            continue
+          _state = (states[st_idx] if _stretch_direct[k]
+                    else states[min(st_idx + 1, len(states) - 1)])
+          _holders = {robot_index[c[1]] for p in assembly.objects
+                      for c in _state.supports.get(p, ())
+                      if c[0] == "grasp" and c[1] in robot_index}
+          if not _holders:
+            continue
+          _qa, _qb = _P[_bi[k - 1] if k else 0], _P[_bi[k]]
+          _movers = {r for r, idx in enumerate(arm_dims)
+                     if float(np.linalg.norm(_qb[np.asarray(idx, int)]
+                                             - _qa[np.asarray(idx, int)])) > 1e-8}
+          _a0 = _bar[k - 1] if k else 0.0
+          for _h in _holders:
+            for _m in _movers - {_h}:
+              _payload_locks.append((min(_h, _m), max(_h, _m), _a0, _bar[k]))
+        if _payload_locks:
+          _pl = sorted({(i, j, round(a, 2), round(b, 2))
+                        for i, j, a, b in _payload_locks})
+          print(f"[sim/mp] phase payload locks ({len(_pl)}): " +
+                ", ".join(f"arm{i}-arm{j}[{a},{b}]" for i, j, a, b in _pl))
       _vmax = _amax = None
       if force_limits:
         # ---- WRENCH-LIMITED MOTION -------------------------------------------------------
@@ -4901,7 +5187,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                 # Effectively zero cells: candidates are exact; cache only identical states
                 # revisited by a CEGAR restart.
                 collide_ds=1e-9, dwell=dwell, event_durations=_event_budget,
-                per_arm_rate=True, stretch_rates=_stretch_rates)
+                per_arm_rate=True, stretch_rates=_stretch_rates,
+                locked=list(_locked) + list(_payload_locks))
           except RuntimeError as _e:
             _fallback_reason = f"{_pdt:g}s planning grid: {_e}"
             print(f"[sim/mp] --phase-schedule {_pdt:g}s search failed after "
@@ -5716,36 +6003,46 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       return j, tid, fr[1], np.asarray(exp, dtype=float)
 
     def _pending_mate(i):
-      """Return a nearby lone mate fire when its intended interface has seated by contact.
+      """Return the mate following the explicit pre-insertion barrier.
 
-      The joint-space endpoint is an ideal datum, but the physical skill terminates at
-      contact.  Consuming the remaining samples after a fitted CAD interface has touched can
-      only command penetration.  As for the place shortcut, never jump over another arm's
-      motion; that keeps this a local execution skill rather than an implicit rescheduler.
+      The motion planner owns the free-space path all the way to the certified funnel mouth;
+      the relative-pose controller owns only mouth-to-seat. The earlier proximity handoff could
+      trigger up to one extra funnel length before that barrier, making the replay appear to
+      skip its pre-insertion waypoint. As for the place shortcut, never jump over another arm's
+      motion; that keeps this local rather than an implicit rescheduler.
       """
       if servo is None:
         return None
-      j = next((sm for sm in _fire_samples if sm >= i), None)
-      if j is None or j == i or len(fire_at[j]) != 1:
+      here = fire_at.get(i, ())
+      if (len(here) != 1
+          or "_pre_assemble" not in (getattr(problem.tasks[here[0]], "name", "") or "")):
         return None
-      tid = fire_at[j][0]
-      fr = getattr(problem.tasks[tid], "frames", None)
-      if not fr or len(fr) < 2 or fr[0] not in assembly.objects or fr[1] not in assembly.objects:
+      # A split funnel can contain one or more frame-less GOTO barriers before its physical
+      # mate event (post-pick, pre-insertion, or a coupled rendezvous). They do not alter the
+      # attachment mode. Look through exactly those barriers, but never cross another framed
+      # side effect: this identifies the next *physical* operation without guessing from the
+      # high-level action name.
+      j = tid = fr = None
+      for _sm in _fire_samples:
+        if _sm < i:
+          continue
+        if len(fire_at[_sm]) != 1:
+          return None
+        _tid = fire_at[_sm][0]
+        _fr = getattr(problem.tasks[_tid], "frames", None)
+        if not _fr:
+          continue
+        if (len(_fr) >= 2 and _fr[0] in assembly.objects
+            and _fr[1] in assembly.objects):
+          j, tid, fr = _sm, _tid, _fr
+        break
+      if j is None or j == i:
         return None
       parent, child = fr[0], fr[1]
       holder = next((r for r, g in scene.active_grasps.items() if g[1] == child), None)
       if holder is None:
         return None
-      got = _rel_pos(scene.part_pose(parent), scene.part_pose(child))
-      miss = float(np.linalg.norm(
-          got - np.asarray(assembly.relative_pose(child)[1], dtype=float)))
-      if miss > SEAT_POS_TOL or scene.part_pair_contact_force(parent, child) < 0.5:
-        return None
-      hold_dims = set(int(x) for x in arm_dims[robots.index(holder)])
-      others = [k for k in range(traj.q[i].shape[0]) if k not in hold_dims]
-      if others and float(np.max(np.abs(traj.q[j][others] - traj.q[i][others]))) > 1e-3:
-        return None
-      return j, tid, parent, child, miss
+      return j, tid, parent, child, holder
 
     i, _NQ = 0, len(traj.q)
     while i < _NQ:
@@ -5775,6 +6072,21 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           qc = servo.adjust(traj.q[i])
           _fmin = float(np.min(servo.rate_factors(robots)))
           _reps += 1
+        # A pressed cargo whose next event is its own table PLACE is already at the
+        # physically meaningful terminal condition.  Enter the contact skill immediately;
+        # waiting through the generic guard budget first produced the visible one-second
+        # stall before the same place-seat fallback.  This is deliberately restricted to a
+        # lone table place by _pending_place, so no other arm is skipped and no non-place
+        # collision is converted into a successful action.
+        _pp = _pending_place(i)
+        if _pp is not None:
+          _j, _tid, _part, _exp = _pp
+          servo.place_seat(qc, _part, _exp, problem.tasks[_tid].name, drive_q,
+                           lambda: scene.step(1, report, ("servo",)), settle_max)
+          fire(_tid)
+          _process_after(_j)
+          i = _j + 1
+          continue
         # GUARDED HOLD: while a held part is PRESSED the schedule stops advancing and the
         # admittance yields in place. Budget-capped so a hard jam cannot hang the run.
         held = 0
@@ -5804,9 +6116,68 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       scene.step(1, report, (traj.phase[i],))
       _pm = _pending_mate(i)
       if _pm is not None:
-        _j, _tid, _parent, _child, _miss = _pm
-        print(f"[sim/mp] contact-complete mate {_child}->{_parent} "
-              f"{_miss*1000:.1f}mm from datum; skipping {_j-i} penetration-command sample(s)")
+        _j, _tid, _parent, _child, _holder = _pm
+        if phase_schedule:
+          # A phase schedule may let unrelated arms cross a barrier, but a pre-assemble
+          # marker itself must still carry its task arms' exact certified mouth.  Report this
+          # separately from plant tracking: it distinguishes a scheduler-reference violation
+          # from an actuated/dynamic departure before the seat controller starts.
+          _pre_goal = getattr(problem.tasks[fire_at[i][0]], "goals", None)
+          if _pre_goal:
+            _qmouth = np.asarray(_pre_goal[0], dtype=float).reshape(-1)
+            _mouth_err = {}
+            for _rn in problem.tasks[_tid].robots:
+              if _rn in robots:
+                _dd = arm_dims[robots.index(_rn)]
+                _mouth_err[_rn] = float(np.max(np.abs(traj.q[i][_dd] - _qmouth[_dd])))
+            print("[sim/mp] phase funnel-reference error: " + ", ".join(
+                f"{_rn} {v * 1000:.2f}mrad" for _rn, v in sorted(_mouth_err.items())))
+        # This is a real mode barrier even though it has no attachment side effect. Settle
+        # its actors onto the certified mouth before transferring control; otherwise the
+        # controller would inherit whatever actuated tracking lag happened to remain on the
+        # first tick at this sample and “explicit pre-insertion” would only be true on paper.
+        _owned_pre = ([robots[r] for r in sorted(acting_for(fire_at[i]))]
+                      if phase_schedule else None)
+        settle_before_fire(traj.q[i], _touch_robots(fire_at[i]),
+                           _touch_mates(fire_at[i]), owned=_owned_pre)
+        if servo is not None:
+          servo.update()
+          qc = servo.adjust(traj.q[i])
+        else:
+          qc = traj.q[i]
+        _metrics = _mate_pose_error(scene.part_pose(_parent), scene.part_pose(_child),
+                                    mate_relative_target(_parent, _child),
+                                    assembly.mate_axis(_child))
+        _miss, _ang = _metrics["position"], _metrics["angle"]
+        print(f"[sim/mp] insertion handoff {_child}->{_parent} at certified funnel mouth: "
+              f"{_miss*1000:.1f}mm/{np.rad2deg(_ang):.1f}deg from datum; relative-pose "
+              f"controller owns the remaining {_j-i} reference sample(s)")
+        # Complete the frame-less pre-insertion task before skipping its nominal seating edge.
+        # It has no attachment side effect, but firing it keeps reports/task accounting exact.
+        for _pre_tid in fire_at[i]:
+          fire(_pre_tid)
+        _set_process_for([_tid])
+        # Park every mate participant while the incoming holder contracts the relative pose;
+        # unrelated robots may continue along the certified phase schedule. The held target
+        # is a support during this atomic insertion skill, not an independent moving goal.
+        _owned_robots = set(problem.tasks[_tid].robots)
+        _owned_dims = np.asarray(sorted({int(k) for r in _owned_robots
+                                         for k in arm_dims[robots.index(r)]}), dtype=int)
+        _free_dims = np.asarray([k for k in range(traj.q[i].shape[0])
+                                 if k not in set(_owned_dims)], dtype=int)
+        _flow_i = [i]
+        def _mate_flow_drive(_q_holder):
+          _k = min(_flow_i[0] + 1, _j)
+          _q_mix = np.asarray(traj.q[_k], dtype=float).copy()
+          _q_mix[_owned_dims] = np.asarray(_q_holder, dtype=float)[_owned_dims]
+          drive_q(_q_mix)
+        def _mate_flow_tick():
+          scene.step(1, report, ("servo",))
+          _flow_i[0] = min(_flow_i[0] + 1, _j)
+        seat_before_fire(_tid, qc, flow_drive=_mate_flow_drive,
+                         flow_tick=_mate_flow_tick,
+                         min_steps=(_j - i if len(_free_dims) else 0),
+                         posture_target=traj.q[_j])
         fire(_tid)
         _process_after(_j)
         i = _j + 1
@@ -6030,6 +6401,10 @@ _STANDARD_SIM_PROFILE = {
     "servo_max_dev": 0.010,
     "servo_torque_guard": 0.6,
     "servo_tol": 0.002,
+    # A table PLACE is a physical contact event, not a CAD-coordinate tracking target.  The
+    # skill terminates on sustained support and prevents the force guard from repeatedly
+    # holding a carried part against the planner's slightly lower table datum.
+    "servo_place_seat": True,
     # Wrench-aware rate tables remain a physical backstop even though phase scheduling uses
     # the visual cruise directly. Corner impulses are part of that contract.
     "force_limits": True,
@@ -6133,7 +6508,8 @@ def _cli_run(a):
   if getattr(a, "sim_profile", None):
     print("[profile] sim 'standard' resolved: saved real-arm path, actuated skill servo, "
           "collision-audited phase schedule + smoothing/batching, strict preflight, and "
-          "0.6 normalized wrench guard. Explicit individual flags remain authoritative.")
+          "0.6 normalized wrench guard + contact-terminated table places. "
+          "Explicit individual flags remain authoritative.")
   if a.require_mp_path and not a.mp_path:
     raise SystemExit(
         "[sim] --require-mp-path: this reproduction profile will not run a fresh stochastic "
@@ -6291,6 +6667,7 @@ def _cli_run(a):
   # against, and the path indexes tasks by integer id (the signature guard below catches it,
   # but only if we even try). pre_insertion alone was restored here.
   rik.pre_pick_delta = float(_saved(cfg, "pre_pick", legacy=0.0))
+  rik.post_pick_delta = float(_saved(cfg, "post_pick", legacy=0.0))
   rik.pre_place_delta = float(_saved(cfg, "pre_place", legacy=0.0))
   rik.pre_add_grasp_delta = float(_saved(cfg, "pre_add_grasp", legacy=0.0))
   rik.post_release_delta = float(_saved(cfg, "post_release", 0.0))
@@ -6357,6 +6734,7 @@ def _cli_run(a):
       _es = _final_export["settings"]
       rik.pre_insertion_delta = float(_es.get("pre_insertion", rik.pre_insertion_delta))
       rik.pre_pick_delta = float(_es.get("pre_pick", rik.pre_pick_delta))
+      rik.post_pick_delta = float(_es.get("post_pick", rik.post_pick_delta))
       rik.pre_place_delta = float(_es.get("pre_place", rik.pre_place_delta))
       rik.pre_add_grasp_delta = float(
           _es.get("pre_add_grasp", rik.pre_add_grasp_delta))
@@ -6574,6 +6952,7 @@ def _cli_run(a):
                             process_noise_seed=a.process_noise_seed,
                             process_engagement_distance=a.process_engagement_distance,
                             process_wrench_ramp=a.process_wrench_ramp,
+                            pre_insertion=float(_saved(cfg, "pre_insertion", legacy=0.05)),
                             animate_grippers=a.animate_grippers,
                             gripper_motion_time=a.gripper_motion_time)
   print(rep.summary())

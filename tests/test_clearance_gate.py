@@ -6,6 +6,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import solver as S
+import robotic as ry
 
 
 class _Frame:
@@ -134,6 +135,61 @@ def test_free_pose_handover_payload_must_clear_the_table():
   # Pick/place table contact is intentional and must not inherit the transport buffer.
   rik._cur_action = ("pick", "a2", "obj_0", 3)
   assert rik._clearance_pair_reason(C, "obj_0__shape", "table") is None
+
+
+def _workcell_scene(x=0.0, y=0.0):
+  C = ry.Config()
+  C.addFrame("table").setShape(ry.ST.box, [1.0, 0.6, 0.05]).setPosition([0, 0, 0])
+  hand = C.addFrame("gripper").setPosition([x, y, 0.2])
+  C.addFrame("obj_0").setParent(hand).setRelativePosition([0, 0, 0])
+  C.addFrame("obj_1").setPosition([10.0, 10.0, 0.2])       # unheld: deliberately ignored
+  return C
+
+
+def test_object_over_table_uses_local_table_footprint_and_only_held_parts():
+  rik = object.__new__(S.RobotIK)
+  rik.object_over_table = True
+  rik.object_over_table_margin = 0.05
+  rik.gripper_frame = {"a1": "gripper"}
+  rik.object_frames = ("obj_0", "obj_1")
+  assert rik._object_over_table_violation(_workcell_scene(0.44, 0.0)) is None
+  violation = rik._object_over_table_violation(_workcell_scene(0.46, 0.0))
+  assert violation[0] == "obj_0"
+  assert np.isclose(violation[1], 0.01)
+
+
+def test_object_over_table_checks_one_reference_datum_per_held_component_and_allows_overhang():
+  rik = object.__new__(S.RobotIK)
+  rik.object_over_table = True
+  rik.object_over_table_margin = -0.1
+  rik.gripper_frame = {"a1": "gripper"}
+  rik.object_frames = ("obj_0", "obj_1")
+  C = ry.Config()
+  C.addFrame("table").setShape(ry.ST.box, [1.0, 0.6, 0.05])
+  hand = C.addFrame("gripper").setPosition([0.58, 0.0, 0.2])
+  root = C.addFrame("obj_0").setParent(hand).setRelativePosition([0, 0, 0])
+  # A constituent datum may extend past the reference bound; it is not a second independent
+  # workcell constraint on the same rigid payload.
+  C.addFrame("obj_1").setParent(root).setRelativePosition([0.3, 0, 0])
+  assert rik._held_object_frames(C) == ("obj_0",)
+  assert rik._object_over_table_violation(C) is None
+  hand.setPosition([0.61, 0.0, 0.2])
+  violation = rik._object_over_table_violation(C)
+  assert violation[0] == "obj_0"
+  assert np.isclose(violation[1], 0.01)
+
+
+def test_object_over_table_adds_four_hard_bounds_per_held_part():
+  rik = object.__new__(S.RobotIK)
+  rik.object_over_table = True
+  rik.object_over_table_margin = 0.0
+  rik.gripper_frame = {"a1": "gripper"}
+  rik.object_frames = ("obj_0", "obj_1")
+  C = _workcell_scene()
+  komo = ry.KOMO(C, phases=1, slicesPerPhase=1, kOrder=1, enableCollisions=False)
+  # This is also an API-shape regression: RAI validates the 1x3 scale rows at insertion.
+  rik._add_object_over_table_objectives(komo, C)
+  assert len(komo.info_objectiveNames()) == 4
 
 
 def test_joint_limit_margin_is_part_of_the_same_search_time_gate():

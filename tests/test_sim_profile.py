@@ -16,11 +16,13 @@ def test_standard_sim_profile_is_reversible_by_explicit_flags():
       "--no-actuated", "--no-skill-servo", "--no-arm-arm-contacts",
       "--no-spline", "--no-phase-schedule", "--no-phase-smooth", "--no-phase-batch",
       "--no-servo-pick",
+      "--no-servo-place-seat",
       "--no-servo-torque-guard", "--no-path-preflight", "--no-force-limits",
       "--no-require-mp-path", "--no-require-success",
       "--corridor", "--joint-rate", "0.5", "--mass-scale", "0.25",
   ])
   assert not a.actuated and not a.skill_servo and not a.arm_arm_contacts and not a.servo_pick
+  assert not a.servo_place_seat
   assert not a.spline and not a.phase_schedule and not a.phase_smooth and not a.phase_batch
   assert a.servo_torque_guard is None and not a.path_preflight and not a.force_limits
   assert not a.require_mp_path and not a.require_success
@@ -29,6 +31,7 @@ def test_standard_sim_profile_is_reversible_by_explicit_flags():
 
 def test_standard_profile_refuses_an_implicit_motion_plan_before_scene_build():
   a = sim.parse_args(["run", "plan.json", "--sim-profile", "standard"])
+  assert a.servo_place_seat
   with pytest.raises(SystemExit, match="require-mp-path"):
     sim._cli_run(a)
 

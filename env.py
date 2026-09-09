@@ -540,9 +540,12 @@ def make_husky_duo_env():
     # The carrier's front bumper ends at x~=0.48.  Keep a 20mm gap, but use a compact
     # tabletop whose centre is in the two UR5e arms' shared reach volume; inheriting the
     # generic 1.1m-deep standalone table put centred parts 0.93--1.06m from the shoulders.
+    # A 44cm work surface keeps the shared build volume below the Husky's shoulder-height
+    # singularity and leaves enough vertical reach for top-down stool assembly.  The 8cm slab
+    # is centred at z=.40, hence its physical top is z=.44.
     C.getFrame("table").setShape(
         ry.ST.ssBox, size=[0.64, 1.10, 0.08, 0.02]).setPosition(
-        [0.82, 0.0, 0.50]).setColor([0.55, 0.55, 0.58, 1.0]).setContact(1)
+        [0.82, 0.0, 0.40]).setColor([0.55, 0.55, 0.58, 1.0]).setContact(1)
 
     carrier = C.addFile(os.path.join(HERE, HUSKY_CALIBRATED_PATH), namePrefix="husky0_")
     carrier.setParent(C.getFrame("floor")).setJoint(ry.JT.rigid)

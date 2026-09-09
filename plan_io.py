@@ -10,6 +10,7 @@ replaced by feasibility-safe optimized keyframes, so motion-plan and sim stages 
 functions of this file instead of re-solving the witness pass.
 Written by main.py --save, read by replay.py / main.py --load-plan / sim.py."""
 import json
+from pathlib import Path
 
 
 # Keep this deliberately local instead of importing solver._IK_ACTIONS: plan persistence is a
@@ -97,7 +98,12 @@ def write_plan(path, config, plan, witnesses=None):
   data = {"config": config, "plan": [list(step) for step in plan]}
   if witnesses is not None:
     data["witnesses"] = witnesses
-  with open(path, "w") as f:
+  # `--save experiments/new-run/plan.json` is a normal CLI workflow.  Persisting a
+  # successfully solved certificate must not fail merely because the run directory was
+  # not pre-created by the caller.
+  target = Path(path)
+  target.parent.mkdir(parents=True, exist_ok=True)
+  with target.open("w") as f:
     json.dump(data, f, indent=2)
 
 
