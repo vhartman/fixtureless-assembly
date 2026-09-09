@@ -89,10 +89,11 @@ _CAL = {
         "sign": np.ones(6),
         "offset": np.zeros(6),
         "tools": {
-            # calibrated tool0 is the Robotiq mounting flange; gripper_center is 130mm
-            # along its +z axis (measured from the same loaded RAI scene).
-            "two_finger": np.array([[1.0, 0.0, 0.0, 0.0],
-                                     [0.0, 1.0, 0.0, 0.0],
+            # calibrated tool0 is the Robotiq mounting flange; the physical two-finger
+            # tool is rolled +90deg about that flange axis and gripper_center is 130mm
+            # along the resulting +z axis.  This must match husky_calibrated.g exactly.
+            "two_finger": np.array([[0.0, -1.0, 0.0, 0.0],
+                                     [1.0, 0.0, 0.0, 0.0],
                                      [0.0, 0.0, 1.0, 0.13],
                                      [0.0, 0.0, 0.0, 1.0]]),
         },
@@ -102,8 +103,10 @@ _CAL = {
         "sign": np.ones(6),
         "offset": np.zeros(6),
         "tools": {
-            "two_finger": np.array([[1.0, 0.0, 0.0, 0.0],
-                                     [0.0, 1.0, 0.0, 0.0],
+            # Same physical +90deg tool roll as the right arm; the arm itself is
+            # calibrated independently.
+            "two_finger": np.array([[0.0, -1.0, 0.0, 0.0],
+                                     [1.0, 0.0, 0.0, 0.0],
                                      [0.0, 0.0, 1.0, 0.13],
                                      [0.0, 0.0, 0.0, 1.0]]),
         },
