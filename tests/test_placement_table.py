@@ -126,6 +126,17 @@ def test_anchor_rest_yaws_without_changing_tilt_or_height():
   assert all(np.isclose(np.linalg.norm(axis), 1.0) for axis in axes)
 
 
+def test_one_leg_stool_cannot_rest_upright_on_the_offset_leg():
+  """A finite-area contact is not automatically stable when the COM is outside it."""
+  P.set_placement_yaws(1)
+  a = P.make_assembly("real-stool", 5)
+
+  faces = P.rest_faces(a, {"obj_0", "obj_1"})
+
+  assert P._IDENTITY_FACE not in faces
+  assert faces, "the partial stool must retain physically stable side/seat rests"
+
+
 def test_identity_id_is_reserved_in_both_modes():
   """Id 5 means 'as anchored' everywhere. `_group_rest_pose` and `_group_rest_lift`
   special-case it, and it is the default of several helpers, so the computed table must

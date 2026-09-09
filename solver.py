@@ -844,6 +844,11 @@ class RobotIK:
     # gripper along -approach (its +z tool axis points INTO the object), place LIFTS the object
     # +z (world) off its rest pose. 0.0 = that skill is not split.
     self.pre_pick_delta = 0.0
+    # Held-object departure after attachment.  A table pick gets a separately solved world
+    # +z escape (the support normal); other acquisition contexts retain the paired pre-pick
+    # approach-axis endpoint in mp_export.  Keeping this as an IK endpoint, rather than an
+    # execution-only offset, makes the payload and every obstacle visible to motion planning.
+    self.post_pick_delta = 0.0
     self.pre_place_delta = 0.0
     self.pre_add_grasp_delta = 0.0   # brace/handover reach: retract like pick (-z_EE)
     self.post_release_delta = 0.0    # depart from a released grasp along the same -z_EE axis
@@ -908,6 +913,16 @@ class RobotIK:
     # zero-measure goal for BiRRT (OpenArm car-mini: 3e-9 rad slack on joint 7); reject it in
     # search so another branch/witness/plan is tried, rather than diagnosing it after export.
     self.joint_margin_reject = None
+    # Optional held-object workcell contract. Every part datum whose kinematic ancestry
+    # reaches a gripper must remain inside the table's LOCAL x/y footprint. This is installed
+    # in KOMO before optimization and repeated as an endpoint certificate; a post-only gate
+    # would waste restarts on a condition the optimizer had never been told about.
+    self.object_over_table = False
+    self.object_over_table_margin = 0.0
+    self.workspace_rejects = 0
+    self.last_workspace_reject = None
+    self.object_frames = tuple(
+        n for n in names if n.startswith("obj_") and n[4:].isdigit())
     self.margin_rejects = 0
     self.margin_reject_pairs = {}
     self.last_margin_reject = None
@@ -1927,6 +1942,7 @@ class RobotIK:
                        [self.col_weight], [-0.0])
         k.addControlObjective([], 0, 1e-1)
         k.addControlObjective([], 1, 1e-1)
+        self._add_object_over_table_objectives(k, Cr)
         k.addObjective([1, 1], ry.FS.position, [ee], ry.OT.eq, [1e1], p_t)
         k.addObjective([1, 1], ry.FS.vectorX, [ee], ry.OT.eq, [1e1], R_t[:, 0])
         k.addObjective([1, 1], ry.FS.vectorZ, [ee], ry.OT.eq, [1e1], R_t[:, 2])
@@ -2329,6 +2345,89 @@ class RobotIK:
       return "arm-part"
     return None
 
+  def _table_workcell_half_extents(self, C):
+    """Return usable table-local x/y half extents for the held-object gate."""
+    table = C.getFrame("table") if C is not None else None
+    if table is None:
+      raise ValueError("--object-over-table requires a frame named 'table'")
+    size = np.asarray(table.getSize(), dtype=float).ravel()
+    if size.size < 2 or not np.all(np.isfinite(size[:2])):
+      raise ValueError("--object-over-table requires a table shape with finite x/y size")
+    margin = float(getattr(self, "object_over_table_margin", 0.0) or 0.0)
+    half = 0.5 * size[:2] - margin
+    if np.any(half <= 0.0):
+      raise ValueError(
+          f"--object-over-table-margin {margin:g} leaves an empty table footprint "
+          f"for table size {size[:2].tolist()}")
+    return half
+
+  def _held_object_frames(self, C):
+    """Reference datum of each component kinematically carried by a gripper.
+
+    A held assembly is represented as one object frame attached to the gripper with the
+    remaining member frames below it.  Constraining every descendant datum made the workspace
+    test depend on assembly size and grasped-member choice (and can be impossible for an
+    assembly wider than the table).  The workcell guard is meant to bound the carried
+    component, so use its kinematic root -- the datum attached directly below the gripper.
+    """
+    grippers = set(self.gripper_frame.values())
+    objects = set(self.object_frames)
+    held = []
+    for name in self.object_frames:
+      f = C.getFrame(name)
+      seen = set()
+      object_ancestor = False
+      while f is not None and f.name not in seen:
+        if f.name in grippers:
+          if not object_ancestor:
+            held.append(name)
+          break
+        seen.add(f.name)
+        f = f.getParent()
+        if f is not None and f.name in objects:
+          object_ancestor = True
+    return tuple(held)
+
+  def _object_over_table_violation(self, C):
+    """Return ``(part, excess_m, table_xy)`` for the first held datum outside."""
+    if not getattr(self, "object_over_table", False):
+      return None
+    half = self._table_workcell_half_extents(C)
+    for part in self._held_object_frames(C):
+      rel, _ = C.eval(ry.FS.positionRel, [part, "table"])
+      xy = np.asarray(rel, dtype=float).ravel()[:2]
+      excess = np.abs(xy) - half
+      if np.any(excess > 1e-9):
+        return part, float(np.max(excess)), tuple(float(v) for v in xy)
+    return None
+
+  def _add_object_over_table_objectives(self, komo, C, times=None):
+    """Tell KOMO the exact workcell condition used by the endpoint certificate."""
+    if not getattr(self, "object_over_table", False):
+      return
+    half = self._table_workcell_half_extents(C)
+    # A tiny optimization interior absorbs NLP feasibility tolerance; the post-check remains
+    # against the exact user-requested footprint.
+    target_half = half - 1e-4
+    if np.any(target_half <= 0.0):
+      target_half = half * 0.999
+    times = [] if times is None else times
+    for part in self._held_object_frames(C):
+      for axis in range(2):
+        target = np.zeros(3, dtype=float)
+        target[axis] = target_half[axis]
+        row = np.zeros((1, 3), dtype=float)
+        # Use RAI's standard workspace-bound scaling.  This is only a coarse workcell guard;
+        # giving it a 1e3 scale needlessly worsens the augmented-Lagrangian conditioning.
+        # The exact post-solve check below remains authoritative, so an NLP-tolerance leak at
+        # this deliberately gentle 1e1 scale is rejected rather than shipped.
+        row[0, axis] = 1e1
+        komo.addObjective(times, ry.FS.positionRel, [part, "table"], ry.OT.ineq,
+                          row, target)
+        target[axis] = -target_half[axis]
+        komo.addObjective(times, ry.FS.positionRel, [part, "table"], ry.OT.ineq,
+                          -row, target)
+
   def _clearance_ok(self, C, q):
     """Shared search/witness workspace + joint-interior gate."""
     M = self.clearance_reject
@@ -2349,11 +2448,15 @@ class RobotIK:
     arm_models = getattr(self, "robot_arm", None)
     if arm_models is not None and not any(v is not None for v in arm_models.values()):
       J = None
-    if ((M is None or M <= 0.0) and (J is None or J <= 0.0)) or C is None or q is None:
+    W = bool(getattr(self, "object_over_table", False))
+    if (((M is None or M <= 0.0) and (J is None or J <= 0.0) and not W)
+        or C is None or q is None):
       return True
     saved = C.getJointState()
     qv = np.asarray(q, dtype=float)
     C.setJointState(qv)
+    self.last_margin_reject = None
+    self.last_workspace_reject = None
     bad = None
     if J is not None and J > 0.0:
       try:
@@ -2384,6 +2487,13 @@ class RobotIK:
         if reason is not None:
           bad = (str(fa), str(fb), d, reason)
           break
+    if bad is None and W:
+      violation = self._object_over_table_violation(C)
+      if violation is not None:
+        self.workspace_rejects += 1
+        self.last_workspace_reject = violation
+        C.setJointState(saved)
+        return False                                      # inequalities were installed up front
     C.setJointState(saved)
     if bad is not None:
       self.margin_rejects += 1
@@ -3302,6 +3412,7 @@ class RobotIK:
         )
       komo.addControlObjective([], 0, 1e-1)
       komo.addControlObjective([], 1, 1e-1)
+      self._add_object_over_table_objectives(komo, C)
       self._add_pull(komo, C, robot)                      # witness-opt pull (no-op in search)
       self._add_pin(komo, C)                              # pre-skill pin (no-op in search)
       # 6-DOF: gripper tool-center must sit at the (approach-corrected) grasp on the part:
@@ -3419,6 +3530,7 @@ class RobotIK:
         komo.addObjective([], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [self.col_weight], [-0.0])
       komo.addControlObjective([], 0, 1e-1)
       komo.addControlObjective([], 1, 1e-1)
+      self._add_object_over_table_objectives(komo, C)
       self._add_pull(komo, C, robot)                      # witness-opt pull (no-op in search)
       self._add_pin(komo, C)                              # pre-skill pin (no-op in search)
       self._add_grasp_objectives(komo, robot, gpart, ee_target)
@@ -3500,6 +3612,7 @@ class RobotIK:
         )
       komo.addControlObjective([], 0, 1e-1)
       komo.addControlObjective([], 1, 1e-1)
+      self._add_object_over_table_objectives(komo, C)
       self._add_pull(komo, C, robot)                      # witness-opt pull (no-op in search)
       self._add_pin(komo, C)                              # pre-skill pin (no-op in search)
       # object-pose constraint (like assemble, not an EE pose): the group's reference part
@@ -3621,6 +3734,7 @@ class RobotIK:
       komo.addObjective([], ry.FS.accumulatedCollisions, [], ry.OT.ineq, [self.col_weight], [-0.0])
     komo.addControlObjective([], 0, 1e-1)
     komo.addControlObjective([], 1, 1e-1)
+    self._add_object_over_table_objectives(komo, C)
     self._assemble_objectives(komo, part_name, onto, rel_pos, rel_quat, bias_axes)
     return komo
 
@@ -4464,6 +4578,80 @@ class RobotIK:
       self._opt_pull = None
       self._pin_joints = None
     return w if ok else None
+
+  def post_pick_witness(self, action, s0, s1, assembly, pick_witness=None):
+    """Solve the held-object escape endpoint for a pick from a horizontal table.
+
+    Pre-pick follows the grasp approach because an empty hand must approach along a direction
+    compatible with the gripper.  The useful motion *after* attachment is different: for a
+    table-supported object, moving along the support normal creates clearance independent of
+    the grasp orientation.  Reusing the pre-pick joint configuration can instead force a
+    payload to return downward after a collision-avoiding detour.
+
+    This helper changes only table picks.  It returns ``None`` for every other acquisition
+    context, letting the exporter retain the historical paired approach-axis endpoint.  The
+    target is a full held-scene IK query: the EE orientation and rigid grasp are preserved,
+    idle arms are frozen at the pick witness, and the ordinary collision/clearance/workcell
+    gates certify the endpoint.  The free-space planner remains free to detour to it.
+    """
+    self.post_pick_used_delta = None
+    if (self.post_pick_delta <= 0.0 or pick_witness is None
+        or action[0] != "pick"):
+      return None
+    robot, part = action[1], action[2]
+    group0 = next((g for g in s0.subassemblies() if part in g), frozenset((part,)))
+    if not _group_is_on_table(s0, group0):
+      return None
+
+    warm = np.asarray(pick_witness, dtype=float).ravel()
+    C = self.scene_for(s1, assembly)
+    names = list(C.getJointNames())
+    if warm.size != len(names):
+      return None
+    C.setJointState(warm)
+    ee = self.gripper_frame[robot]
+    target = np.asarray(C.getFrame(ee).getPose(), dtype=float).copy()
+    target[:3] += np.array([0.0, 0.0, float(self.post_pick_delta)])
+    if self._reach_reject(C, robot, target[:3]):
+      return None
+
+    # Restricting the active coordinates freezes every other arm at `warm` while retaining
+    # them, the table, loose parts, and the newly attached payload as collision geometry.
+    full_names = self._restrict_to_arm(C, robot)
+
+    def build(collisions):
+      komo = ry.KOMO(C, phases=1, slicesPerPhase=1, kOrder=1,
+                     enableCollisions=collisions)
+      if collisions:
+        komo.addObjective([], ry.FS.accumulatedCollisions, [], ry.OT.ineq,
+                          [self.col_weight], [-0.0])
+      komo.addControlObjective([], 0, 1e-1)
+      komo.addControlObjective([], 1, 1e-1)
+      self._add_object_over_table_objectives(komo, C)
+      komo.addObjective([1, 1], ry.FS.position, [ee], ry.OT.eq, [1e1], target[:3])
+      komo.addObjective([1, 1], ry.FS.quaternion, [ee], ry.OT.eq, [1e1], target[3:])
+      return komo
+
+    self._cur_action = action
+    self._funnel_solve = True
+    try:
+      seeds = self._analytic_seeds(C, robot, target, None)
+      wseed = self._restrict_seed(warm, C, full_names)
+      feasible, raw = self._solve_ik(
+          self._timed_stage_call("komo_build", build, True),
+          seeds=[wseed] + list(seeds or []), C=C)
+      witness = self._expand_witness(C, raw, full_names)
+      if feasible and witness is not None:
+        actor_idx = [i for i, n in enumerate(names) if n.startswith(robot + "_")]
+        if float(np.linalg.norm(np.asarray(witness)[actor_idx] - warm[actor_idx])) \
+            > self.pre_skill_max_dq:
+          feasible, witness = False, None
+      if feasible and witness is not None:
+        self.post_pick_used_delta = float(self.post_pick_delta)
+        return np.asarray(witness, dtype=float)
+      return None
+    finally:
+      self._funnel_solve = False
 
 
 # actions that move a part into a possibly-colliding pose (so they need the CHEAP geometry
@@ -5584,8 +5772,11 @@ def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
   Returns (witnesses, [(step, action, penetration_m, swapped_bool, reason), ...])."""
   if tol is None:
     tol = robot_ik.penetration_reject
-  if tol is None:
+  check_penetration = tol is not None
+  if not check_penetration and not getattr(robot_ik, "object_over_table", False):
     return witnesses, []
+  if tol is None:
+    tol = float("inf")                                  # workcell-only export validation
   if grasp_table is None:
     _checker, grasp_table = _search_context(C, assembly, robots)
   states = _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
@@ -5625,7 +5816,8 @@ def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
         try:
           clear = bool(gate(Ci, np.asarray(q, dtype=float).ravel()))
           if not clear:
-            reason = getattr(robot_ik, "last_margin_reject", None)
+            reason = (getattr(robot_ik, "last_margin_reject", None)
+                      or getattr(robot_ik, "last_workspace_reject", None))
         finally:
           robot_ik._cur_action = old_action
       return p, clear, reason
@@ -5855,6 +6047,18 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
                         [robot_ik.col_weight], [-0.0])
       komo.addControlObjective([], 0, 1e-1)
       komo.addControlObjective([], 1, 1e-1)
+      # The add-grasp and assemble scenes have the same kinematic mode here. Constrain the
+      # union of their held part datums at both phases; this keeps the post-pass from undoing
+      # an --object-over-table certificate already established by search.
+      if robot_ik.object_over_table:
+        held = tuple(sorted(set(robot_ik._held_object_frames(Ca)) |
+                            set(robot_ik._held_object_frames(Cb))))
+        original = robot_ik.object_frames
+        try:
+          robot_ik.object_frames = held
+          robot_ik._add_object_over_table_objectives(komo, Ca)
+        finally:
+          robot_ik.object_frames = original
       robot_ik._add_grasp_objectives(komo, rb, gpart, ee_t, phase=1)
       robot_ik._add_grasp_maintenance(komo, states[i], assembly, phase=1)
       if chain_active:

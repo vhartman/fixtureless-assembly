@@ -12,7 +12,9 @@ Examples:
 
 The exported ``q`` is the joint motion that actually occurred in simulation, not the nominal
 motion-planner command.  ``qd`` and ``qdd`` are deterministic finite differences at the saved
-recording rate.  Samples annotated with ``controller_active`` depended on an online execution
+recording rate.  Every sample also carries ``attached_objects`` (one object name or ``None`` per
+robot), reconstructed from the recorded close/open transitions.  Samples annotated with
+``controller_active`` depended on an online execution
 hook in simulation and therefore require an equivalent hardware controller rather than blind
 position playback.
 """
@@ -26,7 +28,7 @@ import mujoco
 import numpy as np
 
 
-SCHEMA = "assembly-open-loop-v1"
+SCHEMA = "assembly-open-loop-v2"
 JSON_SCHEMA = "assembly-open-loop-json-v2"
 _OPEN_LOOP_MODE = "trajectory"
 
@@ -93,8 +95,40 @@ def _event_time(event, *, physics_dt, time_origin, source_t):
   return min(max(float(value), 0.0), float(source_t[-1]))
 
 
-def _json_samples(q, t, hinge, controller_active, events, robots, *, dt, grasp_wait,
-                  physics_dt, time_origin):
+def _attachment_trace(t, events, robots, *, physics_dt, time_origin):
+  """Return the object held by each robot at every source-recording sample.
+
+  Events are applied in their recorded order.  This matters for a handover: the receiver's
+  close is emitted before the giver's open at the same physics tick.  Empty strings are used in
+  the numeric NPZ channel because fixed-width arrays cannot represent JSON ``null``; JSON rows
+  convert them to ``None``.
+  """
+  n = len(t)
+  state = {str(robot): "" for robot in robots}
+  by_index = [[] for _ in range(n)]
+  for order, event in enumerate(events):
+    kind = event.get("event")
+    robot = str(event.get("robot", ""))
+    if kind not in ("close_start", "open_start") or robot not in state:
+      continue
+    et = _event_time(event, physics_dt=physics_dt, time_origin=time_origin, source_t=t)
+    index = int(np.searchsorted(t, et, side="right") - 1)
+    index = min(max(index, 0), n - 1)
+    by_index[index].append((order, kind, robot, str(event.get("part", ""))))
+
+  width = max([len(str(x)) for e in events for x in [e.get("part", "")] if x] + [1])
+  out = np.full((n, len(robots)), "", dtype=f"U{width}")
+  robot_index = {str(robot): i for i, robot in enumerate(robots)}
+  for i in range(n):
+    for _order, kind, robot, part in sorted(by_index[i], key=lambda row: row[0]):
+      state[robot] = part if kind == "close_start" else ""
+    for robot, j in robot_index.items():
+      out[i, j] = state[robot]
+  return out
+
+
+def _json_samples(q, t, hinge, controller_active, events, robots, attached_objects, *, dt,
+                  grasp_wait, physics_dt, time_origin):
   """Uniform row-oriented JSON samples with explicit post-close dwell intervals.
 
   Close commands at the same source time are concurrent and therefore insert one global dwell,
@@ -173,6 +207,7 @@ def _json_samples(q, t, hinge, controller_active, events, robots, *, dt, grasp_w
   source_indices = np.searchsorted(t, source_at, side="right") - 1
   source_indices = np.clip(source_indices, 0, len(t) - 1)
   servo = cin[source_indices]
+  attached = np.asarray(attached_objects)[source_indices]
 
   opening = [set() for _ in range(count)]
   for et, kind, robot in tagged:
@@ -192,6 +227,10 @@ def _json_samples(q, t, hinge, controller_active, events, robots, *, dt, grasp_w
         "opening_gripper": sorted(opening[i]),
         "closing_gripper": sorted(closing[i]),
         "servo_controller": bool(servo[i]),
+        "attached_objects": {
+            robot: (str(attached[i, j]) if str(attached[i, j]) else None)
+            for j, robot in enumerate(robots)
+        },
     })
   return samples
 
@@ -319,6 +358,8 @@ def export_recording(source, destination, *, allow_failed=False, sample_dt=0.05,
 
     events = _json_scalar(z, "gripper_events", [])
     events = list(events) + _legacy_gripper_events(z, robots, t, events)
+    attached_objects = _attachment_trace(
+        t, events, robots, physics_dt=physics_dt, time_origin=time_origin)
     close = np.zeros((len(q), len(robots)), dtype=bool)
     for event in events:
       if event.get("event") != "close_start" or event.get("robot") not in robots:
@@ -350,7 +391,7 @@ def export_recording(source, destination, *, allow_failed=False, sample_dt=0.05,
     # Keep the model-order metadata outside the list so each row only carries execution data.
     samples = _json_samples(
         q, t, np.asarray([r[3] for r in rows], dtype=bool), controller_active, events, robots,
-        dt=sample_dt, grasp_wait=grasp_wait, physics_dt=physics_dt,
+        attached_objects, dt=sample_dt, grasp_wait=grasp_wait, physics_dt=physics_dt,
         time_origin=time_origin)
     payload = {
         "schema": JSON_SCHEMA,
@@ -373,6 +414,7 @@ def export_recording(source, destination, *, allow_failed=False, sample_dt=0.05,
         joint_names=np.asarray([r[1] for r in rows]),
         robot_slices=np.asarray(json.dumps(slices, sort_keys=True)),
         q=q, qd=qd, qdd=qdd,
+        attached_objects=attached_objects,
         controller_mode=controller,
         controller_active=controller_active,
         gripper_close_start=close,

@@ -158,6 +158,7 @@ _STANDARD_MOTION_PROFILE = {
     # Complete both sides of every contact skill and preserve the coupled endpoints. Tight
     # socket scenes may explicitly disable individual auxiliary funnels after the profile.
     "pre_pick": 0.05,
+    "post_pick": 0.05,
     "pre_place": 0.05,
     "pre_add_grasp": 0.05,
     "pre_insertion": 0.05,
@@ -827,6 +828,14 @@ def build_parser():
            "instead. Default 0.008; 0 disables. Saved with the plan -- it rebinds grasp ids.",
   )
   g_ik.add_argument(
+      "--grasp-sampler-strict", action=argparse.BooleanOptionalAction, default=False,
+      help="--grasp-sampler: treat --grasp-sampler-margin and --grasp-sampler-pad-support "
+           "as hard quality gates. Below-gate sampled rows are omitted instead of being "
+           "used as a last-resort fallback; if no candidate remains, isolated grasp preflight "
+           "fails loudly. Canonical face grasps are unchanged. Off preserves the widening "
+           "fallback behavior. Saved with the plan -- it rebinds grasp ids.",
+  )
+  g_ik.add_argument(
       "--grasp-sampler-seed", type=int, default=0, metavar="S",
       help="--grasp-sampler: sampler RNG seed (saved with the plan; grasp ids only replay "
            "under the same seed/counts).",
@@ -1482,6 +1491,21 @@ def build_parser():
            "are not hardware joints and are exempt.",
   )
   g_witness.add_argument(
+      "--object-over-table", action=argparse.BooleanOptionalAction, default=False,
+      help="Keep the reference datum of each currently held rigid component inside the "
+           "tabletop's local x/y "
+           "footprint at every real-IK witness. The same bounds are hard KOMO inequalities "
+           "and a post-solve certificate; table-supported parts are unchanged. This is an "
+           "endpoint/workcell constraint, not a constraint on every motion-planning sample.",
+  )
+  g_witness.add_argument(
+      "--object-over-table-margin", type=float, default=0.0, metavar="M",
+      help="Signed --object-over-table boundary margin in metres (default 0): positive "
+           "values inset the table footprint; negative values permit bounded overhang. "
+           "The bound applies to each held component's reference datum, not its complete "
+           "collision geometry.",
+  )
+  g_witness.add_argument(
       "--witness-branch-budget", type=int, default=5, metavar="N",
       help="--optimize-witnesses floor: permit N extra IK BRANCH CROSSINGS in exchange for a "
            "higher clearance floor. 0 takes only the clearance that is FREE -- the "
@@ -1694,6 +1718,14 @@ def build_parser():
            "Currently authored only for real-stool/yandv-stool legs (four quarter turns "
            "about the long axis). Default off for exact compatibility.",
   )
+  g_phys.add_argument(
+      "--mate-wrench-limits", action=argparse.BooleanOptionalAction, default=True,
+      help="Honor assembly-authored finite wrench-transmission limits at already-seated "
+           "mates. Ideal internal mates are contracted; each finite interface gets an "
+           "equal-and-opposite bounded wrench in a per-rigid-node equilibrium LP. Default "
+           "on, but assemblies without finite caps use the historical one-body LP exactly. "
+           "Use --no-mate-wrench-limits for the ideal-weld baseline/ablation.",
+  )
   g_search.add_argument(
       "--lru-robots", action="store_true",
       help="Order robots LEAST-RECENTLY-USED first in successor generation (utilization "
@@ -1707,7 +1739,8 @@ def build_parser():
   g_skills.add_argument(
       "--skill", type=float, nargs="?", const=0.05, default=0.0, metavar="DELTA",
       help="Shorthand: set ALL approach/departure funnels (--pre-pick/--pre-place/"
-           "--pre-add-grasp/--pre-insertion/--post-release) to DELTA metres (default 0.05). "
+           "--pre-add-grasp/--pre-insertion/--post-pick/--post-release) to DELTA metres "
+           "(default 0.05). "
            "An explicit per-skill flag overrides this for that skill. The individual funnels "
            "already default to 0.05; this is mainly a convenient common retune.",
   )
@@ -1759,6 +1792,14 @@ def build_parser():
       help="Like --pre-insertion, for PICK (EXPORT/REPLAY only): split each pick into a GOTO to "
            "the pre-grasp pose (gripper retracted DELTA m along its -approach axis, default "
            "0.05) + the real grasp at the pick witness. Default 0.05; 0 disables.",
+  )
+  g_skills.add_argument(
+      "--post-pick", type=float, nargs="?", const=0.05, default=0.05, metavar="DELTA",
+      help="Complete PICK's departure side: after the grasp attaches, add a GOTO to the "
+           "table support normal (+world z) for table picks, with the payload attached; "
+           "other contexts retain the paired -approach-axis endpoint. The motion planner "
+           "therefore certifies the held-object retreat instead of the simulator injecting "
+           "a transient lift that the nominal reference undoes. Default 0.05; 0 disables.",
   )
   g_skills.add_argument(
       "--pre-place", type=float, nargs="?", const=0.05, default=0.05, metavar="DELTA",
@@ -2222,8 +2263,8 @@ _SAVE_CONFIG_FIELDS = (
     "wrench_profile", "grasp_model", "insert_force",
     "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
     "bracing", "robust_mode", "dense_grasps", "random_init", "part_float", "inhand_reorient",
-    "pre_insertion", "skill_funnel_collision_res", "pre_pick", "pre_place", "pre_add_grasp",
-    "post_release", "staged_mates", "mate_symmetry",
+    "pre_insertion", "skill_funnel_collision_res", "pre_pick", "post_pick", "pre_place", "pre_add_grasp",
+    "post_release", "staged_mates", "mate_symmetry", "mate_wrench_limits",
     "screw_angle", "screw_depth", "screw_torque", "screw_speed", "screw_samples",
     "allow_curved_grasps", "grippers", "grasp_compliance",
     "vacuum_scale", "two_finger_scale", "vacuum_engage_force",
@@ -2256,16 +2297,18 @@ _SAVE_CONFIG_FIELDS = (
     # search provenance; replay reconstructs the final widened prefix recorded in `keep`
     "grasp_sampler_margin", "grasp_sampler_pad_support",
     "grasp_sampler_wrap",                                 # curvature-fair support metric (None = legacy)
+    "grasp_sampler_strict",                               # reject below-gate fallback rows
     "grasp_sampler_scenes",                              # scene-aware set split (rebinds ids)
     "tight_fingers",                                     # changes what the grasp DB filters out
     "openarm_real_finger_radius_scale",                  # diagnostic real-arm IK geometry
     "grasp_closure_check",                               # virtual close changes grasp-edge feasibility
     "ik_seeding",                                        # off => witness IK fails on re-picks/
     # reorienting places, and mp_export then exports the arm's PREVIOUS config as the goal
-    "pre_pick", "pre_place", "pre_add_grasp", "post_release", # each SPLITS an action into tasks:
+    "pre_pick", "post_pick", "pre_place", "pre_add_grasp", "post_release", # each SPLITS an action into tasks:
     # unsaved, a replay/sim rebuild has fewer tasks than the --mp-path it loads, and the path
     # indexes tasks by integer id. pre_insertion was already saved; these three were not.
-    "witness_margin", "witness_joint_margin", "witness_draw", # robust-keyframe gates + ladder
+    "witness_margin", "witness_joint_margin", "object_over_table",
+    "object_over_table_margin", "witness_draw", # robust-keyframe/workcell gates + ladder
     "witness_sets", "witness_set_spread",                # multi-witness goal sets
     # draw: both change which witnesses ship, so replays/reuse must match
     "ban_actions",                                       # shapes the PLAN (provenance +
@@ -2352,12 +2395,12 @@ _WITNESS_FIELDS = (
     "ssik_seed_neighborhood", "ssik_neighborhood_cap",
     "seed", "bracing", "handovers", "allow_place", "mate_symmetry",
     "tight_fingers", "openarm_real_finger_radius_scale", "part_float", "witness_margin",
-    "witness_joint_margin", "witness_draw",
+    "witness_joint_margin", "object_over_table", "object_over_table_margin", "witness_draw",
     "witness_sets", "witness_set_spread", "pre_insertion", "skill_funnel_collision_res",
     "grasp_sampler", "grasp_sampler_keep", "grasp_sampler_candidates", "grasp_sampler_seed",
     "grasp_sampler_db_hash",
     "grasp_sampler_margin", "grasp_sampler_pad_support", "grasp_sampler_wrap",
-    "grasp_sampler_scenes", "placement_yaws")
+    "grasp_sampler_strict", "grasp_sampler_scenes", "placement_yaws")
 
 
 def _witnesses_reusable(saved_cfg, cfg):
@@ -3210,7 +3253,8 @@ def run(cfg, explicit=None):
                                         else cfg.grasp_sampler_keep),
                         "margin": cfg.grasp_sampler_margin,
                         "pad_support": cfg.grasp_sampler_pad_support,
-                        "wrap": cfg.grasp_sampler_wrap})
+                        "wrap": cfg.grasp_sampler_wrap,
+                        "strict": cfg.grasp_sampler_strict})
     print("[flag] --grasp-sampler ACTIVE: SCENE-RESERVED HYBRID conventional + mesh-sampled"
           + f" grasp DB ({cfg.grasp_sampler_candidates} raw candidates -> "
           + (f"{cfg.grasp_sampler_keep} initially active, finite master requested up to "
@@ -3218,7 +3262,7 @@ def run(cfg, explicit=None):
              if cfg.grasp_local_widen else
              f"{cfg.grasp_sampler_keep} total kept per part")
           + f"; suction + antipodal blocks; seed "
-          f"{cfg.grasp_sampler_seed}). Grasp ids index the SAMPLED list -- plans/witnesses "
+          f"{cfg.grasp_sampler_seed}; {'strict quality gates' if cfg.grasp_sampler_strict else 'fallback quality rows allowed'}). Grasp ids index the SAMPLED list -- plans/witnesses "
           f"only replay under the same sampler settings (saved with the plan).")
     if cfg.grasp_widen:
       print(f"[flag] --grasp-widen ACTIVE: start with K={cfg.grasp_sampler_keep}; after a "
@@ -3497,6 +3541,22 @@ def run(cfg, explicit=None):
       print(f"[flag] NOTE: --assembly {cfg.assembly} has at most {_maxp} parts; the default "
             f"--parts {cfg.parts} is clamped to {_maxp}.")
   assembly = make_assembly(cfg.assembly, cfg.parts)
+  from problem import set_mate_wrench_limits
+  set_mate_wrench_limits(cfg.mate_wrench_limits)
+  if assembly.mate_wrench_limits:
+    if cfg.mate_wrench_limits:
+      print("[flag] --mate-wrench-limits ACTIVE: finite internal mate boxes enforced for "
+            + ", ".join(sorted(assembly.mate_wrench_limits, key=lambda p: int(p.split('_')[1])))
+            + "; ideal mate edges remain rigidly contracted.")
+      if cfg.wrench and cfg.orientation_robust_wrench:
+        raise SystemExit("--orientation-robust-wrench is not yet supported with finite "
+                         "--mate-wrench-limits; use the default fixed-orientation model")
+      if cfg.wrench and cfg.robust_mode == "affine" and cfg.insertion_noise is not None:
+        raise SystemExit("--robust-mode affine is not yet supported with finite "
+                         "--mate-wrench-limits; use --robust-mode corners")
+    else:
+      print("[flag] --no-mate-wrench-limits ACTIVE: authored finite mate caps ignored; "
+            "using the historical ideal-weld baseline.")
   assembly.configure_mate_symmetry(cfg.mate_symmetry)
   if cfg.mate_symmetry:
     _sets = {p: len(qs) for p, qs in assembly.mate_symmetry_quats.items()}
@@ -3915,6 +3975,22 @@ def run(cfg, explicit=None):
               "+ WITNESS PASSES for coupled handover/add_grasp/assemble endpoints: IK keyframes "
               "on/near a hardware stop are rejected before they become zero-neighbourhood "
               "motion-planning goals; ordinary picks/places are unchanged.")
+    if not np.isfinite(cfg.object_over_table_margin):
+      raise SystemExit("main.py: --object-over-table-margin must be finite")
+    if cfg.object_over_table and robot_ik is not None:
+      robot_ik.object_over_table = True
+      robot_ik.object_over_table_margin = float(cfg.object_over_table_margin)
+      # Fail before a long search if a custom scene has no usable tabletop geometry.
+      robot_ik._table_workcell_half_extents(robot_ik.C)
+      margin_desc = (f" inset by {cfg.object_over_table_margin * 1000:g}mm"
+                     if cfg.object_over_table_margin > 0.0 else
+                     f" expanded by {-cfg.object_over_table_margin * 1000:g}mm"
+                     if cfg.object_over_table_margin < 0.0 else "")
+      print("[flag] --object-over-table ACTIVE IN SEARCH + WITNESS PASSES: every held "
+            f"component reference datum stays inside the table-local x/y footprint"
+            f"{margin_desc}; KOMO receives "
+            "the bounds up front and the accepted endpoint is checked again. This does not "
+            "constrain arm links or the continuous motion-planning path.")
     if robot_ik is not None and cfg.mate_eq_weight is not None:
       robot_ik.mate_eq_weight = float(cfg.mate_eq_weight)
       print(f"[flag] --mate-eq-weight {cfg.mate_eq_weight:g}: assemble mate eq constraints "
@@ -3988,11 +4064,11 @@ def run(cfg, explicit=None):
     if cfg.skill > 0.0:
       # shorthand: set every funnel not explicitly overridden on this command. Checking the
       # CLI presence rather than `<= 0` matters now that funnels default ON.
-      for _f in ("pre_insertion", "pre_pick", "pre_place", "pre_add_grasp", "post_release"):
+      for _f in ("pre_insertion", "pre_pick", "post_pick", "pre_place", "pre_add_grasp", "post_release"):
         if not explicit or _f not in explicit:
           setattr(cfg, _f, cfg.skill)
-      print(f"[flag] --skill {cfg.skill:g} ACTIVE: enabling all pre-skill splits (pick, place, "
-            "add_grasp, assemble) as skills.")
+      print(f"[flag] --skill {cfg.skill:g} ACTIVE: enabling all approach/departure funnels "
+            "(pick, place, add_grasp, assemble).")
     if robot_ik is not None and cfg.pre_insertion > 0.0:
       robot_ik.pre_insertion_delta = cfg.pre_insertion
       print(f"[flag] --pre-insertion ACTIVE: MP export splits each assemble into a goto to the "
@@ -4011,6 +4087,20 @@ def run(cfg, explicit=None):
       robot_ik.pre_pick_delta = cfg.pre_pick
       print(f"[flag] --pre-pick ACTIVE: MP export splits each pick into a goto to the pre-grasp "
             f"({cfg.pre_pick:g}m gripper retract) + the real grasp. Search/plan unchanged.")
+    if robot_ik is not None and cfg.post_pick > 0.0:
+      if cfg.pre_pick <= 0.0:
+        if explicit and "post_pick" in explicit:
+          raise SystemExit("--post-pick currently requires --pre-pick so export emits the "
+                           "complete approach/contact/departure task split")
+        print("[flag] --post-pick disabled because --pre-pick is 0 (no certified standoff to "
+              "complete the pick funnel).")
+        cfg.post_pick = 0.0
+    if robot_ik is not None and cfg.post_pick > 0.0:
+      robot_ik.post_pick_delta = cfg.post_pick
+      print(f"[flag] --post-pick ACTIVE: MP export appends a held-object retreat "
+            f"({cfg.post_pick:g}m along +world-z for table picks; otherwise the paired "
+            "-approach endpoint) after each grasp. "
+            "Search/plan unchanged.")
     if robot_ik is not None and cfg.pre_place > 0.0:
       robot_ik.pre_place_delta = cfg.pre_place
       print(f"[flag] --pre-place ACTIVE: MP export splits each place into a goto to the pre-place "
@@ -4269,6 +4359,9 @@ def run(cfg, explicit=None):
       rows = sorted(robot_ik.margin_reject_pairs.items(), key=lambda kv: kv[1], reverse=True)
       for (reason, fa, fb), count in rows[:5]:
         print(f"  [ik-clearance] {reason:11s} {fa} ~ {fb}: {count} veto(es)")
+    if robot_ik is not None and getattr(robot_ik, "object_over_table", False):
+      print(f"[ik-workcell] vetoed {robot_ik.workspace_rejects} IK candidate(s) whose held "
+            "part datum left the table footprint.")
     if robot_ik is not None and cfg.mate_accuracy is not None:
       if getattr(cfg, "grasp_accuracy", None) is not None:
         print(f"[grasp-accuracy] vetoed {robot_ik.grasp_rejects} off-pose grasps "
@@ -4518,7 +4611,13 @@ def run(cfg, explicit=None):
           if witness_alts:
             witness_alts = {i: ms for i, ms in witness_alts.items()
                             if np.allclose(ms[0], opt_witnesses[i], atol=1e-9, rtol=0.0)}
-      if opt_witnesses is not None and _required_pre and not _reuse_final:
+      # Search-stage plans already loaded their matching pre_wit block above.  Re-solving
+      # those mouths is both unnecessary and non-reproducible: a fresh optimizer can land in
+      # another basin and make an otherwise complete saved certificate fail during replay.
+      # Only a pass that actually CHANGED endpoint witnesses needs matching mouths rebuilt.
+      _endpoints_postprocessed = bool(cfg.optimize_witnesses is not None or _has_path_skill)
+      if (opt_witnesses is not None and _required_pre and not _reuse_final
+          and _endpoints_postprocessed):
         from solver import collect_plan_pre_witnesses
         opt_pre_witnesses = collect_plan_pre_witnesses(
             C, assembly, plan, opt_witnesses, robots, robot_ik,
@@ -4598,6 +4697,7 @@ def run(cfg, explicit=None):
             robot_ik.pre_insertion_delta = float(
                 _es.get("pre_insertion", robot_ik.pre_insertion_delta))
             robot_ik.pre_pick_delta = float(_es.get("pre_pick", robot_ik.pre_pick_delta))
+            robot_ik.post_pick_delta = float(_es.get("post_pick", robot_ik.post_pick_delta))
             robot_ik.pre_place_delta = float(_es.get("pre_place", robot_ik.pre_place_delta))
             robot_ik.pre_add_grasp_delta = float(
                 _es.get("pre_add_grasp", robot_ik.pre_add_grasp_delta))
@@ -4649,7 +4749,8 @@ def run(cfg, explicit=None):
           # was solved -- optimize_witnesses* emits a splice and fuse_cograsp re-solves pairs.
           # This used to inspect only assemble, allowing a handover to put its freely-held
           # subassembly through the table and fail later as an unexplained "no path".
-          if robot_ik.penetration_reject is not None:
+          if (robot_ik.penetration_reject is not None
+              or getattr(robot_ik, "object_over_table", False)):
             from solver import validate_export_witnesses
             _pre_gate_input_wit = list(mp_wit)
             mp_wit, _bad = validate_export_witnesses(
@@ -4675,11 +4776,19 @@ def run(cfg, explicit=None):
               print(f"[export-gate] FAILURE: {len(_bad)} IK keyframe(s) exceed the search "
                     f"collision gate; motion planning was NOT started:")
               for _i, _act, _p, _, _why in _bad:
-                if _why is not None and _why[3] == "joint-limit":
+                # Clearance reasons are (frame_a, frame_b, distance, class); the
+                # object-over-table gate reports (part, excess, table_xy).  Keep this
+                # diagnostic fail-closed without assuming the reason schemas coincide.
+                if (_why is not None and len(_why) == 3
+                    and isinstance(_why[2], (tuple, list))):
+                  print(f"    step {_i} {_act[:4]}: {_why[0]} datum is "
+                        f"{_why[1] * 1000:.1f}mm outside the table footprint at "
+                        f"xy=({_why[2][0]:.3f}, {_why[2][1]:.3f})m")
+                elif _why is not None and len(_why) >= 4 and _why[3] == "joint-limit":
                   print(f"    step {_i} {_act[:4]}: {_why[0]} has only "
                         f"{_why[2]:.6f}rad limit slack "
                         f"(gate {robot_ik.joint_margin_reject:g}rad)")
-                elif _why is not None:
+                elif _why is not None and len(_why) >= 4:
                   print(f"    step {_i} {_act[:4]}: {_why[3]} pair {_why[0]} ~ {_why[1]} "
                         f"has {_why[2] * 1000:.2f}mm clearance "
                         f"(gate {robot_ik.clearance_reject * 1000:.1f}mm)")
@@ -4805,6 +4914,7 @@ def run(cfg, explicit=None):
               "table_float": float(_export_table_float or 0.0),
               "pre_insertion": float(robot_ik.pre_insertion_delta),
               "pre_pick": float(robot_ik.pre_pick_delta),
+              "post_pick": float(robot_ik.post_pick_delta),
               "pre_place": float(robot_ik.pre_place_delta),
               "pre_add_grasp": float(robot_ik.pre_add_grasp_delta),
               "post_release": float(robot_ik.post_release_delta),

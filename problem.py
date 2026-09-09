@@ -141,6 +141,14 @@ class Assembly:
     self.masses = {}
     self.mate_types = {}
     self.mate_axes = {}
+    # Optional FINITE wrench transmitted by an already-seated mate.  The key is the child
+    # part (and therefore identifies its authored child->parent mate); values are independent
+    # component bounds in the PARENT mate frame:
+    #   {part: {"force": [Fx,Fy,Fz], "torque": [Mx,My,Mz]}}
+    # Missing mates remain ideal rigid welds.  The concrete wrench checker contracts every
+    # ideal edge into a rigid supernode and retains only these finite interfaces, so assemblies
+    # without entries take the historical one-body LP path exactly.
+    self.mate_wrench_limits = {}
     # DISCRETE, FUNCTIONALLY-EQUIVALENT MATE ORIENTATIONS.  Each authored quaternion is the
     # orientation of the mated part in its parent's frame (wxyz); identity is implicit for
     # ordinary mates.  The finite set is deliberately metadata until the opt-in runtime flag
@@ -473,6 +481,15 @@ class Assembly:
             f"invalid mate-symmetry quaternion for {part}: {q!r}"
         assert abs(float(np.linalg.norm(q)) - 1.0) < 1e-8, \
             f"mate-symmetry quaternion for {part} is not normalized: {q!r}"
+    for part, limit in self.mate_wrench_limits.items():
+      assert part in self.assembly_relative_poses, \
+          f"mate wrench limit assigned to non-mated part {part}"
+      assert isinstance(limit, dict) and set(limit) == {"force", "torque"}, \
+          f"mate wrench limit for {part} needs force and torque vectors"
+      for kind in ("force", "torque"):
+        v = np.asarray(limit[kind], dtype=float)
+        assert v.shape == (3,) and np.all(np.isfinite(v)) and np.all(v >= 0.0), \
+            f"invalid {kind} mate wrench limit for {part}: {limit[kind]!r}"
 
   def dependencies_of(self, part):
     return self.assembly_dependencies.get(part, [])
@@ -579,7 +596,10 @@ def add_disassembled_obj(C, assembly, perturb_start_pose=False, pos_noise=0.03, 
       obj.setRelativePosition([pos[0], pos[1], pos[2]]).setJoint(ry.JT.rigid)
       if scatter_q is not None:
         obj.setRelativeQuaternion(list(scatter_q))
-      shape_f.setMass(0.1)                                 # rai wants the mass on the shape
+      # RAI stores a rigid body's mass on one of its shapes.  Keep this authored scene value
+      # consistent with the mass used later by the wrench model and MuJoCo (compound children
+      # remain one body, so only the first child owns this field).
+      shape_f.setMass(float(assembly.masses.get(name, assembly.DEFAULT_MASS)))
       _col = np.random.rand(3)                             # ONE draw, as before: the global
       shape_f.setColor(_col)                               # np.random stream is id-bearing
       for _s in _extra_shape_fs:                           # downstream (scatter layout)
@@ -1923,7 +1943,10 @@ class YandVStoolAssembly(Assembly):
     self.base = "obj_0"
     self.part_shapes["obj_0"] = ("compound", children)
     self.visual_meshes["obj_0"] = self._seat_visual_mesh
-    self.masses["obj_0"] = 0.75
+    # Y&V's demonstrator is deliberately lightweight: the seat is at most 100g and each
+    # wooden leg is about 50g.  These are the physical masses shared by the wrench LP and
+    # MuJoCo; the CAD display meshes themselves carry zero inertia.
+    self.masses["obj_0"] = 0.10
     leg_spec = ("box", [self.leg_x, self.leg_y, self.leg_length, 0.0])
     # Lie each leg flat: its local +z (long axis) becomes world +x. This matches the
     # established peg-stool convention and leaves both end faces reachable.
@@ -1946,7 +1969,15 @@ class YandVStoolAssembly(Assembly):
       self.mate_symmetry_quats[part] = tuple(
           np.array([np.cos(k * np.pi / 2.0), 0.0, 0.0,
                     np.sin(k * np.pi / 2.0)]) for k in range(2))
-      self.masses[part] = 0.08
+      self.masses[part] = 0.05
+      # Deliberately modest demonstrator joint strength.  A leg easily carries its own 50g
+      # weight and its share of the 100g seat, but one leg cannot act as an infinitely strong
+      # handle for the complete stool and the four legs alone cannot relay a 10N insertion
+      # press into the table.  That should make direct seat support/bracing emerge in search.
+      self.mate_wrench_limits[part] = {
+          "force": [1.0, 1.0, 1.0],       # N, parent-mate-frame component box
+          "torque": [0.03, 0.03, 0.03],   # Nm
+      }
 
 
 class SlotPinAssembly(Assembly):
@@ -2812,6 +2843,7 @@ def set_sampled_grasps(mode):
                          int(mode.get("master_keep", mode.get("keep", 12)))),
       "margin": float(mode.get("margin", 0.008)),
       "pad_support": float(mode.get("pad_support", 0.75)),
+      "strict": bool(mode.get("strict", False)),
       "wrap": (None if mode.get("wrap") is None else float(mode.get("wrap")))}
   _SAMPLED_VIEWS_CACHE.clear()
   _SAMPLED_META_CACHE.clear()
@@ -3593,9 +3625,10 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
       tail.append(e); tail_seen.add(id(e[0])); progressed = True
     if not progressed:
       break
-  for e in ordered(bad):                                  # finite fallback for tiny/curved parts
-    if id(e[0]) not in tail_seen:
-      tail.append(e); tail_seen.add(id(e[0]))
+  if not bool(_SAMPLED_GRASPS.get("strict", False)):
+    for e in ordered(bad):                                # finite fallback for tiny/curved parts
+      if id(e[0]) not in tail_seen:
+        tail.append(e); tail_seen.add(id(e[0]))
   for e in canonical_fallback:                           # free-space source poses: last resort
     if id(e[0]) not in tail_seen:
       tail.append(e); tail_seen.add(id(e[0]))
@@ -3613,7 +3646,7 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
   reserve_blocks = []
   for fact in facts:
     block = [e for e in primary if has_scene_fact(e, fact)]
-    if not block:
+    if not block and not bool(_SAMPLED_GRASPS.get("strict", False)):
       block = [e for e in bad if has_scene_fact(e, fact)]
     if block:
       reserve_blocks.append((fact, ordered(block)))
@@ -3648,7 +3681,7 @@ def _sampled_keys(spec, offset, part=None):
   # and all obsolete generation branches are gone.
   base = (_spec_key(spec), float(offset), 2, cfgv["seed"], cfgv["candidates"],
           float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)),
-          cfgv.get("wrap"))
+          cfgv.get("wrap"), bool(cfgv.get("strict", False)))
   ctx = _SAMPLED_SCENE_CTX
   cache = base + (cfgv.get("master_keep", cfgv["keep"]),)
   return base, cache + (part, (ctx["sig"] if ctx is not None else None))
@@ -5277,7 +5310,8 @@ def _vacuum_engagement_stable(state, assembly, group, robot, gpart, grasp_id,
   res = _group_stable(
       state, assembly, group, gripper_kind,
       applied=[(force * approach, point)],
-      table_override=("friction", mu_engage) if mu_engage > 0.0 else None)
+      table_override=("friction", mu_engage) if mu_engage > 0.0 else None,
+      applied_part=gpart)
   _VEG_CACHE[key] = res
   return res
 
@@ -6221,7 +6255,21 @@ def _rest_stable(assembly, group, ref, face, anchor_q, tol=1e-4, span_tol=1e-3):
   if len(low) >= 3:
     xy = low[:, :2] - low[:, :2].mean(axis=0)
     if float(np.linalg.svd(xy, compute_uv=False)[1]) > span_tol:
-      return True                                            # 2-D support polygon: stable
+      # A non-degenerate footprint is necessary but not sufficient: the mass-weighted COM
+      # projection must also lie in its convex hull.  The old span-only test called a stool
+      # with ONE corner leg "stable" merely because that leg's cap has four corners.  A place
+      # then touched on the leg with the seat COM far outside the cap and toppled/slid in
+      # MuJoCo.  This is the standard static support-polygon criterion and uses the same
+      # authored masses as the wrench model.
+      from scipy.spatial import ConvexHull
+      hull = ConvexHull(low[:, :2])
+      masses = np.asarray([assembly.mass(p) for p in group], dtype=float)
+      com_xy = np.average(np.asarray([poses[p][:2] for p in group]), axis=0,
+                          weights=masses)
+      # scipy's facet convention is A*x+b <= 0 inside.  ``tol`` admits only numerical
+      # boundary noise, not a physically meaningful COM overhang.
+      if np.all(hull.equations[:, :2] @ com_xy + hull.equations[:, 2] <= tol):
+        return True                                        # genuinely stable support polygon
   # NEUTRAL (rolling) rest -- change-2-lite: a lone CYLINDER on its curved side (line
   # contact) or a SPHERE (point) does not TIP: as it rolls, the contact follows the curved
   # surface and the COM stays above it (neutral equilibrium) -- it stays put when placed,
@@ -6492,11 +6540,178 @@ def _grasp_frame(assembly, part, part_pose, grasp_id):
 _WRENCH_CACHE = {}
 # solve-scoped vacuum-engagement verdict cache (cleared with _WRENCH_CACHE).
 _VEG_CACHE = {}
+# Finite internal-mate transmission is the physical model by default.  It remains separately
+# switchable for a clean paper ablation and, crucially, assemblies with no authored limits do
+# not enter the new code path at all.
+_MATE_WRENCH_LIMITS = True
+
+
+def set_mate_wrench_limits(enabled=True):
+  global _MATE_WRENCH_LIMITS
+  _MATE_WRENCH_LIMITS = bool(enabled)
+
+
+def _finite_mate_limits(assembly, group):
+  """Enabled finite child->parent mate edges wholly contained in ``group``.
+
+  A tuple is used throughout so cache keys and supernode construction are deterministic.
+  Every missing edge is an ideal weld and is contracted by `_multibody_grounding_caps`.
+  """
+  if not _MATE_WRENCH_LIMITS:
+    return ()
+  members = set(group)
+  out = []
+  for child in sorted(getattr(assembly, "mate_wrench_limits", {}), key=_part_index):
+    rel = assembly.relative_pose(child)
+    if child in members and rel is not None and rel[0] in members:
+      lim = assembly.mate_wrench_limits[child]
+      out.append((child, rel[0], tuple(float(x) for x in lim["force"]),
+                  tuple(float(x) for x in lim["torque"])))
+  return tuple(out)
 
 
 def reset_wrench_cache():
   _WRENCH_CACHE.clear()
   _VEG_CACHE.clear()
+
+
+def _table_footprint_by_part(assembly, poses, group, tol=1e-3):
+  """Like `_table_footprint`, retaining which finite-mate rigid node owns each point."""
+  by_part = {p: _part_support_points_world(poses[p], assembly.part_shape(p)) for p in group}
+  zmin = min(x[2] for cs in by_part.values() for x in cs)
+  return [(p, x) for p, cs in by_part.items() for x in cs if x[2] <= zmin + tol]
+
+
+def _multibody_grounding_caps(state, assembly, group, gripper_kind, finite,
+                              table_override=None):
+  """Grounding + finite internal-interface matrix for exact per-rigid-node equilibrium.
+
+  Ideal mates are unioned into rigid supernodes.  Each capped mate contributes one bounded
+  wrench box with equal-and-opposite columns on its two incident nodes.  Grounding contacts
+  act only on the node containing the physical contact, and gravity is accumulated per node.
+  All moments use one common group centroid, making the internal reactions cancel exactly
+  when the node equilibrium rows are summed.
+  """
+  if isinstance(gripper_kind, dict):
+    kind_of = gripper_kind.get
+    gk_key = tuple(sorted(gripper_kind.items()))
+  else:
+    kind_of = lambda _r: gripper_kind
+    gk_key = gripper_kind
+  cap_sig = tuple((c, p, f, t) for c, p, f, t in finite)
+  cache = getattr(state, "_mgcaps", None)
+  if cache is None:
+    cache = state._mgcaps = {}
+  ckey = (_subasm_key(group), cap_sig, gk_key, wrench.PARAMS.get("table_model"),
+          wrench.PARAMS.get("table_mu"), table_override)
+  hit = cache.get(ckey)
+  if hit is not None:
+    return hit
+
+  members = sorted(group, key=_part_index)
+  finite_children = {x[0] for x in finite}
+  parent = {p: p for p in members}
+
+  def find(p):
+    while parent[p] != p:
+      parent[p] = parent[parent[p]]
+      p = parent[p]
+    return p
+
+  def union(a, b):
+    ra, rb = find(a), find(b)
+    if ra != rb:
+      # Stable root choice is useful for deterministic cache keys and diagnostics.
+      if _part_index(ra) > _part_index(rb):
+        ra, rb = rb, ra
+      parent[rb] = ra
+
+  member_set = set(members)
+  for child in members:
+    rel = assembly.relative_pose(child)
+    if rel is not None and rel[0] in member_set and child not in finite_children:
+      union(child, rel[0])
+  comps = {}
+  for p in members:
+    comps.setdefault(find(p), []).append(p)
+  nodes = sorted((tuple(sorted(ps, key=_part_index)) for ps in comps.values()),
+                 key=lambda ps: _part_index(ps[0]))
+  node_of = {p: i for i, ps in enumerate(nodes) for p in ps}
+  node_map = tuple((p, node_of[p]) for p in members)
+
+  base = reference_part(group)
+  on_table = any(("table",) in state.supports.get(p, ()) for p in members)
+  grasps = tuple(sorted((kind_of(c[1]), c[2], c[3]) for p in members
+                        for c in state.supports.get(p, ()) if c[0] == "grasp"))
+  anchor_q = np.round(np.asarray(state.poses[base][3:], dtype=float), 9).tobytes()
+  l2 = getattr(assembly, "_mate_caps_cache", None)
+  if l2 is None:
+    l2 = assembly._mate_caps_cache = {}
+  l2key = (tuple(nodes), cap_sig, on_table,
+           _placement_face(state, group) if on_table else None, anchor_q, grasps,
+           wrench.PARAMS.get("grasp_model"), wrench.PARAMS.get("curved_grasp_torque_scale"),
+           wrench.PARAMS.get("table_model"), wrench.PARAMS.get("table_mu"), _ROLLS_PER_FACE,
+           table_override)
+  anchor_pos = np.asarray(state.poses[base][:3], dtype=float)
+  l2hit = l2.get(l2key)
+  if l2hit is not None:
+    coff, w_grav, G, ub, bounds, gbytes, cached_map = l2hit
+    hit = cache[ckey] = (anchor_pos + coff, w_grav, G, ub, bounds, gbytes, cached_map)
+    return hit
+
+  poses = _state_part_poses(state, assembly, lift=0.0)
+  pos = {p: np.asarray(poses[p][:3], dtype=float) for p in members}
+  centroid = np.mean([pos[p] for p in members], axis=0)
+  D = 6 * len(nodes)
+  w_grav = np.zeros(D)
+  for p in members:
+    i = node_of[p]
+    w_grav[6 * i:6 * i + 6] += wrench.gravity_wrench(
+        [(assembly.mass(p), pos[p] - centroid)])
+
+  columns, limits = [], []
+
+  def add_cap(G6, ub6, positive_node, negative_node=None):
+    E = np.zeros((D, G6.shape[1]))
+    E[6 * positive_node:6 * positive_node + 6, :] = G6
+    if negative_node is not None:
+      E[6 * negative_node:6 * negative_node + 6, :] = -G6
+    columns.append(E)
+    limits.append(np.asarray(ub6, dtype=float))
+
+  if on_table:
+    points = _table_footprint_by_part(assembly, poses, members)
+    by_node = {}
+    for p, x in points:
+      by_node.setdefault(node_of[p], []).append(np.asarray(x, dtype=float) - centroid)
+    for i in sorted(by_node):
+      cp = (wrench.table_capability_override(by_node[i], *table_override)
+            if table_override else wrench.table_capability(by_node[i]))
+      add_cap(cp[0], cp[1], i)
+  derate = wrench.PARAMS.get("curved_grasp_torque_scale") is not None
+  for p in members:
+    for c in sorted(state.supports.get(p, ())):
+      if c[0] != "grasp" or not _grasp_holds(assembly, members, c[2]):
+        continue
+      gp, n, t1, t2 = _grasp_frame(assembly, c[2], poses[c[2]], c[3])
+      surf = _grasp_surface(assembly.grasp_shape(c[2]), c[3]) if derate else "flat"
+      cp = wrench.grasp_capability(gp - centroid, n, t1, t2, kind_of(c[1]), surface=surf)
+      add_cap(cp[0], cp[1], node_of[c[2]])
+  for child, par, fcap, tcap in finite:
+    R = _quat_to_R(np.asarray(poses[par][3:], dtype=float))
+    rel = np.asarray(assembly.relative_pose(child)[1], dtype=float)
+    point = np.asarray(poses[par][:3], dtype=float) + R @ (
+        rel + assembly.mate_interface(child, assembly.mate_axis(child)))
+    cp = wrench.cap_mate_box(point - centroid, R, fcap, tcap)
+    add_cap(cp[0], cp[1], node_of[child], node_of[par])
+
+  G = np.hstack(columns) if columns else np.zeros((D, 0))
+  ub = np.concatenate(limits) if limits else np.zeros(0)
+  bounds = [(0.0, None if not np.isfinite(u) else float(u)) for u in ub]
+  gbytes = (np.round(G, 4).tobytes(), np.round(ub, 4).tobytes(), D)
+  hit = cache[ckey] = (centroid, w_grav, G, ub, bounds, gbytes, node_map)
+  l2[l2key] = (centroid - anchor_pos,) + hit[1:]
+  return hit
 
 
 def reset_grasp_pose_cache():
@@ -6594,7 +6809,8 @@ def _grounding_caps(state, assembly, group, gripper_kind, table_override=None):
   return hit
 
 
-def _group_stable(state, assembly, group, gripper_kind, applied=(), table_override=None):
+def _group_stable(state, assembly, group, gripper_kind, applied=(), table_override=None,
+                  applied_part=None):
   # static-equilibrium feasibility for a subassembly: can its grounding contacts balance
   # gravity plus any `applied` [(force_vec_world, point_world[, pure_torque_world]), ...]
   # (e.g. insertion or screwing)? The optional third vector is a FREE COUPLE, not a force at
@@ -6602,17 +6818,32 @@ def _group_stable(state, assembly, group, gripper_kind, applied=(), table_overri
   # load-independent contacts come from _grounding_caps (cached); here we only add the applied
   # load to the gravity wrench and hit the LP cache / solve. table_override: scoped table
   # model for the engagement gate, see _grounding_caps.
-  centroid, w_grav, G, ub, bounds, gbytes = _grounding_caps(
-      state, assembly, group, gripper_kind, table_override=table_override)
-  w_applied = np.zeros(6)
+  finite = _finite_mate_limits(assembly, group)
+  if finite:
+    centroid, w_grav, G, ub, bounds, gbytes, node_map = _multibody_grounding_caps(
+        state, assembly, group, gripper_kind, finite, table_override=table_override)
+    node_of = dict(node_map)
+    load_part = applied_part if applied_part is not None else reference_part(group)
+    if load_part not in node_of:
+      raise ValueError(f"applied wrench owner {load_part!r} is outside group {sorted(group)}")
+    load_row = 6 * node_of[load_part]
+    w_applied = np.zeros_like(w_grav)
+  else:
+    # Keep the historical one-rigid-body formulation as the literal fast path.  Besides
+    # providing the ablation, this guarantees byte-identical behavior for every existing
+    # assembly that has no finite mate metadata.
+    centroid, w_grav, G, ub, bounds, gbytes = _grounding_caps(
+        state, assembly, group, gripper_kind, table_override=table_override)
+    load_row = 0
+    w_applied = np.zeros(6)
   for load in applied:
     f, pt = load[:2]
-    w_applied = w_applied + wrench.point_force_wrench(
+    w_applied[load_row:load_row + 6] += wrench.point_force_wrench(
         f, np.asarray(pt, dtype=float) - centroid)
     if len(load) >= 3:
-      w_applied = w_applied + np.concatenate(
+      w_applied[load_row:load_row + 6] += np.concatenate(
           [np.zeros(3), np.asarray(load[2], dtype=float)])
-  geo_key = (gbytes[0], gbytes[1])
+  geo_key = (("mate",) + gbytes) if finite else (gbytes[0], gbytes[1])
   # A freely held component can be rotated by the continuous witness even though the
   # discrete state retains its last table orientation. Under the opt-in robust model, keep
   # contacts and process wrench fixed in that body frame and let gravity range over the
@@ -6625,6 +6856,9 @@ def _group_stable(state, assembly, group, gripper_kind, applied=(), table_overri
   orientation_robust = bool(
       orientation_requested
       and not any(("table",) in state.supports.get(p, ()) for p in group))
+  if orientation_robust and finite:
+    raise ValueError("finite mate wrench limits do not yet support "
+                     "--orientation-robust-wrench; use the default fixed-orientation model")
   if orientation_robust:
     poses = _state_part_poses(state, assembly, lift=0.0)
     gravity_map = wrench.gravity_wrench_map([
@@ -6724,17 +6958,19 @@ def _grasp_surface(spec, grasp_id):
   return surfaces[grasp_id]
 
 
-def _group_stable_loaded(state, assembly, group, gripper_kind, load_variants):
+def _group_stable_loaded(state, assembly, group, gripper_kind, load_variants,
+                         applied_part=None):
   # ROBUST stability under an UNCERTAIN applied load: the group must balance EVERY worst-case
   # realization in `load_variants` (a list of (force_world, point) corners from
   # _insertion_uncertainty_variants). With insertion_uncertainty off that list is the single
   # nominal load, so this is exactly the old one-shot _group_stable check.
-  return all(_group_stable(state, assembly, group, gripper_kind, applied=[lv])
+  return all(_group_stable(state, assembly, group, gripper_kind, applied=[lv],
+                           applied_part=applied_part)
              for lv in load_variants)
 
 
 def _group_stable_affine(state, assembly, group, gripper_kind, f0, point, gens,
-                         pure_torque=None):
+                         pure_torque=None, applied_part=None):
   # CONSERVATIVE robust check: one AFFINE contact-force policy must hold across the whole
   # uncertainty box (wrench.equilibrium_robust_affine), vs _group_stable_loaded's EXACT per-corner
   # test. Builds the nominal wrench w0 and the box's generator wrenches delta_j about the group
@@ -6742,6 +6978,9 @@ def _group_stable_affine(state, assembly, group, gripper_kind, f0, point, gens,
   # implies every TRUE corner is stable only when the box has no point-shift generators
   # (offset == 0) -- with shift and tilt together the corners carry a bilinear cross couple
   # that no linear policy can express. _robust_stable guards this (falls back to corners).
+  if _finite_mate_limits(assembly, group):
+    raise ValueError("finite mate wrench limits do not yet support --robust-mode affine; "
+                     "use --robust-mode corners")
   centroid, w_grav, G, ub, bounds, _ = _grounding_caps(state, assembly, group, gripper_kind)
   f0 = np.asarray(f0, dtype=float); point = np.asarray(point, dtype=float)
   w0 = w_grav + wrench.point_force_wrench(f0, point - centroid)
@@ -6762,7 +7001,7 @@ _AFFINE_FALLBACK_WARNED = [False]
 
 
 def _robust_stable(state, assembly, group, gripper_kind, f_world, point, mag, scale=1.0,
-                   pure_torque=None):
+                   pure_torque=None, applied_part=None):
   # dispatch the robust insertion-stability check by wrench.PARAMS['robust_mode']:
   #   'corners' (default, EXACT): every uncertainty-box corner must be balanceable, the contacts
   #             free to rechoose their force split per realization (fully-adjustable robustness).
@@ -6784,11 +7023,12 @@ def _robust_stable(state, assembly, group, gripper_kind, f_world, point, mag, sc
     else:
       f0, pt, gens = _insertion_uncertainty_gens(f_world, point, mag, scale=scale)
       return _group_stable_affine(state, assembly, group, gripper_kind, f0, pt, gens,
-                                  pure_torque=pure_torque)
+                                  pure_torque=pure_torque, applied_part=applied_part)
   variants = _insertion_uncertainty_variants(f_world, point, mag, scale=scale)
   if pure_torque is not None:
     variants = [(f, pt, np.asarray(pure_torque, dtype=float)) for f, pt in variants]
-  return _group_stable_loaded(state, assembly, group, gripper_kind, variants)
+  return _group_stable_loaded(state, assembly, group, gripper_kind, variants,
+                              applied_part=applied_part)
 
 
 def _cross3(a, b):
@@ -6973,6 +7213,15 @@ def _wrench_params_sig():
           None if not unc else _sigv(unc))
 
 
+def _mate_wrench_sig(assembly):
+  if not _MATE_WRENCH_LIMITS:
+    return False
+  return tuple((p, tuple(float(x) for x in lim["force"]),
+                tuple(float(x) for x in lim["torque"]))
+               for p, lim in sorted(getattr(assembly, "mate_wrench_limits", {}).items(),
+                                    key=lambda kv: _part_index(kv[0])))
+
+
 def _insertion_stable(state, assembly, group, gripper_kind, part, onto, d=None):
   # `group` (the TARGET) withstands the robust insertion reaction of `part` seating onto it.
   # A compliantly-held target wanders under the press -> its uncertainty box inflates.
@@ -6982,7 +7231,8 @@ def _insertion_stable(state, assembly, group, gripper_kind, part, onto, d=None):
   # assemble candidate), which measured thousands of redundant re-asks in a wandering fill.
   # The PARAMS signature keeps the cache sound across in-process re-tunes (replay, tests).
   key = (state.key(), part, onto,
-         _compliance_factor(state, assembly, group, gripper_kind), _wrench_params_sig())
+         _compliance_factor(state, assembly, group, gripper_kind), _wrench_params_sig(),
+         _mate_wrench_sig(assembly))
   cache = getattr(state, "_ins_cache", None)
   if cache is None:
     cache = state._ins_cache = {}
@@ -6993,7 +7243,8 @@ def _insertion_stable(state, assembly, group, gripper_kind, part, onto, d=None):
   res = _robust_stable(state, assembly, group, gripper_kind, f_world, point,
                        wrench.insert_force(part), scale=key[3],
                        pure_torque=_screw_torque_load(
-                           state, assembly, part, onto, target_side=True))
+                           state, assembly, part, onto, target_side=True),
+                       applied_part=onto)
   cache[key] = res
   return res
 
@@ -7004,7 +7255,8 @@ def _inserter_stable(state, assembly, group, gripper_kind, part, onto, d=None):
   # Same per-state verdict cache as _insertion_stable (the inserter side is asked just as
   # often, with the same 4-corner cost under noise).
   key = (state.key(), part, onto,
-         _compliance_factor(state, assembly, group, gripper_kind), _wrench_params_sig())
+         _compliance_factor(state, assembly, group, gripper_kind), _wrench_params_sig(),
+         _mate_wrench_sig(assembly))
   cache = getattr(state, "_iser_cache", None)
   if cache is None:
     cache = state._iser_cache = {}
@@ -7015,7 +7267,8 @@ def _inserter_stable(state, assembly, group, gripper_kind, part, onto, d=None):
   res = _robust_stable(state, assembly, group, gripper_kind, f_world, point,
                        wrench.insert_force(part), scale=key[3],
                        pure_torque=_screw_torque_load(
-                           state, assembly, part, onto, target_side=False))
+                           state, assembly, part, onto, target_side=False),
+                       applied_part=part)
   cache[key] = res
   return res
 

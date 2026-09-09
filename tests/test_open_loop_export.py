@@ -39,6 +39,10 @@ def test_export_open_loop_contains_robot_derivatives_and_annotations(tmp_path):
     assert list(z["controller_active"]) == [False, True, True, False]
     close = z["gripper_close_start"]
     assert close.shape == (4, 2) and close[2, 1] and close.sum() == 1
+    attached = z["attached_objects"]
+    assert attached.shape == (4, 2)
+    assert list(attached[0]) == ["", ""]
+    assert list(attached[2]) == ["", "obj_1"]
     assert json.loads(str(z["robot_slices"])) == {"a1": [0, 1], "a2": [1, 2]}
     assert json.loads(str(z["metadata"]))["source_signal"] == "simulated_joint_qpos"
 
@@ -57,13 +61,16 @@ def test_export_open_loop_json_has_the_same_typed_channels(tmp_path):
   assert len(samples) == 9
   assert [row["time"] for row in samples] == pytest.approx(np.arange(9) * 0.05)
   assert all(set(row) == {"q", "qd", "qdd", "time", "opening_gripper",
-                          "closing_gripper", "servo_controller"} for row in samples)
+                          "closing_gripper", "servo_controller", "attached_objects"}
+             for row in samples)
   assert np.asarray([row["q"] for row in samples]).shape == (9, 2)
   assert np.asarray([row["qd"] for row in samples]).shape == (9, 2)
   assert np.asarray([row["qdd"] for row in samples]).shape == (9, 2)
   assert samples[4]["closing_gripper"] == ["a2"]
   assert samples[5]["closing_gripper"] == ["a2"]
   assert samples[8]["opening_gripper"] == ["a1"]
+  assert samples[0]["attached_objects"] == {"a1": None, "a2": None}
+  assert samples[4]["attached_objects"] == {"a1": None, "a2": "obj_1"}
   # The arm is held at the close configuration for the requested 100ms before proceeding.
   assert np.allclose(samples[4]["q"], samples[5]["q"])
   assert np.allclose(samples[5]["q"], samples[6]["q"])

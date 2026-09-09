@@ -69,6 +69,7 @@ def main():
     rik.pre_insertion_delta = float(settings.get("pre_insertion",
                                                  cfg.get("pre_insertion", 0.0)))
     rik.pre_pick_delta = float(settings.get("pre_pick", cfg.get("pre_pick", 0.0)))
+    rik.post_pick_delta = float(settings.get("post_pick", cfg.get("post_pick", 0.0)))
     rik.pre_place_delta = float(settings.get("pre_place", cfg.get("pre_place", 0.0)))
     rik.pre_add_grasp_delta = float(settings.get("pre_add_grasp",
                                                  cfg.get("pre_add_grasp", 0.0)))

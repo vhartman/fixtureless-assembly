@@ -314,6 +314,19 @@ def test_orientation_robust_wrench_cli_and_plan_roundtrip(tmp_path):
   assert RunConfig.from_file(str(out)).orientation_robust_wrench is True
 
 
+def test_object_over_table_cli_and_plan_roundtrip(tmp_path):
+  cfg = RunConfig.from_namespace(main.parse_args([
+      "--object-over-table", "--object-over-table-margin", "0.03",
+  ]))
+  assert cfg.object_over_table is True
+  assert cfg.object_over_table_margin == 0.03
+  out = tmp_path / "object-over-table-plan.json"
+  main.save_plan(str(out), cfg, [])
+  loaded = RunConfig.from_file(str(out))
+  assert loaded.object_over_table is True
+  assert loaded.object_over_table_margin == 0.03
+
+
 def test_max_robotiq_wrench_profile_cli_and_plan_roundtrip(tmp_path):
   cfg = RunConfig.from_namespace(main.parse_args([
       "--search-profile", "standard", "--wrench-profile", "max_robotiq",

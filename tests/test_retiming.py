@@ -308,6 +308,23 @@ def test_schedule_no_collide_is_pure_desync():
   assert a.q.shape == b.q.shape and np.allclose(a.q, b.q)    # a no-op collide changes nothing
 
 
+def test_schedule_structural_lock_keeps_payload_on_certified_diagonal():
+  # A carrying arm cannot be allowed to run ahead of another arm through the same symbolic
+  # state: that would move its payload through a configuration absent from the certified
+  # composite path.  Structural locks express this attachment invariant without needing a
+  # collision counterexample first.
+  st = [([np.array([0.0, 0.0]), np.array([4.0, 8.0])], [10])]
+  dims = [np.array([0]), np.array([1])]
+  free = retiming.plan_schedule(st, dims, [{0}], DT, RATE, RD, RM,
+                                per_arm_rate=True)
+  locked = retiming.plan_schedule(st, dims, [{0}], DT, RATE, RD, RM,
+                                  per_arm_rate=True,
+                                  locked=[(0, 1, 0.0, np.hypot(4.0, 8.0))])
+  assert np.abs(free.q[:, 0] / 4.0 - free.q[:, 1] / 8.0).max() > 0.05
+  assert np.allclose(locked.q[:, 0] / 4.0, locked.q[:, 1] / 8.0)
+  assert [e for _, e in locked.fires] == [[10]]
+
+
 def test_schedule_world_evolution_wait():
   # An AHEAD arm blocked by a part that MOVES at event 0: collide depends on `fired`.
   # arm1 crosses barrier 0's arc without stopping but may not pass x1=4 (beyond the

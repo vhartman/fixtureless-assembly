@@ -26,7 +26,7 @@ def test_husky_exposes_two_normal_robot_subtrees_and_valid_home():
   assert A.get_robots(C) == ["a1", "a2"]
   assert is_husky_scene(C)
   table = C.getFrame("table")
-  assert np.isclose(table.getPosition()[2] + table.getSize()[2] / 2.0, 0.54)
+  assert np.isclose(table.getPosition()[2] + table.getSize()[2] / 2.0, 0.44)
   assert len(C.getJointState()) == 12
   assert all(n.startswith(("a1_", "a2_")) for n in C.getJointNames())
   for r in A.get_robots(C):

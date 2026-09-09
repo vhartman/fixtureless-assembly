@@ -270,6 +270,22 @@ def test_sampler_contains_conventional_grasps_and_refines_by_prefix():
   assert all(np.array_equal(a, b) for a, b in zip(q20, q24))
 
 
+def test_strict_sampler_omits_below_gate_fallback_rows():
+  """The opt-in strict mode must never expose a sampled row below either quality gate.
+
+  Conventional face grasps are deliberately unchanged; the contract applies to the
+  generated cloud that historically filled an undersized prefix with ``bad`` rows.
+  """
+  P.set_sampled_grasps({"seed": 3, "candidates": 96, "keep": 32,
+                        "margin": 0.015, "pad_support": 0.9,
+                        "wrap": 0.015, "strict": True})
+  meta = P.sampled_grasp_meta(CUBE)
+  sampled = [m for m in meta if str(m.get("origin", "")).startswith("sampled")]
+  assert sampled
+  assert all(float(m["edge_clearance"]) >= 0.015 for m in sampled)
+  assert all(float(m["pad_support"]) >= 0.9 for m in sampled)
+
+
 def test_closure_ranking_prioritizes_certified_canonical_rows_without_deleting_fallbacks():
   """A cuboid's conventional prefix must not bypass closure-aware sampler ranking."""
   entries = []

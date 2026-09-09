@@ -342,6 +342,7 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
   from visualization import _active_robots
 
   pre_pick = getattr(robot_ik, "pre_pick_delta", 0.0) > 0.0       # --pre-pick:      split pick
+  post_pick = getattr(robot_ik, "post_pick_delta", 0.0) > 0.0     # --post-pick: held retreat
   pre_place = getattr(robot_ik, "pre_place_delta", 0.0) > 0.0     # --pre-place:     split place
   pre_add_grasp = getattr(robot_ik, "pre_add_grasp_delta", 0.0) > 0.0  # --pre-add-grasp: split brace reach
   pre_ins = (getattr(robot_ik, "pre_insertion_delta", 0.0) > 0.0
@@ -453,7 +454,7 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
     return q
 
   def split_skill(a, i, wit, involved, name, kind, mk_skill, members=None,
-                  complete_place_funnel=False):
+                  complete_place_funnel=False, complete_pick_funnel=False):
     # --pre-*: prepend a GOTO to the pre-skill FUNNEL pose (skill witness backed off along its
     # approach axis) before the REAL skill task. Pure motion first (the collision-free approach
     # the free-space planner connects to), then the unchanged skill at the real witness -- so the
@@ -477,6 +478,7 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       print(f"  [pre] {i:02d} {kind}: NO pre keyframe -- the goto goal equals the skill goal "
             f"(zero-length funnel)")
     post_name = f"{i:02d}_post_place_{'_'.join(str(x) for x in a[1:])}"
+    post_pick_name = f"{i:02d}_post_pick_{'_'.join(str(x) for x in a[1:])}"
     if not members:
       pre_member = pre_wit if pre_wit is not None else wit
       pre_involved = list(involved)
@@ -484,6 +486,21 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
                           pre_member)                                        # cur := T_pre
       out = [(pan, Task(pan, pre_involved, pre_goal, type="goto")),
              (name, mk_skill(goal_for(involved, wit)))]                      # cur := real witness
+      if complete_pick_funnel:
+        # After a TABLE pick, retreat along the support normal (+world z), not back to the
+        # empty-hand pre-grasp pose.  The payload is attached in states[i+1], so this separate
+        # IK endpoint sees its full swept geometry and cannot encode the old lift-then-descend
+        # artefact.  Non-table acquisitions (and a failed vertical endpoint) retain the
+        # historical, branch-paired approach-axis standoff.
+        post_member = robot_ik.post_pick_witness(
+            a, states[i], states[i + 1], assembly, wit)
+        if post_member is None:
+          print(f"  [post-pick] {i:02d}: no table-normal retreat keyframe -- using the "
+                "paired approach-axis endpoint")
+          post_member = pre_member
+        post_goal = goal_for([a[1]], post_member)
+        out.append((post_pick_name,
+                    Task(post_pick_name, [a[1]], post_goal, type="goto")))
       if complete_place_funnel:
         # A place DETACHES the payload at the contact-rich skill endpoint.  Certify the other
         # half of the funnel in the POST-place scene, where the object remains on its support
@@ -537,6 +554,21 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
       skill_goal = goal_for(involved, skill_members[0])
     out = [(pan, Task(pan, involved, pre_goal, type="goto")),
            (name, mk_skill(skill_goal))]
+    if complete_pick_funnel:
+      post_members = []
+      for m, (member, fallback) in enumerate(zip(skill_members, pre_members)):
+        qpost = robot_ik.post_pick_witness(
+            a, states[i], states[i + 1], assembly, member)
+        if qpost is None:
+          print(f"  [post-pick] {i:02d} member {m}: no table-normal retreat keyframe -- "
+                "using the paired approach-axis endpoint")
+        post_members.append(np.asarray(fallback if qpost is None else qpost, dtype=float))
+      if len(skill_members) >= 2:
+        post_goal = goal_for_paired([a[1]], skill_members, post_members, i)
+      else:
+        post_goal = goal_for([a[1]], post_members[0])
+      out.append((post_pick_name,
+                  Task(post_pick_name, [a[1]], post_goal, type="goto")))
     if complete_place_funnel:
       post_members = []
       for m, member in enumerate(skill_members):
@@ -631,10 +663,13 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
         print(f"[witsets] step {i} {kind}: member 0 no longer matches the canonical witness "
               f"(rewritten by a later pass) -- set dropped.")
     if kind == "pick":
-      # --pre-pick splits into a goto to the retracted pre-grasp + the real pick (grasp+attach).
+      # A complete pick funnel is PRE-GRASP -> ATTACH -> HELD-OBJECT RETREAT. The two
+      # standoff endpoints intentionally share one paired IK member, while the attachment
+      # between them changes which geometry follows the hand.
       frames = [robot_ik.gripper_frame[r], _root_of(states[i], a[2], mate_parent)]
       mk = lambda g: Task(name, involved, g, type="pick", frames=frames)
-      emit = (split_skill(a, i, wit, involved, name, kind, mk, smembers)
+      emit = (split_skill(a, i, wit, involved, name, kind, mk, smembers,
+                          complete_pick_funnel=post_pick)
               if pre_pick and bridge_j is None else None)
       if emit is None:
         t = mk(goal_for_set(involved, smembers, i) if smembers
@@ -1196,6 +1231,14 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
       fa, fb, d = c[0], c[1], float(c[2])
       if d >= qmargin:
         continue
+      # Part--part contacts are governed by the underlying strict penetration predicate.
+      # Do not apply the *robot* clearance margin to them: fitted mates remain separate
+      # collision bodies in the exported model, and their zero-distance contact is expected
+      # throughout later modes even after the attachment relation has been serialized.  Any
+      # unintended overlap still fails the base predicate above; this branch only avoids
+      # misclassifying a legitimate assembled interface as an arm-participant clearance wall.
+      if _nearest_part(fa) is not None and _nearest_part(fb) is not None:
+        continue
       # CARRIED part vs the table: relaxed at both segment ends, full margin mid-transit.
       if table_margin > 0.0 and "table" in (fa, fb):
         other = fb if fa == "table" else fa
@@ -1350,8 +1393,12 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
   # bodies.  Search already exempts the intended mate pair.  Apply the equivalent physical
   # rule to every subsequently accumulated rigid component, without muting contacts between
   # two separately held/resting parts.
+  # Production environments install ``plan_actions`` before this wrapper. Lightweight audit
+  # tests may install it out of band and legitimately have no assembly actions; an absent list
+  # means there are no rigid mate ancestry exemptions, not an undefined outer-scope fallback.
+  _source_actions = getattr(env, "plan_actions", None) or ()
   _part_names = set()
-  for _a in getattr(env, "plan_actions", ()):
+  for _a in _source_actions:
     if len(_a) >= 3 and isinstance(_a[2], str):
       _part_names.add(_a[2])
     if len(_a) >= 4 and _a[0] == "assemble" and isinstance(_a[3], str):

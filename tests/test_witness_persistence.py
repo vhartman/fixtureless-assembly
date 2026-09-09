@@ -29,6 +29,13 @@ def _write(tmp_path, witnesses):
   return str(p)
 
 
+def test_write_plan_creates_requested_parent_directory(tmp_path):
+  p = tmp_path / "new-run" / "nested" / "plan.json"
+  write_plan(str(p), {"assembly": "cross"}, PLAN)
+  assert p.is_file()
+  assert read_plan(str(p)) == ({"assembly": "cross"}, PLAN)
+
+
 def test_round_trip_exact(tmp_path):
   wit = [np.array([0.1, -0.2, 0.3, 4.0]), None, np.array([0.0, 1.5, -2.5, 0.25])]
   p = _write(tmp_path, witness_block(JOINTS, wit))

@@ -4,6 +4,7 @@ import pytest
 
 from benchmarks import plot_cube_scaling as C
 from benchmarks import plot_cube_wrench_envelope_scaling as W
+from benchmarks import plot_process_wrench_full_matrix as P
 from benchmarks import search_runner as B
 
 
@@ -76,6 +77,31 @@ def test_matrix_expansion_is_row_by_column_and_keeps_coordinates_and_guard():
   guarded = B._guarded_command(runs[-1], ["planner", "--flag"])
   assert guarded == ["/usr/bin/prlimit", "--as=6442450944", "--",
                      "planner", "--flag"]
+
+
+def test_repeated_expansion_keeps_logical_cell_and_adds_stable_repeat_ids():
+  runs = B.expand_runs(B.validate_manifest(_matrix_manifest()), repeats=2)
+  assert len(runs) == 8
+  assert runs[0]["run_id"].endswith("__rep-01")
+  assert runs[1]["run_id"].endswith("__rep-02")
+  assert runs[0]["seed"] == runs[1]["seed"] == 3
+  assert runs[0]["repeat"] == 1 and runs[1]["repeat"] == 2
+  with pytest.raises(ValueError, match="positive integer"):
+    B.expand_runs(B.validate_manifest(_matrix_manifest()), repeats=0)
+
+
+def test_process_wrench_plot_can_use_plan_cost(tmp_path):
+  def sample(parts, robots, force, cost):
+    return {"planner_command": ["python", "main.py", "--parts", str(parts),
+                                "--num-robots", str(robots), "--insert-force", str(force)],
+            "success": True, "plan_cost": cost, "milestone_search_s": 1.0}
+  physical = [sample(2, 2, 0, 3), sample(2, 2, 10, 4), sample(2, 2, 20, 5),
+              sample(2, 3, 0, 3), sample(2, 3, 10, 4), sample(2, 3, 20, 5),
+              sample(2, 4, 0, 3), sample(2, 4, 10, 4), sample(2, 4, 20, 5)]
+  # The real plot requires all six lambda columns; exercise the metric path through the
+  # aggregator directly so this remains a small, deterministic unit test.
+  rows = P._aggregate(physical, physical=True)
+  assert rows[0]["plan_cost_mean"] == 3.0
 
 
 def test_manifest_rejects_ambiguous_variant_and_matrix_products():
@@ -286,9 +312,9 @@ def test_piecewise_cube_scaling_manifest_changes_only_the_assembly_family():
 
 
 @pytest.mark.parametrize("name,n_runs,parts,assembly", [
-    ("cube_piecewise_process_wrench_full_matrix.json", 231, range(2, 13),
+    ("cube_piecewise_process_wrench_full_matrix.json", 198, range(2, 13),
      "cube-sequence-2x2x3"),
-    ("cross_process_wrench_full_matrix.json", 126, range(2, 8), "cross"),
+    ("cross_process_wrench_full_matrix.json", 108, range(2, 8), "cross"),
 ])
 def test_full_process_wrench_manifests_have_requested_product(name, n_runs, parts, assembly):
   path = B.ROOT / "benchmarks" / "manifests" / name
@@ -297,7 +323,7 @@ def test_full_process_wrench_manifests_have_requested_product(name, n_runs, part
   assert {int(C._flag_value(r["args"], "--parts")) for r in runs} == set(parts)
   assert {int(C._flag_value(r["args"], "--num-robots")) for r in runs} == {2, 3, 4}
   assert {float(C._flag_value(r["args"], "--insert-force")) / 10.0
-          for r in runs} == {0.0, 0.01, 0.1, 0.5, 1.0, 2.0, 10.0}
+          for r in runs} == {0.0, 0.01, 0.1, 0.5, 1.0, 2.0}
   assert all(C._flag_value(r["args"], "--assembly") == assembly for r in runs)
   assert all("--no-wrench" not in r["args"] and "--ignore-gravity" not in r["args"]
              for r in runs)
