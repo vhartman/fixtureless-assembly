@@ -1,0 +1,22 @@
+# Local Python virtual environment (README "Setup" builds it here).
+# It holds installed packages only, so it must never enter the repository.
+.venv/
+venv/
+.venv.old/
+
+# Files pip writes when a package is installed into the source tree.
+*.egg-info/
+.eggs/
+
+# Python bytecode. Written again on every run, and different for each
+# interpreter and pytest version, so it only makes noise in `git status`.
+__pycache__/
+*.py[cod]
+
+# Mesh cache that arm_model.py writes for MuJoCo (arm_model.py:168).
+# It is built again from the robot models when it is missing, and it is large
+# (~160 MB), so it is a cache and not a source file.
+sim_meshes/
+
+# The log file rai writes into the working directory on every run.
+z.log.global
