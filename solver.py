@@ -38,11 +38,34 @@ def _timed_bind_stage(name):
 # free-orientation DOF toward a canonical pose without fighting the hard mate constraint.
 _ASSEMBLE_ORIENT_BIAS_W = 1e0
 
-# slight position bias on a held subassembly in the assemble IK: nudge its centre body
-# toward the middle of the workspace (a bit above the table). LOW weight vs the mate eq
-# (1e1), so it only breaks the free-position DOF of a HELD assembly; inert on the table.
+# Slight position bias on a held subassembly in the assemble IK: nudge its centre body
+# toward the middle of the workspace (a bit above the table).  The historical world has a
+# table top at z=.2, so this encoded a 30cm TABLE-LOCAL offset as the world-fixed
+# ``(0, 0, .5)``.  That accidentally pulled Husky assemblies toward the carrier: its compact
+# table is centred at world x=.82.  Keep the legacy constant as the no-scene/default value,
+# but derive the real target from the actual table frame below.
+_ASSEMBLE_POS_BIAS_HEIGHT_ABOVE_TABLE = 0.30
 _ASSEMBLE_POS_BIAS_TARGET = (0.0, 0.0, 0.5)
 _ASSEMBLE_POS_BIAS_W = 1e0
+
+
+def _assemble_position_bias_target(C):
+  """World point at the centre of ``C``'s table, 30cm above its physical top.
+
+  Computing this in the table frame handles translated workcells (notably Husky) and also
+  preserves the intended meaning for a rotated table.  A missing/malformed table retains the
+  exact historical target so standalone helper calls remain well-defined.
+  """
+  table = C.getFrame("table") if C is not None else None
+  if table is None:
+    return np.asarray(_ASSEMBLE_POS_BIAS_TARGET, dtype=float).copy()
+  size = np.asarray(table.getSize(), dtype=float).ravel()
+  if size.size < 3:
+    return np.asarray(_ASSEMBLE_POS_BIAS_TARGET, dtype=float).copy()
+  local = np.array([0.0, 0.0,
+                    float(size[2]) / 2.0 + _ASSEMBLE_POS_BIAS_HEIGHT_ABOVE_TABLE,
+                    1.0, 0.0, 0.0, 0.0])
+  return _pose_compose(np.asarray(table.getPose(), dtype=float), local)[:3]
 
 # the canonical orientations the assemble IK sweeps (structured restarts): the 6 ways a
 # principal axis of the assembly's centre body points along a world axis. Each entry is
@@ -2948,7 +2971,7 @@ class RobotIK:
 
     q0 = np.asarray(C.getJointState(), dtype=float).copy()
     current_position = np.asarray(C.getFrame(onto).getPosition(), dtype=float).copy()
-    preferred_position = np.asarray(_ASSEMBLE_POS_BIAS_TARGET, dtype=float)
+    preferred_position = _assemble_position_bias_target(C)
     names = list(C.getJointNames())
     try:
       lo, hi = (np.asarray(v, dtype=float).ravel() for v in C.getJointLimits())
@@ -3761,11 +3784,13 @@ class RobotIK:
     komo.addControlObjective([], 0, 1e-1)
     komo.addControlObjective([], 1, 1e-1)
     self._add_object_over_table_objectives(komo, C)
-    self._assemble_objectives(komo, part_name, onto, rel_pos, rel_quat, bias_axes)
+    self._assemble_objectives(
+        komo, part_name, onto, rel_pos, rel_quat, bias_axes,
+        position_bias_target=_assemble_position_bias_target(C))
     return komo
 
   def _assemble_objectives(self, komo, part_name, onto, rel_pos, rel_quat, bias_axes,
-                           phase=1):
+                           phase=1, position_bias_target=None):
     # the mate constraint + its soft pose biases. Split out of _assemble_komo so
     # fuse_cograsp_witnesses can ground it on the SECOND keyframe of a 2-phase KOMO; the
     # single-phase caller keeps the default.
@@ -3781,9 +3806,11 @@ class RobotIK:
     # slight position bias: pull the centre body toward the middle of the workspace. LOW
     # weight vs the mate eq -- only breaks the free-position DOF of a HELD assembly (inert on
     # the table). Keeps held assemblies centred instead of drifting to the reachable fringe.
+    if position_bias_target is None:
+      position_bias_target = _ASSEMBLE_POS_BIAS_TARGET
     komo.addObjective(
         [phase, phase], ry.FS.position, [onto], ry.OT.sos, [_ASSEMBLE_POS_BIAS_W],
-        list(_ASSEMBLE_POS_BIAS_TARGET),
+        list(position_bias_target),
     )
     # soft orientation bias on the centre body (`onto`): nudge its local +z / +x axes toward
     # the given world directions. LOW weight vs the mate eq (1e1), so it only breaks the
@@ -6096,8 +6123,11 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
         # holders do not transport the assembly afterwards; only the inserter traverses the
         # final pre_delta. This is the atomic add_grasp -> assemble choreography.
         robot_ik._assemble_objectives(
-            komo, part, onto, pre_rel_pos, rel_quat, bias, phase=1)
-      robot_ik._assemble_objectives(komo, part, onto, rel_pos, rel_quat, bias, phase=2)
+            komo, part, onto, pre_rel_pos, rel_quat, bias, phase=1,
+            position_bias_target=_assemble_position_bias_target(Ca))
+      robot_ik._assemble_objectives(
+          komo, part, onto, rel_pos, rel_quat, bias, phase=2,
+          position_bias_target=_assemble_position_bias_target(Ca))
       robot_ik._add_grasp_maintenance(komo, states[j], assembly, phase=2)
       # A target held by two arms is a closed chain. With a funnel, freeze every target
       # holder across the two phases as a hard equality. The old soft brace-only pull was not
