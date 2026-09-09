@@ -187,18 +187,36 @@ _STANDARD_MOTION_PROFILE = {
     # BiRRT edges, accepted shortcuts, and simulator preflight; a plan cannot become invalid
     # merely because the next stage samples the same edge more finely.
     "mp_shortcut_res": 0.002,
-    # Collision/clearance certificate shared by every current robust MP artifact. A positive
-    # table margin remains scene-specific: no successful general artifact has validated one.
+    # The portable certificate is collision-free motion plus hardware joint limits.  A uniform
+    # positive inter-robot shell is not generally feasible: even though the task-participant
+    # ramp reaches zero at its anchors, 10cm can disconnect otherwise broad transit spaces in
+    # compact workcells (Fabrica Beam).  Positive robot/table margins remain explicit
+    # experiment settings until clearance is optimized softly rather than imposed as a hard
+    # topology-changing gate.
     "mp_collision_tolerance": 1e-4,
-    "mp_robot_margin": 0.1,
-    "mp_margin_ramp": 0.1,
+    "mp_robot_margin": 0.0,
+    "mp_margin_ramp": 0.0,
+    "mp_margin_mode": "linear",
     "mp_table_margin": 0.0,
     "mp_cograsp": True,
     "quiet_rai": True,
     "view": False,
 }
 
-_MOTION_PROFILES = {"standard": dict(_STANDARD_MOTION_PROFILE)}
+_EXECUTION_MOTION_PROFILE = {
+    **_STANDARD_MOTION_PROFILE,
+    # Explicit robustness profile: demand a 5cm inter-robot shell in unconstrained transit,
+    # but remove it in a 5cm neighbourhood of either segment keyframe, where handovers,
+    # co-grasps, and compact assembly postures can require deliberate proximity.
+    "mp_robot_margin": 0.05,
+    "mp_margin_ramp": 0.05,
+    "mp_margin_mode": "binary",
+}
+
+_MOTION_PROFILES = {
+    "standard": dict(_STANDARD_MOTION_PROFILE),
+    "execution": dict(_EXECUTION_MOTION_PROFILE),
+}
 
 def _rss_mb():
   # A1/A6 instrumentation probe: peak RSS of THIS process in MB (ru_maxrss is KiB on Linux).
@@ -234,7 +252,9 @@ def build_parser():
   parser.add_argument(
       "--motion-profile", choices=tuple(_MOTION_PROFILES), default=None, metavar="NAME",
       help="Named motion-export/planning defaults. standard pins skill funnels/fusion, "
-           "sequence export, 1e-4 collision tolerance, 0.1m robot margin+ramp, RRT* "
+           "sequence export, 1e-4 collision tolerance, and zero auxiliary margin; execution "
+           "is otherwise identical but uses a 5cm robot margin with binary 5cm endpoint "
+           "relaxation. Both use RRT* "
            "optimization over a full 300s budget (no frontier-stall cutoff), a 4-plan/6-tier "
            "open-loop budget, and 100 certified shortcuts. It does not imply "
            "--motion-plan or guess --mp-seed/output paths. Precedence matches search profiles.",
@@ -1770,13 +1790,15 @@ def build_parser():
   )
   g_skills.add_argument(
       "--pre-insertion", type=float, nargs="?", const=0.05, default=0.05, metavar="DELTA",
-      help="PRE-INSERTION funnel (EXPORT/REPLAY only; the SEARCH is unchanged): split every "
+      help="PRE-INSERTION funnel: split every "
            "`assemble` into a GOTO to the funnel-mouth pose T_pre (the mate witness backed off "
            "DELTA metres along the mate axis, default 0.05) followed by the REAL mate at the "
            "seated witness. The motion planner then connects the free-space approach to T_pre "
            "and only the short T_pre->seated seating motion is contact-rich -- on the mr_bench "
-           "SKILLS branch that second task becomes the insertion skill. The mate pose, wrench "
-           "gate, and plan are all untouched. Default 0.05 since 2026-07-29 (FRAGILITY 2.2: "
+           "SKILLS branch that second task becomes the insertion skill. Search accepts a seated "
+           "witness only if that same branch realizes the full DELTA; there is no shorter "
+           "fallback. The mate pose, wrench gate, and symbolic action graph are untouched. "
+           "Default 0.05 since 2026-07-29 (FRAGILITY 2.2: "
            "without it the held part arrives laterally, already in contact); "
            "0 = single un-split assemble.",
   )
@@ -2079,14 +2101,23 @@ def build_parser():
   )
   g_mp.add_argument(
       "--mp-margin-ramp", type=float, default=0.1, metavar="M",
-      help="With --mp-robot-margin: relax the margin between the TASK'S OWN robots over the last "
-           "M metres of END-EFFECTOR travel to their goal (0 = drop it outright for that pair; "
+      help="With --mp-robot-margin: relax the margin near BOTH endpoints of a segment, measured "
+           "in metres of END-EFFECTOR displacement (0 = drop it outright for the task's own "
+           "robot pair; "
            "default 0.1 since 2026-07-29). "
            "A handover needs its two arms close but not close to the third, so the margin is "
-           "dropped only for the participating pair, and only as they approach. Keyed on EE "
+           "dropped only for the participating pair near its anchors. Keyed on EE "
            "DISTANCE, not path position: a sampling planner's predicate must be a pure function "
            "of the state, so 'the last 10%% of the path' is not expressible -- distance-to-goal "
            "is, and means the same thing.",
+  )
+  g_mp.add_argument(
+      "--mp-margin-mode", choices=("linear", "binary"), default="linear",
+      help="How --mp-margin-ramp relaxes robot/table margins near BOTH segment anchors. "
+           "linear scales the requirement continuously from zero to full margin; binary "
+           "requires zero auxiliary margin while the relevant EE is within the ramp distance "
+           "of either anchor and the full margin outside it. The base collision predicate and "
+           "joint-limit gate remain active in either mode.",
   )
   g_mp.add_argument(
       "--mp-seed", type=int, default=None, metavar="N",
@@ -2328,7 +2359,7 @@ _SAVE_CONFIG_FIELDS = (
     "mp_no_shortcut", "mp_shortcut_iters", "mp_shortcut_res",
     "mp_shortcut_strategy", "mp_shortcut_pair_checks", # certified path post-processing
     "mp_collision_tolerance",                            # base predicate certificate
-    "mp_robot_margin", "mp_margin_ramp",                 # clearance the path was planned with
+    "mp_robot_margin", "mp_margin_ramp", "mp_margin_mode", # clearance certificate
     "mp_table_margin",                                   # carried-part-vs-table transit clearance
     "mp_cograsp",                                        # closed-chain path diagnostic
     "mp_seed",                                           # reproducible BiRRT draw (None = unseeded)
@@ -2842,6 +2873,7 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
            "--mp-collision-tolerance", f"{cfg.mp_collision_tolerance:g}",
            "--mp-robot-margin", f"{cfg.mp_robot_margin:g}",
            "--mp-margin-ramp", f"{cfg.mp_margin_ramp:g}",
+           "--mp-margin-mode", cfg.mp_margin_mode,
            "--mp-table-margin", f"{cfg.mp_table_margin:g}",
            "--mp-save", mpfile, "--quiet-rai", "--no-view"]
     if getattr(cfg, "_motion_profile", None):
@@ -2902,6 +2934,7 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
                 "mp_runtime", "mp_stall_timeout", "mp_no_shortcut", "mp_shortcut_iters",
                 "mp_shortcut_res", "mp_shortcut_strategy", "mp_shortcut_pair_checks",
                 "mp_collision_tolerance", "mp_robot_margin", "mp_margin_ramp",
+                "mp_margin_mode",
                 "mp_table_margin", "mp_cograsp", "mp_seed", "mp_open_plans",
                 "mp_plan_candidates", "mp_plan_epochs", "mp_plan_initial_runtime"):
       selected_cfg[key] = getattr(cfg, key)
@@ -3043,7 +3076,7 @@ def _merge_mp_export_clearance_settings(cfg, saved, explicit=None):
   settings remain authoritative.  Collision/clearance values are planner tuning knobs,
   however: the export supplies reproducible defaults, while an option explicitly present on
   THIS command line must win (the same CLI > file rule used by ``--config``).  Previously the
-  four assignments in the load branch unconditionally restored the export and silently made
+  assignments in the load branch unconditionally restored the export and silently made
   e.g. ``--mp-collision-tolerance 0.1`` ineffective.
 
   Returns ``(values, sources)`` where sources are suitable for the effective-settings log.
@@ -3054,6 +3087,7 @@ def _merge_mp_export_clearance_settings(cfg, saved, explicit=None):
       ("collision_tolerance", "mp_collision_tolerance", float),
       ("robot_robot_margin", "mp_robot_margin", float),
       ("robot_margin_ramp", "mp_margin_ramp", float),
+      ("robot_margin_mode", "mp_margin_mode", str),
       ("table_margin", "mp_table_margin", float),
   )
   values, sources = {}, {}
@@ -3164,7 +3198,8 @@ def run(cfg, explicit=None):
     _stall = "none" if cfg.mp_stall_timeout is None else f"{cfg.mp_stall_timeout:g}s"
     print(f"[profile] motion '{_mp_profile}' resolved: collision-tolerance="
           f"{cfg.mp_collision_tolerance:g}m, robot-margin={cfg.mp_robot_margin:g}m, "
-          f"ramp={cfg.mp_margin_ramp:g}m, table-margin={cfg.mp_table_margin:g}m, "
+          f"ramp={cfg.mp_margin_ramp:g}m/{cfg.mp_margin_mode}, "
+          f"table-margin={cfg.mp_table_margin:g}m, "
           f"runtime={cfg.mp_runtime:g}s, stall={_stall}, "
           f"RRT*-optimize={'on' if cfg.mp_optimize else 'off'}, "
           f"shortcuts={cfg.mp_shortcut_iters}. Explicit individual flags remain authoritative.")
@@ -4073,8 +4108,10 @@ def run(cfg, explicit=None):
       robot_ik.pre_insertion_delta = cfg.pre_insertion
       print(f"[flag] --pre-insertion ACTIVE: MP export splits each assemble into a goto to the "
             f"funnel mouth ({cfg.pre_insertion:g}m back along the mate axis) + the real mate at "
-            "the seated witness. With --skill-funnel-collision-res, search also certifies the "
-            "short held-gripper edge between them.")
+            "the seated witness. This is a hard boundary: the full configured separation must "
+            "be feasible; it is never shortened toward the seated pose. With "
+            "--skill-funnel-collision-res, search also certifies the short held-gripper edge "
+            "between them.")
     if robot_ik is not None and cfg.skill_funnel_collision_res is not None:
       if cfg.skill_funnel_collision_res < 0.0:
         raise SystemExit("--skill-funnel-collision-res must be nonnegative")
@@ -4417,7 +4454,11 @@ def run(cfg, explicit=None):
             skill_paths = read_skill_paths(
                 cfg.load_plan, joint_names, len(plan), baseline_witnesses)
             baseline_pre_witnesses = read_pre_witnesses(
-                cfg.load_plan, joint_names, len(plan), baseline_witnesses)
+                cfg.load_plan, joint_names, len(plan), baseline_witnesses,
+                require_full_assemble=bool(
+                    cfg.pre_insertion > 0.0 and any(
+                        a and a[0] == "assemble" and assembly.screw_skill(a[2]) is None
+                        for a in plan)))
         if baseline_witnesses is None and cfg.refresh_witnesses:
           from solver import collect_plan_witnesses
           baseline_witnesses = collect_plan_witnesses(
@@ -4673,6 +4714,7 @@ def run(cfg, explicit=None):
           _export_collision_tolerance = cfg.mp_collision_tolerance
           _export_robot_margin = cfg.mp_robot_margin
           _export_margin_ramp = cfg.mp_margin_ramp
+          _export_margin_mode = cfg.mp_margin_mode
           _export_table_margin = cfg.mp_table_margin
           _export_table_float = cfg.part_float if cfg.mp_table_margin else 0.0
           mp_pre = dict(opt_pre_witnesses or {})
@@ -4692,6 +4734,7 @@ def run(cfg, explicit=None):
             _export_collision_tolerance = _clearance["collision_tolerance"]
             _export_robot_margin = _clearance["robot_robot_margin"]
             _export_margin_ramp = _clearance["robot_margin_ramp"]
+            _export_margin_mode = _clearance["robot_margin_mode"]
             _export_table_margin = _clearance["table_margin"]
             _export_table_float = _clearance["table_float"]
             robot_ik.pre_insertion_delta = float(
@@ -4713,6 +4756,8 @@ def run(cfg, explicit=None):
                   f"[{_clearance_source['robot_robot_margin']}], "
                   f"margin_ramp={_export_margin_ramp:g} "
                   f"[{_clearance_source['robot_margin_ramp']}], "
+                  f"margin_mode={_export_margin_mode} "
+                  f"[{_clearance_source['robot_margin_mode']}], "
                   f"table_margin={_export_table_margin:g} "
                   f"[{_clearance_source['table_margin']}], "
                   f"table_float={_export_table_float:g} "
@@ -4869,6 +4914,7 @@ def run(cfg, explicit=None):
                                  pre_witnesses=mp_pre,
                                  robot_robot_margin=_export_robot_margin,
                                  robot_margin_ramp=_export_margin_ramp,
+                                 robot_margin_mode=_export_margin_mode,
                                  table_margin=_export_table_margin,
                                  table_float=_export_table_float,
                                  witness_sets=witness_alts,
@@ -4910,6 +4956,7 @@ def run(cfg, explicit=None):
               "collision_tolerance": float(_export_collision_tolerance),
               "robot_robot_margin": float(_export_robot_margin or 0.0),
               "robot_margin_ramp": float(_export_margin_ramp or 0.0),
+              "robot_margin_mode": str(_export_margin_mode),
               "table_margin": float(_export_table_margin or 0.0),
               "table_float": float(_export_table_float or 0.0),
               "pre_insertion": float(robot_ik.pre_insertion_delta),
@@ -4950,7 +4997,24 @@ def run(cfg, explicit=None):
             _modes_sys.path.insert(
                 0, _os.path.join(_os.path.dirname(MP._MRBENCH_SRC), "scripts"))
             from show_problems import visualize_modes
-            print(f"[motion-plan] serving MODES on http://localhost:{cfg.viser_port}")
+            # mr_bench's generic mode viewer hard-codes ``primitives_only=True`` and does
+            # not forward a port.  That silently hides every file-backed shape, including
+            # legitimate mesh COLLIDERS (Fabrica Beam's two uprights), so a complete mode
+            # appears to have missing parts.  Keep mr_bench unmodified, but intercept its
+            # final display call and apply this CLI's normal viewer policy.  Primitive-only
+            # rendering remains available explicitly via --mp-collision-view.
+            _display_modes = prob.display_path_viser
+
+            def _display_modes_with_cli(paths, *args, **kwargs):
+              kwargs["port"] = cfg.viser_port
+              kwargs["primitives_only"] = bool(cfg.mp_collision_view)
+              return _display_modes(paths, *args, **kwargs)
+
+            prob.display_path_viser = _display_modes_with_cli
+            _geom = "primitive collision shapes only" if cfg.mp_collision_view \
+                else "complete visual and collision geometry"
+            print(f"[motion-plan] serving MODES on http://localhost:{cfg.viser_port} "
+                  f"({_geom})")
             visualize_modes(prob, use_viser=True)
             return
           # One edge certificate, end to end.  mr_bench's RAI environment defaults to a

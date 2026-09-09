@@ -865,8 +865,8 @@ def _dependency_graph(plan, states, step_names, robots, robot_ik, initial_task=N
   return g
 
 
-def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_margin=0.0,
-                          table_float=0.0):
+def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0,
+                          margin_mode="linear", table_margin=0.0, table_float=0.0):
   """MONKEY-PATCH our planning gates onto the exported problem (mr_bench unmodified).
 
   Joint limits are ALWAYS enforced here. mr_bench samples random configurations inside
@@ -882,8 +882,9 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
   error drives the held part into the table and the contact force snaps the grasp -- measured
   obj_0~world at 40-120N against a 25N cap, the FIRST failure in every config tried). A part
   must touch the table at pick and set-down, so the margin is relaxed at BOTH ends of the
-  segment: required = table_margin * min(1, d_to_goal/ramp, d_from_prev_goal/ramp), where
-  prev-goal is the carrying arm's own previous task goal (its segment start). Both anchors are
+  segment. Linear mode interpolates with the nearer-anchor distance; binary mode removes the
+  auxiliary requirement inside the configured endpoint neighbourhood. The previous goal is
+  the carrying arm's own segment start. Both anchors are
   properties of the mode, so the predicate stays a pure function of (q, mode). Applies ONLY to
   bodies riding on an arm -- a RESTING part keeps zero table clearance (a place needs contact),
   and the arm itself may still work arbitrarily close to the table.
@@ -895,9 +896,10 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
      current mode's task -- everyone else keeps the full margin for the whole segment. The mode
      already carries this (`task.robots`), so nothing has to be inferred.
 
-  2. BY EE DISTANCE TO BOTH SEGMENT ANCHORS, for that involved pair: required =
-     margin * min(1, d_from_start/ramp, d_to_goal/ramp).  Full margin applies in transit and
-     relaxes to zero at either keyframe where contact may be intended.  Relaxing only at the
+  2. BY EE DISTANCE TO BOTH SEGMENT ANCHORS. In ``linear`` mode, for that involved pair:
+     required = margin * min(1, d_from_start/ramp, d_to_goal/ramp). In ``binary`` mode the
+     auxiliary requirement is zero within ``ramp`` metres of either anchor and the full margin
+     elsewhere. Both modes permit intended proximity at a keyframe. Relaxing only at the
      destination makes the predicate discontinuous at a mode switch: a pair allowed to touch
      at the preceding handover/release would suddenly owe the full margin before it had moved.
 
@@ -912,6 +914,19 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
   them, restoring the caller's state) since they cost FK.
   """
   import numpy as _np
+
+  margin_mode = str(margin_mode)
+  if margin_mode not in ("linear", "binary"):
+    raise ValueError(
+        f"unknown motion-planning margin mode {margin_mode!r}; expected linear or binary")
+
+  def _anchor_factor(distance):
+    """Auxiliary-clearance factor at distance from the nearer segment anchor."""
+    if ramp <= 0.0:
+      return 1.0
+    if margin_mode == "binary":
+      return 0.0 if distance <= ramp else 1.0
+    return min(1.0, distance / ramp)
 
   def _owner(fname):
     try:
@@ -1257,7 +1272,8 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
               d_go = float(_np.linalg.norm(ee - gp)) if gp is not None else _np.inf
               pv = _prev_ee(ro, m)
               d_pv = float(_np.linalg.norm(ee - pv)) if pv is not None else _np.inf
-              f = min(1.0, min(d_go, d_pv) / ramp)
+              d_anchor = max(0.0, min(d_go, d_pv) - _anchor_deadband)
+              f = _anchor_factor(d_anchor)
             except Exception:
               f = 0.0                          # fail OPEN -- the base predicate still applies
           # The requirement interpolates from CONTACT-ALLOWED (-margin/2) at the segment ends
@@ -1308,7 +1324,7 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
             # Exact FK re-evaluation of a persisted anchor can differ by roundoff.  Without
             # this clamp, observed==0 and required~=1e-15 spuriously rejects the anchor.
             d_anchor = max(0.0, min(d_goal, d_prev) - _anchor_deadband)
-            factor = 0.0 if d_anchor <= 1e-9 else min(1.0, d_anchor / ramp)
+            factor = 0.0 if d_anchor <= 1e-9 else _anchor_factor(d_anchor)
             req = margin * factor
           except Exception:
             req = 0.0
@@ -1335,7 +1351,7 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
           prev = _prev_ee(rinv, m)
           d_prev = float(_np.linalg.norm(ee - prev)) if prev is not None else d_goal
           d_anchor = max(0.0, min(d_goal, d_prev) - _anchor_deadband)
-          factor = 0.0 if d_anchor <= 1e-9 else min(1.0, d_anchor / ramp)
+          factor = 0.0 if d_anchor <= 1e-9 else _anchor_factor(d_anchor)
           req = margin * factor
         except Exception:
           req = 0.0
@@ -1514,7 +1530,8 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0, table_ma
 
 def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, bracing,
                  depgraph=False, collision_tolerance=0.01, pre_witnesses=None,
-                 robot_robot_margin=0.0, robot_margin_ramp=0.0, table_margin=0.0,
+                 robot_robot_margin=0.0, robot_margin_ramp=0.0,
+                 robot_margin_mode="linear", table_margin=0.0,
                  table_float=0.0, witness_sets=None, resolved_pre_witnesses=None,
                  resolve_missing_pre=True, task_records=None, saved_step_names=None,
                  saved_sequence_names=None, pre_pin_robots=None, skill_paths=None):
@@ -1621,13 +1638,15 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
       print(f"[mp] --mp-robot-margin {robot_robot_margin:g}m: robot-robot clearance enforced by a "
             f"wrapper around mr_bench's predicate (that module stays unmodified). Planning will be "
             f"slower -- its early-out on 'nothing penetrates' no longer applies."
-            + (f" Relaxed to 0 between the TASK'S OWN robots, ramped over "
-               f"{robot_margin_ramp:g}m of EE travel from/to each segment anchor." if robot_margin_ramp > 0
+            + (f" Relaxed to 0 between the TASK'S OWN robots over "
+               f"{robot_margin_ramp:g}m of EE travel from/to each segment anchor "
+               f"({robot_margin_mode})." if robot_margin_ramp > 0
                else " Dropped entirely between the TASK'S OWN robots (no ramp)."))
     if table_margin and table_margin > 0.0:
       print(f"[mp] --mp-table-margin {table_margin:g}m: CARRIED parts keep this clearance to the "
             f"table mid-transit (the graze that snaps grasps), relaxed over {robot_margin_ramp:g}m "
-            f"of EE travel at BOTH segment ends so pick and set-down still touch. Resting parts "
+            f"of EE travel at BOTH segment ends ({robot_margin_mode}) so pick and set-down still "
+            f"touch. Resting parts "
             f"and the arms themselves are unaffected.")
       if not robot_margin_ramp or robot_margin_ramp <= 0.0:
         print("[mp] WARNING: --mp-table-margin without --mp-margin-ramp demands the full margin "
@@ -1638,6 +1657,7 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
   # arithmetic and changes only configurations which simulation would reject anyway.
   _install_robot_margin(env, float(robot_robot_margin or 0.0), list(robots),
                         robot_ik.gripper_frame, ramp=float(robot_margin_ramp),
+                        margin_mode=robot_margin_mode,
                         table_margin=float(table_margin or 0.0),
                         table_float=float(table_float or 0.0))
   return env

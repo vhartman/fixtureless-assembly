@@ -6815,6 +6815,8 @@ def _cli_run(a):
           "robot_robot_margin", _saved(cfg, "mp_robot_margin", legacy=0.0))),
       robot_margin_ramp=float(_es.get(
           "robot_margin_ramp", _saved(cfg, "mp_margin_ramp", legacy=0.0))),
+      robot_margin_mode=str(_es.get(
+          "robot_margin_mode", _saved(cfg, "mp_margin_mode", legacy="linear"))),
       table_margin=float(_es.get("table_margin", _saved(cfg, "mp_table_margin"))),
       table_float=float(_es.get(
           "table_float", (float(_saved(cfg, "part_float", legacy=0.015))

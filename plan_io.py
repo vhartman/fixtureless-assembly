@@ -19,6 +19,11 @@ from pathlib import Path
 IK_WITNESS_ACTIONS = frozenset(
     {"pick", "assemble", "place", "set_down", "add_grasp", "handover"})
 
+# Semantic version of persisted pre-insertion endpoints. Older files may contain a mouth
+# selected from the historical 100/80/60/40/20/10% fallback ladder. Its vector is structurally
+# valid, but it does not certify that the moving part reached the configured skill boundary.
+PRE_WITNESS_CONTRACT = "full-assemble-v1"
+
 
 def missing_required_witnesses(plan, witnesses):
   """Indices of IK actions whose persisted keyframe is absent.
@@ -84,6 +89,7 @@ def witness_block(joint_names, witnesses, alts=None, stage=None, skill_paths=Non
     out["pre_wit"] = {
         str(i): [float(v) for v in q]
         for i, q in sorted(pre_witnesses.items()) if q is not None}
+    out["pre_wit_contract"] = PRE_WITNESS_CONTRACT
   return out
 
 
@@ -200,7 +206,8 @@ def read_skill_paths(path, joint_names, n_actions, witnesses=None):
   return out or None
 
 
-def read_pre_witnesses(path, joint_names, n_actions, witnesses=None):
+def read_pre_witnesses(path, joint_names, n_actions, witnesses=None, *,
+                       require_full_assemble=False):
   """Read exact pre-skill endpoint certificates aligned to persisted witnesses.
 
   Unlike optional witness-set diversity, malformed pre-witness data is a hard artifact error:
@@ -213,6 +220,12 @@ def read_pre_witnesses(path, joint_names, n_actions, witnesses=None):
   raw = blk.get("pre_wit")
   if not raw:
     return None
+  if (require_full_assemble
+      and blk.get("pre_wit_contract") != PRE_WITNESS_CONTRACT):
+    raise ValueError(
+        f"{path}: persisted pre-insertion endpoints predate the hard full-separation "
+        "contract and may contain a collapsed funnel. Refusing to replay them; rerun the "
+        "search, or pass --refresh-witnesses to recertify this fixed plan.")
   if list(blk.get("joints") or []) != list(joint_names):
     raise ValueError(f"{path}: pre-witness joint order differs from the current scene")
   out = {}

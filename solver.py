@@ -4297,10 +4297,11 @@ class RobotIK:
     witness config (the same movers rule as fuse_pre_skill_witnesses). This makes "the export
     finds a funnel keyframe" a property OF the witness, not of export-time luck: the witness
     solver now prefers target float heights that leave funnel room, and witness-optimization
-    candidates (also produced by _ik_assemble) inherit the same guarantee. Delta remains a
-    REQUESTED MAXIMUM (the ladder accepts the largest feasible rung), so the search never
-    rejects a witness the exporter could have used. Only for the REAL mate solve (backoff==0);
-    the funnel solves themselves must not recurse."""
+    candidates (also produced by _ik_assemble) inherit the same guarantee.  The configured
+    assemble delta is a HARD skill boundary: accepting a shorter mouth leaves the part inside
+    the insertion corridor and hands a contact-rich narrow passage back to free-space motion
+    planning. Only for the REAL mate solve (backoff==0); the funnel solves themselves must not
+    recurse."""
     key = self._funnel_witness_key(action, s0, s1, witness)
     if key in self._funnel_witness_cache:
       return True
@@ -4386,8 +4387,9 @@ class RobotIK:
     rejects a different IK branch (the pull alone is only a cost and cannot guarantee this).
     Without both, the two independent solves can land in different IK basins (a whole wrist
     revolution measured for assemble) -> a long, possibly-colliding 'skill' motion between the
-    two keyframes. If no non-zero backoff rung stays in the corridor, return None and let the
-    exporter use the skill witness itself: a zero-length funnel is safer than a branch jump.
+    two keyframes. Acquisitions and table places may use a shorter collision-free escape rung.
+    Assemble must achieve the full configured backoff or return None, so search tries another
+    witness rather than silently exporting a nearly seated funnel.
 
     `pin` ({joint_name: value}, --fuse-pre-skill only) additionally FREEZES those joints by a
     hard eq. The pull alone cannot enforce "only the actor moves": the skill constraints are
@@ -4456,14 +4458,16 @@ class RobotIK:
         self._screw_path_cache[key] = [q.copy() for q in self.last_screw_path]
         return self.last_screw_path[0].copy()
 
-      # DELTA is a REQUESTED MAXIMUM: the full backoff can point into a nearby obstacle (the
-      # classic case: an insertion whose mate sits just above the tabletop -- backing off
-      # along -mate_axis sinks the part into the table). Walk a deterministic fraction
-      # ladder (1.0/0.8/0.6/0.4/0.2/0.1); each rung is gated by the FULL skill acceptance
-      # INCLUDING the funnel table-clearance in _pen_ok. A short non-zero funnel mouth is
-      # strictly better than a colliding one, and a failed ladder falls back to the skill
-      # witness (the caller keeps today's keyframe).
-      for frac in (1.0, 0.8, 0.6, 0.4, 0.2, 0.1):
+      # An insertion mouth is the boundary between ordinary collision-free motion and the
+      # contact-rich assembly controller. It therefore has to be the FULL configured backoff.
+      # The old shared ladder silently accepted 10% (5mm for a requested 5cm) and put an
+      # almost-seated pose into BiRRT; Real Bench then needed centimetres of tolerated
+      # penetration to reach it. Other pre-skills are genuine escape/approach hints and may
+      # still take their largest feasible shorter rung.
+      if kind == "assemble" and assembly.mate_axis(action[2]) is None:
+        return None                                      # no direction in which to separate
+      fractions = (1.0,) if kind == "assemble" else (1.0, 0.8, 0.6, 0.4, 0.2, 0.1)
+      for frac in fractions:
         d = delta * frac
         if kind == "pick":
           ok, w = self._ik_pick(action, s0, s1, assembly, None, backoff=d, warm=warm)

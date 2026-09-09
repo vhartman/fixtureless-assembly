@@ -1209,9 +1209,8 @@ class FabricaAssembly(Assembly):
       "gamepad": {"1": "3", "2": "3", "4": "3", "0": "3", "5": "3"},
       "plumbers_block": {"3": "2", "0": "2", "1": "2", "4": "2"},
       "stool_circular": {"1": "2", "0": "1", "3": "2", "6": "3",
-                         "5": "2", "8": "5", "7": "2", "4": "7"},
+                          "5": "2", "8": "5", "7": "2", "4": "7"},
   }
-
   def __init__(self, n_parts, model):
     if model not in self._SOURCE_ORDER:
       raise ValueError(f"unsupported Fabrica model {model!r}")
@@ -1244,6 +1243,67 @@ class FabricaAssembly(Assembly):
   def _box(size, pos=(0.0, 0.0, 0.0)):
     return {"shape": ("box", [*map(float, size), 0.0]), "pos": list(map(float, pos))}
 
+  @classmethod
+  def _box_bounds(cls, lo, hi):
+    """Axis-aligned inner box from local-frame bounds."""
+    lo, hi = np.asarray(lo, dtype=float), np.asarray(hi, dtype=float)
+    return cls._box(hi - lo, 0.5 * (lo + hi))
+
+  @classmethod
+  def _beam_primitive_collision_shape(cls, source_id):
+    """Small conservative box unions for Fabrica's three mortised beam pieces.
+
+    The generic inner decomposition used 150 hulls for source 6 and 115/124 for sources
+    0/1.  They are axis-aligned manufactured members, so that representation bought no
+    useful collision fidelity and made every motion-planner predicate about eight times
+    slower.  These unions follow the material around the *actual through holes*: seven
+    boxes for the four-mortise base rail and ten for each one-mortise tapered crossbar.
+    Bounds sit inside the rounded CAD skin.  Exact OBJ meshes remain the visual and grasp
+    sampling geometry.
+    """
+    if source_id == "6":
+      # 152.4 x 17.78 x 12.7mm base rail.  Four through-mortises are centred at
+      # x={-44.45,-12.70,12.70,44.45}mm and span approximately +/-2.86 by
+      # +/-4.81mm.  The two continuous side rails plus five centre spans preserve all four.
+      zlo, zhi = -0.0055, 0.0055
+      boxes = [
+          cls._box_bounds((-0.0755, -0.0083, zlo), (0.0755, -0.0051, zhi)),
+          cls._box_bounds((-0.0755,  0.0051, zlo), (0.0755,  0.0083, zhi)),
+      ]
+      for xlo, xhi in ((-0.0755, -0.0483), (-0.0406, -0.0165),
+                       (-0.0089,  0.0089), ( 0.0165,  0.0406),
+                       ( 0.0483,  0.0755)):
+        boxes.append(cls._box_bounds((xlo, -0.0039, zlo),
+                                     (xhi,  0.0039, zhi)))
+      return ("compound", boxes)
+
+    if source_id in ("0", "1"):
+      # 12.7 x 76.2 x 15.24mm crossbar.  Its central through-mortise is roughly
+      # 5.7 x 9.5mm.  Four central boxes retain it; the underside tapers upward over
+      # the final 14.6mm at either end, represented by three nested-height segments.
+      xlo, xhi, core_top = -0.0054, 0.0054, 0.0048
+      boxes = [
+          cls._box_bounds((xlo, -0.0233, -0.0068),
+                          (xhi, -0.0063, core_top)),
+          cls._box_bounds((xlo,  0.0063, -0.0068),
+                          (xhi,  0.0233, core_top)),
+          cls._box_bounds((xlo, -0.0062, -0.0064),
+                          (-0.0042, 0.0062, core_top)),
+          cls._box_bounds((0.0042, -0.0062, -0.0064),
+                          (xhi,    0.0062, core_top)),
+      ]
+      for ylo, yhi, zlo, zhi in (
+          (-0.0283, -0.0245, -0.0028, core_top),
+          (-0.0323, -0.0287,  0.0008, 0.0067),
+          (-0.0363, -0.0327,  0.0037, 0.0067),
+          ( 0.0245,  0.0283, -0.0028, core_top),
+          ( 0.0287,  0.0323,  0.0008, 0.0067),
+          ( 0.0327,  0.0363,  0.0037, 0.0067),
+      ):
+        boxes.append(cls._box_bounds((xlo, ylo, zlo), (xhi, yhi, zhi)))
+      return ("compound", boxes)
+    raise ValueError(f"no primitive beam collision model for source {source_id!r}")
+
   def _collision_shape(self, source_id):
     part = self._manifest["parts"][source_id]
     collision = part.get("collision")
@@ -1275,7 +1335,10 @@ class FabricaAssembly(Assembly):
     self.objects = [f"obj_{i}" for i in range(self.n_parts)]
     self.base = "obj_0"
     for source, part in source_to_part.items():
-      self.part_shapes[part] = self._collision_shape(source)
+      self.part_shapes[part] = (
+          self._beam_primitive_collision_shape(source)
+          if self.model == "beam" and source in ("6", "0", "1")
+          else self._collision_shape(source))
       self.visual_meshes[part] = f"part_meshes/fabrica/{self.model}/{source}.obj"
       self.grasp_shapes[part] = self._grasp_shape(source)
       # Uniform light-plastic density: plausible demonstrators while preserving the source
