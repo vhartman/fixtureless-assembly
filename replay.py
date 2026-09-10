@@ -17,7 +17,7 @@ import numpy as np
 
 from assembly import *
 from env import make_four_robot_env
-from plan_io import read_plan, read_witnesses
+from plan_io import read_optimization_candidates, read_plan, read_witnesses
 from config import saved_cfg as _saved
 
 
@@ -251,7 +251,8 @@ def build_scene(cfg):
 
 
 def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=True,
-           resolve_ik=False):
+           resolve_ik=False, optimization_alternatives=1, alternative_opacity=0.18,
+           active_robots_only=False):
   """Rebuild the saved scene and replay the plan. Returns the ViserRecorder (or None) so a
   headless caller can inspect the recorded steps without serving."""
   cfg, plan = read_plan(path)
@@ -266,7 +267,12 @@ def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=T
   recorder = None
   if viser or not view:
     from viser_view import ViserRecorder
-    recorder = ViserRecorder()
+    # Optimizer alternatives are a visual comparison, not collision debugging. Suppress the
+    # translucent robot/gripper proxy capsules here while leaving ordinary replay unchanged.
+    recorder = ViserRecorder(
+        hide_collision_primitives=int(optimization_alternatives) > 1)
+  if int(optimization_alternatives) > 1 and recorder is None:
+    raise SystemExit("--optimization-alternatives requires --viser or --no-view")
   brace = bool(_saved(cfg, "bracing", legacy=False))         # match the search that made the plan
   if use_ik:
     rik = RobotIK(C, robots)
@@ -287,7 +293,15 @@ def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=T
       rik.col_weight = 1e2
     # --always-contact: the search never disabled touched contacts; the replay must not either.
     rik.keep_contacts = bool(_saved(cfg, "always_contact", legacy=False))
-    witnesses = read_witnesses(path, list(rik.C.getJointNames()), len(plan))
+    joint_names = list(rik.C.getJointNames())
+    witnesses = read_witnesses(path, joint_names, len(plan))
+    candidate_pools = (read_optimization_candidates(path, joint_names, len(plan))
+                       if int(optimization_alternatives) > 1 else None)
+    if int(optimization_alternatives) > 1 and not candidate_pools:
+      raise SystemExit(
+          f"{path} has no compatible persisted witness-optimizer candidate pools. Re-run "
+          "witness optimization once with this version from a compatible persisted baseline, "
+          "or regenerate the plan; the viewer will not rerun optimization or IK implicitly.")
     needs_ik = {"pick", "place", "stow", "assemble", "add_grasp", "handover"}
     missing = ([] if witnesses is None else
                [i for i, (a, w) in enumerate(zip(plan, witnesses))
@@ -305,8 +319,14 @@ def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=T
       print(f"[replay] {sum(w is not None for w in witnesses)} persisted witnesses loaded; "
             "per-action IK solving SKIPPED.")
     visualize_plan_ik(C, assembly, plan, robots=robots, robot_ik=rik,
-                      recorder=recorder, bracing=brace, witnesses=witnesses)
+                      recorder=recorder, bracing=brace, witnesses=witnesses,
+                      optimization_candidates=candidate_pools,
+                      alternative_count=int(optimization_alternatives),
+                      alternative_opacity=float(alternative_opacity),
+                      active_robots_only=bool(active_robots_only))
   else:
+    if int(optimization_alternatives) > 1:
+      raise SystemExit("--optimization-alternatives requires a real-IK optimized plan")
     visualize_plan(C, assembly, plan, robots=robots, recorder=recorder, bracing=brace)
   if viser and serve:
     recorder.serve(port=viser_port)
@@ -325,6 +345,20 @@ def parse_args():
   p.add_argument("--resolve-ik", action="store_true",
                  help="Explicitly allow per-action IK solving when no persisted witnesses are "
                       "available. Replay otherwise fails instead of silently re-solving.")
+  p.add_argument(
+      "--optimization-alternatives", "--witness-alternatives",
+      dest="optimization_alternatives", type=int, default=1, metavar="N",
+      help="With --viser, overlay up to N keyframes from the exact candidate ladder considered "
+           "by witness optimization. The selected candidate is opaque and unselected alternatives "
+           "are translucent; the displayed subset is chosen for joint-space diversity. No "
+           "optimization/IK is rerun. Default 1 disables.")
+  p.add_argument(
+      "--alternative-opacity", type=float, default=0.18, metavar="A",
+      help="Base opacity in (0,1) for --optimization-alternatives (default: 0.18).")
+  p.add_argument(
+      "--active-robots-only", action="store_true",
+      help="In the real-IK Viser timeline, hide robots not involved in the current action. "
+           "Parts and workspace geometry remain visible.")
   p.add_argument("--no-view", dest="view", action="store_false",
                  help="Rebuild + run the replay without opening a window (validation only).")
   return p.parse_args()
@@ -333,4 +367,7 @@ def parse_args():
 if __name__ == "__main__":
   a = parse_args()
   replay(a.path, viser=a.viser, view=a.view, real_ik=a.real_ik,
-         viser_port=a.viser_port, resolve_ik=a.resolve_ik)
+         viser_port=a.viser_port, resolve_ik=a.resolve_ik,
+         optimization_alternatives=a.optimization_alternatives,
+         alternative_opacity=a.alternative_opacity,
+         active_robots_only=a.active_robots_only)

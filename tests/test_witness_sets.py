@@ -5,7 +5,8 @@ import sys, os
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from plan_io import witness_block, write_plan, read_witnesses, read_witness_sets
+from plan_io import (read_optimization_candidates, read_witnesses, read_witness_sets,
+                     witness_block, write_plan)
 
 
 JOINTS = [f"j{i}" for i in range(6)]
@@ -49,6 +50,26 @@ def test_old_files_without_alts_load_as_none(tmp_path):
              witnesses=witness_block(JOINTS, [_w(0)]))
   assert read_witness_sets(str(p), JOINTS, 1) is None
   assert read_witnesses(str(p), JOINTS, 1) is not None    # plain witnesses unaffected
+
+
+def test_optimizer_candidates_are_separate_and_guard_selected_member(tmp_path):
+  wit = [_w(0), _w(2)]
+  pools = {0: [_w(0), _w(0) + 0.25], 1: [_w(2), _w(2) - 0.5]}
+  p = tmp_path / "plan.json"
+  write_plan(str(p), {"assembly": "t"}, [("pick",)] * 2,
+             witnesses=witness_block(
+                 JOINTS, wit, alts={0: [_w(0), _w(0) + 9]},
+                 optimization_candidates=pools))
+  got = read_optimization_candidates(str(p), JOINTS, 2)
+  assert set(got) == {0, 1}
+  assert np.allclose(got[0][1], _w(0) + 0.25)
+  # GoalSets and optimizer ladders are independent payloads.
+  assert np.allclose(read_witness_sets(str(p), JOINTS, 2)[0][1], _w(0) + 9)
+
+  bad = {0: [_w(0) + 1, _w(0) + 0.25], 1: pools[1]}
+  write_plan(str(p), {"assembly": "t"}, [("pick",)] * 2,
+             witnesses=witness_block(JOINTS, wit, optimization_candidates=bad))
+  assert set(read_optimization_candidates(str(p), JOINTS, 2)) == {1}
 
 
 def test_greedy_maxmin_wrist_selection():

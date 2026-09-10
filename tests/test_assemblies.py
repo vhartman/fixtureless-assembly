@@ -19,6 +19,7 @@ import time
 import pytest
 
 import assembly as A
+import solver as S
 import wrench as W
 from env import make_four_robot_env
 
@@ -1828,6 +1829,46 @@ def test_direct_fill_skeleton_failure_explicitly_uses_complete_fallback(monkeypa
   assert plan is not None
   assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
   assert "complete local fallback" in capsys.readouterr().out
+
+
+def test_fill_action_widening_validates_direct_transport_before_broader_families(capsys):
+  """The nested-family scheduler keeps the ordinary actions and stops at the first family."""
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 2)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  plan = A.solve_assembly_problem_milestones(
+      C, asm, robots=robots, weight=1.0, verbose=True,
+      milestone_oracle="structural", fill_action_widening=True)
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+  assert not any(action[0] in ("handover", "add_grasp", "place") for action in plan[:-1])
+  assert "[fill-actions obj_1] direct alphabet validated" in capsys.readouterr().out
+
+
+def test_action_widening_bridge_hint_only_requires_one_common_scene_grasp(monkeypatch):
+  """The direct-stage scheduler reads the finite sampled interface without rejecting it."""
+  class Assembly:
+    @staticmethod
+    def grasp_shape(_part):
+      return ("box", [0.1, 0.1, 0.1, 0.0])
+
+  table = {("obj_1",): [("obj_1", 0, None), ("obj_1", 1, None)]}
+  meta = (
+      {"scene_by_kind": {"two_finger": ("pick",)}},
+      {"scene_by_kind": {"two_finger": ("assemble",)}},
+  )
+  monkeypatch.setattr(S, "sampled_grasp_meta", lambda *_a, **_kw: meta)
+  assert S._has_sampled_direct_grasp_bridge(
+      Assembly(), "obj_1", table, "two_finger") is False
+
+  meta = (
+      {"scene_by_kind": {"two_finger": ("pick", "assemble")}},
+      {"scene_by_kind": {"two_finger": ("assemble",)}},
+  )
+  assert S._has_sampled_direct_grasp_bridge(
+      Assembly(), "obj_1", table, {"a1": "two_finger"}) is True
 
 
 def test_fill_local_reverse_oracle_is_lazy_and_mixed_wrench_aware():

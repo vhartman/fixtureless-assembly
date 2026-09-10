@@ -29,6 +29,44 @@ def test_standard_sim_profile_is_reversible_by_explicit_flags():
   assert a.corridor and a.joint_rate == 0.5 and a.mass_scale == 0.25
 
 
+def test_wait_for_gripper_is_opt_in_and_requires_animation():
+  assert not sim.parse_args(["run", "plan.json"]).wait_for_gripper
+  a = sim.parse_args([
+      "run", "plan.json", "--animate-grippers", "--wait-for-gripper", "--articulated",
+      "--no-actuated"])
+  assert a.animate_grippers and a.wait_for_gripper
+
+
+def test_kinematic_arm_reasserts_visual_gripper_mimic_joints(monkeypatch):
+  """Kinematic parent resets must not leave presentation-only child hinges free-running."""
+  scene = sim.SimScene.__new__(sim.SimScene)
+  scene.animate_grippers = True
+  scene.actuated = False
+  scene.robots = ["a1"]
+  scene._rai_joints = []
+  scene._qadr = {}
+  scene._vadr = {}
+  scene._cmd_q = None
+  scene._phys = 0
+  scene._gripper_model = {"a1": "robotiq"}
+  scene._gripper_aperture = {"a1": 0.021}                 # half of the 42mm stroke
+  scene._gripper_qadr = {"a1": [0, 1]}
+  scene._gripper_vadr = {"a1": [0, 1]}
+  scene._gripper_ctrl = {"a1": [0, 1]}
+  scene._gripper_gain = {"a1": [1.0, -1.0]}
+  scene._gripper_angle = {"a1": [0.8, 0.8]}
+  scene.data = SimpleNamespace(
+      qpos=np.asarray([0.71, 0.33]), qvel=np.asarray([4.0, -3.0]), ctrl=np.zeros(2))
+  scene.model = object()
+  monkeypatch.setattr(sim.mujoco, "mj_forward", lambda _model, _data: None)
+
+  scene.set_arm_q(np.empty(0))
+
+  assert np.allclose(scene.data.qpos, [0.4, -0.4])
+  assert np.allclose(scene.data.qvel, 0.0)
+  assert np.allclose(scene.data.ctrl, [0.4, -0.4])
+
+
 def test_standard_profile_refuses_an_implicit_motion_plan_before_scene_build():
   a = sim.parse_args(["run", "plan.json", "--sim-profile", "standard"])
   assert a.servo_place_seat

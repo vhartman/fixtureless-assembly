@@ -458,6 +458,55 @@ def visualize_initial_grasps_viser(C, assembly, checker, grasp_table, robots,
   return summary
 
 
+def _rest_pose_groups(assembly):
+  """Named singleton and assembled groups shared by both rest-pose viewers."""
+  objs = list(assembly.objects)
+  groups = [(f"{p}", {p}) for p in objs]
+  for r in getattr(assembly, "connect_parts", set()):
+    groups.append((f"module<{r}>",
+                   {p for p in objs if r in _mate_closure(assembly, p)} | {r}))
+  direct = ({p for p in objs if assembly.relative_pose(p) and
+             assembly.relative_pose(p)[0] == assembly.base} | {assembly.base})
+  groups.append(("base+direct", direct))
+  groups.append(("FULL", set(objs)))
+  # Some sequential assemblies make base+direct identical to FULL. Preserve the first
+  # descriptive name while avoiding a visually identical duplicate step.
+  unique = []
+  seen = set()
+  for name, group in groups:
+    key = tuple(sorted(group, key=_part_index))
+    if key not in seen:
+      unique.append((name, group))
+      seen.add(key)
+  return unique
+
+
+# A categorical, colour-blind-friendly palette (Okabe-Ito plus two muted extensions).
+# Colour is keyed by the authored part id and therefore remains constant across poses and
+# subassemblies: the viewer compares orientations without changing what each component means.
+_REST_PART_COLORS = (
+    [0.00, 0.45, 0.70, 1.0],  # blue
+    [0.90, 0.62, 0.00, 1.0],  # orange
+    [0.00, 0.62, 0.45, 1.0],  # green
+    [0.80, 0.47, 0.65, 1.0],  # purple
+    [0.34, 0.71, 0.91, 1.0],  # sky blue
+    [0.84, 0.37, 0.00, 1.0],  # vermilion
+    [0.94, 0.89, 0.26, 1.0],  # yellow
+    [0.45, 0.45, 0.45, 1.0],  # grey
+)
+
+
+def _color_rest_part(C, assembly, original_name, copy_name):
+  """Give every rendered shape of a copied part its stable part-identity colour."""
+  index = list(assembly.objects).index(original_name)
+  color = _REST_PART_COLORS[index % len(_REST_PART_COLORS)]
+  for shape_name in part_shape_frames(C, copy_name):
+    C.getFrame(shape_name).setColor(color)
+  visual_name = f"{copy_name}__visual"
+  if visual_name in C.getFrameNames():
+    C.getFrame(visual_name).setColor(color)
+
+
 def visualize_rest_poses_viser(C, assembly, recorder=None, view=True, groups=None):
   """REST-POSE CATALOG (scrubbable): for each group, one step per STABLE rest face, the group
   laid out resting on the table in that pose (rest_faces + _rest_layout_poses -- exactly what
@@ -467,15 +516,8 @@ def visualize_rest_poses_viser(C, assembly, recorder=None, view=True, groups=Non
   recorder (serve() for viser); else blocking rai view."""
   base = make_world()
   ttop = base.getFrame("table").getPosition()[2] + base.getFrame("table").getSize()[2] / 2.0
-  objs = list(assembly.objects)
   if groups is None:
-    groups = [(f"{p}", {p}) for p in objs]                 # singletons
-    for r in getattr(assembly, "connect_parts", set()):
-      groups.append((f"module<{r}>", {p for p in objs if r in _mate_closure(assembly, p)} | {r}))
-    stool = {p for p in objs if assembly.relative_pose(p) and
-             assembly.relative_pose(p)[0] == assembly.base} | {assembly.base}
-    groups.append(("base+direct", stool))
-    groups.append(("FULL", set(objs)))
+    groups = _rest_pose_groups(assembly)
 
   n = 0
   for name, grp in groups:
@@ -491,6 +533,7 @@ def visualize_rest_poses_viser(C, assembly, recorder=None, view=True, groups=Non
       for p, pose in poses.items():
         add_part_frame(Cv, p, assembly.part_shape(p))
         add_part_visual(Cv, p, assembly.visual_meshes.get(p))
+        _color_rest_part(Cv, assembly, p, p)
         Cv.getFrame(p).setPosition(np.asarray(pose[:3]) + [0, 0, ttop])
         Cv.getFrame(p).setQuaternion(pose[3:])
       label = f"{name} ({len(grp)}p): rest face {f} of {faces}"
@@ -501,6 +544,100 @@ def visualize_rest_poses_viser(C, assembly, recorder=None, view=True, groups=Non
       n += 1
     print(f"[rest-viz] {name} ({len(grp)} parts): rest faces {faces}")
   print(f"[rest-viz] {n} rest poses total")
+  return recorder
+
+
+def visualize_rest_poses_grid_viser(C, assembly, recorder=None, view=True, groups=None,
+                                    gap=0.05):
+  """Show each group's accepted stable placements together in a tabletop grid.
+
+  This deliberately calls :func:`rest_faces` and :func:`_rest_layout_poses`, the same
+  placement table and geometry path used by concrete search. It therefore diagnoses the
+  real finite placement alphabet, including ``--stable-rest-poses`` and
+  ``--placement-yaws``, rather than recomputing a display-only approximation.
+
+  One recorder step is emitted per group. Copies are spaced from their collision-geometry
+  AABBs and individually lifted so their lowest support point lies on the table. The Viser
+  step label maps each row/column slot to its replay-safe placement id.
+  """
+  if groups is None:
+    groups = _rest_pose_groups(assembly)
+  table_probe = make_world()
+  table = table_probe.getFrame("table")
+  ttop = table.getPosition()[2] + table.getSize()[2] / 2.0
+
+  total = 0
+  for group_index, (name, raw_group) in enumerate(groups):
+    group = set(raw_group)
+    faces = list(rest_faces(assembly, group))
+    Cv = make_world()
+    if not faces:
+      label = f"{name} ({len(group)}p): NO STABLE TABLE PLACEMENT (unparkable)"
+      if recorder is not None:
+        recorder.record(Cv, label)
+      elif view:
+        Cv.view(True, label)
+      print(f"[rest-grid] {name} ({len(group)} parts): NO REST POSE (unparkable)")
+      continue
+
+    ref = reference_part(group)
+    anchor_q = assembly.scatter_orientations.get(
+        ref, np.array([1.0, 0.0, 0.0, 0.0]))
+    entries = []
+    for face in faces:
+      poses = _rest_layout_poses(assembly, group, ref, face, anchor_q)
+      points = np.vstack([
+          np.asarray(_part_support_points_world(poses[p], assembly.part_shape(p)),
+                     dtype=float)
+          for p in group
+      ])
+      lo, hi = points.min(axis=0), points.max(axis=0)
+      contact_parts = tuple(sorted(
+          (p for p in group
+           if np.min(np.asarray(
+               _part_support_points_world(poses[p], assembly.part_shape(p)))[:, 2])
+           <= lo[2] + 1e-4),
+          key=_part_index))
+      entries.append((face, poses, lo, hi, contact_parts))
+
+    cols = int(np.ceil(np.sqrt(len(entries))))
+    rows = int(np.ceil(len(entries) / cols))
+    cell_x = max(float(hi[0] - lo[0]) for _f, _p, lo, hi, _c in entries) + float(gap)
+    cell_y = max(float(hi[1] - lo[1]) for _f, _p, lo, hi, _c in entries) + float(gap)
+    cell_x = max(cell_x, 0.08)
+    cell_y = max(cell_y, 0.08)
+    slot_labels = []
+    for slot, (face, poses, lo, hi, contact_parts) in enumerate(entries):
+      row, col = divmod(slot, cols)
+      cell_center = np.array([(col - 0.5 * (cols - 1)) * cell_x,
+                              (0.5 * (rows - 1) - row) * cell_y])
+      object_center = 0.5 * (lo[:2] + hi[:2])
+      shift = np.array([*(cell_center - object_center), ttop - lo[2]])
+      prefix = f"rest_g{group_index}_s{slot}_"
+      for p in sorted(group, key=_part_index):
+        copy_name = prefix + p
+        add_part_frame(Cv, copy_name, assembly.part_shape(p), contact=0)
+        add_part_visual(Cv, copy_name, assembly.visual_meshes.get(p))
+        _color_rest_part(Cv, assembly, p, copy_name)
+        Cv.getFrame(copy_name).setPosition(np.asarray(poses[p][:3]) + shift)
+        Cv.getFrame(copy_name).setQuaternion(poses[p][3:])
+      marker_z = ttop + float(hi[2] - lo[2]) + 0.025
+      Cv.addFrame(prefix + "placement_id").setPosition(
+          [cell_center[0], cell_center[1], marker_z]).setShape(
+              ry.ST.marker, size=[0.025]).setContact(0)
+      slot_labels.append(
+          f"r{row}c{col}=id {face} (support: {','.join(contact_parts)})")
+
+    label = (f"{name} ({len(group)}p): {len(entries)} stable placements | " +
+             ", ".join(slot_labels))
+    if recorder is not None:
+      recorder.record(Cv, label)
+    elif view:
+      Cv.view(True, label)
+    print(f"[rest-grid] {name} ({len(group)} parts): {len(entries)} poses; "
+          f"{rows}x{cols} grid; ids={faces}")
+    total += len(entries)
+  print(f"[rest-grid] {total} stable placements in {len(groups)} group view(s)")
   return recorder
 
 
@@ -774,7 +911,9 @@ def _write_robot_dofs(C, robot, q_full):
 
 
 def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
-                      recorder=None, bracing=False, witnesses=None, wrench_gk=None):
+                      recorder=None, bracing=False, witnesses=None, wrench_gk=None,
+                      optimization_candidates=None, alternative_count=4,
+                      alternative_opacity=0.18, active_robots_only=False):
   """Replay a plan on a SINGLE persistent config: for each action we load its supplied
   witness, or solve the skill IK only when no witness was supplied; then write the active
   arms' DOFs into the live config (so arms keep their poses between steps) and mirror the
@@ -806,6 +945,10 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
         if wrench_gk is not None else None
     recorder.record(Cv, "0: initial", vectors=vecs0,
                     interfaces=_interface_vectors(Cv, assembly, s))
+    if active_robots_only:
+      for name in list(recorder.steps[-1]):
+        if any(name.startswith(r + "_") for r in robots):
+          del recorder.steps[-1][name]
   elif view:
     Cv.view(True, "0: initial")
 
@@ -858,6 +1001,12 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
 
   allobj = set(assembly.objects)                           # for resolving stow edges (declutter)
   grasp_table = None if recorded else _search_context(C, assembly, robots)[1]
+  alternative_poses = {}
+  joint_names = list(Cv.getJointNames())
+  robot_joint_idx = {
+      r: np.asarray([k for k, n in enumerate(joint_names) if n.startswith(r + "_")],
+                    dtype=int)
+      for r in robots}
   for i, action in enumerate(plan, 1):
     if recorded is not None:
       nxt = recorded[i]
@@ -1007,9 +1156,55 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
       recorder.record(Cv, f"{i}: {action[0]} {' '.join(map(str, action[1:]))}{_ctag}",
                       vectors=vecs,
                       interfaces=_interface_vectors(Cv, assembly, nxt))
+      if active_robots_only:
+        display_active = set(involved_robots(action, s, nxt, robot_ik))
+        # Release has no witness and therefore no optimizer mover, but it is still a robot
+        # action worth displaying when scrubbing the complete plan.
+        if not display_active and len(action) > 1 and action[1] in robots:
+          display_active.add(action[1])
+        snap = recorder.steps[-1]
+        for name in list(snap):
+          owner = next((r for r in robots if name.startswith(r + "_")), None)
+          if owner is not None and owner not in display_active:
+            del snap[name]
+      pool = ((optimization_candidates or {}).get(i - 1) or [])
+      if len(pool) >= 2 and int(alternative_count) >= 2:
+        selected = np.asarray(pool[0], dtype=float)
+        # Display selection only: greedily maximize the minimum joint-space distance to
+        # candidates already shown. This does not feed back into optimization; it merely
+        # avoids spending three translucent layers on nearly coincident solver restarts.
+        remaining = [np.asarray(q, dtype=float) for q in pool[1:]]
+        shown = [selected]
+        while remaining and len(shown) < int(alternative_count):
+          dmin = [min(float(np.linalg.norm(q - old)) for old in shown)
+                  for q in remaining]
+          shown.append(remaining.pop(int(np.argmax(dmin))))
+        posed = []
+        for q_alt in shown[1:]:
+          Calt = ry.Config()
+          Calt.addConfigurationCopy(Cv)
+          # The live replay deliberately carries inactive arms forward.  Therefore writing a
+          # complete optimizer vector would incorrectly reset those arms to the IK background.
+          # Only arms whose candidate slice differs from the selected candidate are changed;
+          # any payload attached to such an arm follows through the copied kinematic tree.
+          for r in robots:
+            idx = robot_joint_idx[r]
+            if (len(idx) and not np.allclose(q_alt[idx], selected[idx],
+                                             atol=1e-8, rtol=0.0)):
+              _write_robot_dofs(Calt, r, q_alt)
+          # Match the opaque layer's visibility exactly: inactive robots were removed above,
+          # while parts attached to an active robot remain and may move in this candidate.
+          posed.append(recorder.snapshot_poses(Calt, names=recorder.steps[-1].keys()))
+        if posed:
+          alternative_poses[i] = posed
     elif view:
       Cv.view(True, f"{i}: {action[0]} {' '.join(map(str, action[1:]))}")
     s = nxt
+  if alternative_poses:
+    recorder.overlay_alternatives(
+        alternative_poses, count=int(alternative_count),
+        opacity=float(alternative_opacity),
+        description="witness-optimizer candidate keyframes")
   return Cv
 
 

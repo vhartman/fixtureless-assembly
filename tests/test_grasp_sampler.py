@@ -286,6 +286,23 @@ def test_strict_sampler_omits_below_gate_fallback_rows():
   assert all(float(m["pad_support"]) >= 0.9 for m in sampled)
 
 
+def test_strict_sampler_filters_the_same_raw_candidate_cloud():
+  """Strictness is a selector, not a proposal-distribution parameter.
+
+  In particular, adding the opt-in flag must not rebind every historical non-strict grasp id.
+  The filtered views need distinct cache keys, but their private RNG seed keys must match.
+  """
+  mode = {"seed": 3, "candidates": 96, "keep": 32,
+          "margin": 0.015, "pad_support": 0.9, "wrap": 0.015}
+  P.set_sampled_grasps({**mode, "strict": False})
+  loose_base, loose_cache = P._sampled_keys(CUBE, 0.04)
+  P.set_sampled_grasps({**mode, "strict": True})
+  strict_base, strict_cache = P._sampled_keys(CUBE, 0.04)
+
+  assert strict_base == loose_base
+  assert strict_cache != loose_cache
+
+
 def test_closure_ranking_prioritizes_certified_canonical_rows_without_deleting_fallbacks():
   """A cuboid's conventional prefix must not bypass closure-aware sampler ranking."""
   entries = []
@@ -543,6 +560,27 @@ def test_scene_reservation_preempts_a_full_canonical_prefix(monkeypatch):
   facts = {(kind, role) for _row, meta in rows
            for kind, roles in meta["scene_by_kind"].items() for role in roles}
   assert facts == {("two_finger", "pick"), ("two_finger", "assemble")}
+
+
+def test_scene_reservation_puts_transport_bridge_before_endpoint_only_rows(monkeypatch):
+  """A single direct-transport grasp dominates two unrelated endpoint certificates."""
+  spec, part, suction, antip, ctx = _synthetic_scene_reservation_input(monkeypatch)
+  bridge = list(suction[0])
+  bridge[0] = np.array([3.0, 0.0, 0.08, 1.0, 0.0, 0.0, 0.0])
+  suction.append(tuple(bridge))
+  old = ctx["checker"].pose_collision_free
+
+  def with_bridge(state, target, pose, assembly, robot=None):
+    if abs(float(np.asarray(pose)[0]) - 3.0) < 1e-9:
+      return True
+    return old(state, target, pose, assembly, robot=robot)
+
+  monkeypatch.setattr(ctx["checker"], "pose_collision_free", with_bridge)
+  P.set_sampled_grasps({"seed": 0, "candidates": 8, "keep": 2})
+  rows = P._sampled_master_rows(spec, 0.01, part, suction, antip, 2, ctx, None)
+  assert float(rows[0][0][0][0]) == 3.0
+  assert {"pick", "assemble"}.issubset(
+      rows[0][1]["scene_by_kind"]["two_finger"])
 
 
 def test_scene_reservation_master_is_append_only(monkeypatch):

@@ -179,6 +179,32 @@ def test_object_over_table_checks_one_reference_datum_per_held_component_and_all
   assert np.isclose(violation[1], 0.01)
 
 
+def test_object_over_table_ignores_payloads_of_inactive_exit_arms():
+  rik = object.__new__(S.RobotIK)
+  rik.object_over_table = True
+  rik.object_over_table_margin = 0.0
+  rik.robots = ["a1", "a2"]
+  rik.gripper_frame = {"a1": "a1_gripper", "a2": "a2_gripper"}
+  rik.object_frames = ("obj_0", "obj_1")
+  C = ry.Config()
+  C.addFrame("table").setShape(ry.ST.box, [1.0, 0.6, 0.05])
+  hand1 = C.addFrame("a1_gripper").setPosition([0.8, 0.0, 0.2])
+  C.addFrame("a2_gripper").setPosition([0.0, 0.0, 0.2])
+  C.addFrame("obj_0").setParent(hand1).setRelativePosition([0, 0, 0])
+  C.addFrame("obj_1").setPosition([0.0, 0.0, 0.05])
+
+  # obj_0 is outside only because uninvolved a1 is parked at the isolated IK EXIT pose.
+  rik._cur_action = ("pick", "a2", "obj_1", 0)
+  assert rik._object_over_table_violation(C) is None
+
+  # Once the skill touches obj_0, its current holder is a participant and the same pose is
+  # correctly rejected.
+  rik._cur_action = ("handover", "a2", "obj_0", 0)
+  violation = rik._object_over_table_violation(C)
+  assert violation[0] == "obj_0"
+  assert np.isclose(violation[1], 0.3)
+
+
 def test_object_over_table_adds_four_hard_bounds_per_held_part():
   rik = object.__new__(S.RobotIK)
   rik.object_over_table = True

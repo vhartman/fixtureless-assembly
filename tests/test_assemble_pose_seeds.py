@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+import robotic as ry
 
 import solver as S
 
@@ -49,6 +50,20 @@ def test_bias_pose_accepts_a_projected_position_without_changing_orientation():
   assert np.allclose(pose[:3], [0.2, -0.3, 0.7])
   assert np.allclose(R[:, 2], bias[0])
   assert np.allclose(R[:, 0], bias[1])
+
+
+def test_assembly_position_bias_tracks_the_physical_table_centre():
+  C = ry.Config()
+  C.addFrame("table").setPosition([0.82, -0.13, 0.40]).setShape(
+      ry.ST.box, [0.64, 1.10, 0.08, 0.0])
+  assert np.allclose(S._assemble_position_bias_target(C), [0.82, -0.13, 0.74])
+
+
+def test_assembly_position_bias_preserves_the_historical_world_target():
+  C = ry.Config()
+  C.addFrame("table").setPosition([0.0, 0.0, 0.17]).setShape(
+      ry.ST.box, [3.0, 3.0, 0.06, 0.0])
+  assert np.allclose(S._assemble_position_bias_target(C), S._ASSEMBLE_POS_BIAS_TARGET)
 
 
 def test_exact_and_projected_ablation_cannot_run_together():

@@ -105,6 +105,62 @@ def test_fabrica_source_mapping_and_dependencies():
   assert manifold.part_shape("obj_3")[0] == "compound"
 
 
+def test_gamepad_square_pins_have_opt_in_quarter_turn_mate_symmetry():
+  asm = P.make_assembly("fabrica-gamepad", 6)
+  # Reviewed source order is (3,1,2,4,0,5): the last two objects are the two
+  # geometrically/functionally fourfold square pins.
+  assert set(asm.mate_symmetry_quats) == {"obj_4", "obj_5"}
+  for part in ("obj_4", "obj_5"):
+    assert len(asm.mate_quaternions(part)) == 1           # opt-in remains compatible
+  asm.configure_mate_symmetry(True)
+  for part in ("obj_4", "obj_5"):
+    quats = asm.mate_quaternions(part)
+    assert len(quats) == 4
+    for k, q in enumerate(quats):
+      expected = np.array([np.cos(k * np.pi / 4.0), 0.0, 0.0,
+                           np.sin(k * np.pi / 4.0)])
+      assert np.allclose(q, expected)
+
+
+def test_circular_stool_pegs_and_caps_have_authored_axial_mate_symmetry():
+  asm = P.make_assembly("fabrica-circular-stool", 9)
+  # Reviewed source order is (2,1,0,3,6,5,8,7,4): odd obj ids are the four
+  # hexagonal long pegs, while the following even ids are their square caps.
+  pegs = ("obj_1", "obj_3", "obj_5", "obj_7")
+  caps = ("obj_2", "obj_4", "obj_6", "obj_8")
+  assert set(asm.mate_symmetry_quats) == set(pegs + caps)
+  assert all(len(asm.mate_quaternions(part)) == 1 for part in pegs + caps)
+  asm.configure_mate_symmetry(True)
+  for part in pegs:
+    quats = asm.mate_quaternions(part)
+    assert len(quats) == 6
+    for k, q in enumerate(quats):
+      assert np.allclose(q, [np.cos(k * np.pi / 6.0), 0.0, 0.0,
+                             np.sin(k * np.pi / 6.0)])
+  for part in caps:
+    quats = asm.mate_quaternions(part)
+    assert len(quats) == 4
+    for k, q in enumerate(quats):
+      assert np.allclose(q, [np.cos(k * np.pi / 4.0), 0.0, 0.0,
+                             np.sin(k * np.pi / 4.0)])
+
+
+def test_cooling_manifold_hex_fasteners_have_sixfold_mate_symmetry():
+  asm = P.make_assembly("fabrica-cooling-manifold", 7)
+  # Reviewed source order is (1,0,4,2,3,5,6): only the final four objects are the
+  # exact hexagonal fasteners.
+  fasteners = ("obj_3", "obj_4", "obj_5", "obj_6")
+  assert set(asm.mate_symmetry_quats) == set(fasteners)
+  assert all(len(asm.mate_quaternions(part)) == 1 for part in fasteners)
+  asm.configure_mate_symmetry(True)
+  for part in fasteners:
+    quats = asm.mate_quaternions(part)
+    assert len(quats) == 6
+    for k, q in enumerate(quats):
+      assert np.allclose(q, [np.cos(k * np.pi / 6.0), 0.0, 0.0,
+                             np.sin(k * np.pi / 6.0)])
+
+
 def test_fabrica_scattered_collision_and_mate_openings():
   for kind, n_parts in FABRICA_MODELS:
     asm = P.make_assembly(kind, n_parts)
