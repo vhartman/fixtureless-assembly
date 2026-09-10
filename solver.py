@@ -38,11 +38,34 @@ def _timed_bind_stage(name):
 # free-orientation DOF toward a canonical pose without fighting the hard mate constraint.
 _ASSEMBLE_ORIENT_BIAS_W = 1e0
 
-# slight position bias on a held subassembly in the assemble IK: nudge its centre body
-# toward the middle of the workspace (a bit above the table). LOW weight vs the mate eq
-# (1e1), so it only breaks the free-position DOF of a HELD assembly; inert on the table.
+# Slight position bias on a held subassembly in the assemble IK: nudge its centre body
+# toward the middle of the workspace (a bit above the table).  The historical world has a
+# table top at z=.2, so this encoded a 30cm TABLE-LOCAL offset as the world-fixed
+# ``(0, 0, .5)``.  That accidentally pulled Husky assemblies toward the carrier: its compact
+# table is centred at world x=.82.  Keep the legacy constant as the no-scene/default value,
+# but derive the real target from the actual table frame below.
+_ASSEMBLE_POS_BIAS_HEIGHT_ABOVE_TABLE = 0.30
 _ASSEMBLE_POS_BIAS_TARGET = (0.0, 0.0, 0.5)
 _ASSEMBLE_POS_BIAS_W = 1e0
+
+
+def _assemble_position_bias_target(C):
+  """World point at the centre of ``C``'s table, 30cm above its physical top.
+
+  Computing this in the table frame handles translated workcells (notably Husky) and also
+  preserves the intended meaning for a rotated table.  A missing/malformed table retains the
+  exact historical target so standalone helper calls remain well-defined.
+  """
+  table = C.getFrame("table") if C is not None else None
+  if table is None:
+    return np.asarray(_ASSEMBLE_POS_BIAS_TARGET, dtype=float).copy()
+  size = np.asarray(table.getSize(), dtype=float).ravel()
+  if size.size < 3:
+    return np.asarray(_ASSEMBLE_POS_BIAS_TARGET, dtype=float).copy()
+  local = np.array([0.0, 0.0,
+                    float(size[2]) / 2.0 + _ASSEMBLE_POS_BIAS_HEIGHT_ABOVE_TABLE,
+                    1.0, 0.0, 0.0, 0.0])
+  return _pose_compose(np.asarray(table.getPose(), dtype=float), local)[:3]
 
 # the canonical orientations the assemble IK sweeps (structured restarts): the 6 ways a
 # principal axis of the assembly's centre body points along a world axis. Each entry is
@@ -913,10 +936,11 @@ class RobotIK:
     # zero-measure goal for BiRRT (OpenArm car-mini: 3e-9 rad slack on joint 7); reject it in
     # search so another branch/witness/plan is tried, rather than diagnosing it after export.
     self.joint_margin_reject = None
-    # Optional held-object workcell contract. Every part datum whose kinematic ancestry
-    # reaches a gripper must remain inside the table's LOCAL x/y footprint. This is installed
-    # in KOMO before optimization and repeated as an endpoint certificate; a post-only gate
-    # would waste restarts on a condition the optimizer had never been told about.
+    # Optional held-object workcell contract. Every carried-component datum moved by the
+    # current skill must remain inside the table's LOCAL x/y footprint. Payloads of uninvolved
+    # arms are excluded because isolated IK parks them at an artificial EXIT configuration.
+    # This is installed in KOMO before optimization and repeated as an endpoint certificate;
+    # a post-only gate would waste restarts on a condition the optimizer had never seen.
     self.object_over_table = False
     self.object_over_table_margin = 0.0
     self.workspace_rejects = 0
@@ -2252,7 +2276,7 @@ class RobotIK:
       return False
     if self._part_is_payload_of(C, part, robot):
       return True
-    action = tuple(self._cur_action or ())
+    action = tuple(getattr(self, "_cur_action", None) or ())
     return (len(action) >= 3 and action[0] in ("pick", "add_grasp", "handover")
             and action[1] == robot and action[2] == part)
 
@@ -2295,7 +2319,7 @@ class RobotIK:
     # search already applies elsewhere rather than accepting a table-skimming keyframe. On
     # OpenArm car-mini the nominal wheel gap was 0.10mm; accumulated achieved-grasp residuals
     # turned it into 1.22mm penetration in mr_bench's real attachment chain.
-    action = tuple(self._cur_action or ())
+    action = tuple(getattr(self, "_cur_action", None) or ())
     if action and action[0] in ("handover", "add_grasp"):
       part = pb if fa == "table" else pa if fb == "table" else None
       if part is not None and any(self._part_is_payload_of(C, part, r) for r in self.robots):
@@ -2361,7 +2385,28 @@ class RobotIK:
           f"for table size {size[:2].tolist()}")
     return half
 
-  def _held_object_frames(self, C):
+  def _workspace_participant_robots(self, C):
+    """Robots whose carried payload is moved/constrained by the current skill.
+
+    ``scene_for`` deliberately parks every uninvolved arm at EXIT.  A payload held by one of
+    those arms is therefore only background geometry for the isolated IK program; treating
+    its artificial EXIT pose as a workspace decision makes ``--object-over-table`` reject an
+    otherwise unrelated pick.  Include the actor plus every holder of a part touched by this
+    action.  With no current action (standalone diagnostics/tests), retain the historical
+    all-held-components interpretation.
+    """
+    action = tuple(getattr(self, "_cur_action", None) or ())
+    if len(action) < 2:
+      return None
+    out = {action[1]} if action[1] in self.robots else set()
+    touched = [p for p in action[2:]
+               if isinstance(p, str) and p.startswith("obj_")]
+    for robot in self.robots:
+      if any(self._part_is_payload_of(C, part, robot) for part in touched):
+        out.add(robot)
+    return out
+
+  def _held_object_frames(self, C, robots=None):
     """Reference datum of each component kinematically carried by a gripper.
 
     A held assembly is represented as one object frame attached to the gripper with the
@@ -2370,6 +2415,8 @@ class RobotIK:
     assembly wider than the table).  The workcell guard is meant to bound the carried
     component, so use its kinematic root -- the datum attached directly below the gripper.
     """
+    allowed_grippers = (set(self.gripper_frame.values()) if robots is None else
+                        {self.gripper_frame[r] for r in robots if r in self.gripper_frame})
     grippers = set(self.gripper_frame.values())
     objects = set(self.object_frames)
     held = []
@@ -2379,7 +2426,7 @@ class RobotIK:
       object_ancestor = False
       while f is not None and f.name not in seen:
         if f.name in grippers:
-          if not object_ancestor:
+          if not object_ancestor and f.name in allowed_grippers:
             held.append(name)
           break
         seen.add(f.name)
@@ -2393,7 +2440,8 @@ class RobotIK:
     if not getattr(self, "object_over_table", False):
       return None
     half = self._table_workcell_half_extents(C)
-    for part in self._held_object_frames(C):
+    participants = self._workspace_participant_robots(C)
+    for part in self._held_object_frames(C, participants):
       rel, _ = C.eval(ry.FS.positionRel, [part, "table"])
       xy = np.asarray(rel, dtype=float).ravel()[:2]
       excess = np.abs(xy) - half
@@ -2412,7 +2460,8 @@ class RobotIK:
     if np.any(target_half <= 0.0):
       target_half = half * 0.999
     times = [] if times is None else times
-    for part in self._held_object_frames(C):
+    participants = self._workspace_participant_robots(C)
+    for part in self._held_object_frames(C, participants):
       for axis in range(2):
         target = np.zeros(3, dtype=float)
         target[axis] = target_half[axis]
@@ -2922,7 +2971,7 @@ class RobotIK:
 
     q0 = np.asarray(C.getJointState(), dtype=float).copy()
     current_position = np.asarray(C.getFrame(onto).getPosition(), dtype=float).copy()
-    preferred_position = np.asarray(_ASSEMBLE_POS_BIAS_TARGET, dtype=float)
+    preferred_position = _assemble_position_bias_target(C)
     names = list(C.getJointNames())
     try:
       lo, hi = (np.asarray(v, dtype=float).ravel() for v in C.getJointLimits())
@@ -3735,11 +3784,13 @@ class RobotIK:
     komo.addControlObjective([], 0, 1e-1)
     komo.addControlObjective([], 1, 1e-1)
     self._add_object_over_table_objectives(komo, C)
-    self._assemble_objectives(komo, part_name, onto, rel_pos, rel_quat, bias_axes)
+    self._assemble_objectives(
+        komo, part_name, onto, rel_pos, rel_quat, bias_axes,
+        position_bias_target=_assemble_position_bias_target(C))
     return komo
 
   def _assemble_objectives(self, komo, part_name, onto, rel_pos, rel_quat, bias_axes,
-                           phase=1):
+                           phase=1, position_bias_target=None):
     # the mate constraint + its soft pose biases. Split out of _assemble_komo so
     # fuse_cograsp_witnesses can ground it on the SECOND keyframe of a 2-phase KOMO; the
     # single-phase caller keeps the default.
@@ -3755,9 +3806,11 @@ class RobotIK:
     # slight position bias: pull the centre body toward the middle of the workspace. LOW
     # weight vs the mate eq -- only breaks the free-position DOF of a HELD assembly (inert on
     # the table). Keeps held assemblies centred instead of drifting to the reachable fringe.
+    if position_bias_target is None:
+      position_bias_target = _ASSEMBLE_POS_BIAS_TARGET
     komo.addObjective(
         [phase, phase], ry.FS.position, [onto], ry.OT.sos, [_ASSEMBLE_POS_BIAS_W],
-        list(_ASSEMBLE_POS_BIAS_TARGET),
+        list(position_bias_target),
     )
     # soft orientation bias on the centre body (`onto`): nudge its local +z / +x axes toward
     # the given world directions. LOW weight vs the mate eq (1e1), so it only breaks the
@@ -6070,8 +6123,11 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
         # holders do not transport the assembly afterwards; only the inserter traverses the
         # final pre_delta. This is the atomic add_grasp -> assemble choreography.
         robot_ik._assemble_objectives(
-            komo, part, onto, pre_rel_pos, rel_quat, bias, phase=1)
-      robot_ik._assemble_objectives(komo, part, onto, rel_pos, rel_quat, bias, phase=2)
+            komo, part, onto, pre_rel_pos, rel_quat, bias, phase=1,
+            position_bias_target=_assemble_position_bias_target(Ca))
+      robot_ik._assemble_objectives(
+          komo, part, onto, rel_pos, rel_quat, bias, phase=2,
+          position_bias_target=_assemble_position_bias_target(Ca))
       robot_ik._add_grasp_maintenance(komo, states[j], assembly, phase=2)
       # A target held by two arms is a closed chain. With a funnel, freeze every target
       # holder across the two phases as a hard equality. The old soft brace-only pull was not
@@ -8416,7 +8472,7 @@ class SignatureCollapsedHeuristic(CollapsedLabeledHeuristic):
 
 
 _TABLE_PICK_FACT_CACHE = {}
-_FACT_TEMPLATES = {}                                       # (ee_path, id(assembly)) -> template
+_FACT_TEMPLATES = {}                                       # (ee_path, assembly identity) -> template
 
 
 def _fact_template(gripper_path, assembly):
@@ -8424,7 +8480,11 @@ def _fact_template(gripper_path, assembly):
   # + the EE pre-parsed. Per fact we COPY it (rai ~0.4ms) and reposition -- profiling showed
   # place_floating_ee's addFile (re-parsing the gripper .g per fact) was a third of the
   # whole heuristic build. Frames are named by PART (shape-correct per part).
-  key = (gripper_path, id(assembly))
+  # Keep the assembly OBJECT in the key. ``id(assembly)`` can be reused after a short-lived
+  # assembly (for example an exported model) is collected, which used to serve a template
+  # containing another assembly's part frames. The identity-hashed object both distinguishes
+  # the geometry and keeps that identity alive for as long as the cache entry exists.
+  key = (gripper_path, assembly)
   hit = _FACT_TEMPLATES.get(key)
   if hit is not None:
     return hit
@@ -8452,7 +8512,7 @@ def _table_aware_pick_fact(assembly, S_key, face, gpart, gid, gripper_path,
   # the table, so the real pick gate is more tolerant than an exactly-resting scene -- an
   # abstraction fact must be AT LEAST as permissive as any real context (over-permissive
   # only weakens the heuristic; over-strict breaks admissibility).
-  key = (id(assembly), S_key, face, gpart, gid, gripper_path, round(clearance, 4))
+  key = (assembly, S_key, face, gpart, gid, gripper_path, round(clearance, 4))
   hit = _TABLE_PICK_FACT_CACHE.get(key)
   if hit is not None:
     return hit

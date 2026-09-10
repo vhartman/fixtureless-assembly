@@ -8,6 +8,8 @@ top_coll_left (base_link) 	{ Q:[0, -0.15, 0.35, 0, 0, -0.383,  0.924]  , shape:b
 
 base_coll (base_link) 	{ Q:[0, 0, 0.06, 0, 0, 0, 1]  , shape:box, size:[0.8, 0.7, 0.35, 0], color:[0.8, 0.2, 0.2, 0.5], contact:-2 }
 
+#workcell_back (base_link) 	{ Q:[-0.2, 0., 0.75, 0, 0, 0, 1]  , shape:box, size:[0.01, 2, 0.5, 0], color:[0.1, 0.1, 0.1, 0.1], contact:-2 }
+
 
 base_footprint: {}
 inertial_link: { mass: 46.034, inertia: [0.6022 -0.02364 -0.1197 1.7386 -0.001544 2.0296],}
@@ -98,13 +100,13 @@ right_arm_mount_joint (right_arm_mount_joint_origin right_ur_arm_base_link): { j
 right_ur_arm_base_link-base_link_inertia_origin (right_ur_arm_base_link): { Q: "E(0 0 3.14159265359)" }
 right_ur_arm_base_link-base_link_inertia (right_ur_arm_base_link-base_link_inertia_origin right_ur_arm_base_link_inertia): { joint: rigid,}
 right_ur_arm_shoulder_pan_joint_origin (right_ur_arm_base_link_inertia): { Q: [0 0 0.1627782525221701] }
-right_ur_arm_shoulder_pan_joint (right_ur_arm_shoulder_pan_joint_origin right_ur_arm_shoulder_link): { joint: hingeZ, limits: [-3.2832 3.2832], ctrl_limits: [3.14 -1 150],}
+right_ur_arm_shoulder_pan_joint (right_ur_arm_shoulder_pan_joint_origin right_ur_arm_shoulder_link): { joint: hingeZ, limits: [-2.2832 2.2832], ctrl_limits: [3.14 -1 150],}
 right_ur_arm_shoulder_lift_joint_origin (right_ur_arm_shoulder_link): { Q: "t(0.00017951387097150235 0 0) E(1.5703872163784984 0 -0.0000044300287598275637)" }
-right_ur_arm_shoulder_lift_joint (right_ur_arm_shoulder_lift_joint_origin right_ur_arm_upper_arm_link): { joint: hingeZ, limits: [-3.2832 2], ctrl_limits: [3.14 -1 150],}
+right_ur_arm_shoulder_lift_joint (right_ur_arm_shoulder_lift_joint_origin right_ur_arm_upper_arm_link): { joint: hingeZ, limits: [-3.2832 -0.5], ctrl_limits: [3.14 -1 150],}
 right_ur_arm_elbow_joint_origin (right_ur_arm_upper_arm_link): { Q: "t(-0.42484922240722683 0 0) E(0.000017598778356909152 -0.0017646390504777454 0.000022896679262627857)" }
-right_ur_arm_elbow_joint (right_ur_arm_elbow_joint_origin right_ur_arm_forearm_link): { joint: hingeZ, limits: [-3.1416 3.1416], ctrl_limits: [3.14 -1 150],}
+right_ur_arm_elbow_joint (right_ur_arm_elbow_joint_origin right_ur_arm_forearm_link): { joint: hingeZ, limits: [-2.3416 2.3416], ctrl_limits: [3.14 -1 150],}
 right_ur_arm_wrist_1_joint_origin (right_ur_arm_forearm_link): { Q: "t(-0.39267466285441494 -0.0007932258609161224 0.13276574606781064) E(0.0059745562860579046 -0.0017403184893875676 -0.000012182431672809177)" }
-right_ur_arm_wrist_1_joint (right_ur_arm_wrist_1_joint_origin right_ur_arm_wrist_1_link): { joint: hingeZ, limits: [-3.2832 3.2832], ctrl_limits: [6.28 -1 28],}
+right_ur_arm_wrist_1_joint (right_ur_arm_wrist_1_joint_origin right_ur_arm_wrist_1_link): { joint: hingeZ, limits: [-4.2832 -0.8832], ctrl_limits: [6.28 -1 28],}
 right_ur_arm_wrist_2_joint_origin (right_ur_arm_wrist_1_link): { Q: "t(-0.000057633117397977084 -0.099557455213209314 0.00015287024635024139) E(1.569260830273018 0 0.00000037474165375667162)" }
 right_ur_arm_wrist_2_joint (right_ur_arm_wrist_2_joint_origin right_ur_arm_wrist_2_link): { joint: hingeZ, limits: [-0.2832 3.2832], ctrl_limits: [6.28 -1 28],}
 right_ur_arm_wrist_3_joint_origin (right_ur_arm_wrist_2_link): { Q: "t(0.000058942281949617339 0.099514048224567206 0.00020241494029680382) E(1.5728303578162324 3.1415926535897931 3.1415917754729397)" }
@@ -119,11 +121,11 @@ right_ur_arm_flange-tool0 (right_ur_arm_flange-tool0_origin right_ur_arm_tool0):
 left_ur_arm_base_link-base_link_inertia_origin (left_ur_arm_base_link): { Q: "E(0 0 3.14159265359)" }
 left_ur_arm_base_link-base_link_inertia (left_ur_arm_base_link-base_link_inertia_origin left_ur_arm_base_link_inertia): { joint: rigid,}
 left_ur_arm_shoulder_pan_joint_origin (left_ur_arm_base_link_inertia): { Q: [0 0 0.16257807277263761] }
-left_ur_arm_shoulder_pan_joint (left_ur_arm_shoulder_pan_joint_origin left_ur_arm_shoulder_link): { joint: hingeZ, limits: [-3.2832 3.2832], ctrl_limits: [3.14 -1 150],}
+left_ur_arm_shoulder_pan_joint (left_ur_arm_shoulder_pan_joint_origin left_ur_arm_shoulder_link): { joint: hingeZ, limits: [-1.2832 2.2832], ctrl_limits: [3.14 -1 150],}
 left_ur_arm_shoulder_lift_joint_origin (left_ur_arm_shoulder_link): { Q: "t(0.00019007197441139241 0 0) E(1.5713901981958054 0 -0.0000026681008682416518)" }
-left_ur_arm_shoulder_lift_joint (left_ur_arm_shoulder_lift_joint_origin left_ur_arm_upper_arm_link): { joint: hingeZ, limits: [-3.2832 0], ctrl_limits: [3.14 -1 150],}
+left_ur_arm_shoulder_lift_joint (left_ur_arm_shoulder_lift_joint_origin left_ur_arm_upper_arm_link): { joint: hingeZ, limits: [-2.5832 0], ctrl_limits: [3.14 -1 150],}
 left_ur_arm_elbow_joint_origin (left_ur_arm_upper_arm_link): { Q: "t(-0.42492076346025309 0 0) E(0.00053885028029254363 -0.00088899660595502864 -0.0000090893692096143134)" }
-left_ur_arm_elbow_joint (left_ur_arm_elbow_joint_origin left_ur_arm_forearm_link): { joint: hingeZ, limits: [-3.1416 3.1416], ctrl_limits: [3.14 -1 150],}
+left_ur_arm_elbow_joint (left_ur_arm_elbow_joint_origin left_ur_arm_forearm_link): { joint: hingeZ, limits: [-2.3416 2.3416], ctrl_limits: [3.14 -1 150],}
 left_ur_arm_wrist_1_joint_origin (left_ur_arm_forearm_link): { Q: "t(-0.39208100648997279 -0.00090760192761138176 0.13352893003432456) E(0.0067969386915389153 0.0021092387583197063 -0.0000069072557868343565)" }
 left_ur_arm_wrist_1_joint (left_ur_arm_wrist_1_joint_origin left_ur_arm_wrist_1_link): { joint: hingeZ, limits: [-3.2832 0.2832], ctrl_limits: [6.28 -1 28],}
 left_ur_arm_wrist_2_joint_origin (left_ur_arm_wrist_1_link): { Q: "t(0.00013627350480989177 -0.099746834502379381 0.0000073743752427287777) E(1.5707223958750225 0 -0.00000021941801741677536)" }
@@ -139,23 +141,23 @@ left_ur_arm_flange-tool0 (left_ur_arm_flange-tool0_origin left_ur_arm_tool0): { 
 
 # UR5e capsule collision proxies.  These use the same dimensions and link
 # coverage as ../ur5/ur5.g, expressed in this calibrated URDF's link frames.
-#right_ur_arm_coll1 (right_ur_arm_base_link_inertia): { shape: capsule, size: [.18 .08], Q: "t(0 0 .1)", color: [1 1 1 .5], contact: -3 }
-right_ur_arm_coll1_1 (right_ur_arm_shoulder_link): { shape: capsule, size: [.16 .065], Q: "t(0 -.09 .004) d(90 1 0 0)", color: [1 1 1 .5], contact: -2 }
+right_ur_arm_coll1 (right_ur_arm_base_link_inertia): { shape: cylinder, size: [.13 .08], Q: "t(0 0 .1)", color: [1 1 1 0.5], contact: 0 }
+right_ur_arm_coll1_1 (right_ur_arm_shoulder_link): { shape: capsule, size: [.17 .08], Q: "t(0 -.08 .004) d(90 1 0 0)", color: [1 1 1 .5], contact: -2 }
 right_ur_arm_coll2 (right_ur_arm_shoulder_lift_joint): { shape: capsule, size: [.35 .065], Q: "t(-.212 0 .135) d(90 0 1 0)", color: [1 1 1 .5], contact: -2 }
 right_ur_arm_coll3 (right_ur_arm_elbow_joint_origin): { shape: capsule, size: [.16 .065], Q: "t(0 0 .09)", color: [1 1 1 0.5], contact: -2 }
-right_ur_arm_coll4 (right_ur_arm_elbow_joint): { shape: capsule, size: [.37 .06], Q: "t(-.186 0 .006) d(90 0 1 0)", color: [1 1 1 .5], contact: -2 }
-right_ur_arm_coll5 (right_ur_arm_wrist_1_joint): { shape: capsule, size: [.1 .047], Q: "t(0 0 -.018) d(90 1 0 0)", color: [1 1 1 .5], contact: -2 }
-right_ur_arm_coll6 (right_ur_arm_wrist_2_joint): { shape: capsule, size: [.1 .05], Q: "t(0 -.002 -.004) d(90 1 0 0)", color: [1 1 1 .5], contact: -2 }
-#right_ur_arm_coll7 (right_ur_arm_wrist_3_joint): { shape: capsule, size: [.1 .045], Q: "t(0 -.003 -.023) d(90 1 0 0)", color: [1 1 1 .5], contact: -2 }
+right_ur_arm_coll4 (right_ur_arm_elbow_joint): { shape: capsule, size: [.38 .06], Q: "t(-.186 0 .006) d(90 0 1 0)", color: [1 1 1 .5], contact: -2 }
+right_ur_arm_coll5 (right_ur_arm_wrist_1_joint): { shape: capsule, size: [.1 .047], Q: "t(0 -0.02 -.0) d(90 1 0 0)", color: [1 1 1 .5], contact: -2 }
+right_ur_arm_coll6 (right_ur_arm_wrist_2_joint): { shape: capsule, size: [.09 .05], Q: "t(0 .025 -.00) d(90 1 0 0)", color: [1 1 1 .5], contact: -2 }
+right_ur_arm_coll7 (right_ur_arm_wrist_1_joint): { shape: capsule, size: [.1 .045], Q: "t(0 -.00 -.1) d(0 1 0 0)", color: [1 1 1 .5], contact: -2 }
 
-#left_ur_arm_coll1 (left_ur_arm_base_link_inertia): { shape: capsule, size: [.18 .08], Q: "t(0 0 .1)", color: [1 1 1 .5], contact: -3 }
-left_ur_arm_coll1_1 (left_ur_arm_shoulder_link): { shape: capsule, size: [.16 .065], Q: "t(0 -.09 .004) d(90 1 0 0)", color: [1 1 1 .5], contact: -2 }
+left_ur_arm_coll1 (left_ur_arm_base_link_inertia): { shape: cylinder, size: [.13 .08], Q: "t(0 0 .1)", color: [1 1 1 .5], contact: 0 }
+left_ur_arm_coll1_1 (left_ur_arm_shoulder_link): { shape: capsule, size: [.17 .08], Q: "t(0 -.08 .004) d(90 1 0 0)", color: [1 1 1 .5], contact: -2 }
 left_ur_arm_coll2 (left_ur_arm_shoulder_lift_joint): { shape: capsule, size: [.35 .065], Q: "t(-.212 0 .135) d(90 0 1 0)", color: [1 1 1 .5], contact: -2 }
 left_ur_arm_coll3 (left_ur_arm_elbow_joint_origin): { shape: capsule, size: [.16 .065], Q: "t(0 0 .09)", color: [1 1 1 .5], contact: -2 }
 left_ur_arm_coll4 (left_ur_arm_elbow_joint): { shape: capsule, size: [.37 .06], Q: "t(-.186 0 .006) d(90 0 1 0)", color: [1 1 1 .5], contact: -2 }
-left_ur_arm_coll5 (left_ur_arm_wrist_1_joint): { shape: capsule, size: [.1 .047], Q: "t(0 0 -.018) d(90 1 0 0)", color: [1 1 1 .5], contact: -2 }
-left_ur_arm_coll6 (left_ur_arm_wrist_2_joint): { shape: capsule, size: [.1 .05], Q: "t(0 -.002 -.004) d(90 1 0 0)", color: [1 1 1 .5], contact: -2 }
-#left_ur_arm_coll7 (left_ur_arm_wrist_3_joint): { shape: capsule, size: [.1 .045], Q: "t(0 -.003 -.023) d(90 1 0 0)", color: [1 1 1 .5], contact: -2 }
+left_ur_arm_coll5 (left_ur_arm_wrist_1_joint): { shape: capsule, size: [.1 .047], Q: "t(0 -0.02 -.0) d(90 1 0 0)", color: [1 1 1 .5], contact: -2 }
+left_ur_arm_coll6 (left_ur_arm_wrist_2_joint): { shape: capsule, size: [.09 .05], Q: "t(0 .025 -.0) d(90 1 0 0)", color: [1 1 1 .5], contact: -2 }
+left_ur_arm_coll7 (left_ur_arm_wrist_1_joint): { shape: capsule, size: [.1 .045], Q: "t(0 -.00 -.1) d(0 1 0 0)", color: [1 1 1 .5], contact: -2 }
 
 # Match the initial configuration used by the repository's UR5e models.
 Edit right_ur_arm_shoulder_pan_joint: { q: -1.5 }

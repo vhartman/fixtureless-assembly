@@ -1524,10 +1524,11 @@ def build_parser():
   )
   g_witness.add_argument(
       "--object-over-table", action=argparse.BooleanOptionalAction, default=False,
-      help="Keep the reference datum of each currently held rigid component inside the "
-           "tabletop's local x/y "
+      help="Keep the reference datum of each held rigid component moved by the current skill "
+           "inside the tabletop's local x/y "
            "footprint at every real-IK witness. The same bounds are hard KOMO inequalities "
-           "and a post-solve certificate; table-supported parts are unchanged. This is an "
+           "and a post-solve certificate; table-supported parts and payloads on uninvolved "
+           "arms parked at the isolated IK EXIT pose are unchanged. This is an "
            "endpoint/workcell constraint, not a constraint on every motion-planning sample.",
   )
   g_witness.add_argument(
@@ -4065,10 +4066,11 @@ def run(cfg, explicit=None):
                      f" expanded by {-cfg.object_over_table_margin * 1000:g}mm"
                      if cfg.object_over_table_margin < 0.0 else "")
       print("[flag] --object-over-table ACTIVE IN SEARCH + WITNESS PASSES: every held "
-            f"component reference datum stays inside the table-local x/y footprint"
+            f"component moved by the current skill stays inside the table-local x/y footprint"
             f"{margin_desc}; KOMO receives "
             "the bounds up front and the accepted endpoint is checked again. This does not "
-            "constrain arm links or the continuous motion-planning path.")
+            "constrain inactive EXIT-pose payloads, arm links, or the continuous "
+            "motion-planning path.")
     if robot_ik is not None and cfg.mate_eq_weight is not None:
       robot_ik.mate_eq_weight = float(cfg.mate_eq_weight)
       print(f"[flag] --mate-eq-weight {cfg.mate_eq_weight:g}: assemble mate eq constraints "

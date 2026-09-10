@@ -23,10 +23,14 @@ coll7(ur_wrist_3_joint)              { shape:capsule color:[1.,1.,1.,.5] size:[.
 # gripper-mount flange (tool root), like ur5.g; its +z is the tool/approach axis (wrist-3 +z).
 ur_ee_link (ur_wrist_3_joint) { Q:"d(90 0 0 1) t(-.0 -.0 .09)" }
 
+# Robotiq ePick CAD, display only.  Keep its pose separate from the collision/tool frames so
+# calibration only requires editing this Q; the cylinder below remains the planning proxy.
+ur_epick_visual (ur_ee_link) { shape:mesh, mesh:<../robotiq/meshes/visual/robotiq_epick.dae>, meshscale:0.001, Q:"t(0 0 0.055)", visual:True, contact:0 }
+
 # vacuum pen: a fill cylinder along the tool axis (+z) and the suction tip `ur_vacuum` at the
 # grasp standoff. Approach axis = (ur_vacuum - ur_ee_link) resolves to +z.
-gripper_fill (ur_ee_link){ shape:cylinder, color:[.1, .1, .1, 1], Q:"t(0 0 .025)", size:[.05 .021], contact:-1 }
-ur_vacuum (ur_ee_link){ shape:sphere, color:[.9, 0, 0, 1], Q:"t(0 0 .06)", size:[0.005], contact:0 }
+gripper_fill (ur_ee_link){ shape:cylinder, color:[1, 1, 1, .5], Q:"t(0 0 .025)", size:[.07 .04], contact:-1 }
+ur_vacuum (ur_ee_link){ shape:sphere, color:[.9, 0, 0, 1], Q:"t(0 0 .075)", size:[0.005], contact:0 }
 ur_ee_marker (ur_ee_link){ shape:marker, size:[0.05] }
 
 Edit ur_shoulder_pan_joint: { q: 0.0 }

@@ -1883,6 +1883,19 @@ class SimScene:
       if adr is not None:
         self.data.qpos[adr] = q[i]
         self.data.qvel[self._vadr[jn]] = 0.0 if v is None else v[i]
+    # ``--animate-grippers`` adds genuine hinge coordinates, but their meshes and collision
+    # proxies are deliberately presentation-only: the planner has no finger DOFs.  In the
+    # kinematic arm mode the parent chain is re-pinned here after every mj_step.  Leaving its
+    # child finger hinges dynamically integrated makes that discontinuous parent correction
+    # inject energy into the six independent Robotiq mimic joints (measured on UR10: a common
+    # zero command diverged across the linkage by 0.81rad and several joints hit their stops).
+    # Re-pin the hinges to the CURRENT smooth aperture too.  They remain actual articulated
+    # joints in the model and NPZ, but share the same kinematic semantics as their parent arm.
+    # Actuated-arm execution is intentionally unchanged: its finger position actuators track
+    # normally (UR10 max mimic spread 0.075rad, matching UR5/Husky's 0.081rad).
+    if self.animate_grippers and not self.actuated:
+      for robot in self.robots:
+        self.set_gripper_aperture(robot, self.gripper_aperture(robot))
     mujoco.mj_forward(self.model, self.data)
     self._phys += 1
 
@@ -3250,7 +3263,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         servo_tol=0.002, servo_torque_guard=None,
                         servo_place_seat=False, compliant_follow=False,
                         compliant_force=3.0, servo_pick=False,
-                        animate_grippers=False, gripper_motion_time=0.25):
+                        animate_grippers=False, gripper_motion_time=0.25,
+                        wait_for_gripper=False):
   """Execute an mr_bench PATH (from mp_export.run_birrt) in MuJoCo with the REAL ARMS:
   every rai robot shape frame (the capsule collision model + gripper primitives) is mirrored
   as a kinematic body positioned by rai FK along the path -- the planner's own kinematics by
@@ -3287,6 +3301,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
   # FK config: a private copy so the caller's C is untouched.
   C_fk = ry.Config()
   C_fk.addConfigurationCopy(C)
+  _C_fk_names = set(C_fk.getFrameNames())
   jnames = C_fk.getJointNames()
   ridx = {r: [i for i, jn in enumerate(jnames) if jn.startswith(r)] for r in robots}
 
@@ -3300,9 +3315,9 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
   # FK pose here as well so that body is initialized and subsequently driven from the same
   # frame as the planner's attach task.
   for r in robots:
-    semantic = f"{r}_ur_gripper_center"
-    if C_fk.getFrame(semantic) is not None:
-      _fk_frame_names.add(semantic)
+    for semantic in (f"{r}_ur_gripper_center", f"{r}_ur_vacuum"):
+      if semantic in _C_fk_names:
+        _fk_frame_names.add(semantic)
   _fk_frames = sorted(_fk_frame_names)
   _fk_objs = [C_fk.getFrame(f) for f in _fk_frames]
 
@@ -3320,24 +3335,28 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       o += n
     return qfull
 
-  # EE anchor frame for grasp welds.  Every supported real robot exposes the SAME semantic
-  # frame used by RobotIK/mp_export's pick tasks: ``<robot>_ur_gripper_center``.  Do not infer
-  # this from shape ordering.  In particular, Husky's last non-mesh shape is ``finger2``;
-  # welding cargo there made the execution wrench and Cartesian pick servo act about one
-  # fingertip while the saved keyframe was defined at the tool centre.  Keep the old rule
-  # only for genuinely legacy models which predate the common alias.
+  # EE anchor frame for grasp welds.  Use the SAME priority as
+  # problem._gripper_rest_transforms / RobotIK: parallel jaws expose
+  # ``<robot>_ur_gripper_center`` and vacuum tools expose ``<robot>_ur_vacuum``.  Do not infer
+  # this from shape ordering.  In particular, Husky's last non-mesh shape is ``finger2`` and
+  # the UR vacuum's ``gripper_fill`` is a collision cylinder whose centre is deliberately
+  # behind the suction goal.  Welding cargo to either one silently changes the saved grasp
+  # transform (the calibrated ePick has a 55mm fill-to-tip offset).  Keep shape inference only
+  # for genuinely legacy models which predate both semantic frames.
   ee_anchor = {}
   for r in robots:
-    semantic = f"{r}_ur_gripper_center"
-    if C_fk.getFrame(semantic) is not None:
+    semantics = (f"{r}_ur_gripper_center", f"{r}_ur_vacuum")
+    semantic = next((name for name in semantics if name in _C_fk_names), None)
+    if semantic is not None:
       ee_anchor[r] = semantic
       continue
     cands = [e[1] for e in arms if e[1].startswith(r) and e[2][0] != "mesh"]
     if not cands:
       raise ValueError(f"simulation export found no end-effector frame for {r}")
     ee_anchor[r] = next((f for f in cands if "gripper_fill" in f), cands[-1])
-    print(f"[sim/mp] WARNING: {r} has no {semantic}; using legacy grasp anchor "
-          f"{ee_anchor[r]}. Add the standard ur_gripper_center alias to the robot model.")
+    print(f"[sim/mp] WARNING: {r} has neither {semantics[0]} nor {semantics[1]}; using legacy "
+          f"grasp anchor {ee_anchor[r]}. Add the appropriate semantic tool-centre frame to "
+          "the robot model.")
 
   q0 = full_q(mp_path[0].q)
   scene = SimScene(assembly, initial_state if initial_state is not None else states[0], robots,
@@ -3358,9 +3377,11 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         f"(MuJoCo sliding/torsional/rolling={_contact_friction(scene.table_mu, table=True)}).")
   if animate_grippers:
     _n = sum(len(v) for v in scene._gripper_qadr.values())
+    _timing = ("with an execution barrier after each command" if wait_for_gripper else
+               "concurrent with arm motion")
     print(f"[sim/gripper] --animate-grippers ACTIVE: {_n} simulation-only articulated finger "
           f"hinge(s) with position actuators, object-dependent terminal apertures, "
-          f"{gripper_motion_time:g}s smooth commands concurrent with arm motion. Planner/MP "
+          f"{gripper_motion_time:g}s smooth commands {_timing}. Planner/MP "
           "joint vectors are unchanged; NPZ qpos includes the finger joints.")
   if record_metadata is not None:
     # Persist the RESOLVED value, not the nullable plan field.  Legacy plans omit table_mu
@@ -3780,6 +3801,24 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                and abs(scene.gripper_aperture(r) - float(v)) > 1e-6}
     for r, target in targets.items():
       scene.command_gripper_aperture(r, target, gripper_motion_time)
+    return tuple(sorted(targets))
+
+  def _wait_gripper_motion(commanded, event):
+    """Optional hardware-event barrier while the arm reference remains fixed.
+
+    Finger animation normally overlaps the following trajectory. That is fast, but means a
+    post-pick retreat can begin while the jaws are visibly half closed. The opt-in barrier
+    advances physics for exactly the configured command duration without consuming another
+    trajectory sample. In actuated mode the last arm reference is re-issued every tick; in
+    kinematic mode this also re-pins the presentation joints through ``set_arm_q``.
+    """
+    if not wait_for_gripper or not commanded:
+      return
+    q_hold = np.asarray(_last_q["q"], dtype=float)
+    ticks = max(1, int(np.ceil(gripper_motion_time / DT)))
+    for _ in range(ticks):
+      drive_q(q_hold)
+      scene.step(1, report, (f"gripper_{event}",))
 
   def _closing_aperture(robot, child):
     """Object-dependent aperture from the same geometry routine as the closure gate."""
@@ -3924,7 +3963,11 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           "physics_tick": int(scene._phys), "time_s": float(scene._phys * DT),
           "frame": int(len(rec["qpos"])), "animated": bool(animate_grippers)})
     if animate_grippers and _incoming is not None:
-      _command_gripper_targets({_incoming: _closing_aperture(_incoming, child)})
+      _closed = _command_gripper_targets(
+          {_incoming: _closing_aperture(_incoming, child)})
+      # For picks this finishes closure before the grasp weld is activated. For handovers it
+      # keeps the giver attached until the receiver has finished closing.
+      _wait_gripper_motion(_closed, "close")
     # seat check BEFORE the datum weld (part-part attach only) -- report a genuine miss.
     seat_miss = seat_angle = None
     if parent in assembly.objects:
@@ -3962,7 +4005,10 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             "physics_tick": int(scene._phys), "time_s": float(scene._phys * DT),
             "frame": int(len(rec["qpos"])), "animated": bool(animate_grippers)})
     if animate_grippers:
-      _command_gripper_targets(_open)
+      _opened = _command_gripper_targets(_open)
+      # Ownership has already transferred (or the part has been released), so a handover
+      # cannot open both hands together: receiver-close completed above, then giver-open.
+      _wait_gripper_motion(_opened, "open")
     # Every framed task is the physical side effect of its plan action. Usually that is the
     # final split task; --post-release deliberately appends a frame-less departure AFTER the
     # detach, so requiring `is-final` here would lose the release result entirely.
@@ -6553,6 +6599,8 @@ def _cli_run(a):
     raise SystemExit("[sim] object grasp capture tolerances must be positive")
   if a.animate_grippers and not (a.actuated or a.articulated):
     raise SystemExit("[sim] --animate-grippers requires --actuated or --articulated")
+  if a.wait_for_gripper and not a.animate_grippers:
+    raise SystemExit("[sim] --wait-for-gripper requires --animate-grippers")
   if a.gripper_motion_time <= 0.0:
     raise SystemExit("[sim] --gripper-motion-time must be positive")
   _has_object_perturb = bool(a.object_perturb_xy > 0.0 or a.object_perturb_yaw > 0.0)
@@ -6878,6 +6926,7 @@ def _cli_run(a):
       "apply_process_wrench": bool(a.apply_process_wrench),
       "animate_grippers": bool(a.animate_grippers),
       "gripper_motion_time": float(a.gripper_motion_time),
+      "wait_for_gripper": bool(a.wait_for_gripper),
       "table_mu": _saved(cfg, "table_mu", legacy=None),
       "resolved_profile": {k: getattr(a, k) for k in _STANDARD_SIM_PROFILE},
   }
@@ -6956,7 +7005,8 @@ def _cli_run(a):
                             process_wrench_ramp=a.process_wrench_ramp,
                             pre_insertion=float(_saved(cfg, "pre_insertion", legacy=0.05)),
                             animate_grippers=a.animate_grippers,
-                            gripper_motion_time=a.gripper_motion_time)
+                            gripper_motion_time=a.gripper_motion_time,
+                            wait_for_gripper=a.wait_for_gripper)
   print(rep.summary())
   if a.report_json:
     import json
@@ -7488,6 +7538,12 @@ def _build_cli():
                       "The joints live in qpos, so recordings replay without a side channel.")
   r.add_argument("--gripper-motion-time", type=float, default=0.25, metavar="SEC",
                  help="Smooth close/open duration for --animate-grippers (default 0.25s).")
+  r.add_argument("--wait-for-gripper", action=argparse.BooleanOptionalAction, default=False,
+                 help="With --animate-grippers, make each physical finger command an execution "
+                      "barrier: hold the arm reference until closing/opening finishes. Picks "
+                      "close before grasp activation, releases open before departure, and "
+                      "handovers are receiver-close -> transfer -> giver-open. OFF preserves "
+                      "the historical overlap with subsequent arm motion.")
   r.add_argument("--report-json", metavar="FILE", default=None,
                  help="write the structured per-action SimReport and resolved perturbation "
                       "metadata as JSON (also written before --require-success exits 3).")

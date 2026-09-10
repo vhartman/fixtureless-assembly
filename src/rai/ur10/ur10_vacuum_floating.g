@@ -7,8 +7,12 @@ ur_floatRX (ur_floatZ){ joint:hingeX, limits:[-3.14159 3.14159], mass:.01 }
 ur_floatRY (ur_floatRX){ joint:hingeY, limits:[-3.14159 3.14159], mass:.01 }
 ur_ee_link (ur_floatRY){ joint:hingeZ, limits:[-3.14159 3.14159], mass:.01 }
 
-gripper_fill (ur_ee_link){ shape:cylinder, color:[.1, .1, .1 , 1], Q:"d(90 0 1 0) t(-.0 -.0 .025)",
-	size:[.05 .021],
+# Robotiq ePick CAD, display only; calibrated to the same tool-root convention as
+# ur10_vacuum.g.  The cylinder remains the collision proxy used by planning.
+ur_epick_visual (ur_ee_link) { shape:mesh, mesh:<../robotiq/meshes/visual/robotiq_epick.dae>, meshscale:0.001, Q:"t(0.095 0.0 0.) d(90 0 1 0)", visual:True, contact:0 }
+
+gripper_fill (ur_ee_link){ shape:cylinder, color:[1, 1, 1, 0.5], Q:"d(90 0 1 0) t(-.0 -.0 .06)",
+	size:[.07 .04],
 	contact:-1
 }
 
@@ -16,7 +20,7 @@ gripper_fill (ur_ee_link){ shape:cylinder, color:[.1, .1, .1 , 1], Q:"d(90 0 1 0
 ur_vacuum (ur_ee_link){
     shape:sphere,
     color:[.9, 0, 0 ,1],
-    Q:"t(.06 0.0 0.)",
+    Q:"t(.115 0.0 0.)",
     size:[0.005],
     contact:0
 }

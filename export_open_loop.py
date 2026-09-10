@@ -29,7 +29,7 @@ import numpy as np
 
 
 SCHEMA = "assembly-open-loop-v2"
-JSON_SCHEMA = "assembly-open-loop-json-v2"
+JSON_SCHEMA = "assembly-open-loop-json-v3"
 _OPEN_LOOP_MODE = "trajectory"
 
 
@@ -133,7 +133,8 @@ def _json_samples(q, t, hinge, controller_active, events, robots, attached_objec
 
   Close commands at the same source time are concurrent and therefore insert one global dwell,
   not one dwell per robot. Opening is a one-sample command; closing remains asserted throughout
-  its dwell so a simple player can issue the command and wait before advancing the arm path.
+  its dwell so a simple player can issue the command and wait before advancing the arm path. For
+  a handover, the giver's atomic source open is delayed to the end of the receiver's dwell.
   """
   dt = float(dt)
   grasp_wait = float(grasp_wait)
@@ -143,16 +144,35 @@ def _json_samples(q, t, hinge, controller_active, events, robots, attached_objec
     raise ValueError("grasp wait must be finite and nonnegative")
 
   tagged = []
-  for event in events:
+  for order, event in enumerate(events):
     kind, robot = event.get("event"), event.get("robot")
     if kind not in ("close_start", "open_start") or robot not in robots:
       continue
     tagged.append((_event_time(event, physics_dt=physics_dt, time_origin=time_origin,
-                               source_t=t), str(kind), str(robot)))
+                               source_t=t), order, str(kind), str(robot),
+                   str(event.get("part", ""))))
+
+  # Simulation performs a handover's two logical weld changes at one physics tick. Hardware
+  # cannot: the receiver must finish closing before the giver starts opening. Identify only
+  # same-part close/open pairs here; unrelated parallel pick/release events need no ordering.
+  handover_opens = {}
+  for et, order, kind, robot, part in tagged:
+    if kind != "open_start" or not part:
+      continue
+    receivers = {
+        cr for ct, _co, ck, cr, cp in tagged
+        if ck == "close_start" and cr != robot and cp == part
+        and abs(ct - et) <= 0.5 * physics_dt
+    }
+    if receivers:
+      handover_opens[order] = (et, robot, part, receivers)
+  if handover_opens and grasp_wait <= 0.0:
+    raise ValueError("a handover requires positive --grasp-wait so the receiver can close "
+                     "before the giver opens")
 
   # Group simultaneous close commands before constructing the time warp.
   close_groups = []
-  for et, kind, robot in sorted(tagged):
+  for et, _order, kind, robot, _part in sorted(tagged):
     if kind != "close_start":
       continue
     if close_groups and abs(et - close_groups[-1][0]) <= 0.5 * physics_dt:
@@ -207,15 +227,32 @@ def _json_samples(q, t, hinge, controller_active, events, robots, attached_objec
   source_indices = np.searchsorted(t, source_at, side="right") - 1
   source_indices = np.clip(source_indices, 0, len(t) - 1)
   servo = cin[source_indices]
-  attached = np.asarray(attached_objects)[source_indices]
+  attached = np.asarray(attached_objects)[source_indices].copy()
 
   opening = [set() for _ in range(count)]
-  for et, kind, robot in tagged:
+  for et, order, kind, robot, _part in tagged:
     if kind != "open_start":
       continue
-    out_time = shifted_event_time(et)
-    idx = min(int(np.floor(out_time / dt + 0.5)), count - 1)
+    # The source handover is atomic, but its hardware realization is not. The close dwell is
+    # inserted immediately after this source instant; put the giver's open command at its end.
+    out_time = shifted_event_time(et) + (grasp_wait if order in handover_opens else 0.0)
+    # Never round an opening command *backwards* across its event time. In particular, an
+    # off-grid handover dwell endpoint rounded to the nearest sample can still lie inside the
+    # receiver's close interval, recreating the unsafe overlap this expansion is meant to fix.
+    idx = min(int(np.ceil(out_time / dt - 1e-12)), count - 1)
     opening[idx].add(robot)
+
+  # At an atomic source handover the source trace already says "receiver only" at the event.
+  # During the expanded hardware dwell, the giver in fact remains attached while the receiver
+  # closes. Represent that intentional co-grasp interval, and let the source trace take over at
+  # the end when the delayed open command fires.
+  robot_index = {str(robot): i for i, robot in enumerate(robots)}
+  for _order, (et, giver, part, receivers) in handover_opens.items():
+    begin, end = shifted_event_time(et), shifted_event_time(et) + grasp_wait
+    overlap = np.flatnonzero((tout >= begin - 1e-12) & (tout < end - 1e-12))
+    attached[overlap, robot_index[giver]] = part
+    for receiver in receivers:
+      attached[overlap, robot_index[receiver]] = part
 
   samples = []
   for i in range(count):
