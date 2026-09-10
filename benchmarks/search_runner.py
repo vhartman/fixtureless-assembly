@@ -313,6 +313,20 @@ def parse_log(text: str):
   one("clearance_rejects", r"\[ik-clearance\] vetoed (\d+)", int)
 
   m = re.search(
+      r"\[search-phase-prof\] pipeline=" + _NUM + r"s "
+      r"grasp=" + _NUM + r"s/(\d+) "
+      r"grasp_backward=" + _NUM + r"s/(\d+) "
+      r"force_lp_backward=" + _NUM + r"s/(\d+) "
+      r"force_lp_forward=" + _NUM + r"s/(\d+)", text)
+  if m:
+    out.update(
+        search_pipeline_s=float(m.group(1)),
+        grasp_generation_s=float(m.group(2)), grasp_generation_calls=int(m.group(3)),
+        grasp_backward_s=float(m.group(4)), grasp_backward_calls=int(m.group(5)),
+        backward_force_lp_s=float(m.group(6)), backward_force_lp_calls=int(m.group(7)),
+        forward_force_lp_s=float(m.group(8)), forward_force_lp_calls=int(m.group(9)))
+
+  m = re.search(
       r"\[ik-prof\] binds: (\d+) called, (\d+) cache hits .*?, (\d+) solved "
       r"\((\d+) ok / (\d+) failed\), bind wall " + _NUM + r"s", text)
   if m:
@@ -436,6 +450,24 @@ def parse_log(text: str):
         sum(int(m[1]) for m in sk_ok) + sum(int(m[0]) for m in sk_fb))
     out["skeleton_probe_s"] = (
         sum(float(m[2]) for m in sk_ok) + sum(float(m[1]) for m in sk_fb))
+
+  # Exclusive paper-table decomposition. Reverse-search log timers include any lazily
+  # materialized grasp rows and equilibrium optimizer calls made during predecessor
+  # expansion. Remove those nested measurements here, then assign the remaining pipeline
+  # residual to forward discrete search/setup. The five reported columns therefore sum to
+  # search_pipeline_s up to timer precision. A missing component remains absent rather than
+  # being silently treated as measured zero.
+  required = ("search_pipeline_s", "grasp_generation_s", "grasp_backward_s",
+              "backward_search_s", "backward_force_lp_s", "ik_bind_wall_s")
+  if all(k in out for k in required):
+    out["backward_graph_search_s"] = max(
+        0.0, out["backward_search_s"] - out["grasp_backward_s"]
+        - out["backward_force_lp_s"])
+    outside_backward_grasp = max(
+        0.0, out["grasp_generation_s"] - out["grasp_backward_s"])
+    out["forward_search_s"] = max(
+        0.0, out["search_pipeline_s"] - out["backward_search_s"]
+        - out["ik_bind_wall_s"] - outside_backward_grasp)
   return out
 
 
@@ -519,6 +551,7 @@ def run_one(spec, suite_dir: Path, suite_provenance, env_extra, timeout_override
            "-o", str(time_path), *guarded_command]
   env = os.environ.copy()
   env.update({"PYTHONHASHSEED": "0", "PYTHONUNBUFFERED": "1",
+              "ASSEMBLY_BENCH_PROFILE": "1",
               "NUMBA_CACHE_DIR": "/tmp/assembly-numba-cache",
               "MPLCONFIGDIR": "/tmp/assembly-mpl-cache"})
   env.update(env_extra)
@@ -545,13 +578,15 @@ def run_one(spec, suite_dir: Path, suite_provenance, env_extra, timeout_override
   time_metrics = parse_time_file(time_path)
   plan_metrics = parse_plan(plan_path)
   success = returncode == 0 and "plan_actions" in plan_metrics
+  out_of_memory = not timed_out and returncode != 0 and "MemoryError" in text
   status = "success" if success else "timeout" if timed_out else (
-      "no_plan" if returncode == 0 else "error")
+      "oom" if out_of_memory else "no_plan" if returncode == 0 else "error")
   result = {
       **run_meta,
       "status": status,
       "success": success,
       "timed_out": timed_out,
+      "out_of_memory": out_of_memory,
       "returncode": returncode,
       "started_utc": started.isoformat(),
       "finished_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -579,6 +614,11 @@ def _numeric_summary(rows, key):
 
 def aggregate(results):
   metrics = ("wall_s", "observed_wall_s", "max_rss_kb", "plan_actions", "plan_cost",
+             "search_pipeline_s", "grasp_generation_s", "grasp_generation_calls",
+             "grasp_backward_s", "grasp_backward_calls",
+             "backward_graph_search_s", "backward_force_lp_s",
+             "backward_force_lp_calls", "forward_search_s", "forward_force_lp_s",
+             "forward_force_lp_calls",
              "backward_states", "backward_build_s", "fill_pdb_reverse_s",
              "backward_search_s", "milestone_search_s",
              "milestone_repairs", "ik_bind_calls", "ik_bind_fail", "ik_bind_wall_s",
@@ -605,7 +645,11 @@ def aggregate(results):
     rows = [r for r in results if r["case"] == case and r["variant"] == variant]
     row = {"case": case, "variant": variant, "runs": len(rows),
            "successes": sum(bool(r.get("success")) for r in rows),
-           "timeouts": sum(bool(r.get("timed_out")) for r in rows)}
+           "timeouts": sum(bool(r.get("timed_out")) for r in rows),
+           "out_of_memory": sum(
+               bool(r.get("out_of_memory")) or r.get("status") == "oom" for r in rows),
+           "errors": sum(r.get("status") == "error" for r in rows),
+           "no_plans": sum(r.get("status") == "no_plan" for r in rows)}
     row["success_rate"] = row["successes"] / max(1, row["runs"])
     for metric in metrics:
       mean, sd = _numeric_summary(rows, metric)

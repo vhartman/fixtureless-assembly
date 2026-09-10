@@ -25,6 +25,7 @@ from matplotlib.lines import Line2D
 from benchmarks import plot_cube_scaling as base
 
 
+PAPER_STYLE = ROOT / "paper_2.mplstyle"
 LAMBDAS = (0.0, 0.01, 0.1, 0.5, 1.0, 2.0)
 COLORS = {
     0.0: "#9aa0a6",
@@ -99,66 +100,128 @@ def _write_csv(path: Path, rows):
     writer.writerows(rows)
 
 
-def plot_pair(physical_suite: Path, no_wrench_suite: Path, output_dir: Path, *,
-              output_stem: str, title: str, x_label: str,
-              metric: str = "milestone_search_s_mean",
-              y_label: str = "Time to initial witnessed plan (s)"):
+def _plot_pair(physical_suite: Path, no_wrench_suite: Path, output_dir: Path, *,
+               output_stem: str, title: str, x_label: str,
+               metric: str = "milestone_search_s_mean",
+               y_label: str = "Time to initial witnessed plan (s)",
+               paper: bool = False, optimistic_no_wrench_suite: Path | None = None):
   physical = _aggregate(_read_results(physical_suite), physical=True)
   topological = _aggregate(_read_results(no_wrench_suite), physical=False)
+  optimistic_topological = (
+      _aggregate(_read_results(optimistic_no_wrench_suite), physical=False)
+      if optimistic_no_wrench_suite is not None else [])
   robots = sorted({int(row["robots"]) for row in physical})
   if robots != [2, 3, 4]:
     raise ValueError(f"expected robot counts 2, 3, 4, got {robots}")
   output_dir.mkdir(parents=True, exist_ok=True)
   _write_csv(output_dir / f"{output_stem}.csv", physical)
   _write_csv(output_dir / f"{output_stem}-no-wrench.csv", topological)
+  if optimistic_topological:
+    _write_csv(output_dir / f"{output_stem}-optimistic-no-wrench.csv",
+               optimistic_topological)
 
+  line_width = float(plt.rcParams["lines.linewidth"]) if paper else 2.0
+  marker_size = float(plt.rcParams["lines.markersize"]) if paper else 4.2
   fig, axes = plt.subplots(1, 3, figsize=(15.2, 5.4), sharey=True)
   for ax, robot_count in zip(axes, robots):
     controls = sorted((row for row in topological if row["robots"] == robot_count),
                       key=lambda row: row["parts"])
     ax.plot([row["parts"] for row in controls],
             [math.nan if row[metric] is None else row[metric] for row in controls],
-            color="#111111", linestyle=":", marker="D", linewidth=2.0,
-            markersize=4.2)
+            color="#111111", linestyle=":", marker="D", linewidth=line_width,
+            markersize=marker_size)
     for row in controls:
-      if row["failures"] and row["failed_elapsed_s_max"]:
+      if (metric != "plan_cost_mean" and row["failures"]
+          and row["failed_elapsed_s_max"]):
         ax.scatter(row["parts"], row["failed_elapsed_s_max"], color="#111111",
                    marker="x", s=45, linewidth=1.7, zorder=4)
+    optimistic_controls = sorted(
+        (row for row in optimistic_topological if row["robots"] == robot_count),
+        key=lambda row: row["parts"])
+    if optimistic_controls:
+      ax.plot([row["parts"] for row in optimistic_controls],
+              [math.nan if row[metric] is None else row[metric]
+               for row in optimistic_controls],
+              color="#9c2f2f", linestyle="--", marker="s", linewidth=line_width,
+              markersize=marker_size)
+      for row in optimistic_controls:
+        if (metric != "plan_cost_mean" and row["failures"]
+            and row["failed_elapsed_s_max"]):
+          ax.scatter(row["parts"], row["failed_elapsed_s_max"], color="#9c2f2f",
+                     marker="x", s=45, linewidth=1.7, zorder=4)
     for lam in LAMBDAS:
       series = sorted((row for row in physical
                        if row["robots"] == robot_count and row["lambda"] == lam),
                       key=lambda row: row["parts"])
       ax.plot([row["parts"] for row in series],
               [math.nan if row[metric] is None else row[metric] for row in series],
-              color=COLORS[lam], marker="o", linewidth=2.0, markersize=4.2)
+              color=COLORS[lam], marker="o", linewidth=line_width,
+              markersize=marker_size)
       for row in series:
-        if row["failures"] and row["failed_elapsed_s_max"]:
+        if (metric != "plan_cost_mean" and row["failures"]
+            and row["failed_elapsed_s_max"]):
           ax.scatter(row["parts"], row["failed_elapsed_s_max"], color=COLORS[lam],
                      marker="x", s=45, linewidth=1.7, zorder=4)
-    ax.set_title(f"{robot_count} robots")
-    ax.set_xlabel(x_label)
-    ax.set_yscale("log")
+    if not paper:
+      ax.set_title(f"{robot_count} robots")
+    ax.set_xlabel(r"\#parts" if paper else x_label)
+    if paper:
+      ax.tick_params(axis="x", labelsize=24)
+    ax.set_yscale("linear" if metric == "plan_cost_mean" else "log")
     ax.grid(True, which="both", alpha=0.25)
     ax.set_xticks(sorted({int(row["parts"]) for row in physical}))
-  axes[0].set_ylabel(y_label)
+  paper_y_label = ("Plan cost" if metric == "plan_cost_mean" else "Planning time (s)")
+  axes[0].set_ylabel(paper_y_label if paper else y_label)
   handles = [Line2D([], [], color="#111111", linestyle=":", marker="D",
-                    label="topological (no wrench)")]
+                    label="ours, topological (no wrench)")]
+  if optimistic_topological:
+    handles.append(Line2D([], [], color="#9c2f2f", linestyle="--", marker="s",
+                          label="optimistic, topological (no wrench)"))
   handles.extend(Line2D([], [], color=COLORS[lam], marker="o",
                         label=("gravity only" if lam == 0 else
                                f"gravity + lambda={lam:g} ({10*lam:g} N)"))
                  for lam in LAMBDAS)
-  if any(row["failures"] for row in physical + topological):
+  if (metric != "plan_cost_mean"
+      and any(row["failures"] for row in physical + topological
+              + optimistic_topological)):
     handles.append(Line2D([], [], color="#555555", marker="x", linestyle="None",
                           label="no solution within budget"))
-  fig.suptitle(title)
-  fig.legend(handles=handles, frameon=False, loc="lower center", ncol=3,
-             bbox_to_anchor=(0.5, -0.01))
-  fig.tight_layout(rect=(0.0, 0.17, 1.0, 0.96))
+  if not paper:
+    fig.suptitle(title)
+    fig.legend(handles=handles, frameon=False, loc="lower center", ncol=3,
+               bbox_to_anchor=(0.5, -0.01))
+    fig.tight_layout(rect=(0.0, 0.17, 1.0, 0.96))
+  else:
+    fig.tight_layout()
   for suffix in ("png", "pdf"):
     fig.savefig(output_dir / f"{output_stem}.{suffix}",
                 dpi=180 if suffix == "png" else None, bbox_inches="tight")
   plt.close(fig)
-  return physical, topological
+  return physical, topological, optimistic_topological
+
+
+def plot_pair(physical_suite: Path, no_wrench_suite: Path, output_dir: Path, *,
+              output_stem: str, title: str, x_label: str,
+              metric: str = "milestone_search_s_mean",
+              y_label: str = "Time to initial witnessed plan (s)",
+              paper: bool = False, optimistic_no_wrench_suite: Path | None = None):
+  """Plot one matrix pair, optionally under the repository's paper style.
+
+  The style context is deliberately local: importing this module or producing a paper plot does
+  not leak TeX/font/size settings into later diagnostic plots in the same benchmark process.
+  """
+  if not paper:
+    return _plot_pair(
+        physical_suite, no_wrench_suite, output_dir, output_stem=output_stem,
+        title=title, x_label=x_label, metric=metric, y_label=y_label, paper=False,
+        optimistic_no_wrench_suite=optimistic_no_wrench_suite)
+  if not PAPER_STYLE.is_file():
+    raise ValueError(f"paper style does not exist: {PAPER_STYLE}")
+  with plt.style.context(str(PAPER_STYLE)):
+    return _plot_pair(
+        physical_suite, no_wrench_suite, output_dir, output_stem=output_stem,
+        title=title, x_label=x_label, metric=metric, y_label=y_label, paper=True,
+        optimistic_no_wrench_suite=optimistic_no_wrench_suite)
 
 
 def main(argv=None):
@@ -166,17 +229,22 @@ def main(argv=None):
   parser.add_argument("physical_suite", type=Path)
   parser.add_argument("no_wrench_suite", type=Path)
   parser.add_argument("--output", type=Path, required=True)
+  parser.add_argument("--optimistic-no-wrench-suite", type=Path, default=None)
   parser.add_argument("--output-stem", required=True)
   parser.add_argument("--title", required=True)
   parser.add_argument("--x-label", default="Number of parts")
   parser.add_argument("--metric", choices=("time", "cost"), default="time")
+  parser.add_argument(
+      "--paper", action="store_true",
+      help="load paper_2.mplstyle and omit all titles and legends")
   args = parser.parse_args(argv)
   metric = ("milestone_search_s_mean", "Time to initial witnessed plan (s)")
   if args.metric == "cost":
     metric = ("plan_cost_mean", "Initial witnessed plan cost")
   plot_pair(args.physical_suite, args.no_wrench_suite, args.output,
             output_stem=args.output_stem, title=args.title, x_label=args.x_label,
-            metric=metric[0], y_label=metric[1])
+            metric=metric[0], y_label=metric[1], paper=args.paper,
+            optimistic_no_wrench_suite=args.optimistic_no_wrench_suite)
   print(f"[process-wrench-matrix] plot -> "
         f"{args.output.resolve() / (args.output_stem + '.pdf')}")
   return 0

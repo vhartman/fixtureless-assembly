@@ -20,6 +20,7 @@ EXPERIMENTS = {
     "cross": {
         "physical": MANIFEST_DIR / "cross_process_wrench_full_matrix.json",
         "control": MANIFEST_DIR / "cross_process_wrench_full_no_wrench.json",
+        "optimistic_control": MANIFEST_DIR / "cross_process_wrench_full_optimistic_no_wrench.json",
         "stem": "cross-process-wrench-full-matrix",
         "title": "Cross: topological to physical assembly loads",
         "x_label": "Number of Cross parts",
@@ -27,6 +28,7 @@ EXPERIMENTS = {
     "cube": {
         "physical": MANIFEST_DIR / "cube_piecewise_process_wrench_full_matrix.json",
         "control": MANIFEST_DIR / "cube_piecewise_process_wrench_full_no_wrench.json",
+        "optimistic_control": MANIFEST_DIR / "cube_piecewise_process_wrench_full_optimistic_no_wrench.json",
         "stem": "cube-piecewise-process-wrench-full-matrix",
         "title": "Piecewise cube: topological to physical assembly loads",
         "x_label": "Number of cube parts",
@@ -45,6 +47,13 @@ def main(argv=None):
   parser.add_argument("--only", default=None, metavar="REGEX")
   parser.add_argument("--dry-run", action="store_true")
   parser.add_argument("--no-plot", action="store_true")
+  parser.add_argument(
+      "--optimistic-no-wrench", action="store_true",
+      help="also run and plot the optimistic/Dogar-style solver under the matched topological "
+           "(--no-wrench) model")
+  parser.add_argument(
+      "--paper", action="store_true",
+      help="plot with paper_2.mplstyle and omit all titles and legends")
   args = parser.parse_args(argv)
   if args.repeats < 1:
     raise SystemExit("--repeats must be a positive integer")
@@ -73,20 +82,27 @@ def main(argv=None):
   for name, spec in selected.items():
     physical_dir = output / name
     control_dir = output / f"{name}-no-wrench"
+    optimistic_dir = output / f"{name}-optimistic-no-wrench"
     # Complete the cheap baseline before the finite-wrench matrix. This does not affect samples
     # (every one is a fresh process), and gives an interrupted overnight run a useful control
     # curve before --resume continues the more expensive cells.
     status = max(status, search_runner.main(run_args(spec["control"], control_dir)))
+    if args.optimistic_no_wrench:
+      status = max(status, search_runner.main(
+          run_args(spec["optimistic_control"], optimistic_dir)))
     status = max(status, search_runner.main(run_args(spec["physical"], physical_dir)))
     if not args.dry_run and not args.no_plot:
       plotter.plot_pair(
           physical_dir, control_dir, output,
-          output_stem=spec["stem"], title=spec["title"], x_label=spec["x_label"])
+          output_stem=spec["stem"], title=spec["title"], x_label=spec["x_label"],
+          paper=args.paper,
+          optimistic_no_wrench_suite=(optimistic_dir if args.optimistic_no_wrench else None))
       plotter.plot_pair(
           physical_dir, control_dir, output,
           output_stem=spec["stem"] + "-cost", title=spec["title"] + ": plan cost",
           x_label=spec["x_label"], metric="plan_cost_mean",
-          y_label="Initial witnessed plan cost")
+          y_label="Initial witnessed plan cost", paper=args.paper,
+          optimistic_no_wrench_suite=(optimistic_dir if args.optimistic_no_wrench else None))
       print(f"[process-wrench-matrix] {name} plot -> "
             f"{output / (spec['stem'] + '.pdf')}")
   return status
