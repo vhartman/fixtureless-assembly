@@ -1,0 +1,697 @@
+{
+  "config": {
+    "assembly": "real-bench",
+    "parts": 3,
+    "num_robots": 2,
+    "vacuum": false,
+    "floating_ee": false,
+    "robot": "husky",
+    "robot_types": null,
+    "scatter_spacing": 0.14285714285714285,
+    "center_scatter": true,
+    "layout_json": "experiments/real-stool-husky-current/layout_nominal_calibrated.json",
+    "perturb_start_pose": false,
+    "seed": 11023,
+    "wrench": true,
+    "wrench_profile": "max_robotiq",
+    "grasp_model": "asymmetric",
+    "insert_force": 10.0,
+    "curved_torque_scale": null,
+    "insertion_noise": null,
+    "insertion_offset": 0.0,
+    "inserter_check": true,
+    "real_ik": true,
+    "bracing": true,
+    "robust_mode": "corners",
+    "dense_grasps": false,
+    "random_init": null,
+    "part_float": 0.002,
+    "inhand_reorient": false,
+    "pre_insertion": 0.05,
+    "skill_funnel_collision_res": 0.002,
+    "pre_pick": 0.05,
+    "post_pick": 0.05,
+    "pre_place": 0.05,
+    "pre_add_grasp": 0.05,
+    "post_release": 0.05,
+    "staged_mates": false,
+    "mate_symmetry": true,
+    "mate_wrench_limits": true,
+    "screw_angle": null,
+    "screw_depth": null,
+    "screw_torque": null,
+    "screw_speed": null,
+    "screw_samples": null,
+    "allow_curved_grasps": false,
+    "grippers": null,
+    "grasp_compliance": null,
+    "vacuum_scale": null,
+    "two_finger_scale": null,
+    "vacuum_engage_force": 0.0,
+    "vacuum_engage_friction": null,
+    "tf_close_torque": null,
+    "dominance": false,
+    "table_mu": null,
+    "useful_grasps": true,
+    "brace_resting": false,
+    "ignore_gravity": false,
+    "orientation_robust_wrench": false,
+    "strict_collisions": 1e-06,
+    "witness_robot_collisions": true,
+    "plain_box": false,
+    "stable_rest_poses": false,
+    "placement_yaws": 4,
+    "strict_mate_collisions": false,
+    "always_contact": true,
+    "ik_accuracy": null,
+    "mate_accuracy": null,
+    "mate_angular_accuracy": null,
+    "grasp_accuracy": null,
+    "mate_eq_weight": 100.0,
+    "grasp_eq_weight": null,
+    "place_eq_weight": 100.0,
+    "grasp_translations": 0,
+    "grasp_standoff": 0.01,
+    "grasp_sampler": true,
+    "grasp_sampler_keep": 20,
+    "grasp_sampler_candidates": 96,
+    "grasp_sampler_seed": 1,
+    "grasp_sampler_db_hash": "05a17221a1a581706d98668a2d58aaaa710114af773c04f822adde604ed039df",
+    "grasp_refine": false,
+    "grasp_widen": true,
+    "grasp_widen_batch": 8,
+    "grasp_widen_max": 96,
+    "grasp_local_widen": false,
+    "grasp_local_caps": null,
+    "component_grasp_keep": 32,
+    "grasp_sampler_margin": 0.008,
+    "grasp_sampler_pad_support": 0.75,
+    "grasp_sampler_wrap": 0.015,
+    "grasp_sampler_strict": false,
+    "grasp_sampler_scenes": true,
+    "tight_fingers": true,
+    "openarm_real_finger_radius_scale": 1.0,
+    "grasp_closure_check": true,
+    "ik_seeding": true,
+    "witness_margin": 0.005,
+    "witness_joint_margin": 0.02,
+    "object_over_table": false,
+    "object_over_table_margin": 0.0,
+    "witness_draw": null,
+    "witness_sets": 4,
+    "witness_set_spread": 0.05,
+    "ban_actions": null,
+    "optimize_witnesses": "floor",
+    "witness_branch_budget": 0,
+    "witness_branch_metric": "motion",
+    "witness_reconfig_thresh": 1.5707963267948966,
+    "hoist_releases": true,
+    "witness_clearance": 0.0,
+    "handovers": true,
+    "allow_place": true,
+    "fuse_cograsp": true,
+    "fuse_pre_skill": null,
+    "mp_sequence": true,
+    "mp_optimize": true,
+    "mp_runtime": 30.0,
+    "mp_stall_timeout": null,
+    "mp_no_shortcut": false,
+    "mp_shortcut_iters": 1000,
+    "mp_shortcut_res": null,
+    "mp_shortcut_strategy": "native",
+    "mp_shortcut_pair_checks": 200,
+    "mp_collision_tolerance": 0.0001,
+    "mp_robot_margin": 0.1,
+    "mp_margin_ramp": 0.1,
+    "mp_margin_mode": "linear",
+    "mp_table_margin": 0.0,
+    "mp_cograsp": false,
+    "mp_seed": null,
+    "mp_fake_clock": false,
+    "mp_open_plans": false,
+    "mp_plan_candidates": 4,
+    "mp_plan_epochs": 6,
+    "mp_plan_initial_runtime": 15.0,
+    "min_sep": null,
+    "place_cells": 0,
+    "prefer_center": false,
+    "brace_for_assembly_only": false,
+    "lru_robots": false,
+    "anon_robots": false,
+    "declutter": false,
+    "por": false,
+    "grid_init": null,
+    "grid_gap": 0.1,
+    "weight": 1.0,
+    "milestones": true,
+    "milestones_anytime": null,
+    "goal_on_table": true,
+    "milestone_oracle": "structural",
+    "fill_local_h": true,
+    "fill_target_support_quotient": false,
+    "fill_exact": false,
+    "fill_greedy": true,
+    "fill_incumbent_first": false,
+    "fill_policy_first": false,
+    "fill_policy_guide": false,
+    "fill_skeleton_first": false,
+    "milestone_boundaries": 4,
+    "fill_scope_widening": true,
+    "fill_touch_all": false,
+    "placement_yaw_widening": true,
+    "fill_window": 2,
+    "lazy_fills": true,
+    "open_witness": true,
+    "open_witness_batch": 7,
+    "open_witness_epochs": 2,
+    "lazy_edge_selector": "forward",
+    "analytic_seed_cap": null,
+    "ssik_seed_neighborhood": 0.0,
+    "ssik_neighborhood_cap": 6,
+    "fail_order": false,
+    "empty_seed_refutes": false,
+    "ik_positive_reuse": true,
+    "assemble_ssik_pose_seeds": false,
+    "assemble_ssik_pose_projection": false,
+    "assemble_unbiased_first": false,
+    "assemble_basin_racing": false,
+    "assemble_race_probe_evals": 24,
+    "assemble_race_promote": 3,
+    "handover_basin_racing": false,
+    "handover_race_probe_evals": 24,
+    "handover_race_starts": 6,
+    "handover_race_promote": 3,
+    "wrench_aware_h": true,
+    "sig_collapsed_h": true,
+    "sig_components": "press",
+    "_search_witness_margin": 0.005,
+    "layout": {
+      "schema": "assembly-pickup-layout-v1",
+      "frame": "husky base_footprint == fixtureless rai world (z=0 floor)",
+      "source_plan": "/home/su/Code/fixtureless-assembly/experiments/real-stool-husky-current/plan.json",
+      "part_float": 0.002,
+      "table": {
+        "center_xy": [
+          0.82,
+          0.0
+        ],
+        "size_xy": [
+          0.6399999856948853,
+          1.100000023841858
+        ],
+        "thickness": 0.07999999821186066,
+        "top_z": 0.4133254885673523
+      },
+      "parts": {
+        "obj_0": {
+          "xy": [
+            0.7358000099484202,
+            -0.036963674393465734
+          ],
+          "yaw": 0.05553404765715626,
+          "footprint_half_xy": [
+            0.0425,
+            0.08500000000000002
+          ],
+          "height": 0.035,
+          "scatter_quat_wxyz": [
+            1.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "visual_mesh": "/home/su/Code/fixtureless-assembly/part_meshes/yandv_stool/seat_2hole_visual.obj",
+          "measured": true,
+          "page": 1
+        },
+        "obj_1": {
+          "xy": [
+            0.7385829103815703,
+            0.11475802228488324
+          ],
+          "yaw": 0.05553404765715582,
+          "footprint_half_xy": [
+            0.052500000000000026,
+            0.015000000000000012
+          ],
+          "height": 0.022000000000000054,
+          "scatter_quat_wxyz": [
+            0.5000000000000001,
+            -0.5000000000000001,
+            -0.5000000000000001,
+            0.5000000000000001
+          ],
+          "visual_mesh": "/home/su/Code/fixtureless-assembly/part_meshes/yandv_stool/leg_lf_visual.obj",
+          "measured": true,
+          "page": 1
+        },
+        "obj_2": {
+          "xy": [
+            0.8467816264906046,
+            -0.06597926683746512
+          ],
+          "yaw": 1.6263303744520525,
+          "footprint_half_xy": [
+            0.052500000000000026,
+            0.015000000000000012
+          ],
+          "height": 0.022000000000000054,
+          "scatter_quat_wxyz": [
+            0.5000000000000001,
+            -0.5000000000000001,
+            -0.5000000000000001,
+            0.5000000000000001
+          ],
+          "visual_mesh": "/home/su/Code/fixtureless-assembly/part_meshes/yandv_stool/leg_lb_visual.obj",
+          "measured": true,
+          "page": 1
+        }
+      },
+      "packed": true,
+      "calibration_marks": [
+        {
+          "name": "p1-near-right",
+          "xy": [
+            0.6910086050787816,
+            -0.13474940189805765
+          ],
+          "page": 1
+        },
+        {
+          "name": "p1-near-left",
+          "xy": [
+            0.6760776236214951,
+            0.13383590260075912
+          ],
+          "page": 1
+        },
+        {
+          "name": "p1-far-right",
+          "xy": [
+            0.8727280304274235,
+            -0.12464739957379682
+          ],
+          "page": 1
+        },
+        {
+          "name": "p1-far-left",
+          "xy": [
+            0.857797048970137,
+            0.14393790492501998
+          ],
+          "page": 1
+        }
+      ],
+      "measurements": {
+        "timestamp": "2026-09-10T16:29:41.142869",
+        "arm": "left",
+        "punch_offset_xyz": [
+          -0.00325,
+          0.00048,
+          0.11832
+        ],
+        "punch_offset_source": "data/calibration_data/20260622/config.yaml punch_tool.left",
+        "points": [
+          {
+            "mark": "p1-near-right",
+            "q6": [
+              -5.423949066792623,
+              -0.35200663030657964,
+              1.5295637289630335,
+              -2.1274501285948695,
+              -0.9570549170123499,
+              0.028029656037688255
+            ],
+            "tip_xyz": [
+              0.6909698247909546,
+              -0.13442257046699524,
+              0.4127896726131439
+            ],
+            "timestamp": "2026-09-10T16:23:01.290349"
+          },
+          {
+            "mark": "p1-far-right",
+            "q6": [
+              -5.26583701768984,
+              -0.12356527269396977,
+              0.8744919935809534,
+              -1.8015433750548304,
+              -0.8691995779620569,
+              0.19321763515472412
+            ],
+            "tip_xyz": [
+              0.8727892637252808,
+              -0.12430289387702942,
+              0.4148435890674591
+            ],
+            "timestamp": "2026-09-10T16:24:40.424257"
+          },
+          {
+            "mark": "p1-far-left",
+            "q6": [
+              -5.0493003765689295,
+              -0.5804991883090516,
+              1.360246483479635,
+              -2.0128866634764613,
+              -0.7791321913348597,
+              0.46220454573631287
+            ],
+            "tip_xyz": [
+              0.8579440712928772,
+              0.1435166299343109,
+              0.4144781231880188
+            ],
+            "timestamp": "2026-09-10T16:27:19.175257"
+          },
+          {
+            "mark": "p1-near-left",
+            "q6": [
+              -5.168218914662496,
+              -0.8256509465030213,
+              1.9532950560199183,
+              -2.2562934360899867,
+              -0.8264811674701136,
+              0.31156182289123535
+            ],
+            "tip_xyz": [
+              0.6759081482887268,
+              0.1335858404636383,
+              0.41224703192710876
+            ],
+            "timestamp": "2026-09-10T16:29:10.292897"
+          }
+        ],
+        "sheet_fit": {
+          "t_mm": [
+            3.3972979331329256,
+            2.9220169584667666
+          ],
+          "yaw_deg": 0.07530449254461338,
+          "rms_mm": 0.36093542668499634,
+          "n_marks": 4
+        },
+        "sheet_delta": {
+          "dyaw": 0.0013143113364470264,
+          "t": [
+            0.0033972979331329256,
+            0.0029220169584667664
+          ]
+        },
+        "nominal_marks": [
+          {
+            "name": "p1-near-right",
+            "xy": [
+              0.6874297701965216,
+              -0.13857503502461663
+            ],
+            "page": 1
+          },
+          {
+            "name": "p1-near-left",
+            "xy": [
+              0.6728518062441036,
+              0.13002966144773093
+            ],
+            "page": 1
+          },
+          {
+            "name": "p1-far-right",
+            "xy": [
+              0.8691623157651732,
+              -0.12871187725755306
+            ],
+            "page": 1
+          },
+          {
+            "name": "p1-far-left",
+            "xy": [
+              0.8545843518127552,
+              0.13989281921479452
+            ],
+            "page": 1
+          }
+        ],
+        "table_points": [
+          {
+            "kind": "top",
+            "q6": [
+              -5.16822320619692,
+              -0.8256586355021973,
+              1.9532273451434534,
+              -2.256247182885641,
+              -0.8264763990985315,
+              0.3116302192211151
+            ],
+            "tip_xyz": [
+              0.6759358048439026,
+              0.13358642160892487,
+              0.4122690260410309
+            ]
+          }
+        ],
+        "robot_sides": {
+          "a1": "right",
+          "a2": "left"
+        },
+        "unmeasured_parts": [],
+        "reference_layout": "/home/su/Code/fixtureless-assembly/experiments/real-stool-husky-current/layout_nominal_calibrated.json"
+      }
+    }
+  },
+  "plan": [
+    [
+      "pick",
+      "a1",
+      "obj_1",
+      0
+    ],
+    [
+      "handover",
+      "a2",
+      "obj_1",
+      4
+    ],
+    [
+      "pick",
+      "a1",
+      "obj_0",
+      1
+    ],
+    [
+      "assemble",
+      "a2",
+      "obj_1",
+      "obj_0"
+    ],
+    [
+      "release",
+      "a2",
+      "obj_1"
+    ],
+    [
+      "pick",
+      "a2",
+      "obj_2",
+      0
+    ],
+    [
+      "assemble",
+      "a2",
+      "obj_2",
+      "obj_0"
+    ],
+    [
+      "release",
+      "a2",
+      "obj_2"
+    ],
+    [
+      "place",
+      "a1",
+      "obj_0",
+      5
+    ]
+  ],
+  "witnesses": {
+    "joints": [
+      "a1_ur_shoulder_pan_joint",
+      "a1_ur_shoulder_lift_joint",
+      "a1_ur_elbow_joint",
+      "a1_ur_wrist_1_joint",
+      "a1_ur_wrist_2_joint",
+      "a1_ur_wrist_3_joint",
+      "a2_ur_shoulder_pan_joint",
+      "a2_ur_shoulder_lift_joint",
+      "a2_ur_elbow_joint",
+      "a2_ur_wrist_1_joint",
+      "a2_ur_wrist_2_joint",
+      "a2_ur_wrist_3_joint"
+    ],
+    "wit": [
+      [
+        -0.8876381377964491,
+        -2.7290273754755563,
+        -1.4155257112824131,
+        -1.1331387204793475,
+        1.0007655310502428,
+        0.7973177090043755,
+        1.5,
+        -1.9999999999999998,
+        0.9999999999999998,
+        -0.9999999999999998,
+        -1.571,
+        0.0
+      ],
+      [
+        -0.6282274554246076,
+        -1.8409316485130849,
+        -1.5411648934121696,
+        -1.7121451328478647,
+        1.9842072560984032,
+        -0.13274889797960326,
+        0.6571681842454838,
+        -1.1397776559758157,
+        1.3654715942668212,
+        -1.318389539994496,
+        -2.0565200519655424,
+        0.3735120666857358
+      ],
+      [
+        -1.2325521229557188,
+        -2.896829404141963,
+        -0.49771707983061747,
+        -2.3802047440206846,
+        1.3111727216009723,
+        0.7707007273635871,
+        1.5,
+        -1.9999999999999998,
+        0.9999999999999998,
+        -0.9999999999999998,
+        -1.571,
+        0.0
+      ],
+      [
+        -0.9972629871155656,
+        -2.2778993672118237,
+        -1.1499978735721075,
+        -1.2691284980916755,
+        1.5770897412079306,
+        -0.9714581029048787,
+        1.299153634504739,
+        -1.0082559160849904,
+        1.4139355644240394,
+        -1.6381276366351811,
+        -2.381380298235703,
+        0.051432152300675806
+      ],
+      null,
+      [
+        -1.5,
+        -0.9999999999999998,
+        -0.9999999999999998,
+        -1.9999999999999998,
+        1.5,
+        0.0,
+        1.016074052052949,
+        -0.3474773394517218,
+        1.114070534377963,
+        -1.8543114163264047,
+        -0.9198913529951416,
+        -2.3426060178440014
+      ],
+      [
+        -1.145166154335154,
+        -2.3804598705662343,
+        -1.0445101406459945,
+        -2.0782006482722895,
+        2.005256897940104,
+        1.2325709233617257,
+        0.5032685441885041,
+        -0.14108276953091714,
+        1.2155912748451452,
+        0.1384578228165566,
+        -0.6734859899481394,
+        -0.20370199735923744
+      ],
+      null,
+      [
+        -1.1701878179262826,
+        -2.9161019889536957,
+        -0.30870589145639943,
+        -2.5571512734641826,
+        1.3653651167516145,
+        0.8007310467384384,
+        1.5,
+        -1.9999999999999998,
+        0.9999999999999998,
+        -0.9999999999999998,
+        -1.571,
+        0.0
+      ]
+    ],
+    "stage": "optimized",
+    "wit_alts": {
+      "8": [
+        [
+          -1.1701878179262826,
+          -2.9161019889536957,
+          -0.30870589145639943,
+          -2.5571512734641826,
+          1.3653651167516145,
+          0.8007310467384384,
+          1.5,
+          -1.9999999999999998,
+          0.9999999999999998,
+          -0.9999999999999998,
+          -1.571,
+          0.0
+        ],
+        [
+          -1.1700868933861217,
+          -3.2112179782841404,
+          0.30607113026648974,
+          -2.8766384206980513,
+          1.3637410784010073,
+          0.7999483667934087,
+          1.5,
+          -1.9999999999999998,
+          0.9999999999999998,
+          -0.9999999999999998,
+          -1.571,
+          0.0
+        ]
+      ]
+    },
+    "pre_wit": {
+      "3": [
+        -0.9972574742417032,
+        -2.2779043924264135,
+        -1.150007473027316,
+        -1.2691373884875026,
+        1.5770925067760977,
+        -0.971463847328519,
+        1.3500111913105914,
+        -1.038810567601857,
+        1.353652414877418,
+        -1.498529038770659,
+        -2.3631882002572007,
+        0.11891034864702585
+      ],
+      "6": [
+        -1.145167692447337,
+        -2.3804646750786764,
+        -1.0445190174234915,
+        -2.0782083395727655,
+        2.005266340946457,
+        1.232578722361679,
+        0.5159225039712491,
+        -0.12560459023552675,
+        1.3176850969892695,
+        0.035566192661514194,
+        -0.6683377801804301,
+        -0.22244323940630106
+      ]
+    },
+    "pre_wit_contract": "full-assemble-v1"
+  }
+}

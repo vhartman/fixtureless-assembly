@@ -1,0 +1,349 @@
+{
+  "final_pose_err": {
+    "obj_0": [
+      0.0030265845701329492,
+      0.016138151322735945
+    ],
+    "obj_1": [
+      0.0021207235840697437,
+      0.016138123486439334
+    ],
+    "obj_2": [
+      0.002550476730173963,
+      0.01613812348649437
+    ],
+    "obj_3": [
+      0.0038542660043447167,
+      0.01613812348696218
+    ],
+    "obj_4": [
+      0.004106437584823517,
+      0.01613812348696218
+    ]
+  },
+  "first_failure": null,
+  "first_failure_index": null,
+  "metadata": {
+    "animate_grippers": true,
+    "apply_process_wrench": true,
+    "directional_caps": true,
+    "dt": 0.002,
+    "gripper_motion_time": 0.25,
+    "motion_path": "experiments/real-stool-husky-full-funnel-fresh-20260909/mp.json",
+    "object_perturbation": {
+      "attempts": 0,
+      "grasp_capture_angle_deg": 10.0,
+      "grasp_capture_m": 0.01,
+      "groups": [],
+      "observation": "observed",
+      "seed": 0,
+      "xy_bound_m": 0.0,
+      "yaw_bound_deg": 0.0
+    },
+    "plan_path": "experiments/real-stool-husky-full-funnel-fresh-20260909/plan.json",
+    "process_wrench": {
+      "engagement_distance": 0.01,
+      "lateral": 0.0,
+      "noise_corner": 0,
+      "noise_mode": "nominal",
+      "noise_seed": 0,
+      "offset": 0.0,
+      "ramp_time": 0.05,
+      "realizations": {
+        "12": {
+          "coefficients": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "lateral": 0.0,
+          "offset": 0.0
+        },
+        "16": {
+          "coefficients": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "lateral": 0.0,
+          "offset": 0.0
+        },
+        "3": {
+          "coefficients": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "lateral": 0.0,
+          "offset": 0.0
+        },
+        "9": {
+          "coefficients": [
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "lateral": 0.0,
+          "offset": 0.0
+        }
+      }
+    },
+    "profile": "standard",
+    "record_every": 8,
+    "resolved_profile": {
+      "actuated": true,
+      "arm_arm_contacts": true,
+      "c2_spline": false,
+      "coll_scale": 1.0,
+      "corner_limits": true,
+      "corridor": false,
+      "corridor_online": false,
+      "force_limits": true,
+      "inertia_factor": 1.0,
+      "joint_rate": 1.0,
+      "limit_rate": false,
+      "mass_scale": 1.0,
+      "pace": false,
+      "path_preflight": true,
+      "path_preflight_resolution": 0.002,
+      "path_preflight_tolerance": 0.0001,
+      "phase_audit_resolution": 0.002,
+      "phase_batch": true,
+      "phase_batch_max_gap": 0.35,
+      "phase_batch_min_motion": 0.08,
+      "phase_intent": false,
+      "phase_schedule": true,
+      "phase_servo_time": 0.15,
+      "phase_smooth": true,
+      "phase_smooth_time": 0.12,
+      "require_mp_path": true,
+      "require_success": true,
+      "servo_force": 6.0,
+      "servo_max_dev": 0.01,
+      "servo_pick": true,
+      "servo_place_seat": true,
+      "servo_tol": 0.002,
+      "servo_torque_guard": 0.6,
+      "settle_max": 1.0,
+      "settle_tol": 0.002,
+      "skill_servo": true,
+      "spline": true,
+      "wrench_margin": 1.0
+    },
+    "table_mu": 0.5
+  },
+  "num_actions": 19,
+  "num_actions_ok": 19,
+  "results": [
+    {
+      "action": [
+        "pick",
+        "a1",
+        "obj_1",
+        0
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    },
+    {
+      "action": [
+        "handover",
+        "a2",
+        "obj_1",
+        10
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    },
+    {
+      "action": [
+        "pick",
+        "a1",
+        "obj_0",
+        6
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    },
+    {
+      "action": [
+        "assemble",
+        "a2",
+        "obj_1",
+        "obj_0"
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    },
+    {
+      "action": [
+        "release",
+        "a2",
+        "obj_1"
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    },
+    {
+      "action": [
+        "pick",
+        "a2",
+        "obj_2",
+        0
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    },
+    {
+      "action": [
+        "place",
+        "a1",
+        "obj_0",
+        0
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    },
+    {
+      "action": [
+        "handover",
+        "a1",
+        "obj_2",
+        14
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    },
+    {
+      "action": [
+        "pick",
+        "a2",
+        "obj_0",
+        0
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    },
+    {
+      "action": [
+        "assemble",
+        "a1",
+        "obj_2",
+        "obj_0"
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    },
+    {
+      "action": [
+        "release",
+        "a1",
+        "obj_2"
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    },
+    {
+      "action": [
+        "pick",
+        "a1",
+        "obj_3",
+        0
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    },
+    {
+      "action": [
+        "assemble",
+        "a1",
+        "obj_3",
+        "obj_0"
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    },
+    {
+      "action": [
+        "release",
+        "a1",
+        "obj_3"
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    },
+    {
+      "action": [
+        "handover",
+        "a1",
+        "obj_0",
+        3
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    },
+    {
+      "action": [
+        "pick",
+        "a2",
+        "obj_4",
+        0
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    },
+    {
+      "action": [
+        "assemble",
+        "a2",
+        "obj_4",
+        "obj_0"
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    },
+    {
+      "action": [
+        "release",
+        "a2",
+        "obj_4"
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    },
+    {
+      "action": [
+        "place",
+        "a1",
+        "obj_0",
+        14622567
+      ],
+      "detail": "",
+      "failure": null,
+      "ok": true
+    }
+  ],
+  "success": true
+}

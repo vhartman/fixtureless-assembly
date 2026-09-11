@@ -1,0 +1,272 @@
+{
+  "outcome": "done",
+  "what_ran": "trajectory",
+  "traj_json": "/home/su/Code/fixtureless-assembly/experiments/real-stool-husky-current/open-loop.json",
+  "args": {
+    "traj_json": "/home/su/Code/fixtureless-assembly/experiments/real-stool-husky-current/open-loop.json",
+    "execute": true,
+    "swap_arms": true,
+    "robot_name": "/a200_0806",
+    "left_ip": "192.168.131.40",
+    "right_ip": "192.168.131.41",
+    "frequency": 125.0,
+    "p_gain": [
+      1.0,
+      1.0
+    ],
+    "joint_accel": 3.0,
+    "max_joint_vel": 2.0,
+    "start_tol": 0.05,
+    "err_abort": 0.25,
+    "no_grasp_abort": false,
+    "no_gripper": false,
+    "stop_after_grasp": false,
+    "approach_vel": 0.25,
+    "no_table": false,
+    "table_top_z": 0.245,
+    "layout_json": "/home/su/Code/fixtureless-assembly/experiments/real-stool-husky-current/layout_nominal_calibrated.json",
+    "plan_json": null,
+    "insertions": false,
+    "ins_push_force": null,
+    "ins_contact_force": null,
+    "ins_guard_force": null,
+    "ins_search_radius": null,
+    "ins_search_pitch": null,
+    "ins_approach_speed": null,
+    "ins_insert_speed": null,
+    "ins_budget": null,
+    "no_zero_ft": false,
+    "no_wrench_log": false,
+    "ins_min_depth": 10.0,
+    "release_wait": 1.0,
+    "resume_blend": 2.0,
+    "end_sample": 0
+  },
+  "started_preroll_s": 0.5,
+  "speed_scale_at_start": 0.5009999871253967,
+  "speed_scale_changes": [],
+  "speed_scale_cap": 2.0,
+  "pauses": [
+    {
+      "paused_at": 23.297,
+      "resumed_at": 23.423,
+      "reason": "operator"
+    }
+  ],
+  "pause_ramp_s": 0.5,
+  "end_sample": 1043,
+  "end_time_s": 52.1,
+  "n_samples_in_file": 1043,
+  "start_deltas": [
+    [
+      0.00022221756649298818,
+      0.00015063588250008308,
+      9.072632290751947e-05,
+      7.754161450779229e-05,
+      6.777750851294506e-05,
+      4.5308320400778805e-05
+    ],
+    [
+      4.183762964826698e-05,
+      0.0001698204063360631,
+      0.00012755801525432542,
+      6.445503912777539e-05,
+      1.2356316727135663e-05,
+      8.800731277903786e-05
+    ]
+  ],
+  "events_fired": [
+    {
+      "kind": "close",
+      "arm": "right",
+      "robot": "a1",
+      "planned_t": 4.0,
+      "fired_t": 4.009,
+      "status": "sent",
+      "stalled": true,
+      "reached_goal": false,
+      "position": 0.5973,
+      "width_mm": 21.5,
+      "goal_status": 6,
+      "result": "GRASPED"
+    },
+    {
+      "kind": "close",
+      "arm": "left",
+      "robot": "a2",
+      "planned_t": 11.200000000000001,
+      "fired_t": 11.201,
+      "status": "sent",
+      "stalled": true,
+      "reached_goal": false,
+      "position": 0.5973,
+      "width_mm": 21.5,
+      "goal_status": 6,
+      "result": "GRASPED"
+    },
+    {
+      "kind": "open",
+      "arm": "right",
+      "robot": "a1",
+      "planned_t": 11.700000000000001,
+      "fired_t": 11.701,
+      "status": "sent",
+      "stalled": false,
+      "reached_goal": true,
+      "position": 0.0035,
+      "width_mm": 84.6,
+      "goal_status": 4,
+      "result": "OPENED"
+    },
+    {
+      "kind": "close",
+      "arm": "right",
+      "robot": "a1",
+      "planned_t": 16.95,
+      "fired_t": 16.962,
+      "status": "sent",
+      "stalled": true,
+      "reached_goal": false,
+      "position": 0.6986,
+      "width_mm": 10.8,
+      "goal_status": 6,
+      "result": "GRASPED"
+    },
+    {
+      "kind": "open",
+      "arm": "left",
+      "robot": "a2",
+      "planned_t": 23.400000000000002,
+      "fired_t": 23.404,
+      "status": "sent",
+      "stalled": false,
+      "reached_goal": true,
+      "position": 0.0035,
+      "width_mm": 84.6,
+      "goal_status": 4,
+      "result": "OPENED"
+    },
+    {
+      "kind": "close",
+      "arm": "right",
+      "robot": "a1",
+      "planned_t": 23.700000000000003,
+      "fired_t": 23.702,
+      "status": "sent",
+      "stalled": true,
+      "reached_goal": false,
+      "position": 0.6986,
+      "width_mm": 10.8,
+      "goal_status": 6,
+      "result": "GRASPED"
+    },
+    {
+      "kind": "close",
+      "arm": "left",
+      "robot": "a2",
+      "planned_t": 31.400000000000002,
+      "fired_t": 31.419,
+      "status": "sent",
+      "stalled": true,
+      "reached_goal": false,
+      "position": 0.5973,
+      "width_mm": 21.5,
+      "goal_status": 6,
+      "result": "GRASPED"
+    },
+    {
+      "kind": "open",
+      "arm": "left",
+      "robot": "a2",
+      "planned_t": 38.85,
+      "fired_t": 38.86,
+      "status": "sent",
+      "stalled": false,
+      "reached_goal": true,
+      "position": 0.007,
+      "width_mm": 84.3,
+      "goal_status": 4,
+      "result": "OPENED"
+    },
+    {
+      "kind": "close",
+      "arm": "right",
+      "robot": "a1",
+      "planned_t": 39.150000000000006,
+      "fired_t": 39.16,
+      "status": "sent",
+      "stalled": true,
+      "reached_goal": false,
+      "position": 0.6986,
+      "width_mm": 10.8,
+      "goal_status": 6,
+      "result": "GRASPED"
+    },
+    {
+      "kind": "open",
+      "arm": "right",
+      "robot": "a1",
+      "planned_t": 45.85,
+      "fired_t": 45.875,
+      "status": "sent",
+      "stalled": false,
+      "reached_goal": true,
+      "position": 0.0035,
+      "width_mm": 84.6,
+      "goal_status": 4,
+      "result": "OPENED"
+    }
+  ],
+  "ft_zeros": [
+    {
+      "reason": "at connect",
+      "at": "2026-09-11 12:58:08",
+      "before": [
+        [
+          -0.16,
+          -0.22,
+          -1.91,
+          -0.0,
+          0.01,
+          0.03
+        ],
+        [
+          -0.26,
+          -1.04,
+          -0.99,
+          0.01,
+          -0.01,
+          0.0
+        ]
+      ],
+      "after": [
+        [
+          -0.14,
+          0.09,
+          -0.08,
+          -0.0,
+          -0.01,
+          0.01
+        ],
+        [
+          -0.61,
+          -0.0,
+          -0.13,
+          -0.0,
+          -0.0,
+          0.01
+        ]
+      ],
+      "ok": true
+    }
+  ],
+  "thread_errors": [
+    null,
+    null
+  ],
+  "n_cycles": [
+    14395,
+    14394
+  ],
+  "insertions": []
+}

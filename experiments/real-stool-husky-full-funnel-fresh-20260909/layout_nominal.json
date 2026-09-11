@@ -1,0 +1,223 @@
+{
+  "schema": "assembly-pickup-layout-v1",
+  "frame": "husky base_footprint == fixtureless rai world (z=0 floor)",
+  "source_plan": "/home/su/Code/fixtureless-assembly/experiments/real-stool-husky-full-funnel-fresh-20260909/plan.json",
+  "part_float": 0.002,
+  "table": {
+    "center_xy": [
+      0.82,
+      0.0
+    ],
+    "size_xy": [
+      0.64,
+      1.1
+    ],
+    "thickness": 0.08,
+    "top_z": 0.44
+  },
+  "parts": {
+    "obj_0": {
+      "xy": [
+        0.677142857142857,
+        -0.07142857142857142
+      ],
+      "yaw": 0.0,
+      "footprint_half_xy": [
+        0.08500000000000002,
+        0.08500000000000002
+      ],
+      "height": 0.035,
+      "scatter_quat_wxyz": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "visual_mesh": "/home/su/Code/fixtureless-assembly/part_meshes/yandv_stool/seat_4hole_visual.obj",
+      "measured": false,
+      "page": 1
+    },
+    "obj_1": {
+      "xy": [
+        0.82,
+        -0.07142857142857142
+      ],
+      "yaw": -4.440892098500624e-16,
+      "footprint_half_xy": [
+        0.052500000000000026,
+        0.015000000000000012
+      ],
+      "height": 0.022000000000000054,
+      "scatter_quat_wxyz": [
+        0.5000000000000001,
+        -0.5000000000000001,
+        -0.5000000000000001,
+        0.5000000000000001
+      ],
+      "visual_mesh": "/home/su/Code/fixtureless-assembly/part_meshes/yandv_stool/leg_lf_visual.obj",
+      "measured": false,
+      "page": 2
+    },
+    "obj_2": {
+      "xy": [
+        0.9628571428571429,
+        -0.07142857142857142
+      ],
+      "yaw": -4.440892098500624e-16,
+      "footprint_half_xy": [
+        0.052500000000000026,
+        0.015000000000000012
+      ],
+      "height": 0.022000000000000054,
+      "scatter_quat_wxyz": [
+        0.5000000000000001,
+        -0.5000000000000001,
+        -0.5000000000000001,
+        0.5000000000000001
+      ],
+      "visual_mesh": "/home/su/Code/fixtureless-assembly/part_meshes/yandv_stool/leg_rf_visual.obj",
+      "measured": false,
+      "page": 3
+    },
+    "obj_3": {
+      "xy": [
+        0.7485714285714286,
+        0.07142857142857142
+      ],
+      "yaw": -4.440892098500624e-16,
+      "footprint_half_xy": [
+        0.052500000000000026,
+        0.015000000000000012
+      ],
+      "height": 0.022000000000000054,
+      "scatter_quat_wxyz": [
+        0.5000000000000001,
+        -0.5000000000000001,
+        -0.5000000000000001,
+        0.5000000000000001
+      ],
+      "visual_mesh": "/home/su/Code/fixtureless-assembly/part_meshes/yandv_stool/leg_lb_visual.obj",
+      "measured": false,
+      "page": 2
+    },
+    "obj_4": {
+      "xy": [
+        0.8914285714285713,
+        0.07142857142857142
+      ],
+      "yaw": -4.440892098500624e-16,
+      "footprint_half_xy": [
+        0.052500000000000026,
+        0.015000000000000012
+      ],
+      "height": 0.022000000000000054,
+      "scatter_quat_wxyz": [
+        0.5000000000000001,
+        -0.5000000000000001,
+        -0.5000000000000001,
+        0.5000000000000001
+      ],
+      "visual_mesh": "/home/su/Code/fixtureless-assembly/part_meshes/yandv_stool/leg_rb_visual.obj",
+      "measured": false,
+      "page": 3
+    }
+  },
+  "calibration_marks": [
+    {
+      "name": "p1-near-right",
+      "xy": [
+        0.5861428571428571,
+        -0.2059285714285714
+      ],
+      "page": 1
+    },
+    {
+      "name": "p1-near-left",
+      "xy": [
+        0.5861428571428571,
+        0.06307142857142856
+      ],
+      "page": 1
+    },
+    {
+      "name": "p1-far-right",
+      "xy": [
+        0.768142857142857,
+        -0.2059285714285714
+      ],
+      "page": 1
+    },
+    {
+      "name": "p1-far-left",
+      "xy": [
+        0.768142857142857,
+        0.06307142857142856
+      ],
+      "page": 1
+    },
+    {
+      "name": "p2-near-right",
+      "xy": [
+        0.6900714285714286,
+        -0.13449999999999998
+      ],
+      "page": 2
+    },
+    {
+      "name": "p2-near-left",
+      "xy": [
+        0.6900714285714286,
+        0.13449999999999998
+      ],
+      "page": 2
+    },
+    {
+      "name": "p2-far-right",
+      "xy": [
+        0.8785,
+        -0.13449999999999998
+      ],
+      "page": 2
+    },
+    {
+      "name": "p2-far-left",
+      "xy": [
+        0.8785,
+        0.13449999999999998
+      ],
+      "page": 2
+    },
+    {
+      "name": "p3-near-right",
+      "xy": [
+        0.8329285714285714,
+        -0.13449999999999998
+      ],
+      "page": 3
+    },
+    {
+      "name": "p3-near-left",
+      "xy": [
+        0.8329285714285714,
+        0.13449999999999998
+      ],
+      "page": 3
+    },
+    {
+      "name": "p3-far-right",
+      "xy": [
+        1.0213571428571429,
+        -0.13449999999999998
+      ],
+      "page": 3
+    },
+    {
+      "name": "p3-far-left",
+      "xy": [
+        1.0213571428571429,
+        0.13449999999999998
+      ],
+      "page": 3
+    }
+  ]
+}

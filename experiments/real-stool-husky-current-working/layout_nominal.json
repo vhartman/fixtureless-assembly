@@ -1,0 +1,118 @@
+{
+  "schema": "assembly-pickup-layout-v1",
+  "frame": "husky base_footprint == fixtureless rai world (z=0 floor)",
+  "source_plan": "/home/su/Code/fixtureless-assembly/experiments/real-stool-husky-current/plan.json",
+  "part_float": 0.002,
+  "table": {
+    "center_xy": [
+      0.82,
+      0.0
+    ],
+    "size_xy": [
+      0.64,
+      1.1
+    ],
+    "thickness": 0.08,
+    "top_z": 0.44
+  },
+  "parts": {
+    "obj_0": {
+      "xy": [
+        0.7770499999999999,
+        -0.06589285714285709
+      ],
+      "yaw": 0.0,
+      "footprint_half_xy": [
+        0.0425,
+        0.08500000000000002
+      ],
+      "height": 0.035,
+      "scatter_quat_wxyz": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "visual_mesh": "/home/su/Code/fixtureless-assembly/part_meshes/yandv_stool/seat_2hole_visual.obj",
+      "measured": false,
+      "page": 1
+    },
+    "obj_1": {
+      "xy": [
+        0.7882499999999999,
+        0.08544047619047618
+      ],
+      "yaw": -4.440892098500624e-16,
+      "footprint_half_xy": [
+        0.052500000000000026,
+        0.015000000000000012
+      ],
+      "height": 0.022000000000000054,
+      "scatter_quat_wxyz": [
+        0.5000000000000001,
+        -0.5000000000000001,
+        -0.5000000000000001,
+        0.5000000000000001
+      ],
+      "visual_mesh": "/home/su/Code/fixtureless-assembly/part_meshes/yandv_stool/leg_lf_visual.obj",
+      "measured": false,
+      "page": 1
+    },
+    "obj_2": {
+      "xy": [
+        0.8862499999999999,
+        -0.10102380952380947
+      ],
+      "yaw": 1.5707963267948961,
+      "footprint_half_xy": [
+        0.052500000000000026,
+        0.015000000000000012
+      ],
+      "height": 0.022000000000000054,
+      "scatter_quat_wxyz": [
+        0.5000000000000001,
+        -0.5000000000000001,
+        -0.5000000000000001,
+        0.5000000000000001
+      ],
+      "visual_mesh": "/home/su/Code/fixtureless-assembly/part_meshes/yandv_stool/leg_lb_visual.obj",
+      "measured": false,
+      "page": 1
+    }
+  },
+  "packed": true,
+  "calibration_marks": [
+    {
+      "name": "p1-near-right",
+      "xy": [
+        0.7268999999999999,
+        -0.1610416666666666
+      ],
+      "page": 1
+    },
+    {
+      "name": "p1-near-left",
+      "xy": [
+        0.7268999999999999,
+        0.10795833333333332
+      ],
+      "page": 1
+    },
+    {
+      "name": "p1-far-right",
+      "xy": [
+        0.9088999999999999,
+        -0.1610416666666666
+      ],
+      "page": 1
+    },
+    {
+      "name": "p1-far-left",
+      "xy": [
+        0.9088999999999999,
+        0.10795833333333332
+      ],
+      "page": 1
+    }
+  ]
+}

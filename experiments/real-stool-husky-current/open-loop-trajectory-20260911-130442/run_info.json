@@ -1,0 +1,266 @@
+{
+  "outcome": "done",
+  "what_ran": "trajectory",
+  "traj_json": "/home/su/Code/fixtureless-assembly/experiments/real-stool-husky-current/open-loop.json",
+  "args": {
+    "traj_json": "/home/su/Code/fixtureless-assembly/experiments/real-stool-husky-current/open-loop.json",
+    "execute": true,
+    "swap_arms": true,
+    "robot_name": "/a200_0806",
+    "left_ip": "192.168.131.40",
+    "right_ip": "192.168.131.41",
+    "frequency": 125.0,
+    "p_gain": [
+      1.0,
+      1.0
+    ],
+    "joint_accel": 3.0,
+    "max_joint_vel": 2.0,
+    "start_tol": 0.05,
+    "err_abort": 0.25,
+    "no_grasp_abort": false,
+    "no_gripper": false,
+    "stop_after_grasp": false,
+    "approach_vel": 0.25,
+    "no_table": false,
+    "table_top_z": 0.245,
+    "layout_json": "/home/su/Code/fixtureless-assembly/experiments/real-stool-husky-current/layout_nominal_calibrated.json",
+    "plan_json": null,
+    "insertions": false,
+    "ins_push_force": null,
+    "ins_contact_force": null,
+    "ins_guard_force": null,
+    "ins_search_radius": null,
+    "ins_search_pitch": null,
+    "ins_approach_speed": null,
+    "ins_insert_speed": null,
+    "ins_budget": null,
+    "no_zero_ft": false,
+    "no_wrench_log": false,
+    "ins_min_depth": 10.0,
+    "release_wait": 1.0,
+    "resume_blend": 2.0,
+    "end_sample": 0
+  },
+  "started_preroll_s": 0.5,
+  "speed_scale_at_start": 0.5049999952316284,
+  "speed_scale_changes": [],
+  "speed_scale_cap": 2.0,
+  "pauses": [],
+  "pause_ramp_s": 0.5,
+  "end_sample": 1113,
+  "end_time_s": 55.6,
+  "n_samples_in_file": 1113,
+  "start_deltas": [
+    [
+      8.895911527662115e-05,
+      0.0002040962454583628,
+      9.789138625482252e-05,
+      0.0001083721122843162,
+      0.00013906593904189357,
+      0.0001442962144740531
+    ],
+    [
+      4.348892179506514e-05,
+      4.332781111071604e-05,
+      2.3638563129146917e-05,
+      6.522032231393027e-06,
+      2.1123539020395654e-05,
+      2.413171300082292e-05
+    ]
+  ],
+  "events_fired": [
+    {
+      "kind": "close",
+      "arm": "right",
+      "robot": "a1",
+      "planned_t": 4.05,
+      "fired_t": 4.065,
+      "status": "sent",
+      "stalled": true,
+      "reached_goal": false,
+      "position": 0.5973,
+      "width_mm": 21.5,
+      "goal_status": 6,
+      "result": "GRASPED"
+    },
+    {
+      "kind": "close",
+      "arm": "left",
+      "robot": "a2",
+      "planned_t": 10.8,
+      "fired_t": 10.808,
+      "status": "sent",
+      "stalled": true,
+      "reached_goal": false,
+      "position": 0.5938,
+      "width_mm": 21.9,
+      "goal_status": 6,
+      "result": "GRASPED"
+    },
+    {
+      "kind": "open",
+      "arm": "right",
+      "robot": "a1",
+      "planned_t": 11.350000000000001,
+      "fired_t": 11.364,
+      "status": "sent",
+      "stalled": false,
+      "reached_goal": true,
+      "position": 0.0035,
+      "width_mm": 84.6,
+      "goal_status": 4,
+      "result": "OPENED"
+    },
+    {
+      "kind": "close",
+      "arm": "right",
+      "robot": "a1",
+      "planned_t": 17.2,
+      "fired_t": 17.223,
+      "status": "sent",
+      "stalled": true,
+      "reached_goal": false,
+      "position": 0.7021,
+      "width_mm": 10.4,
+      "goal_status": 6,
+      "result": "GRASPED"
+    },
+    {
+      "kind": "open",
+      "arm": "left",
+      "robot": "a2",
+      "planned_t": 25.05,
+      "fired_t": 25.051,
+      "status": "sent",
+      "stalled": false,
+      "reached_goal": true,
+      "position": 0.007,
+      "width_mm": 84.3,
+      "goal_status": 4,
+      "result": "OPENED"
+    },
+    {
+      "kind": "close",
+      "arm": "right",
+      "robot": "a1",
+      "planned_t": 25.3,
+      "fired_t": 25.305,
+      "status": "sent",
+      "stalled": true,
+      "reached_goal": false,
+      "position": 0.7021,
+      "width_mm": 10.4,
+      "goal_status": 6,
+      "result": "GRASPED"
+    },
+    {
+      "kind": "close",
+      "arm": "left",
+      "robot": "a2",
+      "planned_t": 32.75,
+      "fired_t": 32.754,
+      "status": "sent",
+      "stalled": true,
+      "reached_goal": false,
+      "position": 0.5973,
+      "width_mm": 21.5,
+      "goal_status": 6,
+      "result": "GRASPED"
+    },
+    {
+      "kind": "open",
+      "arm": "left",
+      "robot": "a2",
+      "planned_t": 39.0,
+      "fired_t": 39.017,
+      "status": "sent",
+      "stalled": false,
+      "reached_goal": true,
+      "position": 0.0035,
+      "width_mm": 84.6,
+      "goal_status": 4,
+      "result": "OPENED"
+    },
+    {
+      "kind": "close",
+      "arm": "right",
+      "robot": "a1",
+      "planned_t": 39.25,
+      "fired_t": 39.27,
+      "status": "sent",
+      "stalled": true,
+      "reached_goal": false,
+      "position": 0.7021,
+      "width_mm": 10.4,
+      "goal_status": 6,
+      "result": "GRASPED"
+    },
+    {
+      "kind": "open",
+      "arm": "right",
+      "robot": "a1",
+      "planned_t": 49.25,
+      "fired_t": 49.27,
+      "status": "sent",
+      "stalled": false,
+      "reached_goal": true,
+      "position": 0.007,
+      "width_mm": 84.3,
+      "goal_status": 4,
+      "result": "OPENED"
+    }
+  ],
+  "ft_zeros": [
+    {
+      "reason": "at connect",
+      "at": "2026-09-11 13:02:32",
+      "before": [
+        [
+          -0.14,
+          -0.01,
+          0.17,
+          -0.01,
+          -0.01,
+          -0.03
+        ],
+        [
+          -0.49,
+          0.06,
+          -0.3,
+          -0.02,
+          -0.04,
+          -0.03
+        ]
+      ],
+      "after": [
+        [
+          -0.32,
+          -0.21,
+          0.11,
+          0.01,
+          -0.01,
+          -0.0
+        ],
+        [
+          0.23,
+          0.22,
+          0.05,
+          -0.0,
+          0.01,
+          -0.0
+        ]
+      ],
+      "ok": true
+    }
+  ],
+  "thread_errors": [
+    null,
+    null
+  ],
+  "n_cycles": [
+    14100,
+    14098
+  ],
+  "insertions": []
+}
