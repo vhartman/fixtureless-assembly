@@ -93,7 +93,7 @@ def test_current_sampler_marker_is_migrated_and_obsolete_markers_fail():
     RunConfig.from_dict({"grasp_sampler": True, "grasp_sampler_version": 3})
 
 
-def test_open_profile_is_a_compatibility_alias_and_fast_open_only_caps_seeds():
+def test_open_profile_is_a_compatibility_alias_and_profile_overlays_are_narrow():
   alias = main.parse_args(["--search-profile", "open"])
   standard = main.parse_args(["--search-profile", "standard"])
   assert {k: getattr(alias, k) for k in main._STANDARD_SEARCH_PROFILE} == {
@@ -104,6 +104,11 @@ def test_open_profile_is_a_compatibility_alias_and_fast_open_only_caps_seeds():
                  if getattr(fast, k) != getattr(standard, k)}
   assert differences == {"analytic_seed_cap"}
   assert standard.analytic_seed_cap is None and fast.analytic_seed_cap is not None
+  fabrica = main.parse_args(["--search-profile", "fabrica"])
+  differences = {k for k in main._STANDARD_SEARCH_PROFILE
+                 if getattr(fabrica, k) != getattr(standard, k)}
+  assert differences == {"grasp_sampler_keep", "grasp_widen"}
+  assert fabrica.grasp_sampler_keep == 64 and fabrica.grasp_widen is False
 
 
 def test_optimistic_dispatch_uses_the_shared_local_fill_settings(monkeypatch):
@@ -231,14 +236,9 @@ def test_standard_uses_greedy_local_fills_without_changing_global_weight():
   assert cfg.fill_exact is False
   assert cfg.weight == 1.0
   assert cfg.mate_symmetry is True
-  assert cfg.grasp_sampler_keep == 64
+  assert cfg.grasp_sampler_keep == 20
   assert cfg.grasp_sampler_candidates == 96
-  assert cfg.grasp_widen is False
-  staged = main.parse_args([
-      "--search-profile", "standard", "--grasp-sampler-keep", "20",
-      "--grasp-widen", "--grasp-widen-batch", "8", "--grasp-widen-max", "96",
-  ])
-  assert staged.grasp_sampler_keep == 20 and staged.grasp_widen is True
+  assert cfg.grasp_widen is True
 
 
 def test_milestone_anytime_receives_greedy_incumbent_policy(monkeypatch):
@@ -267,6 +267,16 @@ def test_lns_window_is_an_explicit_anytime_only_cap():
   assert main._validate_solver_scoped_flags(cfg) == "milestones-anytime"
   with pytest.raises(SystemExit, match="requires --milestones-anytime"):
     main._validate_solver_scoped_flags(RunConfig(milestones=True, lns_window=3))
+
+
+def test_lns_grasp_transition_heuristic_is_explicit_and_anytime_only():
+  cfg = main.parse_args(["--milestones-anytime", "30", "--lns-grasp-transition-h"])
+  assert cfg.lns_grasp_transition_h is True
+  assert main._validate_solver_scoped_flags(cfg) == "milestones-anytime"
+  assert main.parse_args(["--search-profile", "standard"]).lns_grasp_transition_h is False
+  with pytest.raises(SystemExit, match="requires --milestones-anytime"):
+    main._validate_solver_scoped_flags(
+        RunConfig(milestones=True, lns_grasp_transition_h=True))
 
 
 def test_solver_scoped_policy_flags_fail_closed_in_other_engines():
@@ -350,6 +360,17 @@ def test_orientation_robust_wrench_cli_and_plan_roundtrip(tmp_path):
   out = tmp_path / "orientation-robust-plan.json"
   main.save_plan(str(out), cfg, [])
   assert RunConfig.from_file(str(out)).orientation_robust_wrench is True
+
+
+def test_independent_ik_seed_cli_and_plan_roundtrip(tmp_path):
+  cfg = RunConfig.from_namespace(main.parse_args(["--seed", "11023", "--ik-seed", "17"]))
+  assert cfg.seed == 11023
+  assert cfg.ik_seed == 17
+  out = tmp_path / "ik-seed-plan.json"
+  main.save_plan(str(out), cfg, [])
+  loaded = RunConfig.from_file(str(out))
+  assert loaded.seed == 11023
+  assert loaded.ik_seed == 17
 
 
 def test_object_over_table_cli_and_plan_roundtrip(tmp_path):

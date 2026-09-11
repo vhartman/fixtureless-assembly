@@ -2,6 +2,7 @@
 (weighted) A* search with the abstraction heuristic. Depends on the problem definition."""
 
 import os
+import hashlib
 
 import robotic as ry
 import numpy as np
@@ -47,6 +48,45 @@ _ASSEMBLE_ORIENT_BIAS_W = 1e0
 _ASSEMBLE_POS_BIAS_HEIGHT_ABOVE_TABLE = 0.30
 _ASSEMBLE_POS_BIAS_TARGET = (0.0, 0.0, 0.5)
 _ASSEMBLE_POS_BIAS_W = 1e0
+
+
+def _canonical_seed_key(value):
+  """Convert an IK query key to a hash/order-independent immutable representation.
+
+  Physical query keys are already composed almost entirely of sorted tuples. Handling the
+  remaining generic containers here makes the seed contract explicit and prevents a future
+  frozenset/dict field from reintroducing PYTHONHASHSEED dependence.
+  """
+  if isinstance(value, np.ndarray):
+    return ("ndarray", tuple(_canonical_seed_key(v) for v in value.tolist()))
+  if isinstance(value, np.generic):
+    return _canonical_seed_key(value.item())
+  if isinstance(value, dict):
+    rows = [(_canonical_seed_key(k), _canonical_seed_key(v))
+            for k, v in value.items()]
+    return ("dict", tuple(sorted(rows, key=repr)))
+  if isinstance(value, (set, frozenset)):
+    return ("set", tuple(sorted((_canonical_seed_key(v) for v in value), key=repr)))
+  if isinstance(value, (tuple, list)):
+    return tuple(_canonical_seed_key(v) for v in value)
+  if isinstance(value, float):
+    # Query poses are rounded before reaching this helper. Hex preserves their exact binary
+    # identity and gives stable spellings for signed zero, infinities, and NaNs.
+    return ("float", value.hex())
+  if value is None or isinstance(value, (str, bytes, int, bool)):
+    return value
+  raise TypeError(f"IK query seed key contains unsupported {type(value).__name__}: {value!r}")
+
+
+def _deterministic_ik_seed(root_seed, query_key, effort_tier=0):
+  """Stable RAI seed for one physical IK query and one open-witness effort tier."""
+  payload = repr(("physical-ik-v1", int(root_seed), int(effort_tier),
+                  _canonical_seed_key(query_key))).encode("utf-8")
+  # RAI's seed parameter is an ordinary signed int. Avoid zero only to sidestep libraries
+  # that historically interpret it as "choose a seed" rather than the literal value.
+  seed = int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little") \
+      % 2_147_483_646
+  return seed + 1
 
 
 def _assemble_position_bias_target(C):
@@ -645,6 +685,12 @@ class RobotIK:
     self.exit_configuration = np.asarray(
         robot_exit_configuration(self.C, self.robots), dtype=float)
     self.C.setJointState(self.exit_configuration)
+    # RAI owns one process-global RNG. Without partitioning it, changing an unrelated
+    # milestone/query changes every later KOMO restart and therefore changes which bounded
+    # IK calls happen to succeed. Capture the run's public root seed now; bind() derives a
+    # fresh deterministic stream from (physical query, open-witness effort tier).
+    self.seed_root = int(_problem.current_seed())
+    self.deterministic_query_seeding = True
 
     # tool-center frame + approach-axis correction per robot, from the SAME helper the
     # floating EE uses -- so gripper-frame handling lives in one place. The correction is
@@ -1450,6 +1496,15 @@ class RobotIK:
       if hit is not None:
         self.prof["bind_cache_hits"] += 1
         return hit
+    if getattr(self, "deterministic_query_seeding", True):
+      # Visit zero deliberately shares the legacy/ordinary query stream. Every later OPEN
+      # visit advances to a disjoint deterministic stream, so revisiting a stochastic miss
+      # still invests genuinely new effort while query ordering can no longer perturb it.
+      effort_tier = (0 if self._open_probe_attempt is None
+                     else int(self._open_probe_attempt))
+      query_seed = _deterministic_ik_seed(getattr(self, "seed_root", 0), key, effort_tier)
+      ry.params_add({"seed": query_seed})
+      self.prof["query_seed_resets"] = self.prof.get("query_seed_resets", 0) + 1
     _old_depth = getattr(self, "_bind_profile_depth", 0)
     _old_query_key = getattr(self, "_cur_query_key", None)
     self._bind_profile_depth = _old_depth + 1
@@ -5617,6 +5672,96 @@ def _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_pla
   return states
 
 
+def audit_plan_heuristic(C, assembly, plan, robots, heuristic_obj, *,
+                         gripper_kind=None, handovers=True, allow_place=True,
+                         bracing=False, grasp_table=None, checker=None, verbose=True):
+  """Check a claimed lower-bound heuristic along one concrete witnessed plan.
+
+  For every real edge ``s --a/c--> s'``, consistency requires
+  ``h(s) <= c + h(s')``.  Summing those inequalities and using ``h(goal)=0`` also
+  establishes ``h(s0) <= plan_cost``.  A violation therefore pinpoints the first
+  concrete transition missing from, or over-priced by, the backward abstraction.
+  This is diagnostic only: it neither changes the heuristic nor search semantics.
+  """
+  if grasp_table is None:
+    _checker, grasp_table = _search_context(C, assembly, robots)
+    checker = checker or _checker
+  states = _replay_states(
+      C, assembly, [tuple(a) for a in plan], robots, gripper_kind,
+      handovers, allow_place, bracing, grasp_table, "audit_plan_heuristic")
+  values = [float(heuristic_obj.value(s)) for s in states]
+  costs = [float(action_cost(a)) for a in plan]
+  suffix = [0.0] * len(states)
+  for i in range(len(plan) - 1, -1, -1):
+    suffix[i] = costs[i] + suffix[i + 1]
+  violations = []
+  concrete_failures = []
+  for i, (a, c) in enumerate(zip(plan, costs)):
+    residual = values[i] - c - values[i + 1]
+    concrete_ok = (None if checker is None else
+                   bool(cheap_feasible(tuple(a), states[i], states[i + 1],
+                                      assembly, checker)))
+    if concrete_ok is False:
+      concrete_failures.append(i)
+    if residual > 1e-9:
+      violations.append({
+          "index": i, "action": tuple(a), "cost": c,
+          "h_before": values[i], "h_after": values[i + 1],
+          "residual": residual, "abstract_before": heuristic_obj.abstract(states[i]),
+          "abstract_after": heuristic_obj.abstract(states[i + 1]),
+      })
+    if verbose:
+      mark = "  !!!" if residual > 1e-9 else ""
+      print(f"[h-audit] {i:02d} h={values[i]:g} c={c:g} h'={values[i + 1]:g} "
+            f"suffix={suffix[i]:g} residual={residual:g} cheap={concrete_ok}{mark}  "
+            f"{tuple(a)}",
+            flush=True)
+  if verbose:
+    print(f"[h-audit] goal h={values[-1]:g}; plan cost={suffix[0]:g}; "
+          f"h(s0)={values[0]:g}; edge violations={len(violations)}; "
+          f"concrete cheap failures={concrete_failures}", flush=True)
+    for v in violations:
+      print(f"[h-audit-violation] edge {v['index']} {v['action']}: "
+            f"{v['h_before']:g} > {v['cost']:g} + {v['h_after']:g} "
+            f"(excess {v['residual']:g})\n"
+            f"  before={v['abstract_before']}\n  after ={v['abstract_after']}",
+            flush=True)
+    # A missing inverse PICK is the historically most fragile abstraction edge.  Explain
+    # its raw finite fibres so an audit distinguishes label collapse from table geometry.
+    for v in violations[:1]:
+      i, a = v["index"], v["action"]
+      if a[0] != "pick" or not hasattr(heuristic_obj, "_svgroups"):
+        continue
+      part, raw_gid = a[2], int(a[3])
+      label = heuristic_obj._gcollapse(part, raw_gid)
+      variants = heuristic_obj._svgroups.get(part, {}).get(label, (raw_gid,))
+      faces = rest_face_classes(assembly, {part})
+      paths = heuristic_obj._ee_path
+      if isinstance(paths, dict):
+        kinds = ((heuristic_obj._kinds_of or {}).get(((part,), part, raw_gid))
+                 or paths.keys())
+        paths = tuple(paths[k] for k in sorted(kinds))
+      else:
+        paths = (paths,)
+      print(f"[h-audit-pick] part={part} raw={raw_gid} class={label}; "
+            f"class variants={tuple(variants)}; rest faces={faces}; "
+            f"concrete face={_placement_face(states[i], {part})}; "
+            f"anchor={tuple(np.round(states[i].poses[part], 5))}", flush=True)
+      rows = []
+      for gid in variants:
+        for face in faces:
+          vals = [bool(_table_aware_pick_fact(
+              assembly, (part,), face, part, gid, path,
+              clearance=heuristic_obj._clearance)) for path in paths]
+          rows.append((any(vals), gid, face, tuple(vals)))
+      good = [r for r in rows if r[0]]
+      own = [r for r in rows if r[1] == raw_gid]
+      print(f"[h-audit-pick] fact rows true={len(good)}/{len(rows)}; "
+            f"chosen-grasp rows={own}; first-true={good[:8]}", flush=True)
+  return {"states": states, "values": values, "suffix_costs": suffix,
+          "violations": violations, "concrete_failures": concrete_failures}
+
+
 def collect_plan_witnesses(C, assembly, plan, robots, robot_ik, *, gripper_kind=None,
                            handovers=True, allow_place=True, bracing=False,
                            grasp_table=None, resolve_missing=False, verbose=True,
@@ -6979,6 +7124,20 @@ class LabeledDisassemblyHeuristic:
             for pth in fact_paths(S_key, pg))
       return hit
 
+    def scatter_ok(pg):
+      # The real problem supplies every loose singleton in one authored initial pose.  That
+      # pose need not be reproducible by PLACE (for example an imported proxy can have no
+      # enumerated stable rest face), but its initial PICK is still a real edge.  Include it
+      # as an additional predecessor possibility; the OR only relaxes the abstraction.
+      key = ("SCATTER", pg)
+      hit = self._pick_cache.get(key)
+      if hit is None:
+        hit = self._pick_cache[key] = any(
+            _scatter_pick_fact(assembly, pg[0], pg[1], pth,
+                               clearance=self._clearance)
+            for pth in fact_paths((pg[0],), pg))
+      return hit
+
     # placement faces are now looked up PER SUBASSEMBLY in the stable rest-pose table
     # (rest_faces) instead of the old global 0..5 -- so the abstraction offers exactly the
     # resting orientations the real places()/precompute_stable_faces do (e.g. a lone cylinder
@@ -7128,10 +7287,11 @@ class LabeledDisassemblyHeuristic:
       # inverse PICK-LOOSE: some (q,gq) in L was just picked off the table. The abstraction
       # does not track loose parts' resting faces (they can be reoriented via place+pick),
       # so the gate is EXISTS-a-face -- optimistic about the reorientation cost, admissible.
-      # (rest_faces is shape-frame + neutral-rest aware via placement_quat, so scatter-style
-      # side-lying poses are ordinary faces here -- no separate scatter fact needed.)
+      # The authored initial scatter is an additional source pose: it need not be generated
+      # by PLACE or have an enumerated stable face, yet a real initial PICK may use it.
       for q, gq in L:
-        if any(pick_ok((q,), f, (q, gq)) for f in rf((q,))):
+        if (any(pick_ok((q,), f, (q, gq)) for f in rf((q,)))
+            or scatter_ok((q, gq))):
           yield (ideal, G, face, tsub(L, (q, gq))), 1.0
       # inverse LIFT: held solo -> was resting on some face and got picked
       if face is Hf and len(G) == 1:
@@ -7641,7 +7801,7 @@ class CollapsedLabeledHeuristic:
                labeled_loose=False, dist_cap=None, ideal_chain=None,
                component_root=None, fill_goal=False, lazy_build=False,
                goal_states=None, target_support_quotient=False,
-               reverse_deadline=None):
+               reverse_deadline=None, handover_checker=None):
     import heapq
     import time as _time
 
@@ -7672,6 +7832,10 @@ class CollapsedLabeledHeuristic:
     # slice, not unmetered preprocessing.  A deadline pause is deliberately NOT exhaustion;
     # callers must treat an unsettled query as unknown and retain their other admissible bound.
     self._reverse_deadline = reverse_deadline
+    # Optional LNS-only tightening of each loose part's reverse grasp-transition graph. This
+    # checker is never consulted by concrete search here; it removes only abstract handover
+    # edges that fail the forward layer's own floating-EE gate in an isolated payload scene.
+    self._handover_checker = handover_checker
     self._reverse_deadline_hit = False
     if self._goal_states and self._fill_goal:
       raise ValueError("goal_states and fill_goal are mutually exclusive")
@@ -7848,6 +8012,19 @@ class CollapsedLabeledHeuristic:
             for pth in fact_paths(S_key, part, g))
       return hit
 
+    def scatter_ok(pg):
+      # See the fine labeled model above.  Signature labels OR over their raw grasp and
+      # usable-kind fibres, preserving the collapse's relaxation contract.
+      key = ("SCATTER", pg)
+      hit = self._pick_cache.get(key)
+      if hit is None:
+        hit = self._pick_cache[key] = any(
+            _scatter_pick_fact(assembly, part, g, pth,
+                               clearance=self._clearance)
+            for part, g in grasp_pairs((pg[0],), pg)
+            for pth in fact_paths((pg[0],), part, g))
+      return hit
+
     def can_add_label(ideal_key, G, pg):
       if is_target_token(pg):
         return G.count(pg) < self._target_capacity.get(ideal_key, {}).get(pg, 0)
@@ -7867,8 +8044,9 @@ class CollapsedLabeledHeuristic:
     def loose_pickable(q):
       hit = self._loose_pickable.get(q)
       if hit is None:
-        hit = self._loose_pickable[q] = any(
+        hit = self._loose_pickable[q] = (any(
             pick_ok((q,), f, (q, g)) for g in self.single[q] for f in rf((q,)))
+            or any(scatter_ok((q, g)) for g in self.single[q]))
       return hit
 
     # ---- WRENCH facts: identical to the fine class (G stays labeled, so these are exact).
@@ -7899,12 +8077,71 @@ class CollapsedLabeledHeuristic:
         supports[p] = supports[p] | {("grasp", f"zz{i}", p, g)}
       return State(parent=parent, place=place, supports=supports, poses=dict(flatposes))
 
-    def held_single(q, gq):
+    def held_single(q, gq, robot="zzq"):
       st = crafted((), (), _IDENTITY_FACE)
-      st.parent[q] = ("gripper", "zzq")
+      st.parent[q] = ("gripper", robot)
       st.place.pop(q, None)
-      st.supports[q] = frozenset({("grasp", "zzq", q, gq)})
+      st.supports[q] = frozenset({("grasp", robot, q, gq)})
       return st
+
+    # The ordinary reverse relaxation connects every loose-part grasp label to every other by
+    # a cost-two handover. Under the experimental LNS heuristic, retain only transitions for
+    # which some concrete representatives and two distinct available grippers pass the
+    # forward search's fixed-proxy floating-EE coexistence gate. The test is deliberately
+    # isolated from arms, table, and unrelated parts.  OR over representatives and robot
+    # assignments preserves the abstraction's optimism and hence admissibility.
+    self._handover_pair_cache = {}
+    _handover_robots = tuple(getattr(handover_checker, "robots_order", ()))
+    # Floating geometry and grasp masks depend on tool kind, not arm identity.  Enumerating
+    # all ordered robot pairs would repeat the identical FCL query R(R-1) times (12x in the
+    # four-UR Cooling experiment). Keep one distinct-robot representative per ordered kind
+    # pair; this is an exact quotient of the cheap check, not a sampling shortcut.
+    _handover_robot_pairs = []
+    _seen_kind_pairs = set()
+    for _r_old in _handover_robots:
+      for _r_new in _handover_robots:
+        if _r_old == _r_new:
+          continue
+        _kp = (getattr(handover_checker, "_robot_kind", {}).get(_r_old),
+               getattr(handover_checker, "_robot_kind", {}).get(_r_new))
+        if _kp not in _seen_kind_pairs:
+          _seen_kind_pairs.add(_kp)
+          _handover_robot_pairs.append((_r_old, _r_new))
+
+    def _raw_grasp_usable(S_key, p, g, robot):
+      mask = (self._kinds_of or {}).get((S_key, p, g), ())
+      if not mask:
+        return True
+      kind = getattr(handover_checker, "_robot_kind", {}).get(robot)
+      return kind in mask
+
+    def handover_pair_ok(S_key, pg_old, pg_new):
+      if handover_checker is None:
+        return True
+      key = (S_key, pg_old, pg_new)
+      hit = self._handover_pair_cache.get(key)
+      if hit is not None:
+        return hit
+      ok = False
+      for p_old, g_old in grasp_pairs(S_key, pg_old):
+        for p_new, g_new in grasp_pairs(S_key, pg_new):
+          for r_old, r_new in _handover_robot_pairs:
+            if not _raw_grasp_usable(S_key, p_old, g_old, r_old):
+              continue
+            if not _raw_grasp_usable(S_key, p_new, g_new, r_new):
+              continue
+            st = held_single(p_old, g_old, r_old)
+            if handover_checker.pick_collision_free(
+                st, p_new, g_new, assembly,
+                note=f"reverse grasp transition {pg_old}->{pg_new}", robot=r_new):
+              ok = True
+              break
+          if ok:
+            break
+        if ok:
+          break
+      self._handover_pair_cache[key] = ok
+      return ok
 
     def w_hold_ok(ideal_key, G, face):
       # collapsed labels: stable if ANY raw-variant assignment of G is (OR = relaxation).
@@ -8034,11 +8271,11 @@ class CollapsedLabeledHeuristic:
       if self._labeled_loose:
         # inverse PICK-LOOSE, labeled: the loose (part, class) must be pickable AS THAT
         # CLASS (exists-a-face, OR over class variants) -- the pick/press linkage at class
-        # resolution; a swap is available via the LOOSE-HANDOVER edge below. (rest_faces is
-        # shape-frame + neutral-rest aware via placement_quat -- scatter-style side-lying
-        # poses are ordinary faces here.)
+        # resolution; a swap is available via the LOOSE-HANDOVER edge below. The initial
+        # scatter is included separately because it is a supplied source pose, not a PLACE.
         for q, gq in L:
-          if any(pick_ok((q,), f, (q, gq)) for f in rf((q,))):
+          if (any(pick_ok((q,), f, (q, gq)) for f in rf((q,)))
+              or scatter_ok((q, gq))):
             yield (ideal, G, face, tsub(L, (q, gq))), 1.0
       else:
         # inverse PICK-LOOSE: exists-a-face AND exists-a-grasp (the collapse)
@@ -8096,7 +8333,7 @@ class CollapsedLabeledHeuristic:
         if cap_used < self.R:
           for q, gq in L:
             for gq2 in self.single[q]:
-              if gq2 != gq:
+              if gq2 != gq and handover_pair_ok((q,), (q, gq2), (q, gq)):
                 yield (ideal, G, face, tadd(tsub(L, (q, gq)), (q, gq2))), 2.0
         # inverse IN-HAND REORIENT (cost 1, gated): loose part's grasp CLASS swapped in hand,
         # no free arm needed (see the fine class for the full rationale). Pure-collapse mode
@@ -8420,6 +8657,8 @@ class CollapsedLabeledHeuristic:
         "reverse_time": self._reverse_time,
         "pick_facts": len(self._pick_cache),
         "wrench_facts": len(self._wfacts),
+        "handover_pairs": len(self._handover_pair_cache),
+        "handover_pairs_feasible": sum(bool(v) for v in self._handover_pair_cache.values()),
         "exhausted": self._reverse_exhausted,
         "deadline_hit": self._reverse_deadline_hit,
     }
@@ -8557,9 +8796,40 @@ def _table_aware_pick_fact(assembly, S_key, face, gpart, gid, gripper_path,
 
 
 
-# (the interim `_scatter_pick_fact` -- pick facts at the raw scatter orientation -- was
-# removed: placement_quat + neutral rests made scatter-style poses ordinary rest-table
-# faces, so the canonical exists-a-face pick gates cover them; see chair history.)
+def _scatter_pick_fact(assembly, part, gid, gripper_path, clearance=0.0):
+  """Floating-EE pick fact for a loose part's authored initial orientation.
+
+  Initial states are supplied by the problem, not reached through a PLACE action. Their
+  orientation therefore need not occur in ``rest_faces`` (Cooling ``obj_2`` is a concrete
+  example with an empty stable-rest set). Omitting this one-time source edge can make a real
+  initial PICK absent from the backward graph and turns its distance into an overestimate.
+
+  The fact is deliberately optimistic about table x/y and uses the same clearance convention
+  as the ordinary rest-face facts. OR-ing it into inverse PICK can only add abstract edges.
+  """
+  aq = assembly.scatter_orientations.get(part)
+  aq = np.array([1.0, 0.0, 0.0, 0.0]) if aq is None else np.asarray(aq, dtype=float)
+  key = (assembly, "SCATTER", part, gid, gripper_path, round(clearance, 4))
+  hit = _TABLE_PICK_FACT_CACHE.get(key)
+  if hit is not None:
+    return hit
+  tmpl, base_rel_tool, q_corr, top = _fact_template(gripper_path, assembly)
+  C = ry.Config()
+  C.addConfigurationCopy(tmpl)
+  pos = np.array([0.0, 0.0,
+                  top + _problem._shape_half_z(assembly.part_shape(part),
+                                                _quat_to_R(aq)) + clearance])
+  f = C.getFrame(part)
+  f.setPosition(pos)
+  f.setQuaternion(list(aq))
+  grasp_world = _pose_compose(np.concatenate([pos, aq]), grasp_pose(assembly, part, gid))
+  base_world = _ee_root_pose(grasp_world, base_rel_tool, q_corr)
+  root = C.getFrame("eeFACT_ur_base")
+  root.setPosition(base_world[:3])
+  root.setQuaternion(base_world[3:])
+  ok = all(d >= -_CHEAP_PENETRATION_TOL for _a, _b, d in C.getCollisions())
+  _TABLE_PICK_FACT_CACHE[key] = ok
+  return ok
 
 
 def _action_parts(a):
@@ -10031,6 +10301,187 @@ class _IncrementalLazySearch:
       stack.extend(self.children.pop(x, ()))
       for alt in self.alts.pop(x, {}).values():
         self._queue(alt)
+
+
+def _full_state_reverse_policy(reverse_edges, goals, banned):
+  """Exact cost-to-go and one deterministic policy on an explicit directed State graph.
+
+  ``reverse_edges[v]`` contains the original forward edges ``(u, action)`` for ``u -> v``.
+  Nothing is projected: dictionary keys are the concrete :class:`problem.State` values.
+  """
+  import heapq
+  import itertools
+
+  tie = itertools.count()
+  dist = {}
+  policy = {}
+  pq = []
+  for goal in goals:
+    if goal in dist:
+      continue
+    dist[goal] = 0.0
+    heapq.heappush(pq, (0.0, next(tie), goal))
+  while pq:
+    d, _order, state = heapq.heappop(pq)
+    if d != dist.get(state):
+      continue
+    for prev, action in reverse_edges.get(state, ()):
+      if (prev, action, state) in banned:
+        continue
+      nd = d + action_cost(action)
+      if nd < dist.get(prev, float("inf")):
+        dist[prev] = nd
+        policy[prev] = (action, state)
+        heapq.heappush(pq, (nd, next(tie), prev))
+  return dist, policy
+
+
+def solve_assembly_problem_full_backward(
+    C, assembly, robots=None, robot_ik=None, wrench=False, handovers=True,
+    allow_place=True, bracing=False, max_states=200000, max_edges=2000000,
+    verbose=True):
+  """Exact reverse search over the *unprojected* finite symbolic task graph.
+
+  This is the deliberately expensive reference implementation that the old benchmark name
+  ``exact backwards`` was intended to mean.  It differs fundamentally from
+  :class:`CollapsedLabeledHeuristic`: robot identities, raw grasp ids, table-placement ids,
+  every support contact, and the complete kinematic-parent tree all remain in ``State.key``.
+
+  The domain currently exposes reliable forward successor generators but no separately
+  maintained inverse operators.  To avoid a second, drift-prone action model, this routine
+  first materializes the complete cheap-feasible graph reachable from the authored initial
+  state and records every edge in reverse.  Multi-source Dijkstra then runs backward from all
+  reachable goal states.  Real-arm IK is kept lazy, exactly as in the ordinary LazySP solver:
+  validate the shortest candidate, delete its first failing edge, and recompute the reverse
+  shortest-path tree.  With no finite guards and a complete edge validator this is complete
+  and cost-optimal on the same finite task graph; the CLI guards are operational limits and
+  cause a loud error rather than a fallback.
+  """
+  import collections
+  import time
+
+  if max_states < 1 or max_edges < 1:
+    raise ValueError("full backward graph guards must be positive")
+  if robots is None:
+    robots = get_robots(C)
+  checker, grasp_table = _search_context(C, assembly, robots)
+  gk = wrench_kind_arg(C, robots) if wrench else None
+  if gk is not None:
+    reset_wrench_cache()
+
+  # Full means full: neither robot-anonymous hashing nor a temporary placement-yaw prefix is
+  # allowed to quotient the graph.  Restore process globals for library callers on every exit.
+  old_anon = _problem._ANON_ROBOTS
+  old_yaw_prefix = _problem._PLACEMENT_YAW_PREFIX
+  set_anonymous_robots(False)
+  set_placement_yaw_prefix(None)
+  t0 = time.perf_counter()
+  try:
+    start = get_initial_state(C, assembly)
+    canonical = {start: start}
+    queue = collections.deque([start])
+    reverse_edges = {}
+    edge_count = 0
+    cheap_rejects = 0
+
+    while queue:
+      state = queue.popleft()
+      for action, raw_next in successors(
+          state, assembly, robots, grasp_table=grasp_table,
+          gripper_kind=gk, handovers=handovers, allow_place=allow_place,
+          bracing=bracing):
+        # Geometry is a deterministic edge predicate and therefore belongs to the explicit
+        # graph.  Keeping only IK lazy prevents the materializer from invoking nonlinear
+        # optimization on the enormous set of edges no shortest path ever uses.
+        if not cheap_feasible(action, state, raw_next, assembly, checker):
+          cheap_rejects += 1
+          continue
+        nxt = canonical.get(raw_next)
+        if nxt is None:
+          if len(canonical) >= max_states:
+            raise RuntimeError(
+                "full-state backward graph exceeded "
+                f"--full-backward-max-states={max_states} after storing {edge_count} edges. "
+                "Increase the explicit guard for this exponential reference experiment, "
+                "reduce its finite grasp/placement alphabet, or use the projected standard "
+                "search. No fallback was applied.")
+          nxt = raw_next
+          canonical[nxt] = nxt
+          queue.append(nxt)
+        if edge_count >= max_edges:
+          raise RuntimeError(
+              "full-state backward graph exceeded "
+              f"--full-backward-max-edges={max_edges} with {len(canonical)} states. "
+              "Increase the explicit guard for this exponential reference experiment, "
+              "reduce its finite grasp/placement alphabet, or use the projected standard "
+              "search. No fallback was applied.")
+        reverse_edges.setdefault(nxt, []).append((state, action))
+        edge_count += 1
+
+    goals = [state for state in canonical.values() if state.is_goal(assembly)]
+    build_time = time.perf_counter() - t0
+    if verbose:
+      print(f"[full-backward] exact graph: {len(canonical)} full states, "
+            f"{edge_count} cheap-feasible edges, {cheap_rejects} geometric rejects, "
+            f"{len(goals)} goals in {build_time:.2f}s")
+    if not goals:
+      if verbose:
+        print("[full-backward] no reachable symbolic goal; graph exhausted")
+      return None
+
+    banned = set()
+    validated = set()
+    rounds = 0
+    reverse_time = 0.0
+    while True:
+      rounds += 1
+      tr = time.perf_counter()
+      dist, policy = _full_state_reverse_policy(reverse_edges, goals, banned)
+      reverse_time += time.perf_counter() - tr
+      if start not in dist:
+        if verbose:
+          print(f"[full-backward] graph exhausted after {rounds - 1} candidate(s), "
+                f"{len(banned)} IK edge rejection(s)")
+        return None
+
+      actions = Plan()
+      states = [start]
+      state = start
+      while not state.is_goal(assembly):
+        step = policy.get(state)
+        if step is None:
+          raise RuntimeError("full-state reverse policy ended before a goal")
+        action, state = step
+        actions.append(action)
+        states.append(state)
+      actions.states = states
+
+      failed = None
+      if robot_ik is not None:
+        for prev, action, nxt in zip(states, actions, states[1:]):
+          edge = (prev, action, nxt)
+          if edge in validated or action[0] not in _IK_ACTIONS:
+            continue
+          ok, _witness = robot_ik.bind(action, prev, nxt, assembly)
+          if not ok:
+            failed = edge
+            break
+          validated.add(edge)
+      if failed is None:
+        if verbose:
+          print(f"[full-backward] found exact full-state plan: {len(actions)} actions, "
+                f"cost {dist[start]:g}, {rounds} reverse solve(s), "
+                f"{len(validated)} IK validations ({len(banned)} rejected), "
+                f"reverse Dijkstra {reverse_time:.2f}s, total "
+                f"{time.perf_counter() - t0:.2f}s")
+        return actions
+      banned.add(failed)
+      if verbose and (rounds <= 5 or rounds % 25 == 0):
+        print(f"[full-backward] candidate {rounds}: rejected IK edge {failed[1]}; "
+              "recomputing exact reverse policy", flush=True)
+  finally:
+    set_anonymous_robots(old_anon)
+    set_placement_yaw_prefix(old_yaw_prefix)
 
 
 def solve_assembly_problem_lazy(C, assembly, robots=None, max_nodes=200000, verbose=True,
@@ -13208,6 +13659,7 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
                                               labeled_h=False, collapsed_h=False,
                                               grasp_collapsed_h=False, fill_window=2,
                                               lns_window=None,
+                                              lns_grasp_transition_h=False,
                                               milestone_oracle="global",
                                               fill_local_h=False, fill_exact=False,
                                               fill_target_support_quotient=False,
@@ -13311,10 +13763,29 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
              else CollapsedLabeledHeuristic if collapsed_h
              else LabeledDisassemblyHeuristic if labeled_h
              else GraspCollapsedHeuristic)
-    h_lab = h_cls(
-        assembly, len(robots), grasp_table,
+    h_kwargs = dict(
         gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
         verbose=False, gripper_kind=(gk if wrench_aware_h else None), bracing=bracing)
+    if lns_grasp_transition_h and not issubclass(h_cls, CollapsedLabeledHeuristic):
+      raise ValueError("lns_grasp_transition_h requires a collapsed labeled heuristic")
+    h_lab = h_cls(assembly, len(robots), grasp_table, **h_kwargs)
+    # Carry the checker into each goal-conditioned endpoint PDB without spending the global
+    # landmark build on every part's raw grasp-pair matrix.  The endpoint's ideal_chain then
+    # limits the stronger manipulation graph to exactly the destroyed LNS window.
+    if lns_grasp_transition_h:
+      h_lab._handover_checker = checker
+    # Developer diagnostic: run the exact concrete plan through this solve's abstraction.
+    # Kept behind an environment variable so ordinary search is byte-for-byte unchanged.
+    import os as _os
+    _audit_path = _os.environ.get("ASSEMBLY_AUDIT_HEURISTIC_PLAN")
+    if _audit_path:
+      from plan_io import read_plan as _read_audit_plan
+      _audit_cfg, _audit_plan = _read_audit_plan(_audit_path)
+      audit_plan_heuristic(
+          C, assembly, _audit_plan, robots, h_lab, gripper_kind=gk,
+          handovers=handovers, allow_place=allow_place, bracing=bracing,
+          grasp_table=grasp_table, checker=checker, verbose=True)
+      raise SystemExit("heuristic plan audit complete")
     best = _lns_improve(
         inc, C, assembly, robots, checker, grasp_table, robot_ik,
         max(weight, 5.0), 20000, verbose, h_lab, gripper_kind=gk,
@@ -13345,10 +13816,12 @@ def _make_lns_endpoint_pdb(start, target, ideal_chain, assembly, robots, grasp_t
                            h_landmark, cost_bound, deadline=None):
   """Retarget the incumbent's projected model at one exact LNS boundary.
 
-  The ordinary milestone fill and this endpoint heuristic now share the same reverse-Dijkstra
+  The ordinary milestone fill and this endpoint heuristic share the same reverse-Dijkstra
   implementation and grasp-signature quotient. ``ideal_chain`` restricts the projected assembly
-  ideals to the destroyed milestone interval. Reverse search is truncated strictly below the
-  incumbent window cost: anything absent after exhaustion cannot participate in an improvement.
+  ideals to the destroyed milestone interval. ``target=None`` roots the table at the ordinary
+  assembly goal set (used only by the experimental final-window heuristic); otherwise it roots
+  it at the exact splice state. Reverse search is truncated strictly below the incumbent window
+  cost: anything absent after exhaustion cannot participate in an improvement.
   """
   if not isinstance(h_landmark, CollapsedLabeledHeuristic):
     return None                                           # nonstandard fine-h ablation
@@ -13364,7 +13837,9 @@ def _make_lns_endpoint_pdb(start, target, ideal_chain, assembly, robots, grasp_t
       grasp_classes=h_landmark._grasp_classes,
       labeled_loose=h_landmark._labeled_loose, dist_cap=cap,
       ideal_chain=ideal_chain, component_root=h_landmark._component_root,
-      lazy_build=True, goal_states=(target,), reverse_deadline=deadline)
+      lazy_build=True, goal_states=(() if target is None else (target,)),
+      reverse_deadline=deadline,
+      handover_checker=getattr(h_landmark, "_handover_checker", None))
 
 
 def _refill_window(start, touched_parts, target, assembly, robots, checker, grasp_table,
@@ -13622,9 +14097,12 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
   bound: the greedy replacement cost if one was found, otherwise the incumbent span cost. If
   the weight-one pass exhausts, the retained replacement is optimal within this finite window
   under the validated graph. Exact witnesses and open-witness effort persist through robot_ik.
-  When a finite deadline is present, every remaining window receives an equal share of the
-  remaining wall budget, and greedy receives half of that window's still-available slice so the
-  exact pass cannot be starved (unused greedy time flows to exact).
+  Wall time is not divided between windows: a six-second slice is too short even to expose the
+  benefit of a stronger heuristic on realistic fills.  Instead consultations use geometric
+  node budgets.  A budget-hit window stays open and is revisited after the other ranked windows
+  with twice the nodes; success, exhaustive failure, or the run's single global deadline closes
+  it.  Greedy and weight-one therefore see the same global deadline and an explicit, reproducible
+  amount of graph-search effort.
 
   Every non-final window also builds a bounded reverse PDB rooted at its exact projected splice
   endpoint, using the same abstraction and signature quotient as ordinary local fills. Its
@@ -13632,9 +14110,16 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
   incumbent bound certifies that the window cannot improve and avoids concrete forward search.
   The final window retains the ordinary, non-unique assembly goal.
 
+  Within each neighborhood size, windows are visited by decreasing admissible improvement
+  gap ``current span cost - max(0, h(start)-h(target))``.  This is a best-bound schedule:
+  it changes only which independent repair is consulted first, not any repair's state space,
+  bound, validation, or exactness.  Neighborhood sizes still grow from one part to the full
+  horizon, so cheap local repairs precede combinatorially larger ones.
+
   Growing k covers reorderings a small window can't reach; k=n is the whole-plan bounded
   search. Standard LNS: RESTART the sweep on any accept (the plan, hence its partition,
-  changes). No separate proof rung -- the k=n window is the last iteration."""
+  changes and all gaps are recomputed). No separate proof rung -- the k=n window is the last
+  iteration."""
   import math
   import time
   if t0 is None:
@@ -13706,53 +14191,79 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
         print(f"[lns] PROVEN OPTIMAL: cost {cost(cur):g} == heuristic lower bound "
               f"h(s0) at {time.perf_counter() - t0:.1f}s", flush=True)
       return cur
-    accepted = False
+    # Best-bound scheduling WITHIN each growing neighborhood size.  Retaining k=1..km as
+    # the primary order is important: raw gaps grow with window length, whereas refill cost
+    # grows much faster, so globally sorting raw gaps would perversely run the full-horizon
+    # proof before an obvious one-part repair.  At a fixed k all windows have comparable
+    # scope, and the admissible gap is the principled upper bound on useful cost reduction.
+    schedule = []
     for k in range(1, km + 1):
-      if accepted:
-        break
+      same_k = []
       for i in range(m - k + 1):
+        span_cost = cost(cur[bnds[i]:bnds[i + k]])
+        hs = h_lab.value(states[i])
+        ht = 0.0 if i + k == m else h_lab.value(states[i + k])
+        # An infinite target landmark gives no differential information.  Conversely, an
+        # infinite start with a finite target is a valid certificate (and, given the concrete
+        # incumbent, flags another abstraction bug rather than a scheduling ambiguity).
+        if math.isfinite(hs) and math.isfinite(ht):
+          lower = max(0.0, hs - ht)
+        elif math.isinf(hs) and math.isfinite(ht):
+          lower = float("inf")
+        else:
+          lower = 0.0
+        same_k.append((span_cost - lower, i, lower))
+      same_k.sort(key=lambda x: (-x[0], x[1]))
+      schedule.extend((k, i, lower, gap) for gap, i, lower in same_k)
+
+    from collections import deque
+    initial_node_budget = min(512, max_nodes)
+    pending = deque((k, i, landmark_lb, gap, initial_node_budget)
+                    for k, i, landmark_lb, gap in schedule)
+    accepted = False
+    consultation = 0
+    while pending:
+        k, i, landmark_lb, scheduled_gap, node_budget = pending.popleft()
+        consultation += 1
         if deadline is not None and time.perf_counter() > deadline:
           return cur
         span = cur[bnds[i]:bnds[i + k]]
         old_cost = cost(span)
         is_last = (i + k == m)
-        h_start = h_lab.value(states[i])
-        h_tgt = 0.0 if is_last else h_lab.value(states[i + k])
         parts_mated = sorted({p for sp in seg_parts[i:i + k] for p in sp})
-        if old_cost <= max(0.0, h_start - h_tgt):
+        if verbose:
+          print(f"[lns-schedule] consultation={consultation} pending={len(pending)} k={k} "
+                f"parts[{i}:{i + k}] {tuple(parts_mated)} bound={old_cost:g} "
+                f"landmark-lb={landmark_lb:g} gap={scheduled_gap:g} "
+                f"nodes={node_budget}", flush=True)
+        if old_cost <= landmark_lb:
           if verbose:
             print(f"[lns-window] k={k} parts[{i}:{i + k}] {tuple(parts_mated)} "
                   f"passes=greedy->w1 bound={old_cost:g} outcome=lower-bound "
-                  f"h-diff={max(0.0, h_start - h_tgt):g}", flush=True)
+                  f"h-diff={landmark_lb:g}", flush=True)
           continue                                        # window already at its lower bound
         # Destroyed-action neighborhood: include every part physically touched by the removed
         # incumbent span. In particular, ASSEMBLE contributes both its moved part and target;
         # RELEASE contributes only its actual part. All other parts remain frozen. Increasing k
         # exposes the union of more consecutive incumbent spans instead of globally widening.
         touched_parts = set().union(*(_action_parts(a) for a in span)) if span else set()
-        # FAIR SLICING: an early pathological coordinate must not starve all later windows.
-        # Recompute after every attempt, so unused time is automatically redistributed. Native
-        # nonlinear solves may overrun their cooperative slice, but the next A* pop observes it.
+        # One global wall deadline, explicit per-consultation graph effort.  A node-capped
+        # search is reopened below with geometrically more effort; no stochastic/IK failure is
+        # converted into a permanent no-good by this scheduling decision.
         window_deadline = deadline
-        allocated = None
-        if deadline is not None:
-          later_at_k = m - k + 1 - i
-          later_widths = sum(m - kk + 1 for kk in range(k + 1, km + 1))
-          attempts_left = max(1, later_at_k + later_widths)
-          now = time.perf_counter()
-          allocated = max(0.0, (deadline - now) / attempts_left)
-          window_deadline = min(deadline, now + allocated)
         # Direct endpoint PDB: unlike the final-goal landmark difference, this reverse search
-        # is rooted at the exact projected splice state and restricted to the window's ideal
-        # chain. The strict incumbent bound caps its reverse radius. The last window retains
-        # the ordinary (possibly non-unique) assembly goal, so an exact endpoint would be too
-        # strong there and the global goal PDB is already direct.
+        # is restricted to the window's ideal chain and rooted at the exact projected splice.
+        # The experimental final-window version is instead rooted at the complete ordinary
+        # goal SET (never one incumbent final state), so alternative hands-off goals remain.
+        # The strict incumbent bound caps either table's reverse radius.
         endpoint_h = None
         endpoint_lb = None
         endpoint_stats = None
         endpoint_wall = 0.0
-        endpoint_status = "goal-window" if is_last else "active"
-        if not is_last:
+        _experimental_goal_pdb = (is_last and
+                                  getattr(h_lab, "_handover_checker", None) is not None)
+        endpoint_status = "goal-window" if is_last and not _experimental_goal_pdb else "active"
+        if not is_last or _experimental_goal_pdb:
           pdb_t0 = time.perf_counter()
           chain = []
           for st in states[i:i + k + 1]:
@@ -13760,7 +14271,8 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
             chain.append(_subasm_key(main))
           try:
             endpoint_h = _make_lns_endpoint_pdb(
-                states[i], states[i + k], chain, assembly, robots, grasp_table,
+                states[i], None if is_last else states[i + k], chain,
+                assembly, robots, grasp_table,
                 h_lab, old_cost, window_deadline)
             if endpoint_h is None:
               endpoint_status = "unsupported-h-ablation"
@@ -13810,19 +14322,15 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
                     f"outcome=endpoint-bound endpoint-h={endpoint_lb:g} "
                     f"pdb-wall={endpoint_wall:.2f}s", flush=True)
             continue
-        # TWO-PASS WINDOW. Give greedy at most half of the window's remaining fair slice.
-        # Finishing early transfers the unused time to exact; exact always gets a consultation
-        # unless a native nonlinear call overruns its cooperative deadline.
+        # TWO-PASS WINDOW. Both passes have the same global deadline; their separate node caps
+        # ensure greedy cannot consume an arbitrary time allotment reserved for exact search.
         greedy_deadline = window_deadline
-        if window_deadline is not None:
-          now = time.perf_counter()
-          greedy_deadline = now + max(0.0, window_deadline - now) / 2.0
 
         def run_pass(label, pass_weight, pass_bound, pass_deadline):
           refill_stats = {}
           candidate = _refill_window(
               states[i], touched_parts, None if is_last else states[i + k], assembly,
-              robots, checker, grasp_table, robot_ik, pass_weight, max_nodes, h_lab,
+              robots, checker, grasp_table, robot_ik, pass_weight, node_budget, h_lab,
               gripper_kind=gripper_kind, handovers=handovers,
               allow_place=allow_place, bracing=bracing, deadline=pass_deadline,
               cost_bound=pass_bound, stats=refill_stats, endpoint_h=endpoint_h)
@@ -13830,7 +14338,6 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
           # survive the pass boundary. Only dead heap/repair arenas are released here.
           _release_fill_scratch(f"lns-k{k}-{i}-{label}", verbose=verbose)
           if verbose:
-            slice_text = f" window-slice={allocated:.1f}s" if allocated is not None else ""
             result_text = f" result={cost(candidate):g}" if candidate is not None else ""
             endpoint_text = ("" if endpoint_lb is None else
                              f" endpoint-h={'inf' if endpoint_lb == float('inf') else f'{endpoint_lb:g}'}"
@@ -13841,7 +14348,7 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
                                 f"/{pass_endpoint_stats['discovered']}")
             print(f"[lns-window] k={k} parts[{i}:{i + k}] {tuple(parts_mated)} "
                   f"pass={label} w={'inf' if math.isinf(pass_weight) else f'{pass_weight:g}'} "
-                  f"bound={pass_bound:g} footprint={len(touched_parts)}{slice_text} "
+                  f"bound={pass_bound:g} footprint={len(touched_parts)} nodes={node_budget} "
                   f"outcome={refill_stats.get('outcome', 'unknown')}{result_text}"
                   f"{endpoint_text} wall={refill_stats.get('wall', 0.0):.2f}s "
                   f"searches={refill_stats.get('search_calls', 0)} "
@@ -13873,10 +14380,26 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
                     f"boundary={ep.get('boundary_wall', 0.0):.2f}s", flush=True)
           return candidate, refill_stats
 
-        greedy, _greedy_stats = run_pass(
-            "greedy", float("inf"), old_cost, greedy_deadline)
-        exact_bound = min(old_cost, cost(greedy)) if greedy is not None else old_cost
-        exact, _exact_stats = run_pass("exact", 1.0, exact_bound, window_deadline)
+        try:
+          greedy, _greedy_stats = run_pass(
+              "greedy", float("inf"), old_cost, greedy_deadline)
+          exact_bound = min(old_cost, cost(greedy)) if greedy is not None else old_cost
+          exact, _exact_stats = run_pass("exact", 1.0, exact_bound, window_deadline)
+        except MemoryError:
+          # An anytime planner already owns a fully validated incumbent. Resource exhaustion
+          # in a strictly optional improvement consultation must not turn that success into a
+          # failed run. Do not call the ordinary scratch/RSS reporter here: even opening and
+          # parsing /proc/self/statm allocates, and can raise another MemoryError while the
+          # process is at its address-space cap. Returning immediately unwinds the failed
+          # window arena; main can then serialize the best-so-far plan. Search semantics up to
+          # the resource boundary are unchanged.
+          try:
+            if verbose:
+              os.write(1, b"[lns] memory limit in optional improvement; "
+                          b"returning validated incumbent\n")
+          except (OSError, MemoryError):
+            pass
+          return cur
         sub = exact if exact is not None else greedy
         if sub is not None and cost(sub) < old_cost:
           cur = cur[:bnds[i]] + list(sub) + cur[bnds[i + k]:]
@@ -13886,6 +14409,17 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
                   f"{time.perf_counter() - t0:.1f}s", flush=True)
           accepted = True
           break
+        # Exact budget exhaustion means this repair remains unresolved.  Dovetail it after
+        # the other currently ranked windows with geometrically increasing graph effort.
+        # Exhaustion is a proof under the incumbent bound and needs no retry.  A greedy budget
+        # hit alone is also irrelevant when the exact pass has exhausted the same state space.
+        exact_outcome = _exact_stats.get("outcome")
+        if (sub is None and exact_outcome == "budget" and node_budget < max_nodes):
+          next_budget = min(max_nodes, 2 * node_budget)
+          pending.append((k, i, landmark_lb, scheduled_gap, next_budget))
+          if verbose:
+            print(f"[lns-schedule] reopen k={k} parts[{i}:{i + k}] "
+                  f"{tuple(parts_mated)} nodes={node_budget}->{next_budget}", flush=True)
     if not accepted:
       return cur
 

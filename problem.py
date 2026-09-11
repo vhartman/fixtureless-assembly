@@ -14,6 +14,12 @@ import wrench
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+# Root of every stochastic stream owned by one planning run. Keep this explicitly rather
+# than trying to recover it from RAI: query-local IK seeding needs the user-visible --seed,
+# while RAI exposes only the global setter below. Library callers that never call set_seed
+# retain the historical root zero.
+_CURRENT_SEED = 0
+
 # Exact renderer-only part meshes. These stay separate from ``part_shapes``: planning and
 # MuJoCo collide with that spec (which may be a convex decomposition of the same CAD), while
 # RAI/Viser/MuJoCo render this authored surface without duplicating mass or contact.
@@ -97,8 +103,15 @@ def set_seed(seed=0):
   """Make runs as reproducible as possible: seed numpy (part colours / start-pose
   perturbation) AND rai's RNG (KOMO seeds its IK guess with noise, which is the main source
   of run-to-run variation). Call once, before building configs / solving."""
-  ry.params_add({"seed": int(seed)})
-  np.random.seed(int(seed))
+  global _CURRENT_SEED
+  _CURRENT_SEED = int(seed)
+  ry.params_add({"seed": _CURRENT_SEED})
+  np.random.seed(_CURRENT_SEED)
+
+
+def current_seed():
+  """The root seed installed by :func:`set_seed` for newly constructed planners."""
+  return _CURRENT_SEED
 
 
 class Assembly:

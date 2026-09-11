@@ -111,7 +111,17 @@ def _attachment_trace(t, events, robots, *, physics_dt, time_origin):
     robot = str(event.get("robot", ""))
     if kind not in ("close_start", "open_start") or robot not in state:
       continue
-    et = _event_time(event, physics_dt=physics_dt, time_origin=time_origin, source_t=t)
+    # A phase-scheduled close begins before the attachment mode switch. New recordings retain
+    # that distinction in the close event; legacy events still attach at close_start.
+    timing_event = event
+    if kind == "close_start" and "attachment_physics_tick" in event:
+      timing_event = dict(event)
+      timing_event["physics_tick"] = event["attachment_physics_tick"]
+      if "attachment_time_s" in event:
+        timing_event["time_s"] = event["attachment_time_s"]
+      if "attachment_frame" in event:
+        timing_event["frame"] = event["attachment_frame"]
+    et = _event_time(timing_event, physics_dt=physics_dt, time_origin=time_origin, source_t=t)
     index = int(np.searchsorted(t, et, side="right") - 1)
     index = min(max(index, 0), n - 1)
     by_index[index].append((order, kind, robot, str(event.get("part", ""))))
@@ -272,6 +282,65 @@ def _json_samples(q, t, hinge, controller_active, events, robots, attached_objec
   return samples
 
 
+def _json_samples_preserved(q, t, hinge, controller_active, events, robots,
+                            attached_objects, *, dt, grasp_wait, physics_dt, time_origin):
+  """Downsample a source trajectory whose robot-local gripper waits are already scheduled.
+
+  No time warp is applied: doing so would alter relative robot timing after the phase
+  scheduler's collision certificate. Close annotations cover the recorded command-to-attach
+  interval; opening remains an edge-triggered command at its recorded source time.
+  """
+  dt, grasp_wait = float(dt), float(grasp_wait)
+  if not np.isfinite(dt) or dt <= 0.0:
+    raise ValueError("JSON sample dt must be finite and positive")
+  if not np.isfinite(grasp_wait) or grasp_wait < 0.0:
+    raise ValueError("grasp wait must be finite and nonnegative")
+  count = int(np.ceil(float(t[-1]) / dt - 1e-12)) + 1
+  tout = np.arange(count, dtype=float) * dt
+  source_at = np.minimum(tout, float(t[-1]))
+  qc = np.asarray(q, dtype=float).copy()
+  if np.any(hinge):
+    qc[:, hinge] = np.unwrap(qc[:, hinge], axis=0)
+  qout = np.column_stack([np.interp(source_at, t, qc[:, j])
+                          for j in range(qc.shape[1])])
+  qd, qdd = _differentiate(qout, tout, hinge)
+  source_indices = np.clip(
+      np.searchsorted(t, source_at, side="right") - 1, 0, len(t) - 1)
+  servo = np.asarray(controller_active, dtype=bool)[source_indices]
+  attached = np.asarray(attached_objects)[source_indices].copy()
+  closing = [set() for _ in range(count)]
+  opening = [set() for _ in range(count)]
+  for event in events:
+    kind, robot = event.get("event"), str(event.get("robot", ""))
+    if kind not in ("close_start", "open_start") or robot not in robots:
+      continue
+    begin = _event_time(event, physics_dt=physics_dt, time_origin=time_origin, source_t=t)
+    if kind == "open_start":
+      opening[min(int(np.ceil(begin / dt - 1e-12)), count - 1)].add(robot)
+      continue
+    if "attachment_physics_tick" in event:
+      end_event = dict(event)
+      end_event["physics_tick"] = event["attachment_physics_tick"]
+      end = _event_time(
+          end_event, physics_dt=physics_dt, time_origin=time_origin, source_t=t)
+    else:
+      end = min(begin + grasp_wait, float(t[-1]))
+    hits = np.flatnonzero((tout >= begin - 0.5 * dt) & (tout < end - 1e-12))
+    if not len(hits):
+      hits = [min(int(np.ceil(begin / dt - 1e-12)), count - 1)]
+    for i in hits:
+      closing[int(i)].add(robot)
+
+  return [{
+      "q": qout[i].tolist(), "qd": qd[i].tolist(), "qdd": qdd[i].tolist(),
+      "time": float(tout[i]), "opening_gripper": sorted(opening[i]),
+      "closing_gripper": sorted(closing[i]), "servo_controller": bool(servo[i]),
+      "attached_objects": {
+          robot: (str(attached[i, j]) if str(attached[i, j]) else None)
+          for j, robot in enumerate(robots)},
+  } for i in range(count)]
+
+
 def _legacy_gripper_events(z, robots, t, known_events=()):
   """Recover missing logical gripper commands from legacy action marks.
 
@@ -351,7 +420,7 @@ def _legacy_gripper_events(z, robots, t, known_events=()):
 
 
 def export_recording(source, destination, *, allow_failed=False, sample_dt=0.05,
-                     grasp_wait=0.5):
+                     grasp_wait=0.5, grasp_wait_mode="auto"):
   source, destination = Path(source), Path(destination)
   with np.load(source, allow_pickle=False) as z:
     required = {"xml", "qpos", "robots"}
@@ -359,6 +428,20 @@ def export_recording(source, destination, *, allow_failed=False, sample_dt=0.05,
     if missing:
       raise ValueError(f"{source} is not a sim recording; missing {missing}")
     metadata = _json_scalar(z, "metadata", {})
+    source_local_wait = bool(
+        metadata.get("wait_for_gripper")
+        and (metadata.get("phase_schedule")
+             or (metadata.get("resolved_profile") or {}).get("phase_schedule")))
+    if grasp_wait_mode not in ("auto", "insert", "preserve"):
+      raise ValueError("grasp_wait_mode must be auto, insert, or preserve")
+    resolved_wait_mode = ("preserve" if source_local_wait else "insert") \
+        if grasp_wait_mode == "auto" else grasp_wait_mode
+    if resolved_wait_mode == "preserve" and not source_local_wait:
+      raise ValueError(
+          "--grasp-wait-mode preserve requires a recording made with "
+          "--phase-schedule --wait-for-gripper")
+    source_grasp_wait = (float(metadata.get("gripper_motion_time", grasp_wait))
+                         if resolved_wait_mode == "preserve" else float(grasp_wait))
     source_success = (bool(np.asarray(z["success"]).item())
                       if "success" in z.files else None)
     if source_success is False and not allow_failed:
@@ -426,14 +509,17 @@ def export_recording(source, destination, *, allow_failed=False, sample_dt=0.05,
   if destination.suffix.lower() == ".json":
     # JSON is the compact hardware handoff: one self-contained record per 20Hz command sample.
     # Keep the model-order metadata outside the list so each row only carries execution data.
-    samples = _json_samples(
-        q, t, np.asarray([r[3] for r in rows], dtype=bool), controller_active, events, robots,
-        attached_objects, dt=sample_dt, grasp_wait=grasp_wait, physics_dt=physics_dt,
-        time_origin=time_origin)
+    _sample_fn = (_json_samples_preserved
+                  if resolved_wait_mode == "preserve" else _json_samples)
+    samples = _sample_fn(
+        q, t, np.asarray([r[3] for r in rows], dtype=bool), controller_active, events,
+        robots, attached_objects, dt=sample_dt, grasp_wait=source_grasp_wait,
+        physics_dt=physics_dt, time_origin=time_origin)
     payload = {
         "schema": JSON_SCHEMA,
         "dt": float(sample_dt),
-        "grasp_wait": float(grasp_wait),
+        "grasp_wait": source_grasp_wait,
+        "grasp_wait_mode": resolved_wait_mode,
         "robots": robots,
         "joint_names": [r[1] for r in rows],
         "robot_slices": slices,
@@ -486,11 +572,17 @@ def parse_args(argv=None):
   p.add_argument("--dt", type=float, default=0.05, metavar="SEC",
                  help="uniform JSON sample period (default 0.05s = 20Hz; NPZ is unchanged)")
   p.add_argument("--grasp-wait", type=float, default=0.5, metavar="SEC",
-                 help="JSON-only stationary wait inserted after each close command (default 0.5s)")
+                 help="JSON-only wait used in insert mode (default 0.5s); preserve mode reads "
+                      "the source recording's gripper motion time")
+  p.add_argument("--grasp-wait-mode", choices=("auto", "insert", "preserve"), default="auto",
+                 help="auto preserves collision-certified robot-local waits when present, "
+                      "otherwise inserts the legacy global dwell; preserve refuses an "
+                      "unscheduled source (default: auto)")
   return p.parse_args(argv)
 
 
 if __name__ == "__main__":
   args = parse_args()
   export_recording(args.source, args.destination, allow_failed=args.allow_failed,
-                   sample_dt=args.dt, grasp_wait=args.grasp_wait)
+                   sample_dt=args.dt, grasp_wait=args.grasp_wait,
+                   grasp_wait_mode=args.grasp_wait_mode)

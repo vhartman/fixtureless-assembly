@@ -51,6 +51,7 @@ class RunConfig:
   min_sep: Optional[float] = None
   check_init: bool = False
   seed: int = 0
+  ik_seed: Optional[int] = None
   goal_on_table: bool = True
 
   # -- solver / engine --
@@ -59,6 +60,10 @@ class RunConfig:
   optimistic_fallback: bool = True
   optimistic_chain_h: bool = False
   milestones: bool = True
+  # Exact reference solver over the unprojected discrete State graph.
+  full_backward: bool = False
+  full_backward_max_states: int = 200000
+  full_backward_max_edges: int = 2000000
   lazy: bool = False
   anytime: Optional[float] = None
   milestones_anytime: Optional[float] = None
@@ -95,6 +100,8 @@ class RunConfig:
   # complete incumbent horizon; this is separate from fill_window, whose small default is an
   # initial-feasibility recovery mechanism.
   lns_window: Optional[int] = None
+  # Experimental LNS-only reverse loose-grasp heuristic. Named profiles leave this off.
+  lns_grasp_transition_h: bool = False
   milestone_oracle: str = "global"
   fill_local_h: bool = False
   fill_target_support_quotient: bool = False
