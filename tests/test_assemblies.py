@@ -354,6 +354,40 @@ def test_no_hold_parts():
     W.PARAMS["grasp_model"] = saved
 
 
+def test_backward_heuristic_allows_an_initial_scatter_pick_without_a_place_face(monkeypatch):
+  """An authored initial pose is a source state, not the result of PLACE.
+
+  Imported proxies can have no enumerated stable rest face although their supplied initial
+  pose is pickable. The inverse PICK must retain the dedicated scatter edge fact; otherwise
+  a concrete initial edge disappears and the purported lower bound can overestimate (the
+  Cooling cost-34 regression).
+  """
+  A.set_seed(0)
+  A.set_rolls_per_face(1)
+  A.set_sampled_grasps(None)
+  A.set_stable_rest_poses(False)
+  A.set_placement_yaws(1)
+  A.set_placement_yaw_prefix(None)
+  A.set_goal(on_table=True)
+  asm = A.make_assembly("cross", 2)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  checker, gt = S._search_context(C, asm, robots)
+  s0 = A.get_initial_state(C, asm)
+
+  real_rest_classes = S.rest_face_classes
+  monkeypatch.setattr(
+      S, "rest_face_classes",
+      lambda assembly, group: (() if set(group) == {"obj_1"}
+                               else real_rest_classes(assembly, group)))
+  monkeypatch.setattr(S, "_scatter_pick_fact", lambda *_args, **_kwargs: True)
+  h = S.SignatureCollapsedHeuristic(
+      asm, len(robots), gt, gripper_path=checker.fact_gripper_path,
+      gripper_kind=None)
+  assert h.value(s0) == 3.0
+
+
 def test_cograsp_bracing():
   """The add_grasp (co-grasp) primitive + its labeled-h edge. An OFFSET HORIZONTAL mate (a car
   wheel: ±y press at an x-offset -> a yaw moment) needs TWO braces -- a single grasp can't supply
@@ -1942,3 +1976,21 @@ def test_optimistic_chain_heuristic_plans_a_non_module_assembly():
       wrench=False, bracing=False, chain_h=True)
   assert plan is not None
   assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+
+
+def test_full_backward_is_exact_on_unprojected_symbolic_graph():
+  """The reference reverse solver agrees with forward A* on a finite tiny instance."""
+  A.set_seed(0); A.set_rolls_per_face(1); A.set_goal(on_table=True)
+  asm = A.make_assembly("cross", 2)
+  C = make_four_robot_env(num_robots=1, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  reverse = A.solve_assembly_problem_full_backward(
+      C, asm, robots=robots, wrench=False, handovers=False, bracing=False,
+      max_states=20000, max_edges=100000, verbose=False)
+  forward = A.solve_assembly_problem(
+      C, asm, robots=robots, weight=1.0, wrench=False, handovers=False,
+      bracing=False, robot_ik=None, verbose=False)
+  assert reverse is not None and forward is not None
+  assert sum(A.action_cost(a) for a in reverse) == sum(A.action_cost(a) for a in forward)
+  assert _replay_ok(reverse, asm, C, robots_list=robots, gk=None)

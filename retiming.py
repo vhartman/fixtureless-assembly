@@ -356,7 +356,8 @@ def upsample_trajectory(traj, dt, q0=None):
 
 def build_trajectory(stretches, dt, joint_rate=DEFAULT_JOINT_RATE, ramp_dist=DEFAULT_RAMP_DIST,
                      ramp_min=DEFAULT_RAMP_MIN, dwell=0.0, settle=0.0, accel=None,
-                     arm_dims=None, vmax=None, event_durations=None, stretch_rates=None):
+                     arm_dims=None, vmax=None, event_durations=None,
+                     post_event_durations=None, stretch_rates=None):
   """Stitch per-mode stretches into one `TimedTrajectory` with v=0 (+ optional dwell)
   at every boundary where events fire, and a final settle hold.
 
@@ -377,6 +378,17 @@ def build_trajectory(stretches, dt, joint_rate=DEFAULT_JOINT_RATE, ramp_dist=DEF
       raise ValueError("event_durations must be non-negative")
     n_event = (np.rint(_event / dt).astype(int).tolist() if dt > 0
                else [0] * len(stretches))
+  if post_event_durations is None:
+    n_post_event = [0] * len(stretches)
+  else:
+    _post_event = np.asarray(post_event_durations, dtype=float).reshape(-1)
+    if len(_post_event) != len(stretches):
+      raise ValueError(
+          f"post_event_durations has {len(_post_event)} entries for {len(stretches)} events")
+    if np.any(_post_event < 0.0):
+      raise ValueError("post_event_durations must be non-negative")
+    n_post_event = (np.rint(_post_event / dt).astype(int).tolist() if dt > 0
+                    else [0] * len(stretches))
   if stretch_rates is None:
     _rates = [float(joint_rate)] * len(stretches)
   else:
@@ -394,7 +406,7 @@ def build_trajectory(stretches, dt, joint_rate=DEFAULT_JOINT_RATE, ramp_dist=DEF
       q.append(goal)
       phase.append("dwell")
     fires.append((len(q) - 1, list(events)))                 # fire at rest, on the goal
-    for _ in range(n_dwell):                                 # let the new attach take hold
+    for _ in range(n_dwell + n_post_event[k]):               # attach/open command takes hold
       q.append(goal)
       phase.append("dwell")
   for _ in range(int(round(settle / dt)) if dt > 0 else 0):
@@ -629,7 +641,8 @@ def plan_schedule(stretches, arm_dims, acting, dt,
                   ramp_min=DEFAULT_RAMP_MIN, corner_dv=DEFAULT_CORNER_DV,
                   priority=None, collide=None, dwell=0.0, collide_ds=0.01,
                   settle=0.0, max_steps=None, stall_steps=None, rate_boost=False,
-                  event_durations=None, per_arm_rate=False, stretch_rates=None,
+                  event_durations=None, post_event_durations=None,
+                  per_arm_rate=False, stretch_rates=None,
                   locked=()):
   """PRIORITIZED, EVENT-DRIVEN retiming: arms desync so only the arm(s) ACTING at a
   barrier ramp to rest there; uninvolved arms CROSS the barrier without stopping.
@@ -665,6 +678,10 @@ def plan_schedule(stretches, arm_dims, acting, dt,
                 measured runtime correction.  Reserving it in the offline schedule lets
                 crossing arms use that time without a reactive re-timing loop.  A runtime
                 overrun may still hold at the event; it never changes this planned profile.
+    post_event_durations: optional seconds reserved AFTER each event in addition to `dwell`.
+                Like the ordinary post-fire dwell, this parks only the event's acting arms;
+                unrelated arms continue. It is used for physical commands such as opening a
+                gripper after ownership has changed.
     per_arm_rate: interpret `joint_rate` in each arm's OWN joint-space arc instead of in the
                 composite all-arm arc. A phase span on which an arm is physically stationary
                 is bookkeeping and is skipped immediately; a moving arm realizes approximately
@@ -823,6 +840,16 @@ def plan_schedule(stretches, arm_dims, acting, dt,
     if np.any(_event < 0.0):
       raise ValueError("event_durations must be non-negative")
     n_event = np.rint(_event / dt).astype(int) if dt > 0 else np.zeros(K, dtype=int)
+  if post_event_durations is None:
+    n_post_event = np.zeros(K, dtype=int)
+  else:
+    _post_event = np.asarray(post_event_durations, dtype=float).reshape(-1)
+    if len(_post_event) != K:
+      raise ValueError(f"post_event_durations has {len(_post_event)} entries for {K} events")
+    if np.any(_post_event < 0.0):
+      raise ValueError("post_event_durations must be non-negative")
+    n_post_event = (np.rint(_post_event / dt).astype(int) if dt > 0
+                    else np.zeros(K, dtype=int))
   eps = 1e-6
   import os as _os
   _trace = bool(_os.environ.get("RETIMING_TRACE"))
@@ -999,7 +1026,7 @@ def plan_schedule(stretches, arm_dims, acting, dt,
         if steps - ready_since >= n_dwell + n_event[fired]:
           fires.append((len(q) - 1, done_ids[fired]))        # event completes, at rest, in order
           for r in act[fired]:
-            hold_until[r] = steps + n_dwell                  # post-fire dwell: weld takes hold
+            hold_until[r] = steps + n_dwell + n_post_event[fired]  # weld/open takes hold
           fired += 1
           ready_since = None
           progressed = True
@@ -1337,7 +1364,7 @@ def batch_phase_motions(traj, path, arm_dims, fire_actors, bar_s, locked=(),
                         min_motion=0.08, max_gap=0.35, stopped_rate=0.05,
                         collision_free=None, peak_growth=1.02,
                         maximize_idle=False, intent_ramp_time=0.08,
-                        intent_rate=2.0):
+                        intent_rate=2.0, fixed_sample_intervals=()):
   """Merge short move-stop-move islands into a single smooth motion.
 
   This is a conservative final proposal after phase scheduling/smoothing.  Only adjacent
@@ -1393,6 +1420,10 @@ def batch_phase_motions(traj, path, arm_dims, fire_actors, bar_s, locked=(),
       protected_phase[r].append((float(lo), float(hi)))
       protected[:, r] |= ((progress[:, r] >= float(lo) - 1e-9)
                           & (progress[:, r] <= float(hi) + 1e-9))
+  for r, lo, hi in fixed_sample_intervals:
+    r, lo, hi = int(r), max(0, int(lo)), min(len(q) - 1, int(hi))
+    if 0 <= r < len(dims) and hi >= lo:
+      protected[lo:hi + 1, r] = True
 
   report = {"before": len(motion_islands(q, traj.dt, dims, stopped_rate)),
             "after": 0, "merged": 0, "collision_rejected": 0,
@@ -1598,7 +1629,8 @@ def foreign_switch_stops(q, dt, arm_dims, fires, fire_actors, stopped_rate=0.05,
 
 def intentional_phase_motions(traj, path, arm_dims, fire_actors, bar_s, locked=(),
                               stopped_rate=0.05, collision_free=None,
-                              intent_rate=1.5, ramp_time=0.15, stop_time=0.02):
+                              intent_rate=1.5, ramp_time=0.15, stop_time=0.02,
+                              fixed_sample_intervals=()):
   """Schedule one delayed continuous motion between each robot's OWN events.
 
   Foreign mode switches are not anchors: a burst may cross them with nonzero velocity provided
@@ -1663,6 +1695,10 @@ def intentional_phase_motions(traj, path, arm_dims, fire_actors, bar_s, locked=(
     for r in (int(i), int(j)):
       protected[:, r] |= ((progress[:, r] >= float(lo) - 1e-9)
                           & (progress[:, r] <= float(hi) + 1e-9))
+  for r, lo, hi in fixed_sample_intervals:
+    r, lo, hi = int(r), max(0, int(lo)), min(len(q) - 1, int(hi))
+    if 0 <= r < len(dims) and hi >= lo:
+      protected[lo:hi + 1, r] = True
 
   report = {"accepted": 0, "unresolved": [], "protected": 0, "funnel_protected": 0,
             "collision_rejected": 0, "event_rejected": 0, "rate_rejected": 0,
@@ -1874,6 +1910,7 @@ def intentional_phase_motions(traj, path, arm_dims, fire_actors, bar_s, locked=(
 def smooth_phase_trajectory(traj, path, arm_dims, fire_actors, window=0.12,
                             stop_time=0.02, iterations=3, locked=(),
                             restore_intervals=(), barrier_indices=(),
+                            event_stop_times=None,
                             ramp_dist=DEFAULT_RAMP_DIST,
                             corner_dv=DEFAULT_CORNER_DV):
   """Smooth per-arm PHASE RATES while preserving the geometric paths and event samples.
@@ -1995,6 +2032,22 @@ def smooth_phase_trajectory(traj, path, arm_dims, fire_actors, window=0.12,
     w[band] = u * u * (3.0 - 2.0 * u)                       # smoothstep 0 -> 1
     for r in actors:
       weights[:, int(r)] = np.minimum(weights[:, int(r)], w)
+
+  # Some physical events reserve an asymmetric actor-local plateau: close before attach,
+  # open after detach/transfer. These are semantic waits, not reactive stutters, and must not
+  # be rounded away by the Gaussian. ``fire_x`` indexes x (sample index + 1), while ``mids``
+  # indexes the increments that land on trajectory samples.
+  if event_stop_times is not None:
+    if len(event_stop_times) != len(traj.fires):
+      raise ValueError("event_stop_times must have one (pre, post) pair per fire")
+    for k, (centre, actors) in enumerate(
+        zip(fire_x, (set(a) for a in fire_actors))):
+      pre, post = (max(float(x), 0.0) for x in event_stop_times[k])
+      lo = float(centre) - pre / traj.dt
+      hi = float(centre) + post / traj.dt
+      hard = (mids >= lo - 1e-9) & (mids <= hi + 1e-9)
+      for r in actors:
+        weights[hard, int(r)] = 0.0
 
   # Preserve the scheduler's intentional crossing-corner slowdowns. ``d0[k]`` advances from
   # x[k] to x[k+1], so its midpoint phase tells us whether that increment lies inside the same

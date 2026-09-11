@@ -114,20 +114,6 @@ class ViserRecorder:
         for name in requested
         if name in available}
 
-  def snapshot_poses(self, C):
-    """Snapshot poses for geometry already registered by :meth:`record`.
-
-    Alternative optimizer keyframes reuse the selected step's meshes but may move both arms
-    and attached payloads.  Capturing from a cloned, stateful replay configuration preserves
-    those kinematics without adding the alternative as another timeline step.
-    """
-    available = set(C.getFrameNames())
-    return {
-        name: (np.asarray(C.getFrame(name).getPosition(), dtype=np.float32),
-               np.asarray(C.getFrame(name).getQuaternion(), dtype=np.float32))
-        for name in list(self.geometry) + list(self.markers) if name in available
-    }
-
   def overlay_alternatives(self, alternatives, count=4, opacity=0.18,
                            description="witness alternatives"):
     """Add alternative poses for the *same* recorded step as translucent ghost layers.

@@ -3377,8 +3377,9 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         f"(MuJoCo sliding/torsional/rolling={_contact_friction(scene.table_mu, table=True)}).")
   if animate_grippers:
     _n = sum(len(v) for v in scene._gripper_qadr.values())
-    _timing = ("with an execution barrier after each command" if wait_for_gripper else
-               "concurrent with arm motion")
+    _timing = (("with collision-certified robot-local phase waits"
+                if phase_schedule else "with a global execution barrier after each command")
+               if wait_for_gripper else "concurrent with arm motion")
     print(f"[sim/gripper] --animate-grippers ACTIVE: {_n} simulation-only articulated finger "
           f"hinge(s) with position actuators, object-dependent terminal apertures, "
           f"{gripper_motion_time:g}s smooth commands {_timing}. Planner/MP "
@@ -3856,6 +3857,20 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         "qpos": [], "mpos": [], "mquat": [], "forces": [], "marks": [],
         "controller_mode": [], "physics_tick": [], "gripper_events": []}
   report = SimReport()
+  # Task ids whose physical close command was issued during the phase scheduler's certified
+  # pre-fire reservation. ``fire`` must not issue or record those commands a second time.
+  _scheduled_preclose_tasks = set()
+  _scheduled_close_records = {}
+
+  def _record_gripper_event(kind, robot, part):
+    event = {
+        "event": kind, "robot": robot, "part": part,
+        "physics_tick": int(scene._phys), "time_s": float(scene._phys * DT),
+        "frame": int(len(rec["qpos"])) if rec is not None else 0,
+        "animated": bool(animate_grippers)}
+    if rec is not None:
+      rec["gripper_events"].append(event)
+    return event
 
   servo = None
   if skill_servo:
@@ -3953,16 +3968,32 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     _before_grasps = {r: g[1] for r, g in scene.active_grasps.items()}
     _incoming = (None if parent == "table" or parent in assembly.objects
                  else parent.split("_", 1)[0])
-    if rec is not None and _incoming is not None:
+    if task_id in _scheduled_preclose_tasks:
+      _event = _scheduled_close_records.get(task_id)
+      if _event is not None:
+        # Closing started earlier, but ownership begins only at this certified mode switch.
+        # Keeping both times prevents the open-loop attachment channel from claiming that a
+        # part was held while the fingers were still travelling toward it.
+        _event.update({
+            "attachment_physics_tick": int(scene._phys),
+            "attachment_time_s": float(scene._phys * DT),
+            "attachment_frame": int(len(rec["qpos"])) if rec is not None else 0})
+    if task_id in _scheduled_close_records:
+      # The hardware command started earlier, but ownership begins only at this certified
+      # mode switch. Preserve both instants in one event so open-loop attachment annotations
+      # do not pretend the object was already held while the fingers were still closing.
+      _ce = _scheduled_close_records[task_id]
+      _ce["attachment_physics_tick"] = int(scene._phys)
+      _ce["attachment_time_s"] = float(scene._phys * DT)
+      _ce["attachment_frame"] = int(len(rec["qpos"])) if rec is not None else 0
+    if _incoming is not None and task_id not in _scheduled_preclose_tasks:
       # Logical hardware event, independent of whether --animate-grippers adds simulation-only
       # finger joints.  It occurs at the same instant the grasp/transfer task fires.  Preserve
       # the exact physics time as well as the next recording-frame index: RECORD_EVERY may be
       # greater than one, so a frame index alone loses sub-frame event timing.
-      rec["gripper_events"].append({
-          "event": "close_start", "robot": _incoming, "part": child,
-          "physics_tick": int(scene._phys), "time_s": float(scene._phys * DT),
-          "frame": int(len(rec["qpos"])), "animated": bool(animate_grippers)})
-    if animate_grippers and _incoming is not None:
+      _record_gripper_event("close_start", _incoming, child)
+    if (animate_grippers and _incoming is not None
+        and task_id not in _scheduled_preclose_tasks):
       _closed = _command_gripper_targets(
           {_incoming: _closing_aperture(_incoming, child)})
       # For picks this finishes closure before the grasp weld is activated. For handovers it
@@ -3998,17 +4029,17 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     # from ordinary standard-profile recordings because it logged them inside the visual flag.
     _open = {r: 0.0 for r, p in _before_grasps.items()
              if p == child and r not in scene.active_grasps}
-    if rec is not None:
-      for _r in sorted(_open):
-        rec["gripper_events"].append({
-            "event": "open_start", "robot": _r, "part": child,
-            "physics_tick": int(scene._phys), "time_s": float(scene._phys * DT),
-            "frame": int(len(rec["qpos"])), "animated": bool(animate_grippers)})
+    for _r in sorted(_open):
+      _record_gripper_event("open_start", _r, child)
     if animate_grippers:
       _opened = _command_gripper_targets(_open)
       # Ownership has already transferred (or the part has been released), so a handover
       # cannot open both hands together: receiver-close completed above, then giver-open.
-      _wait_gripper_motion(_opened, "open")
+      # A phase schedule has already reserved this as a robot-local post-fire dwell. Its
+      # unrelated arms continue in the ordinary trajectory loop below; an imperative wait
+      # here would freeze the complete joint vector and undo the certified schedule.
+      if not phase_schedule:
+        _wait_gripper_motion(_opened, "open")
     # Every framed task is the physical side effect of its plan action. Usually that is the
     # final split task; --post-release deliberately appends a frame-less departure AFTER the
     # detach, so requiring `is-final` here would lose the release result entirely.
@@ -4376,6 +4407,41 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                 arms_set.add(robot_index[r])
       return arms_set
     acting = [acting_for(done) for _, done in stretches]
+
+    def _state_grasps(state):
+      """Physical (robot, directly-grasped-part) pairs in one symbolic state."""
+      return {(c[1], p) for p in assembly.objects
+              for c in state.supports.get(p, ())
+              if c[0] == "grasp" and c[1] in robot_index}
+
+    def _gripper_changes(done_ids):
+      """Two-finger close/open transitions completed by this task barrier.
+
+      State differences are used for opening because a handover's giver is not necessarily
+      named by the exported attach frame. Closing follows the attach parent, which is exactly
+      the gripper whose weld will be activated by ``fire``.
+      """
+      closes, opens = [], set()
+      for tid in done_ids:
+        task = problem.tasks[int(tid)]
+        frames = getattr(task, "frames", None) or ()
+        lbl = name_of.get(task.name)
+        if frames and frames[0] not in assembly.objects and frames[0] != "table":
+          robot = next((r for r in robots if str(frames[0]).startswith(r)), None)
+          if robot is not None and scene._gripper_qadr.get(robot):
+            closes.append((int(tid), robot, str(frames[1])))
+        # A pre/post GOTO shares the action's before/after states in ``name_of`` but has no
+        # attachment side effect. Charging its barrier for the action's eventual release
+        # invents an open command one task too early (real-bench pre-place task 17).
+        if lbl is None or not frames:
+          continue
+        before = _state_grasps(states[lbl[0]])
+        after = _state_grasps(states[min(lbl[0] + 1, len(states) - 1)])
+        opens.update(r for r, _part in before - after if scene._gripper_qadr.get(r))
+      # A split action can list several task markers at one barrier. Preserve the first task
+      # occurrence while removing duplicate physical commands.
+      closes = list({(r, p): (tid, r, p) for tid, r, p in closes}.values())
+      return closes, opens
     # COLLISION ORACLE: mr_bench's own is_collision_free (the check BiRRT certified the path
     # with), queried at DESYNCED configs against the mode in force after `fired` events --
     # attachments are a function of events fired, not arm positions, so mode_sequence[fired]
@@ -5095,10 +5161,21 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                   and _fr[1] in assembly.objects and servo.place_ok)
 
         _event_budget = []
+        _post_event_budget = []
+        _gripper_event_stops = []
         for _tids in (list(st[1]) for st in stretches):
           _b = phase_servo_time if (actuated and settle_tol > 0.0) else 0.0
           _b += phase_servo_time * sum(_seat_has_budget(_tid) for _tid in _tids)
+          _closes, _opens = _gripper_changes(_tids)
+          if wait_for_gripper and animate_grippers and _closes:
+            _b += gripper_motion_time
           _event_budget.append(_b)
+          _pre_grip = (gripper_motion_time
+                       if wait_for_gripper and animate_grippers and _closes else 0.0)
+          _post_grip = (gripper_motion_time
+                        if wait_for_gripper and animate_grippers and _opens else 0.0)
+          _post_event_budget.append(_post_grip)
+          _gripper_event_stops.append((_pre_grip, _post_grip))
 
         def _strict_collide(fq, fired):
           """Exact planner contract used both while scheduling and for final acceptance."""
@@ -5161,7 +5238,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         _strict_collide.seconds = 0.0
 
         print("[sim/mp] --phase-schedule ACTIVE: visual-quality coordination-space plan; "
-              f"preferred cruise {JOINT_RATE:g}rad/s, nominal servo reservations "
+              f"preferred cruise {JOINT_RATE:g}rad/s, nominal pre-fire reservations "
               f"{min(_event_budget or [0]):g}-{max(_event_budget or [0]):g}s, exact "
               f"{_ptol:g}m collision predicate on every accepted step. Makespan is not "
               "the objective; the synchronized reference is the certified fallback.")
@@ -5233,6 +5310,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                 # Effectively zero cells: candidates are exact; cache only identical states
                 # revisited by a CEGAR restart.
                 collide_ds=1e-9, dwell=dwell, event_durations=_event_budget,
+                post_event_durations=_post_event_budget,
                 per_arm_rate=True, stretch_rates=_stretch_rates,
                 locked=list(_locked) + list(_payload_locks))
           except RuntimeError as _e:
@@ -5263,6 +5341,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           traj = retiming.build_trajectory(
               _phase_stretches, DT, joint_rate=JOINT_RATE, ramp_dist=RAMP_DIST,
               ramp_min=RAMP_MIN, dwell=dwell, event_durations=_event_budget,
+              post_event_durations=_post_event_budget,
               stretch_rates=_stretch_rates)
           _bad_phase = _phase_audit(traj)
           if _bad_phase is not None:
@@ -5305,7 +5384,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
               _cand, _smooth_rep = retiming.smooth_phase_trajectory(
                   _raw_traj, _P, arm_dims, acting, window=phase_smooth_time,
                   locked=_smooth_locks, restore_intervals=_restore,
-                  barrier_indices=_bi, ramp_dist=RAMP_DIST,
+                  barrier_indices=_bi, event_stop_times=_gripper_event_stops,
+                  ramp_dist=RAMP_DIST,
                   corner_dv=retiming.DEFAULT_CORNER_DV)
               _bad_smooth = _phase_audit(_cand, collect=True)
               if not _bad_smooth:
@@ -5370,6 +5450,17 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           # local batching retains the scheduler couplings as before.
           _batch_locks = (list(_locked) if phase_intent else
                           list(_locked) + list(getattr(traj, "couplings", ())))
+          _gripper_fixed_samples = []
+          if wait_for_gripper and animate_grippers:
+            _gticks = max(1, int(np.ceil(gripper_motion_time / traj.dt)))
+            for _fi, _tids in traj.fires:
+              _closes, _opens = _gripper_changes(_tids)
+              _gripper_fixed_samples.extend(
+                  (robot_index[_r], max(0, int(_fi) - _gticks), int(_fi))
+                  for _tid, _r, _part in _closes)
+              _gripper_fixed_samples.extend(
+                  (robot_index[_r], int(_fi), min(len(traj.q) - 1, int(_fi) + _gticks))
+                  for _r in _opens)
 
           def _batch_free(_q, _sample):
             _bt0 = _time.perf_counter()
@@ -5402,7 +5493,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             _batch, _batch_rep = retiming.intentional_phase_motions(
                 traj, _P, arm_dims, acting, _bar, locked=_batch_locks,
                 stopped_rate=0.05 * JOINT_RATE, collision_free=_batch_free,
-                intent_rate=phase_intent_rate, ramp_time=phase_intent_ramp)
+                intent_rate=phase_intent_rate, ramp_time=phase_intent_ramp,
+                fixed_sample_intervals=_gripper_fixed_samples)
             # One Gauss-Seidel refinement removes robot-order bias. On the first pass a1 is
             # placed against a2's still-spread source trace; after a2 is compacted, a1 may be
             # able to shift later without reopening an all-robot gap. Equal-support edits are
@@ -5410,7 +5502,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             _refined, _ref_rep = retiming.intentional_phase_motions(
                 _batch, _P, arm_dims, acting, _bar, locked=_batch_locks,
                 stopped_rate=0.05 * JOINT_RATE, collision_free=_batch_free,
-                intent_rate=phase_intent_rate, ramp_time=phase_intent_ramp)
+                intent_rate=phase_intent_rate, ramp_time=phase_intent_ramp,
+                fixed_sample_intervals=_gripper_fixed_samples)
             if _ref_rep["accepted"]:
               _batch = _refined
               for _key in ("collision_rejected", "event_rejected", "rate_rejected",
@@ -5439,7 +5532,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             _batch, _batch_rep = retiming.batch_phase_motions(
                 traj, _P, arm_dims, acting, _bar, locked=_batch_locks,
                 min_motion=phase_batch_min_motion, max_gap=phase_batch_max_gap,
-                stopped_rate=0.05 * JOINT_RATE, collision_free=_batch_free)
+                stopped_rate=0.05 * JOINT_RATE, collision_free=_batch_free,
+                fixed_sample_intervals=_gripper_fixed_samples)
           _bad_batch = _phase_audit(_batch)
           _restored_batch_windows = set()
           # The planner predicate has internal state/caches, so retain the same final
@@ -5792,6 +5886,67 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     for idx, ev in traj.fires:
       fire_at.setdefault(int(idx), []).extend(int(t) for t in ev)
 
+  # A physical gripper wait belongs to the certified phase schedule, not to an imperative
+  # all-arm sleep in ``fire``. The scheduler has reserved the final ``gripper_motion_time``
+  # seconds before a close and the same interval after an open while parking only the event
+  # actors. Start closes at the beginning of that reservation; the attachment changes at the
+  # existing fire sample after the jaws have finished. Open commands start at the fire and
+  # complete during the reserved post-fire interval. Verify that later smoothing/batching did
+  # not consume either actor-local plateau.
+  _phase_close_at = {}
+  if (traj is not None and phase_schedule and wait_for_gripper and animate_grippers):
+    _grip_ticks = max(1, int(np.ceil(gripper_motion_time / DT)))
+    _scheduled_open_count = 0
+    for _fire_i, _tids in sorted(fire_at.items()):
+      _closes, _opens = _gripper_changes(_tids)
+      if _closes:
+        _start = max(0, int(_fire_i) - _grip_ticks)
+        for _tid, _robot, _child in _closes:
+          _ri = robot_index[_robot]
+          _dd = arm_dims[_ri]
+          _delta = float(np.max(np.abs(
+              np.asarray(traj.q[_start:int(_fire_i) + 1])[:, _dd]
+              - np.asarray(traj.q[_start])[_dd])))
+          if _delta > 1e-7:
+            raise RuntimeError(
+                f"[sim/gripper] phase close reservation for {_robot} before task {_tid} "
+                f"is not stationary (max joint change {_delta:g}); refusing to replace the "
+                "safe global barrier with an uncertified local wait")
+          _phase_close_at.setdefault(_start, []).append((_tid, _robot, _child))
+      for _robot in sorted(_opens):
+        _ri = robot_index[_robot]
+        _dd = arm_dims[_ri]
+        # The command occupies [fire, fire + duration). Motion may resume at the exact
+        # completion sample, so certify the half-open interval rather than demanding one
+        # gratuitous extra stationary control tick.
+        _end = min(len(traj.q), int(_fire_i) + _grip_ticks)
+        _delta = float(np.max(np.abs(
+            np.asarray(traj.q[int(_fire_i):_end])[:, _dd]
+            - np.asarray(traj.q[int(_fire_i)])[_dd])))
+        if _end - int(_fire_i) < _grip_ticks or _delta > 1e-7:
+          raise RuntimeError(
+              f"[sim/gripper] phase open reservation for {_robot} after sample {_fire_i} "
+              f"(tasks {_tids}, actors {sorted(acting_for(_tids))}) is incomplete or not "
+              f"stationary (max joint change {_delta:g}); refusing an "
+              "uncertified local wait")
+        _scheduled_open_count += 1
+    print(f"[sim/gripper] robot-local phase waits ACTIVE: "
+          f"{sum(len(v) for v in _phase_close_at.values())} close and "
+          f"{_scheduled_open_count} open command(s), {gripper_motion_time:g}s each; "
+          "only event participants park while unrelated arms continue. Reservations and "
+          "their complete multi-arm trajectory passed the phase collision audit.")
+
+  def _begin_phase_closes(sample):
+    for _tid, _robot, _child in _phase_close_at.get(int(sample), ()):
+      _lbl = name_of.get(problem.tasks[_tid].name)
+      scene.expect_state = states[min(_lbl[0] + 1, len(states) - 1)] if _lbl else None
+      _scheduled_close_records[_tid] = _record_gripper_event(
+          "close_start", _robot, _child)
+      _command_gripper_targets({_robot: _closing_aperture(_robot, _child)})
+      _scheduled_preclose_tasks.add(_tid)
+      if rec is not None:
+        _scheduled_close_records[_tid] = rec["gripper_events"][-1]
+
   if traj is None:
     # ---------------- ONLINE EXECUTION (--corridor-online) ----------------
     # The stepper advances per-arm arc clocks with the exact offline rules (conservative
@@ -6092,6 +6247,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
 
     i, _NQ = 0, len(traj.q)
     while i < _NQ:
+      _begin_phase_closes(i)
       qc = traj.q[i]
       if servo is not None:
         servo.update()
@@ -6927,6 +7083,7 @@ def _cli_run(a):
       "animate_grippers": bool(a.animate_grippers),
       "gripper_motion_time": float(a.gripper_motion_time),
       "wait_for_gripper": bool(a.wait_for_gripper),
+      "phase_schedule": bool(a.phase_schedule),
       "table_mu": _saved(cfg, "table_mu", legacy=None),
       "resolved_profile": {k: getattr(a, k) for k in _STANDARD_SIM_PROFILE},
   }
@@ -7540,7 +7697,9 @@ def _build_cli():
                  help="Smooth close/open duration for --animate-grippers (default 0.25s).")
   r.add_argument("--wait-for-gripper", action=argparse.BooleanOptionalAction, default=False,
                  help="With --animate-grippers, make each physical finger command an execution "
-                      "barrier: hold the arm reference until closing/opening finishes. Picks "
+                      "barrier: hold the participating arm until closing/opening finishes. "
+                      "With --phase-schedule this is a collision-certified robot-local dwell "
+                      "and unrelated arms continue; legacy schedules hold all arms. Picks "
                       "close before grasp activation, releases open before departure, and "
                       "handovers are receiver-close -> transfer -> giver-open. OFF preserves "
                       "the historical overlap with subsequent arm motion.")

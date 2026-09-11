@@ -2,7 +2,7 @@ import pytest
 
 from open_witness import OpenWitnessPool, run_open_lazy_fill
 import solver as solver_mod
-from solver import RobotIK, _IncrementalLazySearch
+from solver import RobotIK, _IncrementalLazySearch, _deterministic_ik_seed
 
 
 class _State:
@@ -14,6 +14,27 @@ class _State:
 
   def __eq__(self, other):
     return isinstance(other, _State) and self.name == other.name
+
+
+def test_physical_query_seed_is_container_order_independent():
+  key_a = ("assemble", {"parts": frozenset(("obj_2", "obj_1")),
+                         "poses": [0.0, -0.0, 0.25]})
+  key_b = ("assemble", {"poses": [0.0, -0.0, 0.25],
+                         "parts": frozenset(("obj_1", "obj_2"))})
+  assert _deterministic_ik_seed(11023, key_a, 0) \
+      == _deterministic_ik_seed(11023, key_b, 0)
+
+
+def test_physical_query_seed_partitions_root_query_and_effort():
+  key = ("pick", "a1", "obj_6", 20, ("table-scene",))
+  seeds = {
+      _deterministic_ik_seed(11023, key, 0),
+      _deterministic_ik_seed(11024, key, 0),
+      _deterministic_ik_seed(11023, key + ("other",), 0),
+      _deterministic_ik_seed(11023, key, 1),
+  }
+  assert len(seeds) == 4
+  assert all(1 <= seed <= 2_147_483_646 for seed in seeds)
 
 
 def test_incremental_search_pop_observer_sees_the_real_claim_order():
@@ -407,12 +428,122 @@ def test_lns_uses_weight_one_cleanup_then_weighted_wider_windows(monkeypatch, ca
   assert plan == [a1, a2]
   assert [weight for _deadline, weight in calls] == [
       float("inf"), 1.0, float("inf"), 1.0, float("inf"), 1.0]
-  assert all(calls[j][0] < calls[j + 1][0] for j in (0, 2, 4))
-  assert calls[-1][0] <= end
+  # Both passes share the run's global wall deadline; reproducible node budgets, rather
+  # than six-second per-window slices, bound each consultation.
+  assert all(calls[j][0] == calls[j + 1][0] == end for j in (0, 2, 4))
   out = capsys.readouterr().out
   assert out.count("[lns-window]") == 6
   assert "pass=greedy w=inf" in out and "pass=exact w=1" in out
   assert "expanded=7" in out and "peak-open=11" in out and "IK=2(1f)" in out
+
+
+def test_lns_visits_largest_admissible_gap_first_at_each_window_size(monkeypatch, capsys):
+  class State(_State):
+    def __init__(self, name, mated):
+      super().__init__(name)
+      self.mated = frozenset(mated)
+
+    def subassemblies(self):
+      main = frozenset({"obj_0"}) | self.mated
+      return ((main,) if "obj_2" in self.mated else
+              (main, frozenset({"obj_2"})))
+
+  s0 = State("s0", ())
+  s1 = State("s1", ("obj_1",))
+  s1a = State("s1a", ("obj_1",))
+  s1b = State("s1b", ("obj_1",))
+  s2 = State("s2", ("obj_1", "obj_2"))
+  a1 = ("assemble", "a1", "obj_1", "obj_0")
+  h1 = ("handover", "a2", "obj_2", 1)
+  h2 = ("handover", "a1", "obj_2", 2)
+  a2 = ("assemble", "a1", "obj_2", "obj_0")
+  graph = {s0: [(a1, s1)], s1: [(h1, s1a)], s1a: [(h2, s1b)],
+           s1b: [(a2, s2)], s2: []}
+
+  class Assembly:
+    base = "obj_0"
+    objects = ("obj_0", "obj_1", "obj_2")
+
+  class H:
+    def value(self, _state):
+      return 0.0
+
+  monkeypatch.setattr(solver_mod, "get_initial_state", lambda *_args: s0)
+  monkeypatch.setattr(
+      solver_mod, "successors", lambda state, *_args, **_kwargs: graph[state])
+  monkeypatch.setattr(
+      solver_mod, "_part_mated",
+      lambda state, part: part == "obj_0" or part in state.mated)
+  monkeypatch.setattr(solver_mod, "_make_lns_endpoint_pdb", lambda *_args: None)
+  monkeypatch.setattr(solver_mod, "_release_fill_scratch", lambda *_args, **_kwargs: None)
+  starts = []
+
+  def fake_refill(*args, **kwargs):
+    starts.append(args[0].name)
+    kwargs["stats"].update(outcome="exhausted", wall=0.0)
+    return None
+
+  monkeypatch.setattr(solver_mod, "_refill_window", fake_refill)
+  plan = solver_mod._lns_improve(
+      [a1, h1, h2, a2], object(), Assembly(), ("a1", "a2"), object(), object(),
+      None, weight=5.0, max_nodes=20000, verbose=True, h_lab=H(), k_max=1)
+
+  assert plan == [a1, h1, h2, a2]
+  # The second segment costs 5 versus the first segment's 1. Both have lower bound zero,
+  # hence both greedy/exact consultations for the second segment precede the first.
+  assert starts == ["s1", "s1", "s0", "s0"]
+  out = capsys.readouterr().out
+  assert ("consultation=1 pending=1 k=1 parts[1:2] ('obj_2',) "
+          "bound=5 landmark-lb=0 gap=5 nodes=512") in out
+
+
+def test_lns_reopens_a_node_capped_window_with_geometric_effort(monkeypatch, capsys):
+  class State(_State):
+    def __init__(self, name, done=False):
+      super().__init__(name)
+      self.done = done
+
+    def subassemblies(self):
+      return ((frozenset({"obj_0", "obj_1"}),) if self.done else
+              (frozenset({"obj_0"}), frozenset({"obj_1"})))
+
+  s0, s1 = State("s0"), State("s1", True)
+  action = ("assemble", "a1", "obj_1", "obj_0")
+
+  class Assembly:
+    base = "obj_0"
+    objects = ("obj_0", "obj_1")
+
+  class H:
+    def value(self, _state):
+      return 0.0
+
+  monkeypatch.setattr(solver_mod, "get_initial_state", lambda *_args: s0)
+  monkeypatch.setattr(
+      solver_mod, "successors",
+      lambda state, *_args, **_kwargs: [(action, s1)] if state is s0 else [])
+  monkeypatch.setattr(
+      solver_mod, "_part_mated",
+      lambda state, part: part == "obj_0" or state.done)
+  monkeypatch.setattr(solver_mod, "_release_fill_scratch", lambda *_args, **_kwargs: None)
+  calls = []
+
+  def fake_refill(*args, **kwargs):
+    calls.append((args[8], args[9]))
+    # First greedy/exact consultation reaches its cap. The reopened consultation then
+    # exhausts, which closes the window without another retry.
+    kwargs["stats"].update(outcome="budget" if len(calls) <= 2 else "exhausted", wall=0.0)
+    return None
+
+  monkeypatch.setattr(solver_mod, "_refill_window", fake_refill)
+  out = solver_mod._lns_improve(
+      [action], object(), Assembly(), ("a1",), object(), object(), None,
+      weight=5.0, max_nodes=2048, verbose=True, h_lab=H(), k_max=1)
+
+  assert out == [action]
+  assert calls == [(float("inf"), 512), (1.0, 512),
+                   (float("inf"), 1024), (1.0, 1024)]
+  assert "reopen k=1 parts[0:1] ('obj_1',) nodes=512->1024" in capsys.readouterr().out
 
 
 def test_lns_endpoint_pdb_bound_skips_only_exact_splice_window(monkeypatch, capsys):
@@ -525,6 +656,47 @@ def test_lns_greedy_incumbent_tightens_the_weight_one_bound(monkeypatch):
 
   assert out == []
   assert calls == [(float("inf"), solver_mod.action_cost(assemble)), (1.0, 0)]
+
+
+def test_lns_memory_exhaustion_preserves_the_validated_incumbent(monkeypatch):
+  class State(_State):
+    def key(self):
+      return self.name
+
+    def subassemblies(self):
+      return (("obj_0",), ("obj_1",)) if self.name == "s0" else (("obj_0", "obj_1"),)
+
+  s0, s1 = State("s0"), State("s1")
+  assemble = ("assemble", "a1", "obj_1", "obj_0")
+
+  class Assembly:
+    base = "obj_0"
+    objects = ("obj_0", "obj_1")
+
+  class H:
+    def value(self, _state):
+      return 0.0
+
+  monkeypatch.setattr(solver_mod, "get_initial_state", lambda *_args: s0)
+  monkeypatch.setattr(
+      solver_mod, "successors",
+      lambda state, *_args, **_kwargs: [(assemble, s1)] if state is s0 else [])
+  monkeypatch.setattr(
+      solver_mod, "_part_mated",
+      lambda state, part: part == "obj_0" or state is s1)
+  monkeypatch.setattr(
+      solver_mod, "_refill_window",
+      lambda *_args, **_kwargs: (_ for _ in ()).throw(MemoryError()))
+  # In particular, the emergency path must not call the allocating RSS/scratch reporter.
+  monkeypatch.setattr(
+      solver_mod, "_release_fill_scratch",
+      lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("unsafe cleanup")))
+
+  out = solver_mod._lns_improve(
+      [assemble], object(), Assembly(), ("a1",), object(), object(), None,
+      weight=5.0, max_nodes=20000, verbose=False, h_lab=H())
+
+  assert out == [assemble]
 
 
 def test_open_scheduler_replans_immediately_after_first_failed_plan_edge():

@@ -494,6 +494,23 @@ def test_schedule_nominal_event_duration_is_feed_forward_slack():
   assert np.ptp(timed.q[j0 - round(budget / DT):j0 + 1, 1]) > 0.01
 
 
+def test_schedule_post_event_duration_holds_only_actor():
+  stretches, arm_dims, acting = _two_arm_stretches()
+  budget = 0.05
+  base = retiming.plan_schedule(
+      stretches, arm_dims, acting, DT, RATE, RD, RM, dwell=0.0,
+      event_durations=[0.0, 0.0], post_event_durations=[0.0, 0.0])
+  timed = retiming.plan_schedule(
+      stretches, arm_dims, acting, DT, RATE, RD, RM, dwell=0.0,
+      event_durations=[0.0, 0.0], post_event_durations=[budget, 0.0])
+  fire = timed.fires[0][0]
+  w = int(round(budget / DT))
+  # Opening after the event parks its actor, but a foreign arm consumes useful path.
+  assert np.ptp(timed.q[fire:fire + w + 1, 0]) < 1e-9
+  assert np.ptp(timed.q[fire:fire + w + 1, 1]) > 0.01
+  assert len(timed.q) >= len(base.q)
+
+
 def test_upsample_trajectory_preserves_duration_events_and_endpoints():
   src = retiming.TimedTrajectory(
       dt=0.01, q=np.asarray([[1.0, 2.0], [2.0, 4.0]]),
@@ -564,6 +581,22 @@ def test_phase_smoothing_is_monotone_pins_events_and_reduces_jerk():
   # The actor has an actual rest neighbourhood, while the crossing arm is not forced to stop.
   assert np.max(np.diff(out.progress[197:204, 0], axis=0)) < 1e-10
   assert np.max(np.diff(out.progress[194:207, 1], axis=0)) > 1e-5
+
+
+def test_phase_smoothing_preserves_asymmetric_physical_event_waits():
+  stretches, arm_dims, acting = _two_arm_stretches()
+  wait = 0.05
+  raw = retiming.plan_schedule(
+      stretches, arm_dims, acting, DT, RATE, RD, RM, dwell=0.0,
+      event_durations=[wait, 0.0], post_event_durations=[wait, 0.0])
+  path, _ = retiming._composite(stretches)
+  smooth, _ = retiming.smooth_phase_trajectory(
+      raw, path, arm_dims, acting, window=0.04,
+      event_stop_times=[(wait, wait), (0.0, 0.0)])
+  fire = smooth.fires[0][0]
+  w = int(round(wait / DT))
+  assert np.ptp(smooth.q[fire - w:fire + w + 1, 0]) < 1e-9
+  assert np.ptp(smooth.q[fire - w:fire + w + 1, 1]) > 0.01
 
 
 def test_smoothness_quality_guard_rejects_material_regression():

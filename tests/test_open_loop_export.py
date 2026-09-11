@@ -168,3 +168,36 @@ def test_zero_grasp_wait_is_rejected_for_a_handover(tmp_path):
   np.savez_compressed(source, **payload)
   with pytest.raises(ValueError, match="handover requires positive --grasp-wait"):
     E.export_recording(source, destination, sample_dt=0.05, grasp_wait=0.0)
+
+
+def test_json_auto_preserves_source_robot_local_wait_without_global_time_warp(tmp_path):
+  source, destination = tmp_path / "recording.npz", tmp_path / "plan.json"
+  _recording(source)
+  with np.load(source, allow_pickle=False) as z:
+    payload = {name: z[name] for name in z.files}
+  payload["metadata"] = np.asarray(json.dumps({
+      "dt": 0.1, "record_every": 1, "wait_for_gripper": True,
+      "phase_schedule": True, "gripper_motion_time": 0.1}))
+  payload["gripper_events"] = np.asarray(json.dumps([
+      {"event": "close_start", "robot": "a2", "part": "obj_1",
+       "physics_tick": 2, "attachment_physics_tick": 3},
+      {"event": "open_start", "robot": "a1", "part": "obj_0",
+       "physics_tick": 4},
+  ]))
+  np.savez_compressed(source, **payload)
+
+  E.export_recording(source, destination, sample_dt=0.05)
+  result = json.loads(destination.read_text())
+  samples = result["samples"]
+  assert result["grasp_wait_mode"] == "preserve"
+  assert result["grasp_wait"] == 0.1
+  assert len(samples) == 7                                  # source 0.3s, no extra global dwell
+  assert any(row["closing_gripper"] == ["a2"] for row in samples)
+  # a1 changes while a2 closes: preserving the certified source timing must not freeze it.
+  closing = [row for row in samples if row["closing_gripper"]]
+  assert np.ptp([row["q"][0] for row in closing]) > 0.0
+  # Ownership begins at the recorded attachment time, not at close command start.
+  assert next(row for row in samples if row["time"] == pytest.approx(0.1))[
+      "attached_objects"]["a2"] is None
+  assert next(row for row in samples if row["time"] == pytest.approx(0.2))[
+      "attached_objects"]["a2"] == "obj_1"

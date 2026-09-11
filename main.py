@@ -114,10 +114,10 @@ _STANDARD_SEARCH_PROFILE = {
     # compact K prefix from accidentally containing no initial acquisition for a part merely
     # because conventional rows happened to occupy it. Exact state gates stay authoritative.
     "grasp_sampler": True,
-    # Paper/system baseline: expose one fixed finite singleton-grasp alphabet to every
-    # assembly. This removes model-dependent K-prefix restarts from the algorithm being
-    # compared; the former K=20 -> 96 schedule remains available through explicit flags.
-    "grasp_sampler_keep": 64,
+    # Keep ordinary scenes cheap. A failed complete fill monotonically exposes more of the
+    # immutable master database, so K=20 is an initial alphabet rather than a pruning decision.
+    # Imported CAD scenes can opt into the dense fixed alphabet through `fabrica`.
+    "grasp_sampler_keep": 20,
     "grasp_sampler_candidates": 96,
     "grasp_sampler_scenes": True,
     # Multi-part components inherit candidate contacts from all constituent parts. Build
@@ -138,7 +138,7 @@ _STANDARD_SEARCH_PROFILE = {
     # obj_2 exhausted 6280 effort slots; the full DB solved the same fill in 13 slots/0.8s.
     # The optional staged policy remains available as --grasp-refine for ablation/anytime use.
     "grasp_refine": False,
-    "grasp_widen": False,
+    "grasp_widen": True,
     "grasp_widen_batch": 8,
     "grasp_widen_max": 96,
     # A standard search is a batch artifact-producing run.  Both remain explicitly
@@ -149,6 +149,13 @@ _STANDARD_SEARCH_PROFILE = {
 
 _SEARCH_PROFILES = {
     "standard": dict(_STANDARD_SEARCH_PROFILE),
+    # Imported CAD models need denser contact coverage. Keep that expense out of ordinary
+    # scenes and make the different finite action alphabet explicit in saved provenance.
+    "fabrica": {
+        **_STANDARD_SEARCH_PROFILE,
+        "grasp_sampler_keep": 64,
+        "grasp_widen": False,
+    },
     # Compatibility alias: open-witness scheduling is now part of standard. Keep historical
     # commands reproducible at the profile-name level rather than deleting the public spelling.
     "open": dict(_STANDARD_SEARCH_PROFILE),
@@ -250,7 +257,8 @@ def build_parser():
       "--search-profile", choices=tuple(_SEARCH_PROFILES), default=None, metavar="NAME",
       help="Named fresh-search defaults: standard = robust 5mm witness contract + greedy "
            "structural milestone fills with a uniform local PDB + non-pruning useful-grasp "
-           "guidance + bounded fair open witnesses; "
+           "guidance + bounded fair open witnesses; fabrica = standard with a fixed dense "
+           "64-grasp alphabet for imported CAD models; "
            "open = compatibility alias for standard; fast-open = standard plus "
            "--analytic-seed-cap 3 (aggressive/experimental). A profile "
            "is opt-in. Precedence is explicit flag > profile > --config file > built-ins, and "
@@ -980,6 +988,23 @@ def build_parser():
            "once, caches warm). Same completeness and plan validity as the exact search; "
            "wins when most eagerly-checked edges never end up in a plan.",
   )
+  g_solver.add_argument(
+      "--full-backward", action="store_true",
+      help="Exact reference solver over the FULL concrete symbolic State (robot ids, raw "
+           "grasp ids, support contacts, placements, and parent tree are retained). It "
+           "materializes the cheap-feasible reachable graph, then runs multi-source reverse "
+           "Dijkstra from every goal. Failed real-IK edges are removed and the reverse solve "
+           "is repeated. This is deliberately distinct from the projected backward PDB.",
+  )
+  g_solver.add_argument(
+      "--full-backward-max-states", type=int, default=200000, metavar="N",
+      help="Hard state guard for --full-backward (default 200000). The solver fails loudly "
+           "at the guard and never falls back to a projected or forward search.",
+  )
+  g_solver.add_argument(
+      "--full-backward-max-edges", type=int, default=2000000, metavar="N",
+      help="Hard stored-edge guard for --full-backward (default 2000000).",
+  )
   g_phys.add_argument(
       "--brace-for-assembly-only", action="store_true",
       help="EXPERIMENTAL (MEASURED HARMFUL, off by default): assume a brace (2nd grasp via "
@@ -1317,6 +1342,13 @@ def build_parser():
            "The default is the full incumbent horizon. This is independent of "
            "--fill-window, which controls joint-fill recovery while finding the initial "
            "milestone plan.",
+  )
+  g_search.add_argument(
+      "--lns-grasp-transition-h", action="store_true",
+      help="Experimental --milestones-anytime heuristic: in each loose part's grasp graph, "
+           "retain a handover edge only if two available floating grippers can coexist at "
+           "concrete representatives of its grasp classes. Forward search and named profiles "
+           "are unchanged.",
   )
   g_search.add_argument(
       "--milestone-oracle", choices=("global", "chain", "structural"), default="global",
@@ -2248,7 +2280,14 @@ def build_parser():
   )
   g_scene.add_argument(
       "--seed", type=int, default=0,
-      help="RNG seed for numpy + rai (KOMO IK), for reproducible runs. Default: 0.",
+      help="Root RNG seed for the scene and search. It also seeds query-local KOMO IK unless "
+           "--ik-seed is given. Default: 0.",
+  )
+  g_scene.add_argument(
+      "--ik-seed", type=int, default=None,
+      help="Optional independent root for deterministic per-physical-query KOMO restart "
+           "streams. This permits IK robustness sweeps without changing the scene, grasp "
+           "database, or discrete search seed. Default: use --seed.",
   )
   g_output.add_argument(
       "--load-plan", metavar="FILE", default=None,
@@ -2335,7 +2374,7 @@ def parse_args(argv=None):
 # fields persisted by --save so replay.py can reconstruct the EXACT scene (see plan_io.py).
 _SAVE_CONFIG_FIELDS = (
     "assembly", "parts", "num_robots", "vacuum", "floating_ee", "robot", "robot_types",
-    "scatter_spacing", "center_scatter", "layout_json", "perturb_start_pose", "seed", "wrench",
+    "scatter_spacing", "center_scatter", "layout_json", "perturb_start_pose", "seed", "ik_seed", "wrench",
     "wrench_profile", "grasp_model", "insert_force",
     "curved_torque_scale", "insertion_noise", "insertion_offset", "inserter_check", "real_ik",
     "bracing", "robust_mode", "dense_grasps", "random_init", "part_float", "inhand_reorient",
@@ -2421,13 +2460,15 @@ _SAVE_CONFIG_FIELDS = (
     # `--config PLAN.json --solve` must also reproduce the search that selected it. Persist the
     # resolved values rather than only a named-profile label: profiles may evolve, whereas a
     # paper artifact must keep the semantics it was actually solved under.
-    "weight", "milestones", "milestones_anytime", "goal_on_table", "milestone_oracle",
+    "weight", "milestones", "milestones_anytime", "full_backward",
+    "full_backward_max_states", "full_backward_max_edges", "goal_on_table",
+    "milestone_oracle",
     "fill_local_h", "fill_target_support_quotient", "fill_exact",
     "fill_greedy", "fill_incumbent_first",
     "fill_policy_first", "fill_policy_guide", "fill_skeleton_first",
     "fill_action_widening", "milestone_boundaries",
     "fill_scope_widening", "fill_touch_all", "placement_yaw_widening",
-    "fill_window", "lns_window", "lazy_fills", "open_witness", "open_witness_batch",
+    "fill_window", "lns_window", "lns_grasp_transition_h", "lazy_fills", "open_witness", "open_witness_batch",
     "open_witness_epochs", "lazy_edge_selector", "analytic_seed_cap", "ssik_seed_neighborhood",
     "ssik_neighborhood_cap", "fail_order", "empty_seed_refutes",
     "ik_positive_reuse", "assemble_ssik_pose_seeds", "assemble_ssik_pose_projection",
@@ -2476,7 +2517,7 @@ _WITNESS_FIELDS = (
     "assemble_race_probe_evals", "assemble_race_promote", "handover_basin_racing",
     "handover_race_probe_evals", "handover_race_starts", "handover_race_promote",
     "ssik_seed_neighborhood", "ssik_neighborhood_cap",
-    "seed", "bracing", "handovers", "allow_place", "mate_symmetry",
+    "seed", "ik_seed", "bracing", "handovers", "allow_place", "mate_symmetry",
     "tight_fingers", "openarm_real_finger_radius_scale", "part_float", "witness_margin",
     "witness_joint_margin", "object_over_table", "object_over_table_margin", "witness_draw",
     "witness_sets", "witness_set_spread", "pre_insertion", "skill_funnel_collision_res",
@@ -2545,6 +2586,8 @@ def _selected_solver_engine(cfg):
     return "milestones-anytime"
   if cfg.bounded or cfg.dfbnb:
     return "bounded"
+  if cfg.full_backward:
+    return "full-backward"
   if cfg.lazy:
     return "lazy"
   if cfg.optimistic:
@@ -2563,19 +2606,33 @@ def _validate_solver_scoped_flags(cfg):
   would make an experiment look configured while doing nothing.
   """
   engine = _selected_solver_engine(cfg)
+  if cfg.full_backward_max_states < 1:
+    raise SystemExit("--full-backward-max-states must be >= 1")
+  if cfg.full_backward_max_edges < 1:
+    raise SystemExit("--full-backward-max-edges must be >= 1")
+  if cfg.full_backward and (cfg.canonical or cfg.anon_robots or cfg.dominance or cfg.por):
+    raise SystemExit("--full-backward retains the full labeled State; disable "
+                     "--canonical, --anon-robots, --dominance, and --por")
   if cfg.lns_window is not None:
     if engine != "milestones-anytime":
       raise SystemExit("--lns-window requires --milestones-anytime; "
                        f"selected engine is {engine}")
     if cfg.lns_window < 1:
       raise SystemExit("--lns-window must be >= 1 (omit it for the full horizon)")
+  if cfg.lns_grasp_transition_h:
+    if engine != "milestones-anytime":
+      raise SystemExit("--lns-grasp-transition-h requires --milestones-anytime; "
+                       f"selected engine is {engine}")
+    if not cfg.sig_collapsed_h:
+      raise SystemExit("--lns-grasp-transition-h currently requires --sig-collapsed-h")
   if cfg.grasp_local_widen and engine != "milestones":
     raise SystemExit("--grasp-local-widen requires the ordinary --milestones solver; "
                      f"selected engine is {engine}")
-  if cfg.placement_yaw_widening and engine not in ("milestones", "milestones-anytime"):
+  if cfg.placement_yaw_widening and engine not in (
+      "milestones", "milestones-anytime", "full-backward"):
     raise SystemExit("--placement-yaw-widening is currently scheduled only by milestone "
                      f"solvers; selected engine is {engine}")
-  if cfg.fill_greedy:
+  if cfg.fill_greedy and engine != "full-backward":
     if engine not in ("milestones", "milestones-anytime"):
       raise SystemExit("--fill-greedy is implemented only by milestone local fills; "
                        f"selected engine is {engine}")
@@ -2650,6 +2707,7 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         collapsed_h=cfg.collapsed_h, grasp_collapsed_h=cfg.grasp_collapsed_h,
         fill_window=cfg.fill_window, milestone_oracle=cfg.milestone_oracle,
         lns_window=cfg.lns_window,
+        lns_grasp_transition_h=cfg.lns_grasp_transition_h,
         fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
         fill_target_support_quotient=cfg.fill_target_support_quotient,
         fill_greedy=cfg.fill_greedy,
@@ -2672,6 +2730,13 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         sig_collapsed_h=cfg.sig_collapsed_h, beam_width=cfg.beam,
         dfbnb=cfg.dfbnb, pea=cfg.pea, pathmax=cfg.pathmax,
         corridor_h=cfg.corridor_h)
+  elif cfg.full_backward:
+    plan = solve_assembly_problem_full_backward(
+        C, assembly, robots=robots, robot_ik=robot_ik,
+        wrench=cfg.wrench, handovers=cfg.handovers,
+        allow_place=cfg.allow_place, bracing=cfg.bracing,
+        max_states=cfg.full_backward_max_states,
+        max_edges=cfg.full_backward_max_edges)
   elif cfg.lazy:
     plan = solve_assembly_problem_lazy(
         C, assembly, robots=robots, weight=cfg.weight, robot_ik=robot_ik,
@@ -3689,6 +3754,9 @@ def run(cfg, explicit=None):
           f"{cfg.lns_window if cfg.lns_window is not None else 'full horizon'} LNS; "
           "each window greedy -> bounded w=1; "
           "PEA-greedy feasibility net only if the incumbent phase is cut).")
+  if cfg.lns_grasp_transition_h:
+    print("[flag] --lns-grasp-transition-h ACTIVE: LNS reverse loose-grasp handover edges "
+          "require isolated floating-gripper coexistence (experimental; profiles unchanged).")
   if cfg.corridor_h:
     print("[flag] --corridor-h ACTIVE: phase-2 heuristic built only up to the incumbent "
           "bound (misses prune); requires --bounded.")
@@ -3995,6 +4063,10 @@ def run(cfg, explicit=None):
             f"from {cfg.diagnose_plan_rank}; diagnostic queues run without IK and do not "
             "alter the ordinary search.")
     if robot_ik is not None:
+      robot_ik.seed_root = int(cfg.seed if cfg.ik_seed is None else cfg.ik_seed)
+      print(f"[ik-seed] deterministic physical-query streams use root "
+            f"{robot_ik.seed_root} ({'--seed' if cfg.ik_seed is None else '--ik-seed'}); "
+            "open-witness effort tiers receive disjoint derived streams.")
       robot_ik.closure_check = bool(cfg.grasp_closure_check)
       robot_ik.restarts_full = cfg.ik_restarts
       robot_ik.restarts_precheck = cfg.precheck_restarts
