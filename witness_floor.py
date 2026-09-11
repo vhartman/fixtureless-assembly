@@ -568,6 +568,32 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
     if verbose and wit_alts:
       print(f"[witsets] --witness-sets {_K}: {len(wit_alts)} step(s) carry witness sets")
 
+  # Diagnostic provenance: persist the ACTUAL per-step ladder that the clearance-floor
+  # optimizer compared. This is intentionally not ``wit_alts``: those are newly generated,
+  # same-pose IK branches intended as interchangeable motion-planning goals. A ladder member
+  # may instead be a genuinely different feasible task keyframe. Emit every candidate on the
+  # same bind-witness base used by the optimizer, with the selected member first. Keeping the
+  # complete (normally small) pool avoids inventing a display-time ranking or rerunning IK.
+  optimization_candidates = {}
+  for i in steps:
+    if wit[i] is None:
+      continue
+    members = [np.asarray(wit[i], dtype=float).copy()]
+    b = bind_wit.get(i)
+    if b is None:
+      continue
+    for c in cand[i]:
+      q = b.copy()
+      for n, v in c.items():
+        q[name_idx[n]] = v
+      members.append(q)
+    unique = []
+    for q in members:
+      if not any(np.allclose(q, old, atol=1e-9, rtol=0.0) for old in unique):
+        unique.append(q)
+    if len(unique) >= 2:
+      optimization_candidates[i] = unique
+
   robot_ik.strip_inactive_collision = _strip0
   robot_ik.harvest_all_branches = _harvest0
   rep = {"alpha": best_a, "cost": cost, "crossings": crossings,
@@ -576,6 +602,7 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
          "seconds": time.perf_counter() - t0}
   if witness_sets and int(witness_sets) >= 2:
     rep["wit_alts"] = wit_alts
+  rep["optimization_candidates"] = optimization_candidates
   if verbose:
     print(f"[witfloor] alpha={best_a:.2f}: {crossings} branch crossings "
           f"(={ref} with NO floor, so the clearance is free), {rep['candidates']} candidates "

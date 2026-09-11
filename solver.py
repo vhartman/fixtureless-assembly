@@ -5292,6 +5292,7 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
   witness is kept whenever the pulled re-solve fails or is costlier. Sequential sweeps
   (greedy in time -- v2 joint KOMO later). Returns (witnesses, report): witnesses[i] is
   the witness for plan[i] (None for non-IK actions), report = before/after totals."""
+  import math
   import time
   t0 = time.perf_counter()
   # robot_collisions=True: keep the OTHER robots' collision geometry ON while re-solving each
@@ -5487,6 +5488,15 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
         wit[ks[j]] = cands[ks[j]][sel]
         sel = bp_all[j][sel]
     after = total(wit)
+    optimization_candidates = {}
+    for i, pool in cands.items():
+      members = [np.asarray(wit[i], dtype=float).copy()]
+      for q in pool:
+        q = np.asarray(q, dtype=float)
+        if not any(np.allclose(q, old, atol=1e-9, rtol=0.0) for old in members):
+          members.append(q.copy())
+      if len(members) >= 2:
+        optimization_candidates[i] = members
     if verbose:
       tail = ""
       if clear_weight > 0:
@@ -5498,7 +5508,8 @@ def optimize_witnesses(C, assembly, plan, robots, robot_ik, cost="joint",
             f"{sum(1 for w in wit if w is not None)} steps){tail} "
             f"in {time.perf_counter() - t0:.1f}s")
     robot_ik.strip_inactive_collision = _strip0
-    return wit, {"before": before, "after": after, "improved": -1, "fallback": 0}
+    return wit, {"before": before, "after": after, "improved": -1, "fallback": 0,
+                 "optimization_candidates": optimization_candidates}
 
   improved = 0
   fallback = 0
@@ -7476,6 +7487,7 @@ def compute_useful_grasps(assembly, grasp_table, gripper_kind=None):
   return out
 
 
+@wrench.profile_wrench_phase("backward")
 def compute_grasp_signatures(assembly, grasp_table, gripper_kind=None, gripper_path=None,
                              clearance=0.02, components=None):
   """FACT-SIGNATURE grasp-equivalence classes, one map per part: {part: {raw_g: class}}.
@@ -7622,6 +7634,7 @@ class CollapsedLabeledHeuristic:
 
   H = "H"                                                  # face value for held-in-air
 
+  @wrench.profile_wrench_phase("backward")
   def __init__(self, assembly, n_robots, grasp_table, gripper_path=None, verbose=False,
                max_states=2_000_000, clearance=0.02, gripper_kind=None, bracing=False,
                collapse_grasps=False, geo_checker=None, grasp_classes=None,
@@ -8195,6 +8208,7 @@ class CollapsedLabeledHeuristic:
     self._reverse_time = 0.0
     self._reverse_exhausted = False
 
+    @wrench.profile_wrench_phase("backward")
     def advance(target=None):
       """Resume reverse Dijkstra until ``target`` is settled, or exhaust the graph.
 
@@ -9063,6 +9077,12 @@ def isolated_graspability_report(C, assembly, robots, checker, grasp_table,
   from gripper_closure import certify
 
   s0 = get_initial_state(C, assembly)
+  Cfull = None
+  if robot_ik is not None:
+    # One common final scene for the cheap endpoint-reach diagnostic below.  This performs
+    # analytic IK only; it never rejects a grasp or invokes KOMO.
+    from problem import _full_assembly_state
+    Cfull = robot_ik.scene_for(_full_assembly_state(assembly, s0), assembly)
   representatives = {}
   for robot in robots:
     representatives.setdefault(checker._robot_kind.get(robot, robot), robot)
@@ -9107,12 +9127,16 @@ def isolated_graspability_report(C, assembly, robots, checker, grasp_table,
         accepted_by_kind.setdefault(kind, []).append(gid)
       for robot in robots:
         tested = seedable = branches = 0
+        seated_tested = seated_seedable = direct_seedable = 0
         if not robot_ik._analytic_reject_ok(robot):
           reach[robot] = {"calibrated": False, "tested": 0,
-                          "seedable": 0, "branches": 0}
+                          "seedable": 0, "branches": 0,
+                          "seated_tested": 0, "seated_seedable": 0,
+                          "direct_seedable": 0}
           continue
         Ci = robot_ik.scene_for(iso, assembly)
         kind = checker._robot_kind.get(robot, robot)
+        initial_ok = set()
         for gid in accepted_by_kind.get(kind, ()):
           tested += 1
           target = robot_ik.ee_target(robot, part, gid, assembly)
@@ -9120,8 +9144,26 @@ def isolated_graspability_report(C, assembly, robots, checker, grasp_table,
           if seeds:
             seedable += 1
             branches += len(seeds)
+            initial_ok.add(gid)
+        seated_ids = set()
+        if assembly.relative_pose(part) is not None:
+          mate_ctx = _subasm_key(_mate_closure(assembly, part) | {part})
+          seated_ids = {gid for gp, gid, _pose in grasp_table.get(mate_ctx, ())
+                        if gp == part and (not hasattr(grasp_table, "usable")
+                                           or grasp_table.usable(
+                                               mate_ctx, part, gid, robot))}
+        for gid in sorted(seated_ids):
+          seated_tested += 1
+          target = robot_ik.ee_target(robot, part, gid, assembly)
+          if robot_ik._analytic_seeds(Cfull, robot, target, part):
+            seated_seedable += 1
+            if gid in initial_ok:
+              direct_seedable += 1
         reach[robot] = {"calibrated": True, "tested": tested,
-                        "seedable": seedable, "branches": branches}
+                        "seedable": seedable, "branches": branches,
+                        "seated_tested": seated_tested,
+                        "seated_seedable": seated_seedable,
+                        "direct_seedable": direct_seedable}
     report[part] = {"ok": bool(accepted), "accepted": accepted, "kinds": kinds,
                     "analytic_reach": reach}
     if verbose:
@@ -9134,7 +9176,9 @@ def isolated_graspability_report(C, assembly, robots, checker, grasp_table,
       calibrated = [(r, v) for r, v in reach.items() if v["calibrated"]]
       if calibrated:
         rdetail = ", ".join(
-            f"{r}: {v['seedable']}/{v['tested']} poses ({v['branches']} branches)"
+            f"{r}: pick {v['seedable']}/{v['tested']} poses ({v['branches']} branches), "
+            f"seat {v['seated_seedable']}/{v['seated_tested']}, "
+            f"direct {v['direct_seedable']}"
             for r, v in calibrated)
         print(f"[reach-preflight] {part}: exact fixed-arm analytic reach: {rdetail}")
         if not any(v["seedable"] for _r, v in calibrated):
@@ -11816,6 +11860,32 @@ def _add_one_part_declutter(start, p, ideal, assembly, robots, checker, grasp_ta
       print(f"    [declutter] {p}: blocked by {sorted(new)} -> relocating and re-planning")
 
 
+def _has_sampled_direct_grasp_bridge(assembly, part, grasp_table, gripper_kind):
+  """Whether the sampled DB contains a pick-and-seat-clear grasp for ``part``.
+
+  Return ``None`` when scene annotations are unavailable, so callers preserve the historical
+  scheduling order.  A ``False`` result is useful only for choosing which nested action
+  alphabet to try first: the broader handover alphabet remains a strict superset of the
+  direct one, so this must never be used as a feasibility rejection.
+  """
+  meta = sampled_grasp_meta(assembly.grasp_shape(part), part=part)
+  if not meta:
+    return None
+  kinds = (set(gripper_kind.values()) if isinstance(gripper_kind, dict)
+           else {gripper_kind or "two_finger"})
+  gids = {int(gid) for grasp_part, gid, _pose in grasp_table.get((part,), ())
+          if grasp_part == part}
+  for gid in gids:
+    if gid < 0 or gid >= len(meta) or not meta[gid]:
+      continue
+    by_kind = meta[gid].get("scene_by_kind", {})
+    for kind in kinds:
+      roles = set(by_kind.get(kind, ()))
+      if "pick" in roles and "assemble" in roles:
+        return True
+  return False
+
+
 def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=True, robot_ik=None,
                                            weight=5.0, max_nodes=20000, wrench=False,
                                            wrench_aware_h=True,
@@ -11831,6 +11901,7 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
                                            fill_policy_first=False,
                                            fill_policy_guide=False,
                                            fill_skeleton_first=False,
+                                           fill_action_widening=False,
                                            fill_scope_widening=False,
                                            milestone_boundaries=1,
                                            grasp_local_widen=False,
@@ -12216,6 +12287,62 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
       _release_fill_scratch(f"{q}:skeleton", verbose)
       if sub is not None:
         return sub, s2
+    # The reverse wrench abstraction can prove that every admissible mate needs a brace.
+    # In that case the unbraced alphabets below are empty by construction; defer directly to
+    # the established braced phases rather than asking the concrete search to rediscover it.
+    action_widen_unbraced = not (bracing and allow is not None and not unbraced_ok)
+    if fill_action_widening and not action_widen_unbraced and verbose:
+      print(f"[fill-actions {q}] reverse wrench interface requires bracing -> "
+            "skipping unbraced action alphabets", flush=True)
+    if fill_action_widening and action_widen_unbraced:
+      # Nested action alphabets, not schema caps. A direct transport uses only PICK and
+      # ASSEMBLE (plus releases inherited at the boundary). If that finite graph has no
+      # validated path, admit HANDOVER while still excluding table placement and bracing.
+      # The ordinary code below then restores every configured action family. Therefore a
+      # restricted failure is never a no-good and the final fill has exactly the historical
+      # coverage. RobotIK's physical-query cache is shared by all passes.
+      direct_bridge = _has_sampled_direct_grasp_bridge(
+          assembly, q, grasp_table, gk)
+      action_families = []
+      if direct_bridge is not False:
+        action_families.append(("direct", False, False))
+      elif verbose:
+        print(f"[fill-actions {q}] sampled pick/assemble interface has no common "
+              "grasp -> starting with the handover superset", flush=True)
+      if handovers:
+        action_families.append(("handover", True, False))
+      for family_name, family_handovers, family_place in action_families:
+        # When the caller already selected this exact alphabet, let the ordinary attempt be
+        # its sole authority instead of running it twice.
+        if (family_handovers == handovers and family_place == allow_place and not bracing):
+          continue
+        if verbose:
+          print(f"[fill-actions {q}] probing {family_name} alphabet "
+                f"(handovers={family_handovers}, place={family_place}, braces=False)",
+                flush=True)
+        sub, s2 = _add_one_part(
+            s, q, ideal, assembly, robots, checker, grasp_table, robot_ik,
+            weight, max_nodes, verbose, gripper_kind=gk,
+            handovers=family_handovers, allow_place=family_place, bracing=False,
+            deadline=deadline, lazy_fill=lazy_fills, cost_bound=fb,
+            forbid_assemble=forbid, settle_ref=settle,
+            h_extra=(None if lpdb is not None else
+                     h_lab.value if h_lab is not None else None),
+            h_extra_shift=shift,
+            fill_h=(lpdb.value if lpdb is not None else None),
+            exact_fill=fill_exact, fill_greedy=fill_greedy,
+            incumbent_first=fill_incumbent_first,
+            grasp_cap=grasp_caps,
+            touch_all=scope_passes[0], excluded_end_states=excluded_end_states)
+        _release_fill_scratch(f"{q}:actions-{family_name}", verbose)
+        if sub is not None:
+          if verbose:
+            print(f"[fill-actions {q}] {family_name} alphabet validated "
+                  f"{len(sub)} action(s)", flush=True)
+          return sub, s2
+        if verbose:
+          print(f"[fill-actions {q}] {family_name} alphabet did not validate -> widening",
+                flush=True)
     def attempt(selected_phases, selected_scopes, cap_map=None, one_open_epoch=False,
                 active_columns=None, active_rests=None, active_rest_prefix=None):
       old_epochs = None
@@ -12938,6 +13065,7 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
                                      fill_policy_first=False,
                                      fill_policy_guide=False,
                                      fill_skeleton_first=False,
+                                     fill_action_widening=False,
                                      fill_scope_widening=False,
                                      milestone_boundaries=1,
                                      grasp_local_widen=False,
@@ -12987,6 +13115,7 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
       fill_incumbent_first=fill_incumbent_first,
       fill_policy_first=fill_policy_first, fill_policy_guide=fill_policy_guide,
       fill_skeleton_first=fill_skeleton_first,
+      fill_action_widening=fill_action_widening,
       fill_scope_widening=fill_scope_widening,
       milestone_boundaries=milestone_boundaries,
       grasp_widen_batch=grasp_widen_batch, grasp_widen_max=grasp_widen_max,
@@ -13039,6 +13168,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
                                       fill_policy_first=False,
                                       fill_policy_guide=False,
                                       fill_skeleton_first=False,
+                                      fill_action_widening=False,
                                       fill_scope_widening=False,
                                       milestone_boundaries=1,
                                       grasp_local_widen=False,
@@ -13060,6 +13190,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
       fill_policy_first=fill_policy_first,
       fill_policy_guide=fill_policy_guide,
       fill_skeleton_first=fill_skeleton_first,
+      fill_action_widening=fill_action_widening,
       fill_scope_widening=fill_scope_widening,
       milestone_boundaries=milestone_boundaries,
       grasp_local_widen=grasp_local_widen,
@@ -13076,6 +13207,7 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
                                               geo_facts=False, sig_collapsed_h=False,
                                               labeled_h=False, collapsed_h=False,
                                               grasp_collapsed_h=False, fill_window=2,
+                                              lns_window=None,
                                               milestone_oracle="global",
                                               fill_local_h=False, fill_exact=False,
                                               fill_target_support_quotient=False,
@@ -13084,6 +13216,7 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
                                               fill_policy_first=False,
                                               fill_policy_guide=False,
                                               fill_skeleton_first=False,
+                                              fill_action_widening=False,
                                               fill_scope_widening=False,
                                               milestone_boundaries=1,
                                               placement_yaw_widening=False):
@@ -13091,8 +13224,10 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
 
     1. MILESTONES supplies a validated incumbent using the configured local-fill policy.
     2. LNS cuts that incumbent after assembly events and re-fills consecutive windows of
-       one through ``fill_window`` mated parts under the old window cost. Endpoints are exact,
-       every accepted replacement is strictly cheaper, and the sweep restarts after an accept.
+       one through ``lns_window`` mated parts (the full horizon by default) under the old
+       window cost. Every window first seeks an incumbent greedily and then runs bounded
+       weight-one A*. Endpoints are exact, every accepted replacement is strictly cheaper,
+       and the sweep restarts after an accept.
     3. If milestones is cut before finding an incumbent, a PEA-greedy feasibility net uses
        the reserved tail of the deadline.
 
@@ -13102,6 +13237,8 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
   solve may overrun it), and large instances should still use a process memory guard."""
   import math
   import time
+  if lns_window is not None and int(lns_window) < 1:
+    raise ValueError("lns_window must be >= 1 or None (full horizon)")
   if fill_policy_guide:
     raise ValueError("fill_policy_guide is currently supported only by the ordinary "
                      "milestone solver, not --milestones-anytime")
@@ -13138,6 +13275,7 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
         fill_policy_first=fill_policy_first,
         fill_policy_guide=fill_policy_guide,
         fill_skeleton_first=fill_skeleton_first,
+        fill_action_widening=fill_action_widening,
         fill_scope_widening=fill_scope_widening,
         milestone_boundaries=milestone_boundaries,
         placement_yaw_widening=placement_yaw_widening)
@@ -13159,9 +13297,11 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
     return None
   U = sum(action_cost(a) for a in inc)
   if remaining > 10.0:
+    lns_label = str(int(lns_window)) if lns_window is not None else "full horizon"
     if verbose:
       print(f"[mile-anytime] incumbent cost {U:g} ({len(inc)} actions) "
-            f"in {time.perf_counter() - t0:.1f}s -> milestone LNS k=1..{fill_window}, "
+            f"in {time.perf_counter() - t0:.1f}s -> milestone LNS k=1..{lns_label}, "
+            "greedy -> bounded w=1 per window, "
             f"{remaining:.0f}s left")
     checker, grasp_table = _search_context(C, assembly, robots)
     gk = wrench_kind_arg(C, robots) if wrench else None
@@ -13179,7 +13319,8 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
         inc, C, assembly, robots, checker, grasp_table, robot_ik,
         max(weight, 5.0), 20000, verbose, h_lab, gripper_kind=gk,
         handovers=handovers, allow_place=allow_place, bracing=bracing,
-        deadline=t_end, t0=t0, k_max=max(1, int(fill_window)), object_unit=True)
+        deadline=t_end, t0=t0, k_max=(None if lns_window is None
+                                     else max(1, int(lns_window))), object_unit=True)
     best_cost = sum(action_cost(a) for a in best)
     if best_cost < U:
       if verbose:
@@ -13192,7 +13333,7 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
         print(f"[mile-anytime] LNS deadline reached without improving cost {U:g} "
               f"in {elapsed:.1f}s total (no fixpoint certificate)")
       else:
-        print(f"[mile-anytime] LNS reached a k<={fill_window} fixpoint at cost {U:g} "
+        print(f"[mile-anytime] LNS reached a k<={lns_label} fixpoint at cost {U:g} "
               f"in {elapsed:.1f}s total")
   if verbose:
     print(f"[mile-anytime] returning the milestone plan (cost {U:g}) "
@@ -13476,10 +13617,14 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
   holder); coarser and uneven (segments merge under hold-through re-fills). Kept for
   ablation.
 
-  The k=1 cleanup rung uses weight-one A*: these deliberately small coordinates are searched
-  in cost order. Wider neighborhoods retain ``weight`` as their exploration order. When a finite
-  deadline is present, every remaining window receives an equal share of the remaining wall
-  budget (cooperatively).
+  Every window uses the same two-pass schedule. Greedy best-first search (f=h) first seeks a
+  cheap validated replacement quickly. Weight-one A* then searches below the best available
+  bound: the greedy replacement cost if one was found, otherwise the incumbent span cost. If
+  the weight-one pass exhausts, the retained replacement is optimal within this finite window
+  under the validated graph. Exact witnesses and open-witness effort persist through robot_ik.
+  When a finite deadline is present, every remaining window receives an equal share of the
+  remaining wall budget, and greedy receives half of that window's still-available slice so the
+  exact pass cannot be starved (unused greedy time flows to exact).
 
   Every non-final window also builds a bounded reverse PDB rooted at its exact projected splice
   endpoint, using the same abstraction and signature quotient as ordinary local fills. Its
@@ -13490,6 +13635,7 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
   Growing k covers reorderings a small window can't reach; k=n is the whole-plan bounded
   search. Standard LNS: RESTART the sweep on any accept (the plan, hence its partition,
   changes). No separate proof rung -- the k=n window is the last iteration."""
+  import math
   import time
   if t0 is None:
     t0 = time.perf_counter()
@@ -13573,11 +13719,10 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
         h_start = h_lab.value(states[i])
         h_tgt = 0.0 if is_last else h_lab.value(states[i + k])
         parts_mated = sorted({p for sp in seg_parts[i:i + k] for p in sp})
-        window_weight = 1.0 if k == 1 else weight
         if old_cost <= max(0.0, h_start - h_tgt):
           if verbose:
             print(f"[lns-window] k={k} parts[{i}:{i + k}] {tuple(parts_mated)} "
-                  f"w={window_weight:g} bound={old_cost:g} outcome=lower-bound "
+                  f"passes=greedy->w1 bound={old_cost:g} outcome=lower-bound "
                   f"h-diff={max(0.0, h_start - h_tgt):g}", flush=True)
           continue                                        # window already at its lower bound
         # Destroyed-action neighborhood: include every part physically touched by the removed
@@ -13661,63 +13806,78 @@ def _lns_improve(plan, C, assembly, robots, checker, grasp_table, robot_ik, weig
           if endpoint_h is not None and endpoint_lb >= old_cost:
             if verbose:
               print(f"[lns-window] k={k} parts[{i}:{i + k}] {tuple(parts_mated)} "
-                    f"w={window_weight:g} bound={old_cost:g} "
+                    f"passes=greedy->w1 bound={old_cost:g} "
                     f"outcome=endpoint-bound endpoint-h={endpoint_lb:g} "
                     f"pdb-wall={endpoint_wall:.2f}s", flush=True)
             continue
-        refill_stats = {}
-        sub = _refill_window(states[i], touched_parts,
-                             None if is_last else states[i + k], assembly, robots, checker,
-                             grasp_table, robot_ik, window_weight, max_nodes, h_lab,
-                             gripper_kind=gripper_kind, handovers=handovers,
-                             allow_place=allow_place, bracing=bracing,
-                             deadline=window_deadline, cost_bound=old_cost, stats=refill_stats,
-                             endpoint_h=endpoint_h)
-        # _refill_window's heap/repair graph is dead on return; return its allocator arenas
-        # before the next coordinate (or an accepted-plan restart) constructs another large
-        # graph under the process address-space guard. Live plan states/PDB/checker caches are
-        # untouched. This is the same cleanup contract used between ordinary local fills.
-        _release_fill_scratch(f"lns-k{k}-{i}", verbose=verbose)
-        if verbose:
-          slice_text = f" slice={allocated:.1f}s" if allocated is not None else ""
-          result_text = (f" result={cost(sub):g}" if sub is not None else "")
-          endpoint_text = ("" if endpoint_lb is None else
-                           f" endpoint-h={'inf' if endpoint_lb == float('inf') else f'{endpoint_lb:g}'}"
-                           f" pdb={endpoint_wall:.2f}s")
-          if endpoint_h is not None:
-            endpoint_stats = endpoint_h.reverse_stats()
-            endpoint_text += (f" pdb-settled={endpoint_stats['settled']}"
-                              f"/{endpoint_stats['discovered']}")
-          print(f"[lns-window] k={k} parts[{i}:{i + k}] {tuple(parts_mated)} "
-                f"w={window_weight:g} bound={old_cost:g} footprint={len(touched_parts)}"
-                f"{slice_text} outcome={refill_stats.get('outcome', 'unknown')}"
-                f"{result_text}{endpoint_text} wall={refill_stats.get('wall', 0.0):.2f}s "
-                f"searches={refill_stats.get('search_calls', 0)} "
-                f"expanded={refill_stats.get('expanded', 0)} "
-                f"peak-open={refill_stats.get('peak_frontier', 0)} "
-                f"succ={refill_stats.get('successors_scoped', 0)}/"
-                f"{refill_stats.get('successors_seen', 0)} "
-                f"h={refill_stats.get('heuristic_misses', 0)}/"
-                f"{refill_stats.get('heuristic_calls', 0)} "
-                f"cheap={refill_stats.get('cheap_checks', 0)}"
-                f"({refill_stats.get('cheap_cache_hits', 0)} cached) "
-                f"IK={refill_stats.get('ik_binds', 0)}"
-                f"({refill_stats.get('ik_failures', 0)}f)", flush=True)
-          if os.environ.get("FILL_SEARCH_PROFILE"):
-            ep = refill_stats.get("engine_profile", {})
-            print(f"[lns-prof] successor={refill_stats.get('successor_wall', 0.0):.2f}s/"
-                  f"{refill_stats.get('successor_calls', 0)} calls/"
-                  f"{refill_stats.get('successor_states', 0)} states/"
-                  f"{refill_stats.get('successor_cache_hits', 0)} hits "
-                  f"heuristic={refill_stats.get('heuristic_wall', 0.0):.2f}s/"
-                  f"{refill_stats.get('heuristic_misses', 0)} misses "
-                  f"cheap={refill_stats.get('cheap_wall', 0.0):.2f}s/"
-                  f"{refill_stats.get('cheap_checks', 0) - refill_stats.get('cheap_cache_hits', 0)}"
-                  f" misses IK={refill_stats.get('ik_wall', 0.0):.2f}s "
-                  f"queue={ep.get('queue_wall', 0.0):.2f}s/"
-                  f"{ep.get('queue_calls', 0)} alt={ep.get('alt_wall', 0.0):.2f}s/"
-                  f"{ep.get('alt_calls', 0)} pops={ep.get('heap_pops', 0)} "
-                  f"boundary={ep.get('boundary_wall', 0.0):.2f}s", flush=True)
+        # TWO-PASS WINDOW. Give greedy at most half of the window's remaining fair slice.
+        # Finishing early transfers the unused time to exact; exact always gets a consultation
+        # unless a native nonlinear call overruns its cooperative deadline.
+        greedy_deadline = window_deadline
+        if window_deadline is not None:
+          now = time.perf_counter()
+          greedy_deadline = now + max(0.0, window_deadline - now) / 2.0
+
+        def run_pass(label, pass_weight, pass_bound, pass_deadline):
+          refill_stats = {}
+          candidate = _refill_window(
+              states[i], touched_parts, None if is_last else states[i + k], assembly,
+              robots, checker, grasp_table, robot_ik, pass_weight, max_nodes, h_lab,
+              gripper_kind=gripper_kind, handovers=handovers,
+              allow_place=allow_place, bracing=bracing, deadline=pass_deadline,
+              cost_bound=pass_bound, stats=refill_stats, endpoint_h=endpoint_h)
+          # The positive witness pool and finite-failure effort live in robot_ik and therefore
+          # survive the pass boundary. Only dead heap/repair arenas are released here.
+          _release_fill_scratch(f"lns-k{k}-{i}-{label}", verbose=verbose)
+          if verbose:
+            slice_text = f" window-slice={allocated:.1f}s" if allocated is not None else ""
+            result_text = f" result={cost(candidate):g}" if candidate is not None else ""
+            endpoint_text = ("" if endpoint_lb is None else
+                             f" endpoint-h={'inf' if endpoint_lb == float('inf') else f'{endpoint_lb:g}'}"
+                             f" pdb={endpoint_wall:.2f}s")
+            if endpoint_h is not None:
+              pass_endpoint_stats = endpoint_h.reverse_stats()
+              endpoint_text += (f" pdb-settled={pass_endpoint_stats['settled']}"
+                                f"/{pass_endpoint_stats['discovered']}")
+            print(f"[lns-window] k={k} parts[{i}:{i + k}] {tuple(parts_mated)} "
+                  f"pass={label} w={'inf' if math.isinf(pass_weight) else f'{pass_weight:g}'} "
+                  f"bound={pass_bound:g} footprint={len(touched_parts)}{slice_text} "
+                  f"outcome={refill_stats.get('outcome', 'unknown')}{result_text}"
+                  f"{endpoint_text} wall={refill_stats.get('wall', 0.0):.2f}s "
+                  f"searches={refill_stats.get('search_calls', 0)} "
+                  f"expanded={refill_stats.get('expanded', 0)} "
+                  f"peak-open={refill_stats.get('peak_frontier', 0)} "
+                  f"succ={refill_stats.get('successors_scoped', 0)}/"
+                  f"{refill_stats.get('successors_seen', 0)} "
+                  f"h={refill_stats.get('heuristic_misses', 0)}/"
+                  f"{refill_stats.get('heuristic_calls', 0)} "
+                  f"cheap={refill_stats.get('cheap_checks', 0)}"
+                  f"({refill_stats.get('cheap_cache_hits', 0)} cached) "
+                  f"IK={refill_stats.get('ik_binds', 0)}"
+                  f"({refill_stats.get('ik_failures', 0)}f)", flush=True)
+            if os.environ.get("FILL_SEARCH_PROFILE"):
+              ep = refill_stats.get("engine_profile", {})
+              print(f"[lns-prof] pass={label} "
+                    f"successor={refill_stats.get('successor_wall', 0.0):.2f}s/"
+                    f"{refill_stats.get('successor_calls', 0)} calls/"
+                    f"{refill_stats.get('successor_states', 0)} states/"
+                    f"{refill_stats.get('successor_cache_hits', 0)} hits "
+                    f"heuristic={refill_stats.get('heuristic_wall', 0.0):.2f}s/"
+                    f"{refill_stats.get('heuristic_misses', 0)} misses "
+                    f"cheap={refill_stats.get('cheap_wall', 0.0):.2f}s/"
+                    f"{refill_stats.get('cheap_checks', 0) - refill_stats.get('cheap_cache_hits', 0)}"
+                    f" misses IK={refill_stats.get('ik_wall', 0.0):.2f}s "
+                    f"queue={ep.get('queue_wall', 0.0):.2f}s/"
+                    f"{ep.get('queue_calls', 0)} alt={ep.get('alt_wall', 0.0):.2f}s/"
+                    f"{ep.get('alt_calls', 0)} pops={ep.get('heap_pops', 0)} "
+                    f"boundary={ep.get('boundary_wall', 0.0):.2f}s", flush=True)
+          return candidate, refill_stats
+
+        greedy, _greedy_stats = run_pass(
+            "greedy", float("inf"), old_cost, greedy_deadline)
+        exact_bound = min(old_cost, cost(greedy)) if greedy is not None else old_cost
+        exact, _exact_stats = run_pass("exact", 1.0, exact_bound, window_deadline)
+        sub = exact if exact is not None else greedy
         if sub is not None and cost(sub) < old_cost:
           cur = cur[:bnds[i]] + list(sub) + cur[bnds[i + k]:]
           if verbose:

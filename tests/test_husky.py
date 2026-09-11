@@ -93,6 +93,16 @@ def test_husky_side_specific_ssik_matches_real_rai_fk_and_inverse():
     idx = [i for i, n in enumerate(joint_names) if n.startswith(robot + "_")]
     limits = np.vstack([lo[idx], hi[idx]])
     cal = analytic_ik._CAL[arm]
+    # The physical Robotiq tools are mounted with a +90 degree roll relative to
+    # tool0.  Keep this convention explicit: otherwise SSIK still reaches the
+    # old, visually plausible but physically wrong jaw orientation.
+    np.testing.assert_allclose(
+        cal["tools"]["two_finger"],
+        np.array([[0.0, -1.0, 0.0, 0.0],
+                  [1.0, 0.0, 0.0, 0.0],
+                  [0.0, 0.0, 1.0, 0.13],
+                  [0.0, 0.0, 0.0, 1.0]]),
+        atol=1e-12)
     solver = analytic_ik._solver(arm)
     for _ in range(4):
       q = rng.uniform(limits[0] + 0.05, limits[1] - 0.05)

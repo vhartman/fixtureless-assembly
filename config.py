@@ -92,6 +92,10 @@ class RunConfig:
   place_cells: int = 0
   prefer_center: bool = False
   fill_window: int = 2
+  # Maximum consecutive-milestone neighborhood in --milestones-anytime. None means the
+  # complete incumbent horizon; this is separate from fill_window, whose small default is an
+  # initial-feasibility recovery mechanism.
+  lns_window: Optional[int] = None
   milestone_oracle: str = "global"
   fill_local_h: bool = False
   fill_target_support_quotient: bool = False
@@ -101,6 +105,7 @@ class RunConfig:
   fill_policy_first: bool = False
   fill_policy_guide: bool = False
   fill_skeleton_first: bool = False
+  fill_action_widening: bool = False
   milestone_boundaries: int = 1
   lazy_fills: bool = True
   open_witness: bool = False
@@ -273,6 +278,7 @@ class RunConfig:
   viz_initial_grasps: Optional[str] = None
   viz_grasp_closure: Optional[str] = None
   viz_rest_poses: bool = False
+  viz_rest_poses_grid: bool = False
   mate_sequence_viz: bool = False
   show_successors: bool = False
   viser: bool = False

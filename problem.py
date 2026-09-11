@@ -2,6 +2,7 @@
 search model (State + successors). No feasibility/solver or visualization code here."""
 
 import os
+import time
 from dataclasses import dataclass
 
 import robotic as ry
@@ -1418,6 +1419,44 @@ class FabricaAssembly(Assembly):
       if self.model == "gamepad" and "4" in source_to_part:
         # Rear connector slides into the housing along -Y, not through its roof.
         self.mate_axes[source_to_part["4"]] = np.array([0.0, -1.0, 0.0])
+      if self.model == "gamepad":
+        # The two square locating pins (source parts 0 and 5) are functionally unchanged
+        # by quarter turns about their local/insertion z axis.  Keep those alternatives
+        # inside the existing finite mate-goal representation: with --mate-symmetry one
+        # symbolic assemble edge may use any of the four poses, while the historical
+        # identity-only action space remains byte-identical when the flag is absent.
+        for source in ("0", "5"):
+          if source in source_to_part:
+            self.mate_symmetry_quats[source_to_part[source]] = tuple(
+                np.array([np.cos(k * np.pi / 4.0), 0.0, 0.0,
+                          np.sin(k * np.pi / 4.0)]) for k in range(4))
+      if self.model == "stool_circular":
+        # The four long pegs have an exactly hexagonal section and the four short caps have
+        # an exactly square functional interface. Their axial roll is immaterial to the
+        # completed stool, but it changes the required wrist roll substantially. Keep the
+        # alternatives on the existing single symbolic assemble edge: six 60-degree poses
+        # for a peg and four 90-degree poses for a cap. Source ids are used here so this
+        # remains correct if a prefix is requested or public obj_N numbering changes.
+        for source in ("1", "3", "5", "7"):
+          if source in source_to_part:
+            self.mate_symmetry_quats[source_to_part[source]] = tuple(
+                np.array([np.cos(k * np.pi / 6.0), 0.0, 0.0,
+                          np.sin(k * np.pi / 6.0)]) for k in range(6))
+        for source in ("0", "6", "8", "4"):
+          if source in source_to_part:
+            self.mate_symmetry_quats[source_to_part[source]] = tuple(
+                np.array([np.cos(k * np.pi / 4.0), 0.0, 0.0,
+                          np.sin(k * np.pi / 4.0)]) for k in range(4))
+      if self.model == "cooling_manifold":
+        # The four loose corner fasteners have exact hexagonal heads and round stems.
+        # Their authored meshes match after each 60-degree turn about the vertical mate
+        # axis (to sub-micron precision), so these are alternative realizations of one
+        # physical mate rather than additional symbolic assembly actions.
+        for source in ("2", "3", "5", "6"):
+          if source in source_to_part:
+            self.mate_symmetry_quats[source_to_part[source]] = tuple(
+                np.array([np.cos(k * np.pi / 6.0), 0.0, 0.0,
+                          np.sin(k * np.pi / 6.0)]) for k in range(6))
       q_lie = np.array([np.sqrt(.5), 0.0, np.sqrt(.5), 0.0])
       lie_sources = (("2", "3") if self.model == "beam" else
                      ("2", "3", "5", "6") if self.model == "cooling_manifold" else
@@ -3504,7 +3543,9 @@ def _closure_ranked_canonical(entries):
 def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_quat):
   """Select the bounded scene-reserved DB and return ``[(row, metadata), ...]``.
 
-  Conventional primitive grasps are the stable source prefix. Under the explicit closure
+  Conventional primitive grasps remain part of the stable source pool. With scene
+  conditioning, transport-bridge and endpoint-role strata determine the useful prefix;
+  without it the historical conventional-first order is retained. Under the explicit closure
   model, a source whose fingers graze the table may additionally emit a deterministic,
   contact-preserving approach-retracted pose; the colliding source remains eligible as a
   free-space fallback if the bounded set has room. Sampled rows are ordered by a round-robin over fleet/scene/family strata,
@@ -3650,13 +3691,14 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
   # or unusually large K and be a no-op for the cuboid assemblies that motivated the check.
   if checker is not None and checker.closure_check:
     canonical = _closure_ranked_canonical(canonical)
-  closure_select = bool(checker is not None and checker.closure_check)
-  # A strict repaired pose is useless if the immutable source prefix still consumes the whole
-  # bounded K before sampled scene-valid rows are considered. Under closure semantics reserve
-  # the prefix only for candidates that actually serve PICK/ASSEMBLE; zero-role originals stay
-  # available as the LAST fallback below. Off = the historical immutable-prefix path exactly.
-  if closure_select:
-    canonical_seed = [e for e in canonical if any(e[1]["scene_by_kind"].values())][:keep]
+  scene_select = checker is not None
+  # Scene conditioning is useful independently of the optional virtual-close certificate.
+  # Previously only closure-aware runs moved zero-role conventional rows behind sampled rows;
+  # ordinary --grasp-sampler-scenes runs therefore spent almost all of K=20 on the legacy
+  # canonical prefix, even when those poses were blocked at both endpoints.  Retain every such
+  # row as a finite fallback, but do not let it consume the scarce scene-positive prefix.
+  if scene_select:
+    canonical_seed = [e for e in canonical if any(e[1]["scene_by_kind"].values())]
     canonical_fallback = [e for e in canonical if not any(e[1]["scene_by_kind"].values())]
   else:
     canonical_seed, canonical_fallback = list(canonical), []
@@ -3710,11 +3752,21 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
     return [by_id[id(r)] for r in _fps_row_order([e[0] for e in entries])]
 
   categories = []
-  # Scene/fleet needs first. A row may appear in several categories; round-robin deduplication
-  # turns that into useful multi-purpose priority rather than duplicate ids.
+  # Scene/fleet needs first.  A row that clears BOTH endpoint scenes for one gripper kind is
+  # strictly more useful to the finite transport alphabet than two role-specific rows: it can
+  # carry the part from its initial pose to its mate without forcing a handover/regrasp.  Put
+  # those bridge rows in their own leading strata, then retain the two marginal strata.  This
+  # is only ordering; role-specific and free-space fallbacks remain below and widening is still
+  # an append-only prefix of one immutable master.
+  scene_primary = list(canonical_seed) + list(good) if scene_select else list(good)
   for kind in sorted(kind_robot):
-    usable = [e for e in good if (kind != "vacuum" or
+    usable = [e for e in scene_primary if (kind != "vacuum" or
               (e[0][6] != "pinch" and e[0][1] != "curved" and e[0][2] >= seal))]
+    bridge = [e for e in usable
+              if {"pick", "assemble"}.issubset(
+                  e[1]["scene_by_kind"].get(kind, ()))]
+    if bridge:
+      categories.append(ordered(bridge))
     for role in ("pick", "assemble"):
       block = [e for e in usable if role in e[1]["scene_by_kind"].get(kind, ())]
       if block:
@@ -3732,7 +3784,11 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
   # promoted merely because they are conventional. Likewise, below-gate sampled rows are
   # appended only after every gate-passing row; they fill an otherwise undersized database but
   # must never be round-robin interleaved into a prefix that already has enough valid rows.
-  tail, tail_seen = list(canonical_seed), {id(e[0]) for e in canonical_seed}
+  # With a scene context, let the strata above determine the entire useful prefix instead of
+  # pre-pending every conventional row.  Without one, preserve the historical canonical-first
+  # ordering exactly.
+  tail = [] if scene_select else list(canonical_seed)
+  tail_seen = {id(e[0]) for e in tail}
   cursors = [0] * len(categories)
   while True:
     progressed = False
@@ -3753,8 +3809,10 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
     if id(e[0]) not in tail_seen:
       tail.append(e); tail_seen.add(id(e[0]))
 
-  # Reserve one deterministic row for every available (gripper-kind, PICK/ASSEMBLE) fact,
-  # then append the stable tail. A bridge row can satisfy several facts and is emitted once.
+  # Reserve one deterministic bridge per kind when available, then one row for every still
+  # uncovered (gripper-kind, PICK/ASSEMBLE) fact.  A bridge can cover both facts and is emitted
+  # once.  This makes a small K useful as a transport DB, not merely two unrelated endpoint
+  # databases.
   # The complete order is built before slicing, so widening never rebinds an old grasp id.
   def has_scene_fact(entry, fact):
     kind, role = fact
@@ -3764,6 +3822,12 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
            for role in ("pick", "assemble")]
   primary = list(canonical) + list(good)
   reserve_blocks = []
+  for kind in sorted(kind_robot):
+    block = [e for e in primary
+             if {"pick", "assemble"}.issubset(
+                 e[1]["scene_by_kind"].get(kind, ()))]
+    if block:
+      reserve_blocks.append(((kind, "bridge"), ordered(block)))
   for fact in facts:
     block = [e for e in primary if has_scene_fact(e, fact)]
     if not block and not bool(_SAMPLED_GRASPS.get("strict", False)):
@@ -3773,17 +3837,20 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
 
   out, seen, covered = [], set(), set()
   for fact, block in reserve_blocks:
-    if fact in covered:
+    kind, role = fact
+    if ((role == "bridge" and
+         (kind, "pick") in covered and (kind, "assemble") in covered)
+        or (role != "bridge" and fact in covered)):
       continue
     entry = next((e for e in block if id(e[0]) not in seen), None)
     if entry is None:
       continue
     out.append(entry)
     seen.add(id(entry[0]))
-    for kind, roles in entry[1]["scene_by_kind"].items():
-      for role in roles:
-        if role in ("pick", "assemble"):
-          covered.add((kind, role))
+    for covered_kind, roles in entry[1]["scene_by_kind"].items():
+      for covered_role in roles:
+        if covered_role in ("pick", "assemble"):
+          covered.add((covered_kind, covered_role))
 
   for entry in tail:
     if id(entry[0]) not in seen:
@@ -3799,11 +3866,18 @@ def _sampled_keys(spec, offset, part=None):
   # The constant 2 is the established raw-cloud RNG salt. It is not a selectable algorithm
   # version; retaining it keeps current sampler outputs stable while the public version switch
   # and all obsolete generation branches are gone.
+  # Only parameters that alter the raw proposal distribution belong in ``base``: its repr is
+  # hashed below to seed the private RNG.  ``strict`` merely removes fallback rows after the
+  # candidates have been classified.  Including it here used to resample the whole cloud and,
+  # worse, adding the option changed every historical non-strict grasp id even though its value
+  # was False.  Keep strictness in the filtered-view cache key instead.  This also makes the
+  # strict/non-strict comparison a matched filtering ablation over identical proposals.
   base = (_spec_key(spec), float(offset), 2, cfgv["seed"], cfgv["candidates"],
           float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)),
-          cfgv.get("wrap"), bool(cfgv.get("strict", False)))
+          cfgv.get("wrap"))
   ctx = _SAMPLED_SCENE_CTX
-  cache = base + (cfgv.get("master_keep", cfgv["keep"]),)
+  cache = base + (bool(cfgv.get("strict", False)),
+                  cfgv.get("master_keep", cfgv["keep"]),)
   return base, cache + (part, (ctx["sig"] if ctx is not None else None))
 
 
@@ -4883,6 +4957,45 @@ class LazyGraspTable(GraspTable):
     return sum(len(rows) for rows in dict.values(self))
 
 
+# Inclusive time spent constructing scene-conditioned grasp-table rows. Lazy component rows
+# are measured when they are actually materialized. Separating rows requested by reverse
+# search prevents the paper breakdown from counting that work once as grasp generation and
+# again as backward Dijkstra.
+_GRASP_TIMING_ENABLED = os.environ.get("ASSEMBLY_BENCH_PROFILE", "").strip().lower() not in (
+    "", "0", "false", "no")
+_GRASP_TIMING = {
+    "calls": 0, "s": 0.0,
+    "backward_calls": 0, "backward_s": 0.0,
+}
+
+
+def reset_grasp_timing():
+  for key in tuple(_GRASP_TIMING):
+    _GRASP_TIMING[key] = 0.0 if key.endswith("_s") or key == "s" else 0
+
+
+def grasp_timing_snapshot():
+  return dict(_GRASP_TIMING)
+
+
+def _profile_grasp_rows(fn):
+  def wrapped(*args, **kwargs):
+    if not _GRASP_TIMING_ENABLED:
+      return fn(*args, **kwargs)
+    phase = wrench.current_wrench_timing_phase()
+    t0 = time.perf_counter()
+    try:
+      return fn(*args, **kwargs)
+    finally:
+      elapsed = time.perf_counter() - t0
+      _GRASP_TIMING["calls"] += 1
+      _GRASP_TIMING["s"] += elapsed
+      if phase == "backward":
+        _GRASP_TIMING["backward_calls"] += 1
+        _GRASP_TIMING["backward_s"] += elapsed
+  return wrapped
+
+
 def precompute_grasps(assembly, offset=0.01, gripper_path=None):
   """Pregenerate the reachable grasps for EVERY subassembly that can arise, once, up
   front (design doc: G = pregenerate_grasps). Returns {subassembly_key: labeled grasps}.
@@ -4901,6 +5014,7 @@ def precompute_grasps(assembly, offset=0.01, gripper_path=None):
   return table
 
 
+@_profile_grasp_rows
 def compute_cube_grasps(assembly, subassembly, offset=0.01,
                         gripper_path=None, return_labeled=False):
   # placeholder grasp planner for ONE subassembly: assume every part is a cube, generate

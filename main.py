@@ -1,6 +1,7 @@
 import argparse
 import os as _os
 import sys as _sys
+import time as _time
 
 # BEFORE rai loads: RAI_QUIET=1 drops rai's libccd/pairCollision spam at the fd (see rai_quiet).
 # Env var as well as a flag so it can be exported once instead of typed on every run.
@@ -38,6 +39,7 @@ _STANDARD_SEARCH_PROFILE = {
     # benchmark win.  The ordinary compact fill itself stays byte-for-byte unchanged.
     "fill_policy_guide": False,
     "fill_skeleton_first": False,
+    "fill_action_widening": False,
     "milestone_boundaries": 4,
     "fill_scope_widening": True,
     "fill_touch_all": False,
@@ -83,6 +85,11 @@ _STANDARD_SEARCH_PROFILE = {
     "handovers": True,
     "allow_place": True,
     "goal_on_table": True,
+    # Authored mate alternatives are exact physical symmetries, not heuristic poses or
+    # additional symbolic actions. Assemblies without a declared set are unchanged; those
+    # with one let the same assemble edge choose whichever equivalent realization is easiest
+    # for the arms.
+    "mate_symmetry": True,
     "lazy_fills": True,
     "hoist_releases": True,
     # Shared planner/simulator table datum. Keep this small: every millimetre is certified
@@ -107,7 +114,10 @@ _STANDARD_SEARCH_PROFILE = {
     # compact K prefix from accidentally containing no initial acquisition for a part merely
     # because conventional rows happened to occupy it. Exact state gates stay authoritative.
     "grasp_sampler": True,
-    "grasp_sampler_keep": 20,
+    # Paper/system baseline: expose one fixed finite singleton-grasp alphabet to every
+    # assembly. This removes model-dependent K-prefix restarts from the algorithm being
+    # compared; the former K=20 -> 96 schedule remains available through explicit flags.
+    "grasp_sampler_keep": 64,
     "grasp_sampler_candidates": 96,
     "grasp_sampler_scenes": True,
     # Multi-part components inherit candidate contacts from all constituent parts. Build
@@ -128,10 +138,7 @@ _STANDARD_SEARCH_PROFILE = {
     # obj_2 exhausted 6280 effort slots; the full DB solved the same fill in 13 slots/0.8s.
     # The optional staged policy remains available as --grasp-refine for ablation/anytime use.
     "grasp_refine": False,
-    # Keep the fast 20-grasp alphabet on ordinary instances. If a complete fill attempt
-    # fails, monotonically expose another stable sampler prefix instead of spending unlimited IK
-    # effort on a parameterization set that may simply omit the required contact.
-    "grasp_widen": True,
+    "grasp_widen": False,
     "grasp_widen_batch": 8,
     "grasp_widen_max": 96,
     # A standard search is a batch artifact-producing run.  Both remain explicitly
@@ -460,6 +467,13 @@ def build_parser():
       help="REST-POSE CATALOG in viser (add --viser): each group (singletons, connect "
            "modules, full assembly) laid out on the table in every stable rest pose, one "
            "step per (group,face). A group with NO steps is an unparkable subassembly. No search.",
+  )
+  g_viz.add_argument(
+      "--viz-rest-poses-grid", action="store_true",
+      help="GRID REST-POSE CATALOG in viser (add --viser): one step per singleton/module/"
+           "assembly group, with all of that group's stable placement orientations arranged "
+           "side by side on the table. Labels map grid slots to the exact placement ids used "
+           "by search. No search.",
   )
   g_viz.add_argument(
       "--mate-sequence-viz", action="store_true",
@@ -1226,9 +1240,10 @@ def build_parser():
       "--milestones-anytime", type=float, nargs="?", const=300.0, default=None,
       metavar="SEC",
       help="Greedy milestone incumbent under a hard deadline (default 300s), then bounded "
-           "large-neighborhood improvement: re-fill consecutive one- through --fill-window "
-           "milestone windows under their current cost, accept strict improvements, and "
-           "restart the sweep. PEA-greedy net if "
+           "large-neighborhood improvement: re-fill consecutive windows through the full "
+           "milestone horizon by default (--lns-window K caps it). Each window runs greedy "
+           "then bounded weight-one search under its current cost, accepts a strict "
+           "improvement, and restarts the sweep. PEA-greedy net if "
            "milestones itself was cut. With --open-witness, stochastic IK failures are "
            "fairly reopened until the milestone-phase deadline instead of inheriting its "
            "finite operational epoch cap. Always retains the best validated plan. This LNS "
@@ -1295,6 +1310,13 @@ def build_parser():
            "before backjumping -- covers interleaved-glue plans, the milestone "
            "commitment's completeness gap; K=n would be the flat exact search. "
            "1 disables windows.",
+  )
+  g_search.add_argument(
+      "--lns-window", type=int, default=None, metavar="K",
+      help="Maximum consecutive-milestone neighborhood for --milestones-anytime. "
+           "The default is the full incumbent horizon. This is independent of "
+           "--fill-window, which controls joint-fill recovery while finding the initial "
+           "milestone plan.",
   )
   g_search.add_argument(
       "--milestone-oracle", choices=("global", "chain", "structural"), default="global",
@@ -1381,6 +1403,14 @@ def build_parser():
            "cheap-collision and lazy real-IK gates. At most three role assignments per robot "
            "are tried before falling through explicitly to the existing complete local graph; "
            "the probe never declares infeasibility.",
+  )
+  g_search.add_argument(
+      "--fill-action-widening", action=argparse.BooleanOptionalAction, default=False,
+      help="EXPERIMENTAL non-pruning action-family schedule for each local fill. Search the "
+           "same concrete graph first with direct transport only, then with handovers, and "
+           "finally with the configured placement/bracing actions. Every candidate uses the "
+           "ordinary wrench, collision and real-IK gates; restricted-family failure always "
+           "falls through to the existing complete fill and shared IK evidence is retained.",
   )
   g_search.add_argument(
       "--milestone-boundaries", type=int, default=1, metavar="K",
@@ -1714,7 +1744,7 @@ def build_parser():
            "controlled by --fill-scope-widening.",
   )
   g_search.add_argument(
-      "--dominance", action="store_true",
+      "--dominance", action=argparse.BooleanOptionalAction, default=False,
       help="DOMINANCE pruning (spec 8.3, 'same node modulo free robots'): among currently-"
            "FREE arms of the same gripper kind, only the lowest-index one acts (idle twins "
            "are permutation-symmetric). Kills the x2-x3 idle-twin branching of pick/brace/"
@@ -1748,8 +1778,10 @@ def build_parser():
       help="Enable finite, assembly-authored sets of functionally equivalent mate "
            "orientations. One symbolic assemble edge tries the discrete relative "
            "quaternions in IK; the successful realization is retained by its witness. "
-           "Currently authored only for real-stool/yandv-stool legs (four quarter turns "
-           "about the long axis). Default off for exact compatibility.",
+           "Currently authored for the real-stool/yandv-stool legs (half turns), the "
+           "Fabrica Gamepad's square pins (quarter turns), and the Fabrica Circular Stool's "
+           "hexagonal pegs/square caps (six/four axial orientations). "
+           "Default off for exact compatibility.",
   )
   g_phys.add_argument(
       "--mate-wrench-limits", action=argparse.BooleanOptionalAction, default=True,
@@ -2392,9 +2424,10 @@ _SAVE_CONFIG_FIELDS = (
     "weight", "milestones", "milestones_anytime", "goal_on_table", "milestone_oracle",
     "fill_local_h", "fill_target_support_quotient", "fill_exact",
     "fill_greedy", "fill_incumbent_first",
-    "fill_policy_first", "fill_policy_guide", "fill_skeleton_first", "milestone_boundaries",
+    "fill_policy_first", "fill_policy_guide", "fill_skeleton_first",
+    "fill_action_widening", "milestone_boundaries",
     "fill_scope_widening", "fill_touch_all", "placement_yaw_widening",
-    "fill_window", "lazy_fills", "open_witness", "open_witness_batch",
+    "fill_window", "lns_window", "lazy_fills", "open_witness", "open_witness_batch",
     "open_witness_epochs", "lazy_edge_selector", "analytic_seed_cap", "ssik_seed_neighborhood",
     "ssik_neighborhood_cap", "fail_order", "empty_seed_refutes",
     "ik_positive_reuse", "assemble_ssik_pose_seeds", "assemble_ssik_pose_projection",
@@ -2530,6 +2563,12 @@ def _validate_solver_scoped_flags(cfg):
   would make an experiment look configured while doing nothing.
   """
   engine = _selected_solver_engine(cfg)
+  if cfg.lns_window is not None:
+    if engine != "milestones-anytime":
+      raise SystemExit("--lns-window requires --milestones-anytime; "
+                       f"selected engine is {engine}")
+    if cfg.lns_window < 1:
+      raise SystemExit("--lns-window must be >= 1 (omit it for the full horizon)")
   if cfg.grasp_local_widen and engine != "milestones":
     raise SystemExit("--grasp-local-widen requires the ordinary --milestones solver; "
                      f"selected engine is {engine}")
@@ -2571,6 +2610,9 @@ def _validate_solver_scoped_flags(cfg):
     if not (cfg.grasp_local_widen or cfg.placement_yaw_widening):
       raise SystemExit("--fill-policy-guide requires --grasp-local-widen or "
                        "--placement-yaw-widening; otherwise it has no fibre to widen")
+  if cfg.fill_action_widening and engine not in ("milestones", "milestones-anytime"):
+    raise SystemExit("--fill-action-widening is implemented only by milestone local fills; "
+                     f"selected engine is {engine}")
   return engine
 
 
@@ -2607,6 +2649,7 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         sig_collapsed_h=cfg.sig_collapsed_h, labeled_h=cfg.labeled_h,
         collapsed_h=cfg.collapsed_h, grasp_collapsed_h=cfg.grasp_collapsed_h,
         fill_window=cfg.fill_window, milestone_oracle=cfg.milestone_oracle,
+        lns_window=cfg.lns_window,
         fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
         fill_target_support_quotient=cfg.fill_target_support_quotient,
         fill_greedy=cfg.fill_greedy,
@@ -2614,6 +2657,7 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         fill_policy_first=cfg.fill_policy_first,
         fill_policy_guide=cfg.fill_policy_guide,
         fill_skeleton_first=cfg.fill_skeleton_first,
+        fill_action_widening=cfg.fill_action_widening,
         fill_scope_widening=cfg.fill_scope_widening,
         milestone_boundaries=cfg.milestone_boundaries,
         placement_yaw_widening=cfg.placement_yaw_widening)
@@ -2687,6 +2731,7 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         fill_policy_first=cfg.fill_policy_first,
         fill_policy_guide=cfg.fill_policy_guide,
         fill_skeleton_first=cfg.fill_skeleton_first,
+        fill_action_widening=cfg.fill_action_widening,
         fill_scope_widening=cfg.fill_scope_widening,
         milestone_boundaries=cfg.milestone_boundaries,
         grasp_local_widen=cfg.grasp_local_widen,
@@ -2729,6 +2774,7 @@ def _milestone_candidate_session(cfg, C, assembly, robots, robot_ik):
       fill_policy_first=cfg.fill_policy_first,
       fill_policy_guide=cfg.fill_policy_guide,
       fill_skeleton_first=cfg.fill_skeleton_first,
+      fill_action_widening=cfg.fill_action_widening,
       fill_scope_widening=cfg.fill_scope_widening,
       milestone_boundaries=cfg.milestone_boundaries,
       grasp_local_widen=cfg.grasp_local_widen,
@@ -3433,6 +3479,10 @@ def run(cfg, explicit=None):
   if cfg.fill_scope_widening:
     print("[flag] --fill-scope-widening ACTIVE: a failed local-scope fill is retried with "
           "all-part manipulation before the milestone is rejected.")
+  if cfg.fill_action_widening:
+    print("[flag] --fill-action-widening ACTIVE: local fills search nested concrete "
+          "action alphabets (direct transport -> handover -> configured placement/bracing); "
+          "restricted failures only widen and never declare infeasibility.")
   if cfg.fill_touch_all:
     print("[flag] --fill-touch-all ACTIVE: fills skip the cheap local-scope pass and may "
           "manipulate any part immediately; only their requested join may assemble and "
@@ -3635,7 +3685,9 @@ def run(cfg, explicit=None):
           f"rung, monotone incumbent bound).")
   if cfg.milestones_anytime is not None:
     print(f"[flag] --milestones-anytime ACTIVE: budget {cfg.milestones_anytime:g}s "
-          f"(milestone incumbent -> k=1..{cfg.fill_window} LNS improvement; "
+          f"(milestone incumbent -> k=1.."
+          f"{cfg.lns_window if cfg.lns_window is not None else 'full horizon'} LNS; "
+          "each window greedy -> bounded w=1; "
           "PEA-greedy feasibility net only if the incumbent phase is cut).")
   if cfg.corridor_h:
     print("[flag] --corridor-h ACTIVE: phase-2 heuristic built only up to the incumbent "
@@ -3863,7 +3915,7 @@ def run(cfg, explicit=None):
       print("[closure-viz] add --viser (recommended) or --view to display the sweep")
     return
 
-  if cfg.viz_grasps or cfg.viz_rest_poses:
+  if cfg.viz_grasps or cfg.viz_rest_poses or cfg.viz_rest_poses_grid:
     rec = None
     if cfg.viser:
       from viser_view import ViserRecorder
@@ -3878,6 +3930,8 @@ def run(cfg, explicit=None):
       visualize_grasps_viser(C, assembly, recorder=rec, view=cfg.view, useful=U)
     if cfg.viz_rest_poses:
       visualize_rest_poses_viser(C, assembly, recorder=rec, view=cfg.view)
+    if cfg.viz_rest_poses_grid:
+      visualize_rest_poses_grid_viser(C, assembly, recorder=rec, view=cfg.view)
     if rec is not None:
       rec.serve(port=cfg.viser_port)
     return
@@ -4207,6 +4261,15 @@ def run(cfg, explicit=None):
       robot_ik.fail_recorder = fail_rec
       robot_ik.fail_log_seconds = cfg.log_ik_failures
       robot_ik.fail_log_stop = True                # abort the search when the window closes
+    _bench_profile = (_os.environ.get("ASSEMBLY_BENCH_PROFILE", "").strip().lower()
+                      not in ("", "0", "false", "no"))
+    _bench_search_t0 = None
+    if _bench_profile and not cfg.load_plan:
+      import problem as _bench_problem
+      import wrench as _bench_wrench
+      _bench_problem.reset_grasp_timing()
+      _bench_wrench.reset_wrench_timing()
+      _bench_search_t0 = _time.perf_counter()
     if cfg.load_plan:
       # RE-RUN THE POST-PASSES ON A PLAN YOU ALREADY TRUST -- no search.
       # Modern saved plans persist the resolved solver settings as reproducibility provenance,
@@ -4254,6 +4317,24 @@ def run(cfg, explicit=None):
       _pre = isolated_graspability_report(
           C, assembly, robots, _pre_checker, _pre_table,
           require_closure=bool(cfg.grasp_closure_check), robot_ik=robot_ik, verbose=True)
+      if cfg.grasp_sampler_scenes:
+        # The two marginal counts printed by the sampler are not enough to diagnose a
+        # transport funnel: a database can contain many pick-clear rows and many
+        # assembly-clear rows while their intersection is empty.  Report the exact finite
+        # overlap per end-effector kind.  This is cached metadata only; it performs no IK and
+        # has no effect on candidate ordering or feasibility.
+        from problem import sampled_grasp_meta
+        _kinds = sorted(set(_pre_checker._robot_kind.get(r, r) for r in robots))
+        for _p in assembly.objects:
+          _meta = sampled_grasp_meta(assembly.grasp_shape(_p), part=_p)
+          _rows = []
+          for _kind in _kinds:
+            _pick = {i for i, m in enumerate(_meta)
+                     if "pick" in (m.get("scene_by_kind", {}).get(_kind, ()) if m else ())}
+            _asm = {i for i, m in enumerate(_meta)
+                    if "assemble" in (m.get("scene_by_kind", {}).get(_kind, ()) if m else ())}
+            _rows.append(f"{_kind}: pick={len(_pick)} asm={len(_asm)} both={len(_pick & _asm)}")
+          print(f"[grasp-scenes] {_p}: " + ", ".join(_rows))
       if hasattr(_pre_table, "materialized"):
         print(f"[component-grasps/preflight] materialized {_pre_table.materialized}/"
               f"{len(_pre_table)} component tables ({_pre_table.materialized_rows} rows).")
@@ -4457,6 +4538,16 @@ def run(cfg, explicit=None):
       # A1 INSTRUMENTATION: where the real-IK time went + a peak-RSS checkpoint (A6).
       robot_ik.prof_report()
       print(f"[rss] peak RSS after solve attempt: {_rss_mb():.0f} MB")
+    if _bench_search_t0 is not None:
+      import problem as _bench_problem
+      import wrench as _bench_wrench
+      _gp = _bench_problem.grasp_timing_snapshot()
+      _wp = _bench_wrench.wrench_timing_snapshot()
+      print(f"[search-phase-prof] pipeline={_time.perf_counter() - _bench_search_t0:.6f}s "
+            f"grasp={_gp['s']:.6f}s/{_gp['calls']} "
+            f"grasp_backward={_gp['backward_s']:.6f}s/{_gp['backward_calls']} "
+            f"force_lp_backward={_wp['backward_s']:.6f}s/{_wp['backward_calls']} "
+            f"force_lp_forward={_wp['forward_s']:.6f}s/{_wp['forward_calls']}")
     if fail_rec is not None and fail_rec.steps:
       print(f"[ik-failures] {len(fail_rec.steps)} failed binds recorded -- serving in "
             f"viser (Stop in the GUI to continue to the plan replay).")
@@ -4605,6 +4696,7 @@ def run(cfg, explicit=None):
       opt_witnesses = baseline_witnesses
       opt_pre_witnesses = baseline_pre_witnesses
       witness_alts = None                                    # --witness-sets alternatives
+      optimization_candidates = None                         # witness optimizer's ladder
       _reuse_final = False
       if (plan is not None and cfg.optimize_witnesses is not None
           and not (cfg.motion_plan and cfg.mp_export_load)):
@@ -4620,7 +4712,7 @@ def run(cfg, explicit=None):
                               and baseline_witnesses is not None
                               and _saved_witness_stage == "optimized")
           if _reuse_final:
-            from plan_io import read_witness_sets
+            from plan_io import read_optimization_candidates, read_witness_sets
             if opt_witnesses is not None:
               print(f"[witness-reuse] {sum(w is not None for w in opt_witnesses)} persisted "
                     f"witnesses loaded from {cfg.load_plan}; witness optimization SKIPPED "
@@ -4631,6 +4723,11 @@ def run(cfg, explicit=None):
                 if witness_alts:
                   print(f"[witsets-reuse] {len(witness_alts)} persisted witness set(s) "
                         f"loaded from {cfg.load_plan}.")
+              optimization_candidates = read_optimization_candidates(
+                  cfg.load_plan, list(robot_ik.C.getJointNames()), len(plan))
+              if optimization_candidates:
+                print(f"[witopt-candidates] {len(optimization_candidates)} persisted "
+                      f"optimizer candidate pool(s) loaded from {cfg.load_plan}.")
           if not _reuse_final and cfg.optimize_witnesses == "floor":
             from witness_floor import optimize_witnesses_floor
             # floor mode CONSTRAINS clearance (a per-step normalised floor) rather than
@@ -4656,6 +4753,7 @@ def run(cfg, explicit=None):
                 witness_sets=cfg.witness_sets, set_spread=cfg.witness_set_spread,
                 baseline_witnesses=baseline_witnesses)
             witness_alts = _rep.get("wit_alts") or None
+            optimization_candidates = _rep.get("optimization_candidates") or None
           elif not _reuse_final:
             opt_witnesses, _rep = optimize_witnesses(
                 C, assembly, plan, robots, robot_ik, cost=cfg.optimize_witnesses,
@@ -4664,6 +4762,7 @@ def run(cfg, explicit=None):
                 bracing=cfg.bracing, clear_weight=cfg.witness_clearance,
                 robot_collisions=cfg.witness_robot_collisions,
                 baseline_witnesses=baseline_witnesses)
+            optimization_candidates = _rep.get("optimization_candidates") or None
       _has_path_skill = bool(plan and any(
           a and a[0] == "assemble" and assembly.screw_skill(a[2]) is not None
           for a in plan))
@@ -4697,6 +4796,10 @@ def run(cfg, explicit=None):
           if witness_alts:
             witness_alts = {i: ms for i, ms in witness_alts.items()
                             if np.allclose(ms[0], opt_witnesses[i], atol=1e-9, rtol=0.0)}
+          if optimization_candidates:
+            optimization_candidates = {
+                i: ms for i, ms in optimization_candidates.items()
+                if np.allclose(ms[0], opt_witnesses[i], atol=1e-9, rtol=0.0)}
       # Search-stage plans already loaded their matching pre_wit block above.  Re-solving
       # those mouths is both unnecessary and non-reproducible: a fresh optimizer can land in
       # another basin and make an otherwise complete saved certificate fail during replay.
@@ -4727,6 +4830,7 @@ def run(cfg, explicit=None):
         save_plan(cfg.save, cfg, plan,
                   witnesses=witness_block(joint_names, opt_witnesses,
                                           alts=witness_alts,
+                                          optimization_candidates=optimization_candidates,
                                           stage=("optimized" if cfg.optimize_witnesses is not None
                                                  else "search"),
                                           skill_paths=skill_paths,

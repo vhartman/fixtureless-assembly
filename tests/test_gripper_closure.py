@@ -30,7 +30,33 @@ def test_robotiq_virtual_close_finds_object_dependent_aperture():
   out = certify(_robotiq_scene(), "x_", "obj_0")
   assert out.feasible and out.model == "robotiq"
   assert 0.0 < out.aperture < 0.042
-  assert VERSION >= 1
+  assert VERSION >= 2
+
+
+def test_virtual_close_rejects_an_off_centre_bilateral_grasp():
+  """A common aperture must not reach one jaw by driving the other through the part."""
+  C = _robotiq_scene()
+  centre = np.asarray(C.getFrame("x_ur_gripper_center").getPosition(), dtype=float)
+  # A 5mm shift along the pinch axis is comfortably inside the total jaw stroke, so both
+  # fingers can individually reach.  It is nevertheless not a valid rigid, symmetric grasp:
+  # closing to the later contact penetrates the early side by about 10mm.
+  C.getFrame("obj_0").setPosition(centre + np.array([0.0, .005, 0.0]))
+  C.setJointState(C.getJointState())
+
+  out = certify(C, "x_", "obj_0")
+  assert not out.feasible
+  assert out.reason == "miscentred-contact"
+  assert out.detail is not None and out.detail[2] < -.005
+
+
+def test_virtual_close_keeps_submillimetre_centring_noise_feasible():
+  C = _robotiq_scene()
+  centre = np.asarray(C.getFrame("x_ur_gripper_center").getPosition(), dtype=float)
+  C.getFrame("obj_0").setPosition(centre + np.array([0.0, .0005, 0.0]))
+  C.setJointState(C.getJointState())
+
+  out = certify(C, "x_", "obj_0")
+  assert out.feasible
 
 
 def test_virtual_close_rejects_collision_only_in_sweep():

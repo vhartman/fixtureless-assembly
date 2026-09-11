@@ -184,7 +184,7 @@ def test_milestone_anytime_uses_deadline_fair_open_witness_and_restores_cap(monk
   assert rik.open_witness_epochs == 2
 
 
-def test_milestone_anytime_improves_with_two_window_lns_not_full_astar(monkeypatch):
+def test_milestone_anytime_defaults_to_full_horizon_lns_not_separate_full_astar(monkeypatch):
   inc = [("release", "a1", "obj")]
   seen = {}
 
@@ -217,7 +217,7 @@ def test_milestone_anytime_improves_with_two_window_lns_not_full_astar(monkeypat
       object(), object(), robots=("a1",), time_budget=20.0, verbose=False,
       fill_window=2)
   assert out == inc
-  assert seen == {"plan": inc, "k_max": 2}
+  assert seen == {"plan": inc, "k_max": None}
 
 
 def test_lns_refill_uses_astar_and_freezes_parts_outside_destroyed_span(monkeypatch):
@@ -405,11 +405,13 @@ def test_lns_uses_weight_one_cleanup_then_weighted_wider_windows(monkeypatch, ca
       weight=5.0, max_nodes=20000, verbose=True, h_lab=H(), deadline=end,
       k_max=2)
   assert plan == [a1, a2]
-  assert [weight for _deadline, weight in calls] == [1.0, 1.0, 5.0]
-  assert calls[0][0] < calls[1][0] < calls[2][0] <= end
+  assert [weight for _deadline, weight in calls] == [
+      float("inf"), 1.0, float("inf"), 1.0, float("inf"), 1.0]
+  assert all(calls[j][0] < calls[j + 1][0] for j in (0, 2, 4))
+  assert calls[-1][0] <= end
   out = capsys.readouterr().out
-  assert out.count("[lns-window]") == 3
-  assert "w=1" in out and "w=5" in out
+  assert out.count("[lns-window]") == 6
+  assert "pass=greedy w=inf" in out and "pass=exact w=1" in out
   assert "expanded=7" in out and "peak-open=11" in out and "IK=2(1f)" in out
 
 
@@ -475,11 +477,54 @@ def test_lns_endpoint_pdb_bound_skips_only_exact_splice_window(monkeypatch, caps
   assert endpoint_calls == [(s0, s1,
                              [("obj_0",), ("obj_0", "obj_1")])]
   # The final window has a set-valued assembly goal, not the exact incumbent endpoint.
-  assert len(refills) == 1
-  assert refills[0][0][0] is s1 and refills[0][0][2] is None
+  assert len(refills) == 2
+  assert all(call[0][0] is s1 and call[0][2] is None for call in refills)
+  assert [call[0][8] for call in refills] == [float("inf"), 1.0]
   out = capsys.readouterr().out
   assert "outcome=endpoint-bound" in out
   assert "status=bounded-out" in out
+
+
+def test_lns_greedy_incumbent_tightens_the_weight_one_bound(monkeypatch):
+  class State(_State):
+    def key(self):
+      return self.name
+
+    def subassemblies(self):
+      return (("obj_0",), ("obj_1",)) if self.name == "s0" else (("obj_0", "obj_1"),)
+
+  s0, s1 = State("s0"), State("s1")
+  assemble = ("assemble", "a1", "obj_1", "obj_0")
+
+  class Assembly:
+    base = "obj_0"
+    objects = ("obj_0", "obj_1")
+
+  class H:
+    def value(self, _state):
+      return 0.0
+
+  monkeypatch.setattr(solver_mod, "get_initial_state", lambda *_args: s0)
+  monkeypatch.setattr(
+      solver_mod, "successors",
+      lambda state, *_args, **_kwargs: [(assemble, s1)] if state is s0 else [])
+  monkeypatch.setattr(
+      solver_mod, "_part_mated",
+      lambda state, part: part == "obj_0" or state is s1)
+  calls = []
+
+  def fake_refill(*args, **kwargs):
+    calls.append((args[8], kwargs["cost_bound"]))
+    kwargs["stats"].update(outcome="found", wall=0.0)
+    return [] if args[8] == float("inf") else None
+
+  monkeypatch.setattr(solver_mod, "_refill_window", fake_refill)
+  out = solver_mod._lns_improve(
+      [assemble], object(), Assembly(), ("a1",), object(), object(), None,
+      weight=5.0, max_nodes=20000, verbose=False, h_lab=H())
+
+  assert out == []
+  assert calls == [(float("inf"), solver_mod.action_cost(assemble)), (1.0, 0)]
 
 
 def test_open_scheduler_replans_immediately_after_first_failed_plan_edge():

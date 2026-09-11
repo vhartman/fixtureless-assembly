@@ -54,6 +54,12 @@ def test_mate_symmetry_flag_is_opt_in():
   assert main.parse_args(["--mate-symmetry", "--no-mate-symmetry"]).mate_symmetry is False
 
 
+def test_real_arm_dominance_can_be_disabled_when_loading_a_floating_config():
+  assert main.parse_args([]).dominance is False
+  assert main.parse_args(["--dominance"]).dominance is True
+  assert main.parse_args(["--dominance", "--no-dominance"]).dominance is False
+
+
 def test_dict_roundtrip_and_unknown_key():
   rc = RunConfig(assembly="chair", parts=8, milestones=True, insert_force=25.0)
   assert RunConfig.from_dict(rc.to_dict()) == rc
@@ -136,6 +142,7 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
                   fill_policy_first=True,
                   fill_policy_guide=True,
                   fill_skeleton_first=True,
+                  fill_action_widening=True,
                   fill_scope_widening=True, milestone_boundaries=3,
                   wrench_aware_h=False)
   assert main._dispatch_solve(cfg, None, None, [], None) == []
@@ -146,6 +153,7 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
   assert seen["fill_policy_first"] is True
   assert seen["fill_policy_guide"] is True
   assert seen["fill_skeleton_first"] is True
+  assert seen["fill_action_widening"] is True
   assert seen["fill_scope_widening"] is True
   assert seen["milestone_boundaries"] == 3
   assert seen["wrench_aware_h"] is False
@@ -160,6 +168,8 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
   assert main.parse_args(["--no-fill-greedy"]).fill_greedy is False
   assert main.parse_args(["--fill-incumbent-first"]).fill_incumbent_first is True
   assert main.parse_args(["--fill-skeleton-first"]).fill_skeleton_first is True
+  assert main.parse_args(["--fill-action-widening"]).fill_action_widening is True
+  assert main.parse_args(["--no-fill-action-widening"]).fill_action_widening is False
   assert main.parse_args(["--fill-policy-first"]).fill_policy_first is True
   assert main.parse_args(["--no-fill-policy-first"]).fill_policy_first is False
   assert main.parse_args(["--fill-policy-guide"]).fill_policy_guide is True
@@ -220,6 +230,15 @@ def test_standard_uses_greedy_local_fills_without_changing_global_weight():
   assert cfg.fill_greedy is True
   assert cfg.fill_exact is False
   assert cfg.weight == 1.0
+  assert cfg.mate_symmetry is True
+  assert cfg.grasp_sampler_keep == 64
+  assert cfg.grasp_sampler_candidates == 96
+  assert cfg.grasp_widen is False
+  staged = main.parse_args([
+      "--search-profile", "standard", "--grasp-sampler-keep", "20",
+      "--grasp-widen", "--grasp-widen-batch", "8", "--grasp-widen-max", "96",
+  ])
+  assert staged.grasp_sampler_keep == 20 and staged.grasp_widen is True
 
 
 def test_milestone_anytime_receives_greedy_incumbent_policy(monkeypatch):
@@ -239,6 +258,15 @@ def test_milestone_anytime_receives_greedy_incumbent_policy(monkeypatch):
   assert seen["fill_exact"] is False
   assert seen["weight"] == 1.0
   assert seen["placement_yaw_widening"] is True
+  assert seen["lns_window"] is None
+
+
+def test_lns_window_is_an_explicit_anytime_only_cap():
+  cfg = main.parse_args(["--milestones-anytime", "30", "--lns-window", "3"])
+  assert cfg.lns_window == 3
+  assert main._validate_solver_scoped_flags(cfg) == "milestones-anytime"
+  with pytest.raises(SystemExit, match="requires --milestones-anytime"):
+    main._validate_solver_scoped_flags(RunConfig(milestones=True, lns_window=3))
 
 
 def test_solver_scoped_policy_flags_fail_closed_in_other_engines():

@@ -117,6 +117,7 @@ def test_manifest_rejects_ambiguous_variant_and_matrix_products():
                                    "fixture_support_diagnostic.json",
                                    "paper_search_matrix.json",
                                    "paper_search_stress_4r.json",
+                                   "paper_search_comparison.json",
                                    "search_finalists_4r.json",
                                    "search_manipulation_scope_ablation.json",
                                    "cube_scaling.json", "cube_scaling_piecewise.json",
@@ -164,6 +165,7 @@ def test_log_parser_extracts_backward_and_ik_work():
 [ik-reuse] positive certificates: 44 accepted / 47 tried in 0.13s; library=143 vectors over 143 kinematic cores.
 [ik-reuse] negative diagnostic ONLY (no pruning): 3 repeated exact-scene failures / 0.4s; 428 cross-scene same-core repeats / 16.6s optimistic nogood upper bound.
 [ik-reuse] physical-query invariant: 37 symbolic aliases collapsed across 211 physical queries; exact witnesses and open failure effort are shared under the skill-local equivalence.
+[search-phase-prof] pipeline=300.000000s grasp=8.000000s/12 grasp_backward=2.000000s/3 force_lp_backward=3.000000s/90 force_lp_forward=1.500000s/45
 [pick-prof obj_1:ok-open] binds=120/100f targets=30 table-scenes=40 exact-query-reprobes=80; robots: a1=60/50f,15t/20s, a2=60/50f,15t/20s
 [pick-prof] 300 binds/250 failed over 70 exact robot-grasp targets and 95 physical table scenes; exact-query reprobes=205; by robot: a1=150/125f,35 targets/48 scenes, a2=150/125f,35 targets/47 scenes
 [fill-policy-widen obj_2] Bellman frontier adds one grasp batch (loose, context=('obj_2',), part=obj_2, class=1) ids [20, 21]; 1 demand batch(es) remain. One bounded forward-IK epoch; activated columns remain available to later policy branches.
@@ -193,6 +195,13 @@ def test_log_parser_extracts_backward_and_ik_work():
   assert got["ik_negative_core_repeats"] == 428
   assert got["ik_negative_core_repeat_s"] == 16.6
   assert got["ik_physical_aliases"] == 37 and got["ik_physical_queries"] == 211
+  assert got["search_pipeline_s"] == 300.0
+  assert got["grasp_generation_s"] == 8.0 and got["grasp_generation_calls"] == 12
+  assert got["grasp_backward_s"] == 2.0 and got["grasp_backward_calls"] == 3
+  assert got["backward_force_lp_s"] == 3.0 and got["backward_force_lp_calls"] == 90
+  assert got["forward_force_lp_s"] == 1.5 and got["forward_force_lp_calls"] == 45
+  assert got["backward_graph_search_s"] == 9.5
+  assert abs(got["forward_search_s"] - 7.3) < 1e-9
   assert got["pick_profile_binds"] == 300
   assert got["pick_profile_failures"] == 250
   assert got["pick_profile_targets"] == 70
@@ -256,6 +265,19 @@ def test_aggregate_keeps_failures_in_success_rate_but_not_numeric_means():
   assert got["skeleton_successful_fills_mean"] == 3.0
   assert got["skeleton_fallback_fills_mean"] == 1.0
   assert got["skeleton_probe_s_mean"] == 0.5
+
+
+def test_aggregate_preserves_resource_failure_kinds():
+  rows = [
+      {"case": "a", "variant": "x", "status": "oom", "success": False,
+       "timed_out": False, "out_of_memory": True},
+      {"case": "a", "variant": "x", "status": "timeout", "success": False,
+       "timed_out": True, "out_of_memory": False},
+  ]
+  got = B.aggregate(rows)[0]
+  assert got["out_of_memory"] == 1
+  assert got["timeouts"] == 1
+  assert got["errors"] == 0 and got["no_plans"] == 0
 
 
 def test_matrix_markdown_reports_method_by_physics_cells():
@@ -351,6 +373,21 @@ def test_full_process_wrench_controls_are_not_duplicated_per_lambda(
   assert all(C._flag_value(r["args"], "--assembly") == assembly for r in runs)
   assert all("--no-wrench" in r["args"] and "--insert-force" not in r["args"]
              for r in runs)
+
+
+@pytest.mark.parametrize("name,n_runs,assembly", [
+    ("cube_piecewise_process_wrench_full_optimistic_no_wrench.json", 33,
+     "cube-sequence-2x2x3"),
+    ("cross_process_wrench_full_optimistic_no_wrench.json", 18, "cross"),
+])
+def test_full_process_wrench_optimistic_controls_are_matched(name, n_runs, assembly):
+  path = B.ROOT / "benchmarks" / "manifests" / name
+  runs = B.expand_runs(B.validate_manifest(json.loads(path.read_text())))
+  assert len(runs) == n_runs
+  assert all(C._flag_value(r["args"], "--assembly") == assembly for r in runs)
+  assert all("--no-wrench" in r["args"] and "--optimistic" in r["args"]
+             and "--no-optimistic-fallback" in r["args"]
+             and "--insert-force" not in r["args"] for r in runs)
 
 
 def test_wrench_envelope_scaling_is_12_by_5_and_changes_all_vacuum_caps():

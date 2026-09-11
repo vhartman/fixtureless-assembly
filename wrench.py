@@ -21,10 +21,79 @@ Conventions: wrenches are 6-vectors [fx,fy,fz, tx,ty,tz] taken about the WORLD O
 force f applied at world point p is the wrench [f, p x f]. Quasi-static, gravity is -z.
 """
 
+import os
+import time
+
 import numpy as np
 from collections import OrderedDict
 from itertools import combinations
 from scipy.optimize import linprog
+
+# Lightweight benchmark instrumentation.  The planner normally calls HiGHS through either
+# scipy.optimize.linprog or the persistent highspy model below; timing only linprog therefore
+# under-reports the force-feasibility work on machines with highspy installed.  Keep the
+# accounting here, immediately around the actual optimizer call, and let callers mark reverse
+# heuristic construction with ``wrench_timing_phase("backward")``.  It is deliberately dormant
+# unless ASSEMBLY_BENCH_PROFILE is set, so ordinary planning does not pay for perf_counter calls.
+_WRENCH_TIMING_ENABLED = os.environ.get("ASSEMBLY_BENCH_PROFILE", "").strip().lower() not in (
+    "", "0", "false", "no")
+_WRENCH_TIMING_PHASE = "forward"
+_WRENCH_TIMING = {
+    "backward_calls": 0, "backward_s": 0.0,
+    "forward_calls": 0, "forward_s": 0.0,
+}
+
+
+class wrench_timing_phase:
+  """Temporarily attribute equilibrium optimizer calls to a planner phase."""
+
+  def __init__(self, phase):
+    self.phase = phase
+    self.previous = None
+
+  def __enter__(self):
+    global _WRENCH_TIMING_PHASE
+    self.previous = _WRENCH_TIMING_PHASE
+    _WRENCH_TIMING_PHASE = self.phase
+    return self
+
+  def __exit__(self, _typ, _value, _traceback):
+    global _WRENCH_TIMING_PHASE
+    _WRENCH_TIMING_PHASE = self.previous
+
+
+def _record_wrench_optimizer(dt):
+  if not _WRENCH_TIMING_ENABLED:
+    return
+  phase = "backward" if _WRENCH_TIMING_PHASE == "backward" else "forward"
+  _WRENCH_TIMING[f"{phase}_calls"] += 1
+  _WRENCH_TIMING[f"{phase}_s"] += float(dt)
+
+
+def reset_wrench_timing():
+  for key in tuple(_WRENCH_TIMING):
+    _WRENCH_TIMING[key] = 0.0 if key.endswith("_s") else 0
+
+
+def wrench_timing_snapshot():
+  return dict(_WRENCH_TIMING)
+
+
+def current_wrench_timing_phase():
+  """Expose the current attribution label to other benchmarked preprocessing stages."""
+  return _WRENCH_TIMING_PHASE
+
+
+def profile_wrench_phase(phase):
+  """Decorator used by backward-search constructors and lazy reverse expansions."""
+  def decorate(fn):
+    def wrapped(*args, **kwargs):
+      with wrench_timing_phase(phase):
+        return fn(*args, **kwargs)
+    wrapped.__name__ = getattr(fn, "__name__", "wrapped")
+    wrapped.__doc__ = getattr(fn, "__doc__")
+    return wrapped
+  return decorate
 
 try:
   import highspy                                            # optional: warm-startable LP backend
@@ -642,7 +711,10 @@ def _hs_feasible(geo_key, G, ub, beq):
   h, _ = _hs_model(geo_key, G, ub)
   for i in range(G.shape[0]):
     h.changeRowBounds(i, float(beq[i]), float(beq[i]))
+  t0 = time.perf_counter() if _WRENCH_TIMING_ENABLED else None
   h.run()
+  if t0 is not None:
+    _record_wrench_optimizer(time.perf_counter() - t0)
   return h.getModelStatus() == _HS_OPTIMAL                  # 0-objective LP: optimal <=> feasible
 
 
@@ -678,8 +750,11 @@ def equilibrium_solution(G, ub, w_external, bounds=None):
     return bool(np.linalg.norm(w_external) < 1e-9), np.zeros(0)
   if bounds is None:
     bounds = [(0.0, None if not np.isfinite(u) else float(u)) for u in ub]
+  t0 = time.perf_counter() if _WRENCH_TIMING_ENABLED else None
   res = linprog(c=np.zeros(G.shape[1]), A_eq=G, b_eq=-np.asarray(w_external, dtype=float),
                 bounds=bounds, method="highs")
+  if t0 is not None:
+    _record_wrench_optimizer(time.perf_counter() - t0)
   return bool(res.status == 0), (res.x if res.status == 0 else np.zeros(G.shape[1]))
 
 
@@ -719,7 +794,10 @@ def equilibrium_feasible_matrices(G, ub, w_external, tol=1e-6, bounds=None, geo_
           return True                                       # explicit feasible point -> accept
   if bounds is None:
     bounds = [(0.0, None if not np.isfinite(u) else float(u)) for u in ub]
+  t0 = time.perf_counter() if _WRENCH_TIMING_ENABLED else None
   res = linprog(c=np.zeros(G.shape[1]), A_eq=G, b_eq=beq, bounds=bounds, method="highs")
+  if t0 is not None:
+    _record_wrench_optimizer(time.perf_counter() - t0)
   _WARM[1] += 1
   if res.success and geo_key is not None and _WARM_ON:
     nb = _extract_basis(G, np.asarray(ub, float), np.asarray(res.x, float))
@@ -791,6 +869,9 @@ def equilibrium_robust_affine(G, ub, w0, deltas, bounds=None, tol=1e-6):
   vb = [(0.0, None if not fin[k] else float(ub[k])) for k in range(K)]   # lam0 in [0,ub]
   vb += [(None, None)] * (K * m)                                         # lam_j free
   vb += [(0.0, None)] * (K * m)                                          # t_j >= 0
+  t0 = time.perf_counter() if _WRENCH_TIMING_ENABLED else None
   res = linprog(np.zeros(n), A_ub=np.vstack(rows), b_ub=np.concatenate(bub),
                 A_eq=A_eq, b_eq=b_eq, bounds=vb, method="highs")
+  if t0 is not None:
+    _record_wrench_optimizer(time.perf_counter() - t0)
   return bool(res.success)

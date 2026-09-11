@@ -43,7 +43,7 @@ def test_joints_are_exactly_rais_joints():
   assert sorted(jnames) == sorted(rai)
 
 
-@pytest.mark.parametrize("robot", ["ur5", "openarm"])
+@pytest.mark.parametrize("robot", ["ur10", "ur5", "openarm"])
 def test_articulated_gripper_hinges_are_sim_only_and_actuated(robot):
   """Finger export uses real hinges/actuators without entering the planner arm vector."""
   C = _env(robot) if robot != "openarm" else make_openarm_duo_env()

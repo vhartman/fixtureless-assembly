@@ -24,7 +24,7 @@ import robotic as ry
 
 
 class ViserRecorder:
-  def __init__(self):
+  def __init__(self, hide_collision_primitives=False):
     self.geometry = {}                    # name -> (verts, tris, color_rgb, opacity)
     self.markers = {}                     # name -> axes_length (rai ST.marker frames)
     self.steps = []                       # [{name: (pos3, wxyz4)}]
@@ -32,6 +32,31 @@ class ViserRecorder:
     self.step_vectors = []                # one list per step: (start3, end3, rgb) arrows
                                           # (forces red, torques blue, press orange)
     self.step_interfaces = []             # one list per step: mate-interface crosses (green)
+    self.hide_collision_primitives = bool(hide_collision_primitives)
+    self.hidden_collision_primitives = set()
+
+  def _is_display_collision_primitive(self, frame):
+    """Whether a frame is a redundant collision proxy rather than display geometry.
+
+    We cannot hide every collidable frame: primitive-only assembly parts and the table are
+    both collision geometry *and* their intended appearance. Robot/link proxies, gripper
+    capsules, and imported-object hull overlays are instead conventionally translucent or
+    named ``coll*`` and have separate opaque visual geometry. The combined test preserves
+    primitive-only scene objects while removing the white proxy skeletons from paper/debug
+    views.
+    """
+    if not self.hide_collision_primitives:
+      return False
+    info = frame.info()
+    if bool(info.get("visual", False)):
+      return False
+    name = frame.name.lower()
+    named_proxy = ("coll" in name or "collision" in name)
+    color = info.get("color", ())
+    translucent = (hasattr(color, "__len__") and len(color) >= 4
+                   and float(color[3]) < 0.999)
+    contact = float(info.get("contact", 0.0) or 0.0)
+    return named_proxy or (contact < 0.0 and translucent)
 
   def record(self, C, label="", vectors=None, interfaces=None):
     """Snapshot every mesh-bearing frame of `C` as one step. Geometry is captured the
@@ -40,6 +65,9 @@ class ViserRecorder:
     snap = {}
     for frame in C.getFrames():
       name = frame.name
+      if self._is_display_collision_primitive(frame):
+        self.hidden_collision_primitives.add(name)
+        continue
       if name not in self.geometry and name not in self.markers:
         verts = np.asarray(frame.getMeshPoints(), dtype=np.float32)
         tris = np.asarray(frame.getMeshTriangles(), dtype=np.uint32)
@@ -70,6 +98,96 @@ class ViserRecorder:
     self.labels.append(label)
     self.step_vectors.append(list(vectors) if vectors else [])
     self.step_interfaces.append(list(interfaces) if interfaces else [])
+
+  def snapshot_poses(self, C, names=None):
+    """Snapshot poses for geometry already known to the recorder.
+
+    Used for diagnostic ghost layers after the opaque canonical step has been recorded.
+    Requiring known geometry keeps an alternative from silently changing the scene model.
+    """
+    available = set(C.getFrameNames())
+    requested = (list(self.geometry) + list(self.markers)
+                 if names is None else list(names))
+    return {
+        name: (np.asarray(C.getFrame(name).getPosition(), dtype=np.float32),
+               np.asarray(C.getFrame(name).getQuaternion(), dtype=np.float32))
+        for name in requested
+        if name in available}
+
+  def snapshot_poses(self, C):
+    """Snapshot poses for geometry already registered by :meth:`record`.
+
+    Alternative optimizer keyframes reuse the selected step's meshes but may move both arms
+    and attached payloads.  Capturing from a cloned, stateful replay configuration preserves
+    those kinematics without adding the alternative as another timeline step.
+    """
+    available = set(C.getFrameNames())
+    return {
+        name: (np.asarray(C.getFrame(name).getPosition(), dtype=np.float32),
+               np.asarray(C.getFrame(name).getQuaternion(), dtype=np.float32))
+        for name in list(self.geometry) + list(self.markers) if name in available
+    }
+
+  def overlay_alternatives(self, alternatives, count=4, opacity=0.18,
+                           description="witness alternatives"):
+    """Add alternative poses for the *same* recorded step as translucent ghost layers.
+
+    ``alternatives`` maps recorder step indices to lists of ``{frame_name: pose}`` snapshots;
+    the ordinary snapshot remains the opaque selected solution. This is intentionally agnostic
+    to how alternatives were produced. Saved-plan replay uses the persisted witness optimizer
+    ladder, so visualization never reruns optimization or IK.
+    """
+    count = int(count)
+    opacity = float(opacity)
+    if count < 2:
+      raise ValueError("alternative overlay count must be >= 2")
+    if not 0.0 < opacity < 1.0:
+      raise ValueError("alternative ghost opacity must lie strictly between 0 and 1")
+    if getattr(self, "_alternative_overlay_applied", False):
+      raise ValueError("alternative overlays have already been applied to this recording")
+
+    def same_pose(a, b):
+      pa, qa = a
+      pb, qb = b
+      return (np.allclose(pa, pb, atol=1e-7, rtol=0.0) and
+              (np.allclose(qa, qb, atol=1e-7, rtol=0.0) or
+               np.allclose(qa, -qb, atol=1e-7, rtol=0.0)))
+
+    used = set()
+    shown_steps = 0
+    max_layers = 0
+    for step_index, members in sorted(alternatives.items()):
+      if not 0 <= int(step_index) < len(self.steps):
+        raise ValueError(f"alternative overlay step {step_index} is out of range")
+      current = self.steps[int(step_index)]
+      shown = list(members)[:count - 1]
+      if not shown:
+        continue
+      max_layers = max(max_layers, len(shown))
+      for layer, member in enumerate(shown, 1):
+        for name, pose in member.items():
+          if name not in self.geometry:
+            continue
+          if name in current and same_pose(current[name], pose):
+            continue
+          ghost = f"keyframe_alt_{layer}/{name}"
+          current[ghost] = pose
+          used.add((layer, name))
+      self.labels[int(step_index)] += (
+          f"  |  selected candidate=0; translucent alternatives=1..{len(shown)}")
+      shown_steps += 1
+
+    for layer, name in sorted(used):
+      verts, tris, color, original_opacity = self.geometry[name]
+      alpha = 1.0 if original_opacity is None else original_opacity
+      alpha_scale = max(0.35, 1.0 - 0.18 * (layer - 1))
+      self.geometry[f"keyframe_alt_{layer}/{name}"] = (
+          verts, tris, color, opacity * alpha * alpha_scale)
+    self._alternative_overlay_applied = True
+    print(f"[viser] {description}: {shown_steps} keyframe(s), 1 opaque selected witness + "
+          f"up to {max_layers} translucent alternative(s) at opacity {opacity:g}; "
+          f"{len(used)} distinct ghost layer/mesh pairs")
+    return self
 
   def serve(self, port=8080, pause_time=0.5):
     """Open the viser server and block until Stop is pressed (or Ctrl-C)."""

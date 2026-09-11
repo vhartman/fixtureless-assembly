@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Sequential, resource-bounded Fabrica geometry/planning/execution smoke tests.
 
-Uses the named standard profiles, fresh plans and full part counts. Diagnostic reductions
+Uses the named standard profiles, fresh plans and full part counts.  Search is evaluated over
+a fixed 64-grasp alphabet: neither grasp-prefix widening nor action-family widening is used,
+so every model exercises the same complete local-fill algorithm. Diagnostic reductions
 (``--no-wrench``, ``--witness-sets 1``, ``--skip-witness-optimization``) must be requested
 explicitly. No collision exemptions
 or fallback to older plans/recordings are applied.
@@ -48,9 +50,9 @@ def main():
              "force metadata; inheriting the generic 10N default accidentally turns this "
              "geometry benchmark into a bracing stress test.")
     parser.add_argument(
-        "--wrench-profile", choices=["max_robotiq"], default=None, metavar="NAME",
-        help="optional persisted gripper capability profile; max_robotiq is a hardware "
-             "ceiling, not the pending measured slip calibration")
+        "--wrench-profile", choices=["max_robotiq"], default="max_robotiq", metavar="NAME",
+        help="persisted gripper capability profile (default max_robotiq, the hardware "
+             "ceiling rather than the pending measured slip calibration)")
     parser.add_argument("--witness-sets", type=int, default=None, metavar="K",
                         help="override the standard four IK branches (e.g. 1 for a diagnostic)")
     parser.add_argument("--skip-witness-optimization", action="store_true",
@@ -115,6 +117,11 @@ def main():
                        "--search-profile", "standard", "--solve", "--parts", str(MODELS[name]),
                        "--scatter-spacing", str(args.scatter_spacing),
                        "--insert-force", str(args.insert_force),
+                       # Keep grasp generation outside the search comparison.  K=64 contains
+                       # the late valid Plumbers Block contact (g55), while a single complete
+                       # local graph avoids the model-dependent action-widening schedule.
+                       "--grasp-sampler-keep", "64", "--grasp-sampler-candidates", "96",
+                       "--no-grasp-widen", "--no-fill-action-widening",
                        # These imported CAD models contain fitted mates.  A soft KOMO
                        # objective can be individually collision-free yet freeze a slightly
                        # off-pose attachment which overlaps after later mates are accumulated.

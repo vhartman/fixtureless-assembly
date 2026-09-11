@@ -107,7 +107,7 @@ def test_legacy_close_only_recording_recovers_open_commands(tmp_path):
   # were accidentally guarded by --animate-grippers.
   payload["gripper_events"] = np.asarray(json.dumps([
       {"event": "close_start", "robot": "a1", "part": "obj_0", "frame": 1},
-      {"event": "close_start", "robot": "a2", "part": "obj_1", "frame": 2},
+      {"event": "close_start", "robot": "a2", "part": "obj_0", "frame": 2},
   ]))
   payload["marks"] = np.asarray(json.dumps([
       [1, "('pick', 'a1', 'obj_0', 0)"],
@@ -116,10 +116,55 @@ def test_legacy_close_only_recording_recovers_open_commands(tmp_path):
   ]))
   np.savez_compressed(source, **payload)
 
-  E.export_recording(source, destination, sample_dt=0.1, grasp_wait=0.0)
+  E.export_recording(source, destination, sample_dt=0.1, grasp_wait=0.1)
   result = json.loads(destination.read_text())
   samples = result["samples"]
   assert samples[1]["closing_gripper"] == ["a1"]
-  assert samples[2]["closing_gripper"] == ["a2"]
-  assert samples[2]["opening_gripper"] == ["a1"]
-  assert samples[3]["opening_gripper"] == ["a2"]
+  assert samples[3]["closing_gripper"] == ["a2"]
+  assert samples[3]["opening_gripper"] == []
+  assert samples[4]["closing_gripper"] == []
+  assert samples[4]["opening_gripper"] == ["a1"]
+  assert samples[5]["opening_gripper"] == ["a2"]
+
+
+def test_handover_closes_receiver_before_opening_giver_and_keeps_overlap(tmp_path):
+  source, destination = tmp_path / "recording.npz", tmp_path / "plan.json"
+  _recording(source)
+  with np.load(source, allow_pickle=False) as z:
+    payload = {name: z[name] for name in z.files}
+  # a1 first holds obj_0; at the next logical instant a2 receives it. The source side effects
+  # are atomic, exactly as sim.py records them.
+  payload["gripper_events"] = np.asarray(json.dumps([
+      {"event": "close_start", "robot": "a1", "part": "obj_0", "physics_tick": 2},
+      {"event": "close_start", "robot": "a2", "part": "obj_0", "physics_tick": 3},
+      {"event": "open_start", "robot": "a1", "part": "obj_0", "physics_tick": 3},
+  ]))
+  np.savez_compressed(source, **payload)
+
+  E.export_recording(source, destination, sample_dt=0.05, grasp_wait=0.1)
+  samples = json.loads(destination.read_text())["samples"]
+  # First close dwell shifts source t=.2 to output t=.3; the handover dwell is [.3,.4).
+  overlap = [row for row in samples if 0.3 - 1e-9 <= row["time"] < 0.4 - 1e-9]
+  assert overlap and all(row["closing_gripper"] == ["a2"] for row in overlap)
+  assert all(row["opening_gripper"] == [] for row in overlap)
+  assert all(row["attached_objects"] == {"a1": "obj_0", "a2": "obj_0"}
+             for row in overlap)
+  release = next(row for row in samples if row["time"] == pytest.approx(0.4))
+  assert release["opening_gripper"] == ["a1"]
+  assert release["closing_gripper"] == []
+  assert release["attached_objects"] == {"a1": None, "a2": "obj_0"}
+  assert not any(row["opening_gripper"] and row["closing_gripper"] for row in samples)
+
+
+def test_zero_grasp_wait_is_rejected_for_a_handover(tmp_path):
+  source, destination = tmp_path / "recording.npz", tmp_path / "plan.json"
+  _recording(source)
+  with np.load(source, allow_pickle=False) as z:
+    payload = {name: z[name] for name in z.files}
+  payload["gripper_events"] = np.asarray(json.dumps([
+      {"event": "close_start", "robot": "a2", "part": "obj_0", "physics_tick": 3},
+      {"event": "open_start", "robot": "a1", "part": "obj_0", "physics_tick": 3},
+  ]))
+  np.savez_compressed(source, **payload)
+  with pytest.raises(ValueError, match="handover requires positive --grasp-wait"):
+    E.export_recording(source, destination, sample_dt=0.05, grasp_wait=0.0)

@@ -55,7 +55,7 @@ def require_complete_witnesses(plan, witnesses, *, who="witness export"):
 
 
 def witness_block(joint_names, witnesses, alts=None, stage=None, skill_paths=None,
-                  pre_witnesses=None):
+                  pre_witnesses=None, optimization_candidates=None):
   """Pack per-action full-config witnesses for persistence. Entry i belongs to plan[i];
   None entries (actions without an IK keyframe) stay null. `joint_names` records the joint
   ORDER the vectors are expressed in -- readers must refuse the block if their scene's joint
@@ -73,6 +73,15 @@ def witness_block(joint_names, witnesses, alts=None, stage=None, skill_paths=Non
   if alts:
     out["wit_alts"] = {str(i): [[float(v) for v in m] for m in ms]
                        for i, ms in sorted(alts.items())}
+  if optimization_candidates:
+    # The witness optimiser's actual discrete ladder, kept separate from ``wit_alts``.
+    # ``wit_alts`` is a post-pass GoalSet restricted to the same object pose/grasp for
+    # motion planning; these entries are the broader keyframes the optimiser compared.
+    # Member zero is normalized to the selected/canonical witness for straightforward
+    # inspection and validation on replay.
+    out["optimization_candidates"] = {
+        str(i): [[float(v) for v in q] for q in qs]
+        for i, qs in sorted(optimization_candidates.items())}
   if skill_paths:
     # Path-valued skill witnesses (currently screw) are part of the certificate, not an
     # export-time IK request.  Entry i is ordered entry->terminal and its last member must
@@ -169,6 +178,44 @@ def read_witness_sets(path, joint_names, n_actions):
     if not np.allclose(members[0], np.asarray(wit[i], dtype=float), atol=1e-9):
       print(f"[witsets-reuse] {path}: set at index {k}: member 0 no longer matches the "
             f"canonical witness -- dropped.")
+      continue
+    out[i] = members
+  return out or None
+
+
+def read_optimization_candidates(path, joint_names, n_actions):
+  """Read the per-step candidate ladders considered by witness optimization.
+
+  This is deliberately distinct from :func:`read_witness_sets`: optimizer candidates may
+  represent different task keyframes and are diagnostic only.  Member zero must agree with
+  the selected persisted witness; stale pools are dropped instead of being displayed beside
+  a canonical keyframe produced by a later rewrite.
+  """
+  import numpy as np
+  with open(path) as f:
+    data = json.load(f)
+  blk = data.get("witnesses") or {}
+  pools = blk.get("optimization_candidates")
+  if not pools:
+    return None
+  if list(blk.get("joints") or []) != list(joint_names):
+    print(f"[witopt-candidates] {path}: saved joint order differs -- ignoring candidates.")
+    return None
+  wit = blk.get("wit") or []
+  out = {}
+  for k, raw in pools.items():
+    i = int(k)
+    if not (0 <= i < n_actions) or i >= len(wit) or wit[i] is None:
+      print(f"[witopt-candidates] {path}: pool at index {k} has no witness -- dropped.")
+      continue
+    members = [np.asarray(q, dtype=float) for q in raw]
+    if (not members or
+        any(q.ndim != 1 or len(q) != len(joint_names) for q in members)):
+      print(f"[witopt-candidates] {path}: pool at index {k} is malformed -- dropped.")
+      continue
+    if not np.allclose(members[0], np.asarray(wit[i], dtype=float), atol=1e-9, rtol=0.0):
+      print(f"[witopt-candidates] {path}: pool at index {k} no longer matches the selected "
+            "witness -- dropped.")
       continue
     out[i] = members
   return out or None
