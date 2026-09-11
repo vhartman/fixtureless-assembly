@@ -126,6 +126,11 @@ def build_scene(cfg):
   from problem import set_grasp_translations
   set_grasp_translations(int(_saved(cfg, "grasp_translations")))  # grasp IDS index this DB:
   # a replay with a different count would read every saved grasp id against a different table.
+  from problem import set_grasp_standoff
+  set_grasp_standoff(float(_saved(cfg, "grasp_standoff")))     # grasp IDS index this DB:
+  # every pose sits `standoff` off its face, so a replay at a different standoff would read
+  # every saved grasp id against a shifted table. Plans saved before the flag existed fall
+  # back to the RunConfig default (0.01) and stay byte-identical.
   from problem import set_banned_actions
   set_banned_actions(())                                   # search-only; never active in replays
   from problem import set_kind_forbid

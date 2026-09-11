@@ -96,11 +96,15 @@ def test_husky_side_specific_ssik_matches_real_rai_fk_and_inverse():
     # The physical Robotiq tools are mounted with a +90 degree roll relative to
     # tool0.  Keep this convention explicit: otherwise SSIK still reaches the
     # old, visually plausible but physically wrong jaw orientation.
+    # ! 141.2mm, not 130mm: the gripper sits on an 11.2mm GRP-CPL-062 coupling and
+    # ! never touches the flange (husky_calibrated.g carries the same offset).  The
+    # ! test below derives the whole matrix from the loaded frames; this literal is
+    # ! here so a hand edit of either number fails loudly.
     np.testing.assert_allclose(
         cal["tools"]["two_finger"],
         np.array([[0.0, -1.0, 0.0, 0.0],
                   [1.0, 0.0, 0.0, 0.0],
-                  [0.0, 0.0, 1.0, 0.13],
+                  [0.0, 0.0, 1.0, 0.1412],
                   [0.0, 0.0, 0.0, 1.0]]),
         atol=1e-12)
     solver = analytic_ik._solver(arm)
@@ -131,3 +135,27 @@ def test_husky_saved_scenario_rebuilds_through_replay():
   assert A.get_robots(C) == ["a1", "a2"]
   assert assembly.objects == ["obj_0", "obj_1"]
   assert C.getCollisionsTotalPenetration() < 1e-6
+
+
+def test_husky_ssik_tool_calibration_tracks_the_real_gripper_mount():
+  """The typed flange->tool matrix must follow the .g file, mount roll included.
+
+  ssik solves to `ur_tool0` and applies `tools["two_finger"]` separately, so that matrix
+  is a hand-written copy of a transform the model owns. It went stale once already: the
+  physical Robotiq is bolted on a quarter turn about the flange axis, and only the .g file
+  was carrying it. Deriving the expectation from the loaded scene keeps the two tied.
+  """
+  C = make_husky_duo_env()
+  for robot, arm in (("a1", "husky_right"), ("a2", "husky_left")):
+    tool0 = C.getFrame(f"{robot}_ur_tool0")
+    actual = np.linalg.inv(_matrix(tool0)) @ _matrix(C.getFrame(f"{robot}_ur_gripper_center"))
+    np.testing.assert_allclose(
+        analytic_ik._CAL[arm]["tools"]["two_finger"], actual, atol=1e-9)
+
+    # The mount roll is what the matrix above would silently absorb, so state it outright:
+    # the pads close along tool0 X. finger1/finger2 are the two collision proxies.
+    axis = np.linalg.inv(_matrix(tool0))[:3, :3] @ (
+        np.asarray(C.getFrame(f"{robot}_ur_finger1").getPosition(), dtype=float)
+        - np.asarray(C.getFrame(f"{robot}_ur_finger2").getPosition(), dtype=float))
+    assert abs(axis[0]) > 0.99 * np.linalg.norm(axis), \
+        f"{robot} fingers close along {axis / np.linalg.norm(axis)}, expected tool0 +-X"

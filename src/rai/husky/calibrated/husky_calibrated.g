@@ -176,13 +176,34 @@ Edit left_ur_arm_wrist_3_joint: { q: 0 }
 
 # One Robotiq 2F-85 per arm.  The calibrated URDF's tool0 is already located at
 # the physical flange (unlike ur5.g's wrist joint, it needs no 90 mm offset).
-# Zero tool roll keeps this dual-arm home configuration collision-free.
+#
+# ! The grippers are bolted on a QUARTER TURN about the flange axis on the real
+# ! robots, so the models carry the same d(90 0 0 1) roll: the pads close along
+# ! tool0 X, not tool0 Y.  Everything downstream (ur_gripper_center, the finger
+# ! and palm collision proxies, the closure certificate, the MuJoCo mirror) is a
+# ! child of robotiq_base and follows this frame; the one hand-typed copy is
+# ! analytic_ik._CAL["husky_right"/"husky_left"]["tools"]["two_finger"], which
+# ! tests/test_husky.py now pins against these frames.
+#
+# ! t(0 0 .0112) is the COUPLING.  A Robotiq needs one to work at all -- it
+# ! carries the electrical contacts -- and the gripper therefore never touches
+# ! the flange.  Leaving it out (this file said t(0 0 0) until 2026-09-10) put
+# ! every grasp 11 mm too deep, which is what made the closing fingertips reach
+# ! the table.  The number, from the 2F-85 instruction manual: the TCP table
+# ! (6.2.3) gives 171.0 mm flange-to-closed-fingertips WITH the coupling, and
+# ! fig. 6-2 gives 162.8 mm for the gripper alone, so the legacy AGC-CPL-062-002
+# ! is 8.2 mm; fig. 6-6 confirms it (13.9 mm plate less the 3.0 mm and 2.9 mm
+# ! pilot pockets).  These arms carry the current GRP-CPL-062, which Robotiq
+# ! documents as 3 mm thicker => 11.2 mm.  The offset lands on the gripper's
+# ! base-link origin, which the mesh puts at the bottom of its 71 mm pilot --
+# ! exactly the face those manual figures measure from.
+# The dual-arm home configuration was re-checked collision-free at this mount.
 Prefix: "right_ur_arm_"
 Include: <../../robotiq/robotiq.g>
 Prefix: false
-Edit right_ur_arm_robotiq_base (right_ur_arm_tool0): {}
+Edit right_ur_arm_robotiq_base (right_ur_arm_tool0): { Q: "d(90 0 0 1) t(0 0 0.0112)" }
 
 Prefix: "left_ur_arm_"
 Include: <../../robotiq/robotiq.g>
 Prefix: false
-Edit left_ur_arm_robotiq_base (left_ur_arm_tool0): {}
+Edit left_ur_arm_robotiq_base (left_ur_arm_tool0): { Q: "d(90 0 0 1) t(0 0 0.0112)" }

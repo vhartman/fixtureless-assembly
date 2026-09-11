@@ -2121,8 +2121,12 @@ class YandVStoolAssembly(Assembly):
     self.masses["obj_0"] = 0.10
     leg_spec = ("box", [self.leg_x, self.leg_y, self.leg_length, 0.0])
     # Lie each leg flat: its local +z (long axis) becomes world +x. This matches the
-    # established peg-stool convention and leaves both end faces reachable.
-    leg_scatter = np.array([np.sqrt(0.5), 0.0, -np.sqrt(0.5), 0.0])
+    # established peg-stool convention and leaves both end faces reachable. The extra quarter
+    # turn about the leg's OWN long axis lays it on its wider 30mm face instead of the 22mm
+    # one, so it sits flat and stable on the table rather than on edge -- which is how the
+    # legs are actually laid out by hand for the real cell.
+    leg_scatter = _quat_mul(np.array([np.sqrt(0.5), 0.0, -np.sqrt(0.5), 0.0]),
+                            np.array([np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)]))
     leg_top = -st / 2.0 + depth - 0.0005           # 0.5mm short of blind-hole floor
     leg_z = leg_top - self.leg_length / 2.0
     for i, ((cx, cy), corner) in enumerate(zip(
@@ -2931,6 +2935,12 @@ _DENSE_GRASPS = False
 
 
 _GRASP_TRANSLATIONS = 0        # extra TRANSLATED variants per base grasp (0 = off)
+_GRASP_STANDOFF = 0.01         # tool-centre standoff outside the grasped face [m]
+  # ! The tool centre sits this far OUTSIDE the face it grasps, so it also sets how deep the
+  # fingers reach onto the part and how much room the pads have above the table. The Robotiq
+  # 2F-85 is a four-bar: closing swings the inner finger ~13mm further along the approach
+  # axis, so a pad that clears the table with the jaws OPEN can still scrape it once closed.
+  # Raise this (--grasp-standoff) when a top grasp on a short part would do that.
 _GRASP_PAD_HALF = 0.011        # finger-pad HALF-WIDTH. robotiq_tight.g's pad is a capsule
   # `size: [.04, .01]` = 40mm long, 10mm RADIUS -> ~22mm wide. The width is what limits sliding
   # across the face; using the 40mm half-LENGTH instead (as this first did) halved the travel and
@@ -2952,6 +2962,23 @@ def set_grasp_translations(n, pad_half=None):
   _GRASP_TRANSLATIONS = max(0, int(n))
   if pad_half is not None:
     _GRASP_PAD_HALF = float(pad_half)
+
+
+def set_grasp_standoff(m):
+  """Set how far outside the grasped face the tool centre stands, for EVERY part and grasp.
+
+  Call once at startup, before any grasp precomputation: this rebinds every grasp pose, and
+  therefore every grasp id and the grasp-DB content hash. A larger standoff lifts the closing
+  fingertips off the table at the cost of a shallower pinch.
+
+  Args:
+    m (float): standoff in metres, must be > 0.
+  """
+  global _GRASP_STANDOFF
+  m = float(m)
+  if not m > 0.0:
+    raise ValueError(f"--grasp-standoff must be > 0, got {m}")
+  _GRASP_STANDOFF = m
 
 
 def _translation_pattern(n):
@@ -4044,7 +4071,7 @@ def _sampled_grasp_views(spec, offset, part=None):
   return hit
 
 
-def sampled_grasp_meta(spec, offset=0.01, part=None):
+def sampled_grasp_meta(spec, offset=None, part=None):
   """Per-candidate diagnostics of the sampled DB, parallel to part_grasp_poses: edge
   clearance, pad support, and the family a candidate came from. Empty when the sampler is
   off. It exists because a pinch's PAD contact points cannot be recovered from the grasp
@@ -4052,6 +4079,8 @@ def sampled_grasp_meta(spec, offset=0.01, part=None):
   --grasp-sampler-scenes each entry also carries "set": free/pick/asm."""
   if _SAMPLED_GRASPS is None:
     return ()
+  if offset is None:
+    offset = _GRASP_STANDOFF                                # the global --grasp-standoff
   _sampled_grasp_views(spec, offset, part)                  # fills both caches
   return _SAMPLED_META_CACHE.get(_sampled_keys(spec, offset, part)[1], ())
 
@@ -4071,8 +4100,8 @@ def sampled_grasp_db_signature(assembly):
   h.update(b"assembly-grasp-db\0")
   for part in assembly.objects:
     spec = assembly.part_shape(part)
-    poses, surfaces, mins = _sampled_grasp_views(spec, 0.01, part)
-    meta = sampled_grasp_meta(spec, 0.01, part)
+    poses, surfaces, mins = _sampled_grasp_views(spec, _GRASP_STANDOFF, part)
+    meta = sampled_grasp_meta(spec, _GRASP_STANDOFF, part)
     h.update(part.encode() + b"\0")
     h.update(np.asarray(poses, dtype="<f8").tobytes())
     h.update(repr(tuple(surfaces)).encode())
@@ -4693,7 +4722,7 @@ def _shape_half_z(spec, R):
   return float(np.abs(R_total[2, :]) @ _shape_half_extents(spec))
 
 
-def part_grasp_poses(spec, rolls=None, offset=0.01, part=None):
+def part_grasp_poses(spec, rolls=None, offset=None, part=None):
   """All candidate grasp poses of a part shape, in the part's OWN frame -- the per-part
   grasp DB the labeled tables index into (grasp_id = position in this list). Enumerator path:
   the six axis-direction grasps at the FACE CENTER (approach along -direction, standoff =
@@ -4703,6 +4732,8 @@ def part_grasp_poses(spec, rolls=None, offset=0.01, part=None):
   on the caps and the side grasps on the curved surface (vacuum allowed there, same force
   -- per current model decision); spheres get the same six directions at radius standoff.
   Rotated/off-center grasp variants are a later, purely additive extension."""
+  if offset is None:
+    offset = _GRASP_STANDOFF                                # the global --grasp-standoff
   if _SAMPLED_GRASPS is not None:                          # --grasp-sampler second path
     return _sampled_grasp_views(spec, offset, part)[0]
   if spec[0] in ("mesh", "compound"):
@@ -4794,7 +4825,7 @@ def part_grasp_poses(spec, rolls=None, offset=0.01, part=None):
   return hit
 
 
-def grasp_pose(assembly, part, grasp_id, offset=0.01):
+def grasp_pose(assembly, part, grasp_id, offset=None):
   # grasp `grasp_id` of `part`, in the part's own frame (the shape-aware replacement for
   # raw cube_grasp_pose(gid, cube_size) -- identical values for cube parts).
   return part_grasp_poses(assembly.grasp_shape(part), offset=offset, part=part)[grasp_id]
@@ -4806,7 +4837,7 @@ def part_grasp_surfaces(spec, rolls=None, part=None):
   # sphere is curved everywhere. Used to restrict the VACUUM to flat surfaces (a suction
   # cup cannot seal on strong curvature) -- the two-finger keeps curved grasps.
   if _SAMPLED_GRASPS is not None:                          # --grasp-sampler second path
-    return list(_sampled_grasp_views(spec, 0.01, part)[1])
+    return list(_sampled_grasp_views(spec, _GRASP_STANDOFF, part)[1])
   if spec[0] in ("mesh", "compound"):
     raise ValueError("mesh/compound parts need --grasp-sampler (see part_grasp_poses)")
   if rolls is None:
@@ -4834,7 +4865,7 @@ def part_grasp_face_min_dims(spec, rolls=None, part=None):
   # curved gate already handles them). Used for the VACUUM SEAL gate: a suction cup cannot
   # seal on a face smaller than its own diameter (wrench.PARAMS['vacuum_seal_diameter']).
   if _SAMPLED_GRASPS is not None:                          # --grasp-sampler second path
-    return list(_sampled_grasp_views(spec, 0.01, part)[2])
+    return list(_sampled_grasp_views(spec, _GRASP_STANDOFF, part)[2])
   if spec[0] in ("mesh", "compound"):
     raise ValueError("mesh/compound parts need --grasp-sampler (see part_grasp_poses)")
   if rolls is None:
@@ -4858,14 +4889,17 @@ def part_grasp_face_min_dims(spec, rolls=None, part=None):
   return out
 
 
-def cube_grasp_pose(grasp_id, cube_size, offset=0.01):
+def cube_grasp_pose(grasp_id, cube_size, offset=None):
   # grasp pose [x,y,z, qw,qx,qy,qz] in the grasped cube's OWN frame. grasp_id encodes
   # (face, roll): the face sets the approach (-normal); the roll spins the gripper about
   # that approach axis (in-plane finger orientation). cube_size comes from the assembly.
   # MEMOIZED (pure function of a handful of inputs; the cheap collision checker calls it
   # hundreds of thousands of times -- 13% of a whole search before caching). _ROLLS_PER_FACE
   # is part of the key: it changes what a grasp_id means.
-  key = (grasp_id, cube_size, offset, _ROLLS_PER_FACE)
+  if offset is None:
+    offset = _GRASP_STANDOFF                                # the global --grasp-standoff
+  key = (grasp_id, cube_size, offset, _ROLLS_PER_FACE)      # resolved: the memo must not
+  # share one entry between two standoffs
   hit = _GRASP_POSE_CACHE.get(key)
   if hit is not None:
     return hit
@@ -5009,7 +5043,7 @@ def _profile_grasp_rows(fn):
   return wrapped
 
 
-def precompute_grasps(assembly, offset=0.01, gripper_path=None):
+def precompute_grasps(assembly, offset=None, gripper_path=None):
   """Pregenerate the reachable grasps for EVERY subassembly that can arise, once, up
   front (design doc: G = pregenerate_grasps). Returns {subassembly_key: labeled grasps}.
   The result is independent of the search state and of which robot grasps (all EEs are
@@ -5028,7 +5062,7 @@ def precompute_grasps(assembly, offset=0.01, gripper_path=None):
 
 
 @_profile_grasp_rows
-def compute_cube_grasps(assembly, subassembly, offset=0.01,
+def compute_cube_grasps(assembly, subassembly, offset=None,
                         gripper_path=None, return_labeled=False):
   # placeholder grasp planner for ONE subassembly: assume every part is a cube, generate
   # one grasp per face (6 total), keep the collision-free ones. To be replaced by a real

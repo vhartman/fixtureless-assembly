@@ -1629,6 +1629,18 @@ def build_parser():
            "the six face-centred grasps cannot reach. Appended AFTER the existing ids.",
   )
   g_search.add_argument(
+      "--grasp-standoff", type=float, default=0.01, metavar="M",
+      help="How far (m) the tool centre stands OFF the grasped face, for every part and grasp "
+           "(default 0.01). Raise it when a top grasp on a short part would drag the closing "
+           "fingertips across the table: the Robotiq 2F-85 is a four-bar, so closing swings the "
+           "inner finger ~13mm further along the approach axis and a pad that clears the table "
+           "with the jaws OPEN can still scrape it once closed (measured on the 22mm-tall bench "
+           "legs: -0.8 and -2.1mm BELOW the table at 0.01; 0.018 lifts them to +7.2/+5.9mm). "
+           "The cost is a shallower pinch, so do not raise it further than the part can spare. "
+           "SAVED with the plan: it rebinds every grasp pose, hence every grasp id and the "
+           "grasp-DB hash.",
+  )
+  g_search.add_argument(
       "--tight-fingers", action=argparse.BooleanOptionalAction, default=True,
       help="Default ON (2026-07-29). Shrink the finger COLLISION proxy from robotiq.g's capsule (40mm long, 20mm RADIUS "
            "= 80mm end to end) to robotiq_tight.g's (10mm radius), shifted 8mm outward so the "
@@ -2404,6 +2416,7 @@ _SAVE_CONFIG_FIELDS = (
     # measured against, so its residual is not local (measured: body 3.91mm high, wheels then
     # mated onto it at 0.01-0.23mm -- perfectly seated on a body in the wrong place)
     "grasp_translations",                                # grasp ids index the DB
+    "grasp_standoff",                                    # moves every grasp pose -> same
     "grasp_sampler", "grasp_sampler_keep",               # --grasp-sampler: sampled ids only
     "grasp_sampler_candidates", "grasp_sampler_seed",    # replay under identical settings
     "grasp_sampler_db_hash",                              # positional DB content identity
@@ -3474,6 +3487,13 @@ def run(cfg, explicit=None):
     set_grasp_translations(cfg.grasp_translations)
     print(f"[flag] --grasp-translations {cfg.grasp_translations}: each base grasp also offered "
           f"SLID along the gripper's open directions (bounded so the pads stay on the part).")
+  from problem import set_grasp_standoff
+  set_grasp_standoff(cfg.grasp_standoff)                 # before --check-init and before the
+  # sampled-scene context is installed: both build the grasp DB this rebinds
+  if abs(float(cfg.grasp_standoff) - 0.01) > 1e-12:
+    print(f"[flag] --grasp-standoff {cfg.grasp_standoff} ACTIVE: every tool centre stands this "
+          f"far off the face it grasps (default 0.01), so the closing fingertips clear the "
+          f"table at the cost of a shallower pinch. Grasp ids and the DB hash change with it.")
   if cfg.quiet_rai:
     import rai_quiet
     rai_quiet.install()                                  # no-op if RAI_QUIET already installed it

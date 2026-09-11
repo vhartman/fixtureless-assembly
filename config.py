@@ -188,6 +188,7 @@ class RunConfig:
   mate_eq_weight: Optional[float] = 100.0
   place_eq_weight: Optional[float] = 100.0
   grasp_translations: int = 0
+  grasp_standoff: float = 0.01
   grasp_sampler: bool = False
   grasp_sampler_keep: int = 20
   grasp_sampler_candidates: int = 200

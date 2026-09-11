@@ -89,12 +89,15 @@ _CAL = {
         "sign": np.ones(6),
         "offset": np.zeros(6),
         "tools": {
-            # calibrated tool0 is the Robotiq mounting flange; the physical two-finger
-            # tool is rolled +90deg about that flange axis and gripper_center is 130mm
-            # along the resulting +z axis.  This must match husky_calibrated.g exactly.
+            # calibrated tool0 is the Robotiq mounting flange. gripper_center sits 141.2mm
+            # along its +z: 11.2mm of GRP-CPL-062 coupling, then 130mm from the gripper's
+            # own base to its tool centre (measured from the same loaded RAI scene).
+            # ! The Robotiq is bolted on a quarter turn about the flange axis (the real
+            # ! mount; src/rai/husky/calibrated/husky_calibrated.g), hence the Rz(+90).
+            # ! tests/test_husky.py pins this matrix against the loaded RAI frames.
             "two_finger": np.array([[0.0, -1.0, 0.0, 0.0],
                                      [1.0, 0.0, 0.0, 0.0],
-                                     [0.0, 0.0, 1.0, 0.13],
+                                     [0.0, 0.0, 1.0, 0.1412],
                                      [0.0, 0.0, 0.0, 1.0]]),
         },
         "load": lambda: _artifact("husky_right_ik"),
@@ -103,11 +106,10 @@ _CAL = {
         "sign": np.ones(6),
         "offset": np.zeros(6),
         "tools": {
-            # Same physical +90deg tool roll as the right arm; the arm itself is
-            # calibrated independently.
+            # same mount as the right arm: Rz(+90), then 11.2mm coupling + 130mm gripper.
             "two_finger": np.array([[0.0, -1.0, 0.0, 0.0],
                                      [1.0, 0.0, 0.0, 0.0],
-                                     [0.0, 0.0, 1.0, 0.13],
+                                     [0.0, 0.0, 1.0, 0.1412],
                                      [0.0, 0.0, 0.0, 1.0]]),
         },
         "load": lambda: _artifact("husky_left_ik"),

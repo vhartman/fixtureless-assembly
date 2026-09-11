@@ -4,6 +4,28 @@ This repository searches for multi-robot assembly plans, exports real-arm motion
 `mr_bench`, and validates the paths in MuJoCo. See [PIPELINE.md](PIPELINE.md) for the general
 workflow and the other solver modes.
 
+## Running a plan on the real robot
+
+This repository stops at the exported trajectory (`export_open_loop.py` writes
+`open-loop.json`, schema `assembly-open-loop-json-v3`). Everything that drives the hardware --
+the dual-arm RTDE tracker, the Robotiq gripper commands, the collision-checked approach to the
+trajectory's start pose, the paper-layout calibration that produces the `--layout-json` this
+planner solves for, and the operator manual for a run -- lives in a separate repository:
+
+> **husky-assembly-teleop**, <https://github.com/yijiangh/husky-assembly-teleop>
+> branch `yh/fixtureless_assembly`, commit
+> [`ab83d55`](https://github.com/yijiangh/husky-assembly-teleop/commit/ab83d55)
+> ("fixtureless assembly: open-loop execution, compliant insertion, pickup calibration").
+>
+> Start with `doc/pickup_calibration_manual.md` there: it is the stage-by-stage run recipe,
+> and its stages 4-6 are the commands in this repository.
+
+`ab83d55` is the commit the 2026-09-11 bench runs in `experiments/real-stool-husky-current/`
+were executed with, so it is the version that matches those artifacts. The two repositories
+share only the exported JSON, and two numbers that must agree on both sides: the gripper mount
+(`src/rai/husky/calibrated/husky_calibrated.g`, a quarter turn about tool0 plus the 11.2 mm
+Robotiq coupling) and the measured table height in the layout file.
+
 ## Setup
 
 Use Python 3.12 and the repository environment:
