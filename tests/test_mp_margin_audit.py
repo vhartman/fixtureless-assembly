@@ -205,3 +205,20 @@ def test_wrapper_rejects_and_reports_joint_limit_violation(capsys):
   assert "joint=a2_shoulder" in out
   assert "value=1.125000rad upper=1.000000rad" in out
   assert "violation=0.125rad" in out
+
+
+def test_optional_wrench_veto_uses_the_same_audited_predicate(capsys):
+  env = _Env()
+  env.C.collisions = []
+  MP._install_robot_margin(
+      env, 0.0, ["a1", "a2"], {"a1": "a1_ee", "a2": "a2_ee"},
+      wrench_veto=lambda _mode: {"gate": "gravity-wrench", "group": ("obj_0", "obj_2")})
+
+  assert not env.is_collision_free_np(np.zeros(2), _Mode())
+  rec = next(iter(env.margin_rejection_stats["records"].values()))
+  assert rec["gate"] == "gravity-wrench"
+  assert rec["frames"] == ("obj_0+obj_2", "gravity")
+  env.report_margin_rejections([7, 9])
+  out = capsys.readouterr().out
+  assert "gate=gravity-wrench" in out
+  assert "group=obj_0+obj_2" in out

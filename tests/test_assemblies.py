@@ -16,6 +16,7 @@ Run:  python3 -m pytest tests/ -q      (from the repo root, or anywhere -- conft
 """
 import time
 
+import numpy as np
 import pytest
 
 import assembly as A
@@ -55,6 +56,23 @@ def _replay_ok(plan, asm, C, robots_list, gk, bracing=False):
     assert A.cheap_feasible(act, s, ns, asm, checker), f"action failed cheap layer: {act}"
     s = ns
   return s.is_goal(asm)
+
+
+def test_synthetic_cube_and_chair_masses_are_lightweight():
+  """Their wrench ablations should measure support choices, not marginal payload ratings."""
+  for kind in ("cube", "cube-plates", "cube-plates-2x2x3", "cube-sequence-2x2x3"):
+    asm = A.make_assembly(kind, 8)
+    assert all(asm.mass(p) == pytest.approx(0.025) for p in asm.objects)
+
+  chair = A.make_assembly("chair", 8)
+  assert chair.mass("obj_0") == pytest.approx(0.10)
+  assert chair.mass("obj_5") == pytest.approx(0.05)
+  assert all(chair.mass(p) == pytest.approx(0.025)
+             for p in ("obj_1", "obj_2", "obj_3", "obj_4", "obj_6", "obj_7"))
+  post_shape_q = chair.part_shape("obj_6")[2]
+  post_axis = (A._quat_to_R(chair.scatter_orientations["obj_6"])
+               @ A._quat_to_R(post_shape_q))[:, 2]
+  assert post_axis[2] == pytest.approx(0.0, abs=1e-12)
 
 
 def test_centered_scatter_is_a_compact_centred_lattice():
@@ -974,6 +992,21 @@ def test_fill_local_greedy_plans_a_sequence_without_global_oracle():
       C, asm, robots=robots, weight=1.0, verbose=False,
       milestone_oracle="structural", fill_local_h=True,
       fill_exact=False, fill_greedy=True)
+  assert plan is not None
+  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
+
+
+def test_fill_raw_grasp_pdb_plans_with_the_same_milestone_solver():
+  """The fine reverse ablation changes labels, not the outer or forward algorithm."""
+  A.set_seed(0); A.set_rolls_per_face(1)
+  asm = A.make_assembly("cross", 3)
+  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
+  A.add_disassembled_obj(C, asm, spacing=0.2)
+  robots = A.get_robots(C)
+  plan = A.solve_assembly_problem_milestones(
+      C, asm, robots=robots, weight=1.0, verbose=False,
+      milestone_oracle="structural", fill_local_h=True,
+      fill_raw_grasp_h=True, fill_exact=False, fill_greedy=True)
   assert plan is not None
   assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
 

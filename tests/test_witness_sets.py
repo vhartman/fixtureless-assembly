@@ -5,8 +5,8 @@ import sys, os
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from plan_io import (read_optimization_candidates, read_witnesses, read_witness_sets,
-                     witness_block, write_plan)
+from plan_io import (read_diagnostic_candidates, read_optimization_candidates,
+                     read_witnesses, read_witness_sets, witness_block, write_plan)
 
 
 JOINTS = [f"j{i}" for i in range(6)]
@@ -70,6 +70,19 @@ def test_optimizer_candidates_are_separate_and_guard_selected_member(tmp_path):
   write_plan(str(p), {"assembly": "t"}, [("pick",)] * 2,
              witnesses=witness_block(JOINTS, wit, optimization_candidates=bad))
   assert set(read_optimization_candidates(str(p), JOINTS, 2)) == {1}
+
+
+def test_diagnostic_candidates_are_separate_from_optimizer_ladder(tmp_path):
+  wit = [_w(0)]
+  opt = {0: [_w(0), _w(0) + 0.1]}
+  diagnostic = {0: [_w(0), _w(0) + 3.0]}
+  p = tmp_path / "plan.json"
+  write_plan(str(p), {"assembly": "t"}, [("pick",)],
+             witnesses=witness_block(
+                 JOINTS, wit, optimization_candidates=opt,
+                 diagnostic_candidates=diagnostic))
+  assert np.allclose(read_optimization_candidates(str(p), JOINTS, 1)[0][1], _w(0) + 0.1)
+  assert np.allclose(read_diagnostic_candidates(str(p), JOINTS, 1)[0][1], _w(0) + 3.0)
 
 
 def test_greedy_maxmin_wrist_selection():

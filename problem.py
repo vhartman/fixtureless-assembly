@@ -1,6 +1,8 @@
 """Problem definition: assemblies, part geometry, grasps, and the discrete scene-graph
 search model (State + successors). No feasibility/solver or visualization code here."""
 
+import gzip
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -782,6 +784,11 @@ class CubeGridAssembly(Assembly):
   def define(self):
     self.objects = [f"obj_{i}" for i in range(self.n_parts)]
     self.base = "obj_0"
+    # Lightweight foam/polymer blocks.  In particular, a detached 2x2 plate should not sit
+    # exactly on the lateral-force boundary of the deliberately weak-shear vacuum model while
+    # BiRRT rotates it in free space: task feasibility, rather than payload mass, is what this
+    # synthetic family is intended to benchmark.
+    self.masses = {p: 0.025 for p in self.objects}
     self.assembly_dependencies = {
         f"obj_{i}": [f"obj_{i - 1}"] for i in range(1, self.n_parts)
     }
@@ -917,6 +924,7 @@ class CubePlatesAssembly(Assembly):
     o = self.spacing
     self.objects = [f"obj_{i}" for i in range(self.n_parts)]
     self.base = "obj_0"
+    self.masses = {p: 0.025 for p in self.objects}          # lightweight benchmark blocks
 
     def cell(j):
       # grid cell of chain index j within a plate: serpentine rows (even row left->right,
@@ -973,6 +981,9 @@ class CubeSequenceAssembly(Assembly):
   def define(self):
     self.objects = [f"obj_{i}" for i in range(self.n_parts)]
     self.base = "obj_0"
+    # Same physical instance as CubePlatesAssembly; only the assembly dependency structure
+    # differs, so its masses must remain identical for module-vs-piecewise comparisons.
+    self.masses = {p: 0.025 for p in self.objects}
 
     layer = []
     for y in range(self.depth):
@@ -2161,11 +2172,26 @@ class ChairAssembly(Assembly):
     q_seat = [np.sqrt(0.5), np.sqrt(0.5), 0.0, 0.0]
     q_leg  = [0.0, 1.0, 0.0, 0.0]
     q_back = [0.703, 0.073, 0.075, 0.703]
-    q_post = [0.011, 0.99, -0.093, -0.103]
+    q_post = np.asarray([0.011, 0.99, -0.093, -0.103], dtype=float)
+    q_post /= np.linalg.norm(q_post)                         # chair.g literal was rounded
     leg_scatter  = np.array([np.sqrt(0.5), 0.0, -np.sqrt(0.5), 0.0])   # exact: axis -> world x
-    post_scatter = np.array([0.63, 0.0, -0.7766, 0.0])
+    # Exactly lie the post's SHAPE cylinder on its side.  The former rounded literal
+    # [0.63,0,-0.7766,0] left its long axis minutely tilted, so both lowest support samples
+    # fell on the same side of the COM.  The unilateral table LP then (correctly) rejected
+    # the supposedly resting loose post even at tiny mass, making the first MP mode empty.
+    # Also fix the roll about that horizontal axis.  The table LP uses eight points on the
+    # cylinder rim; choosing native shape-x as world +z puts an exact sampled rim point below
+    # the COM instead of leaving the two lowest samples laterally offset.
+    post_rest_R = np.array([[0.0, 0.0, 1.0],
+                            [0.0, -1.0, 0.0],
+                            [1.0, 0.0, 0.0]])
+    post_scatter = _mat_to_quat(
+        post_rest_R @ _quat_to_R(np.asarray(q_post, dtype=float)).T)
     self.part_shapes["obj_0"] = ("box", [0.38 * s, 0.05 * s, 0.35 * s, r], q_seat)
-    self.masses["obj_0"] = 0.4
+    # This is a scaled demonstration chair, not a full-size timber chair.  Keep payloads well
+    # inside the vacuum envelope so free-space motion planning is not accidentally dominated
+    # by a marginal gravity threshold.
+    self.masses["obj_0"] = 0.10
     # 4 legs, seat-relative offsets (chair.g world pos - seat world pos [0,0,1]); pressed UP.
     leg_off = {"obj_1": [0.150, -0.148, -0.182], "obj_2": [-0.150, -0.152, -0.178],
                "obj_3": [-0.154, 0.148, -0.178], "obj_4": [0.146, 0.152, -0.182]}
@@ -2174,6 +2200,7 @@ class ChairAssembly(Assembly):
       self.scatter_orientations[p] = leg_scatter
       self.assembly_relative_poses[p] = ["obj_0", np.array(off) * s]
       self.mate_axes[p] = np.array([0.0, 0.0, 1.0])         # leg pressed up onto the seat bottom
+      self.masses[p] = 0.025
     self.assembly_dependencies = {p: ["obj_0"] for p in leg_off}
     if self.n_parts >= 8:
       # backrest joins the seat as a MODULE (user-specified DAG: posts mate onto the BACK,
@@ -2181,6 +2208,7 @@ class ChairAssembly(Assembly):
       # like cube-plates: obj_5's mate onto the seat is the JOIN, and it requires BOTH posts
       # present (in the held module), so the module is built detached first.
       self.part_shapes["obj_5"] = ("box", [0.23 * s, 0.05 * s, 0.20 * s, r], q_back)
+      self.masses["obj_5"] = 0.05
       self.connect_parts.add("obj_5")
       self.connect_requires["obj_5"] = {"obj_6", "obj_7"}
       self.scatter_orientations["obj_5"] = np.array([0.7772, 0.0, 0.6292, 0.0])  # backrest lies flat
@@ -2201,6 +2229,7 @@ class ChairAssembly(Assembly):
         self.mate_axes[p] = np.array([0.0, -1.0, 0.0]) if p == "obj_6" \
             else np.array([0.0, 1.0, 0.0])               # press toward the back (sideways)
         self.assembly_dependencies[p] = ["obj_5"]
+        self.masses[p] = 0.025
       # for p in post_off:
         # self.mate_interfaces[p] = self.mate_contact_interface(p)
       self.mate_interfaces["obj_6"] = [0, -0.025*s, 0.33*s / 8]
@@ -4911,6 +4940,102 @@ class LazyGraspTable(GraspTable):
   @property
   def materialized_rows(self):
     return sum(len(rows) for rows in dict.values(self))
+
+
+_GRASP_TABLE_CACHE_SCHEMA = 1
+_LOADED_GRASP_TABLE_CACHES = {}
+
+
+def save_grasp_table_cache(path, table, cache_key):
+  """Persist one finite, collision-filtered grasp table as an explicit artifact.
+
+  The paper benchmark constructs this once per physical problem and gives the immutable
+  result to every search variant.  Materialising a ``LazyGraspTable`` here is intentional:
+  laziness controls *when* finite rows are computed, not their contents.  The loaded view is
+  lazy again, so search ordering and component-widening behaviour remain unchanged.
+  """
+  path = os.fspath(path)
+  if type(table) is dict:
+    table_kind = "dict"
+  elif isinstance(table, LazyGraspTable):
+    table_kind = "lazy"
+  else:
+    table_kind = "grasp"
+  rows = []
+  for key in table.keys():
+    key = _subasm_key(key)
+    rows.append({
+        "key": list(key),
+        "grasps": [[part, int(gid), np.asarray(pose, dtype=float).tolist()]
+                   for part, gid, pose in table[key]],
+    })
+  kinds = getattr(table, "kinds_of", None)
+  payload = {
+      "schema_version": _GRASP_TABLE_CACHE_SCHEMA,
+      "cache_key": str(cache_key),
+      "table_kind": table_kind,
+      "rows": rows,
+      "kinds_of": None if kinds is None else [
+          [list(S_key), part, int(gid), sorted(mask)]
+          for (S_key, part, gid), mask in sorted(
+              kinds.items(), key=lambda item: (item[0][0], item[0][1], item[0][2]))
+      ],
+      "robot_kinds": getattr(table, "robot_kinds", None),
+  }
+  parent = os.path.dirname(os.path.abspath(path))
+  os.makedirs(parent, exist_ok=True)
+  tmp = path + f".tmp-{os.getpid()}"
+  try:
+    with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=5) as f:
+      json.dump(payload, f, separators=(",", ":"), sort_keys=True)
+    os.replace(tmp, path)
+  finally:
+    if os.path.exists(tmp):
+      os.unlink(tmp)
+  return {"keys": len(rows), "rows": sum(len(row["grasps"]) for row in rows)}
+
+
+def load_grasp_table_cache(path, cache_key):
+  """Load a table written by :func:`save_grasp_table_cache`, rejecting stale artifacts."""
+  path = os.path.realpath(os.fspath(path))
+  stat = os.stat(path)
+  memory_key = (path, str(cache_key), stat.st_mtime_ns, stat.st_size)
+  hit = _LOADED_GRASP_TABLE_CACHES.get(memory_key)
+  if hit is not None:
+    return hit
+  with gzip.open(path, "rt", encoding="utf-8") as f:
+    payload = json.load(f)
+  if payload.get("schema_version") != _GRASP_TABLE_CACHE_SCHEMA:
+    raise ValueError(
+        f"grasp database schema mismatch in {path}: "
+        f"{payload.get('schema_version')} != {_GRASP_TABLE_CACHE_SCHEMA}")
+  if payload.get("cache_key") != str(cache_key):
+    raise ValueError(f"grasp database fingerprint mismatch in {path}; refusing stale rows")
+  keys = tuple(tuple(row["key"]) for row in payload["rows"])
+  stored = {
+      tuple(row["key"]): [(part, int(gid), np.asarray(pose, dtype=float))
+                          for part, gid, pose in row["grasps"]]
+      for row in payload["rows"]
+  }
+  kind = payload.get("table_kind")
+  if kind == "lazy":
+    table = LazyGraspTable(keys, lambda key: stored[_subasm_key(key)])
+  elif kind == "dict":
+    table = {key: stored[key] for key in keys}
+  elif kind == "grasp":
+    table = GraspTable((key, stored[key]) for key in keys)
+  else:
+    raise ValueError(f"unknown grasp database table kind {kind!r} in {path}")
+  if isinstance(table, GraspTable):
+    encoded = payload.get("kinds_of")
+    table.kinds_of = None if encoded is None else {
+        (tuple(S_key), part, int(gid)): frozenset(mask)
+        for S_key, part, gid, mask in encoded
+    }
+    table.robot_kinds = payload.get("robot_kinds")
+  result = table, {"keys": len(keys), "rows": sum(len(v) for v in stored.values())}
+  _LOADED_GRASP_TABLE_CACHES[memory_key] = result
+  return result
 
 
 # Inclusive time spent constructing scene-conditioned grasp-table rows. Lazy component rows

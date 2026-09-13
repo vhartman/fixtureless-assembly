@@ -913,7 +913,8 @@ def _write_robot_dofs(C, robot, q_full):
 def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
                       recorder=None, bracing=False, witnesses=None, wrench_gk=None,
                       optimization_candidates=None, alternative_count=4,
-                      alternative_opacity=0.18, active_robots_only=False):
+                      alternative_opacity=0.18, active_robots_only=False,
+                      alternative_description="witness-optimizer candidate keyframes"):
   """Replay a plan on a SINGLE persistent config: for each action we load its supplied
   witness, or solve the skill IK only when no witness was supplied; then write the active
   arms' DOFs into the live config (so arms keep their poses between steps) and mirror the
@@ -1204,7 +1205,7 @@ def visualize_plan_ik(C, assembly, plan, robots=None, robot_ik=None, view=True,
     recorder.overlay_alternatives(
         alternative_poses, count=int(alternative_count),
         opacity=float(alternative_opacity),
-        description="witness-optimizer candidate keyframes")
+        description=alternative_description)
   return Cv
 
 

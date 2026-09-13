@@ -1,11 +1,15 @@
 import json
 
+import numpy as np
 import pytest
 
 from benchmarks import plot_cube_scaling as C
 from benchmarks import plot_cube_wrench_envelope_scaling as W
 from benchmarks import plot_process_wrench_full_matrix as P
 from benchmarks import search_runner as B
+from benchmarks import run_wrench_sim_ablation as WS
+from benchmarks import run_paper_search_comparison as PS
+import problem
 
 
 def _manifest():
@@ -24,6 +28,146 @@ def _manifest():
           {"name": "open", "args": ["--open-witness"]},
       ],
   }
+
+
+def test_wrench_sim_ablation_does_not_confound_task_model_with_mp_wrench_gate():
+  assert all(not variant["mp_wrench_gate"] for variant in WS.VARIANTS.values())
+
+
+def test_wrench_sim_ablation_insertion_only_breakage_is_explicit():
+  default = WS._parse_args([])
+  isolated = WS._parse_args(["--insertion-only-grasp-check"])
+  assert not default.insertion_only_grasp_check
+  assert default.abort_on_action_failure
+  assert isolated.insertion_only_grasp_check
+
+
+def test_wrench_sim_ablation_flattens_phase_load_metrics():
+  got = WS._wrench_metrics({
+      "grasp_wrench_metrics": {
+          "window_s": 0.02,
+          "phases": {
+              "transport": {
+                  "peak_force_n": 12.0, "peak_torque_nm": 0.4,
+                  "peak_utilization": 1.2, "peak_sustained_utilization": 0.8,
+              },
+              "insertion": {
+                  "peak_force_n": 20.0, "peak_torque_nm": 0.9,
+                  "peak_utilization": 1.5, "peak_sustained_utilization": 1.1,
+              },
+          },
+          "by_gripper_kind": {
+              "two_finger": {
+                  "transport": {"peak_sustained_utilization": 0.7},
+                  "insertion": {"peak_sustained_utilization": 1.3},
+              },
+              "vacuum": {
+                  "transport": {"peak_sustained_utilization": 0.4},
+                  "insertion": {"peak_sustained_utilization": 0.9},
+              },
+          },
+      },
+  })
+  assert got["wrench_window_s"] == pytest.approx(0.02)
+  assert got["transport_peak_sustained_utilization"] == pytest.approx(0.8)
+  assert got["insertion_peak_force_n"] == pytest.approx(20.0)
+  assert got["transport_two_finger_peak_sustained_utilization"] == pytest.approx(0.7)
+  assert got["insertion_vacuum_peak_sustained_utilization"] == pytest.approx(0.9)
+
+
+def test_wrench_sim_table_formats_phase_and_tool_utilization_as_percent():
+  row = {
+      "transport_two_finger_peak_sustained_utilization_mean": 0.73,
+      "insertion_two_finger_peak_sustained_utilization_mean": 1.24,
+  }
+  assert WS._fmt_util(row, "transport", "two_finger") == "73"
+  assert WS._fmt_util(row, "insertion", "two_finger") == r"$\mathbf{124}$"
+  assert WS._fmt_util(row, "transport", "vacuum") == "--"
+
+
+def test_paper_runner_automatically_measures_first_motion_solution(tmp_path, monkeypatch):
+  calls = []
+  runner_calls = []
+  monkeypatch.setattr(PS.search_runner, "main", lambda args: runner_calls.append(args) or 0)
+  monkeypatch.setattr(
+      PS, "measure_initial_motion_plans",
+      lambda output, **kwargs: calls.append((output, kwargs)))
+  monkeypatch.setattr(PS, "write_tables", lambda _output: None)
+  output = tmp_path / "paper"
+  assert PS.main(["--output", str(output), "--motion-runtime", "12"]) == 0
+  assert calls == [(output.resolve(), {
+      "runtime_s": 12.0, "timeout_s": 420.0, "memory_gb": 4.0, "resume": False,
+      "retry_failed_only": False,
+  })]
+  assert "--shared-grasp-db" in runner_calls[0]
+  assert runner_calls[0][runner_calls[0].index("--timeout") + 1] == "450.0"
+
+
+def test_grasp_database_roundtrip_preserves_lazy_rows_and_kind_masks(tmp_path):
+  rows = {
+      ("obj_0",): [("obj_0", 3, np.arange(7, dtype=float))],
+      ("obj_0", "obj_1"): [("obj_1", 4, np.zeros(7))],
+  }
+  table = problem.LazyGraspTable(rows, lambda key: rows[key])
+  table.kinds_of = {
+      (("obj_0",), "obj_0", 3): frozenset({"two_finger"}),
+      (("obj_0", "obj_1"), "obj_1", 4): frozenset({"vacuum"}),
+  }
+  table.robot_kinds = {"a1": "two_finger", "a2": "vacuum"}
+  path = tmp_path / "grasps.json.gz"
+  assert problem.save_grasp_table_cache(path, table, "unit") == {"keys": 2, "rows": 2}
+  loaded, stats = problem.load_grasp_table_cache(path, "unit")
+  assert isinstance(loaded, problem.LazyGraspTable)
+  assert loaded.materialized == 0 and stats == {"keys": 2, "rows": 2}
+  assert np.array_equal(loaded[("obj_0",)][0][2], np.arange(7, dtype=float))
+  assert loaded.usable(("obj_0",), "obj_0", 3, "a1")
+  assert not loaded.usable(("obj_0",), "obj_0", 3, "a2")
+  with pytest.raises(ValueError, match="fingerprint mismatch"):
+    problem.load_grasp_table_cache(path, "stale")
+
+
+def test_paper_motion_command_is_first_solution_only(tmp_path):
+  command = PS._motion_command(tmp_path / "plan.json", 30.0, 7)
+  assert "--no-mp-optimize" in command
+  assert "--mp-no-shortcut" in command
+  assert command[command.index("--mp-runtime") + 1] == "30.0"
+
+
+def test_paper_breakdown_includes_aggregated_initial_motion_time():
+  groups = B.aggregate([{
+      "case": "cross", "variant": "ours", "success": True,
+      "timed_out": False, "out_of_memory": False, "status": "success",
+      "mp_initial_solution_s": 4.25,
+  }])
+  assert groups[0]["mp_initial_solution_s_mean"] == pytest.approx(4.25)
+  tex = PS._breakdown_tex(groups)
+  assert "t_{\\text{MP init}}" in tex
+  assert "4.2" in tex
+
+
+def test_paper_tables_use_requested_order_caption_and_explicit_uncertainty():
+  records = []
+  for case in PS.CASES:
+    for seed in (3, 5):
+      records.append({
+          "case": case, "variant": "ours", "seed": seed,
+          "success": True, "timed_out": False, "out_of_memory": False,
+          "status": "success", "search_pipeline_s": 1.0, "plan_cost": 4,
+          "grasp_generation_s": 1.0, "backward_graph_search_s": 1.0,
+          "backward_force_lp_s": 1.0, "forward_search_s": 1.0,
+          "ik_bind_wall_s": 1.0, "mp_initial_solution_s": 1.0,
+      })
+  groups = B.aggregate(records)
+  comparison = PS._comparison_tex(groups)
+  breakdown = PS._breakdown_tex(groups)
+  assert "mean and standard deviation of 2 runs" in comparison
+  assert "1.0 +- 0.0" in comparison
+  assert "4 +-" not in comparison
+  assert comparison.index("F. Beam") < comparison.index("F. Plumber block")
+  assert comparison.index("F. Plumber block") < comparison.index("F. Car")
+  assert comparison.index("F. Duct") < comparison.index("F. Stool")
+  assert "Breakdown of where time is spent in \\textsc{Wrap}." in breakdown
+  assert "1.0 +- 0.0" in breakdown
 
 
 def _matrix_manifest():
@@ -88,6 +232,32 @@ def test_repeated_expansion_keeps_logical_cell_and_adds_stable_repeat_ids():
   assert runs[0]["repeat"] == 1 and runs[1]["repeat"] == 2
   with pytest.raises(ValueError, match="positive integer"):
     B.expand_runs(B.validate_manifest(_matrix_manifest()), repeats=0)
+
+
+def test_runner_can_stop_remaining_cell_trials_after_first_timeout(tmp_path, monkeypatch):
+  manifest = _manifest()
+  manifest["cases"] = manifest["cases"][:1]
+  manifest["variants"] = manifest["variants"][:1]
+  path = tmp_path / "manifest.json"
+  path.write_text(json.dumps(manifest), encoding="utf-8")
+  calls = []
+
+  def fake_run_one(spec, *_args, **_kwargs):
+    calls.append(spec["run_id"])
+    return {
+        "run_id": spec["run_id"], "case": spec["case"], "variant": spec["variant"],
+        "seed": spec["seed"], "repeat": spec["repeat"], "tags": spec["tags"],
+        "status": "timeout", "success": False, "timed_out": True, "wall_s": 12.0,
+    }
+
+  monkeypatch.setattr(B, "run_one", fake_run_one)
+  monkeypatch.setattr(B, "provenance", lambda: {"source_sha256": "unit-source"})
+  status = B.main([
+      str(path), "--output", str(tmp_path / "results"), "--repeats", "2",
+      "--stop-cell-on-timeout",
+  ])
+  assert status == 1
+  assert calls == ["a__legacy__seed-3__rep-01"]
 
 
 def test_process_wrench_plot_can_use_plan_cost(tmp_path):
@@ -278,6 +448,13 @@ def test_aggregate_preserves_resource_failure_kinds():
   assert got["out_of_memory"] == 1
   assert got["timeouts"] == 1
   assert got["errors"] == 0 and got["no_plans"] == 0
+
+
+def test_native_bad_alloc_is_classified_as_oom():
+  """The native collision stack can report allocation exhaustion via std::bad_alloc."""
+  assert B._looks_like_out_of_memory("terminate called: std::bad_alloc")
+  assert B._looks_like_out_of_memory("Traceback\nMemoryError")
+  assert not B._looks_like_out_of_memory("ordinary planner failure")
 
 
 def test_matrix_markdown_reports_method_by_physics_cells():

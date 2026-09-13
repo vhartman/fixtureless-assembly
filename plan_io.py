@@ -55,7 +55,8 @@ def require_complete_witnesses(plan, witnesses, *, who="witness export"):
 
 
 def witness_block(joint_names, witnesses, alts=None, stage=None, skill_paths=None,
-                  pre_witnesses=None, optimization_candidates=None):
+                  pre_witnesses=None, optimization_candidates=None,
+                  diagnostic_candidates=None):
   """Pack per-action full-config witnesses for persistence. Entry i belongs to plan[i];
   None entries (actions without an IK keyframe) stay null. `joint_names` records the joint
   ORDER the vectors are expressed in -- readers must refuse the block if their scene's joint
@@ -82,6 +83,13 @@ def witness_block(joint_names, witnesses, alts=None, stage=None, skill_paths=Non
     out["optimization_candidates"] = {
         str(i): [[float(v) for v in q] for q in qs]
         for i, qs in sorted(optimization_candidates.items())}
+  if diagnostic_candidates:
+    # Broad visualization-only pools. These include individually solved IK branches that a
+    # later clearance/continuity/interchangeability gate rejected. Keep them distinct from
+    # the optimizer ladder so an illustration cannot misrepresent what was optimized over.
+    out["diagnostic_candidates"] = {
+        str(i): [[float(v) for v in q] for q in qs]
+        for i, qs in sorted(diagnostic_candidates.items())}
   if skill_paths:
     # Path-valued skill witnesses (currently screw) are part of the certificate, not an
     # export-time IK request.  Entry i is ordered entry->terminal and its last member must
@@ -183,42 +191,48 @@ def read_witness_sets(path, joint_names, n_actions):
   return out or None
 
 
-def read_optimization_candidates(path, joint_names, n_actions):
-  """Read the per-step candidate ladders considered by witness optimization.
-
-  This is deliberately distinct from :func:`read_witness_sets`: optimizer candidates may
-  represent different task keyframes and are diagnostic only.  Member zero must agree with
-  the selected persisted witness; stale pools are dropped instead of being displayed beside
-  a canonical keyframe produced by a later rewrite.
-  """
+def _read_candidate_pools(path, joint_names, n_actions, field, tag):
+  """Read a selected-witness-aligned diagnostic candidate-pool field."""
   import numpy as np
   with open(path) as f:
     data = json.load(f)
   blk = data.get("witnesses") or {}
-  pools = blk.get("optimization_candidates")
+  pools = blk.get(field)
   if not pools:
     return None
   if list(blk.get("joints") or []) != list(joint_names):
-    print(f"[witopt-candidates] {path}: saved joint order differs -- ignoring candidates.")
+    print(f"[{tag}] {path}: saved joint order differs -- ignoring candidates.")
     return None
   wit = blk.get("wit") or []
   out = {}
   for k, raw in pools.items():
     i = int(k)
     if not (0 <= i < n_actions) or i >= len(wit) or wit[i] is None:
-      print(f"[witopt-candidates] {path}: pool at index {k} has no witness -- dropped.")
+      print(f"[{tag}] {path}: pool at index {k} has no witness -- dropped.")
       continue
     members = [np.asarray(q, dtype=float) for q in raw]
     if (not members or
         any(q.ndim != 1 or len(q) != len(joint_names) for q in members)):
-      print(f"[witopt-candidates] {path}: pool at index {k} is malformed -- dropped.")
+      print(f"[{tag}] {path}: pool at index {k} is malformed -- dropped.")
       continue
     if not np.allclose(members[0], np.asarray(wit[i], dtype=float), atol=1e-9, rtol=0.0):
-      print(f"[witopt-candidates] {path}: pool at index {k} no longer matches the selected "
+      print(f"[{tag}] {path}: pool at index {k} no longer matches the selected "
             "witness -- dropped.")
       continue
     out[i] = members
   return out or None
+
+
+def read_optimization_candidates(path, joint_names, n_actions):
+  """Read the exact per-step candidate ladders considered by witness optimization."""
+  return _read_candidate_pools(path, joint_names, n_actions,
+                               "optimization_candidates", "witopt-candidates")
+
+
+def read_diagnostic_candidates(path, joint_names, n_actions):
+  """Read broad visualization-only IK branches rejected by later selection gates."""
+  return _read_candidate_pools(path, joint_names, n_actions,
+                               "diagnostic_candidates", "witdiag-candidates")
 
 
 def read_skill_paths(path, joint_names, n_actions, witnesses=None):

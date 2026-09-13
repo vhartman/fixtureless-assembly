@@ -449,6 +449,7 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
   # for the same EE poses (the wrist-basin diversity the planner needs), never in the object.
   # Member 0 is the DP's canonical witness itself, byte-equal to wit[i].
   wit_alts = {}
+  diagnostic_candidates = {}
   if witness_sets and int(witness_sets) >= 2:
     _K = int(witness_sets)
     _SET_KINDS = ("pick", "place", "add_grasp", "handover")
@@ -502,6 +503,16 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
         for n, v in c.items():
           w[name_idx[n]] = v
         emitted.append(w)
+      # Preserve the broad pool before the stricter GoalSet gates below. These branches are
+      # useful for explaining why selection matters: an individually solved IK basin can be
+      # a terrible transition, lack full-scene clearance, or move the payload relative to the
+      # canonical member. This provenance is visualization-only and never enters planning.
+      raw_members = [np.asarray(base_w, dtype=float).copy()]
+      for q in emitted:
+        if not any(np.allclose(q, old, atol=1e-9, rtol=0.0) for old in raw_members):
+          raw_members.append(np.asarray(q, dtype=float).copy())
+      if len(raw_members) >= 2:
+        diagnostic_candidates[i] = raw_members
       best_c2 = max((scored2[k] for k in range(len(emitted)) if gaps2[k] >= 0.0),
                     default=0.0)
       # ALTERNATIVES ARE GATED LOOSER THAN THE CHAIN. The DP floor (best_a, often 0.99 when
@@ -594,6 +605,18 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
     if len(unique) >= 2:
       optimization_candidates[i] = unique
 
+  # Assemble candidates already contain the authored orientation sweep, while the explicit
+  # branch probes above add the missing diversity for pick/place/handover. Merge both sources
+  # under their honest diagnostic label, always keeping the selected witness as member zero.
+  for i, pool in optimization_candidates.items():
+    merged = [np.asarray(wit[i], dtype=float).copy()]
+    for q in list(diagnostic_candidates.get(i, [])) + list(pool):
+      q = np.asarray(q, dtype=float)
+      if not any(np.allclose(q, old, atol=1e-9, rtol=0.0) for old in merged):
+        merged.append(q.copy())
+    if len(merged) >= 2:
+      diagnostic_candidates[i] = merged
+
   robot_ik.strip_inactive_collision = _strip0
   robot_ik.harvest_all_branches = _harvest0
   rep = {"alpha": best_a, "cost": cost, "crossings": crossings,
@@ -603,6 +626,7 @@ def optimize_witnesses_floor(C, assembly, plan, robots, robot_ik, *, gripper_kin
   if witness_sets and int(witness_sets) >= 2:
     rep["wit_alts"] = wit_alts
   rep["optimization_candidates"] = optimization_candidates
+  rep["diagnostic_candidates"] = diagnostic_candidates
   if verbose:
     print(f"[witfloor] alpha={best_a:.2f}: {crossings} branch crossings "
           f"(={ref} with NO floor, so the clearance is free), {rep['candidates']} candidates "

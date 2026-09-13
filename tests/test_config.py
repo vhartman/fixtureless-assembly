@@ -143,6 +143,7 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
   monkeypatch.setattr(main, "solve_assembly_problem_milestones", fake)
   cfg = RunConfig(milestones=True, milestone_oracle="structural",
                   fill_local_h=True, fill_exact=True, fill_greedy=True,
+                  fill_raw_grasp_h=True,
                   fill_incumbent_first=True,
                   fill_policy_first=True,
                   fill_policy_guide=True,
@@ -153,6 +154,7 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
   assert main._dispatch_solve(cfg, None, None, [], None) == []
   assert seen["milestone_oracle"] == "structural"
   assert seen["fill_local_h"] is True and seen["fill_exact"] is True
+  assert seen["fill_raw_grasp_h"] is True
   assert seen["fill_greedy"] is True
   assert seen["fill_incumbent_first"] is True
   assert seen["fill_policy_first"] is True
@@ -165,6 +167,9 @@ def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
   assert main.parse_args(["--milestone-oracle", "structural"]).milestone_oracle == "structural"
   assert main.parse_args(["--milestone-oracle", "chain"]).milestone_oracle == "chain"
   assert main.parse_args(["--fill-local-h", "--fill-exact"]).fill_local_h is True
+  assert main.parse_args(["--fill-raw-grasp-h"]).fill_raw_grasp_h is True
+  assert main.parse_args(["--mp-wrench-gate"]).mp_wrench_gate is True
+  assert main.parse_args(["--no-mp-wrench-gate"]).mp_wrench_gate is False
   assert main.parse_args([
       "--fill-target-support-quotient"
   ]).fill_target_support_quotient is True
@@ -227,6 +232,18 @@ def test_target_support_quotient_is_a_no_wrench_local_pdb_ablation():
   assert main._validate_solver_scoped_flags(RunConfig(
       milestones=True, fill_target_support_quotient=True, fill_local_h=True,
       wrench=False, geo_facts=False)) == "milestones"
+
+
+def test_raw_grasp_fill_heuristic_is_a_local_pdb_ablation():
+  with pytest.raises(SystemExit, match="requires --fill-local-h"):
+    main._validate_solver_scoped_flags(RunConfig(
+        milestones=True, fill_raw_grasp_h=True, fill_local_h=False))
+  with pytest.raises(SystemExit, match="mutually exclusive"):
+    main._validate_solver_scoped_flags(RunConfig(
+        milestones=True, fill_raw_grasp_h=True, fill_local_h=True,
+        fill_target_support_quotient=True, wrench=False))
+  assert main._validate_solver_scoped_flags(RunConfig(
+      milestones=True, fill_raw_grasp_h=True, fill_local_h=True)) == "milestones"
 
 
 def test_standard_uses_greedy_local_fills_without_changing_global_weight():
@@ -645,10 +662,10 @@ def test_mp_export_clearance_settings_default_to_saved_artifact():
   """Zero-IK export replay is exact unless this invocation explicitly retunes planning."""
   cfg = RunConfig(mp_collision_tolerance=0.7, mp_robot_margin=0.6,
                   mp_margin_ramp=0.5, mp_margin_mode="binary",
-                  mp_table_margin=0.4, part_float=0.03)
+                  mp_table_margin=0.4, mp_wrench_gate=True, part_float=0.03)
   saved = {"collision_tolerance": 1e-4, "robot_robot_margin": 0.1,
            "robot_margin_ramp": 0.1, "robot_margin_mode": "linear",
-           "table_margin": 0.02, "table_float": 0.007}
+           "table_margin": 0.02, "table_float": 0.007, "wrench_gate": False}
   values, sources = main._merge_mp_export_clearance_settings(cfg, saved, explicit=set())
   assert values == saved
   assert set(sources.values()) == {"export"}
@@ -658,19 +675,21 @@ def test_explicit_cli_overrides_mp_export_clearance_settings_independently():
   """A named CLI knob wins without accidentally replacing the other saved defaults."""
   cfg = RunConfig(mp_collision_tolerance=0.2, mp_robot_margin=0.0,
                   mp_margin_ramp=0.03, mp_margin_mode="binary",
-                  mp_table_margin=0.04, part_float=0.012)
+                  mp_table_margin=0.04, mp_wrench_gate=True, part_float=0.012)
   saved = {"collision_tolerance": 1e-4, "robot_robot_margin": 0.1,
            "robot_margin_ramp": 0.1, "robot_margin_mode": "linear",
-           "table_margin": 0.02, "table_float": 0.007}
+           "table_margin": 0.02, "table_float": 0.007, "wrench_gate": False}
   values, sources = main._merge_mp_export_clearance_settings(
-      cfg, saved, explicit={"mp_collision_tolerance", "mp_robot_margin", "mp_table_margin"})
+      cfg, saved, explicit={"mp_collision_tolerance", "mp_robot_margin", "mp_table_margin",
+                            "mp_wrench_gate"})
   assert values == {"collision_tolerance": 0.2, "robot_robot_margin": 0.0,
                     "robot_margin_ramp": 0.1, "robot_margin_mode": "linear",
                     "table_margin": 0.04,
-                    "table_float": 0.012}
+                    "table_float": 0.012, "wrench_gate": True}
   assert sources == {"collision_tolerance": "CLI", "robot_robot_margin": "CLI",
                      "robot_margin_ramp": "export", "robot_margin_mode": "export",
                      "table_margin": "CLI",
+                     "wrench_gate": "CLI",
                      "table_float": "CLI/scene"}
 
 

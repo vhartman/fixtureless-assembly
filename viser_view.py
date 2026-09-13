@@ -23,10 +23,27 @@ import numpy as np
 import robotic as ry
 
 
+def _mesh_vertex_rgba(mesh_colors, n_vertices):
+  """Normalize rai's per-vertex RGB(A) array for color-preserving GLB display."""
+  c = np.asarray(mesh_colors)
+  if c.ndim != 2 or len(c) != int(n_vertices) or c.shape[1] < 3:
+    return None
+  rgba = np.asarray(c[:, :min(4, c.shape[1])], dtype=float)
+  if rgba.size and np.nanmax(rgba) <= 1.0:
+    rgba *= 255.0
+  rgba = np.clip(np.rint(rgba), 0, 255).astype(np.uint8)
+  if rgba.shape[1] == 3:
+    rgba = np.column_stack([rgba, np.full(len(rgba), 255, dtype=np.uint8)])
+  return rgba
+
+
 class ViserRecorder:
   def __init__(self, hide_collision_primitives=False):
     self.geometry = {}                    # name -> (verts, tris, color_rgb, opacity)
     self.markers = {}                     # name -> axes_length (rai ST.marker frames)
+    self.frame_components = {}            # rai frame -> display meshes (material regions)
+    self.geometry_source = {}             # display mesh -> rai frame supplying its pose
+    self._captured_frames = set()
     self.steps = []                       # [{name: (pos3, wxyz4)}]
     self.labels = []                      # one per step
     self.step_vectors = []                # one list per step: (start3, end3, rgb) arrows
@@ -68,7 +85,8 @@ class ViserRecorder:
       if self._is_display_collision_primitive(frame):
         self.hidden_collision_primitives.add(name)
         continue
-      if name not in self.geometry and name not in self.markers:
+      if name not in self._captured_frames:
+        self._captured_frames.add(name)
         verts = np.asarray(frame.getMeshPoints(), dtype=np.float32)
         tris = np.asarray(frame.getMeshTriangles(), dtype=np.uint32)
         if verts.ndim < 2 or tris.ndim < 2 or len(verts) == 0 or len(tris) == 0:
@@ -79,21 +97,44 @@ class ViserRecorder:
           else:
             continue                      # no renderable geometry
         else:
-          # per-vertex colors when present; frame-info color as fallback
+          # Match arm_model.link_meshes (the established MuJoCo export): a rai link mesh can
+          # contain several authored flat materials, while Viser's simple mesh accepts one
+          # color. Split triangles by their first vertex's material color instead of flattening
+          # the whole robot to vertex zero (black) or its modal material (all blue).
           mesh_colors = np.asarray(frame.getMeshColors())
-          if mesh_colors.ndim == 2 and len(mesh_colors) > 0:
-            c = mesh_colors[0]            # [R,G,B,A] 0-255
-            color_rgb = (int(c[0]), int(c[1]), int(c[2]))
-            alpha = int(c[3]) if len(c) > 3 else 255
-            opacity = alpha / 255.0 if alpha < 255 else None
+          vertex_rgba = _mesh_vertex_rgba(mesh_colors, len(verts))
+          if vertex_rgba is not None:
+            tri_color = vertex_rgba[tris[:, 0]]
+            colors = np.unique(tri_color, axis=0)
+            components = []
+            for k, c in enumerate(colors):
+              faces = tris[np.all(tri_color == c, axis=1)]
+              if not len(faces):
+                continue
+              used = np.unique(faces)
+              remap = -np.ones(int(used.max()) + 1, dtype=np.int64)
+              remap[used] = np.arange(len(used))
+              display_name = name if len(colors) == 1 else f"{name}/material_{k}"
+              opacity = float(c[3]) / 255.0 if int(c[3]) < 255 else None
+              self.geometry[display_name] = (
+                  verts[used], remap[faces].astype(np.uint32),
+                  tuple(int(x) for x in c[:3]), opacity)
+              self.geometry_source[display_name] = name
+              components.append(display_name)
+            self.frame_components[name] = components
           else:
             raw = frame.info().get("color", [0.7, 0.7, 0.7])
             color_rgb = tuple(int(x * 255) for x in raw[:3])
             opacity = float(raw[3]) if len(raw) > 3 and raw[3] < 1.0 else None
-          self.geometry[name] = (verts, tris, color_rgb, opacity)
-      if name in self.geometry or name in self.markers:
-        snap[name] = (np.array(frame.getPosition(), dtype=np.float32),
-                      np.array(frame.getQuaternion(), dtype=np.float32))  # ry = [w,x,y,z]
+            self.geometry[name] = (verts, tris, color_rgb, opacity)
+            self.geometry_source[name] = name
+            self.frame_components[name] = [name]
+      pose = (np.array(frame.getPosition(), dtype=np.float32),
+              np.array(frame.getQuaternion(), dtype=np.float32))  # ry = [w,x,y,z]
+      for display_name in self.frame_components.get(name, ()):
+        snap[display_name] = pose
+      if name in self.markers:
+        snap[name] = pose
     self.steps.append(snap)
     self.labels.append(label)
     self.step_vectors.append(list(vectors) if vectors else [])
@@ -108,11 +149,13 @@ class ViserRecorder:
     available = set(C.getFrameNames())
     requested = (list(self.geometry) + list(self.markers)
                  if names is None else list(names))
-    return {
-        name: (np.asarray(C.getFrame(name).getPosition(), dtype=np.float32),
-               np.asarray(C.getFrame(name).getQuaternion(), dtype=np.float32))
-        for name in requested
-        if name in available}
+    out = {}
+    for name in requested:
+      source = self.geometry_source.get(name, name)
+      if source in available:
+        out[name] = (np.asarray(C.getFrame(source).getPosition(), dtype=np.float32),
+                     np.asarray(C.getFrame(source).getQuaternion(), dtype=np.float32))
+    return out
 
   def overlay_alternatives(self, alternatives, count=4, opacity=0.18,
                            description="witness alternatives"):
@@ -189,9 +232,11 @@ class ViserRecorder:
 
     handles = {}
     for name, (verts, tris, color_rgb, opacity) in self.geometry.items():
+      ghost = name.startswith("keyframe_alt_")
       handles[name] = server.scene.add_mesh_simple(
           name=f"frames/{name}", vertices=verts, faces=tris,
-          color=color_rgb, flat_shading=False, opacity=opacity)
+          color=color_rgb, flat_shading=False, opacity=opacity,
+          cast_shadow=not ghost, receive_shadow=False if ghost else True)
     for name, size in self.markers.items():
       handles[name] = server.scene.add_frame(
           name=f"frames/{name}", axes_length=0.5 * size, axes_radius=0.04 * size)

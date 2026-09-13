@@ -29,3 +29,21 @@ def test_mate_error_includes_relative_orientation():
   e = sim._mate_pose_error(parent, child, target, [0.0, 0.0, 1.0])
   assert e["position"] == pytest.approx(0.0)
   assert e["angle"] == pytest.approx(0.2)
+
+
+def test_mate_error_quotients_continuous_cylinder_roll():
+  identity = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+  target = identity.copy()
+  axial_roll = identity.copy()
+  axial_roll[3:] = [np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)]
+  e = sim._mate_pose_error(identity, axial_roll, target, [1.0, 0.0, 0.0],
+                           intrinsic_axis=[0.0, 0.0, 1.0])
+  assert e["angle"] == pytest.approx(0.0)
+  assert np.linalg.norm(e["rotation_vec"]) == pytest.approx(0.0)
+
+  tilt = identity.copy()
+  tilt[3:] = [np.cos(0.15), np.sin(0.15), 0.0, 0.0]
+  e = sim._mate_pose_error(identity, tilt, target, [1.0, 0.0, 0.0],
+                           intrinsic_axis=[0.0, 0.0, 1.0])
+  assert e["angle"] == pytest.approx(0.3)
+  assert np.linalg.norm(e["rotation_vec"]) == pytest.approx(0.3)

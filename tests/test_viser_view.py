@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from viser_view import ViserRecorder
+from viser_view import ViserRecorder, _mesh_vertex_rgba
 
 
 def _pose(x):
@@ -48,6 +48,13 @@ def test_alternative_overlay_validates_arguments_and_cannot_be_applied_twice():
   rec.overlay_alternatives({}, count=2)
   with pytest.raises(ValueError, match="already"):
     rec.overlay_alternatives({}, count=2)
+
+
+def test_mesh_vertex_colors_preserve_every_authored_material():
+  colors = np.array([[10, 10, 10], [100, 138, 163], [100, 138, 163]], dtype=np.uint8)
+  got = _mesh_vertex_rgba(colors, 3)
+  assert np.array_equal(got[:, :3], colors)
+  assert np.array_equal(got[:, 3], np.full(3, 255))
 
 
 class _Frame:

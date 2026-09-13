@@ -66,6 +66,8 @@ def main():
         tasks = saved["tasks"]
         step_names = saved["step_names"]
         sequence_names = saved["sequence_names"]
+    gate_on = bool(settings.get("wrench_gate", cfg.get("mp_wrench_gate", False)))
+    gate_gk = A.wrench_kind_arg(C, robots) if gate_on and gk is None else None
     rik.pre_insertion_delta = float(settings.get("pre_insertion",
                                                  cfg.get("pre_insertion", 0.0)))
     rik.pre_pick_delta = float(settings.get("pre_pick", cfg.get("pre_pick", 0.0)))
@@ -91,6 +93,7 @@ def main():
         table_margin=float(settings.get("table_margin",
                                         cfg.get("mp_table_margin", 0.0))),
         table_float=float(settings.get("table_float", cfg.get("part_float", 0.002))),
+        wrench_gate=gate_on, wrench_gate_gripper_kind=gate_gk,
         witness_sets=witness_sets, resolve_missing_pre=legacy,
         task_records=tasks, saved_step_names=step_names,
         saved_sequence_names=sequence_names)

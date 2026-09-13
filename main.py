@@ -212,6 +212,7 @@ _STANDARD_MOTION_PROFILE = {
     "mp_margin_ramp": 0.0,
     "mp_margin_mode": "linear",
     "mp_table_margin": 0.0,
+    "mp_wrench_gate": False,
     "mp_cograsp": True,
     "quiet_rai": True,
     "view": False,
@@ -1360,6 +1361,12 @@ def build_parser():
            "on; --no-fill-local-h is the counting-only guidance ablation.",
   )
   g_search.add_argument(
+      "--fill-raw-grasp-h", action=argparse.BooleanOptionalAction, default=False,
+      help="Local-PDB projection ablation: keep raw grasp ids in G and L instead of "
+           "mapping them to fact-signature classes. Milestones, concrete greedy fills, "
+           "the action space, and IK validation remain unchanged. Requires --fill-local-h.",
+  )
+  g_search.add_argument(
       "--fill-target-support-quotient", action=argparse.BooleanOptionalAction, default=False,
       help="Experimental no-wrench local-PDB quotient: replace grasp identities on the "
            "already-built target component by anonymous holder counts, preserving tool-kind "
@@ -2050,7 +2057,8 @@ def build_parser():
            "solves. The saved plan and joint order must match exactly; missing keyframes or "
            "a changed task signature are fatal instead of being silently re-solved. Saved "
            "collision/clearance settings are defaults; explicitly supplied --mp-collision-"
-           "tolerance/--mp-robot-margin/--mp-margin-ramp/--mp-table-margin values override "
+           "tolerance/--mp-robot-margin/--mp-margin-ramp/--mp-table-margin/--mp-wrench-gate "
+           "values override "
            "them without changing the persisted keyframes.",
   )
   g_mp.add_argument(
@@ -2212,6 +2220,14 @@ def build_parser():
            "at BOTH segment ends -- pick and set-down still touch. Resting parts and the arms "
            "themselves keep zero table margin. Use WITH --mp-margin-ramp (else the mode after "
            "every pick starts in violation).",
+  )
+  g_mp.add_argument(
+      "--mp-wrench-gate", action=argparse.BooleanOptionalAction, default=False,
+      help="Also require quasi-static GRAVITY equilibrium at every motion-planner feasibility "
+           "sample. This reuses the task planner's grasp capacities and warm LP backend, but "
+           "does not apply insertion/screw forces during unrelated free-space transit. Off by "
+           "default so --no-wrench plans remain a genuinely topological baseline; requires "
+           "--wrench when enabled.",
   )
   g_mp.add_argument(
       "--mp-modes", action="store_true",
@@ -2433,6 +2449,7 @@ _SAVE_CONFIG_FIELDS = (
     "mp_collision_tolerance",                            # base predicate certificate
     "mp_robot_margin", "mp_margin_ramp", "mp_margin_mode", # clearance certificate
     "mp_table_margin",                                   # carried-part-vs-table transit clearance
+    "mp_wrench_gate",                                    # gravity equilibrium along MP path
     "mp_cograsp",                                        # closed-chain path diagnostic
     "mp_seed",                                           # reproducible BiRRT draw (None = unseeded)
     "mp_fake_clock",                                     # fake deterministic clock: runtime becomes
@@ -2451,7 +2468,7 @@ _SAVE_CONFIG_FIELDS = (
     "weight", "milestones", "milestones_anytime", "full_backward",
     "full_backward_max_states", "full_backward_max_edges", "goal_on_table",
     "milestone_oracle",
-    "fill_local_h", "fill_target_support_quotient", "fill_exact",
+    "fill_local_h", "fill_raw_grasp_h", "fill_target_support_quotient", "fill_exact",
     "fill_greedy", "fill_incumbent_first",
     "fill_policy_first", "fill_policy_guide", "fill_skeleton_first",
     "fill_action_widening", "milestone_boundaries",
@@ -2627,6 +2644,15 @@ def _validate_solver_scoped_flags(cfg):
     if not cfg.fill_local_h or not cfg.fill_exact or not cfg.lazy_fills:
       raise SystemExit("--fill-incumbent-first requires --fill-local-h, --fill-exact, "
                        "and --lazy-fills")
+  if cfg.fill_raw_grasp_h:
+    if engine not in ("milestones", "milestones-anytime"):
+      raise SystemExit("--fill-raw-grasp-h is implemented only by milestone local fills; "
+                       f"selected engine is {engine}")
+    if not cfg.fill_local_h:
+      raise SystemExit("--fill-raw-grasp-h requires --fill-local-h")
+    if cfg.fill_target_support_quotient:
+      raise SystemExit("--fill-raw-grasp-h and --fill-target-support-quotient are "
+                       "mutually exclusive")
   if cfg.fill_policy_first:
     if not cfg.fill_local_h:
       raise SystemExit("--fill-policy-first requires --fill-local-h")
@@ -2691,6 +2717,7 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         lns_window=cfg.lns_window,
         lns_grasp_transition_h=cfg.lns_grasp_transition_h,
         fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
+        fill_raw_grasp_h=cfg.fill_raw_grasp_h,
         fill_target_support_quotient=cfg.fill_target_support_quotient,
         fill_greedy=cfg.fill_greedy,
         fill_incumbent_first=cfg.fill_incumbent_first,
@@ -2772,6 +2799,7 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
         sig_collapsed_h=cfg.sig_collapsed_h, fill_window=cfg.fill_window,
         lazy_fills=cfg.lazy_fills, milestone_oracle=cfg.milestone_oracle,
         fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
+        fill_raw_grasp_h=cfg.fill_raw_grasp_h,
         fill_target_support_quotient=cfg.fill_target_support_quotient,
         fill_greedy=cfg.fill_greedy,
         fill_incumbent_first=cfg.fill_incumbent_first,
@@ -2815,6 +2843,7 @@ def _milestone_candidate_session(cfg, C, assembly, robots, robot_ik):
       sig_collapsed_h=cfg.sig_collapsed_h, fill_window=cfg.fill_window,
       lazy_fills=cfg.lazy_fills, milestone_oracle=cfg.milestone_oracle,
       fill_local_h=cfg.fill_local_h, fill_exact=cfg.fill_exact,
+      fill_raw_grasp_h=cfg.fill_raw_grasp_h,
       fill_target_support_quotient=cfg.fill_target_support_quotient,
       fill_greedy=cfg.fill_greedy,
       fill_incumbent_first=cfg.fill_incumbent_first,
@@ -2987,6 +3016,7 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
            "--mp-margin-ramp", f"{cfg.mp_margin_ramp:g}",
            "--mp-margin-mode", cfg.mp_margin_mode,
            "--mp-table-margin", f"{cfg.mp_table_margin:g}",
+           flag("mp-wrench-gate", cfg.mp_wrench_gate),
            "--mp-save", mpfile, "--quiet-rai", "--no-view"]
     if getattr(cfg, "_motion_profile", None):
       cmd.extend(["--motion-profile", cfg._motion_profile])
@@ -3201,6 +3231,7 @@ def _merge_mp_export_clearance_settings(cfg, saved, explicit=None):
       ("robot_margin_ramp", "mp_margin_ramp", float),
       ("robot_margin_mode", "mp_margin_mode", str),
       ("table_margin", "mp_table_margin", float),
+      ("wrench_gate", "mp_wrench_gate", bool),
   )
   values, sources = {}, {}
   for saved_key, cfg_key, cast in specs:
@@ -3831,6 +3862,23 @@ def run(cfg, explicit=None):
             "pass --refresh-witnesses to recertify its "
             "symbolic skeleton -- refusing to silently rebind grasp ids")
     cfg.grasp_sampler_db_hash = _db_hash
+
+  # Internal benchmark pre-pass: construct the finite, scene/gripper-filtered grasp database
+  # once, before any solver is timed.  The public runner supplies both an explicit artifact
+  # path and a source/config fingerprint; _search_context refuses stale artifacts.  Keeping
+  # this out of argparse prevents a benchmark lifecycle control from becoming a planner knob.
+  if _os.environ.get("ASSEMBLY_GRASP_DB_BUILD_ONLY", "").strip().lower() in (
+      "1", "true", "yes"):
+    if not _os.environ.get("ASSEMBLY_GRASP_DB_PATH"):
+      raise SystemExit("ASSEMBLY_GRASP_DB_BUILD_ONLY requires ASSEMBLY_GRASP_DB_PATH")
+    from solver import _search_context
+    _grasp_db_t0 = _time.perf_counter()
+    _checker, _table = _search_context(C, assembly, get_robots(C))
+    _grasp_db_s = _time.perf_counter() - _grasp_db_t0
+    _rows = sum(len(rows) for rows in _table.values())
+    print(f"[grasp-db] build-only complete: {len(_table)} component rows / {_rows} grasps "
+          f"in {_grasp_db_s:.6f}s")
+    return
 
   if cfg.check_init:
     chk_robots = get_robots(C)
@@ -4726,6 +4774,7 @@ def run(cfg, explicit=None):
       opt_pre_witnesses = baseline_pre_witnesses
       witness_alts = None                                    # --witness-sets alternatives
       optimization_candidates = None                         # witness optimizer's ladder
+      diagnostic_candidates = None                           # broad display-only IK branches
       _reuse_final = False
       if (plan is not None and cfg.optimize_witnesses is not None
           and not (cfg.motion_plan and cfg.mp_export_load)):
@@ -4741,7 +4790,8 @@ def run(cfg, explicit=None):
                               and baseline_witnesses is not None
                               and _saved_witness_stage == "optimized")
           if _reuse_final:
-            from plan_io import read_optimization_candidates, read_witness_sets
+            from plan_io import (read_diagnostic_candidates,
+                                 read_optimization_candidates, read_witness_sets)
             if opt_witnesses is not None:
               print(f"[witness-reuse] {sum(w is not None for w in opt_witnesses)} persisted "
                     f"witnesses loaded from {cfg.load_plan}; witness optimization SKIPPED "
@@ -4757,6 +4807,11 @@ def run(cfg, explicit=None):
               if optimization_candidates:
                 print(f"[witopt-candidates] {len(optimization_candidates)} persisted "
                       f"optimizer candidate pool(s) loaded from {cfg.load_plan}.")
+              diagnostic_candidates = read_diagnostic_candidates(
+                  cfg.load_plan, list(robot_ik.C.getJointNames()), len(plan))
+              if diagnostic_candidates:
+                print(f"[witdiag-candidates] {len(diagnostic_candidates)} persisted broad "
+                      f"diagnostic candidate pool(s) loaded from {cfg.load_plan}.")
           if not _reuse_final and cfg.optimize_witnesses == "floor":
             from witness_floor import optimize_witnesses_floor
             # floor mode CONSTRAINS clearance (a per-step normalised floor) rather than
@@ -4783,6 +4838,7 @@ def run(cfg, explicit=None):
                 baseline_witnesses=baseline_witnesses)
             witness_alts = _rep.get("wit_alts") or None
             optimization_candidates = _rep.get("optimization_candidates") or None
+            diagnostic_candidates = _rep.get("diagnostic_candidates") or None
           elif not _reuse_final:
             opt_witnesses, _rep = optimize_witnesses(
                 C, assembly, plan, robots, robot_ik, cost=cfg.optimize_witnesses,
@@ -4829,6 +4885,10 @@ def run(cfg, explicit=None):
             optimization_candidates = {
                 i: ms for i, ms in optimization_candidates.items()
                 if np.allclose(ms[0], opt_witnesses[i], atol=1e-9, rtol=0.0)}
+          if diagnostic_candidates:
+            diagnostic_candidates = {
+                i: ms for i, ms in diagnostic_candidates.items()
+                if np.allclose(ms[0], opt_witnesses[i], atol=1e-9, rtol=0.0)}
       # Search-stage plans already loaded their matching pre_wit block above.  Re-solving
       # those mouths is both unnecessary and non-reproducible: a fresh optimizer can land in
       # another basin and make an otherwise complete saved certificate fail during replay.
@@ -4860,6 +4920,7 @@ def run(cfg, explicit=None):
                   witnesses=witness_block(joint_names, opt_witnesses,
                                           alts=witness_alts,
                                           optimization_candidates=optimization_candidates,
+                                          diagnostic_candidates=diagnostic_candidates,
                                           stage=("optimized" if cfg.optimize_witnesses is not None
                                                  else "search"),
                                           skill_paths=skill_paths,
@@ -4884,6 +4945,11 @@ def run(cfg, explicit=None):
         if robot_ik is None:
           print("[motion-plan] needs --real-ik (for the IK witnesses); skipping.")
         else:
+          if cfg.mp_wrench_gate and not cfg.wrench:
+            raise ValueError(
+                "--mp-wrench-gate requires --wrench: a --no-wrench plan is the topological "
+                "baseline and has no wrench-certified symbolic state. Omit the MP gate for "
+                "that baseline, or re-run task planning with --wrench.")
           import mp_export as MP
           gk = wrench_kind_arg(C, robots) if cfg.wrench else None
           _loaded_export = None
@@ -4895,6 +4961,7 @@ def run(cfg, explicit=None):
           _export_margin_mode = cfg.mp_margin_mode
           _export_table_margin = cfg.mp_table_margin
           _export_table_float = cfg.part_float if cfg.mp_table_margin else 0.0
+          _export_wrench_gate = cfg.mp_wrench_gate
           mp_pre = dict(opt_pre_witnesses or {})
           _pre_pin_robots = {}
           _cograsp_pre = {}
@@ -4915,6 +4982,7 @@ def run(cfg, explicit=None):
             _export_margin_mode = _clearance["robot_margin_mode"]
             _export_table_margin = _clearance["table_margin"]
             _export_table_float = _clearance["table_float"]
+            _export_wrench_gate = _clearance["wrench_gate"]
             robot_ik.pre_insertion_delta = float(
                 _es.get("pre_insertion", robot_ik.pre_insertion_delta))
             robot_ik.pre_pick_delta = float(_es.get("pre_pick", robot_ik.pre_pick_delta))
@@ -4939,7 +5007,9 @@ def run(cfg, explicit=None):
                   f"table_margin={_export_table_margin:g} "
                   f"[{_clearance_source['table_margin']}], "
                   f"table_float={_export_table_float:g} "
-                  f"[{_clearance_source['table_float']}].")
+                  f"[{_clearance_source['table_float']}], "
+                  f"wrench_gate={_export_wrench_gate} "
+                  f"[{_clearance_source['wrench_gate']}].")
           else:
             # witnesses: the optimized set if --optimize-witnesses was given, else RAW
             # (sweeps=0). This is the ONE-TIME export path; replay loads its final artifact.
@@ -5095,6 +5165,7 @@ def run(cfg, explicit=None):
                                  robot_margin_mode=_export_margin_mode,
                                  table_margin=_export_table_margin,
                                  table_float=_export_table_float,
+                                 wrench_gate=_export_wrench_gate,
                                  witness_sets=witness_alts,
                                  resolved_pre_witnesses=_resolved_pre,
                                  resolve_missing_pre=(_loaded_export is None),
@@ -5137,6 +5208,7 @@ def run(cfg, explicit=None):
               "robot_margin_mode": str(_export_margin_mode),
               "table_margin": float(_export_table_margin or 0.0),
               "table_float": float(_export_table_float or 0.0),
+              "wrench_gate": bool(_export_wrench_gate),
               "pre_insertion": float(robot_ik.pre_insertion_delta),
               "pre_pick": float(robot_ik.pre_pick_delta),
               "post_pick": float(robot_ik.post_pick_delta),

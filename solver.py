@@ -6035,6 +6035,23 @@ def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
           robot_ik._cur_action = old_action
       return p, clear, reason
 
+    # GRASP RESIDUAL: the analogous error at pick/handover/add_grasp.  Report only material
+    # misses here; acceptance remains controlled solely by --grasp-accuracy.  Motion export
+    # and execution now enforce the authored grasp transform rather than freezing this error,
+    # but a large miss still predicts extra terminal-servo work or a failed capture.
+    try:
+      if act[0] not in ("pick", "add_grasp", "handover"):
+        raise LookupError
+      _g = grasp_pose(assembly, act[2], act[3])
+      _target = np.concatenate([
+          _g[:3], _quat_mul(_g[3:], robot_ik.q_correction[act[1]])])
+      _gres = robot_ik.grasp_pose_residual(Ci, out[i], act[1], act[2], _target) * 1000.0
+      if _gres > 1.0 and verbose:
+        print(f"  [export-gate] step {i} {act[:4]}: GRASP RESIDUAL shipped "
+              f"{_gres:.2f}mm (accepted because --grasp-accuracy is off)")
+    except Exception:
+      pass
+
     # MATE RESIDUAL: what the witness ACTUALLY achieves for positionRel(part, onto). This is
     # the number mr_bench bakes in -- C.attach preserves the current WORLD pose at the mode
     # switch, so the exported assembly inherits exactly this error and then disagrees with our
@@ -9475,6 +9492,27 @@ def _search_context(C, assembly, robots, build_table=True):
   is_openarm = is_openarm_scene(C)
   kinds = robot_gripper_kinds(C, robots)
   distinct = sorted(set(kinds.values()))
+  cache_root = os.environ.get("ASSEMBLY_GRASP_DB_PATH") if build_table else None
+  cache_path = None
+  cache_key = os.environ.get("ASSEMBLY_GRASP_DB_KEY") if cache_root else None
+  resolved_cache_key = None
+  if cache_root and not cache_key:
+    raise ValueError("ASSEMBLY_GRASP_DB_PATH requires ASSEMBLY_GRASP_DB_KEY")
+
+  def cached_table():
+    if not cache_path or not os.path.exists(cache_path):
+      return None
+    table, stats = load_grasp_table_cache(cache_path, resolved_cache_key)
+    print(f"[grasp-db] loaded {stats['keys']} component rows / {stats['rows']} grasps "
+          f"from {cache_path}")
+    return table
+
+  def persist_table(table):
+    if cache_path:
+      stats = save_grasp_table_cache(cache_path, table, resolved_cache_key)
+      print(f"[grasp-db] wrote {stats['keys']} component rows / {stats['rows']} grasps "
+            f"to {cache_path}")
+    return table
   if is_openarm:
     if distinct != ["two_finger"]:
       raise ValueError("OpenArm currently exports its native pinch hand only")
@@ -9486,14 +9524,33 @@ def _search_context(C, assembly, robots, build_table=True):
     fact_path = {
         k: os.path.join(os.path.dirname(__file__), UR10_PATHS[(True, k == "vacuum")])
         for k in distinct}
+  if cache_root:
+    import env as _env
+    contract = (
+        tuple(assembly.objects),
+        tuple((part, repr(assembly.grasp_shape(part))) for part in assembly.objects),
+        sampled_grasp_db_signature(assembly),
+        _problem._ROLLS_PER_FACE, _problem._DENSE_GRASPS,
+        _problem._GRASP_TRANSLATIONS, _problem._COMPONENT_GRASP_KEEP,
+        bool(getattr(_env, "_TIGHT_FINGERS", False)),
+        floating, is_ur5, is_openarm, tuple(sorted(kinds.items())),
+        tuple(sorted(ee_path.items())),
+    )
+    resolved_cache_key = hashlib.sha256(
+        (str(cache_key) + "\0" + repr(contract)).encode()).hexdigest()
+    cache_path = os.path.join(cache_root, resolved_cache_key + ".json.gz")
   if len(distinct) == 1:                                   # UNIFORM: byte-identical to before
     k = distinct[0]
     checker = CollisionChecker(assembly, robots, gripper_path=ee_path[k], scene_config=C)
     # plain-EE variant for the labeled-h pick facts (clutter-free scenes; see the h_lab
     # construction in solve_assembly_problem for why the wrist is excluded there).
     checker.fact_gripper_path = fact_path[k]
-    return checker, (precompute_grasps(assembly, gripper_path=ee_path[k])
-                     if build_table else None)
+    if not build_table:
+      return checker, None
+    table = cached_table()
+    if table is None:
+      table = persist_table(precompute_grasps(assembly, gripper_path=ee_path[k]))
+    return checker, table
   # MIXED END EFFECTORS: per-robot cheap-EE slots; the grasp table is the UNION over kinds
   # with a per-grasp kind MASK (a grasp enters kind k's set iff k's EE stands there
   # collision-free vs the subassembly). Successor generators gate (robot, grasp) pairs on
@@ -9504,6 +9561,9 @@ def _search_context(C, assembly, robots, build_table=True):
   checker.fact_gripper_path = fact_path                    # dict per kind (mixed)
   if not build_table:
     return checker, None
+  table = cached_table()
+  if table is not None:
+    return checker, table
   per_kind = {k: precompute_grasps(assembly, gripper_path=ee_path[k]) for k in distinct}
   rolls = _problem._ROLLS_PER_FACE
   dense = _problem._DENSE_GRASPS
@@ -9547,7 +9607,7 @@ def _search_context(C, assembly, robots, build_table=True):
   if not isinstance(table, LazyGraspTable):
     for key in ordered_keys:
       table[key] = merge_key(key, table)
-  return checker, table
+  return checker, persist_table(table)
 
 
 def gripper_kind(C):
@@ -10854,11 +10914,9 @@ def _make_fill_local_pdb(start, assembly, robots, checker, grasp_table, p,
                          lazy_build=True, target_support_quotient=False):
   """Build the backward pattern database for one settled fill goal.
 
-  Every grasp label uses the same shared fact-signature projection. This uniform abstraction
-  avoids a role-specific exception for the interface/end grasp and prevents raw holder ids on a
-  detached moving module from creating a Cartesian product. It is an admissible relaxation: the
-  concrete forward search still considers and validates every raw grasp on every part. The same
-  projection applies to a singleton, detached module, chain, or dependency graph.
+  ``grasp_classes`` normally applies the shared fact-signature projection uniformly to every
+  grasp role. Passing ``None`` is the controlled fine-PDB ablation: G and L retain raw grasp ids,
+  while the milestone algorithm, concrete fill, and all numerical validation stay unchanged.
   """
   root = assembly.base if component_root is None else component_root
   comps = tuple(start.subassemblies())
@@ -12346,6 +12404,7 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
                                            fill_window=2, lazy_fills=True,
                                            cost_bound=None, milestone_oracle="global",
                                            fill_local_h=False, fill_exact=False,
+                                           fill_raw_grasp_h=False,
                                            fill_target_support_quotient=False,
                                            fill_greedy=False,
                                            fill_incumbent_first=False,
@@ -12394,6 +12453,10 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
   milestone_boundaries = int(milestone_boundaries)
   if (fill_policy_first or fill_policy_guide) and not fill_local_h:
     raise ValueError("fill_policy_first/fill_policy_guide requires fill_local_h")
+  if fill_raw_grasp_h and not fill_local_h:
+    raise ValueError("fill_raw_grasp_h requires fill_local_h")
+  if fill_raw_grasp_h and fill_target_support_quotient:
+    raise ValueError("fill_raw_grasp_h and fill_target_support_quotient are mutually exclusive")
   if fill_target_support_quotient and (wrench or geo_facts or not fill_local_h):
     raise ValueError("fill_target_support_quotient requires fill_local_h without "
                      "wrench or geo facts")
@@ -12507,13 +12570,15 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
   policy_fill_classes, policy_fill_pdb_cache = None, {}
   policy_fill_pdb_disabled = False
   if fill_local_h:
-    fill_classes = compute_grasp_signatures(
-        assembly, local_pdb_grasp_table, gripper_kind=hgk,
-        gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
-        clearance=0.02)
+    if not fill_raw_grasp_h:
+      fill_classes = compute_grasp_signatures(
+          assembly, local_pdb_grasp_table, gripper_kind=hgk,
+          gripper_path=getattr(checker, "fact_gripper_path", checker.gripper_path),
+          clearance=0.02)
     if verbose:
       print("[fill-local-h] ACTIVE: one goal-conditioned PDB per fill "
-            "(all grasps fact-signature projected); "
+            + ("(raw grasp labels; no grasp projection); " if fill_raw_grasp_h else
+               "(all grasps fact-signature projected); ")
             + f"concrete fill ordering={'greedy' if fill_greedy else ('weight 1 (exact)' if fill_exact else f'weight {weight:g}')}")
       if fill_target_support_quotient:
         print("[fill-target-support-quotient] ACTIVE: target-component holders are "
@@ -13510,6 +13575,7 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
                                      fill_window=2, lazy_fills=True,
                                      cost_bound=None, milestone_oracle="global",
                                      fill_local_h=False, fill_exact=False,
+                                     fill_raw_grasp_h=False,
                                      fill_target_support_quotient=False,
                                      fill_greedy=False,
                                      fill_incumbent_first=False,
@@ -13562,6 +13628,7 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
       deadline=deadline, fill_window=fill_window, lazy_fills=lazy_fills,
       cost_bound=cost_bound, milestone_oracle=milestone_oracle,
       fill_local_h=fill_local_h, fill_exact=fill_exact, fill_greedy=fill_greedy,
+      fill_raw_grasp_h=fill_raw_grasp_h,
       fill_target_support_quotient=fill_target_support_quotient,
       fill_incumbent_first=fill_incumbent_first,
       fill_policy_first=fill_policy_first, fill_policy_guide=fill_policy_guide,
@@ -13613,6 +13680,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
                                       fill_window=2, lazy_fills=True,
                                       cost_bound=None, milestone_oracle="global",
                                       fill_local_h=False, fill_exact=False,
+                                      fill_raw_grasp_h=False,
                                       fill_target_support_quotient=False,
                                       fill_greedy=False,
                                       fill_incumbent_first=False,
@@ -13636,6 +13704,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
       deadline=deadline, fill_window=fill_window, lazy_fills=lazy_fills,
       cost_bound=cost_bound, milestone_oracle=milestone_oracle,
       fill_local_h=fill_local_h, fill_exact=fill_exact, fill_greedy=fill_greedy,
+      fill_raw_grasp_h=fill_raw_grasp_h,
       fill_target_support_quotient=fill_target_support_quotient,
       fill_incumbent_first=fill_incumbent_first,
       fill_policy_first=fill_policy_first,
@@ -13662,6 +13731,7 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
                                               lns_grasp_transition_h=False,
                                               milestone_oracle="global",
                                               fill_local_h=False, fill_exact=False,
+                                              fill_raw_grasp_h=False,
                                               fill_target_support_quotient=False,
                                               fill_greedy=False,
                                               fill_incumbent_first=False,
@@ -13721,6 +13791,7 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
         allow_place=allow_place, bracing=bracing, geo_facts=geo_facts,
         sig_collapsed_h=sig_collapsed_h, deadline=t_mile, fill_window=fill_window,
         milestone_oracle=milestone_oracle, fill_local_h=fill_local_h,
+        fill_raw_grasp_h=fill_raw_grasp_h,
         fill_target_support_quotient=fill_target_support_quotient,
         fill_exact=fill_exact, fill_greedy=fill_greedy,
         fill_incumbent_first=fill_incumbent_first,

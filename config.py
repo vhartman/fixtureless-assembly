@@ -104,6 +104,8 @@ class RunConfig:
   lns_grasp_transition_h: bool = False
   milestone_oracle: str = "global"
   fill_local_h: bool = False
+  # Ablation: retain raw grasp ids in each local reverse PDB instead of fact signatures.
+  fill_raw_grasp_h: bool = False
   fill_target_support_quotient: bool = False
   fill_exact: bool = False
   fill_greedy: bool = False
@@ -266,6 +268,7 @@ class RunConfig:
   mp_margin_ramp: float = 0.1
   mp_margin_mode: str = "linear"
   mp_table_margin: float = 0.0
+  mp_wrench_gate: bool = False
   mp_seed: Optional[int] = None
   mp_fake_clock: bool = False
   mp_open_plans: bool = False

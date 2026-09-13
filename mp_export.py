@@ -51,6 +51,7 @@ import robotic as ry
 import assembly as A
 import solver as S
 import problem as P
+import wrench as W
 from env import make_four_robot_env
 
 
@@ -821,6 +822,44 @@ def build_tasks(assembly, plan, witnesses, states, robots, robot_idx, robot_ik,
   return tasks, seq, step_names
 
 
+def _canonical_task_relposes(tasks, states, assembly, robot_ik):
+  """Attach the exact symbolic child-in-parent transform to every physical task.
+
+  A KOMO witness is a numerical approximation to a grasp/mate/place equality.  Treating its
+  residual as the new rigid attachment transform makes approximation error part of the search
+  state and compounds it across handovers.  The successor symbolic state already contains the
+  exact selected grasp, mate, or table placement, so read the event transform from that state.
+  No IK is run here.
+  """
+  if assembly is None or robot_ik is None or not hasattr(robot_ik, "scene_for"):
+    return
+  cache = {}
+  for task in tasks:
+    if getattr(task, "canonical_relpose", None) is not None:
+      continue
+    task.canonical_relpose = None
+    frames = getattr(task, "frames", None)
+    if not frames or len(frames) < 2 or getattr(task, "type", None) in (None, "goto"):
+      continue
+    try:
+      step = int(str(task.name).split("_", 1)[0])
+    except (TypeError, ValueError):
+      continue
+    if not 0 <= step < len(states) - 1:
+      continue
+    try:
+      Cpost = cache.get(step)
+      if Cpost is None:
+        Cpost = cache[step] = robot_ik.scene_for(states[step + 1], assembly)
+      parent = np.asarray(Cpost.getFrame(frames[0]).getPose(), dtype=float)
+      child = np.asarray(Cpost.getFrame(frames[1]).getPose(), dtype=float)
+      task.canonical_relpose = P._pose_compose(P._pose_invert(parent), child)
+    except Exception as exc:
+      raise RuntimeError(
+          f"mp_export: cannot derive the exact attachment relation for physical task "
+          f"{getattr(task, 'name', '?')!r}") from exc
+
+
 # ---------------------------------------------------------------------------
 # problem instance
 # ---------------------------------------------------------------------------
@@ -865,8 +904,141 @@ def _dependency_graph(plan, states, step_names, robots, robot_ik, initial_task=N
   return g
 
 
+def _gravity_wrench_gate(env, assembly, gripper_kind):
+  """Return a mode-local quasi-static gravity predicate for the MP hot path.
+
+  Contact generators are built once per symbolic state and expressed in the assembly reference
+  body's frame.  A sampled robot configuration therefore changes only the direction of gravity
+  in that frame; the existing HiGHS model sees one fixed matrix with changing right-hand sides
+  and can warm-start.  Process forces deliberately do not enter this predicate: they exist only
+  while the corresponding insertion/screw skill executes, and are already certified by task IK.
+
+  The current implementation requires the sequence export.  A dependency-graph Mode can contain
+  a non-prefix set of completed actions, for which ``env.states`` has no single matching forward
+  state; guessing one would make the allegedly physical gate history-dependent and unsound.
+  """
+  if hasattr(env, "graph"):
+    raise ValueError(
+        "--mp-wrench-gate currently requires --mp-sequence: dependency-graph modes may "
+        "complete a non-prefix subset of actions, so no unique saved support state exists")
+  if assembly is None or gripper_kind is None:
+    raise ValueError("--mp-wrench-gate needs an assembly and physical gripper kinds")
+
+  # The exact action task is the point at which its discrete support state changes.  Pre/post
+  # goto tasks surround it but do not have the same contact state: after a pick, for example,
+  # the payload is already attached during post-pick retreat.
+  task_pos = {name: i for i, name in enumerate(env.sequence_names)}
+  main_pos = []
+  for i, action in enumerate(env.plan_actions):
+    name = f"{i:02d}_{action[0]}_{'_'.join(str(x) for x in action[1:])}"
+    main_pos.append(task_pos.get(name))
+
+  state_index_cache = {}
+  template_cache = {}
+  down = np.array([0.0, 0.0, -1.0])
+
+  def state_index(mode):
+    key = id(mode)
+    if key in state_index_cache:
+      return state_index_cache[key]
+    pos = int(env.get_current_seq_index(mode))
+    done = [i for i, p in enumerate(main_pos) if p is not None and p < pos]
+    # Sequence export must complete plan actions in prefix order.  Refuse a malformed task map
+    # rather than silently checking the wrong supports.
+    if done != list(range(len(done))):
+      raise ValueError(
+          f"--mp-wrench-gate cannot map mode {list(mode.task_ids)} to a support-state prefix")
+    state_index_cache[key] = len(done)
+    return len(done)
+
+  def block_rotate(G, R, nodes):
+    out = np.asarray(G, dtype=float).copy()
+    Rt = R.T
+    for j in range(nodes):
+      sl = slice(6 * j, 6 * j + 6)
+      out[sl.start:sl.start + 3, :] = Rt @ out[sl.start:sl.start + 3, :]
+      out[sl.start + 3:sl.stop, :] = Rt @ out[sl.start + 3:sl.stop, :]
+    return out
+
+  def templates(si):
+    hit = template_cache.get(si)
+    if hit is not None:
+      return hit
+    state = env.states[si]
+    poses = P._state_part_poses(state, assembly, lift=0.0)
+    out = []
+    for group in state.subassemblies():
+      grounding = state.grounding_contacts(group)
+      if assembly.no_hold:
+        grounding = frozenset(
+            c for c in grounding
+            if c[0] != "grasp" or P._grasp_holds(assembly, group, c[2]))
+      if not grounding:
+        out.append({"group": tuple(sorted(group)), "static_ok": False})
+        continue
+      ref = P.reference_part(group)
+      R0 = P._quat_to_R(np.asarray(poses[ref][3:], dtype=float))
+      finite = P._finite_mate_limits(assembly, group)
+      if finite:
+        _centroid, _wg, G, ub, bounds, _gb, node_map = P._multibody_grounding_caps(
+            state, assembly, group, gripper_kind, finite)
+        node_of = dict(node_map)
+        nodes = 1 + max(node_of.values())
+        Gbody = block_rotate(G, R0, nodes)
+        centroid = np.mean([np.asarray(poses[p][:3], dtype=float) for p in group], axis=0)
+        A = np.zeros((6 * nodes, 3), dtype=float)
+        for p in group:
+          rel = R0.T @ (np.asarray(poses[p][:3], dtype=float) - centroid)
+          j = node_of[p]
+          A[6 * j:6 * j + 6, :] += W.gravity_wrench_map([(assembly.mass(p), rel)])
+      else:
+        centroid, _wg, G, ub, bounds, _gb = P._grounding_caps(
+            state, assembly, group, gripper_kind)
+        nodes = 1
+        Gbody = block_rotate(G, R0, nodes)
+        A = W.gravity_wrench_map([
+            (assembly.mass(p), R0.T @ (np.asarray(poses[p][:3], dtype=float) - centroid))
+            for p in group])
+      geo = ("mp-gravity", np.round(Gbody, 4).tobytes(),
+             np.round(np.asarray(ub, dtype=float), 4).tobytes(), Gbody.shape[0])
+      fixed = any(("table",) in state.supports.get(p, ()) for p in group)
+      entry = {"group": tuple(sorted(group)), "ref": ref, "G": Gbody,
+               "ub": np.asarray(ub, dtype=float), "bounds": bounds, "A": A,
+               "geo": geo, "fixed": fixed, "R0": R0}
+      if fixed:
+        d0 = R0.T @ down
+        entry["static_ok"] = W.equilibrium_feasible_matrices(
+            Gbody, entry["ub"], A @ d0, bounds=bounds, geo_key=geo)
+      out.append(entry)
+    template_cache[si] = out
+    return out
+
+  def check(mode):
+    if W.PARAMS.get("ignore_gravity"):
+      return None
+    for item in templates(state_index(mode)):
+      if "static_ok" in item:
+        ok = item["static_ok"]
+      else:
+        try:
+          R = P._quat_to_R(np.asarray(
+              env.C.getFrame(item["ref"]).getQuaternion(), dtype=float))
+        except Exception as exc:
+          raise ValueError(
+              f"--mp-wrench-gate cannot read pose of {item['ref']!r}") from exc
+        w = item["A"] @ (R.T @ down)
+        ok = W.equilibrium_feasible_matrices(
+            item["G"], item["ub"], w, bounds=item["bounds"], geo_key=item["geo"])
+      if not ok:
+        return {"gate": "gravity-wrench", "group": item["group"]}
+    return None
+
+  return check
+
+
 def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0,
-                          margin_mode="linear", table_margin=0.0, table_float=0.0):
+                          margin_mode="linear", table_margin=0.0, table_float=0.0,
+                          wrench_veto=None):
   """MONKEY-PATCH our planning gates onto the exported problem (mr_bench unmodified).
 
   Joint limits are ALWAYS enforced here. mr_bench samples random configurations inside
@@ -1074,7 +1246,8 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0,
                    "gate_rejects": 0, "base_by_mode": {}, "pass_by_mode": {},
                    "gate_by_mode": {}, "records": {}, "base_audited_by_mode": {},
                    "base_records": {}, "edge_rejects": 0, "edge_base_rejects": 0,
-                   "edge_gate_rejects": 0, "edge_by_mode": {}, "edge_records": {}})
+                   "edge_gate_rejects": 0, "edge_by_mode": {}, "edge_records": {},
+                   "wrench_checks": 0, "wrench_rejects": 0})
     _last_rejection[0] = None
 
   _reset_stats()
@@ -1180,8 +1353,13 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0,
                 tuple(int(x) for x in _np.atleast_1d(frontier_task_ids)))
     calls, base, gate = _stats["calls"], _stats["base_rejects"], _stats["gate_rejects"]
     passed = _stats["base_passes"]
+    # Keep the historical prefix/phrase: benchmark parsers and old diagnostics treat this as
+    # the umbrella audit for every local wrapper gate, not only geometric margins.
     print(f"[mp/margin] predicate audit: {calls} checks; base predicate rejected {base}; "
           f"our added margin gates rejected {gate}/{passed} base-valid checks.")
+    if wrench_veto is not None:
+      print(f"[mp/wrench] gravity feasibility checked {_stats['wrench_checks']} "
+            f"base/margin-valid samples; rejected {_stats['wrench_rejects']}.")
     if frontier:
       print(f"[mp/margin] frontier mode {list(frontier)}: "
             f"base rejected {_stats['base_by_mode'].get(frontier, 0)}, "
@@ -1189,12 +1367,17 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0,
             f"our gates rejected {_stats['gate_by_mode'].get(frontier, 0)}.")
     if not gate:
       print("[mp/margin] our wrapper vetoed no base-valid sample; this run's blockage is not "
-            "caused by --mp-robot-margin/--mp-table-margin.")
+            "caused by --mp-robot-margin/--mp-table-margin/--mp-wrench-gate.")
     else:
       rows = list(_stats["records"].values())
       # Put exact-frontier evidence first, then the most common concrete pair/reason overall.
       rows.sort(key=lambda r: (r["mode"] == frontier, r["count"]), reverse=True)
       for r in rows[:max(1, int(top))]:
+        if r["gate"] == "gravity-wrench":
+          print(f"[mp/gate] mode={list(r['mode'])} task={r['task']} "
+                f"gate=gravity-wrench count={r['count']} "
+                f"group={r['frames'][0]}: grasp/table contacts cannot balance gravity")
+          continue
         if r["gate"] == "joint-limit":
           side = r["frames"][1]
           print(f"[mp/gate] mode={list(r['mode'])} task={r['task']} gate=joint-limit "
@@ -1492,6 +1675,13 @@ def _install_robot_margin(env, margin, robots, gripper_frame, ramp=0.0,
       reason = _joint_limit_veto(q, m)
       if reason is None:
         reason = _too_close(m)
+      if reason is None and wrench_veto is not None:
+        _stats["wrench_checks"] += 1
+        wr = wrench_veto(m)
+        if wr is not None:
+          _stats["wrench_rejects"] += 1
+          group = "+".join(map(str, wr["group"]))
+          reason = _veto(m, "gravity-wrench", group, "gravity", 0.0, 1.0)
       if reason is not None:
         _record(reason)
         _last_rejection[0] = {"layer": "gate", "mode": mode, "reason": reason}
@@ -1532,9 +1722,11 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
                  depgraph=False, collision_tolerance=0.01, pre_witnesses=None,
                  robot_robot_margin=0.0, robot_margin_ramp=0.0,
                  robot_margin_mode="linear", table_margin=0.0,
-                 table_float=0.0, witness_sets=None, resolved_pre_witnesses=None,
+                 table_float=0.0, wrench_gate=False, witness_sets=None,
+                 resolved_pre_witnesses=None,
                  resolve_missing_pre=True, task_records=None, saved_step_names=None,
-                 saved_sequence_names=None, pre_pin_robots=None, skill_paths=None):
+                 saved_sequence_names=None, pre_pin_robots=None, skill_paths=None,
+                 wrench_gate_gripper_kind=None):
   """Build a live mr_bench problem from our solved plan. depgraph=False -> SequenceMixin (a
   fixed total order); depgraph=True -> DependencyGraphMixin (the partial order, so the planner
   may reorder independent actions). Same tasks/frames/witnesses either way."""
@@ -1588,12 +1780,19 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
           raise ValueError(
               f"mp_export: persisted task map has {len(step_names)} plan steps, expected "
               f"{len(plan)}")
+      _canonical_task_relposes(self.tasks, states, assembly, robot_ik)
       self.step_names = step_names                         # task names per plan action -- lets
       self.plan_actions = [tuple(a) for a in plan]         # sim.py map completed tasks back to
                                                            # plan actions (grasp/weld events)
       self.states = states                                 # discrete state trajectory -- the
                                                            # only place report_cograsp_drift can
                                                            # read WHO holds WHAT per mode
+      # Retain the two scene builders for endpoint diagnostics.  Motion planning itself never
+      # reads these attributes: they let validate_nominal_keyframes compare mr_bench's
+      # accumulated, achieved attachments with the canonical symbolic state that certified the
+      # witness.  Keeping that comparison next to the gate avoids another replay-only IK path.
+      self.assembly = assembly
+      self.robot_ik = robot_ik
       self.home_configuration = home.copy()
       self.exit_configuration = exit_state.copy()
       if depgraph:
@@ -1628,6 +1827,63 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
       BaseModeLogic.__init__(self)
       self.prev_mode = self.start_mode
 
+    def set_to_mode(self, m, config=None, use_cached=True, place_in_cache=True):
+      """Rebuild a mode, then replace numerical attach residuals by event semantics.
+
+      mr_bench's generic attach preserves the achieved world pose.  For assembly planning our
+      task goal instead names an exact grasp/mate/place transform, and execution has a terminal
+      servo for reaching it.  Canonicalizing only the just-completed attachment relations keeps
+      the collision scene on that contract and prevents residuals accumulating across modes.
+      """
+      super().set_to_mode(m, config=config, use_cached=use_cached,
+                          place_in_cache=place_in_cache)
+      target = config if config is not None else self.C
+      if target is None:
+        return
+      chain, cur_mode = [], m
+      while cur_mode is not None:
+        chain.append(cur_mode)
+        cur_mode = cur_mode.prev_mode
+      chain.reverse()
+      # Only the LAST attachment event for a child is active in the rebuilt mode.  Walk those
+      # events backwards so an earlier pick is not mistaken for a broken invariant after a
+      # later assemble has legitimately re-parented that same child.
+      seen_children = set()
+      for before, after in reversed(list(zip(chain, chain[1:]))):
+        try:
+          task = self.get_active_task(before, after.task_ids)
+          rel = getattr(task, "canonical_relpose", None)
+          if rel is None or not getattr(task, "frames", None):
+            continue
+          parent, child = task.frames[:2]
+          if child in seen_children:
+            continue
+          seen_children.add(child)
+          frame = target.getFrame(child)
+          actual_parent = (None if frame is None or frame.getParent() is None else
+                           frame.getParent().name)
+          if actual_parent != parent:
+            raise ValueError(
+                f"expected {child!r} parent {parent!r} after event, got {actual_parent!r}")
+          rel = np.asarray(rel, dtype=float)
+          # Mate symmetry is deliberately quotient-ed out of the symbolic state.  Preserve
+          # the exact member selected by the witness by snapping the achieved relative
+          # orientation to its nearest declared equivalent; blindly using scene_for's default
+          # member would turn a valid half/quarter-turn mate into a different configuration.
+          if parent in self.assembly.objects and child in self.assembly.objects:
+            achieved_q = np.asarray(frame.getRelativeQuaternion(), dtype=float)
+            rel = rel.copy()
+            rel[3:] = self.assembly.closest_mate_quaternion(child, achieved_q)
+          frame.setRelativePosition(rel[:3])
+          frame.setRelativeQuaternion(rel[3:])
+        except Exception as exc:
+          # A task with no canonical relation is deliberately ignored above.  Once a physical
+          # assembly event has one, silently retaining the achieved residual would violate the
+          # event contract and recreate the accumulated-drift bug this method exists to fix.
+          raise RuntimeError(
+              f"mp_export: could not enforce canonical relation for task "
+              f"{getattr(task, 'name', '?')!r}") from exc
+
   env = AssemblyEnv()
   if _distinct_exit:
     print("[mp] distinct HOME/EXIT poses: IK parks idle arms at EXIT, while execution starts "
@@ -1652,6 +1908,17 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
         print("[mp] WARNING: --mp-table-margin without --mp-margin-ramp demands the full margin "
               "AT the pick keyframe too, where the part is only part_float above the table -- "
               "the mode after every pick starts in violation and planning will wedge.")
+  _wrench_veto = None
+  if wrench_gate:
+    _gate_gk = gk if wrench_gate_gripper_kind is None else wrench_gate_gripper_kind
+    _wrench_veto = _gravity_wrench_gate(env, assembly, _gate_gk)
+    if W.PARAMS.get("ignore_gravity"):
+      print("[mp] --mp-wrench-gate requested, but --ignore-gravity makes its external load "
+            "zero; the gate is active but vacuous.")
+    else:
+      print("[mp] --mp-wrench-gate ACTIVE: every sampled configuration must balance "
+            "quasi-static gravity with the mode's grasp/table contacts. Process insertion "
+            "and screw loads remain confined to their skill certificates.")
   # Always install: beyond the optional margin gates this supplies the joint-limit predicate
   # missing from mr_bench's RAI collision checker. With both margins at zero it is cheap
   # arithmetic and changes only configurations which simulation would reject anyway.
@@ -1659,7 +1926,8 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
                         robot_ik.gripper_frame, ramp=float(robot_margin_ramp),
                         margin_mode=robot_margin_mode,
                         table_margin=float(table_margin or 0.0),
-                        table_float=float(table_float or 0.0))
+                        table_float=float(table_float or 0.0),
+                        wrench_veto=_wrench_veto)
   return env
 
 
@@ -1874,12 +2142,42 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
       return current_time > self.max_s
   ptc = (RuntimeTerminationCondition(runtime) if stall_timeout is None
          else _FrontierStallPTC(planner, runtime, stall_timeout))
+  _plan_wall_start = _time_mod.perf_counter()
   try:
     path, info = planner.plan(ptc=ptc, optimize=optimize)
+  except Exception:
+    # mr_bench raises while INITIALIZING when every sample of a transition is vetoed.  The
+    # normal audit below was therefore skipped precisely for the most useful failure case.
+    # Emit our structured gate/base diagnosis before preserving the original exception.
+    _modes_on_error = list(getattr(planner, "modes", ()) or ())
+    _frontier_on_error = ([int(t) for t in np.atleast_1d(_modes_on_error[-1].task_ids)]
+                          if _modes_on_error else None)
+    _report_on_error = getattr(problem, "report_margin_rejections", None)
+    if callable(_report_on_error):
+      print("[mp/birrt] initialization/plan exception; rejection audit follows:")
+      _report_on_error(_frontier_on_error)
+    raise
   finally:
+    _plan_wall_s = _time_mod.perf_counter() - _plan_wall_start
     _time_mod.time = _real_time
     BidirectionalTree.__init__ = _tree_init
   info = dict(info or {})
+  # mr_bench records every incumbent's discovery time. Expose its first entry under a stable
+  # name so benchmarks need not infer it from total process wall time (which also contains
+  # scene reconstruction, export, and optional shortcutting). With optimize=False the planner
+  # exits immediately after this incumbent. Fake-clock runs intentionally report consultation
+  # time here and are therefore unsuitable for wall-time benchmarks.
+  _raw_incumbent_times = info.get("times")
+  _incumbent_times = (list(_raw_incumbent_times)
+                      if _raw_incumbent_times is not None else [])
+  info["initial_solution_time_s"] = (
+      float(_incumbent_times[0]) if path and _incumbent_times else None)
+  info["tree_search_wall_s"] = float(_plan_wall_s)
+  _initial_s = info["initial_solution_time_s"]
+  print("[mp-prof] initial_solution_s="
+        + (f"{_initial_s:.6f}" if _initial_s is not None else "none")
+        + f" tree_search_wall_s={_plan_wall_s:.6f} optimize={bool(optimize)}"
+        + (" clock=fake" if fake_clock else " clock=wall"))
   _modes = list(getattr(planner, "modes", ()) or ())
   info["frontier_modes"] = len(_modes)
   info["frontier_leaves"] = sum(not getattr(_m, "next_modes", ()) for _m in _modes)
@@ -1998,6 +2296,9 @@ def _task_record(task):
           "side_effect": getattr(task, "side_effect", None),
           "side_effect_data": (None if getattr(task, "side_effect_data", None) is None else
                                np.asarray(task.side_effect_data, dtype=float).ravel().tolist()),
+          "canonical_relpose": (
+              None if getattr(task, "canonical_relpose", None) is None else
+              np.asarray(task.canonical_relpose, dtype=float).ravel().tolist()),
           "skill_data": getattr(task, "skill_data", None)}
 
 
@@ -2020,6 +2321,8 @@ def _task_from_record(rec):
               side_effect_data=(None if side_data is None else np.asarray(side_data, dtype=float)))
   if rec.get("skill_data") is not None:
     task.skill_data = dict(rec["skill_data"])
+  task.canonical_relpose = (None if rec.get("canonical_relpose") is None else
+                            np.asarray(rec["canonical_relpose"], dtype=float))
   return task
 
 
@@ -2298,7 +2601,103 @@ def validate_nominal_keyframes(problem, tolerance=None, verbose=True):
   cur = [np.asarray(q0.robot_state(j), dtype=float).copy()
          for j in range(len(env.robots))]
   bad, m = [], env.start_mode
+  history = []
+  explained_parts = set()
   task_index = 0
+
+  def _plan_step(name):
+    """Plan/state index encoded by build_tasks' stable ``NN_kind_...`` names."""
+    try:
+      return int(str(name).split("_", 1)[0])
+    except (TypeError, ValueError):
+      return None
+
+  def _pose_error(actual, expected):
+    actual, expected = np.asarray(actual, dtype=float), np.asarray(expected, dtype=float)
+    dp = float(np.linalg.norm(actual[:3] - expected[:3]))
+    qa, qb = actual[3:] / np.linalg.norm(actual[3:]), expected[3:] / np.linalg.norm(expected[3:])
+    da = float(2.0 * np.arccos(np.clip(abs(np.dot(qa, qb)), 0.0, 1.0)))
+    return dp, da
+
+  def _canonical_audit(task, q, pairs):
+    """Compare a rejected achieved-attachment endpoint to its isolated witness scene.
+
+    The comparison is diagnostic only.  It deliberately reuses RobotIK.scene_for and never
+    changes the acceptance test, so a message cannot make an old plan pass or fail.
+    """
+    robot_ik = getattr(env, "robot_ik", None)
+    assembly = getattr(env, "assembly", None)
+    step = _plan_step(getattr(task, "name", None))
+    if robot_ik is None or assembly is None or step is None or step >= len(env.states):
+      return None
+    # The task carrying an action's side effect is evaluated just BEFORE that effect.  A
+    # post-* task is evaluated in the successor state.  This distinction matters for a place:
+    # its skill endpoint is still gripper-parented, whereas post-place is table-parented.
+    post = "_post_" in str(task.name)
+    si = min(step + int(post), len(env.states) - 1)
+    try:
+      Cc = robot_ik.scene_for(env.states[si], assembly)
+      # q is the complete multi-robot configuration represented by the planner's ConfigType.
+      Cc.setJointState(np.asarray(env.C.getJointState(), dtype=float))
+      Cc.computeCollisions()
+    except Exception as exc:
+      return {"error": str(exc)}
+
+    names = set()
+    for fa, fb, _d in pairs:
+      for f in (fa, fb):
+        root = str(f).split("__", 1)[0]
+        if root in assembly.objects:
+          names.add(root)
+    # Include every part whose accumulated pose differs appreciably.  This exposes movement
+    # of a whole carried group even when only one of its collision children hit the table.
+    drift = []
+    for p in assembly.objects:
+      try:
+        dp, da = _pose_error(env.C.getFrame(p).getPose(), Cc.getFrame(p).getPose())
+      except Exception:
+        continue
+      if p in names or dp > 1e-4 or da > np.deg2rad(0.05):
+        drift.append((p, dp, da))
+    drift.sort(key=lambda x: max(x[1] / 1e-3, x[2] / np.deg2rad(1.0)), reverse=True)
+
+    # Ask the same base geometric question in the canonical scene.  Intended mate/internal
+    # pairs are omitted using the accumulated environment's stable classification helpers.
+    cpairs = [(str(a), str(b), float(d)) for a, b, d in Cc.getCollisions() if float(d) < 0.0]
+    _internal = getattr(env, "is_internal_rigid_pair", lambda _a, _b: False)
+    _intended = getattr(env, "is_intended_active_mate_pair", lambda _a, _b, _m: False)
+    cpairs = [(a, b, d) for a, b, d in cpairs
+              if not _internal(a, b) and not _intended(a, b, m)]
+    return {"state": si, "drift": drift, "penetration": sum(-d for _a, _b, d in cpairs),
+            "pairs": sorted(cpairs, key=lambda x: x[2])}
+
+  def _drift_history(parts):
+    """Canonical-vs-accumulated error at earlier physical event endpoints."""
+    robot_ik = getattr(env, "robot_ik", None)
+    assembly = getattr(env, "assembly", None)
+    if robot_ik is None or assembly is None:
+      return []
+    out = []
+    for rec in history:
+      name, si, qj, poses = rec
+      if "_pre_" in name or "_post_" in name:
+        continue
+      try:
+        Cc = robot_ik.scene_for(env.states[si], assembly)
+        Cc.setJointState(qj)
+      except Exception:
+        continue
+      vals = []
+      for p in parts:
+        if p not in poses:
+          continue
+        try:
+          vals.append((p, *_pose_error(poses[p], Cc.getFrame(p).getPose())))
+        except Exception:
+          pass
+      if vals:
+        out.append((name, vals))
+    return out
   def owner(frame):
     """Robot whose kinematic subtree contains frame, including a carried part."""
     try:
@@ -2328,6 +2727,18 @@ def validate_nominal_keyframes(problem, tolerance=None, verbose=True):
     # robot/table margins are a path-shaping policy and may legitimately relax at a keyframe.
     # The underlying total penetration is the shared hard geometric fact.
     env.is_collision_free(q, m)
+    _step = _plan_step(task.name)
+    if _step is not None and _step < len(env.states):
+      _post = "_post_" in str(task.name)
+      _si = min(_step + int(_post), len(env.states) - 1)
+      _poses = {}
+      for _p in getattr(getattr(env, "assembly", None), "objects", ()):
+        try:
+          _poses[_p] = np.asarray(env.C.getFrame(_p).getPose(), dtype=float).copy()
+        except Exception:
+          pass
+      history.append((str(task.name), _si,
+                      np.asarray(env.C.getJointState(), dtype=float).copy(), _poses))
     active = set(task.robots)
     all_pairs = [(str(c[0]), str(c[1]), float(c[2])) for c in env.C.getCollisions()
                  if float(c[2]) < 0.0]
@@ -2348,6 +2759,35 @@ def validate_nominal_keyframes(problem, tolerance=None, verbose=True):
               f"{float(tolerance) * 1000:.3f}mm")
         for fa, fb, d in pairs[:6]:
           print(f"    {fa} ~ {fb}: {d * 1000:+.2f}mm")
+        audit = _canonical_audit(task, q, pairs)
+        if audit is not None:
+          if "error" in audit:
+            print(f"    canonical comparison unavailable: {audit['error']}")
+          else:
+            print(f"    canonical symbolic state {audit['state']}: "
+                  f"{audit['penetration'] * 1000:.2f}mm total penetration")
+            for p, dp, da in audit["drift"][:8]:
+              print(f"    accumulated drift {p}: {dp * 1000:.2f}mm, "
+                    f"{np.rad2deg(da):.2f}deg")
+            roots = {str(f).split("__", 1)[0] for fa, fb, _d in pairs for f in (fa, fb)}
+            roots &= set(getattr(getattr(env, "assembly", None), "objects", ()))
+            roots -= explained_parts
+            if roots:
+              print("    drift history at physical event endpoints:")
+              previous = {p: (-1.0, -1.0) for p in roots}
+              for hname, vals in _drift_history(roots):
+                # Suppress repeated zero/no-change entries while preserving each material jump.
+                show = False
+                for p, dp, da in vals:
+                  odp, oda = previous[p]
+                  if (abs(dp - odp) > 1e-4 or abs(da - oda) > np.deg2rad(0.05)):
+                    show = True
+                  previous[p] = (dp, da)
+                if show:
+                  desc = ", ".join(f"{p}={dp*1000:.2f}mm/{np.rad2deg(da):.2f}deg"
+                                   for p, dp, da in vals)
+                  print(f"      {hname}: {desc}")
+              explained_parts |= roots
     # get_next_modes is NOT a pure query: it appends the returned child to m.next_modes.
     # This validator runs before BiRRT. Leaving the canonical chain installed made every
     # subsequently reached mode look non-frontier, so mr_bench's 98%-frontier policy had an

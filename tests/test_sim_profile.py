@@ -83,6 +83,36 @@ def test_process_wrench_application_is_explicit_and_reversible():
       "--no-apply-process-wrench"]).apply_process_wrench
 
 
+def test_sim_gravity_is_enabled_by_default_and_explicitly_reversible():
+  assert sim.parse_args(["run", "plan.json"]).sim_gravity
+  assert not sim.parse_args(["run", "plan.json", "--no-sim-gravity"]).sim_gravity
+  assert sim.parse_args([
+      "run", "plan.json", "--no-sim-gravity", "--sim-gravity"]).sim_gravity
+
+
+def test_insertion_only_grasp_check_is_opt_in():
+  assert not sim.parse_args(["run", "plan.json"]).insertion_only_grasp_check
+  assert sim.parse_args([
+      "run", "plan.json", "--apply-process-wrench",
+      "--insertion-only-grasp-check"]).insertion_only_grasp_check
+
+
+def test_exact_grasp_target_uses_authored_relation_not_witness_fk(monkeypatch):
+  part_pose = np.asarray([0.4, -0.2, 0.7, 1.0, 0.0, 0.0, 0.0])
+  grasp = np.asarray([0.03, 0.01, -0.02, 1.0, 0.0, 0.0, 0.0])
+  # Representative robot-specific tool-frame calibration: a 90 degree roll.
+  correction = np.asarray([np.sqrt(0.5), np.sqrt(0.5), 0.0, 0.0])
+  monkeypatch.setattr(sim, "grasp_pose", lambda _a, _p, _g: grasp)
+  robot_ik = SimpleNamespace(q_correction={"a1": correction})
+
+  got = sim._exact_grasp_anchor_target(
+      object(), robot_ik, "a1", "obj_0", 7, part_pose)
+  expected = sim._pose_compose(
+      part_pose, np.r_[grasp[:3], sim._quat_mul(grasp[3:], correction)])
+
+  assert np.allclose(got, expected)
+
+
 def test_process_noise_cli_is_explicit_and_replayable():
   a = sim.parse_args([
       "run", "plan.json", "--apply-process-wrench", "--process-noise", "sample",
@@ -155,6 +185,42 @@ def test_saved_wrench_cap_scales_are_idempotent_not_squared():
   finally:
     wrench.PARAMS.clear()
     wrench.PARAMS.update(old)
+
+
+def test_grasp_wrench_metric_requires_a_contiguous_full_window():
+  scene = sim.SimScene.__new__(sim.SimScene)
+  scene._wrench_metric_window = 3
+  scene._wrench_metric_history = {}
+  scene._wrench_metrics_by_kind = {}
+  scene.gripper_kinds = {"a1": "two_finger"}
+  scene._wrench_metrics = {
+      phase: {
+          "samples": 0,
+          "peak_force_n": 0.0,
+          "peak_torque_nm": 0.0,
+          "peak_utilization": 0.0,
+          "peak_sustained_force_n": None,
+          "peak_sustained_torque_nm": None,
+          "peak_sustained_utilization": None,
+      }
+      for phase in ("transport", "insertion")
+  }
+  for tick, utilization in enumerate((0.3, 0.6, 0.9)):
+    scene.step_i = tick
+    scene._observe_grasp_wrench(
+        "transport", "a1", "obj_0", utilization, 10.0 * utilization, utilization)
+  got = scene.grasp_wrench_metrics()
+  assert got["phases"]["transport"]["peak_utilization"] == pytest.approx(0.9)
+  assert got["phases"]["transport"]["peak_sustained_utilization"] == pytest.approx(0.6)
+  assert got["by_gripper_kind"]["two_finger"]["transport"][
+      "peak_sustained_utilization"] == pytest.approx(0.6)
+
+  # A gap starts a new interval rather than joining physically unrelated samples.
+  scene.step_i = 10
+  scene._observe_grasp_wrench("transport", "a1", "obj_0", 3.0, 30.0, 3.0)
+  got = scene.grasp_wrench_metrics()
+  assert got["phases"]["transport"]["peak_utilization"] == pytest.approx(3.0)
+  assert got["phases"]["transport"]["peak_sustained_utilization"] == pytest.approx(0.6)
 
 
 def test_max_robotiq_selects_axis_resolved_breakaway_unless_overridden():

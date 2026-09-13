@@ -43,6 +43,8 @@ Recordings: sim_recordings/*.npz -- replay with `python3 sim.py replay <file> [s
 """
 import os
 import time as _time
+from collections import deque
+from pathlib import Path
 import numpy as np
 from math import sqrt as _sqrt
 import arm_model
@@ -75,7 +77,7 @@ def _assembly_contact_filter(model, data, geom1, geom2):
   return scene._filter_active_mate_contact(data, int(geom1), int(geom2))
 
 from problem import (grasp_pose, _pose_compose, _pose_invert, _quat_to_R, _quat_mul,
-                     _shape_half_z, _state_part_poses)
+                     _shape_half_z, _shape_quat, _state_part_poses)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -303,6 +305,9 @@ class SimReport:
   def __init__(self):
     self.results = []
     self.final_pose_err = None                             # {part: (pos_err_m, ang_err_rad)}
+    # Filled by execute_motion_plan. These come from the same MuJoCo weld wrench and
+    # directional caps as grasp breakaway, not from a second analytical model.
+    self.grasp_wrench_metrics = None
 
   @property
   def success(self):
@@ -349,6 +354,7 @@ class SimReport:
                     for r in self.results],
         "final_pose_err": {p: [float(v[0]), float(v[1])]
                            for p, v in (self.final_pose_err or {}).items()},
+        "grasp_wrench_metrics": dict(self.grasp_wrench_metrics or {}),
         "metadata": dict(metadata or {}),
     }
 
@@ -1269,6 +1275,18 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
 # ---------------------------------------------------------------------------------------------
 # the sim world: weld managers + stepping + breakaway
 # ---------------------------------------------------------------------------------------------
+def _empty_grasp_wrench_metric():
+  return {
+      "samples": 0,
+      "peak_force_n": 0.0,
+      "peak_torque_nm": 0.0,
+      "peak_utilization": 0.0,
+      "peak_sustained_force_n": None,
+      "peak_sustained_torque_nm": None,
+      "peak_sustained_utilization": None,
+  }
+
+
 class SimScene:
   def __init__(self, assembly, state, robots, gripper_kinds=None, gui=False,
                arms=None, arm_poses=None, ee_anchor=None, articulated_C=None,
@@ -1304,6 +1322,16 @@ class SimScene:
     self.recorder = None                                   # set by the executor (see record=)
     self._rec_count = 0
     self._over = {}                                        # robot -> consecutive overload steps
+    # Paper metric: raw instantaneous weld-load peaks plus a BREAK_SUSTAIN-wide trailing
+    # average of the normalized directional breakaway ratio. Keep histories per
+    # (phase, robot, payload), and reject non-contiguous samples, so a release/regrasp cannot
+    # manufacture a sustained load by joining two unrelated intervals.
+    self._wrench_metric_window = max(1, int(BREAK_SUSTAIN / DT))
+    self._wrench_metric_history = {}
+    self._wrench_metrics = {
+        phase: _empty_grasp_wrench_metric()
+        for phase in ("transport", "insertion")}
+    self._wrench_metrics_by_kind = {}                    # kind -> phase -> same metrics
     self._grasp_trace = int(os.environ.get("SIM_GRASP_TRACE", "0"))   # weld-slip diagnostic
     self.wrench_trace = None                               # SIM_WRENCH_TRACE hook, see
     self.trace_ctx = None                                  # _make_wrench_tracer (driver's
@@ -1314,6 +1342,8 @@ class SimScene:
     self.process_wrenches = []
     self._process_wrench_bodies = set()
     self._process_wrench_ticks = 0
+    self._process_engagement = 0.0                         # actual near-insertion load fraction
+    self.insertion_only_grasp_check = False
     self.process_engagement_distance = float(process_engagement_distance)
     self.process_wrench_ramp = float(process_wrench_ramp)
     # per-robot geom ids of the rai contact=-2 wrist capsules (un-collided while holding)
@@ -1552,6 +1582,7 @@ class SimScene:
 
   def _apply_process_wrenches(self):
     """Write current-pose process forces into MuJoCo's body-COM wrench input."""
+    self._process_engagement = 0.0
     if not self._process_wrench_bodies:
       return
     for bid in self._process_wrench_bodies:
@@ -1581,6 +1612,7 @@ class SimScene:
         # A thread is engaged throughout its certified helix; only suppress the turn-on impulse.
         engage = 1.0
       scale = ramp * engage
+      self._process_engagement = max(self._process_engagement, scale)
       for body, (force, torque, point) in loads.items():
         bid = self._body_id(body)
         # xfrc_applied is a world-frame force/couple at the body's inertial COM. Translate
@@ -1613,24 +1645,37 @@ class SimScene:
     return (float(np.linalg.norm(rel_p - tgt_p)) * 1000.0,
             float(np.degrees(_quat_angle(rel_q, tgt_q))))
 
-  def _activate_weld(self, eq_id, body1, body2):
-    """Freeze the CURRENT relative pose of body2 in body1 into the weld's eq_data, then
-    activate. TODO(verify): eq_data layout for mjEQ_WELD is [anchor(3), relpose(7), torquescale]
-    in mujoco 3.x -- check indices on first run."""
-    p1, q1 = self.data.xpos[body1], self.data.xquat[body1]
-    p2, q2 = self.data.xpos[body2], self.data.xquat[body2]
-    R1 = _quat_to_R(q1)
-    rel_p = R1.T @ (p2 - p1)
-    rel_q = _pose_compose(np.r_[0, 0, 0, _quat_conj(q1)], np.r_[0, 0, 0, q2])[3:]
+  def _activate_weld(self, eq_id, body1, body2, relative_pose=None):
+    """Activate a weld with an explicit or currently achieved body2-in-body1 pose."""
+    if relative_pose is None:
+      p1, q1 = self.data.xpos[body1], self.data.xquat[body1]
+      p2, q2 = self.data.xpos[body2], self.data.xquat[body2]
+      R1 = _quat_to_R(q1)
+      rel_p = R1.T @ (p2 - p1)
+      rel_q = _pose_compose(np.r_[0, 0, 0, _quat_conj(q1)], np.r_[0, 0, 0, q2])[3:]
+    else:
+      rel = np.asarray(relative_pose, dtype=float)
+      rel_p, rel_q = rel[:3], rel[3:]
     self.model.eq_data[eq_id][:3] = 0.0                    # anchor
     self.model.eq_data[eq_id][3:6] = rel_p
     self.model.eq_data[eq_id][6:10] = rel_q
     self.model.eq_data[eq_id][10] = 1.0                    # torquescale
     self.data.eq_active[eq_id] = 1
 
-  def grasp(self, robot, part, gid=None, grasp_part=None):
+  def grasp(self, robot, part, gid=None, grasp_part=None, grasp_relpose=None):
     eq = self._eq_id(f"grasp_{robot}_{part}")
-    self._activate_weld(eq, self._body_id(self.grasp_anchor[robot]), self._body_id(part))
+    anchor_body, root_body = self._body_id(self.grasp_anchor[robot]), self._body_id(part)
+    weld_relpose = None
+    if grasp_relpose is not None:
+      # ``grasp_relpose`` is contacted-part_T_anchor.  The welded child can instead be the
+      # fixed root of an assembled component, so compose through the live (already exact)
+      # component geometry to obtain anchor_T_root.  The servo makes this activation gentle;
+      # the equality itself remains exact and cannot carry a residual into the next mode.
+      contacted = part if grasp_part is None else grasp_part
+      world_T_contacted = self.part_pose(contacted)
+      world_T_anchor = _pose_compose(world_T_contacted, grasp_relpose)
+      weld_relpose = _pose_compose(_pose_invert(world_T_anchor), self.part_pose(part))
+    self._activate_weld(eq, anchor_body, root_body, relative_pose=weld_relpose)
     kind = self.gripper_kinds.get(robot, "vacuum")
     self.active_grasps[robot] = (eq, part) + _grasp_caps(kind)
     # DIRECTIONAL CAPS need the grasp FRAME, which is a property of the grasp id. Stored in a
@@ -1966,7 +2011,7 @@ class SimScene:
     if meq >= 0 and self.data.eq_active[meq]:
       self.data.eq_active[meq] = 0
 
-  def attach(self, parent_frame, child):
+  def attach(self, parent_frame, child, grasp_relpose=None):
     """Replay ONE mr_bench task attach (frames = [parent, child]) as a weld, EXACTLY as
     set_to_mode does. This is the correct event model for a saved motion PATH: the path was
     planned under these attaches, so the sim must mirror them or the arm drags the part.
@@ -1993,7 +2038,7 @@ class SimScene:
         except ValueError:
           _gid = None
       self.grasp(parent_frame.split("_", 1)[0], child, gid=_gid,
-                 grasp_part=_grasp_part)
+                 grasp_part=_grasp_part, grasp_relpose=grasp_relpose)
 
   def _active_mate_component(self, part):
     """Parts rigidly connected to ``part`` by the currently active mate welds.
@@ -2265,6 +2310,66 @@ class SimScene:
     return (_sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]),
             ts * _sqrt(f[3] * f[3] + f[4] * f[4] + f[5] * f[5]))
 
+  def _observe_grasp_wrench(self, phase, robot, part, utilization, force_n, torque_nm):
+    """Accumulate a phase-specific physical grasp-load metric.
+
+    ``utilization`` is the worst component/cap ratio returned by ``_grasp_violation`` (or
+    the equivalent scalar-cap ratio for legacy grasps). A full 20ms contiguous window is
+    required before a value contributes to the sustained peak; short impulses therefore stay
+    visible in the raw maxima without dominating the paper metric.
+    """
+    metric = self._wrench_metrics[phase]
+    by_kind = getattr(self, "_wrench_metrics_by_kind", None)
+    if by_kind is None:                                  # small __new__ unit-test fixtures
+      by_kind = self._wrench_metrics_by_kind = {}
+    kind = getattr(self, "gripper_kinds", {}).get(robot, "vacuum")
+    kind_metric = by_kind.setdefault(kind, {}).setdefault(
+        phase, _empty_grasp_wrench_metric())
+    utilization = float(utilization)
+    force_n = float(force_n)
+    torque_nm = float(torque_nm)
+    for target in (metric, kind_metric):
+      target["samples"] += 1
+      target["peak_force_n"] = max(target["peak_force_n"], force_n)
+      target["peak_torque_nm"] = max(target["peak_torque_nm"], torque_nm)
+      target["peak_utilization"] = max(target["peak_utilization"], utilization)
+    key = (phase, robot, part)
+    hist, last = self._wrench_metric_history.get(
+        key, (deque(maxlen=self._wrench_metric_window), None))
+    if last is None or last != self.step_i - 1:
+      hist.clear()
+    hist.append((utilization, force_n, torque_nm))
+    self._wrench_metric_history[key] = (hist, self.step_i)
+    if len(hist) != self._wrench_metric_window:
+      return
+    avg = np.mean(np.asarray(hist, dtype=float), axis=0)
+    for target in (metric, kind_metric):
+      for field, value in zip(
+          ("peak_sustained_utilization", "peak_sustained_force_n",
+           "peak_sustained_torque_nm"), avg):
+        old = target[field]
+        target[field] = float(value) if old is None else max(float(old), float(value))
+
+  def grasp_wrench_metrics(self):
+    """JSON-safe summary of measured active-grasp loads, split by execution phase."""
+    return {
+        "window_s": float(self._wrench_metric_window * DT),
+        "definition": ("maximum trailing-window mean of the instantaneous worst normalized "
+                       "directional grasp-cap ratio"),
+        "phases": {
+            phase: {key: (int(value) if key == "samples" else value)
+                    for key, value in metric.items()}
+            for phase, metric in self._wrench_metrics.items()
+        },
+        "by_gripper_kind": {
+            kind: {
+                phase: {key: (int(value) if key == "samples" else value)
+                        for key, value in metric.items()}
+                for phase, metric in phases.items()}
+            for kind, phases in self._wrench_metrics_by_kind.items()
+        },
+    }
+
   def step(self, n=1, report=None, action=None):
     """Advance; after each step check every active grasp weld against its breakaway caps --
     an overloaded grasp DROPS (deactivates) and is recorded as the LP-predicted failure."""
@@ -2312,13 +2417,30 @@ class SimScene:
         # when actuators make the chain track for real.
         self.set_arm_q(*self._cmd_q)
       self.step_i += 1
+      _check_grasps = (not self.insertion_only_grasp_check
+                       or self._process_engagement > 0.0)
       for r, (eq, part, fcap, tcap) in list(self.active_grasps.items()):
-        fmag, tmag = self._weld_wrench(eq)
+        # Measure every active grasp even when the optional insertion-only BREAKAGE switch
+        # suppresses transport rejection. Phase membership follows the explicitly declared
+        # entry-to-seat process interval, including its zero-load approach/ramp samples.
+        _h = self._hold_info.get(r) if self.directional_caps else None
+        if _h is not None:
+          _ratio, _lbl, fmag, tmag = self._grasp_violation(_h)
+        else:
+          _lbl = ""
+          fmag, tmag = self._weld_wrench(eq)
+          _ratio = max(fmag / max(float(fcap), 1e-9),
+                       tmag / max(float(tcap), 1e-9))
+        _phase = "insertion" if self.process_wrenches else "transport"
+        self._observe_grasp_wrench(_phase, r, part, _ratio, fmag, tmag)
+        if not _check_grasps:
+          # An overload must be sustained continuously inside the insertion neighborhood;
+          # transport samples neither count toward nor leak into that interval.
+          self._over[r] = 0
+          continue
         if self.wrench_trace is not None:                   # diagnostic: reuses THIS wrench
           self.wrench_trace(r, part, fmag, tmag, fcap, tcap)
-        _h = self._hold_info.get(r) if self.directional_caps else None
         if _h is not None:                                  # the planner's BOX, in the grasp frame
-          _ratio, _lbl, fmag, tmag = self._grasp_violation(_h)
           _over = _ratio > 1.0
         else:                                               # no grasp id -> conservative scalar
           _lbl, _over = "", (fmag > fcap or tmag > tcap)
@@ -2443,7 +2565,26 @@ def _rel_pos(pose_a, pose_b):
                                                  - np.asarray(pose_a[:3]))
 
 
-def _mate_pose_error(parent_pose, child_pose, relative_target, insertion_axis):
+def _mate_intrinsic_axis(assembly, part):
+  """Return a part-frame axis whose rotation is physically unobservable at a mate.
+
+  Cylinders are continuously symmetric about their shape axis (which need not be the part
+  frame's z axis); spheres are symmetric about every axis, represented by a zero vector.
+  ``None`` means that the complete authored orientation remains significant.
+  """
+  shape = assembly.part_shape(part)
+  kind = shape[0]
+  if kind == "sphere":
+    return np.zeros(3)
+  if kind != "cylinder":
+    return None
+  shape_q = _shape_quat(shape)
+  return (np.array([0.0, 0.0, 1.0]) if shape_q is None
+          else _quat_to_R(np.asarray(shape_q, dtype=float))[:, 2])
+
+
+def _mate_pose_error(parent_pose, child_pose, relative_target, insertion_axis,
+                     intrinsic_axis=None):
   """Decompose a mate residual in the measured parent's frame.
 
   ``relative_target`` is the complete child-in-parent transform selected by the witness.
@@ -2463,6 +2604,35 @@ def _mate_pose_error(parent_pose, child_pose, relative_target, insertion_axis):
   axis = axis / n
   axial = float(ep_parent @ axis)
   lateral_vec = ep_parent - axial * axis
+  # The insertion controller needs both an angle for its terminal condition and a world-frame
+  # rotation vector for feedback. A round peg's roll about its own axis is not a physical
+  # error: trying to servo that arbitrary coordinate made freely rolled chair posts rotate
+  # into their guide and jam. Align only the cylinder axes, choosing the equivalent end-cap
+  # direction nearest the current pose. Boxes/meshes retain the complete quaternion error.
+  if intrinsic_axis is None:
+    qe = _quat_mul(desired[3:], _quat_conj(child_pose[3:]))
+    if qe[0] < 0.0:
+      qe = -qe
+    nv = float(np.linalg.norm(qe[1:]))
+    angle = 2.0 * np.arctan2(nv, max(float(qe[0]), 0.0))
+    rotation_vec = (np.zeros(3) if nv < 1e-12 else qe[1:] * (angle / nv))
+  else:
+    axis_local = np.asarray(intrinsic_axis, dtype=float)
+    na = float(np.linalg.norm(axis_local))
+    if na < 1e-12:                                        # sphere: orientation is immaterial
+      angle, rotation_vec = 0.0, np.zeros(3)
+    else:
+      axis_local /= na
+      actual_axis = _quat_to_R(child_pose[3:]) @ axis_local
+      desired_axis = _quat_to_R(desired[3:]) @ axis_local
+      dot = float(np.dot(actual_axis, desired_axis))
+      if dot < 0.0:                                       # identical cylinder end caps
+        desired_axis = -desired_axis
+        dot = -dot
+      cross = np.cross(actual_axis, desired_axis)
+      sn = float(np.linalg.norm(cross))
+      angle = float(np.arctan2(sn, np.clip(dot, -1.0, 1.0)))
+      rotation_vec = (np.zeros(3) if sn < 1e-12 else cross * (angle / sn))
   return {
       "desired": desired,
       "world": ep_world,
@@ -2472,7 +2642,8 @@ def _mate_pose_error(parent_pose, child_pose, relative_target, insertion_axis):
       "lateral_vec": lateral_vec,
       "position": float(np.linalg.norm(ep_parent)),
       "lateral": float(np.linalg.norm(lateral_vec)),
-      "angle": float(_quat_angle(desired[3:], child_pose[3:])),
+      "angle": float(angle),
+      "rotation_vec": rotation_vec,
   }
 
 
@@ -2490,6 +2661,25 @@ def _held_grasp_id(state, part, robot=None):
         return p, c[3]
   who = "" if robot is None else f" by {robot}"
   raise ValueError(f"{part}'s group not held{who} in this state")
+
+
+def _exact_grasp_anchor_target(assembly, robot_ik, robot, part, grasp_id, part_pose):
+  """World pose of the grasp anchor for the selected exact object-relative grasp.
+
+  The saved witness supplies a robot posture, not the grasp transform: its small numerical FK
+  residual must never be copied into the physical attachment.  This relation is shared by
+  ordinary picks and the receiving hand of a handover.
+  """
+  object_T_anchor = _exact_grasp_anchor_relation(
+      assembly, robot_ik, robot, part, grasp_id)
+  return _pose_compose(np.asarray(part_pose, dtype=float), object_T_anchor)
+
+
+def _exact_grasp_anchor_relation(assembly, robot_ik, robot, part, grasp_id):
+  """The authored ``part_T_anchor`` relation selected by a grasp id."""
+  grasp = np.asarray(grasp_pose(assembly, part, grasp_id), dtype=float)
+  correction = np.asarray(robot_ik.q_correction[robot], dtype=float)
+  return np.r_[grasp[:3], _quat_mul(grasp[3:], correction)]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2607,17 +2797,17 @@ class _SkillServo:
     mujoco.mj_jac(self.scene.model, self.scene.data, jacp, jacr, point, body)
     return np.vstack((jacp[:, self.dofs[robot]], jacr[:, self.dofs[robot]]))
 
-  def align_pick(self, q_ref, robot, part, nominal_part_pose, nominal_anchor_pose,
+  def align_pick(self, q_ref, robot, part, desired_anchor,
                  drive, tick, budget, observed=True, angular_tol=np.deg2rad(2.0)):
     """Measure, optionally correct, and return the terminal grasp-pose residual.
 
-    The desired anchor is obtained by left-multiplying the nominal anchor with the measured
-    world displacement of the part. This preserves the exact saved grasp transform and all
-    robot-specific EE calibration; no grasp geometry is reconstructed in the simulator.
+    ``desired_anchor`` is built from the measured part pose and the selected grasp database
+    transform.  In particular it is *not* the approximate FK pose of the KOMO witness: using
+    that pose preserved the witness residual and every handover froze a slightly different
+    object-in-hand transform.  This servo is the execution realization of the exact grasp
+    event used by motion planning.
     """
-    actual_part = np.asarray(self.scene.part_pose(part), dtype=float)
-    delta = _pose_compose(actual_part, _pose_invert(np.asarray(nominal_part_pose, dtype=float)))
-    desired = _pose_compose(delta, np.asarray(nominal_anchor_pose, dtype=float))
+    desired = np.asarray(desired_anchor, dtype=float)
     q = np.asarray(q_ref, dtype=float).copy()
     # Continue from the plant rather than jumping back to the nominal reference after settle.
     for j in self.qidx[robot]:
@@ -2649,14 +2839,6 @@ class _SkillServo:
           break
         vp = self.kp * ep
         wp = self.kp * er
-        if pair_force >= 0.5 and self.torque_guard is not None and util > self.torque_guard:
-          # Smoothly spend the certified wrench reserve instead of jumping from the transport
-          # yield threshold straight to the hard insertion guard. This is a velocity damper in
-          # normalized wrench space: 100% speed at the soft guard, zero at the 90% hard guard.
-          den = max(guard_fraction - self.torque_guard, 1e-6)
-          wrench_scale = float(np.clip((guard_fraction - util) / den, 0.0, 1.0))
-          vp_parent *= wrench_scale
-          wp *= wrench_scale
         npv, nw = float(np.linalg.norm(vp)), float(np.linalg.norm(wp))
         if npv > self.vmax:
           vp *= self.vmax / npv
@@ -3042,7 +3224,8 @@ class _SkillServo:
         self.scene.net_contact_force(part))), ticks * self.dt))
 
   def seat(self, q_ref, parent, child, name, drive, tick, budget,
-           relative_target, insertion_axis, min_steps=0, posture_target=None):
+           relative_target, insertion_axis, intrinsic_axis=None, min_steps=0,
+           posture_target=None):
     """Guarded, parent-relative insertion of ``child`` into ``parent``.
 
     This is a small hybrid skill rather than a world-position correction. It first removes
@@ -3080,7 +3263,7 @@ class _SkillServo:
     for _ in range(int(budget / self.dt)):
       pp = self.scene.part_pose(parent)
       cp = self.scene.part_pose(child)
-      metrics = _mate_pose_error(pp, cp, relative_target, insertion_axis)
+      metrics = _mate_pose_error(pp, cp, relative_target, insertion_axis, intrinsic_axis)
       err = metrics["position"]
       if err0 is None:
         err0 = err
@@ -3169,14 +3352,7 @@ class _SkillServo:
           contact_speed = INSERT_CONTACT_SPEED * (0.5 if retried else 1.0)
           if axial_speed > contact_speed:
             vp_parent += (contact_speed - axial_speed) * metrics["axis"]
-        desired = metrics["desired"]
-        qe = _quat_mul(desired[3:], _quat_conj(cp[3:]))
-        if qe[0] < 0.0:
-          qe = -qe
-        nv = float(np.linalg.norm(qe[1:]))
-        er = (np.zeros(3) if nv < 1e-12 else
-              qe[1:] * (2.0 * np.arctan2(nv, max(float(qe[0]), 0.0)) / nv))
-        wp = self.kp * er
+        wp = self.kp * metrics["rotation_vec"]
       phases.append(phase)
 
       vp = _quat_to_R(pp[3:]) @ vp_parent
@@ -3214,7 +3390,7 @@ class _SkillServo:
     if err0 is not None:
       # Re-evaluate after the last driven tick so outcome reporting is not one sample stale.
       metrics = _mate_pose_error(self.scene.part_pose(parent), self.scene.part_pose(child),
-                                 relative_target, insertion_axis)
+                                 relative_target, insertion_axis, intrinsic_axis)
       self.seat_log.append((name, err0, metrics["position"]))
       self.seat_outcome[name] = {
           "status": status, "position": metrics["position"],
@@ -3255,6 +3431,9 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         path_preflight=True, path_preflight_tolerance=PATH_PREFLIGHT_TOL,
                         path_preflight_resolution=None,
                         apply_process_wrench=False, table_mu=None,
+                        sim_gravity=True,
+                        insertion_only_grasp_check=False,
+                        abort_on_action_failure=False,
                         process_noise_mode="nominal", process_noise_corner=0,
                         process_noise_seed=0, process_engagement_distance=0.01,
                         process_wrench_ramp=0.05,
@@ -3370,6 +3549,20 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                    process_engagement_distance=process_engagement_distance,
                    process_wrench_ramp=process_wrench_ramp,
                    animate_grippers=animate_grippers, object_damping=object_damping)
+  if not sim_gravity:
+    # Simulation-only counterfactual: retain the saved task plan, motion path, grasp caps,
+    # controllers, contacts, and explicitly applied assembly-process wrench, but remove the
+    # ambient gravitational load. Do this after MJCF compilation so no planning/replay
+    # semantics are changed and the resulting artifact remains directly comparable.
+    scene.model.opt.gravity[:] = 0.0
+    mujoco.mj_forward(scene.model, scene.data)
+    print("[sim/mp] --no-sim-gravity ACTIVE: MuJoCo gravity is zero; saved planning "
+          "semantics and explicit process wrenches are unchanged.")
+  scene.insertion_only_grasp_check = bool(insertion_only_grasp_check)
+  if scene.insertion_only_grasp_check:
+    print("[sim/mp] --insertion-only-grasp-check ACTIVE: grasp breakaway is evaluated only "
+          "while the explicit process load is engaged near the mate; physical gravity and "
+          "all contacts remain active during transport.")
   if object_damping:
     print(f"[sim/mp] --object-damping {object_damping:g}: viscous damping applied to free "
           "part joints (simulation only).")
@@ -3558,6 +3751,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                    min_steps * DT + INSERT_SKILL_BUDGET),
                relative_target=_relative_target,
                insertion_axis=np.asarray(assembly.mate_axis(fr[1]), dtype=float),
+               intrinsic_axis=_mate_intrinsic_axis(assembly, fr[1]),
                min_steps=min_steps, posture_target=posture_target)
     _hook_log["seat"].append(_cnt[0] * DT)
 
@@ -3578,7 +3772,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       if lbl is None:
         continue
       action = tuple(plan[lbl[0]])
-      if action and action[0] in ("pick", "handover") and action[1] in robots:
+      if action and action[0] in ("pick", "handover", "add_grasp") and action[1] in robots:
         out.append(action[1])
     return tuple(out)
 
@@ -3591,18 +3785,30 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         out.append((fr[0], fr[1]))
     return tuple(out)
 
-  def _pick_task(tid):
-    """The part a PICK task acquires, or None. Keys on the PLAN ACTION kind, not on
-    Task.type: mp_export gives inhand_reorient `type="pick"` too (it re-attaches to the same
-    gripper), and running a lift-off on an already-held, in-air part is a spurious 1s stall."""
+  def _grasp_task(tid):
+    """``(action, contacted part)`` for a new grasp acquisition, else None.
+
+    Keys on the plan action, not Task.type: inhand_reorient also has ``type='pick'`` but does
+    not acquire a new physical contact.
+    """
     t = problem.tasks[tid]
     lbl = name_of.get(t.name)
-    if lbl is None or plan[lbl[0]][0] != "pick":
+    if lbl is None or plan[lbl[0]][0] not in ("pick", "handover", "add_grasp"):
       return None
+    action = tuple(plan[lbl[0]])
     fr = getattr(t, "frames", None)
+    # add_grasp is a GOTO in the single-parent RAI scene graph, but it is a genuine second
+    # physical attachment in MuJoCo.  Its contacted part therefore comes from the action.
+    if action[0] == "add_grasp":
+      return action, action[2]
     if not fr or len(fr) < 2 or fr[1] not in assembly.objects:
       return None
-    return fr[1]
+    return action, action[2]
+
+  def _pick_task(tid):
+    """Root acquired by a literal PICK (used only by the post-pick lift skill)."""
+    got = _grasp_task(tid)
+    return None if got is None or got[0][0] != "pick" else problem.tasks[tid].frames[1]
 
   _planned_post_pick = {
       int(t.name.split("_", 1)[0]) for t in problem.tasks
@@ -3614,48 +3820,56 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
        object_perturbation.get("yaw_bound_deg", 0.0) > 0.0))
 
   def align_pick_before_fire(tid, q_ref, flow_drive=None, flow_tick=None):
-    """Retarget a pick to an observed displaced part, then enforce physical capture.
+    """Servo every new grasp to its exact selected part-relative transform.
 
-    In an unobserved trial the controller follows the nominal saved path unchanged. We still
-    measure the residual here as an outcome gate: MuJoCo weld activation freezes the current
-    relative transform and would otherwise attach an arbitrarily distant object.
+    Initial placement perturbations may deliberately be unobserved for the ablation; otherwise
+    the current part pose is the feedback datum.  Handovers/add-grasps are always relative to
+    the measured moving payload, as a real local grasp skill would be.
     """
-    if not _object_perturb_active:
+    got = _grasp_task(tid)
+    if got is None:
       return
-    part = _pick_task(tid)
-    if part is None:
-      return
+    act, part = got
     t = problem.tasks[tid]
     lbl = name_of.get(t.name)
     if lbl is None:
       return
-    act = tuple(plan[lbl[0]])
     robot = act[1]
-    nominal_parts = _state_part_poses(states[lbl[0]], assembly, lift=CARRY_LIFT)
-    nominal_anchor = fk_poses(np.asarray(q_ref, dtype=float))[ee_anchor[robot]]
+    # RobotIK constrains the gripper frame at grasp_pose * q_correction, both expressed in the
+    # contacted part frame. Use exactly that transform rather than reverse-engineering it from
+    # the approximate witness FK.
+    observed = not (_object_perturb_active and act[0] == "pick"
+                    and object_perturb_observation != "observed")
+    if observed:
+      part_pose = np.asarray(scene.part_pose(part), dtype=float)
+    else:
+      part_pose = np.asarray(
+          _state_part_poses(states[lbl[0]], assembly, lift=CARRY_LIFT)[part], dtype=float)
+    desired_anchor = _exact_grasp_anchor_target(
+        assembly, problem.robot_ik, robot, part, act[3], part_pose)
+    grasp_relpose = _exact_grasp_anchor_relation(
+        assembly, problem.robot_ik, robot, part, act[3])
     _drv = flow_drive if flow_drive is not None else drive_q
     _tck = flow_tick if flow_tick is not None else (lambda: scene.step(1, report, ("servo",)))
     if servo is not None:
       metrics = servo.align_pick(
-          q_ref, robot, part, nominal_parts[part], nominal_anchor, _drv, _tck, settle_max,
-          observed=(object_perturb_observation == "observed"))
+          q_ref, robot, part, desired_anchor, _drv, _tck, settle_max, observed=observed)
     else:
-      actual_part = np.asarray(scene.part_pose(part), dtype=float)
-      delta = _pose_compose(actual_part, _pose_invert(np.asarray(nominal_parts[part], dtype=float)))
-      desired = _pose_compose(delta, nominal_anchor)
       body = scene._body_id(scene.grasp_anchor[robot])
       current = np.r_[scene.data.xpos[body], scene.data.xquat[body]]
       metrics = {"observed": False,
-                 "position_initial_m": float(np.linalg.norm(desired[:3] - current[:3])),
-                 "angle_initial_deg": float(np.rad2deg(_quat_angle(desired[3:], current[3:]))),
-                 "position_m": float(np.linalg.norm(desired[:3] - current[:3])),
-                 "angle_deg": float(np.rad2deg(_quat_angle(desired[3:], current[3:]))),
+                 "position_initial_m": float(np.linalg.norm(desired_anchor[:3] - current[:3])),
+                 "angle_initial_deg": float(np.rad2deg(
+                     _quat_angle(desired_anchor[3:], current[3:]))),
+                 "position_m": float(np.linalg.norm(desired_anchor[:3] - current[:3])),
+                 "angle_deg": float(np.rad2deg(
+                     _quat_angle(desired_anchor[3:], current[3:]))),
                  "duration_s": 0.0, "guarded": False}
     ok = (metrics["position_m"] <= float(object_grasp_capture) and
           metrics["angle_deg"] <= float(np.rad2deg(object_grasp_capture_angle)))
-    _pick_capture[tid] = (ok, metrics)
-    print(f"[sim/placement] {t.name}: {'observed correction' if metrics['observed'] else 'nominal'} "
-          f"pick residual {metrics['position_initial_m']*1000:.1f} -> "
+    _pick_capture[tid] = (ok, metrics, grasp_relpose)
+    print(f"[sim/grasp] {t.name}: {'relative-pose correction' if metrics['observed'] else 'nominal'} "
+          f"residual {metrics['position_initial_m']*1000:.1f} -> "
           f"{metrics['position_m']*1000:.1f}mm, {metrics['angle_initial_deg']:.1f} -> "
           f"{metrics['angle_deg']:.1f}deg ({'CAPTURE' if ok else 'MISS'})")
 
@@ -3884,8 +4098,9 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       servo.place_ok = bool(servo_place_seat)
       servo.pick_ok = bool(servo_pick)
       if servo_pick:
-        print("[sim/mp] --servo-pick ACTIVE: pick/handover acquisition settles terminate on "
-              "touch; exported post-pick tasks own the collision-checked held-object retreat "
+        print("[sim/mp] --servo-pick ACTIVE: every pick/handover receiver corrects toward the "
+              "selected exact object-to-EE grasp transform before attachment (with contact "
+              "guard); exported post-pick tasks own the collision-checked held-object retreat "
               "(legacy paths retain the execution-only contact-free rise).")
       if compliant_follow:
         print(f"[sim/mp] --compliant-follow ACTIVE: whole-branch admittance -- arm links, "
@@ -3962,8 +4177,37 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       if rec is not None:
         rec["marks"].append((len(rec["qpos"]), repr(act) + " MISS"))
       return
-    if t.name == "terminal" or not getattr(t, "frames", None):
-      return                                               # goto / terminal: nothing to relink
+    if t.name == "terminal":
+      return
+    if not getattr(t, "frames", None):
+      # RAI cannot represent two simultaneous kinematic parents, so add_grasp is deliberately
+      # exported as a GOTO. MuJoCo can: after its exact relative-pose servo succeeds, add a
+      # second breakaway weld without detaching the existing holder. This is the physical brace
+      # that the wrench model certified. Ordinary frame-less GOTOs still have no side effect.
+      act = tuple(plan[_l[0]]) if _l else ()
+      if not act or act[0] != "add_grasp":
+        return
+      incoming, contacted = act[1], act[2]
+      group = next((g for g in states[_l[0] + 1].subassemblies()
+                    if contacted in g), {contacted})
+      root = next((g[1] for g in scene.active_grasps.values() if g[1] in group), contacted)
+      if task_id in _scheduled_close_records:
+        _ce = _scheduled_close_records[task_id]
+        _ce["attachment_physics_tick"] = int(scene._phys)
+        _ce["attachment_time_s"] = float(scene._phys * DT)
+        _ce["attachment_frame"] = int(len(rec["qpos"])) if rec is not None else 0
+      if task_id not in _scheduled_preclose_tasks:
+        _record_gripper_event("close_start", incoming, contacted)
+      if animate_grippers and task_id not in _scheduled_preclose_tasks:
+        _closed = _command_gripper_targets(
+            {incoming: _closing_aperture(incoming, contacted)})
+        _wait_gripper_motion(_closed, "close")
+      scene.grasp(incoming, root, gid=act[3], grasp_part=contacted,
+                  grasp_relpose=(_capture[2] if _capture is not None else None))
+      if rec is not None:
+        rec["marks"].append((len(rec["qpos"]), repr(act)))
+      report.results.append(_judge_resting(scene, assembly, act, states[_l[0] + 1]))
+      return
     parent, child = t.frames[0], t.frames[1]
     _before_grasps = {r: g[1] for r, g in scene.active_grasps.items()}
     _incoming = (None if parent == "table" or parent in assembly.objects
@@ -4004,7 +4248,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     if parent in assembly.objects:
       _sm = _mate_pose_error(scene.part_pose(parent), scene.part_pose(child),
                              mate_relative_target(parent, child),
-                             assembly.mate_axis(child))
+                             assembly.mate_axis(child),
+                             _mate_intrinsic_axis(assembly, child))
       if _sm["position"] > SEAT_POS_TOL or _sm["angle"] > SEAT_ANG_TOL:
         seat_miss, seat_angle = _sm["position"], _sm["angle"]
     # only DATUM-WELD when the part is within CAPTURE range -- snapping a far part in would
@@ -4022,7 +4267,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             f"{CAPTURE_RANGE*1000:.0f}mm/{np.rad2deg(CAPTURE_ANG_RANGE):.1f}deg) -- mate NOT "
             "welded, gripper released; expect downstream failures.")
     else:
-      scene.attach(parent, child)
+      scene.attach(parent, child,
+                   grasp_relpose=(_capture[2] if _capture is not None else None))
     # Transfers close the receiver before the weld changes hands, then open every giver.
     # Releases and mates simply open the former holder(s). This is a LOGICAL hardware event
     # even when finger animation is disabled; older code accidentally omitted every open event
@@ -6247,6 +6493,13 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
 
     i, _NQ = 0, len(traj.q)
     while i < _NQ:
+      # After an irrecoverable action failure, later loads belong to a corrupted scene rather
+      # than the planned assembly. Benchmark runs may stop here while interactive diagnostics
+      # retain the historical continue-and-observe behavior.
+      if abort_on_action_failure and any(not result.ok for result in report.results):
+        print("[sim/mp] --abort-on-action-failure: stopping at the first failed action; "
+              "subsequent loads would belong to a corrupted execution state.")
+        break
       _begin_phase_closes(i)
       qc = traj.q[i]
       if servo is not None:
@@ -6349,7 +6602,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           qc = traj.q[i]
         _metrics = _mate_pose_error(scene.part_pose(_parent), scene.part_pose(_child),
                                     mate_relative_target(_parent, _child),
-                                    assembly.mate_axis(_child))
+                                    assembly.mate_axis(_child),
+                                    _mate_intrinsic_axis(assembly, _child))
         _miss, _ang = _metrics["position"], _metrics["angle"]
         print(f"[sim/mp] insertion handoff {_child}->{_parent} at certified funnel mouth: "
               f"{_miss*1000:.1f}mm/{np.rad2deg(_ang):.1f}deg from datum; relative-pose "
@@ -6412,6 +6666,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     report.final_pose_err[p] = (
         float(np.linalg.norm(scene.part_pose(p)[:3] - exp[:3])),
         _part_orientation_error(assembly, p, scene.part_pose(p)[3:], exp[3:]))
+  report.grasp_wrench_metrics = scene.grasp_wrench_metrics()
   if scene.mate_caps is not None and scene._mate_max:
     # per-mate load maxima -- this is the calibration readout: caps must sit ABOVE every
     # value seen in a normal run and BELOW the load of an abusive hold (car by one wheel).
@@ -6447,9 +6702,158 @@ def _judge_resting(scene, assembly, action, expect_state):
 
 
 # ---------------------------------------------------------------------------------------------
-# replay: look at a recorded rollout, any time, no re-simulation
+# replay/export: inspect or render a recorded rollout without re-simulation
 # ---------------------------------------------------------------------------------------------
-def replay_recording(path, speed=1.0, loop=True):
+def _scene_export_geometry(model, geom_id, trimesh):
+  """Return ``(mesh, local_transform, cache_key)`` for one compiled MuJoCo geom.
+
+  MuJoCo stores file meshes in a centered principal-axis frame. ``mesh_pos/mesh_quat`` map
+  those compiled vertices back into the geom frame; omitting this transform is the subtle
+  reason a direct ``mesh_vert`` dump puts visual links in the wrong place.
+  """
+  kind = int(model.geom_type[geom_id])
+  size = np.asarray(model.geom_size[geom_id], dtype=float)
+  local = np.eye(4)
+  if kind == int(mujoco.mjtGeom.mjGEOM_BOX):
+    mesh = trimesh.creation.box(extents=2.0 * size[:3])
+    key = ("box", *np.round(size[:3], 9))
+  elif kind == int(mujoco.mjtGeom.mjGEOM_SPHERE):
+    mesh = trimesh.creation.icosphere(subdivisions=3, radius=float(size[0]))
+    key = ("sphere", round(float(size[0]), 9))
+  elif kind == int(mujoco.mjtGeom.mjGEOM_ELLIPSOID):
+    mesh = trimesh.creation.icosphere(subdivisions=3, radius=1.0)
+    mesh.apply_scale(size[:3])
+    key = ("ellipsoid", *np.round(size[:3], 9))
+  elif kind == int(mujoco.mjtGeom.mjGEOM_CYLINDER):
+    mesh = trimesh.creation.cylinder(radius=float(size[0]), height=2.0 * float(size[1]),
+                                     sections=48)
+    key = ("cylinder", round(float(size[0]), 9), round(float(size[1]), 9))
+  elif kind == int(mujoco.mjtGeom.mjGEOM_CAPSULE):
+    mesh = trimesh.creation.capsule(height=2.0 * float(size[1]), radius=float(size[0]),
+                                    count=[16, 32])
+    key = ("capsule", round(float(size[0]), 9), round(float(size[1]), 9))
+  elif kind == int(mujoco.mjtGeom.mjGEOM_PLANE):
+    # GLB has no infinite primitive. MuJoCo's nonzero plane x/y sizes are its rendered
+    # half-extents (our floor is 4m x 4m); use a thin slab whose top is the exact plane.
+    half_x = float(size[0]) if size[0] > 0 else 4.0
+    half_y = float(size[1]) if size[1] > 0 else 4.0
+    thickness = 0.002
+    mesh = trimesh.creation.box(extents=[2.0 * half_x, 2.0 * half_y, thickness])
+    local[2, 3] = -thickness / 2.0
+    key = ("plane", round(half_x, 9), round(half_y, 9))
+  elif kind == int(mujoco.mjtGeom.mjGEOM_MESH):
+    mesh_id = int(model.geom_dataid[geom_id])
+    va, vn = int(model.mesh_vertadr[mesh_id]), int(model.mesh_vertnum[mesh_id])
+    fa, fn = int(model.mesh_faceadr[mesh_id]), int(model.mesh_facenum[mesh_id])
+    vertices = np.asarray(model.mesh_vert[va:va + vn], dtype=float).copy()
+    faces = np.asarray(model.mesh_face[fa:fa + fn], dtype=np.int64).copy()
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+    rot = np.empty(9, dtype=float)
+    mujoco.mju_quat2Mat(rot, np.asarray(model.mesh_quat[mesh_id], dtype=float))
+    local[:3, :3] = rot.reshape(3, 3)
+    local[:3, 3] = np.asarray(model.mesh_pos[mesh_id], dtype=float)
+    key = ("mesh", mesh_id)
+  else:
+    return None
+  return mesh, local, key
+
+
+def export_visual_scene_glb(model, data, output, visible_groups=(GROUP_PART, GROUP_ENV,
+                                                                 GROUP_VISUAL)):
+  """Export the currently posed MuJoCo scene as one self-contained GLB.
+
+  Only renderer geometry is included: assembly/environment groups 0/1 and the visual robot
+  group 3. Dedicated collision proxies in group 2 are deliberately absent. Native primitive
+  parts remain visible because, unlike imported CAD, their physical and rendered shapes are
+  intentionally the same geom. Coordinates are converted from MuJoCo Z-up to glTF Y-up and
+  remain in metres.
+  """
+  if not HAVE_MUJOCO:
+    raise RuntimeError("mujoco not installed")
+  try:
+    import trimesh
+  except ImportError as exc:
+    raise RuntimeError("scene export requires trimesh") from exc
+
+  mujoco.mj_forward(model, data)
+  scene = trimesh.Scene(base_frame="world")
+  allowed = {int(group) for group in visible_groups}
+  geometry_cache = {}
+  skipped = []
+  # glTF is Y-up. This maps MuJoCo (x,y,z) to glTF (x,z,-y), so Blender and other glTF
+  # importers reconstruct the familiar Z-up scene after applying their standard conversion.
+  gltf_from_mujoco = np.array([
+      [1.0, 0.0, 0.0, 0.0],
+      [0.0, 0.0, 1.0, 0.0],
+      [0.0, -1.0, 0.0, 0.0],
+      [0.0, 0.0, 0.0, 1.0],
+  ])
+
+  for geom_id in range(model.ngeom):
+    group = int(model.geom_group[geom_id])
+    rgba = np.asarray(model.geom_rgba[geom_id], dtype=float).copy()
+    if group not in allowed or rgba[3] <= 1e-4:
+      continue
+    built = _scene_export_geometry(model, geom_id, trimesh)
+    if built is None:
+      skipped.append(int(model.geom_type[geom_id]))
+      continue
+    mesh, local, shape_key = built
+    color = tuple(int(x) for x in np.clip(np.round(rgba * 255.0), 0, 255))
+    cache_key = (shape_key, color)
+    geom_name = geometry_cache.get(cache_key)
+    if geom_name is None:
+      geom_name = f"shape_{len(geometry_cache):04d}"
+      material = trimesh.visual.material.PBRMaterial(
+          name=f"material_{len(geometry_cache):04d}", baseColorFactor=np.asarray(color))
+      mesh.visual = trimesh.visual.TextureVisuals(material=material)
+      scene.geometry[geom_name] = mesh
+      geometry_cache[cache_key] = geom_name
+
+    world = np.eye(4)
+    world[:3, :3] = np.asarray(data.geom_xmat[geom_id], dtype=float).reshape(3, 3)
+    world[:3, 3] = np.asarray(data.geom_xpos[geom_id], dtype=float)
+    body_id = int(model.geom_bodyid[geom_id])
+    body_name = (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+                 or f"body_{body_id}")
+    source_name = (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, geom_id)
+                   or f"geom_{geom_id}")
+    node_name = f"{body_name}__{source_name}"
+    scene.graph.update(frame_to=node_name, matrix=gltf_from_mujoco @ world @ local,
+                       geometry=geom_name,
+                       metadata={"mujoco_geom_id": geom_id, "mujoco_group": group})
+
+  if not scene.geometry:
+    raise ValueError("MuJoCo scene contains no visible geometry to export")
+  output = Path(output)
+  if output.suffix.lower() != ".glb":
+    raise ValueError("self-contained scene export requires a .glb output path")
+  output.parent.mkdir(parents=True, exist_ok=True)
+  payload = scene.export(file_type="glb")
+  temporary = output.with_suffix(output.suffix + ".tmp")
+  temporary.write_bytes(payload)
+  os.replace(temporary, output)
+  extra = (f"; skipped {len(skipped)} unsupported geom(s)" if skipped else "")
+  print(f"[replay/export] {len(scene.graph.nodes_geometry)} visible instances, "
+        f"{len(scene.geometry)} embedded meshes -> {output}{extra}")
+  return output
+
+
+def _recording_frame(model, data, qpos, mpos, mquat, frame):
+  data.qpos[:] = qpos[frame]
+  if mpos is not None and len(mpos):
+    data.mocap_pos[:] = mpos[frame]
+    data.mocap_quat[:] = mquat[frame]
+  mujoco.mj_forward(model, data)
+
+
+def _auto_scene_path(recording, frame):
+  source = Path(recording)
+  return source.with_name(f"{source.stem}-frame-{int(frame):06d}.glb")
+
+
+def replay_recording(path, speed=1.0, loop=True, frame=None, export_scene=None,
+                     export_only=False):
   """Open the MuJoCo viewer on a recording made with execute(record=...): kinematic playback
   of the stored qpos frames (no physics re-run -- exactly what happened, bit for bit). BLOCKS
   while the viewer is open (close it or ctrl-C to stop).
@@ -6458,6 +6862,7 @@ def replay_recording(path, speed=1.0, loop=True):
   to the viewer (stdlib tkinter; skipped gracefully if unavailable). The slider label shows
   time + the most recent plan action. Keyboard in the MuJoCo window works too:
       SPACE play/pause | LEFT/RIGHT step 1 | PgUp/PgDn jump 5% | HOME/END | UP/DOWN speed x2
+      E export the currently shown frame as a self-contained GLB
   """
   import json, time
   z = np.load(path, allow_pickle=False)
@@ -6466,11 +6871,18 @@ def replay_recording(path, speed=1.0, loop=True):
   marks = dict((int(f), a) for f, a in json.loads(str(z["marks"])))
   qpos = z["qpos"]
   T = len(qpos)
+  if T == 0:
+    raise ValueError(f"recording has no frames: {path}")
+  initial_frame = 0 if frame is None else int(frame)
+  if initial_frame < 0:
+    initial_frame += T
+  if not 0 <= initial_frame < T:
+    raise ValueError(f"--frame {frame} outside recording range [-{T}, {T - 1}]")
   print(f"[replay] {path}: {T} frames, {len(marks)} actions; results:")
   for r in json.loads(str(z["results"])):
     print("   ", r)
   print("[replay] controls: SPACE pause | arrows step | PgUp/PgDn jump | HOME/END | "
-        "UP/DOWN speed | slider window (if Tk)")
+        "UP/DOWN speed | E export GLB | slider window (if Tk)")
   print("[replay] geom groups (number keys): 0=parts 1=floor/table 2=arm-collision-capsules "
         "3=arm-visual-meshes  (capsules start HIDDEN when meshes exist)")
   from mujoco import viewer as _viewer
@@ -6478,7 +6890,8 @@ def replay_recording(path, speed=1.0, loop=True):
   mquat = z["mquat"] if "mquat" in z.files else None
   mark_keys = sorted(marks)
 
-  st = {"i": 0.0, "playing": True, "speed": float(speed), "scrub": False}
+  st = {"i": float(initial_frame), "playing": frame is None, "speed": float(speed),
+        "scrub": False, "export": False}
 
   def key_cb(key):                                         # GLFW keycodes
     if key == 32:                                          # SPACE
@@ -6499,6 +6912,17 @@ def replay_recording(path, speed=1.0, loop=True):
       st["speed"] = min(16.0, st["speed"] * 2)
     elif key == 264:                                       # DOWN
       st["speed"] = max(0.0625, st["speed"] / 2)
+    elif key in (69, 101):                                 # E
+      st["playing"] = False
+      st["export"] = True
+
+  _recording_frame(model, data, qpos, mpos, mquat, initial_frame)
+  if export_scene is not None:
+    export_visual_scene_glb(model, data, export_scene)
+    if export_only:
+      return Path(export_scene)
+  elif export_only:
+    raise ValueError("--export-only requires --export-scene FILE")
 
   # optional Tk slider window (viser-style scrub bar)
   root = scale = lbl = None
@@ -6525,6 +6949,8 @@ def replay_recording(path, speed=1.0, loop=True):
               ).pack(side="left")
     tk.Button(row, text="+", command=lambda: st.update(speed=min(16.0, st["speed"] * 2))
               ).pack(side="left")
+    tk.Button(row, text="export GLB",
+              command=lambda: st.update(export=True, playing=False)).pack(side="left", padx=4)
     for frac, txt in ((0.0, "|<"), (0.25, "25%"), (0.5, "50%"), (0.75, "75%")):
       tk.Button(row, text=txt, command=lambda f=frac: st.update(i=f * (T - 1))
                 ).pack(side="left", padx=2)
@@ -6543,12 +6969,11 @@ def replay_recording(path, speed=1.0, loop=True):
     while v.is_running():
       i = int(st["i"])
       if i != prev_shown:
-        data.qpos[:] = qpos[i]
-        if mpos is not None and len(mpos):
-          data.mocap_pos[:] = mpos[i]
-          data.mocap_quat[:] = mquat[i]
-        mujoco.mj_forward(model, data)
+        _recording_frame(model, data, qpos, mpos, mquat, i)
         prev_shown = i
+      if st.pop("export", False):
+        destination = Path(export_scene) if export_scene else _auto_scene_path(path, i)
+        export_visual_scene_glb(model, data, destination)
       v.sync()
       if root is not None:
         try:
@@ -6747,6 +7172,10 @@ def _cli_run(a):
     raise SystemExit("[sim] --process-wrench-ramp must be non-negative")
   if a.process_noise != "nominal" and not a.apply_process_wrench:
     raise SystemExit("[sim] --process-noise requires --apply-process-wrench")
+  if a.insertion_only_grasp_check and not a.apply_process_wrench:
+    raise SystemExit(
+        "[sim] --insertion-only-grasp-check requires --apply-process-wrench so the "
+        "near-insertion interval is defined")
   if a.object_perturb_xy < 0.0 or a.object_perturb_yaw < 0.0:
     raise SystemExit("[sim] --object-perturb-xy/--object-perturb-yaw must be non-negative")
   if a.object_perturb_max_tries < 1:
@@ -6918,6 +7347,7 @@ def _cli_run(a):
   _aplace = bool(_saved(cfg, "allow_place"))
   _saved_mp_path = None
   _final_export = None
+  _wrench_gate_gk = None
   if a.mp_path:
     _saved_mp_path = MP.load_path(a.mp_path)
     try:
@@ -6945,6 +7375,13 @@ def _cli_run(a):
       rik.post_release_delta = float(
           _es.get("post_release", rik.post_release_delta))
       brace = bool(_es.get("bracing", brace))
+      # The gravity-only ablation deliberately sets config.wrench=False in its execution-plan
+      # copy so the already-fixed symbolic action sequence can be replayed under the common
+      # process force.  Its MP artifact nevertheless carries a physical gravity certificate;
+      # reconstruct that predicate with real gripper kinds rather than mistaking the replay
+      # override for a topological motion plan.
+      if bool(_es.get("wrench_gate", False)) and gk is None:
+        _wrench_gate_gk = A.wrench_kind_arg(C, robots)
       print(f"[sim/mp] final post-fusion export embedded in {a.mp_path}: "
             f"{sum(w is not None for w in _final_export['witnesses'])} skill and "
             f"{len(_final_export['pre_witnesses'])} pre-skill keyframes; IK solves: 0.")
@@ -7025,6 +7462,8 @@ def _cli_run(a):
       table_float=float(_es.get(
           "table_float", (float(_saved(cfg, "part_float", legacy=0.015))
                           if _saved(cfg, "mp_table_margin") else 0.0))),
+      wrench_gate=bool(_es.get("wrench_gate", _saved(cfg, "mp_wrench_gate", legacy=False))),
+      wrench_gate_gripper_kind=_wrench_gate_gk,
       witness_sets=(_final_export["witness_sets"] if _final_export is not None else None),
       resolve_missing_pre=(_final_export is None),
       task_records=(None if _final_export is None else _final_export["tasks"]),
@@ -7080,6 +7519,9 @@ def _cli_run(a):
       "dt": DT,
       "record_every": RECORD_EVERY,
       "apply_process_wrench": bool(a.apply_process_wrench),
+      "sim_gravity": bool(a.sim_gravity),
+      "insertion_only_grasp_check": bool(a.insertion_only_grasp_check),
+      "abort_on_action_failure": bool(a.abort_on_action_failure),
       "animate_grippers": bool(a.animate_grippers),
       "gripper_motion_time": float(a.gripper_motion_time),
       "wait_for_gripper": bool(a.wait_for_gripper),
@@ -7154,6 +7596,9 @@ def _cli_run(a):
                                 PATH_PREFLIGHT_TOL),
                             path_preflight_resolution=a.path_preflight_resolution,
                             apply_process_wrench=a.apply_process_wrench,
+                            sim_gravity=a.sim_gravity,
+                            insertion_only_grasp_check=a.insertion_only_grasp_check,
+                            abort_on_action_failure=a.abort_on_action_failure,
                             table_mu=_saved(cfg, "table_mu", legacy=None),
                             process_noise_mode=a.process_noise,
                             process_noise_corner=a.process_noise_corner,
@@ -7242,6 +7687,18 @@ def _build_cli():
                       "--insertion-noise set stays nominal unless --process-noise explicitly "
                       "selects a corner or seeded sample. Opt-in; use "
                       "--no-apply-process-wrench to reproduce the historical contact-only sim.")
+  r.add_argument("--sim-gravity", action=argparse.BooleanOptionalAction, default=True,
+                 help="Enable physical MuJoCo gravity (default). --no-sim-gravity is a "
+                      "simulation-only counterfactual: it leaves the saved plan/path, grasp "
+                      "limits, contacts, controllers, and --apply-process-wrench unchanged.")
+  r.add_argument("--insertion-only-grasp-check", action="store_true",
+                 help="Ablation: keep physical gravity everywhere, but evaluate grasp "
+                      "breakaway only while --apply-process-wrench is nonzero inside the "
+                      "insertion neighborhood. This tests process-load support without "
+                      "counting vacuum transport under gravity as a failure.")
+  r.add_argument("--abort-on-action-failure", action="store_true",
+                 help="Stop after the first failed action. This keeps benchmark load metrics "
+                      "from including downstream motion in an already-corrupted assembly.")
   r.add_argument("--process-noise", choices=("nominal", "corner", "sample"),
                  default="nominal", metavar="MODE",
                  help="Realization of the saved --insertion-noise uncertainty set when "
@@ -7717,6 +8174,12 @@ def _build_cli():
   v.add_argument("path")
   v.add_argument("speed", nargs="?", type=float, default=1.0)
   v.add_argument("--no-loop", action="store_true")
+  v.add_argument("--frame", type=int, default=None, metavar="N",
+                 help="start paused at recording frame N; negative indices count from the end")
+  v.add_argument("--export-scene", metavar="FILE.glb",
+                 help="export --frame (or frame 0) as one self-contained visual-only GLB")
+  v.add_argument("--export-only", action="store_true",
+                 help="write --export-scene without opening the replay viewer")
   return p
 
 
@@ -7744,4 +8207,6 @@ if __name__ == "__main__":
       print(str(e), file=sys.stderr)
       raise SystemExit(2)
   else:
-    replay_recording(args.path, speed=args.speed, loop=not args.no_loop)
+    replay_recording(args.path, speed=args.speed, loop=not args.no_loop,
+                     frame=args.frame, export_scene=args.export_scene,
+                     export_only=args.export_only)

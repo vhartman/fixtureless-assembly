@@ -17,7 +17,8 @@ import numpy as np
 
 from assembly import *
 from env import make_four_robot_env
-from plan_io import read_optimization_candidates, read_plan, read_witnesses
+from plan_io import (read_diagnostic_candidates, read_optimization_candidates,
+                     read_plan, read_witnesses)
 from config import saved_cfg as _saved
 
 
@@ -252,7 +253,7 @@ def build_scene(cfg):
 
 def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=True,
            resolve_ik=False, optimization_alternatives=1, alternative_opacity=0.18,
-           active_robots_only=False):
+           active_robots_only=False, alternative_source="optimizer"):
   """Rebuild the saved scene and replay the plan. Returns the ViserRecorder (or None) so a
   headless caller can inspect the recorded steps without serving."""
   cfg, plan = read_plan(path)
@@ -295,11 +296,15 @@ def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=T
     rik.keep_contacts = bool(_saved(cfg, "always_contact", legacy=False))
     joint_names = list(rik.C.getJointNames())
     witnesses = read_witnesses(path, joint_names, len(plan))
-    candidate_pools = (read_optimization_candidates(path, joint_names, len(plan))
+    if alternative_source not in ("optimizer", "diagnostic"):
+      raise ValueError("alternative_source must be 'optimizer' or 'diagnostic'")
+    read_candidates = (read_diagnostic_candidates if alternative_source == "diagnostic"
+                       else read_optimization_candidates)
+    candidate_pools = (read_candidates(path, joint_names, len(plan))
                        if int(optimization_alternatives) > 1 else None)
     if int(optimization_alternatives) > 1 and not candidate_pools:
       raise SystemExit(
-          f"{path} has no compatible persisted witness-optimizer candidate pools. Re-run "
+          f"{path} has no compatible persisted {alternative_source} candidate pools. Re-run "
           "witness optimization once with this version from a compatible persisted baseline, "
           "or regenerate the plan; the viewer will not rerun optimization or IK implicitly.")
     needs_ik = {"pick", "place", "stow", "assemble", "add_grasp", "handover"}
@@ -323,7 +328,11 @@ def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=T
                       optimization_candidates=candidate_pools,
                       alternative_count=int(optimization_alternatives),
                       alternative_opacity=float(alternative_opacity),
-                      active_robots_only=bool(active_robots_only))
+                      active_robots_only=bool(active_robots_only),
+                      alternative_description=(
+                          "broad diagnostic IK branches (may fail later selection gates)"
+                          if alternative_source == "diagnostic"
+                          else "witness-optimizer candidate keyframes"))
   else:
     if int(optimization_alternatives) > 1:
       raise SystemExit("--optimization-alternatives requires a real-IK optimized plan")
@@ -356,6 +365,11 @@ def parse_args():
       "--alternative-opacity", type=float, default=0.18, metavar="A",
       help="Base opacity in (0,1) for --optimization-alternatives (default: 0.18).")
   p.add_argument(
+      "--alternative-source", choices=["optimizer", "diagnostic"], default="optimizer",
+      help="Candidate pool shown by --optimization-alternatives: the exact optimizer ladder "
+           "(default), or a broader diagnostic pool containing individually solved branches "
+           "rejected by later clearance/continuity/interchangeability gates.")
+  p.add_argument(
       "--active-robots-only", action="store_true",
       help="In the real-IK Viser timeline, hide robots not involved in the current action. "
            "Parts and workspace geometry remain visible.")
@@ -370,4 +384,5 @@ if __name__ == "__main__":
          viser_port=a.viser_port, resolve_ik=a.resolve_ik,
          optimization_alternatives=a.optimization_alternatives,
          alternative_opacity=a.alternative_opacity,
-         active_robots_only=a.active_robots_only)
+         active_robots_only=a.active_robots_only,
+         alternative_source=a.alternative_source)
