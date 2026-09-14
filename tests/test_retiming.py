@@ -285,6 +285,26 @@ def test_per_stretch_rate_slows_only_selected_skill_interval():
   assert sched_mixed.fires[1][0] > sched_fast.fires[1][0]
 
 
+def test_schedule_respects_external_phase_rate_profile():
+  st = [([np.array([0.0]), np.array([1.0])], [10])]
+  dims = [np.array([0])]
+  free = retiming.plan_schedule(st, dims, [{0}], DT, RATE, RD, RM)
+  limited = retiming.plan_schedule(
+      st, dims, [{0}], DT, RATE, RD, RM,
+      rate_limits=np.full((1, 21), 0.25), rate_limit_ds=0.05)
+  assert len(limited.q) > len(free.q)
+  speed = np.abs(np.diff(limited.q[:, 0])) / DT
+  assert float(speed.max()) <= 0.25 + 1e-9
+
+
+def test_schedule_rate_profile_requires_matching_arm_rows():
+  st = [([np.array([0.0]), np.array([1.0])], [10])]
+  with pytest.raises(ValueError, match="rate_limits must have shape"):
+    retiming.plan_schedule(
+        st, [np.array([0])], [{0}], DT, RATE, RD, RM,
+        rate_limits=np.ones((2, 3)), rate_limit_ds=0.5)
+
+
 def test_schedule_priority_lower_arm_yields():
   # Shared 1-D lane: a "gate" forbids arm1 in (1.5,2.5) WHILE arm0 hasn't cleared (x0<3).
   # Yielding suffices: arm1 waits below the gate until arm0 passes 3, then proceeds.
@@ -464,6 +484,24 @@ def test_schedule_pocket_coupling_restart():
   assert (np.diff(traj.q[:, 1]) > -1e-9).all()
   assert not any(pocket(fq, 0) for fq in traj.q)             # never sampled inside a violation
   assert [e for _, e in traj.fires] == [[10], [11]]
+
+
+def test_schedule_boolean_pocket_recovers_certified_diagonal():
+  # Some collision backends expose only a boolean, so the ordinary wedge scan cannot name
+  # the blocking arm.  A phase-lead deadlock must still restart toward the known-safe
+  # synchronized diagonal instead of failing solely because blocker attribution is absent.
+  st = [([np.array([0.0, 0.0]), np.array([2.0, 2.0])], [10]),
+        ([np.array([2.0, 2.0]), np.array([6.0, 6.0])], [11])]
+  dims = [np.array([0]), np.array([1])]
+  def pocket(fq, fired):
+    x0, x1 = fq
+    return ((2.7 < x1 < 3.5 and 1.8 < x0 < 2.35)
+            or (2.2 < x0 < 2.4 and 2.6 < x1 < 2.8))
+  traj = retiming.plan_schedule(
+      st, dims, [{0}, {1}], DT, RATE, RD, RM,
+      collide=pocket, dwell=1.0, stall_steps=300)
+  assert np.allclose(traj.q[-1], [6.0, 6.0])
+  assert not any(pocket(fq, 0) for fq in traj.q)
 
 
 def test_schedule_dwell_rests_acting_arm_only():

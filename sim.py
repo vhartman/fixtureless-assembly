@@ -104,19 +104,23 @@ BREAK_SUSTAIN = 0.02            # s : a grasp breaks only if overloaded CONTINUO
                                 # survivable by a real seal/pinch; loss of grip is a leak/slip
                                 # process, not a single-sample event. Static overloads (what
                                 # the LP prices) persist and still break.
-WELD_TIMECONST = 0.004          # s   : solref timeconst of the grasp/mate welds (stiff: with
-                                # MuJoCo's soft default the mocap-anchored weld SAGS mm-scale
-                                # under carry loads -- measured 7-8mm, enough to miss a seat).
+WELD_TIMECONST = 0.012          # s   : solref timeconstant of grasp/mate welds. 4ms amplified
+                                # sub-millimetre capture/tracking residuals into sustained
+                                # 8--12N numerical reactions; 12ms removes that ringing while
+                                # the task-space terminal servos keep seating error bounded.
 
 
 class PathPreflightError(RuntimeError):
   """A saved motion path violates an invariant retiming cannot repair."""
 
 
-KINK_TAU = 2.0 * WELD_TIMECONST # s   : time the grasp interface takes to absorb a VELOCITY
+KINK_TAU = 0.008                 # s   : conservative time the grasp interface is allowed to
+                                # absorb a VELOCITY
                                 # STEP (a C0 path corner), i.e. peak |F| = m|dv|/KINK_TAU.
                                 # MEASURED on car-mini: a 1.24 m/s step on a 0.30kg group
-                                # peaked at 39.9N => 9.3ms, ~2 solref timeconsts. On hardware
+                                # peaked at 39.9N => 9.3ms; retain the slightly shorter 8ms
+                                # calibration rather than gaining speed from a softer
+                                # numerical equality. On hardware
                                 # the corner-rounding time of the tracking controller plays
                                 # this role; here it is the weld, which IS the interface.
 CAPTURE_RANGE = 0.05            # m   : a part-part mate datum-welds only within this of the
@@ -125,6 +129,13 @@ CAPTURE_RANGE = 0.05            # m   : a part-part mate datum-welds only within
 CAPTURE_ANG_RANGE = np.deg2rad(10.0)  # same anti-snap guard for relative orientation
 INSERT_ALIGN_TOL = 0.0005      # m   : funnel centering required before axial motion
 INSERT_ALIGN_ANG_TOL = np.deg2rad(0.5)
+# An exact grasp weld must not be asked to remove the generic skill servo's residual in one
+# 4ms constraint response.  Doing so creates a purely numerical holding wrench before the
+# payload has moved (measured on Chair: 8--12N from a 1.3mm / 2deg capture residual).  First
+# realize the authored object-to-gripper transform to the same accuracy as insertion
+# centering; the weld then maintains that relation instead of impulsively correcting it.
+GRASP_ALIGN_TOL = 0.0005       # m
+GRASP_ALIGN_ANG_TOL = np.deg2rad(0.5)
 INSERT_CONTACT_SPEED = 0.020   # m/s : axial rate after intended guide/socket contact
 INSERT_STALL_TIME = 0.12       # s   : commanded insertion without 0.2mm progress => jam
 INSERT_PROGRESS = 0.0002       # m   : progress quantum resetting the stall timer
@@ -151,7 +162,17 @@ def _grasp_caps(kind):
   model = W.PARAMS["grasp"].get(W.PARAMS.get("grasp_model", "isotropic"),
                                 W.PARAMS["grasp"]["isotropic"])
   g = model.get(kind, {})
-  fcap = min([v for k, v in g.items() if k.startswith("F_")] or [40.0])
+  force_caps = [v for k, v in g.items() if k.startswith("F_")]
+  # The directional models also bound EACH lateral component by friction times the
+  # preload/pull-off force.  Omitting this term made the supposedly conservative scalar
+  # reduction return 25N for a vacuum cup whose actual weak direction is
+  # 0.15*25=3.75N; consequently the retimer never bound on the very failure the physical
+  # breakaway detected.  This is the radius of the force box's inscribed isotropic ball.
+  if "mu" in g:
+    axial = g.get("F_pull", g.get("F_axial"))
+    if axial is not None:
+      force_caps.append(float(g["mu"]) * float(axial))
+  fcap = min(force_caps or [40.0])
   tcap = min([v for k, v in g.items() if k.startswith("T_")] or [1.0])
   return float(fcap), float(tcap)
 
@@ -308,6 +329,7 @@ class SimReport:
     # Filled by execute_motion_plan. These come from the same MuJoCo weld wrench and
     # directional caps as grasp breakaway, not from a second analytical model.
     self.grasp_wrench_metrics = None
+    self.table_wrench_metrics = None
 
   @property
   def success(self):
@@ -355,6 +377,7 @@ class SimReport:
         "final_pose_err": {p: [float(v[0]), float(v[1])]
                            for p, v in (self.final_pose_err or {}).items()},
         "grasp_wrench_metrics": dict(self.grasp_wrench_metrics or {}),
+        "table_wrench_metrics": dict(self.table_wrench_metrics or {}),
         "metadata": dict(metadata or {}),
     }
 
@@ -1287,6 +1310,16 @@ def _empty_grasp_wrench_metric():
   }
 
 
+def _empty_table_wrench_metric():
+  return {
+      "samples": 0,
+      "peak_normal_force_n": 0.0,
+      "peak_tangent_force_n": 0.0,
+      "peak_utilization": 0.0,
+      "peak_sustained_utilization": None,
+  }
+
+
 class SimScene:
   def __init__(self, assembly, state, robots, gripper_kinds=None, gui=False,
                arms=None, arm_poses=None, ee_anchor=None, articulated_C=None,
@@ -1313,7 +1346,12 @@ class SimScene:
     self._cmd_ref = None                                   # last commanded q (tracking metric)
     self._cmd_qdot = None                                  # ... and its velocity feedforward
     self._phys = 0                                         # bumped by mj_step / mj_forward
-    self._eq_cache = (None, None, None)                    # (eq_active key, rows, ids)
+    self._eq_cache = (None, None, None)                    # (realized layout key, rows, ids)
+    # ``data.eq_active`` is a REQUEST for the next constraint rebuild.  Immediately after an
+    # attach/release it can differ from the equality rows still stored in ``data.efc_*``.
+    # Snapshot the active set only after MuJoCo has realized it (mj_forward/mj_step); the
+    # wrench-row cache must describe those rows, not the pending request.
+    self._efc_active = None
     self.verify_efc_cache = False                          # --verify-efc-cache
     self._mocap_ids = self._mocap_fkf = None               # resolved on first sync_arms
     self.grasp_anchor = ({r: f"ee_{r}" for r in robots} if arms is None
@@ -1332,7 +1370,20 @@ class SimScene:
         phase: _empty_grasp_wrench_metric()
         for phase in ("transport", "insertion")}
     self._wrench_metrics_by_kind = {}                    # kind -> phase -> same metrics
+    # Physical table-support metric.  The table has unbounded normal capacity in the planner,
+    # so a generic six-dimensional "wrench utilization" is undefined.  Its finite resource is
+    # friction: report ||f_t||/(mu f_n), accumulated from actual MuJoCo contacts.  This exposes
+    # plans that ask the table to carry the process load even when every grasp is lightly used.
+    self._table_geom_id = mujoco.mj_name2id(
+        self.model, mujoco.mjtObj.mjOBJ_GEOM, "table")
+    self._table_wrench_metrics = {
+        phase: _empty_table_wrench_metric()
+        for phase in ("transport", "insertion")}
+    self._table_wrench_metric_history = {}
     self._grasp_trace = int(os.environ.get("SIM_GRASP_TRACE", "0"))   # weld-slip diagnostic
+    self._part_trace = os.environ.get("SIM_PART_TRACE") or None
+    self._part_trace_origin = None
+    self._part_trace_bucket = 0
     self.wrench_trace = None                               # SIM_WRENCH_TRACE hook, see
     self.trace_ctx = None                                  # _make_wrench_tracer (driver's
     self.step_i = 0                                        # sample index + the sim clock)
@@ -1541,6 +1592,8 @@ class SimScene:
                           bool(getattr(assembly, "visual_meshes", {})) or
                           (arms is not None and any(e[2][0] == "mesh" for e in arms)))
     mujoco.mj_forward(self.model, self.data)
+    if hasattr(self.data, "eq_active"):
+      self._efc_active = self.data.eq_active.tobytes()
     self._phys += 1
 
   def _filter_active_mate_contact(self, data, geom1, geom2):
@@ -1665,17 +1718,15 @@ class SimScene:
   def grasp(self, robot, part, gid=None, grasp_part=None, grasp_relpose=None):
     eq = self._eq_id(f"grasp_{robot}_{part}")
     anchor_body, root_body = self._body_id(self.grasp_anchor[robot]), self._body_id(part)
-    weld_relpose = None
-    if grasp_relpose is not None:
-      # ``grasp_relpose`` is contacted-part_T_anchor.  The welded child can instead be the
-      # fixed root of an assembled component, so compose through the live (already exact)
-      # component geometry to obtain anchor_T_root.  The servo makes this activation gentle;
-      # the equality itself remains exact and cannot carry a residual into the next mode.
-      contacted = part if grasp_part is None else grasp_part
-      world_T_contacted = self.part_pose(contacted)
-      world_T_anchor = _pose_compose(world_T_contacted, grasp_relpose)
-      weld_relpose = _pose_compose(_pose_invert(world_T_anchor), self.part_pose(part))
-    self._activate_weld(eq, anchor_body, root_body, relative_pose=weld_relpose)
+    # Close at the ACHIEVED capture pose. ``grasp_relpose`` is still the authored controller
+    # target (and is used above to bring the hand within GRASP_ALIGN_TOL), but a real gripper
+    # does not snap the object through the remaining sub-millimetre error when its fingers/cup
+    # engage. Asking a stiff weld to realize that ideal transform manufactured a sustained
+    # preload with an otherwise stationary payload (measured: 6--9N from a 0.5mm residual,
+    # enough to break a vacuum's 3.75N lateral bound). The achieved relation is bounded by the
+    # capture gate, follows the same planned geometry to that tolerance, and the relative-pose
+    # insertion controller removes it at the mate rather than hiding it in the weld.
+    self._activate_weld(eq, anchor_body, root_body, relative_pose=None)
     kind = self.gripper_kinds.get(robot, "vacuum")
     self.active_grasps[robot] = (eq, part) + _grasp_caps(kind)
     # DIRECTIONAL CAPS need the grasp FRAME, which is a property of the grasp id. Stored in a
@@ -1942,6 +1993,8 @@ class SimScene:
       for robot in self.robots:
         self.set_gripper_aperture(robot, self.gripper_aperture(robot))
     mujoco.mj_forward(self.model, self.data)
+    if hasattr(self.data, "eq_active"):
+      self._efc_active = self.data.eq_active.tobytes()
     self._phys += 1
 
   def sync_arms(self, poses):
@@ -2172,22 +2225,24 @@ class SimScene:
     Hoisted out of _weld_wrench, which used to scan the two full efc arrays per ACTIVE GRASP per
     step (125k calls / 2.5s of a 13.7s car-mini run, the largest cost after mj_step itself).
 
-    CACHED ON eq_active, NOT on the step. MuJoCo lays the EQUALITY block at the head of efc and
-    gives every active weld exactly 6 rows in eq order, so which rows belong to which eq id is a
-    function of the ACTIVE SET ALONE -- contacts and limits are appended after it and cannot
-    shift it. So this only needs rebuilding when a grasp activates or releases (a handful of
-    times per run) rather than once per step. `--verify-efc-cache` re-derives it every step and
-    asserts equality, which is how the assumption above is checked rather than trusted."""
-    # KEY ON (eq_active, ne), NOT eq_active ALONE. step() breaks a grasp by writing
-    # eq_active[eq]=0 and then reads the NEXT grasp's wrench in the SAME loop iteration --
-    # before any mj_step/mj_forward has rebuilt efc. Keyed on the bytes alone that rebuilt the
-    # cache from STALE efc rows and stored it under the new key, so it was never corrected:
-    # measured IndexError (index 6 into a size-6 efc_force) on the next step with no contacts,
-    # and -- worse -- with contacts padding efc, no crash at all, just a permanently wrong
-    # reading (2.3x understated), which silently defeats every breakaway and force check.
-    # d.ne still holds the PRE-write row count at that moment and drops after the step, so it
-    # distinguishes the stale read; the bytes still catch an activate+release that keeps ne.
-    key = (self.data.eq_active.tobytes(), int(self.data.ne))
+    CACHED ON THE ACTIVE SET REALIZED BY THE LAST PHYSICS UPDATE, NOT on the step. MuJoCo lays
+    the EQUALITY block at the head of efc and gives every active weld exactly 6 rows in eq
+    order, so which rows belong to which eq id is a function of that realized set alone --
+    contacts and limits are appended after it and cannot shift it. Thus this normally rebuilds
+    only after an attachment event. `--verify-efc-cache` re-derives the live arrays and asserts
+    equality, which checks the layout assumption independently."""
+    # Key on the REALIZED active set, not live ``eq_active``.  A handover deactivates one
+    # grasp and activates another before the next mj_step.  The live bit pattern changes but
+    # the current efc rows still belong to the old pattern (and ``ne`` is unchanged).  Keying
+    # on the requested pattern rebuilt a permanently shifted map: the new holder read zero,
+    # while an unrelated vacuum grasp read the old holder's load and falsely broke at 6.4N.
+    # ``_efc_active`` is updated immediately after each mj_step/mj_forward, when the rows and
+    # active bits once again describe the same constraint system.  Mutations during the
+    # per-grasp loop intentionally retain the current-step layout until the next physics tick.
+    realized = getattr(self, "_efc_active", None)
+    if realized is None:                                   # tiny unit-test fixtures / legacy
+      realized = self.data.eq_active.tobytes()
+    key = (realized, int(self.data.ne))
     if self._eq_cache[0] != key:
       idx = np.flatnonzero(self.data.efc_type == mujoco.mjtConstraint.mjCNSTR_EQUALITY)
       self._eq_cache = (key, idx, self.data.efc_id[idx])
@@ -2370,6 +2425,90 @@ class SimScene:
         },
     }
 
+  def _observe_table_wrench(self, phase):
+    """Measure worst component-local table friction-cone usage for one physics tick.
+
+    Contact normals add capacity, while tangential contact magnitudes add demand.  Summing
+    over one rigid component's complete table contact patch avoids unstable ratios at
+    solver-created contact points with nearly zero individual normal force.  Components must
+    remain separate: otherwise unrelated loose parts resting on the table donate fictitious
+    normal load (and hence friction capacity) to the component under process load.  A phase
+    with no part--table contact is a measured zero (the table is not being used), not missing
+    data.
+    """
+    component_loads = {}
+    component_by_part = {}
+    table = int(self._table_geom_id)
+    if table >= 0:
+      for i in range(int(self.data.ncon)):
+        c = self.data.contact[i]
+        if int(c.geom1) == table:
+          other = int(c.geom2)
+        elif int(c.geom2) == table:
+          other = int(c.geom1)
+        else:
+          continue
+        body = int(self.model.geom_bodyid[other])
+        part = self._part_owner_by_body[body]
+        if part is None:
+          continue
+        component = component_by_part.get(part)
+        if component is None:
+          component = frozenset(self._active_mate_component(part))
+          for member in component:
+            component_by_part[member] = component
+        f6 = np.zeros(6)
+        mujoco.mj_contactForce(self.model, self.data, i, f6)
+        normal, tangent = component_loads.get(component, (0.0, 0.0))
+        normal += abs(float(f6[0]))
+        tangent += _sqrt(float(f6[1]) ** 2 + float(f6[2]) ** 2)
+        component_loads[component] = (normal, tangent)
+
+    # Report the component with the largest normalized friction use, rather than pooling
+    # independent supports.  The raw force fields correspond to that same component.
+    utilization = normal = tangent = 0.0
+    for component_normal, component_tangent in component_loads.values():
+      capacity = float(self.table_mu) * component_normal
+      if capacity > 1e-12:
+        component_utilization = component_tangent / capacity
+      else:
+        component_utilization = (0.0 if component_tangent <= 1e-12 else float("inf"))
+      if component_utilization >= utilization:
+        utilization = component_utilization
+        normal = component_normal
+        tangent = component_tangent
+
+    metric = self._table_wrench_metrics[phase]
+    metric["samples"] += 1
+    metric["peak_normal_force_n"] = max(metric["peak_normal_force_n"], normal)
+    metric["peak_tangent_force_n"] = max(metric["peak_tangent_force_n"], tangent)
+    metric["peak_utilization"] = max(metric["peak_utilization"], utilization)
+    hist, last = self._table_wrench_metric_history.get(
+        phase, (deque(maxlen=self._wrench_metric_window), None))
+    if last is None or last != self.step_i - 1:
+      hist.clear()
+    hist.append(utilization)
+    self._table_wrench_metric_history[phase] = (hist, self.step_i)
+    if len(hist) == self._wrench_metric_window:
+      avg = float(np.mean(np.asarray(hist, dtype=float)))
+      old = metric["peak_sustained_utilization"]
+      metric["peak_sustained_utilization"] = avg if old is None else max(float(old), avg)
+
+  def table_wrench_metrics(self):
+    """JSON-safe table friction utilization, split by execution phase."""
+    return {
+      "window_s": float(self._wrench_metric_window * DT),
+        "definition": ("maximum trailing-window mean of sum(|f_t|) / "
+                       "(table_mu * sum(f_n)) over each independently supported rigid "
+                       "component's part-table contacts"),
+        "table_mu": float(self.table_mu),
+        "phases": {
+            phase: {key: (int(value) if key == "samples" else value)
+                    for key, value in metric.items()}
+            for phase, metric in self._table_wrench_metrics.items()
+        },
+    }
+
   def step(self, n=1, report=None, action=None):
     """Advance; after each step check every active grasp weld against its breakaway caps --
     an overloaded grasp DROPS (deactivates) and is recorded as the LP-predicted failure."""
@@ -2378,6 +2517,10 @@ class SimScene:
       self._advance_grippers()
       self._apply_process_wrenches()
       mujoco.mj_step(self.model, self.data)
+      # The efc rows now realize the equality set requested since the previous step.  Keep
+      # this snapshot fixed while breakaway processing may deactivate one of those welds;
+      # the remaining rows do not change until MuJoCo runs again.
+      self._efc_active = self.data.eq_active.tobytes()
       self._phys += 1
       if self._grasp_trace and self.step_i % self._grasp_trace == 0:
         for r, g in sorted(self.active_grasps.items()):
@@ -2417,6 +2560,39 @@ class SimScene:
         # when actuators make the chain track for real.
         self.set_arm_q(*self._cmd_q)
       self.step_i += 1
+      if self._part_trace in self.assembly.objects:
+        _p = np.asarray(self.part_pose(self._part_trace)[:3], dtype=float)
+        if self._part_trace_origin is None:
+          self._part_trace_origin = _p.copy()
+        _disp = float(np.linalg.norm(_p - self._part_trace_origin))
+        _bucket = int(_disp / 0.005)
+        if _bucket > self._part_trace_bucket:
+          self._part_trace_bucket = _bucket
+          _hits = []
+          for _ci in range(int(self.data.ncon)):
+            _c = self.data.contact[_ci]
+            _b1 = int(self.model.geom_bodyid[_c.geom1])
+            _b2 = int(self.model.geom_bodyid[_c.geom2])
+            if self._part_trace not in (
+                self._part_owner_by_body[_b1], self._part_owner_by_body[_b2]):
+              continue
+            _n1 = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, int(_c.geom1)) or str(_c.geom1)
+            _n2 = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_GEOM, int(_c.geom2)) or str(_c.geom2)
+            _bn1 = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_BODY, _b1) or str(_b1)
+            _bn2 = mujoco.mj_id2name(
+                self.model, mujoco.mjtObj.mjOBJ_BODY, _b2) or str(_b2)
+            _f6 = np.zeros(6)
+            mujoco.mj_contactForce(self.model, self.data, _ci, _f6)
+            _hits.append(
+                f"{_n1}[{_bn1}]~{_n2}[{_bn2}]:{float(np.linalg.norm(_f6[:3])):.1f}N")
+          print(f"[sim/part-trace] {self._part_trace} moved {_disp*1000:.1f}mm "
+                f"at physics tick {self._phys}, path sample {self.trace_ctx}, "
+                f"action={action}; contacts={', '.join(_hits) or 'none'}", flush=True)
+      _phase = "insertion" if self.process_wrenches else "transport"
+      self._observe_table_wrench(_phase)
       _check_grasps = (not self.insertion_only_grasp_check
                        or self._process_engagement > 0.0)
       for r, (eq, part, fcap, tcap) in list(self.active_grasps.items()):
@@ -2431,7 +2607,6 @@ class SimScene:
           fmag, tmag = self._weld_wrench(eq)
           _ratio = max(fmag / max(float(fcap), 1e-9),
                        tmag / max(float(tcap), 1e-9))
-        _phase = "insertion" if self.process_wrenches else "transport"
         self._observe_grasp_wrench(_phase, r, part, _ratio, fmag, tmag)
         if not _check_grasps:
           # An overload must be sustained continuously inside the insertion neighborhood;
@@ -2748,7 +2923,19 @@ class _SkillServo:
     self.kp = float(kp)                                    # 1/s task-space P gain (seat servo)
     self.vmax = float(vmax)                                # m/s task-space rate cap
     self.tol = float(tol)                                  # seat servo convergence (m)
+    # A pickup is handed back to a reference which may subsequently move anywhere inside the
+    # controller's bounded correction tube.  Lift by that complete tube plus terminal
+    # tolerance before calling the component clear; 4mm was insufficient for a 10mm servo.
+    self.pick_clearance = self.max_dev + self.tol
     self.off = {}                                          # robot -> world task-space offset
+    # A measured pick may deliberately move the arm away from the nominal witness before
+    # attaching. Carry that configuration correction into the start of the post-pick path
+    # and decay it smoothly as the certified retreat gains clearance; otherwise the first
+    # nominal sample commands the arm straight back to the stale witness.
+    self.capture_qoff = {}                                 # robot -> local joint correction
+    self.capture_clearance = {}                            # robot -> safe hand-back height
+    self.capture_hold = set()                              # through explicit post-pick retreat
+    self.capture_override_q = {}                           # robot -> skill-owned lifted posture
     self.peak = {}                                         # robot -> peak |offset| (diagnostic)
     self.seat_log = []                                     # (task name, before m, after m)
     self.seat_touch = set()                                # contact-terminated mate skills
@@ -2798,7 +2985,8 @@ class _SkillServo:
     return np.vstack((jacp[:, self.dofs[robot]], jacr[:, self.dofs[robot]]))
 
   def align_pick(self, q_ref, robot, part, desired_anchor,
-                 drive, tick, budget, observed=True, angular_tol=np.deg2rad(2.0)):
+                 drive, tick, budget, observed=True,
+                 position_tol=GRASP_ALIGN_TOL, angular_tol=GRASP_ALIGN_ANG_TOL):
     """Measure, optionally correct, and return the terminal grasp-pose residual.
 
     ``desired_anchor`` is built from the measured part pose and the selected grasp database
@@ -2832,7 +3020,7 @@ class _SkillServo:
     if observed:
       for _ in range(int(float(budget) / self.dt)):
         ep, er = residual()
-        if np.linalg.norm(ep) <= self.tol and np.linalg.norm(er) <= angular_tol:
+        if np.linalg.norm(ep) <= position_tol and np.linalg.norm(er) <= angular_tol:
           break
         if np.linalg.norm(self.scene.branch_contact_force(robot)) > 4.0 * self.f0:
           guarded = 1
@@ -2857,6 +3045,44 @@ class _SkillServo:
             "position_m": float(np.linalg.norm(ep)),
             "angle_deg": float(np.rad2deg(np.linalg.norm(er))),
             "duration_s": ticks * self.dt, "guarded": bool(guarded)}
+
+  def inherit_pick_configuration(self, q_ref, robot, position_correction=0.0):
+    """Retain a measured pick correction until the cargo can safely absorb it.
+
+    The nominal witness may differ from the observed, settled object pose.  Blending that
+    correction away while the payload is still close to the table turns the blend into a
+    lateral scrape.  A sufficient geometric hand-back condition is table clearance greater
+    than the Cartesian correction plus the lift-off clearance used by ``pick_lift``.
+    """
+    ref = np.asarray(q_ref, dtype=float)[self.qidx[robot]]
+    plant = np.asarray([
+        self.scene.data.qpos[self.scene._qadr[self.scene._rai_joints[j]]]
+        for j in self.qidx[robot]], dtype=float)
+    delta = plant - ref
+    # Use shortest angular representatives for revolute joints. The correction describes
+    # the same physical branch reached by the servo, not a new IK branch.
+    for k, j in enumerate(self.qidx[robot]):
+      if self.scene._rai_hinge[j]:
+        delta[k] = (delta[k] + np.pi) % (2.0 * np.pi) - np.pi
+    self.capture_qoff[robot] = delta
+    self.capture_clearance[robot] = max(
+        self.pick_clearance, float(position_correction) + self.pick_clearance)
+    self.capture_hold.add(robot)
+
+  def finish_pick_retreat(self, robot, q_ref=None):
+    """Hand the lifted plant posture back at the certified post-pick endpoint.
+
+    The caller first settles the elevated plant onto ``q_ref``.  No measured joint offset may
+    survive that boundary: a fixed joint-space correction is only locally meaningful and can
+    distort a later Cartesian carry/reorientation even when the saved path itself is safe.
+    """
+    self.capture_qoff.pop(robot, None)
+    self.capture_clearance.pop(robot, None)
+    self.capture_hold.discard(robot)
+    self.capture_override_q.pop(robot, None)
+    # The task-space lift is now represented by the plant-to-endpoint joint correction.
+    # Retaining the old Cartesian lift offset would apply the same retreat twice.
+    self.off[robot] = np.zeros(3)
 
   def update(self, only=None):
     """Once per control tick, BEFORE building the adjusted reference: read each held part's
@@ -2925,7 +3151,7 @@ class _SkillServo:
           o = o * (self.max_dev / n)
         if n > self.peak.get(r, 0.0):
           self.peak[r] = n
-      else:
+      elif r not in self.capture_hold:
         o = o * (1.0 - self.decay)
       self.off[r] = o
 
@@ -2943,11 +3169,16 @@ class _SkillServo:
       hot = mag
       excess = mag - self.c_f0
       if self.torque_guard is not None and g is not None:
-        # Identical normalized wrench trigger to the held-cargo path above.
+        # Identical normalized wrench trigger to the held-cargo path above.  ``mag`` is the
+        # measured external contact force, so requiring it to exceed the unrelated absolute
+        # admittance threshold (f0=6N) is both unnecessary and wrong for a weak-direction
+        # grasp whose normalized guard may legitimately bind below 6N (vacuum lateral:
+        # 0.6*3.75=2.25N).  A positive contact plus normalized overload is the physical gate;
+        # gravity-only weld load still cannot trigger because there is no external contact.
         fmag, tmag = self.scene._weld_wrench(g[0])
         util = max(fmag / max(self.torque_guard * float(g[2]), 1e-9),
                    tmag / max(self.torque_guard * float(g[3]), 1e-9))
-        if util > 1.0 and mag > self.f0:
+        if util > 1.0 and mag > 1e-9:
           hot = max(hot, 4.0 * self.f0 + 1e-3)
           excess = max(excess, (util - 1.0) * self.f0)
           self.wrench_holds += 1
@@ -2964,7 +3195,7 @@ class _SkillServo:
           o = o * (self.max_dev / n)
         if n > self.peak.get(r, 0.0):
           self.peak[r] = n
-      else:
+      elif r not in self.capture_hold:
         o = o * (1.0 - self.decay)
       self.off[r] = o
 
@@ -2975,8 +3206,13 @@ class _SkillServo:
     return getattr(self, "_hot", 0.0) > self.f0
 
   def _cargo_clearance(self, robot):
-    """Min table clearance of `robot`'s held cargo (m), or None when not carrying/no table.
-    Exact per-geom bottom projection from the EXECUTED MuJoCo state, no collision queries."""
+    """Min table clearance of `robot`'s complete held component (m), or ``None``.
+
+    A re-pick can acquire one member of an already mated component.  Measuring only that
+    named member lets the lift terminate while a different member still touches the table;
+    the resumed carry then turns that support contact into a lateral grasp load.  Use all
+    collision geoms owned by the *live* mate component, including imported child bodies.
+    """
     m, d = self.scene.model, self.scene.data
     if not hasattr(self, "_ttop"):
       self._ttop = None
@@ -2998,11 +3234,16 @@ class _SkillServo:
         return None
       return self._bare_ee_clearance(robot)
     part = g[1]
-    gids = self._part_geoms.get(part)
+    component = frozenset(self.scene._active_mate_component(part))
+    # Component membership changes as mate welds fire/break, so cache by the complete live
+    # set rather than by the picked part.  Geom ownership itself is static.
+    if not hasattr(self, "_component_geoms"):
+      self._component_geoms = {}
+    gids = self._component_geoms.get(component)
     if gids is None:
-      bid = self.scene._body_id(part)
-      gids = [gi for gi in range(m.ngeom) if int(m.geom_bodyid[gi]) == bid]
-      self._part_geoms[part] = gids
+      gids = [gi for gi in range(m.ngeom)
+              if self.scene._part_owner_by_body[int(m.geom_bodyid[gi])] in component]
+      self._component_geoms[component] = gids
     lo = None
     for gi in gids:
       R = d.geom_xmat[gi].reshape(3, 3)
@@ -3124,9 +3365,30 @@ class _SkillServo:
   # BOTH executors -- offline as a min-over-arms hold on the global clock, online per-arm.)
 
   def adjust(self, q):
-    """Fold the task-space offsets into the joint reference (minimum-norm dq per arm)."""
+    """Fold capture and admittance offsets into the nominal joint reference."""
+    # A capture correction bridges the measured grasp and the explicit post-pick waypoint.
+    # ``finish_pick_retreat`` removes it once the elevated plant has settled onto that
+    # certified waypoint; it must never leak into the later geometric carry.
+    for r in list(self.capture_qoff):
+      if r not in self.scene.active_grasps and r not in self.capture_hold:
+        self.capture_qoff.pop(r, None)
+        self.capture_clearance.pop(r, None)
+        self.capture_override_q.pop(r, None)
     out = None
+    for r, o in self.capture_qoff.items():
+      if r in self.capture_hold and r in self.capture_override_q:
+        if out is None:
+          out = np.asarray(q, dtype=float).copy()
+        out[self.qidx[r]] = self.capture_override_q[r]
+        continue
+      if float(o @ o) < 1e-12:
+        continue
+      if out is None:
+        out = np.asarray(q, dtype=float).copy()
+      out[self.qidx[r]] += o
     for r, o in self.off.items():
+      if r in self.capture_hold and r in self.capture_override_q:
+        continue
       if float(o @ o) < 1e-10:
         continue
       g = self.scene.active_grasps.get(r)
@@ -3152,7 +3414,7 @@ class _SkillServo:
     contact -- the executed world, not the model, decides where the set-down ends."""
     holder = next((r for r, g in self.scene.active_grasps.items() if g[1] == part), None)
     if holder is None:
-      return
+      return np.asarray(q_ref, dtype=float).copy()
     tgt = np.asarray(target_pose[:3], dtype=float)
     q_ref = np.asarray(q_ref, dtype=float).copy()
     e0 = touched = 0
@@ -3176,8 +3438,10 @@ class _SkillServo:
       drive(q_ref)
       tick()
     self.place_log.append((name, e0, fmag, touched * self.dt >= 0.03))
+    return q_ref
 
-  def pick_lift(self, q_ref, robot, part, name, drive, tick, budget):
+  def pick_lift(self, q_ref, robot, part, name, drive, tick, budget,
+                retreat_clearance=None):
     """--servo-pick: force-terminated LIFT-OFF owning the fresh-weld window. A pick's grasp
     keyframe is a CONTACT terminal: it is authored ~1mm into the part, plant lag bottoms out
     PAST it right after the fire, and the press lands exactly inside the 20ms breakage
@@ -3196,6 +3460,9 @@ class _SkillServo:
       q[j] = float(self.scene.data.qpos[self.scene._qadr[jn[j]]])
     F0 = float(np.linalg.norm(self.scene.net_contact_force(part)))
     free = ticks = 0
+    target_clearance = max(
+        self.pick_clearance,
+        self.pick_clearance if retreat_clearance is None else float(retreat_clearance))
     for _ in range(int(budget / self.dt)):
       F = self.scene.net_contact_force(part)
       if float(F @ F) < 1.0:                               # < 1N: cargo is free...
@@ -3203,7 +3470,7 @@ class _SkillServo:
         c = self._cargo_clearance(robot)
         # ...but free NOW is not enough: the schedule resumes at the pressing keyframe, so
         # terminate only with real CLEARANCE in hand (or when the scene has no table datum).
-        if free * self.dt >= 0.03 and (c is None or c >= 0.004):
+        if free * self.dt >= 0.03 and (c is None or c >= target_clearance):
           break
       else:
         free = 0
@@ -3220,6 +3487,10 @@ class _SkillServo:
     o = np.array([0.0, 0.0, min(ticks * 0.8 * self.vmax * self.dt, self.max_dev)])
     if o[2] > self.off.get(robot, np.zeros(3))[2]:
       self.off[robot] = o
+    # Until the explicit post-pick task completes, the straight support-normal retreat is
+    # the authoritative controller output.  Tracking the nominal joint path concurrently can
+    # rotate a settled component back through the table even though both endpoints are valid.
+    self.capture_override_q[robot] = np.asarray(q, dtype=float)[self.qidx[robot]].copy()
     self.pick_log.append((name, F0, float(np.linalg.norm(
         self.scene.net_contact_force(part))), ticks * self.dt))
 
@@ -3810,10 +4081,6 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     got = _grasp_task(tid)
     return None if got is None or got[0][0] != "pick" else problem.tasks[tid].frames[1]
 
-  _planned_post_pick = {
-      int(t.name.split("_", 1)[0]) for t in problem.tasks
-      if "_post_pick_" in (getattr(t, "name", "") or "")}
-
   _pick_capture = {}
   _object_perturb_active = bool(object_perturbation and
       (object_perturbation.get("xy_bound_m", 0.0) > 0.0 or
@@ -3868,6 +4135,9 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     ok = (metrics["position_m"] <= float(object_grasp_capture) and
           metrics["angle_deg"] <= float(np.rad2deg(object_grasp_capture_angle)))
     _pick_capture[tid] = (ok, metrics, grasp_relpose)
+    if ok and act[0] == "pick" and servo is not None:
+      servo.inherit_pick_configuration(
+          q_ref, robot, position_correction=metrics["position_initial_m"])
     print(f"[sim/grasp] {t.name}: {'relative-pose correction' if metrics['observed'] else 'nominal'} "
           f"residual {metrics['position_initial_m']*1000:.1f} -> "
           f"{metrics['position_m']*1000:.1f}mm, {metrics['angle_initial_deg']:.1f} -> "
@@ -3875,16 +4145,14 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
 
   def lift_after_fire(tid, q_ref, flow_drive=None, flow_tick=None):
     """--servo-pick: own the fresh-weld window AFTER a pick fires -- rise until the new
-    cargo is contact-free instead of tracking through the pressing grasp keyframe (see
-    _SkillServo.pick_lift). Handovers/places keep their own terminals. `flow_drive`/
-    `flow_tick`: FIRE-FLOW pair, as in seat_before_fire."""
+    cargo is contact-free instead of dwelling at the pressing grasp keyframe (see
+    _SkillServo.pick_lift).  This lift also runs when the exported task chain contains a
+    post-pick waypoint: it establishes physical lift-off immediately, while that certified
+    waypoint continues in the same +world-z direction.  ``pick_lift`` parks the achieved
+    offset while the nominal segment catches up, so the path cannot pull the payload back
+    into the table. Handovers/places keep their own terminals. `flow_drive`/`flow_tick`:
+    FIRE-FLOW pair, as in seat_before_fire."""
     if servo is None or not servo.pick_ok:
-      return
-    _label = name_of.get(problem.tasks[tid].name)
-    if _label is not None and _label[0] in _planned_post_pick:
-      # The exported mode chain owns this retreat and collision-checks it with the payload
-      # attached. Injecting a second execution-only lift here would put the plant ahead of the
-      # saved segment, after which its early samples pull the arm back toward contact.
       return
     part = _pick_task(tid)
     if part is None:
@@ -3894,7 +4162,13 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       return
     _drv = flow_drive if flow_drive is not None else drive_q
     _tck = flow_tick if flow_tick is not None else (lambda: scene.step(1, report, ("servo",)))
-    servo.pick_lift(q_ref, holder, part, problem.tasks[tid].name, _drv, _tck, settle_max)
+    _retreat = float(getattr(problem.robot_ik, "post_pick_delta", 0.0) or 0.0)
+    _lift_budget = max(
+        float(settle_max),
+        _retreat / max(0.8 * float(servo.vmax), 1e-9) + 0.25)
+    servo.pick_lift(
+        q_ref, holder, part, problem.tasks[tid].name, _drv, _tck, _lift_budget,
+        retreat_clearance=_retreat)
 
   def servo_summary():
     # called from EVERY executor tail -- the corridor branch returns early, and the first
@@ -4100,8 +4374,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       if servo_pick:
         print("[sim/mp] --servo-pick ACTIVE: every pick/handover receiver corrects toward the "
               "selected exact object-to-EE grasp transform before attachment (with contact "
-              "guard); exported post-pick tasks own the collision-checked held-object retreat "
-              "(legacy paths retain the execution-only contact-free rise).")
+              "guard); every table pick immediately rises to physical contact-free clearance, "
+              "then an exported post-pick task continues the collision-checked retreat.")
       if compliant_follow:
         print(f"[sim/mp] --compliant-follow ACTIVE: whole-branch admittance -- arm links, "
               f"bare gripper AND cargo forces all yield the reference above "
@@ -4185,6 +4459,10 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       # second breakaway weld without detaching the existing holder. This is the physical brace
       # that the wrench model certified. Ordinary frame-less GOTOs still have no side effect.
       act = tuple(plan[_l[0]]) if _l else ()
+      if (servo is not None and act and act[0] == "pick"
+          and "_post_pick_" in (getattr(t, "name", "") or "")):
+        _goals = getattr(t, "goals", None) or ()
+        servo.finish_pick_retreat(act[1], q_ref=(_goals[0] if _goals else None))
       if not act or act[0] != "add_grasp":
         return
       incoming, contacted = act[1], act[2]
@@ -4333,6 +4611,12 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       mp_path, q_of=lambda st: full_q(st.q),
       mode_of=lambda st: st.mode,
       taskids_of=lambda m: np.atleast_1d(m.task_ids))
+  if os.environ.get("SIM_PHASE_EVENT_TRACE"):
+    print("[sim/mp] phase event map:")
+    for _ek, (_eq, _etids) in enumerate(stretches):
+      _enames = [problem.tasks[int(_tid)].name for _tid in sorted(set(_etids))]
+      print(f"  barrier {_ek:03d}: {len(_eq):4d} waypoint(s), "
+            + (", ".join(_enames) if _enames else "<no task>"))
 
   def _process_pairs(done_ids):
     """Mate loads owned by the stretch ending in ``done_ids`` (pre-skill GOTOs own none)."""
@@ -4628,15 +4912,20 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         # second motion (most visibly a1's first peg-stool pick). Only an attaching task or the
         # action's final task is a physical rest rendezvous. Unowned GOTO barriers remain exact
         # path/event anchors but crossing robots may retain nonzero velocity through them.
-        # A pre-HANDOVER is the exception: it is a two-arm rendezvous at which the giver is
-        # in position and the receiver is still clear of the payload. If it is crossed like
-        # an ordinary waypoint, the faster receiver can sit inside the payload while waiting
-        # for the giver (measured Husky Cross: 4.18mm / 76N before the ownership switch).
-        _pre_handover = bool(
-            lbl and not lbl[1] and tuple(plan[lbl[0]])[0] == "handover"
-            and "_pre_handover_" in (getattr(t, "name", "") or ""))
+        # A pre-CONTACT task is the exception: it is the last collision-certified waypoint
+        # at which the actor is still separated from its target.  It is therefore also the
+        # synchronization gate for entering the final pick/handover/place/assembly approach.
+        # If crossed early, a fast robot can wait at the *contact* endpoint while an earlier
+        # skill is still moving the scene (measured Cube: a2 parked at its future obj_5 pick
+        # while a3 seated obj_5, and its wrist displaced the loose obj_6 by 86mm).  Waiting at
+        # the explicit pre-contact waypoint is both safe and already part of the planned path;
+        # no scene-specific clearance threshold is introduced.
+        _pre_contact = bool(
+            lbl and not lbl[1] and tuple(plan[lbl[0]])[0] in
+            {"pick", "handover", "place", "assemble"}
+            and "_pre_" in (getattr(t, "name", "") or ""))
         _physical_event = (bool(getattr(t, "frames", None)) or bool(lbl and lbl[1])
-                           or _pre_handover)
+                           or _pre_contact)
         if lbl and _physical_event:
           pre = states[lbl[0]]                               # state entering the action
           for tok in plan[lbl[0]]:
@@ -4849,7 +5138,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
 
         def _c2_free(q, stretch_index):
           return bool(problem.is_collision_free(
-              _conf(q), stretch_mode[min(stretch_index, len(stretch_mode) - 1)]))
+              _conf(q), stretch_mode[min(stretch_index, len(stretch_mode) - 1)],
+              collision_tolerance=_ptol))
 
         _c2_stretches, _c2_rows, _c2_rep = _c2.smooth_stretches(
             stretches, _c2_free, limits=_limits, protected=_c2_protected,
@@ -4877,14 +5167,32 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         # Barrier-adjacent spans stay straight so approach/retreat directions are preserved.
         _wp_stretch, _kk = [], 0
         for _i in range(len(_P)):
-          while _kk + 1 < len(_bi) and _i > _bi[_kk]:
+          # A barrier waypoint is shared by the stretch that ENDS there and the one that
+          # starts there.  ``spline_path`` asks about the segment ``i -> i+1``, so at
+          # ``i == barrier`` the event has fired and the segment belongs to the NEXT world
+          # mode.  Using ``>`` here certified every post-switch spline span against the stale
+          # pre-switch attachments; phase scheduling later (correctly) rejected the same
+          # diagonal, e.g. a future gripper cutting through a newly placed Cube component.
+          while _kk + 1 < len(_bi) and _i >= _bi[_kk]:
             _kk += 1
           _wp_stretch.append(min(_kk, len(stretch_mode) - 1))
 
         def _sp_free(Q, j0, j1, i):
           m = stretch_mode[_wp_stretch[min(i, len(_wp_stretch) - 1)]]
-          return all(bool(problem.is_collision_free(_conf(Q[j]), m))
-                     for j in range(j0, j1 + 1))
+          # Certify the complete piecewise-linear interpolation consumed by config_at, not
+          # only Catmull--Rom's eight output knots.  A 1.6mm gripper/part penetration once
+          # hid between two safe knots and was discovered only by the 2ms phase scheduler.
+          # Use the same joint-path resolution and penetration tolerance as its final audit.
+          _res = max(float(phase_audit_resolution), 1e-9)
+          for j in range(j0, j1):
+            qa, qb = np.asarray(Q[j], float), np.asarray(Q[j + 1], float)
+            ns = max(1, int(np.ceil(float(np.linalg.norm(qb - qa)) / _res)))
+            for kk in range(ns + 1):
+              qk = qa + (qb - qa) * (kk / ns)
+              if not bool(problem.is_collision_free(
+                  _conf(qk), m, collision_tolerance=_ptol)):
+                return False
+          return True
         _Q, _imap, _rep = retiming.spline_path(_P, bar_idx=_bi, per_seg=spline_per_seg,
                                                tension=spline_tension, free_of=_sp_free)
         _P, _bi = _Q, [_imap[b] for b in _bi]
@@ -5078,6 +5386,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         # One sample per stretch is also CHEAPER (one oracle call per stretch, not per radian).
         _K = len(stretches)
         _p = np.zeros((len(robots), _K, 3))                  # held-group COM, per stretch
+        _com_local = np.full((len(robots), _K, 3), np.nan)   # COM in grasp-anchor frame
         _lev = np.zeros((len(robots), _K))                    # |COM - gripper| lever arm
         _m = np.zeros((len(robots), _K))                      # held mass (SHARE of it, below)
         _bad_lever = 0
@@ -5085,7 +5394,14 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
           _a0 = _bar[_k - 1] if _k else 0.0
           _s = 0.5 * (_a0 + _bar[_k])                        # mid-stretch config
           problem.is_collision_free(_conf(_pose([_s] * len(robots))), stretch_mode[_k])
-          _st = states[min(_stretch_plan[_k], len(states) - 1)]   # by ACTION, not by barrier
+          _st_idx = min(_stretch_plan[_k], len(states) - 1)
+          # A DIRECT stretch approaches its action and therefore carries the entering
+          # state's payload.  An inherited post-event stretch already executes in the
+          # successor state.  Payload locks use this same convention above; using the
+          # entering state unconditionally here left a freshly picked arm unconstrained
+          # until the next direct task (observed as m=0 immediately after attachment).
+          _st = (states[_st_idx] if _stretch_direct[_k]
+                 else states[min(_st_idx + 1, len(states) - 1)])
           for _r, _rn in enumerate(robots):
             grasped = [q for q in assembly.objects
                        if any(c[0] == "grasp" and c[1] == _rn
@@ -5114,6 +5430,10 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                                 for q in grp for c in _st.supports.get(q, ())))
             _share = gm / max(_nhold, 1)
             _p[_r, _k] = com
+            _af = problem.C.getFrame(ee_anchor[_rn])
+            _ap = np.asarray(_af.getPosition(), dtype=float)
+            _aR = np.asarray(_af.getRotationMatrix(), dtype=float)
+            _com_local[_r, _k] = _aR.T @ (np.asarray(com, dtype=float) - _ap)
             _m[_r, _k] = _share
             _lev[_r, _k] = max(lev, 5e-3)
             if _os.environ.get("SIM_FORCE_TRACE"):
@@ -5132,10 +5452,32 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         _sf = np.arange(0.0, _D + _dsf, _dsf)
         _GF = len(_sf)
         _pf = np.zeros((len(robots), _GF, 3))
+        # Differentiate the CARRIED COM, not the wrist origin.  Rotation about an offset
+        # grasp can accelerate the payload strongly while the wrist position barely moves;
+        # the old wrist-only approximation therefore admitted trajectories whose measured
+        # lateral grasp load was an order of magnitude above its prediction.  Extend each
+        # loaded transform through neighbouring unloaded samples solely to obtain a clean
+        # one-sided derivative at pick/release boundaries.  Values in unloaded stretches are
+        # never assigned a wrench budget and cannot constrain an empty arm.
+        _nearest_loaded = np.full((len(robots), _K), -1, dtype=int)
+        for _r in range(len(robots)):
+          _loaded = np.flatnonzero(_m[_r] > 0.0)
+          if len(_loaded):
+            for _k in range(_K):
+              _nearest_loaded[_r, _k] = int(
+                  _loaded[np.argmin(np.abs(_loaded - _k))])
         for _gi, _s in enumerate(_sf):
           C_fk.setJointState(retiming.config_at(list(_P), _cs, _sg, min(_s, _D)))
+          _kk = min(_fired_at(_s), _K - 1)
           for _r, _rn in enumerate(robots):
-            _pf[_r, _gi] = C_fk.getFrame(ee_anchor[_rn]).getPosition()
+            _af = C_fk.getFrame(ee_anchor[_rn])
+            _ap = np.asarray(_af.getPosition(), dtype=float)
+            _lk = _nearest_loaded[_r, _kk]
+            if _lk < 0:
+              _pf[_r, _gi] = _ap
+            else:
+              _aR = np.asarray(_af.getRotationMatrix(), dtype=float)
+              _pf[_r, _gi] = _ap + _aR @ _com_local[_r, _lk]
         # CORNERS (on by default; --no-corner-limits to ablate). What is EXECUTED is the
         # piecewise-linear path through _P's waypoints, so at every waypoint the Cartesian
         # tangent JUMPS -- and every mode
@@ -5222,9 +5564,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
             # also inflates the STATIC term, which eats the whole budget and collapses the
             # limit to ~0.01 rad/s (measured: passes, but 8-18x slower). Here the static load
             # stays true and only the dynamic estimate is derated. Both scenes now pass at
-            # k=1: the residual model error (no I*alpha -- measured at 2.8% of the wrench at
-            # the break -- and the grasp-anchor path standing in for the COM path) is small
-            # next to the corner term above, which is what k>1 was really compensating for.
+            # k=1: the residual model error (principally no I*alpha) is small next to the
+            # carried-COM translation and corner terms, which are evaluated explicitly.
             k = max(inertia_factor, 1e-9)
             # STATIC LOAD ALONE OVER THE CAP = an INFEASIBLE HOLD, not a slow one. Without
             # this report the only symptom is retiming's "exceeded max_steps" much later: the
@@ -5493,9 +5834,9 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                 "joint limits; the preferred visual cruise remains --joint-rate. Joint "
                 "limits themselves remain hard constraints of the audited path.")
         if force_limits:
-          print("[sim/mp] --phase-schedule: geometric scheduling uses the conservative "
-                "preferred cruise; the existing wrench speed/acceleration tables are not "
-                "yet part of this scheduler. Runtime wrench guards remain authoritative.")
+          print("[sim/mp] --phase-schedule: applying the brakeable grasp-wrench phase-rate "
+                "profile to each arm; runtime directional breakaway and contact guards remain "
+                "the independent physical backstop.")
 
         def _phase_audit(_traj, collect=False):
           _audit_t0 = _time.perf_counter()
@@ -5558,7 +5899,9 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                 collide_ds=1e-9, dwell=dwell, event_durations=_event_budget,
                 post_event_durations=_post_event_budget,
                 per_arm_rate=True, stretch_rates=_stretch_rates,
-                locked=list(_locked) + list(_payload_locks))
+                locked=list(_locked) + list(_payload_locks),
+                rate_limits=_vmax if force_limits else None,
+                rate_limit_ds=_dsf if force_limits else None)
           except RuntimeError as _e:
             _fallback_reason = f"{_pdt:g}s planning grid: {_e}"
             print(f"[sim/mp] --phase-schedule {_pdt:g}s search failed after "
@@ -6132,6 +6475,13 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     for idx, ev in traj.fires:
       fire_at.setdefault(int(idx), []).extend(int(t) for t in ev)
 
+  # The Newton--Euler wrench diagnostic is useful for the certified lockstep baseline too.
+  # Corridor execution installs a predictor-aware tracer above; lockstep has no phase
+  # predictor, but the measured rigid-body decomposition still separates gravity/inertia
+  # from contact preload.  Previously SIM_WRENCH_TRACE silently did nothing in lockstep.
+  if os.environ.get("SIM_WRENCH_TRACE") and scene.wrench_trace is None:
+    scene.wrench_trace = _make_wrench_tracer(scene)
+
   # A physical gripper wait belongs to the certified phase schedule, not to an imperative
   # all-arm sleep in ``fire``. The scheduler has reserved the final ``gripper_motion_time``
   # seconds before a close and the same interval after an open while parking only the event
@@ -6420,7 +6770,14 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
 
     def _pending_place(i):
       """If the NEXT fire is a lone PLACE of a currently-PRESSED cargo, return
-      (fire sample, tid, part, expected rest pose); else None."""
+      (fire sample, tid, part, expected rest pose); else None.
+
+      Take over slightly before contact as well when the complete carried component is at
+      the table and the named root has reached the place XY.  In a multi-part component a
+      lower child can touch before the root reaches its nominal z; waiting for a force guard
+      in that case spends part of the grasp's breakaway margin before the contact-terminal
+      place skill even starts.
+      """
       if servo is None or not servo.place_ok:
         return None
       j = next((sm for sm in _fire_samples if sm >= i), None)
@@ -6432,7 +6789,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       if not fr or fr[0] != "table" or len(fr) < 2 or fr[1] not in assembly.objects:
         return None
       holder = next((r for r, g in scene.active_grasps.items() if g[1] == fr[1]), None)
-      if holder is None or getattr(servo, "_hot_by", {}).get(holder, 0.0) <= servo.f0:
+      if holder is None:
         return None
       _l = name_of.get(t.name)
       if _l is None:
@@ -6447,6 +6804,18 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         return None
       exp = _state_part_poses(states[min(_l[0] + 1, len(states) - 1)], assembly,
                               lift=CARRY_LIFT)[fr[1]]
+      _pressed = getattr(servo, "_hot_by", {}).get(holder, 0.0) > servo.f0
+      if not _pressed:
+        _clear = servo._cargo_clearance(holder)
+        _cur = np.asarray(scene.part_pose(fr[1]), dtype=float)
+        # 2mm is the existing guarded-approach floor (rate_factors.c0), not a second
+        # collision tolerance.  XY must already satisfy the terminal skill tolerance, so a
+        # low horizontal carry cannot be mistaken for an intended place.
+        _at_terminal_contact = (
+            _clear is not None and _clear <= 0.002
+            and float(np.linalg.norm(_cur[:2] - np.asarray(exp[:2]))) <= servo.tol)
+        if not _at_terminal_contact:
+          return None
       return j, tid, fr[1], np.asarray(exp, dtype=float)
 
     def _pending_mate(i):
@@ -6490,6 +6859,48 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       if holder is None:
         return None
       return j, tid, parent, child, holder
+
+    def _pending_pre_place(i):
+      """Return the physical table PLACE following an explicit pre-place barrier.
+
+      As with insertion, the collision-checked motion owns free space only through the
+      exported funnel mouth.  The support-relative/contact controller owns mouth-to-table;
+      consuming the nominal joint descent first can scrape a slightly displaced payload
+      before the contact controller is reached.  Look through frame-less bookkeeping tasks,
+      but never through another physical attachment event.
+      """
+      if servo is None or not servo.place_ok:
+        return None
+      here = fire_at.get(i, ())
+      if (len(here) != 1
+          or "_pre_place_" not in (getattr(problem.tasks[here[0]], "name", "") or "")):
+        return None
+      j = tid = fr = None
+      for _sm in _fire_samples:
+        if _sm <= i:
+          continue
+        if len(fire_at[_sm]) != 1:
+          return None
+        _tid = fire_at[_sm][0]
+        _fr = getattr(problem.tasks[_tid], "frames", None)
+        if not _fr:
+          continue
+        if (len(_fr) >= 2 and _fr[0] == "table"
+            and _fr[1] in assembly.objects):
+          j, tid, fr = _sm, _tid, _fr
+        break
+      if j is None:
+        return None
+      part = fr[1]
+      holder = next((r for r, g in scene.active_grasps.items() if g[1] == part), None)
+      if holder is None:
+        return None
+      _l = name_of.get(problem.tasks[tid].name)
+      if _l is None:
+        return None
+      exp = _state_part_poses(states[min(_l[0] + 1, len(states) - 1)], assembly,
+                              lift=CARRY_LIFT)[part]
+      return j, tid, part, holder, np.asarray(exp, dtype=float)
 
     i, _NQ = 0, len(traj.q)
     while i < _NQ:
@@ -6569,6 +6980,50 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       drive_q(qc)
       scene.trace_ctx = i
       scene.step(1, report, (traj.phase[i],))
+      _ppre = _pending_pre_place(i)
+      if _ppre is not None:
+        _j, _tid, _part, _holder, _exp = _ppre
+        _owned_pre = ([robots[r] for r in sorted(acting_for(fire_at[i]))]
+                      if phase_schedule else None)
+        settle_before_fire(traj.q[i], _touch_robots(fire_at[i]),
+                           _touch_mates(fire_at[i]), owned=_owned_pre)
+        if servo is not None:
+          servo.update()
+          qc = servo.adjust(traj.q[i])
+        # Complete the frame-less pre-place marker before entering the contact skill.
+        for _pre_tid in fire_at[i]:
+          fire(_pre_tid)
+        _hold_dims = np.asarray(
+            sorted(int(x) for x in arm_dims[robots.index(_holder)]), dtype=int)
+        _flow_i = [i]
+        def _place_flow_drive(_q_holder):
+          _k = min(_flow_i[0] + 1, _j)
+          _q_mix = np.asarray(traj.q[_k], dtype=float).copy()
+          _q_mix[_hold_dims] = np.asarray(_q_holder, dtype=float)[_hold_dims]
+          drive_q(_q_mix)
+        def _place_flow_tick():
+          scene.step(1, report, ("servo",))
+          _flow_i[0] = min(_flow_i[0] + 1, _j)
+        # Budget follows directly from the controller's 15mm/s descent rate and the current
+        # root-to-target height.  ``settle_max`` alone is only 1s in the standard profile,
+        # shorter than a normal 50mm pre-place funnel (3.3s), and previously let the datum
+        # attach fire before the physical support had been reached.
+        _place_dz = max(
+            0.0, float(scene.part_pose(_part)[2]) - float(np.asarray(_exp)[2]))
+        _place_budget = max(float(settle_max), _place_dz / 0.015 + 0.5)
+        _q_seated = servo.place_seat(
+            qc, _part, _exp, problem.tasks[_tid].name,
+            _place_flow_drive, _place_flow_tick, _place_budget)
+        # The controller may touch down before unrelated robots consume their remaining
+        # certified phase slack.  Keep the placing arm fixed while those paths catch up;
+        # jumping directly to ``_j`` would create a one-tick velocity impulse.
+        while _flow_i[0] < _j:
+          _place_flow_drive(_q_seated)
+          _place_flow_tick()
+        fire(_tid)
+        _process_after(_j)
+        i = _j + 1
+        continue
       _pm = _pending_mate(i)
       if _pm is not None:
         _j, _tid, _parent, _child, _holder = _pm
@@ -6646,11 +7101,17 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         # Lockstep/corridor retain their historical all-arm check.
         _owned = ([robots[r] for r in sorted(acting_for(fire_at[i]))]
                   if phase_schedule else None)
-        settle_before_fire(traj.q[i], _touch_robots(fire_at[i]),
+        # A table-pick retreat is owned by the support-normal skill until this exact
+        # post-pick barrier.  The cargo is now clear, so settle once onto the certified
+        # post-pick waypoint before returning control to the saved geometric path.  Carrying
+        # the lift skill's redundant-joint posture as a constant offset through later path
+        # segments changes their Cartesian geometry and invalidates the collision proof.
+        _fire_q = traj.q[i]
+        settle_before_fire(_fire_q, _touch_robots(fire_at[i]),
                            _touch_mates(fire_at[i]), owned=_owned)
         for tid in fire_at[i]:
-          seat_before_fire(tid, traj.q[i])
-          align_pick_before_fire(tid, traj.q[i])
+          seat_before_fire(tid, _fire_q)
+          align_pick_before_fire(tid, _fire_q)
           fire(tid)
         _process_after(i)                                   # the completed mate no longer loads
         for tid in fire_at[i]:
@@ -6667,6 +7128,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         float(np.linalg.norm(scene.part_pose(p)[:3] - exp[:3])),
         _part_orientation_error(assembly, p, scene.part_pose(p)[3:], exp[3:]))
   report.grasp_wrench_metrics = scene.grasp_wrench_metrics()
+  report.table_wrench_metrics = scene.table_wrench_metrics()
   if scene.mate_caps is not None and scene._mate_max:
     # per-mate load maxima -- this is the calibration readout: caps must sit ABOVE every
     # value seen in a normal run and BELOW the load of an abusive hold (car by one wheel).
@@ -7010,7 +7472,12 @@ _STANDARD_SIM_PROFILE = {
     "actuated": True,
     "skill_servo": True,
     "arm_arm_contacts": True,
-    "spline": True,
+    # Preserve the planner-certified geometry.  The phase scheduler below changes only WHEN
+    # each robot visits that path and its rate smoother removes temporal stutter.  Spatial
+    # Catmull--Rom fitting is deliberately opt-in: although it can certify a nominal RAI
+    # scene, its lateral deviation can consume the execution slack around a physically
+    # settled part (the nominal pose and MuJoCo contact pose differ by millimetres).
+    "spline": False,
     "phase_schedule": True,
     "phase_servo_time": 0.15,
     "phase_smooth": True,
@@ -7639,7 +8106,8 @@ def _build_cli():
   r.add_argument("--sim-profile", choices=tuple(_SIM_PROFILES), default=None, metavar="NAME",
                  help="Named execution defaults. 'standard' selects the fail-closed saved-"
                       "path reproduction pipeline: actuated skill servo, physical arm-arm "
-                      "contacts, spline + phase schedule/smoothing/batching, normalized wrench "
+                      "contacts, geometry-preserving phase schedule/smoothing/batching, "
+                      "normalized wrench "
                       "guard, and strict path preflight. Explicit individual flags win. "
                       "--mp-path/--record and robot-specific calibrations remain per run.")
   r.add_argument("--require-mp-path", action=argparse.BooleanOptionalAction, default=False,

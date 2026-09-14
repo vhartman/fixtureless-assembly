@@ -204,14 +204,16 @@ _STANDARD_MOTION_PROFILE = {
     # The portable certificate is collision-free motion plus hardware joint limits.  A uniform
     # positive inter-robot shell is not generally feasible: even though the task-participant
     # ramp reaches zero at its anchors, 10cm can disconnect otherwise broad transit spaces in
-    # compact workcells (Fabrica Beam).  Positive robot/table margins remain explicit
-    # experiment settings until clearance is optimized softly rather than imposed as a hard
-    # topology-changing gate.
+    # compact workcells (Fabrica Beam), so the robot shell remains zero.  The 2mm carried-part
+    # table margin is different: it exactly covers the standard search ``part_float`` datum
+    # between the planner's lower table and the physical MuJoCo surface.  The 5cm endpoint ramp
+    # preserves contact-feasible picks/places while preventing a nominally certified transit
+    # from grazing the real table during a payload reorientation.
     "mp_collision_tolerance": 1e-4,
     "mp_robot_margin": 0.0,
-    "mp_margin_ramp": 0.0,
+    "mp_margin_ramp": 0.05,
     "mp_margin_mode": "linear",
-    "mp_table_margin": 0.0,
+    "mp_table_margin": 0.002,
     "mp_wrench_gate": False,
     "mp_cograsp": True,
     "quiet_rai": True,

@@ -643,7 +643,7 @@ def plan_schedule(stretches, arm_dims, acting, dt,
                   settle=0.0, max_steps=None, stall_steps=None, rate_boost=False,
                   event_durations=None, post_event_durations=None,
                   per_arm_rate=False, stretch_rates=None,
-                  locked=()):
+                  locked=(), rate_limits=None, rate_limit_ds=None):
   """PRIORITIZED, EVENT-DRIVEN retiming: arms desync so only the arm(s) ACTING at a
   barrier ramp to rest there; uninvolved arms CROSS the barrier without stopping.
   Events fire in DAG/sequence order, each once its acting arm(s) have arrived at rest
@@ -687,6 +687,10 @@ def plan_schedule(stretches, arm_dims, acting, dt,
                 is bookkeeping and is skipped immediately; a moving arm realizes approximately
                 `joint_rate` regardless of how many other arms move in that composite segment.
                 Every resulting desynchronized configuration still goes through `collide`.
+    rate_limits: optional ``(num_arms, num_samples)`` upper bounds on each arm's composite
+                path-phase rate, sampled uniformly at ``rate_limit_ds`` along the composite
+                arc. They are applied after per-arm normalization, allowing a brakeable
+                dynamic-wrench profile to constrain timing without changing path geometry.
     collide_ds: arc-length cell (rad) for caching collide verdicts -- one query per
                 (mover, arm-cells, fired) cell, not per dt step. Verdicts are evaluated
                 with EVERY arm at its forward cell edge (clamped to its cap), so a safe
@@ -714,6 +718,19 @@ def plan_schedule(stretches, arm_dims, acting, dt,
     _stretch_rates = np.asarray(stretch_rates, dtype=float).reshape(-1)
     if len(_stretch_rates) != K or np.any(_stretch_rates <= 0.0):
       raise ValueError("stretch_rates must contain one positive rate per stretch")
+  if rate_limits is not None:
+    _rate_limits = np.asarray(rate_limits, dtype=float)
+    if (_rate_limits.ndim != 2 or _rate_limits.shape[0] != n
+        or _rate_limits.shape[1] < 1):
+      raise ValueError(
+          f"rate_limits must have shape ({n}, N>=1), got {_rate_limits.shape}")
+    if np.any(_rate_limits <= 0.0) or not np.all(np.isfinite(_rate_limits)):
+      raise ValueError("rate_limits must contain finite positive rates")
+    if rate_limit_ds is None or float(rate_limit_ds) <= 0.0:
+      raise ValueError("positive rate_limit_ds is required with rate_limits")
+    _rate_limit_ds = float(rate_limit_ds)
+  else:
+    _rate_limits, _rate_limit_ds = None, None
   # Segment i joins composite waypoints i->i+1. The first barrier waypoint at or beyond its
   # endpoint identifies the owning source stretch.
   _segment_stretch = np.asarray(
@@ -779,10 +796,14 @@ def plan_schedule(stretches, arm_dims, acting, dt,
     i = _seg_index(csum, segs, s)
     nominal = float(_stretch_rates[_segment_stretch[i]])
     base = nominal if _boost is None else nominal * _boost[i]
-    if not per_arm_rate:
-      return base
-    sh = _share[r][i]
-    return np.inf if sh <= 1e-9 else base / sh
+    if per_arm_rate:
+      sh = _share[r][i]
+      base = np.inf if sh <= 1e-9 else base / sh
+    if _rate_limits is not None:
+      gi = int(np.clip(round(float(s) / _rate_limit_ds),
+                       0, _rate_limits.shape[1] - 1))
+      base = min(base, float(_rate_limits[r, gi]))
+    return base
 
   def ramp_factor(r, s):
     if ramp_dist <= 0:
@@ -1086,6 +1107,22 @@ def plan_schedule(stretches, arm_dims, acting, dt,
             raise _Wedge(r, j, base, s[j])
         wedge = 0                                            # only static blocks: wait/stall
       if stall > stall_steps:
+        # A collision oracle is allowed to return only a boolean (or to identify a pair that
+        # is already inside the current fused component).  In that case the pairwise wedge
+        # scan above has no new blocker edge to add, although the phase lead itself is still
+        # the reason the greedy schedule cannot follow the certified path.  Couple the
+        # lagging component to its most advanced outside arm and restart.  Repeating this
+        # operation monotonically recovers the all-arm diagonal in the worst case; if every
+        # arm is already fused, the error below remains loud because then the supplied base
+        # path/oracle is genuinely inconsistent.
+        if collide is not None:
+          lag = min(range(n), key=lambda r: s[r])
+          lag_comp = next((set(comp) for comp in comps if lag in comp), {lag})
+          outside = [r for r in range(n)
+                     if r not in lag_comp and s[r] > s[lag] + eps]
+          if outside:
+            lead = max(outside, key=lambda r: s[r])
+            raise _Wedge(lag, lead, s[lag], s[lead])
         state = ", ".join(f"arm{r}@{s[r]:.3f}" for r in range(n))
         _bar = bar_s[fired] if fired < K else D
         _caps = [min(cap_of(r, fired), entry.get(r, D)) for r in range(n)]

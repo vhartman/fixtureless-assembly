@@ -70,6 +70,8 @@ def test_kinematic_arm_reasserts_visual_gripper_mimic_joints(monkeypatch):
 def test_standard_profile_refuses_an_implicit_motion_plan_before_scene_build():
   a = sim.parse_args(["run", "plan.json", "--sim-profile", "standard"])
   assert a.servo_place_seat
+  assert not a.spline
+  assert a.phase_schedule and a.phase_smooth and a.phase_batch
   with pytest.raises(SystemExit, match="require-mp-path"):
     sim._cli_run(a)
 
@@ -182,6 +184,21 @@ def test_saved_wrench_cap_scales_are_idempotent_not_squared():
         pytest.approx(4.0 * base_tf)
     assert wrench.PARAMS["grasp"]["asymmetric"]["vacuum"]["T_axis"] == \
         pytest.approx(2.0 * base_vac)
+  finally:
+    wrench.PARAMS.clear()
+    wrench.PARAMS.update(old)
+
+
+def test_scalar_vacuum_cap_includes_friction_limited_lateral_force():
+  old = copy.deepcopy(wrench.PARAMS)
+  try:
+    wrench.PARAMS["grasp_model"] = "asymmetric"
+    wrench.PARAMS["grasp"]["asymmetric"]["vacuum"] = {
+        "F_push": 40.0, "F_pull": 25.0, "mu": 0.15,
+        "T_axis": 0.6, "T_lat": 0.8}
+    force, torque = sim._grasp_caps("vacuum")
+    assert force == pytest.approx(3.75)
+    assert torque == pytest.approx(0.6)
   finally:
     wrench.PARAMS.clear()
     wrench.PARAMS.update(old)

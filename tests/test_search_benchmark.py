@@ -39,6 +39,8 @@ def test_wrench_sim_ablation_insertion_only_breakage_is_explicit():
   isolated = WS._parse_args(["--insertion-only-grasp-check"])
   assert not default.insertion_only_grasp_check
   assert default.abort_on_action_failure
+  assert default.animate_grippers
+  assert not WS._parse_args(["--no-animate-grippers"]).animate_grippers
   assert isolated.insertion_only_grasp_check
 
 
@@ -67,22 +69,44 @@ def test_wrench_sim_ablation_flattens_phase_load_metrics():
               },
           },
       },
+      "table_wrench_metrics": {
+          "table_mu": 0.5,
+          "phases": {
+              "transport": {"peak_utilization": 0.3,
+                            "peak_sustained_utilization": 0.2},
+              "insertion": {"peak_utilization": 1.6,
+                            "peak_sustained_utilization": 1.4},
+          },
+      },
   })
   assert got["wrench_window_s"] == pytest.approx(0.02)
   assert got["transport_peak_sustained_utilization"] == pytest.approx(0.8)
   assert got["insertion_peak_force_n"] == pytest.approx(20.0)
   assert got["transport_two_finger_peak_sustained_utilization"] == pytest.approx(0.7)
   assert got["insertion_vacuum_peak_sustained_utilization"] == pytest.approx(0.9)
+  assert got["table_mu"] == pytest.approx(0.5)
+  assert got["insertion_table_peak_utilization"] == pytest.approx(1.6)
+  assert got["insertion_table_peak_sustained_utilization"] == pytest.approx(1.4)
 
 
 def test_wrench_sim_table_formats_phase_and_tool_utilization_as_percent():
   row = {
       "transport_two_finger_peak_sustained_utilization_mean": 0.73,
       "insertion_two_finger_peak_sustained_utilization_mean": 1.24,
+      "insertion_table_peak_utilization_mean": 0.81,
   }
   assert WS._fmt_util(row, "transport", "two_finger") == "73"
   assert WS._fmt_util(row, "insertion", "two_finger") == r"$\mathbf{124}$"
   assert WS._fmt_util(row, "transport", "vacuum") == "--"
+  failed = dict(row, success_percent=0)
+  assert WS._fmt_util(failed, "transport", "two_finger") == "(73)"
+  assert WS._fmt_util(failed, "insertion", "two_finger") == \
+      r"($\mathbf{124}$)"
+  assert WS._fmt_task_progress({"actions_ok_prefix_mean": 17.0,
+                                "actions_mean": 22.0}) == "17/22"
+  assert WS._fmt_task_progress({"actions_ok_prefix_mean": 2.5,
+                                "actions_mean": 4.5}) == "2.5/4.5"
+  assert WS._fmt_task_progress({}) == "--"
 
 
 def test_paper_runner_automatically_measures_first_motion_solution(tmp_path, monkeypatch):
