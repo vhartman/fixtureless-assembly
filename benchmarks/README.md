@@ -113,7 +113,7 @@ neutral on Car Mini, and redirects Chair into a larger symbolic frontier.
 
 `run_paper_search_comparison.py` runs the search matrix used by the comparison and timing-
 breakdown tables. Every sample is a fresh sequential process, defaults to three fixed seeds, has
-a 4 GiB address-space limit, and has a 450 s wall-clock limit. It disables witness reranking and
+a 4 GiB process-tree resident-memory limit, and has a 450 s wall-clock limit. It disables witness reranking and
 motion planning but retains the exact per-edge IK
 certificates found by lazy search. To avoid repeatedly spending the full budget on an
 intractable cell, the first timeout for a case/solver pair suppresses its remaining unrun seeds
@@ -122,7 +122,9 @@ and repetitions. The timeout itself remains in the aggregate and generated table
 On another Linux machine, a repository checkout plus the environment documented in the root
 README is sufficient for search. The default initial-motion-planning stage additionally needs
 the `mr_bench` checkout selected by `MRBENCH_SRC`. The runner uses GNU `/usr/bin/time` for peak
-RSS and `/usr/bin/prlimit` for the per-process memory guard. No Fabrica source checkout and no
+RSS and a dependency-free `/proc` watchdog for the process-tree resident-memory guard. This is
+deliberately not `RLIMIT_AS`: BLAS and robotics libraries reserve machine-dependent virtual
+address ranges which do not represent committed physical memory. No Fabrica source checkout and no
 generated file under `experiments/` is required: the converted meshes and plain benchmark scene
 configs are repository inputs.
 

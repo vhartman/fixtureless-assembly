@@ -3,7 +3,7 @@
   "name": "paper-search-comparison",
   "description": "Search-only comparison under the full wrench model. Native cases use the standard staged grasp alphabet; imported Fabrica cases use tracked plain scene configs and the dense fixed grasp alphabet required by their CAD geometry. Within each case, rows differ only in the high-level decomposition or reverse/forward search policy.",
   "timeout_s": 450,
-  "max_address_space_gb": 4,
+  "max_rss_gb": 4,
   "seeds": [11023, 11024, 11025],
   "env": {
     "OPENBLAS_NUM_THREADS": "1",

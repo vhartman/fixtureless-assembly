@@ -247,6 +247,30 @@ def test_matrix_expansion_is_row_by_column_and_keeps_coordinates_and_guard():
                      "planner", "--flag"]
 
 
+def test_resident_memory_limit_expands_without_becoming_an_address_space_limit():
+  manifest = _matrix_manifest()
+  manifest.pop("max_address_space_gb")
+  manifest["max_rss_gb"] = 4
+  runs = B.expand_runs(B.validate_manifest(manifest))
+  assert all(run["max_rss_gb"] == 4.0 for run in runs)
+  assert all(run["max_address_space_gb"] is None for run in runs)
+  assert B._guarded_command(runs[0], ["planner"]) == ["planner"]
+
+
+def test_resident_memory_watchdog_marks_process_tree_limit(monkeypatch):
+  class FakeProcess:
+    pid = 123
+
+    @staticmethod
+    def poll():
+      return None
+
+  monkeypatch.setattr(B, "_process_tree_rss_kb", lambda _pid: 2048)
+  monkeypatch.setattr(B, "_terminate_process_group", lambda _proc: -15)
+  got = B._wait_with_guards(FakeProcess(), timeout_s=10, max_rss_gb=0.001)
+  assert got == (-15, False, True, 2048)
+
+
 def test_repeated_expansion_keeps_logical_cell_and_adds_stable_repeat_ids():
   runs = B.expand_runs(B.validate_manifest(_matrix_manifest()), repeats=2)
   assert len(runs) == 8

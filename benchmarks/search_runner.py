@@ -132,14 +132,16 @@ def validate_manifest(data):
       if "seeds" in row and (not isinstance(row["seeds"], list)
                               or not all(isinstance(x, int) for x in row["seeds"])):
         raise ValueError(f"{group_name}[{i}].seeds must be a list of integers")
-      if ("max_address_space_gb" in row
-          and (not isinstance(row["max_address_space_gb"], (int, float))
-               or row["max_address_space_gb"] <= 0)):
-        raise ValueError(f"{group_name}[{i}].max_address_space_gb must be positive")
-  if ("max_address_space_gb" in data
-      and (not isinstance(data["max_address_space_gb"], (int, float))
-           or data["max_address_space_gb"] <= 0)):
-    raise ValueError("max_address_space_gb must be positive")
+      for limit_name in ("max_address_space_gb", "max_rss_gb"):
+        if (limit_name in row
+            and (not isinstance(row[limit_name], (int, float))
+                 or row[limit_name] <= 0)):
+          raise ValueError(f"{group_name}[{i}].{limit_name} must be positive")
+  for limit_name in ("max_address_space_gb", "max_rss_gb"):
+    if (limit_name in data
+        and (not isinstance(data[limit_name], (int, float))
+             or data[limit_name] <= 0)):
+      raise ValueError(f"{limit_name} must be positive")
   env = data.get("env", {})
   if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str)
                                            for k, v in env.items()):
@@ -183,6 +185,7 @@ def expand_runs(data, repeats=1, seeds=None):
             "timeout_s": column.get("timeout_s", row.get("timeout_s")),
             "max_address_space_gb": column.get(
                 "max_address_space_gb", row.get("max_address_space_gb")),
+            "max_rss_gb": column.get("max_rss_gb", row.get("max_rss_gb")),
         })
   else:
     variants = data.get("variants", [{"name": "default", "args": []}])
@@ -205,6 +208,9 @@ def expand_runs(data, repeats=1, seeds=None):
           memory_gb = variant.get("max_address_space_gb")
           if memory_gb is None:
             memory_gb = case.get("max_address_space_gb", data.get("max_address_space_gb"))
+          rss_gb = variant.get("max_rss_gb")
+          if rss_gb is None:
+            rss_gb = case.get("max_rss_gb", data.get("max_rss_gb"))
           run = {
               "run_id": rid,
               "case": case["name"],
@@ -213,6 +219,7 @@ def expand_runs(data, repeats=1, seeds=None):
               "repeat": repeat,
               "timeout_s": float(timeout),
               "max_address_space_gb": float(memory_gb) if memory_gb is not None else None,
+              "max_rss_gb": float(rss_gb) if rss_gb is not None else None,
               "args": defaults + list(case.get("args", [])) + list(variant.get("args", [])),
               "tags": sorted(set(data.get("tags", [])) | set(case.get("tags", []))
                              | set(variant.get("tags", []))),
@@ -248,6 +255,74 @@ def _guarded_command(spec, command):
 def _looks_like_out_of_memory(text: str) -> bool:
   """Recognize Python and native allocation failures emitted by the solver stack."""
   return "MemoryError" in text or "bad_alloc" in text
+
+
+def _process_tree_pids(root_pid: int):
+  """Return the live Linux process tree rooted at ``root_pid``."""
+  seen = set()
+  pending = [root_pid]
+  while pending:
+    pid = pending.pop()
+    if pid in seen:
+      continue
+    seen.add(pid)
+    try:
+      children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+      continue
+    pending.extend(int(child) for child in children)
+  return seen
+
+
+def _process_tree_rss_kb(root_pid: int):
+  """Best-effort sum of resident memory for a process and all descendants."""
+  total = 0
+  for pid in _process_tree_pids(root_pid):
+    try:
+      for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+        if line.startswith("VmRSS:"):
+          total += int(line.split()[1])
+          break
+    except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+      pass
+  return total
+
+
+def _terminate_process_group(proc, grace_s=5):
+  """Terminate a benchmark's isolated process group and return its exit status."""
+  try:
+    os.killpg(proc.pid, signal.SIGTERM)
+  except ProcessLookupError:
+    return proc.wait()
+  try:
+    return proc.wait(timeout=grace_s)
+  except subprocess.TimeoutExpired:
+    try:
+      os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+      pass
+    return proc.wait()
+
+
+def _wait_with_guards(proc, timeout_s: float, max_rss_gb=None, poll_s=0.05):
+  """Wait while enforcing wall-time and resident memory on the whole process tree."""
+  deadline = time.monotonic() + timeout_s
+  rss_limit_kb = (None if max_rss_gb is None
+                  else int(float(max_rss_gb) * 1024 ** 2))
+  sampled_peak_kb = 0
+  while True:
+    returncode = proc.poll()
+    if returncode is not None:
+      sampled_peak_kb = max(sampled_peak_kb, _process_tree_rss_kb(proc.pid))
+      return returncode, False, False, sampled_peak_kb
+    rss_kb = _process_tree_rss_kb(proc.pid)
+    sampled_peak_kb = max(sampled_peak_kb, rss_kb)
+    if rss_limit_kb is not None and rss_kb > rss_limit_kb:
+      return _terminate_process_group(proc), False, True, sampled_peak_kb
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+      return _terminate_process_group(proc), True, False, sampled_peak_kb
+    time.sleep(min(poll_s, remaining))
 
 
 def _logical_cell(spec):
@@ -560,6 +635,7 @@ def run_one(spec, suite_dir: Path, suite_provenance, env_extra, timeout_override
       "seed": spec["seed"], "repeat": spec.get("repeat", 1), "tags": spec["tags"],
       "timeout_s": timeout_s,
       "max_address_space_gb": spec.get("max_address_space_gb"),
+      "max_rss_gb": spec.get("max_rss_gb"),
       "planner_command": command, "planner_command_shell": shlex.join(command),
       "execution_command": guarded_command,
       "execution_command_shell": shlex.join(guarded_command),
@@ -590,23 +666,19 @@ def run_one(spec, suite_dir: Path, suite_provenance, env_extra, timeout_override
                 "ASSEMBLY_GRASP_DB_KEY": grasp_database["cache_key"]})
   started = dt.datetime.now(dt.timezone.utc)
   t0 = time.perf_counter()
-  timed_out = False
   with log_path.open("w", encoding="utf-8") as log:
     log.write(f"[benchmark-command] {shlex.join(command)}\n")
     log.flush()
     proc = subprocess.Popen(timed, cwd=ROOT, env=env, stdout=log,
                             stderr=subprocess.STDOUT, start_new_session=True)
-    try:
-      returncode = proc.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-      timed_out = True
-      os.killpg(proc.pid, signal.SIGTERM)
-      try:
-        returncode = proc.wait(timeout=5)
-      except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
-        returncode = proc.wait()
+    returncode, timed_out, rss_limit_hit, sampled_peak_kb = _wait_with_guards(
+        proc, timeout_s, spec.get("max_rss_gb"))
   observed_wall = time.perf_counter() - t0
+  if rss_limit_hit:
+    with log_path.open("a", encoding="utf-8") as log:
+      log.write(
+          f"[benchmark-resource] process-tree RSS exceeded {spec['max_rss_gb']:g} GiB "
+          f"(sampled peak {sampled_peak_kb / 1024:.1f} MiB); process group terminated\n")
   text = log_path.read_text(encoding="utf-8", errors="replace")
   time_metrics = parse_time_file(time_path)
   plan_metrics = parse_plan(plan_path)
@@ -615,7 +687,8 @@ def run_one(spec, suite_dir: Path, suite_provenance, env_extra, timeout_override
   # FCL/RAI containers) can instead terminate the process with an uncaught
   # ``std::bad_alloc`` and SIGABRT.  Both are the same resource-limit outcome for this
   # benchmark and must not be reported as planner errors.
-  out_of_memory = not timed_out and returncode != 0 and _looks_like_out_of_memory(text)
+  out_of_memory = (not timed_out and returncode != 0
+                   and (rss_limit_hit or _looks_like_out_of_memory(text)))
   status = "success" if success else "timeout" if timed_out else (
       "oom" if out_of_memory else "no_plan" if returncode == 0 else "error")
   result = {
@@ -624,6 +697,8 @@ def run_one(spec, suite_dir: Path, suite_provenance, env_extra, timeout_override
       "success": success,
       "timed_out": timed_out,
       "out_of_memory": out_of_memory,
+      "rss_limit_hit": rss_limit_hit,
+      "sampled_process_tree_peak_rss_kb": sampled_peak_kb,
       "returncode": returncode,
       "started_utc": started.isoformat(),
       "finished_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -696,28 +771,27 @@ def _prepare_grasp_database(entry, suite_dir, source_sha, env_extra):
   timeout_s = float(spec["timeout_s"])
   print(f"[grasp-db] build {entry['case']} seed {entry['seed']} -> {path.name}")
   t0 = time.perf_counter()
-  timed_out = False
   with log_path.open("w", encoding="utf-8") as log:
     log.write(f"[grasp-database-command] {shlex.join(command)}\n")
     log.flush()
     proc = subprocess.Popen(guarded, cwd=ROOT, env=env, stdout=log,
                             stderr=subprocess.STDOUT, start_new_session=True)
-    try:
-      returncode = proc.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-      timed_out = True
-      os.killpg(proc.pid, signal.SIGTERM)
-      try:
-        returncode = proc.wait(timeout=5)
-      except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
-        returncode = proc.wait()
+    returncode, timed_out, rss_limit_hit, sampled_peak_kb = _wait_with_guards(
+        proc, timeout_s, spec.get("max_rss_gb"))
   elapsed = time.perf_counter() - t0
+  if rss_limit_hit:
+    with log_path.open("a", encoding="utf-8") as log:
+      log.write(
+          f"[benchmark-resource] process-tree RSS exceeded {spec['max_rss_gb']:g} GiB "
+          f"(sampled peak {sampled_peak_kb / 1024:.1f} MiB); process group terminated\n")
   log_text = log_path.read_text(encoding="utf-8", errors="replace")
   match = re.search(r"\[grasp-db\] build-only complete: .* in " + _NUM + r"s", log_text)
   entry["build_s"] = elapsed
   entry["generation_s"] = float(match.group(1)) if match else elapsed
-  entry["status"] = "timeout" if timed_out else "success" if returncode == 0 else "error"
+  entry["status"] = ("timeout" if timed_out else "oom" if rss_limit_hit else
+                     "success" if returncode == 0 else "error")
+  entry["rss_limit_hit"] = rss_limit_hit
+  entry["sampled_process_tree_peak_rss_kb"] = sampled_peak_kb
   entry["log"] = log_path
   artifacts = tuple(path.glob("*.json.gz"))
   if entry["status"] != "success" or not artifacts:
@@ -984,6 +1058,8 @@ def main(argv=None):
             "an earlier trial in this case/variant cell timed out")
       continue
     print(f"[bench {i}/{len(runs)}] {spec['run_id']}")
+    if spec.get("max_rss_gb") is not None:
+      print(f"  [rss-guard] process tree limited to {spec['max_rss_gb']:g} GiB resident")
     if args.dry_run:
       if grasp_database is not None:
         print(f"  [grasp-db] {grasp_database['path']}")
