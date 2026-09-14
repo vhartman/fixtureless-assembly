@@ -37,6 +37,78 @@ COLORS = {
 }
 
 
+def write_tikz_legend(path: Path, *, include_optimistic: bool = False,
+                      include_failure: bool = True):
+  """Write a standalone PGFPlots legend matching the scaling figures exactly."""
+  color_names = {
+      0.0: "processLambdaZero",
+      0.01: "processLambdaPointZeroOne",
+      0.1: "processLambdaPointOne",
+      0.5: "processLambdaPointFive",
+      1.0: "processLambdaOne",
+      2.0: "processLambdaTwo",
+  }
+  lines = [
+      "% Standalone legend for the process-wrench scaling figures.",
+      "% Requires: \\usepackage{pgfplots} and \\pgfplotsset{compat=1.18}",
+      "\\definecolor{processTopological}{HTML}{111111}",
+      "\\definecolor{processOptimistic}{HTML}{9C2F2F}",
+      "\\definecolor{processFailure}{HTML}{555555}",
+  ]
+  for lam in LAMBDAS:
+    lines.append(
+        f"\\definecolor{{{color_names[lam]}}}{{HTML}}{{{COLORS[lam][1:].upper()}}}")
+  lines.extend([
+      "\\begin{tikzpicture}",
+      "  \\begin{axis}[",
+      "    width=\\columnwidth,",
+      "    height=0.18\\columnwidth,",
+      "    hide axis,",
+      "    xmin=0, xmax=10, ymin=0, ymax=10,",
+      "    legend style={",
+      "      draw=none,",
+      "      anchor=center,",
+      "      legend cell align=left,",
+      "      legend columns=4,",
+      "      at={(axis cs:5,5)},",
+      "      font=\\scriptsize,",
+      "      /tikz/every even column/.append style={column sep=0.35em}",
+      "    }",
+      "  ]",
+      "    \\addlegendimage{color=processTopological, dotted, line width=1.0pt, "
+      "mark=diamond*, mark size=1.5pt}",
+      "    \\addlegendentry{Topological}",
+  ])
+  if include_optimistic:
+    lines.extend([
+        "    \\addlegendimage{color=processOptimistic, dashed, line width=1.0pt, "
+        "mark=square*, mark size=1.5pt}",
+        "    \\addlegendentry{Optimistic}",
+    ])
+  labels = {
+      0.0: "$\\lambda=0$",
+      0.01: "$\\lambda=0.01$",
+      0.1: "$\\lambda=0.1$",
+      0.5: "$\\lambda=0.5$",
+      1.0: "$\\lambda=1$",
+      2.0: "$\\lambda=2$",
+  }
+  for lam in LAMBDAS:
+    lines.extend([
+        f"    \\addlegendimage{{color={color_names[lam]}, solid, line width=1.0pt, "
+        "mark=*, mark size=1.5pt}",
+        f"    \\addlegendentry{{{labels[lam]}}}",
+    ])
+  if include_failure:
+    lines.extend([
+        "    \\addlegendimage{color=processFailure, only marks, mark=x, mark size=1.8pt}",
+        "    \\addlegendentry{No solution}",
+    ])
+  lines.extend(["  \\end{axis}", "\\end{tikzpicture}", ""])
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def _read_results(suite: Path):
   path = suite.resolve() / "results.json"
   if not path.is_file():
@@ -122,7 +194,7 @@ def _plot_pair(physical_suite: Path, no_wrench_suite: Path, output_dir: Path, *,
 
   line_width = float(plt.rcParams["lines.linewidth"]) if paper else 2.0
   marker_size = float(plt.rcParams["lines.markersize"]) if paper else 4.2
-  fig, axes = plt.subplots(1, 3, figsize=(15.2, 5.4), sharey=True)
+  fig, axes = plt.subplots(1, 3, figsize=(15.2, 4.7 if paper else 5.4), sharey=True)
   for ax, robot_count in zip(axes, robots):
     controls = sorted((row for row in topological if row["robots"] == robot_count),
                       key=lambda row: row["parts"])
@@ -245,6 +317,10 @@ def main(argv=None):
             output_stem=args.output_stem, title=args.title, x_label=args.x_label,
             metric=metric[0], y_label=metric[1], paper=args.paper,
             optimistic_no_wrench_suite=args.optimistic_no_wrench_suite)
+  write_tikz_legend(
+      args.output / f"{args.output_stem}-legend.tex",
+      include_optimistic=args.optimistic_no_wrench_suite is not None,
+      include_failure=args.metric == "time")
   print(f"[process-wrench-matrix] plot -> "
         f"{args.output.resolve() / (args.output_stem + '.pdf')}")
   return 0

@@ -64,6 +64,7 @@ def main(argv=None):
   selected = EXPERIMENTS if args.assembly == "all" else {
       args.assembly: EXPERIMENTS[args.assembly]}
   status = 0
+  legend_has_failure = False
 
   def run_args(manifest, destination):
     values = [str(manifest), "--output", str(destination)]
@@ -92,11 +93,13 @@ def main(argv=None):
           run_args(spec["optimistic_control"], optimistic_dir)))
     status = max(status, search_runner.main(run_args(spec["physical"], physical_dir)))
     if not args.dry_run and not args.no_plot:
-      plotter.plot_pair(
+      physical_rows, control_rows, optimistic_rows = plotter.plot_pair(
           physical_dir, control_dir, output,
           output_stem=spec["stem"], title=spec["title"], x_label=spec["x_label"],
           paper=args.paper,
           optimistic_no_wrench_suite=(optimistic_dir if args.optimistic_no_wrench else None))
+      legend_has_failure = legend_has_failure or any(
+          row["failures"] for row in physical_rows + control_rows + optimistic_rows)
       plotter.plot_pair(
           physical_dir, control_dir, output,
           output_stem=spec["stem"] + "-cost", title=spec["title"] + ": plan cost",
@@ -105,6 +108,12 @@ def main(argv=None):
           optimistic_no_wrench_suite=(optimistic_dir if args.optimistic_no_wrench else None))
       print(f"[process-wrench-matrix] {name} plot -> "
             f"{output / (spec['stem'] + '.pdf')}")
+  if not args.dry_run and not args.no_plot:
+    legend_path = output / "process-wrench-scaling-legend.tex"
+    plotter.write_tikz_legend(
+        legend_path, include_optimistic=args.optimistic_no_wrench,
+        include_failure=legend_has_failure)
+    print(f"[process-wrench-matrix] shared TikZ legend -> {legend_path}")
   return status
 
 

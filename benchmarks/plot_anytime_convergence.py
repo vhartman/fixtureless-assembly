@@ -115,7 +115,7 @@ def parse_log(path: Path, label: str) -> dict:
     hit = EXPANSIONS_RE.search(line)
     if hit:
       expansions = int(hit.group(1))
-    if "proved optimal" in line.lower():
+    if "proved optimal" in line.lower() or "proven optimal" in line.lower():
       optimal = True
 
   if not events:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sequential, manifest-driven benchmark runner for assembly search.
+"""Manifest-driven benchmark runner for assembly search.
 
 The solver is deliberately executed in a fresh subprocess for every sample. This prevents
 RAI, wrench, and IK state from leaking between variants or seeds. With ``--shared-grasp-db``,
@@ -14,6 +14,7 @@ See benchmarks/README.md for the manifest schema and example commands.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import datetime as dt
 import hashlib
@@ -28,6 +29,7 @@ import signal
 import statistics
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -979,6 +981,10 @@ def build_parser():
                  help="run only expanded ids matching REGEX")
   p.add_argument("--max-runs", type=int, default=None,
                  help="truncate the selected run list (useful for smoke tests)")
+  p.add_argument(
+      "--jobs", type=int, default=1, metavar="N",
+      help=("run up to N different cases concurrently; runs within one case remain "
+            "sequential (default: 1)"))
   p.add_argument("--timeout", type=float, default=None, metavar="SEC",
                  help="override every manifest timeout")
   p.add_argument(
@@ -1003,6 +1009,8 @@ def main(argv=None):
   manifest = validate_manifest(_read_json(manifest_path))
   if args.repeats < 1:
     raise SystemExit("--repeats must be a positive integer")
+  if args.jobs < 1:
+    raise SystemExit("--jobs must be a positive integer")
   runs = expand_runs(manifest, repeats=args.repeats, seeds=args.seeds)
   if args.append_arg:
     _check_args(args.append_arg, "--append-arg")
@@ -1025,6 +1033,7 @@ def main(argv=None):
   prov["appended_args"] = list(args.append_arg)
   prov["seed_override"] = list(args.seeds) if args.seeds is not None else None
   prov["shared_grasp_database"] = bool(args.shared_grasp_db)
+  prov["jobs"] = int(args.jobs)
   prov["manifest_path"] = str(manifest_path)
   prov["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
   suite_dir.mkdir(parents=True, exist_ok=True)
@@ -1033,58 +1042,91 @@ def main(argv=None):
 
   if not runs:
     raise SystemExit("no runs selected")
-  print(f"[bench] {manifest['name']}: {len(runs)} sequential run(s) -> {suite_dir}")
-  results = []
-  timed_out_cells = set()
+  mode = "sequential" if args.jobs == 1 else f"up to {args.jobs} cases in parallel"
+  print(f"[bench] {manifest['name']}: {len(runs)} run(s), {mode} -> {suite_dir}")
+  results_by_id = {}
   grasp_databases = (_grasp_database_specs(runs, prov["source_sha256"], suite_dir)
                      if args.shared_grasp_db else {})
-  for i, spec in enumerate(runs, 1):
-    run_dir = suite_dir / "runs" / spec["run_id"]
-    result_path = run_dir / "result.json"
-    command = _command_for(spec, run_dir / "plan.json")
-    grasp_database = grasp_databases.get((spec["case"], spec["seed"]))
-    grasp_db_key = None if grasp_database is None else grasp_database["cache_key"]
-    fingerprint = _fingerprint(spec, command, prov["source_sha256"], grasp_db_key)
-    if args.resume and result_path.exists():
-      old = _read_json(result_path)
-      if old.get("run_fingerprint") == fingerprint:
-        print(f"[bench {i}/{len(runs)}] reuse {spec['run_id']}: {old.get('status')}")
-        results.append(old)
-        if old.get("timed_out"):
-          timed_out_cells.add(_logical_cell(spec))
-        continue
-    if args.stop_cell_on_timeout and _logical_cell(spec) in timed_out_cells:
-      print(f"[bench {i}/{len(runs)}] skip {spec['run_id']}: "
-            "an earlier trial in this case/variant cell timed out")
-      continue
-    print(f"[bench {i}/{len(runs)}] {spec['run_id']}")
-    if spec.get("max_rss_gb") is not None:
-      print(f"  [rss-guard] process tree limited to {spec['max_rss_gb']:g} GiB resident")
-    if args.dry_run:
-      if grasp_database is not None:
-        print(f"  [grasp-db] {grasp_database['path']}")
-      print("  " + shlex.join(_guarded_command(spec, command)))
-      continue
-    if grasp_database is not None and "status" not in grasp_database:
-      _prepare_grasp_database(grasp_database, suite_dir, prov["source_sha256"],
-                              manifest.get("env", {}))
+  run_order = {spec["run_id"]: i for i, spec in enumerate(runs)}
+  output_lock = threading.Lock()
+
+  def current_results():
+    return sorted(results_by_id.values(), key=lambda row: run_order[row["run_id"]])
+
+  def checkpoint(result):
+    with output_lock:
+      results_by_id[result["run_id"]] = result
+      write_suite_outputs(suite_dir, manifest, prov, current_results())
+
+  def write_grasp_database_index():
+    with output_lock:
       _write_json(suite_dir / "grasp-databases.json", {
           "schema_version": 1,
           "databases": [{k: (str(v.relative_to(suite_dir)) if isinstance(v, Path) else v)
                           for k, v in db.items() if k != "representative"}
                          for db in grasp_databases.values()],
       })
-    result = run_one(spec, suite_dir, prov, manifest.get("env", {}),
-                     grasp_database=grasp_database)
-    results.append(result)
-    if result.get("timed_out"):
-      timed_out_cells.add(_logical_cell(spec))
-    wall = result.get("wall_s", result.get("observed_wall_s"))
-    print(f"  -> {result['status']} in {wall:.2f}s"
-          + (f", cost {result['plan_cost']}" if result.get("success") else ""))
-    write_suite_outputs(suite_dir, manifest, prov, results)
+
+  def run_case(case_runs):
+    # A case is the unit of concurrency. Keeping its variants/seeds ordered preserves both
+    # stop-on-timeout semantics and deterministic reuse of its immutable grasp databases.
+    timed_out_cells = set()
+    for i, spec in case_runs:
+      run_dir = suite_dir / "runs" / spec["run_id"]
+      result_path = run_dir / "result.json"
+      command = _command_for(spec, run_dir / "plan.json")
+      grasp_database = grasp_databases.get((spec["case"], spec["seed"]))
+      grasp_db_key = None if grasp_database is None else grasp_database["cache_key"]
+      fingerprint = _fingerprint(spec, command, prov["source_sha256"], grasp_db_key)
+      if args.resume and result_path.exists():
+        old = _read_json(result_path)
+        if old.get("run_fingerprint") == fingerprint:
+          print(f"[bench {i}/{len(runs)}] reuse {spec['run_id']}: {old.get('status')}")
+          checkpoint(old)
+          if old.get("timed_out"):
+            timed_out_cells.add(_logical_cell(spec))
+          continue
+      if args.stop_cell_on_timeout and _logical_cell(spec) in timed_out_cells:
+        print(f"[bench {i}/{len(runs)}] skip {spec['run_id']}: "
+              "an earlier trial in this case/variant cell timed out")
+        continue
+      print(f"[bench {i}/{len(runs)}] {spec['run_id']}")
+      if spec.get("max_rss_gb") is not None:
+        print(f"  [rss-guard] process tree limited to {spec['max_rss_gb']:g} GiB resident")
+      if args.dry_run:
+        if grasp_database is not None:
+          print(f"  [grasp-db] {grasp_database['path']}")
+        print("  " + shlex.join(_guarded_command(spec, command)))
+        continue
+      if grasp_database is not None and "status" not in grasp_database:
+        _prepare_grasp_database(grasp_database, suite_dir, prov["source_sha256"],
+                                manifest.get("env", {}))
+        write_grasp_database_index()
+      result = run_one(spec, suite_dir, prov, manifest.get("env", {}),
+                       grasp_database=grasp_database)
+      if result.get("timed_out"):
+        timed_out_cells.add(_logical_cell(spec))
+      wall = result.get("wall_s", result.get("observed_wall_s"))
+      print(f"  -> {result['status']} in {wall:.2f}s"
+            + (f", cost {result['plan_cost']}" if result.get("success") else ""))
+      checkpoint(result)
+
+  grouped = {}
+  for i, spec in enumerate(runs, 1):
+    grouped.setdefault(spec["case"], []).append((i, spec))
+  case_groups = list(grouped.values())
+  if args.jobs == 1 or args.dry_run:
+    for group in case_groups:
+      run_case(group)
+  else:
+    with ThreadPoolExecutor(max_workers=min(args.jobs, len(case_groups)),
+                            thread_name_prefix="benchmark-case") as pool:
+      futures = [pool.submit(run_case, group) for group in case_groups]
+      for future in as_completed(futures):
+        future.result()
   if args.dry_run:
     return 0
+  results = current_results()
   write_suite_outputs(suite_dir, manifest, prov, results)
   print(f"[bench] summary -> {suite_dir / 'summary.json'}")
   if manifest.get("matrix") is not None:

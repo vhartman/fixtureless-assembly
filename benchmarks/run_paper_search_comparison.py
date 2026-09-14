@@ -12,6 +12,7 @@ remains excluded.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import datetime as dt
 import hashlib
@@ -24,6 +25,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 
@@ -473,7 +475,7 @@ def _run_motion_initial(result, output: Path, runtime_s: float, timeout_s: float
 
 def measure_initial_motion_plans(output: Path, runtime_s: float, timeout_s: float,
                                  memory_gb: float, resume=False,
-                                 retry_failed_only=False):
+                                 retry_failed_only=False, jobs=1):
   """Measure first-solution motion planning for successful Ours search rows only."""
   results_path = output / "results.json"
   if not results_path.is_file():
@@ -489,29 +491,50 @@ def measure_initial_motion_plans(output: Path, runtime_s: float, timeout_s: floa
       if result.get("variant") == "ours" and result.get("success")
       and (not retry_failed_only or result.get("mp_initial_status") != "success")
   ]
-  print(f"[paper-search] measuring initial MP for {len(selected)} successful Ours run(s)")
+  print(f"[paper-search] measuring initial MP for {len(selected)} successful Ours run(s), "
+        f"up to {jobs} case(s) concurrently")
+  output_lock = threading.Lock()
+
+  def run_group(group):
+    for index, result in group:
+      cached = output / "motion-initial" / result["run_id"] / "result.json"
+      old = json.loads(cached.read_text(encoding="utf-8")) if cached.is_file() else None
+      plan = _resolve_plan_artifact(output, result, merge_sources)
+      expected = (_motion_fingerprint(
+          result, plan, _motion_command(plan, runtime_s, int(result.get("seed", 0))))
+                  if plan is not None else None)
+      if resume and old is not None and old.get("run_fingerprint") == expected:
+        measured = old
+        action = "reused"
+      else:
+        measured = _run_motion_initial(
+            result, output, runtime_s, timeout_s, memory_gb, merge_sources)
+        action = "measured"
+      with output_lock:
+        result["mp_initial_status"] = measured["status"]
+        result["mp_initial_solution_s"] = measured.get("mp_initial_solution_s")
+        result["mp_initial_observed_wall_s"] = measured.get("mp_initial_observed_wall_s")
+        result.setdefault("artifacts", {})["mp_initial_log"] = measured.get("mp_initial_log")
+        # Checkpoint after every potentially expensive motion-planning run.
+        search_runner._write_json(results_path, results)
+      print(f"[paper-search] MP {index}/{len(selected)} {result['run_id']}: {action} "
+            f"{measured['status']}, t_init={measured.get('mp_initial_solution_s')}")
+
+  grouped = {}
   for index, result in enumerate(selected, 1):
-    cached = output / "motion-initial" / result["run_id"] / "result.json"
-    old = json.loads(cached.read_text(encoding="utf-8")) if cached.is_file() else None
-    plan = _resolve_plan_artifact(output, result, merge_sources)
-    expected = (_motion_fingerprint(
-        result, plan, _motion_command(plan, runtime_s, int(result.get("seed", 0))))
-                if plan is not None else None)
-    if resume and old is not None and old.get("run_fingerprint") == expected:
-      measured = old
-      action = "reused"
-    else:
-      measured = _run_motion_initial(
-          result, output, runtime_s, timeout_s, memory_gb, merge_sources)
-      action = "measured"
-    result["mp_initial_status"] = measured["status"]
-    result["mp_initial_solution_s"] = measured.get("mp_initial_solution_s")
-    result["mp_initial_observed_wall_s"] = measured.get("mp_initial_observed_wall_s")
-    result.setdefault("artifacts", {})["mp_initial_log"] = measured.get("mp_initial_log")
-    # Checkpoint after every potentially expensive motion-planning run.
-    search_runner._write_json(results_path, results)
-    print(f"[paper-search] MP {index}/{len(selected)} {result['run_id']}: {action} "
-          f"{measured['status']}, t_init={measured.get('mp_initial_solution_s')}")
+    grouped.setdefault(result["case"], []).append((index, result))
+  groups = list(grouped.values())
+  if not groups:
+    return
+  if jobs == 1:
+    for group in groups:
+      run_group(group)
+  else:
+    with ThreadPoolExecutor(max_workers=min(jobs, len(groups)),
+                            thread_name_prefix="motion-case") as pool:
+      futures = [pool.submit(run_group, group) for group in groups]
+      for future in as_completed(futures):
+        future.result()
 
 
 def merge_results(inputs, output: Path):
@@ -561,6 +584,10 @@ def main(argv=None):
       "--repeats", type=int, default=1,
       help="repeat each selected seed unchanged to measure same-seed timing variation")
   parser.add_argument(
+      "--jobs", type=int, default=1, metavar="N",
+      help=("run up to N different assembly cases concurrently; each case retains its "
+            "sequential solver/seed order (default: 1)"))
+  parser.add_argument(
       "--continue-after-timeout", action="store_true",
       help=("run every requested seed even after an earlier seed times out for the same "
             "case/solver; default preserves the paper suite's timeout suppression"))
@@ -591,6 +618,8 @@ def main(argv=None):
   args = parser.parse_args(argv)
   if args.timeout <= 0:
     parser.error("--timeout must be positive")
+  if args.jobs < 1:
+    parser.error("--jobs must be a positive integer")
   if args.motion_runtime <= 0 or args.motion_timeout <= 0:
     parser.error("--motion-runtime and --motion-timeout must be positive")
   if args.motion_memory_gb < 0:
@@ -601,7 +630,8 @@ def main(argv=None):
       parser.error("--retry-failed-motion cannot be combined with --merge-from or --dry-run")
     measure_initial_motion_plans(
         output, runtime_s=args.motion_runtime, timeout_s=args.motion_timeout,
-        memory_gb=args.motion_memory_gb, resume=False, retry_failed_only=True)
+        memory_gb=args.motion_memory_gb, resume=False, retry_failed_only=True,
+        jobs=args.jobs)
     write_tables(output)
     return 0
   if args.merge_from:
@@ -610,7 +640,7 @@ def main(argv=None):
     return 0
   if not args.report_only:
     runner = [str(MANIFEST), "--output", str(output), "--repeats", str(args.repeats),
-              "--shared-grasp-db"]
+              "--shared-grasp-db", "--jobs", str(args.jobs)]
     if not args.continue_after_timeout:
       runner.append("--stop-cell-on-timeout")
     if args.seeds is not None:
@@ -631,7 +661,7 @@ def main(argv=None):
       measure_initial_motion_plans(
           output, runtime_s=args.motion_runtime, timeout_s=args.motion_timeout,
           memory_gb=args.motion_memory_gb, resume=args.resume,
-          retry_failed_only=False)
+          retry_failed_only=False, jobs=args.jobs)
   write_tables(output)
   return 0
 
