@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "name": "paper-search-comparison",
-  "description": "Search-only comparison under the full wrench model. Native cases use the standard staged grasp alphabet; imported Fabrica cases use the dense fixed grasp alphabet required by their CAD geometry. Within each case, rows differ only in the high-level decomposition or reverse/forward search policy.",
+  "description": "Search-only comparison under the full wrench model. Native cases use the standard staged grasp alphabet; imported Fabrica cases use tracked plain scene configs and the dense fixed grasp alphabet required by their CAD geometry. Within each case, rows differ only in the high-level decomposition or reverse/forward search policy.",
   "timeout_s": 450,
   "max_address_space_gb": 4,
   "seeds": [11023, 11024, 11025],
@@ -55,10 +55,7 @@
       "timeout_s": 450,
       "args": [
         "--search-profile", "fabrica",
-        "--config", "experiments/fabrica-e2e/circular-stool-plan.json",
-        "--assembly", "fabrica-circular-stool", "--parts", "9",
-        "--num-robots", "4", "--robot", "ur5_limited",
-        "--grippers", "two_finger,two_finger,two_finger,two_finger"
+        "--config", "benchmarks/configs/fabrica/circular-stool.json"
       ]
     },
     {
@@ -66,10 +63,7 @@
       "timeout_s": 450,
       "args": [
         "--search-profile", "fabrica",
-        "--config", "experiments/fabrica-e2e/cooling-manifold-plan.json",
-        "--assembly", "fabrica-cooling-manifold", "--parts", "7",
-        "--num-robots", "4", "--robot", "ur5_limited",
-        "--grippers", "two_finger,two_finger,two_finger,two_finger"
+        "--config", "benchmarks/configs/fabrica/cooling-manifold.json"
       ]
     },
     {
@@ -77,10 +71,7 @@
       "timeout_s": 450,
       "args": [
         "--search-profile", "fabrica",
-        "--config", "experiments/fabrica-e2e/duct-plan.json",
-        "--assembly", "fabrica-duct", "--parts", "8",
-        "--num-robots", "4", "--robot", "ur5_limited",
-        "--grippers", "two_finger,two_finger,two_finger,two_finger"
+        "--config", "benchmarks/configs/fabrica/duct.json"
       ]
     },
     {
@@ -88,10 +79,7 @@
       "timeout_s": 450,
       "args": [
         "--search-profile", "fabrica",
-        "--config", "experiments/fabrica-e2e/gamepad-plan.json",
-        "--assembly", "fabrica-gamepad", "--parts", "6",
-        "--num-robots", "4", "--robot", "ur5_limited",
-        "--grippers", "two_finger,two_finger,two_finger,two_finger"
+        "--config", "benchmarks/configs/fabrica/gamepad.json"
       ]
     },
     {
@@ -99,10 +87,7 @@
       "timeout_s": 450,
       "args": [
         "--search-profile", "fabrica",
-        "--config", "experiments/fabrica-e2e/plumbers-block-plan.json",
-        "--assembly", "fabrica-plumbers-block", "--parts", "5",
-        "--num-robots", "4", "--robot", "ur5_limited",
-        "--grippers", "two_finger,two_finger,two_finger,two_finger"
+        "--config", "benchmarks/configs/fabrica/plumbers-block.json"
       ]
     },
     {
@@ -110,10 +95,7 @@
       "timeout_s": 450,
       "args": [
         "--search-profile", "fabrica",
-        "--config", "experiments/fabrica-e2e/beam-plan.json",
-        "--assembly", "fabrica-beam", "--parts", "5",
-        "--num-robots", "4", "--robot", "ur5_limited",
-        "--grippers", "two_finger,two_finger,two_finger,two_finger"
+        "--config", "benchmarks/configs/fabrica/beam.json"
       ]
     },
     {
@@ -121,10 +103,7 @@
       "timeout_s": 450,
       "args": [
         "--search-profile", "fabrica",
-        "--config", "experiments/fabrica-e2e/car-plan.json",
-        "--assembly", "fabrica-car", "--parts", "5",
-        "--num-robots", "4", "--robot", "ur5_limited",
-        "--grippers", "two_finger,two_finger,two_finger,two_finger"
+        "--config", "benchmarks/configs/fabrica/car.json"
       ]
     }
   ],

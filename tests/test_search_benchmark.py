@@ -258,6 +258,46 @@ def test_repeated_expansion_keeps_logical_cell_and_adds_stable_repeat_ids():
     B.expand_runs(B.validate_manifest(_matrix_manifest()), repeats=0)
 
 
+def test_seed_override_replaces_manifest_case_and_variant_seeds():
+  manifest = _manifest()
+  manifest["seeds"] = [1]
+  manifest["cases"][0]["seeds"] = [2]
+  manifest["variants"][0]["seeds"] = [3]
+  runs = B.expand_runs(B.validate_manifest(manifest), seeds=[41, 42])
+  assert {run["seed"] for run in runs} == {41, 42}
+  assert len(runs) == 2 * len(manifest["cases"]) * len(manifest["variants"])
+
+
+def test_paper_manifest_uses_portable_plain_fabrica_configs():
+  from config import RunConfig
+  from main import parse_args
+
+  manifest = json.loads(PS.MANIFEST.read_text(encoding="utf-8"))
+  fabrica = [case for case in manifest["cases"]
+             if "--search-profile" in case["args"]
+             and case["args"][case["args"].index("--search-profile") + 1] == "fabrica"]
+  assert len(fabrica) == 7
+  for case in fabrica:
+    args = case["args"]
+    config_token = args[args.index("--config") + 1]
+    config_path = B.ROOT / config_token
+    assert not config_token.startswith("/")
+    assert config_path.is_file()
+    assert "experiments" not in config_path.parts
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    assert "plan" not in raw and "witnesses" not in raw
+    cfg = RunConfig.from_file(config_path)
+    assert cfg.assembly.startswith("fabrica-")
+
+    # A historical saved plan used as --config silently supplied legacy replay defaults.
+    # These benchmark configs must instead inherit the current profile/default semantics.
+    resolved = parse_args([*manifest["defaults"], *args, "--seed", "4242"])
+    assert resolved.seed == 4242
+    assert resolved.grasp_sampler_db_hash is None
+    assert resolved.mate_wrench_limits
+    assert resolved.post_pick == pytest.approx(0.05)
+
+
 def test_runner_can_stop_remaining_cell_trials_after_first_timeout(tmp_path, monkeypatch):
   manifest = _manifest()
   manifest["cases"] = manifest["cases"][:1]

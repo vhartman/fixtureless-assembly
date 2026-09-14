@@ -1,0 +1,7 @@
+{
+  "assembly": "fabrica-duct",
+  "parts": 8,
+  "num_robots": 4,
+  "robot": "ur5_limited",
+  "grippers": "two_finger,two_finger,two_finger,two_finger"
+}

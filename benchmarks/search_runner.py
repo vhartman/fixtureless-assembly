@@ -2,9 +2,11 @@
 """Sequential, manifest-driven benchmark runner for assembly search.
 
 The solver is deliberately executed in a fresh subprocess for every sample. This prevents
-RAI, wrench, grasp, and IK caches from leaking between variants or seeds. The runner adds only
-search-output controls (no viewer, no witness optimization, no motion planning), retains the
-raw log and replayable plan, and emits machine-readable per-run and aggregate records.
+RAI, wrench, and IK state from leaking between variants or seeds. With ``--shared-grasp-db``,
+one explicitly fingerprinted grasp table is constructed outside timing and then used as the
+same immutable problem input by every variant; no process-local cache is shared. The runner
+adds only search-output controls (no viewer, no witness optimization, no motion planning),
+retains the raw log and replayable plan, and emits machine-readable records.
 
 See benchmarks/README.md for the manifest schema and example commands.
 """
@@ -145,15 +147,22 @@ def validate_manifest(data):
   return data
 
 
-def expand_runs(data, repeats=1):
+def expand_runs(data, repeats=1, seeds=None):
   """Return the deterministic case x variant x seed product.
 
   ``repeats`` duplicates each logical cell with the same planner seed.  The duplicate
   processes are intentionally independent, so aggregation can report timing variation
-  without changing the solver's sampled problem or search semantics.
+  without changing the solver's sampled problem or search semantics. ``seeds`` is an
+  experiment-wide override: unlike ``repeats``, it selects independent planner seeds and
+  takes precedence over manifest-, case-, and variant-local seed lists.
   """
   if not isinstance(repeats, int) or repeats < 1:
     raise ValueError("repeats must be a positive integer")
+  if seeds is not None:
+    if (not isinstance(seeds, (list, tuple)) or not seeds
+        or not all(isinstance(seed, int) for seed in seeds)):
+      raise ValueError("seeds override must be a non-empty list of integers")
+    seeds = list(seeds)
   runs = []
   defaults = list(data.get("defaults", []))
   matrix = data.get("matrix")
@@ -180,12 +189,12 @@ def expand_runs(data, repeats=1):
   for case in data["cases"]:
     if not case.get("enabled", True):
       continue
-    case_seeds = case.get("seeds", data.get("seeds", [0]))
+    case_seeds = seeds if seeds is not None else case.get("seeds", data.get("seeds", [0]))
     for variant in variants:
       if not variant.get("enabled", True):
         continue
-      seeds = variant.get("seeds", case_seeds)
-      for seed in seeds:
+      run_seeds = case_seeds if seeds is not None else variant.get("seeds", case_seeds)
+      for seed in run_seeds:
         for repeat in range(1, repeats + 1):
           rid = f"{_slug(case['name'])}__{_slug(variant['name'])}__seed-{seed}"
           if repeats > 1:
@@ -234,6 +243,16 @@ def _guarded_command(spec, command):
     raise RuntimeError("manifest requests max_address_space_gb but /usr/bin/prlimit is absent")
   limit_bytes = int(float(memory_gb) * 1024 ** 3)
   return [str(_PRLIMIT), f"--as={limit_bytes}", "--", *command]
+
+
+def _looks_like_out_of_memory(text: str) -> bool:
+  """Recognize Python and native allocation failures emitted by the solver stack."""
+  return "MemoryError" in text or "bad_alloc" in text
+
+
+def _logical_cell(spec):
+  """Cell whose repeated trials estimate one case/algorithm combination."""
+  return spec["case"], spec["variant"]
 
 
 def _git(args):
@@ -510,13 +529,15 @@ def parse_plan(path: Path):
     return {"plan_parse_error": f"{type(exc).__name__}: {exc}"}
 
 
-def _fingerprint(spec, command, source_sha):
-  payload = json.dumps({"spec": spec, "command": command, "source": source_sha},
+def _fingerprint(spec, command, source_sha, grasp_db_key=None):
+  payload = json.dumps({"spec": spec, "command": command, "source": source_sha,
+                        "grasp_db_key": grasp_db_key},
                        sort_keys=True, separators=(",", ":")).encode()
   return hashlib.sha256(payload).hexdigest()
 
 
-def run_one(spec, suite_dir: Path, suite_provenance, env_extra, timeout_override=None):
+def run_one(spec, suite_dir: Path, suite_provenance, env_extra, timeout_override=None,
+            grasp_database=None):
   run_dir = suite_dir / "runs" / spec["run_id"]
   run_dir.mkdir(parents=True, exist_ok=True)
   plan_path = run_dir / "plan.json"
@@ -530,7 +551,8 @@ def run_one(spec, suite_dir: Path, suite_provenance, env_extra, timeout_override
       stale.unlink()
   command = _command_for(spec, plan_path)
   guarded_command = _guarded_command(spec, command)
-  fingerprint = _fingerprint(spec, command, suite_provenance["source_sha256"])
+  grasp_db_key = None if grasp_database is None else grasp_database["cache_key"]
+  fingerprint = _fingerprint(spec, command, suite_provenance["source_sha256"], grasp_db_key)
   timeout_s = float(timeout_override if timeout_override is not None else spec["timeout_s"])
   run_meta = {
       "schema_version": SCHEMA_VERSION, "run_fingerprint": fingerprint,
@@ -543,6 +565,14 @@ def run_one(spec, suite_dir: Path, suite_provenance, env_extra, timeout_override
       "execution_command_shell": shlex.join(guarded_command),
       "source_sha256": suite_provenance["source_sha256"],
   }
+  if grasp_database is not None:
+    run_meta["grasp_database"] = {
+        "path": str(Path(grasp_database["path"]).relative_to(suite_dir)),
+        "cache_key": grasp_database["cache_key"],
+        "build_s": grasp_database.get("build_s"),
+        "shared_preprocessing": True,
+    }
+    run_meta["grasp_database_build_s"] = grasp_database.get("generation_s")
   if "method" in spec:
     run_meta.update(method=spec["method"], physics=spec["physics"])
   _write_json(run_dir / "run.json", run_meta)
@@ -555,6 +585,9 @@ def run_one(spec, suite_dir: Path, suite_provenance, env_extra, timeout_override
               "NUMBA_CACHE_DIR": "/tmp/assembly-numba-cache",
               "MPLCONFIGDIR": "/tmp/assembly-mpl-cache"})
   env.update(env_extra)
+  if grasp_database is not None:
+    env.update({"ASSEMBLY_GRASP_DB_PATH": str(grasp_database["path"]),
+                "ASSEMBLY_GRASP_DB_KEY": grasp_database["cache_key"]})
   started = dt.datetime.now(dt.timezone.utc)
   t0 = time.perf_counter()
   timed_out = False
@@ -578,7 +611,11 @@ def run_one(spec, suite_dir: Path, suite_provenance, env_extra, timeout_override
   time_metrics = parse_time_file(time_path)
   plan_metrics = parse_plan(plan_path)
   success = returncode == 0 and "plan_actions" in plan_metrics
-  out_of_memory = not timed_out and returncode != 0 and "MemoryError" in text
+  # Python allocations normally surface as ``MemoryError``.  Native allocations (notably
+  # FCL/RAI containers) can instead terminate the process with an uncaught
+  # ``std::bad_alloc`` and SIGABRT.  Both are the same resource-limit outcome for this
+  # benchmark and must not be reported as planner errors.
+  out_of_memory = not timed_out and returncode != 0 and _looks_like_out_of_memory(text)
   status = "success" if success else "timeout" if timed_out else (
       "oom" if out_of_memory else "no_plan" if returncode == 0 else "error")
   result = {
@@ -600,8 +637,102 @@ def run_one(spec, suite_dir: Path, suite_provenance, env_extra, timeout_override
           "time": str(time_path.relative_to(suite_dir)) if time_path.exists() else None,
       },
   }
+  # The solver timing deliberately excludes shared preprocessing. Keep its actual one-time
+  # cost in the ordinary grasp column so the paper breakdown does not misleadingly show zero.
+  if (grasp_database is not None
+      and isinstance(grasp_database.get("generation_s"), (int, float))):
+    result["grasp_generation_s"] = float(grasp_database["generation_s"])
   _write_json(result_path, result)
   return result
+
+
+def _grasp_database_specs(runs, source_sha, suite_dir):
+  """One immutable grasp input per physical case/seed, shared across solver variants."""
+  groups = {}
+  for spec in runs:
+    groups.setdefault((spec["case"], spec["seed"]), []).append(spec)
+  answer = {}
+  for group, specs in groups.items():
+    case, seed = group
+    # Include every variant's resolved arguments in the fingerprint. This makes the artifact
+    # a property of this exact comparison matrix, while deliberately excluding `repeat`.
+    payload = {
+        "schema": 1, "source": source_sha, "case": case, "seed": seed,
+        "resolved_args": sorted({s["variant"]: s["args"] for s in specs}.items()),
+    }
+    key = hashlib.sha256(json.dumps(
+        payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    path = suite_dir / "grasp-databases" / f"{_slug(case)}__seed-{seed}__{key[:12]}"
+    entry = {"cache_key": key, "path": path, "representative": specs[0],
+             "case": case, "seed": seed}
+    answer[group] = entry
+  return answer
+
+
+def _prepare_grasp_database(entry, suite_dir, source_sha, env_extra):
+  """Build the shared DB in a guarded subprocess outside every measured solver run."""
+  path = Path(entry["path"])
+  meta_path = path / "metadata.json"
+  if meta_path.exists() and any(path.glob("*.json.gz")):
+    meta = _read_json(meta_path) if meta_path.exists() else {}
+    entry["build_s"] = meta.get("build_s", 0.0)
+    entry["generation_s"] = meta.get("generation_s", entry["build_s"])
+    entry["status"] = "reused"
+    return entry
+  path.mkdir(parents=True, exist_ok=True)
+  spec = entry["representative"]
+  log_path = path / "build.log"
+  command = _command_for(spec, path / "unused-plan.json")
+  guarded = _guarded_command(spec, command)
+  env = os.environ.copy()
+  env.update({"PYTHONHASHSEED": "0", "PYTHONUNBUFFERED": "1",
+              "ASSEMBLY_BENCH_PROFILE": "1",
+              "ASSEMBLY_GRASP_DB_BUILD_ONLY": "1",
+              "ASSEMBLY_GRASP_DB_PATH": str(path),
+              "ASSEMBLY_GRASP_DB_KEY": entry["cache_key"],
+              "NUMBA_CACHE_DIR": "/tmp/assembly-numba-cache",
+              "MPLCONFIGDIR": "/tmp/assembly-mpl-cache"})
+  env.update(env_extra)
+  timeout_s = float(spec["timeout_s"])
+  print(f"[grasp-db] build {entry['case']} seed {entry['seed']} -> {path.name}")
+  t0 = time.perf_counter()
+  timed_out = False
+  with log_path.open("w", encoding="utf-8") as log:
+    log.write(f"[grasp-database-command] {shlex.join(command)}\n")
+    log.flush()
+    proc = subprocess.Popen(guarded, cwd=ROOT, env=env, stdout=log,
+                            stderr=subprocess.STDOUT, start_new_session=True)
+    try:
+      returncode = proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+      timed_out = True
+      os.killpg(proc.pid, signal.SIGTERM)
+      try:
+        returncode = proc.wait(timeout=5)
+      except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        returncode = proc.wait()
+  elapsed = time.perf_counter() - t0
+  log_text = log_path.read_text(encoding="utf-8", errors="replace")
+  match = re.search(r"\[grasp-db\] build-only complete: .* in " + _NUM + r"s", log_text)
+  entry["build_s"] = elapsed
+  entry["generation_s"] = float(match.group(1)) if match else elapsed
+  entry["status"] = "timeout" if timed_out else "success" if returncode == 0 else "error"
+  entry["log"] = log_path
+  artifacts = tuple(path.glob("*.json.gz"))
+  if entry["status"] != "success" or not artifacts:
+    tail = log_text.splitlines()[-12:]
+    raise RuntimeError(
+        f"shared grasp database build failed for {entry['case']} seed {entry['seed']} "
+        f"({entry['status']}, returncode={returncode}); see {log_path}\n" + "\n".join(tail))
+  _write_json(meta_path, {
+      "schema_version": 1, "cache_key": entry["cache_key"],
+      "build_s": entry["build_s"], "generation_s": entry["generation_s"],
+      "log": str(log_path.relative_to(suite_dir)),
+  })
+  size = sum(artifact.stat().st_size for artifact in artifacts)
+  print(f"[grasp-db] ready in {elapsed:.2f}s ({size / 1024**2:.1f} MiB)")
+  return entry
 
 
 def _numeric_summary(rows, key):
@@ -614,6 +745,7 @@ def _numeric_summary(rows, key):
 
 def aggregate(results):
   metrics = ("wall_s", "observed_wall_s", "max_rss_kb", "plan_actions", "plan_cost",
+             "mp_initial_solution_s",
              "search_pipeline_s", "grasp_generation_s", "grasp_generation_calls",
              "grasp_backward_s", "grasp_backward_calls",
              "backward_graph_search_s", "backward_force_lp_s",
@@ -765,12 +897,26 @@ def build_parser():
                  help="reuse matching completed per-run result files")
   p.add_argument("--repeats", type=int, default=1, metavar="N",
                  help="independent repetitions per logical cell (default: 1; same planner seed)")
+  p.add_argument(
+      "--seeds", type=int, nargs="+", default=None, metavar="SEED",
+      help=("replace every manifest/case/variant seed list with these independent planner "
+            "seeds; unlike --repeats, this changes the randomized search instance"))
   p.add_argument("--only", default=None, metavar="REGEX",
                  help="run only expanded ids matching REGEX")
   p.add_argument("--max-runs", type=int, default=None,
                  help="truncate the selected run list (useful for smoke tests)")
   p.add_argument("--timeout", type=float, default=None, metavar="SEC",
                  help="override every manifest timeout")
+  p.add_argument(
+      "--stop-cell-on-timeout", action="store_true",
+      help="after one trial times out, skip unrun seeds/repeats for that case/variant cell")
+  p.add_argument(
+      "--shared-grasp-db", action="store_true",
+      help=("precompute one fingerprinted collision-filtered grasp database per case/seed "
+            "outside timed search, then load that identical artifact in every variant"))
+  p.add_argument("--append-arg", action="append", default=[], metavar="TOKEN",
+                 help="append one planner argument token to every expanded run; repeat for "
+                      "flags with values (use --append-arg=--flag for option-like tokens)")
   p.add_argument("--dry-run", action="store_true", help="print commands without executing")
   return p
 
@@ -783,7 +929,10 @@ def main(argv=None):
   manifest = validate_manifest(_read_json(manifest_path))
   if args.repeats < 1:
     raise SystemExit("--repeats must be a positive integer")
-  runs = expand_runs(manifest, repeats=args.repeats)
+  runs = expand_runs(manifest, repeats=args.repeats, seeds=args.seeds)
+  if args.append_arg:
+    _check_args(args.append_arg, "--append-arg")
+    runs = [{**run, "args": list(run["args"]) + list(args.append_arg)} for run in runs]
   if args.only:
     rx = re.compile(args.only)
     runs = [r for r in runs if rx.search(r["run_id"])]
@@ -799,6 +948,9 @@ def main(argv=None):
   # Capture git status before creating a default results directory inside the worktree; the
   # benchmark must not report itself as the source of a dirty tree.
   prov = provenance()
+  prov["appended_args"] = list(args.append_arg)
+  prov["seed_override"] = list(args.seeds) if args.seeds is not None else None
+  prov["shared_grasp_database"] = bool(args.shared_grasp_db)
   prov["manifest_path"] = str(manifest_path)
   prov["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
   suite_dir.mkdir(parents=True, exist_ok=True)
@@ -809,23 +961,48 @@ def main(argv=None):
     raise SystemExit("no runs selected")
   print(f"[bench] {manifest['name']}: {len(runs)} sequential run(s) -> {suite_dir}")
   results = []
+  timed_out_cells = set()
+  grasp_databases = (_grasp_database_specs(runs, prov["source_sha256"], suite_dir)
+                     if args.shared_grasp_db else {})
   for i, spec in enumerate(runs, 1):
     run_dir = suite_dir / "runs" / spec["run_id"]
     result_path = run_dir / "result.json"
     command = _command_for(spec, run_dir / "plan.json")
-    fingerprint = _fingerprint(spec, command, prov["source_sha256"])
+    grasp_database = grasp_databases.get((spec["case"], spec["seed"]))
+    grasp_db_key = None if grasp_database is None else grasp_database["cache_key"]
+    fingerprint = _fingerprint(spec, command, prov["source_sha256"], grasp_db_key)
     if args.resume and result_path.exists():
       old = _read_json(result_path)
       if old.get("run_fingerprint") == fingerprint:
         print(f"[bench {i}/{len(runs)}] reuse {spec['run_id']}: {old.get('status')}")
         results.append(old)
+        if old.get("timed_out"):
+          timed_out_cells.add(_logical_cell(spec))
         continue
+    if args.stop_cell_on_timeout and _logical_cell(spec) in timed_out_cells:
+      print(f"[bench {i}/{len(runs)}] skip {spec['run_id']}: "
+            "an earlier trial in this case/variant cell timed out")
+      continue
     print(f"[bench {i}/{len(runs)}] {spec['run_id']}")
     if args.dry_run:
+      if grasp_database is not None:
+        print(f"  [grasp-db] {grasp_database['path']}")
       print("  " + shlex.join(_guarded_command(spec, command)))
       continue
-    result = run_one(spec, suite_dir, prov, manifest.get("env", {}))
+    if grasp_database is not None and "status" not in grasp_database:
+      _prepare_grasp_database(grasp_database, suite_dir, prov["source_sha256"],
+                              manifest.get("env", {}))
+      _write_json(suite_dir / "grasp-databases.json", {
+          "schema_version": 1,
+          "databases": [{k: (str(v.relative_to(suite_dir)) if isinstance(v, Path) else v)
+                          for k, v in db.items() if k != "representative"}
+                         for db in grasp_databases.values()],
+      })
+    result = run_one(spec, suite_dir, prov, manifest.get("env", {}),
+                     grasp_database=grasp_database)
     results.append(result)
+    if result.get("timed_out"):
+      timed_out_cells.add(_logical_cell(spec))
     wall = result.get("wall_s", result.get("observed_wall_s"))
     print(f"  -> {result['status']} in {wall:.2f}s"
           + (f", cost {result['plan_cost']}" if result.get("success") else ""))

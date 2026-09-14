@@ -1,0 +1,7 @@
+{
+  "assembly": "fabrica-circular-stool",
+  "parts": 9,
+  "num_robots": 4,
+  "robot": "ur5_limited",
+  "grippers": "two_finger,two_finger,two_finger,two_finger"
+}

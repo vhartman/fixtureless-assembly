@@ -1,0 +1,7 @@
+{
+  "assembly": "fabrica-beam",
+  "parts": 5,
+  "num_robots": 4,
+  "robot": "ur5_limited",
+  "grippers": "two_finger,two_finger,two_finger,two_finger"
+}
