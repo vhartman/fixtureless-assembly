@@ -1866,14 +1866,14 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
             raise ValueError(
                 f"expected {child!r} parent {parent!r} after event, got {actual_parent!r}")
           rel = np.asarray(rel, dtype=float)
-          # Mate symmetry is deliberately quotient-ed out of the symbolic state.  Preserve
-          # the exact member selected by the witness by snapping the achieved relative
-          # orientation to its nearest declared equivalent; blindly using scene_for's default
-          # member would turn a valid half/quarter-turn mate into a different configuration.
-          if parent in self.assembly.objects and child in self.assembly.objects:
-            achieved_q = np.asarray(frame.getRelativeQuaternion(), dtype=float)
-            rel = rel.copy()
-            rel[3:] = self.assembly.closest_mate_quaternion(child, achieved_q)
+          # Mate symmetry is deliberately quotient-ed out of the symbolic state: every
+          # declared member denotes the SAME physical mate and the successor state uses one
+          # canonical representative.  Keep that representative here as well.  Retaining the
+          # member reached by IK would make an unrecorded symmetry choice leak into the mode
+          # chain; descendants then accumulate (for example) 60deg - 90deg = 30deg of frame
+          # drift even though all subsequent witnesses were certified in the canonical scene.
+          # For a valid declared symmetry this snap changes no physical geometry, only its
+          # redundant frame coordinates.
           frame.setRelativePosition(rel[:3])
           frame.setRelativeQuaternion(rel[3:])
         except Exception as exc:

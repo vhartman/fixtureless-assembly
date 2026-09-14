@@ -31,9 +31,10 @@ DESIGN DECISIONS (modeling side):
     predictions match the sim's DYNAMIC loads (the paper claim), not the truth of the caps
     themselves -- cap truth is a hardware question. Real frictional finger plates remain the
     future upgrade if reviewers want contact-level grasp failure.
-  * FRICTION from the planner's mu; ssBox rounding dropped (plain box; contact patch grows by
-    ~r -- conservative for stability, note in the paper). Fixed timestep, default implicit
-    solver, seeded => deterministic (the PYTHONHASHSEED discipline, for physics).
+  * FRICTION from the planner's mu; rai rounded boxes are exported as an equivalent union of
+    MuJoCo primitives (three face slabs plus twelve rounded edges), rather than enlarged sharp
+    boxes. Fixed timestep, default implicit solver, seeded => deterministic (the
+    PYTHONHASHSEED discipline, for physics).
 
 TRAJECTORY SOURCE: persisted mr_bench BiRRT joint trajectories. Mode-transition task frames
 drive the grasp/release/mate managers; strict preflight and phase scheduling use the motion
@@ -104,10 +105,14 @@ BREAK_SUSTAIN = 0.02            # s : a grasp breaks only if overloaded CONTINUO
                                 # survivable by a real seal/pinch; loss of grip is a leak/slip
                                 # process, not a single-sample event. Static overloads (what
                                 # the LP prices) persist and still break.
-WELD_TIMECONST = 0.012          # s   : solref timeconstant of grasp/mate welds. 4ms amplified
+WELD_TIMECONST = 0.012          # s   : solref timeconstant of physical grasp interfaces. 4ms amplified
                                 # sub-millimetre capture/tracking residuals into sustained
                                 # 8--12N numerical reactions; 12ms removes that ringing while
                                 # the task-space terminal servos keep seating error bounded.
+MATE_WELD_TIMECONST = 0.004     # s   : assembled mates are the rigid connections assumed by
+                                # planning. Giving them the grasp's 12ms compliance turns a
+                                # multi-part payload into a spring chain: the grasp first
+                                # accelerates only its root, producing spurious load pulses.
 
 
 class PathPreflightError(RuntimeError):
@@ -527,6 +532,96 @@ def _spec_volume(spec):
   raise ValueError(f"unknown shape kind {kind!r}")
 
 
+def _rounded_box_geoms_xml(spec, mu, mass, group, rgba, name_prefix,
+                           pos=None, quat=None):
+  """MuJoCo collision geometry matching rai's ``ssBox`` convention.
+
+  Assembly ``("box", [sx, sy, sz, r])`` shapes are rounded boxes in rai.  Emitting one
+  sharp MuJoCo box used to enlarge every edge/corner by up to ``r``.  That is not merely a
+  cosmetic approximation: a path which cleared a rounded corner by 3.3mm in rai struck the
+  sharp MuJoCo corner during a cube re-pick, displaced the target, and then made the grasp
+  servo chase it into its neighbour.
+
+  A rounded cuboid is the Minkowski sum of its inner cuboid and a radius-r sphere.  Represent
+  that union exactly (up to MuJoCo's primitive contact tolerance) with three face slabs and
+  twelve edge primitives. Four capsules along one axis supply the eight corner spheres; the
+  other eight edges are cylinders, avoiding coincident contact surfaces at the corners. Only
+  the slabs carry mass, split by their
+  volumes; the edge/corner collision geoms are massless so overlapping primitives cannot
+  silently multiply the authored body mass.  ``pos``/``quat`` place the shape inside a
+  compound part.
+  """
+  p = np.asarray(spec[1], dtype=float).ravel()
+  if p.size < 4 or p[3] <= 0.0:
+    return None
+  dims, radius = p[:3], float(p[3])
+  if np.any(dims <= 2.0 * radius):
+    raise ValueError(
+        f"rounded box {name_prefix!r} has size {dims.tolist()} but radius {radius:g}; "
+        "each extent must exceed twice the radius")
+
+  base_p = np.zeros(3) if pos is None else np.asarray(pos, dtype=float)
+  base_q = np.array([1.0, 0.0, 0.0, 0.0]) if quat is None else np.asarray(quat, dtype=float)
+  inner = dims - 2.0 * radius
+  fr = f'friction="{_contact_friction(mu)}"'
+  items = []                                                # (kind, size, local p, local q)
+
+  # Three mutually overlapping slabs expose the six planar faces without filling the
+  # rounded edges.  Their aggregate assigned mass is normalized below (overlap is collision
+  # geometry only, never extra physical mass).
+  slabs = [
+      (np.array([dims[0], inner[1], inner[2]]), inner[0] * inner[1] * inner[2]),
+      (np.array([inner[0], dims[1], inner[2]]), inner[0] * inner[1] * inner[2]),
+      (np.array([inner[0], inner[1], dims[2]]), inner[0] * inner[1] * inner[2]),
+  ]
+  # Weight by actual slab volume.  The normalization, rather than geometric union volume,
+  # is deliberate: MuJoCo sums geom inertias, while the authored part supplies one mass.
+  slab_vol = np.array([float(np.prod(s[0])) for s in slabs], dtype=float)
+  slab_mass = float(mass) * slab_vol / float(slab_vol.sum())
+  for size, _unused in slabs:
+    items.append(("box", size / 2.0, np.zeros(3),
+                  np.array([1.0, 0.0, 0.0, 0.0])))
+
+  # Edge primitives cover the twelve rounded edges. MuJoCo cylinders/capsules use local z as
+  # their axis. The four x-edge capsules also contribute the eight spherical corners; using
+  # cylinders on y/z avoids three coincident spheres (and eight additional geoms) there.
+  qaxis = [
+      np.array([np.sqrt(0.5), 0.0, np.sqrt(0.5), 0.0]),     # z -> x
+      np.array([np.sqrt(0.5), -np.sqrt(0.5), 0.0, 0.0]),    # z -> y
+      np.array([1.0, 0.0, 0.0, 0.0]),                       # z -> z
+  ]
+  half_inner = inner / 2.0
+  for axis in range(3):
+    other = [j for j in range(3) if j != axis]
+    for sa in (-1.0, 1.0):
+      for sb in (-1.0, 1.0):
+        lp = np.zeros(3)
+        lp[other[0]] = sa * half_inner[other[0]]
+        lp[other[1]] = sb * half_inner[other[1]]
+        items.append(("capsule" if axis == 0 else "cylinder",
+                      np.array([radius, inner[axis] / 2.0]), lp,
+                      qaxis[axis]))
+
+  out = []
+  for i, (kind, size, lp, lq) in enumerate(items):
+    wp = base_p + _quat_to_R(base_q) @ lp
+    wq = _quat_mul(base_q, lq)
+    if kind == "box":
+      shape = f'type="box" size="{size[0]} {size[1]} {size[2]}"'
+      gm = slab_mass[i]
+    elif kind in ("cylinder", "capsule"):
+      shape = f'type="{kind}" size="{size[0]} {size[1]}"'
+      gm = 0.0
+    else:
+      shape = f'type="sphere" size="{size[0]}"'
+      gm = 0.0
+    out.append(
+        f'<geom name="{name_prefix}__collision{i}" {shape} {fr} mass="{gm}" '
+        f'group="{group}" rgba="{rgba}" pos="{wp[0]} {wp[1]} {wp[2]}" '
+        f'quat="{wq[0]} {wq[1]} {wq[2]} {wq[3]}"/>')
+  return "".join(out)
+
+
 def _compound_geoms_xml(spec, mu, mass, group, rgba, name_prefix=None):
   """FINISHED <geom> strings for a compound part: one geom per sub-shape, each at its own
   pos/quat inside the body, mass split by sub-shape volume (no mass_placeholder -- the
@@ -538,6 +633,14 @@ def _compound_geoms_xml(spec, mu, mass, group, rgba, name_prefix=None):
   out = []
   for i, ((sub, pos), w) in enumerate(zip(chs, vols)):
     sq = sub[2] if len(sub) > 2 else None
+    rounded = (_rounded_box_geoms_xml(
+        sub, mu, mass * w, group, rgba,
+        f"{name_prefix}__shape{i}" if name_prefix is not None else f"shape{i}",
+        pos=pos, quat=sq)
+        if sub[0] == "box" else None)
+    if rounded is not None:
+      out.append(rounded)
+      continue
     gq = ' quat="1 0 0 0"' if sq is None else f' quat="{sq[0]} {sq[1]} {sq[2]} {sq[3]}"'
     gp = f' pos="{pos[0]} {pos[1]} {pos[2]}"'
     xml = _geom_xml(sub, mu)
@@ -984,7 +1087,8 @@ def planner_table_top(C):
 
 def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
                ee_anchor=None, articulated_C=None, actuated=False, planner_table_top=None,
-               weld_timeconst=None, table_geometry=None, animate_grippers=False,
+               weld_timeconst=None, mate_weld_timeconst=None, table_geometry=None,
+               animate_grippers=False,
                object_damping=0.0):
   """The whole validation world as one MJCF string:
   - table (static), parts (free bodies at state.poses, shape quat baked into the geom),
@@ -1065,12 +1169,16 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
       g = _compound_geoms_xml(spec, mu_table, mass, collision_group,
                               collision_rgba, name_prefix=p)
     else:
-      g = _geom_xml(spec, mu_table).replace("<geom ",
-          f'<geom name="{p}__collision" ', 1).replace(
-          "mass_placeholder",
-          f'mass="{mass}" group="{collision_group}" rgba="{collision_rgba}"{gq}').replace(
-          "vis_placeholder",
-          f'group="{collision_group}" rgba="{collision_rgba}"{gq}')
+      g = (_rounded_box_geoms_xml(
+          spec, mu_table, mass, collision_group, collision_rgba, p, quat=sq)
+          if spec[0] == "box" else None)
+      if g is None:
+        g = _geom_xml(spec, mu_table).replace("<geom ",
+            f'<geom name="{p}__collision" ', 1).replace(
+            "mass_placeholder",
+            f'mass="{mass}" group="{collision_group}" rgba="{collision_rgba}"{gq}').replace(
+            "vis_placeholder",
+            f'group="{collision_group}" rgba="{collision_rgba}"{gq}')
     if visual:
       vprm = {"file": visual} if isinstance(visual, str) else dict(visual)
       vname, _vpath = _part_visual_mesh_asset(vprm)
@@ -1234,6 +1342,11 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
   # kinematic (--articulated) run places both arms exactly and sees none of it. A real pinch has
   # finite stiffness; peak |F| = m|dv| / (2*timeconst), so softening trades sag for force.
   _wtc = float(weld_timeconst) if weld_timeconst else WELD_TIMECONST
+  # Preserve the historical shared experimental override: an explicit weld_timeconst still
+  # controls both equality types unless a mate-specific value is supplied. With neither,
+  # model the physical grasp compliance separately from the planner's rigid assembly mates.
+  _mtc = (float(mate_weld_timeconst) if mate_weld_timeconst else
+          (float(weld_timeconst) if weld_timeconst else MATE_WELD_TIMECONST))
   for r in robots:
     # grasp welds: anchor body <-> each part (inactive; relpose set at grasp time).
     for p in assembly.objects:
@@ -1245,7 +1358,7 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
     rel = assembly.relative_pose(p)
     if rel is not None:
       eq_xml.append(f'<weld name="mate_{p}" body1="{rel[0]}" body2="{p}" active="false" '
-                    f'solref="{_wtc} 1"/>')
+                    f'solref="{_mtc} 1"/>')
   # Preserve the planning scene's real slab thickness. Only its z centre follows the selected
   # top height (normally the lowest floated part bottom; exactly the planner top under
   # --planner-table). Stretching the box down to the floor made raised FR3 workbenches look
@@ -1324,6 +1437,7 @@ class SimScene:
   def __init__(self, assembly, state, robots, gripper_kinds=None, gui=False,
                arms=None, arm_poses=None, ee_anchor=None, articulated_C=None,
                actuated=False, planner_table_top=None, weld_timeconst=None,
+               mate_weld_timeconst=None,
                table_geometry=None, table_mu=None, process_engagement_distance=0.01,
                process_wrench_ramp=0.05, animate_grippers=False, object_damping=0.0):
     if not HAVE_MUJOCO:
@@ -1333,6 +1447,7 @@ class SimScene:
     self.xml = build_mjcf(assembly, state, robots, mu_table=self.table_mu,
                           arms=arms, arm_poses=arm_poses,
                           planner_table_top=planner_table_top, weld_timeconst=weld_timeconst,
+                          mate_weld_timeconst=mate_weld_timeconst,
                           table_geometry=table_geometry,
                           ee_anchor=ee_anchor, articulated_C=articulated_C,
                           actuated=actuated, animate_grippers=animate_grippers,
@@ -2317,11 +2432,14 @@ class SimScene:
     """
     try:
       import mujoco
+      component = self._active_mate_component(part)
       names, tot = {}, {}
       for i in range(int(self.data.ncon)):
         c = self.data.contact[i]
-        b1 = self.model.body(self.model.geom_bodyid[c.geom1]).name
-        b2 = self.model.body(self.model.geom_bodyid[c.geom2]).name
+        bid1 = int(self.model.geom_bodyid[c.geom1])
+        bid2 = int(self.model.geom_bodyid[c.geom2])
+        b1 = self.model.body(bid1).name
+        b2 = self.model.body(bid2).name
         # ``table`` and ``floor`` are worldbody geoms in the generated MJCF, so reporting
         # only their body name used to collapse both to the unhelpful label ``world``.  Keep
         # the logical body names for aggregation, but retain the concrete geom pair in the
@@ -2329,7 +2447,10 @@ class SimScene:
         # actually low insertion from a collision with some unrelated workcell fixture.
         g1 = self.model.geom(int(c.geom1)).name or f"geom{int(c.geom1)}"
         g2 = self.model.geom(int(c.geom2)).name or f"geom{int(c.geom2)}"
-        if not (b1.startswith(r) or b2.startswith(r) or part in (b1, b2)):
+        owner1 = self._part_owner_by_body[bid1]
+        owner2 = self._part_owner_by_body[bid2]
+        if not (b1.startswith(r) or b2.startswith(r)
+                or owner1 in component or owner2 in component):
           continue
         f = np.zeros(6)
         mujoco.mj_contactForce(self.model, self.data, i, f)
@@ -2338,7 +2459,8 @@ class SimScene:
         names[k] = f"{g1}~{g2} {c.dist * 1000:+.2f}mm"
       hot = sorted(tot.items(), key=lambda kv: -kv[1])[:3]
       if not hot:
-        return "  [no contacts on the gripper or the part -- the load is NOT a reaction]"
+        return ("  [no contacts on the gripper or held component -- the load is NOT a "
+                "reaction]")
       return "  contacts: " + ", ".join(
           f"{a}~{b} {v:.1f}N @[{names[(a, b)]}]" for (a, b), v in hot)
     except Exception as e:
@@ -2632,6 +2754,8 @@ class SimScene:
                   + (f" -- worst bound {_lbl}" if _lbl else
                      f" (scalar caps {fcap:g}N/{tcap:g}Nm)")
                   + f" sustained {BREAK_SUSTAIN*1000:.0f}ms"
+                  + (f" at trajectory sample {int(self.trace_ctx)}"
+                     if self.trace_ctx is not None else "")
                   + self._contact_context(r, part)))
         else:
           self._over[r] = 0
@@ -3697,7 +3821,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         c2_smooth_weight=0.03, c2_max_deviation=0.20,
                         c2_resolution=0.01,
                         articulated=False, actuated=False, use_planner_table=False,
-                        corridor_margin=0.0, weld_timeconst=None, limit_rate=False,
+                        corridor_margin=0.0, weld_timeconst=None,
+                        mate_weld_timeconst=None, limit_rate=False,
                         object_damping=0.0,
                         path_preflight=True, path_preflight_tolerance=PATH_PREFLIGHT_TOL,
                         path_preflight_resolution=None,
@@ -3816,7 +3941,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                    actuated=actuated,
                    planner_table_top=(planner_table_top(C) if use_planner_table else None),
                    table_geometry=planner_table_geometry(C),
-                   weld_timeconst=weld_timeconst, table_mu=table_mu,
+                   weld_timeconst=weld_timeconst,
+                   mate_weld_timeconst=mate_weld_timeconst, table_mu=table_mu,
                    process_engagement_distance=process_engagement_distance,
                    process_wrench_ramp=process_wrench_ramp,
                    animate_grippers=animate_grippers, object_damping=object_damping)
@@ -8054,6 +8180,7 @@ def _cli_run(a):
                             use_planner_table=getattr(a, 'planner_table', False),
                             corridor_margin=getattr(a, 'corridor_margin', 0.0),
                             weld_timeconst=getattr(a, 'weld_timeconst', 0.0),
+                            mate_weld_timeconst=getattr(a, 'mate_weld_timeconst', 0.0),
                             object_damping=a.object_damping,
                             limit_rate=getattr(a, 'limit_rate', False),
                             path_preflight=a.path_preflight,
@@ -8494,12 +8621,18 @@ def _build_cli():
                  help="--c2-spline: maximum per-joint step in the dense collision/joint-limit "
                       "certificate (default 0.01 rad).")
   r.add_argument("--weld-timeconst", type=float, default=0.0, metavar="S",
-                 help="solref timeconst of the grasp/mate welds (default 0.004 = near-rigid). "
+                 help="legacy shared solref timeconstant override for grasp and mate welds. "
+                      "By default they are modeled separately (12ms compliant grasps, 4ms "
+                      "rigid assembly mates). "
                       "Two arms co-grasping one part form a closed chain, so under --actuated "
                       "their tracking DIFFERENCE becomes force through the part (measured "
                       "119.7N vs a 25N cap). A real pinch is compliant: peak |F| = m|dv|/"
                       "(2*timeconst), so a larger value absorbs the mismatch -- at the cost of "
                       "the weld sagging under carry loads. 0 = keep the default.")
+  r.add_argument("--mate-weld-timeconst", type=float, default=0.0, metavar="S",
+                 help="override only the internal assembly-mate solref timeconstant "
+                      "(default 0.004s, matching the planner's rigid component). This wins "
+                      "over --weld-timeconst for mates; 0 keeps the default/shared behavior.")
   r.add_argument("--limit-rate", action="store_true",
                  help="Time-rescale so the BINDING JOINT sits on its real velocity limit (rai "
                       "reports them: UR10 2.16 rad/s pan/lift, 3.15 elbow, 3.20 wrists) instead "
