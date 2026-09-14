@@ -7295,9 +7295,11 @@ def _judge_resting(scene, assembly, action, expect_state):
 def _scene_export_geometry(model, geom_id, trimesh):
   """Return ``(mesh, local_transform, cache_key)`` for one compiled MuJoCo geom.
 
-  MuJoCo stores file meshes in a centered principal-axis frame. ``mesh_pos/mesh_quat`` map
-  those compiled vertices back into the geom frame; omitting this transform is the subtle
-  reason a direct ``mesh_vert`` dump puts visual links in the wrong place.
+  MuJoCo stores file meshes in a centered principal-axis frame, but also folds the inverse
+  compiler correction into the compiled geom pose.  Consequently ``data.geom_xpos/xmat``
+  already maps ``model.mesh_vert`` directly into world coordinates.  Applying
+  ``mesh_pos/mesh_quat`` again double-counts the source-mesh offset and makes visual links
+  fly away from their bodies.
   """
   kind = int(model.geom_type[geom_id])
   size = np.asarray(model.geom_size[geom_id], dtype=float)
@@ -7336,10 +7338,6 @@ def _scene_export_geometry(model, geom_id, trimesh):
     vertices = np.asarray(model.mesh_vert[va:va + vn], dtype=float).copy()
     faces = np.asarray(model.mesh_face[fa:fa + fn], dtype=np.int64).copy()
     mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    rot = np.empty(9, dtype=float)
-    mujoco.mju_quat2Mat(rot, np.asarray(model.mesh_quat[mesh_id], dtype=float))
-    local[:3, :3] = rot.reshape(3, 3)
-    local[:3, 3] = np.asarray(model.mesh_pos[mesh_id], dtype=float)
     key = ("mesh", mesh_id)
   else:
     return None
