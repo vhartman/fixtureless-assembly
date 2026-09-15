@@ -246,6 +246,39 @@ def _unpickable_required_parts(assembly, report):
   return [p for p, result in report.items()
           if p != assembly.base and not result["ok"]]
 
+
+def _sampled_scene_coverage(assembly, checker, robots, prefix="[grasp-scenes]"):
+  """Report the finite sampler's pick/seat coverage without running IK.
+
+  This diagnostic is also emitted while the benchmark's immutable shared grasp table is
+  built. It makes an accidentally impoverished database visible *before* every algorithm
+  spends its search budget on it. ``both=0`` is deliberately only a warning: a regrasp or
+  handover may legitimately connect disjoint pick- and assembly-clear grasp sets.
+  """
+  from problem import sampled_grasp_meta
+  kinds = sorted(set(checker._robot_kind.get(r, r) for r in robots))
+  report = {}
+  for part in assembly.objects:
+    meta = sampled_grasp_meta(assembly.grasp_shape(part), part=part)
+    part_report = {}
+    fields = []
+    for kind in kinds:
+      pick = {i for i, row in enumerate(meta)
+              if "pick" in (row.get("scene_by_kind", {}).get(kind, ()) if row else ())}
+      seat = {i for i, row in enumerate(meta)
+              if "assemble" in (row.get("scene_by_kind", {}).get(kind, ()) if row else ())}
+      values = {"pick": len(pick), "assemble": len(seat), "both": len(pick & seat)}
+      part_report[kind] = values
+      fields.append(f"{kind}: pick={values['pick']} asm={values['assemble']} "
+                    f"both={values['both']}")
+    report[part] = part_report
+    print(f"{prefix} {part}: " + ", ".join(fields))
+    if part != assembly.base and all(values["both"] == 0
+                                     for values in part_report.values()):
+      print(f"{prefix} WARNING {part}: no grasp is clear in both the isolated pick and "
+            "assembled scenes; any solution requires a regrasp or handover.")
+  return report
+
 def build_parser():
   parser = argparse.ArgumentParser(
       description="Spawn a multi-robot UR10 environment."
@@ -3878,6 +3911,10 @@ def run(cfg, explicit=None):
     _checker, _table = _search_context(C, assembly, get_robots(C))
     _grasp_db_s = _time.perf_counter() - _grasp_db_t0
     _rows = sum(len(rows) for rows in _table.values())
+    if cfg.grasp_sampler_scenes:
+      _sampled_scene_coverage(
+          assembly, _checker, get_robots(C), prefix="[grasp-db-coverage]")
+    print(f"[grasp-db] sampled signature: {cfg.grasp_sampler_db_hash}")
     print(f"[grasp-db] build-only complete: {len(_table)} component rows / {_rows} grasps "
           f"in {_grasp_db_s:.6f}s")
     return
@@ -4402,18 +4439,7 @@ def run(cfg, explicit=None):
         # assembly-clear rows while their intersection is empty.  Report the exact finite
         # overlap per end-effector kind.  This is cached metadata only; it performs no IK and
         # has no effect on candidate ordering or feasibility.
-        from problem import sampled_grasp_meta
-        _kinds = sorted(set(_pre_checker._robot_kind.get(r, r) for r in robots))
-        for _p in assembly.objects:
-          _meta = sampled_grasp_meta(assembly.grasp_shape(_p), part=_p)
-          _rows = []
-          for _kind in _kinds:
-            _pick = {i for i, m in enumerate(_meta)
-                     if "pick" in (m.get("scene_by_kind", {}).get(_kind, ()) if m else ())}
-            _asm = {i for i, m in enumerate(_meta)
-                    if "assemble" in (m.get("scene_by_kind", {}).get(_kind, ()) if m else ())}
-            _rows.append(f"{_kind}: pick={len(_pick)} asm={len(_asm)} both={len(_pick & _asm)}")
-          print(f"[grasp-scenes] {_p}: " + ", ".join(_rows))
+        _sampled_scene_coverage(assembly, _pre_checker, robots)
       if hasattr(_pre_table, "materialized"):
         print(f"[component-grasps/preflight] materialized {_pre_table.materialized}/"
               f"{len(_pre_table)} component tables ({_pre_table.materialized_rows} rows).")

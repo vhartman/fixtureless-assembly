@@ -2,8 +2,10 @@
 search model (State + successors). No feasibility/solver or visualization code here."""
 
 import gzip
+import hashlib
 import json
 import os
+import random
 import time
 from dataclasses import dataclass
 
@@ -1476,6 +1478,18 @@ class FabricaAssembly(Assembly):
           # Rotate the common flange normal onto world +Z (minus 30 degrees about Y).
           self.scatter_orientations[p] = np.array([
               np.cos(np.pi / 12), 0.0, -np.sin(np.pi / 12), 0.0])
+          if source != "1":
+            # A small fastener is not an infinitely strong handle for the complete duct.
+            # Keep the cover-to-body mate ideal, but bound every fastener-to-body mate
+            # below the assembled duct's weight (about 2.5N).  Even all six fasteners
+            # together therefore cannot justify lifting the assembly by their heads; the
+            # forward wrench check must retain a hand or table support on a load-bearing
+            # duct part.  Each cap remains comfortably above the fastener's own ~0.062N
+            # weight, so this does not make an isolated seated fastener unstable.
+            self.mate_wrench_limits[p] = {
+                "force": [0.25, 0.25, 0.25],       # N, parent-mate-frame box
+                "torque": [0.005, 0.005, 0.005],  # Nm
+            }
     else:  # plumbers_block: top block and fasteners descend; shaft slides through Y bore.
       for p in self.objects[1:]:
         self.mate_axes[p] = np.array([0.0, 0.0, -1.0])
@@ -3857,7 +3871,7 @@ def _sampled_keys(spec, offset, part=None):
   # worse, adding the option changed every historical non-strict grasp id even though its value
   # was False.  Keep strictness in the filtered-view cache key instead.  This also makes the
   # strict/non-strict comparison a matched filtering ablation over identical proposals.
-  base = (_spec_key(spec), float(offset), 2, cfgv["seed"], cfgv["candidates"],
+  base = (_sampling_spec_key(spec), float(offset), 2, cfgv["seed"], cfgv["candidates"],
           float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)),
           cfgv.get("wrap"))
   ctx = _SAMPLED_SCENE_CTX
@@ -3890,14 +3904,13 @@ def _sampled_grasp_views(spec, offset, part=None):
   hit = _SAMPLED_VIEWS_CACHE.get(key)
   if hit is not None:
     return hit
-  import trimesh
   mesh = _spec_mesh(spec)
   # PRIVATE RNG, seeded from (sampler seed, canonical spec key): byte-identical across
   # processes and entry points -- the global np.random stream is drained path-dependently
   # by scatter layout and must never feed the id-bearing pipeline. Identical parts share the
   # same RAW cloud (the base_key has no part); only the scene filter below differs per part.
   rng_seed = zlib.crc32(repr(base_key).encode())
-  pts, fidx = trimesh.sample.sample_surface(mesh, cfgv["candidates"], seed=int(rng_seed))
+  pts, fidx = _sample_surface_deterministic(mesh, cfgv["candidates"], int(rng_seed))
   normals = mesh.face_normals[np.asarray(fidx, int)]
 
   # EDGE CLEARANCE of every sampled point, up front (vectorised): the margin gate below
@@ -4347,6 +4360,75 @@ def _spec_key(spec):
   if kind == "mesh":
     return (kind, _mesh_key(spec[1]), qk)
   return (kind, tuple(spec[1]), qk)
+
+
+_MESH_CONTENT_DIGEST_CACHE = {}
+
+
+def _sampling_spec_key(spec):
+  """Location-independent identity used only to seed sampled grasp proposals.
+
+  ``_spec_key`` deliberately contains an absolute mesh path because it is also a local
+  object/cache key. Hashing its repr into the sampler seed made an otherwise identical
+  checkout under ``/home/alice`` and ``/home/bob`` generate different grasp IDs. Use the
+  mesh *contents* here instead: the proposal cloud is a property of geometry and sampler
+  settings, not of the directory containing the repository.
+  """
+  kind = spec[0]
+  if kind == "compound":
+    return (kind, tuple((_sampling_spec_key(sub), tuple(map(float, pos)))
+                        for sub, pos in _compound_children(spec)))
+  sq = _shape_quat(spec)
+  qk = tuple(np.asarray(sq, dtype=float)) if sq is not None else None
+  if kind != "mesh":
+    return (kind, tuple(spec[1]), qk)
+  mesh_key = _mesh_key(spec[1])
+  if mesh_key[0] == "verts":
+    portable = mesh_key
+  else:
+    path, scale, geometry = mesh_key
+    digest = _MESH_CONTENT_DIGEST_CACHE.get(path)
+    if digest is None:
+      h = hashlib.sha256()
+      with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+          h.update(block)
+      digest = _MESH_CONTENT_DIGEST_CACHE[path] = h.hexdigest()
+    portable = ("sha256", digest, scale, geometry)
+  return (kind, portable, qk)
+
+
+def _sample_surface_deterministic(mesh, count, seed):
+  """Sample a triangle mesh without trimesh/numpy RNG implementation details.
+
+  Python's ``random.Random`` stream and the explicit area/barycentric construction make the
+  positional grasp database reproducible across supported Python/numpy installations.
+  Face order remains part of the mesh asset, as it should: changing the asset changes the
+  database content hash and invalidates saved grasp IDs.
+  """
+  import bisect
+  vertices = np.asarray(mesh.vertices, dtype=float)
+  faces = np.asarray(mesh.faces, dtype=np.int64)
+  triangles = vertices[faces]
+  edges1 = triangles[:, 1] - triangles[:, 0]
+  edges2 = triangles[:, 2] - triangles[:, 0]
+  areas = 0.5 * np.linalg.norm(np.cross(edges1, edges2), axis=1)
+  cumulative = np.cumsum(areas, dtype=float)
+  total = float(cumulative[-1]) if len(cumulative) else 0.0
+  if not np.isfinite(total) or total <= 0.0:
+    raise ValueError("cannot sample grasp candidates from a zero-area mesh")
+  rng = random.Random(int(seed))
+  points = np.empty((int(count), 3), dtype=float)
+  face_ids = np.empty(int(count), dtype=np.int64)
+  cdf = cumulative.tolist()
+  for i in range(int(count)):
+    face = min(bisect.bisect_right(cdf, rng.random() * total), len(faces) - 1)
+    u, v = rng.random(), rng.random()
+    if u + v > 1.0:
+      u, v = 1.0 - u, 1.0 - v
+    points[i] = triangles[face, 0] + u * edges1[face] + v * edges2[face]
+    face_ids[i] = face
+  return points, face_ids
 
 
 _COMPOUND_MESH_CACHE = {}

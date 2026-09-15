@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the full piecewise-Cube and Cross process-wrench matrices sequentially."""
+"""Run the full piecewise-Cube and Cross process-wrench matrices."""
 
 from __future__ import annotations
 
@@ -43,6 +43,14 @@ def main(argv=None):
   parser.add_argument("--resume", action="store_true")
   parser.add_argument("--repeats", type=int, default=1, metavar="N",
                       help="independent repetitions per matrix cell (default: 1)")
+  parser.add_argument(
+      "--seeds", type=int, nargs="+", default=None, metavar="SEED",
+      help=("independent planner seeds, replacing the seed list in every matrix manifest; "
+            "unlike --repeats, these change the randomized search instance"))
+  parser.add_argument(
+      "--jobs", type=int, default=1, metavar="N",
+      help=("run up to N different part-count cases concurrently within each matrix "
+            "(default: 1)"))
   parser.add_argument("--timeout", type=float, default=None, metavar="SEC")
   parser.add_argument("--only", default=None, metavar="REGEX")
   parser.add_argument("--dry-run", action="store_true")
@@ -57,6 +65,8 @@ def main(argv=None):
   args = parser.parse_args(argv)
   if args.repeats < 1:
     raise SystemExit("--repeats must be a positive integer")
+  if args.jobs < 1:
+    raise SystemExit("--jobs must be a positive integer")
 
   stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
   output = (args.output or ROOT / "benchmarks" / "results"
@@ -72,6 +82,10 @@ def main(argv=None):
       values.append("--resume")
     if args.repeats != 1:
       values += ["--repeats", str(args.repeats)]
+    if args.seeds is not None:
+      values += ["--seeds", *map(str, args.seeds)]
+    if args.jobs != 1:
+      values += ["--jobs", str(args.jobs)]
     if args.timeout is not None:
       values += ["--timeout", str(args.timeout)]
     if args.only is not None:

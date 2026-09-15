@@ -492,13 +492,19 @@ def _parse_args(argv=None):
                       default=list(VARIANTS))
   parser.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS))
   parser.add_argument("--physical-force", type=float, default=10.0, metavar="N")
-  parser.add_argument("--mp-runtime", type=float, default=300.0, metavar="SEC",
-                      help="BiRRT* optimization budget for the saved task plan (default 300)")
+  parser.add_argument("--mp-runtime", type=float, default=100.0, metavar="SEC",
+                      help=("BiRRT* optimization budget for the saved task plan "
+                            "(default 100; Cross/Cube/Chair first solved within 30s in the "
+                            "recorded benchmark runs)"))
   parser.add_argument("--task-timeout", type=float, default=300.0, metavar="SEC",
                       help="wall-time guard for task planning alone (default 300)")
   parser.add_argument("--motion-timeout", type=float, default=450.0, metavar="SEC",
-                      help="wall-time guard around the 300s MP consultation plus export (default 450)")
+                      help="wall-time guard around the MP consultation plus export (default 450)")
   parser.add_argument("--sim-timeout", type=float, default=600.0, metavar="SEC")
+  parser.add_argument("--physics-step", type=float, choices=(0.002, 0.004), default=0.004,
+                      metavar="SEC",
+                      help="MuJoCo/control timestep passed to sim.py (wrench benchmark "
+                           "default 0.004; pass 0.002 for the conservative replay baseline)")
   parser.add_argument("--execution-timing", choices=("lockstep", "phase"),
                       default="lockstep",
                       help="simulation timing policy (default: lockstep)")
@@ -565,6 +571,7 @@ def main(argv=None):
       "physical_insert_force_n": args.physical_force,
       "simulation_process_noise": "nominal", "search_profile": "standard",
       "motion_profile": "standard", "sim_profile": "standard",
+      "physics_step_s": args.physics_step,
       "simulation_gravity": True,
       "motion_gravity_gate": {
           name: bool(spec["mp_wrench_gate"]) for name, spec in VARIANTS.items()},
@@ -588,6 +595,7 @@ def main(argv=None):
     semantic_keys = (
         "scenes", "variants", "seeds", "physical_insert_force_n",
         "simulation_process_noise", "search_profile", "motion_profile", "sim_profile",
+        "physics_step_s",
         "simulation_gravity", "motion_gravity_gate", "execution_timing", "animate_grippers",
         "reused_task_plans_from", "reused_motion_plans_from",
         "insertion_only_grasp_check", "abort_on_action_failure",
@@ -829,6 +837,7 @@ def main(argv=None):
                 sim_cmd = [
                     sys.executable, "-u", str(ROOT / "sim.py"), "run", str(execution_plan),
                     "--sim-profile", "standard", "--mp-path", str(motion),
+                    "--physics-step", str(args.physics_step),
                     "--apply-process-wrench", "--process-noise", "nominal",
                     "--process-noise-seed", str(seed), "--report-json", str(sim_report),
                 ]
@@ -843,6 +852,8 @@ def main(argv=None):
                   sim_cmd += ["--animate-grippers", "--wait-for-gripper"]
                 if args.record != "none":
                   sim_cmd += ["--record", str(recording)]
+                  if args.record == "failures":
+                    sim_cmd += ["--record-on-failure"]
                 print(f"[wrench-sim] {ordinal}/{total} {scene}/{variant}/seed-{seed}: sim",
                       flush=True)
                 scode, sim_wall, sim_outcome = _run(

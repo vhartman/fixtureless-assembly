@@ -1824,6 +1824,10 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
       # validated configs contain no tolerated penetration at all. Must be set BEFORE
       # BaseModeLogic.__init__ (start-mode validation uses it).
       self.collision_tolerance = collision_tolerance
+      # set_to_mode is on every collision-predicate query.  The mode ancestry and canonical
+      # attachment events are immutable, so derive them once per Mode instead of repeatedly
+      # walking the full task sequence (millions of SequenceMixin list scans in a replay).
+      self._canonical_relations_by_mode = {}
       BaseModeLogic.__init__(self)
       self.prev_mode = self.start_mode
 
@@ -1840,25 +1844,40 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
       target = config if config is not None else self.C
       if target is None:
         return
-      chain, cur_mode = [], m
-      while cur_mode is not None:
-        chain.append(cur_mode)
-        cur_mode = cur_mode.prev_mode
-      chain.reverse()
-      # Only the LAST attachment event for a child is active in the rebuilt mode.  Walk those
-      # events backwards so an earlier pick is not mistaken for a broken invariant after a
-      # later assemble has legitimately re-parented that same child.
-      seen_children = set()
-      for before, after in reversed(list(zip(chain, chain[1:]))):
+      # Mode.id is the planner's monotonic semantic identity.  Do not use Python's id(m): the
+      # planner creates short-lived Mode objects while rebuilding a chain, and CPython may
+      # reuse an address for a different mode immediately after collection.
+      cache_key = m.id
+      relations = self._canonical_relations_by_mode.get(cache_key)
+      if relations is None:
+        chain, cur_mode = [], m
+        while cur_mode is not None:
+          chain.append(cur_mode)
+          cur_mode = cur_mode.prev_mode
+        chain.reverse()
+        # Only the LAST attachment event for a child is active in the rebuilt mode. Walk those
+        # events backwards so an earlier pick is not mistaken for a broken invariant after a
+        # later assemble has legitimately re-parented that same child.
+        relations, seen_children = [], set()
+        for before, after in reversed(list(zip(chain, chain[1:]))):
+          task = None
+          try:
+            task = self.get_active_task(before, after.task_ids)
+            rel = getattr(task, "canonical_relpose", None)
+            if rel is None or not getattr(task, "frames", None):
+              continue
+            parent, child = task.frames[:2]
+            if child in seen_children:
+              continue
+            seen_children.add(child)
+            relations.append((parent, child, np.asarray(rel, dtype=float).copy(), task.name))
+          except Exception as exc:
+            raise RuntimeError(
+                f"mp_export: could not derive canonical relation for task "
+                f"{getattr(task, 'name', '?')!r}") from exc
+        self._canonical_relations_by_mode[cache_key] = relations
+      for parent, child, rel, task_name in relations:
         try:
-          task = self.get_active_task(before, after.task_ids)
-          rel = getattr(task, "canonical_relpose", None)
-          if rel is None or not getattr(task, "frames", None):
-            continue
-          parent, child = task.frames[:2]
-          if child in seen_children:
-            continue
-          seen_children.add(child)
           frame = target.getFrame(child)
           actual_parent = (None if frame is None or frame.getParent() is None else
                            frame.getParent().name)
@@ -1882,7 +1901,7 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
           # event contract and recreate the accumulated-drift bug this method exists to fix.
           raise RuntimeError(
               f"mp_export: could not enforce canonical relation for task "
-              f"{getattr(task, 'name', '?')!r}") from exc
+              f"{task_name!r}") from exc
 
   env = AssemblyEnv()
   if _distinct_exit:

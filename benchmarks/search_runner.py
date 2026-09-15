@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import datetime as dt
 import hashlib
+import importlib.metadata
 import json
 import math
 import os
@@ -42,7 +43,9 @@ _SOURCE_GLOBS = (
     # calibrated IK model, assembly mesh, or robot collision model changes. The former short
     # hand list omitted open_witness.py and every .g file, so precisely those changes could
     # reuse stale paper results.
-    "*.py", "benchmarks/*.py", "ik_artifacts/*.py", "part_meshes/*",
+    "*.py", "requirements.txt", "benchmarks/*.py", "benchmarks/configs/**/*.json",
+    "benchmarks/manifests/**/*.json", "ik_artifacts/*.py",
+    "part_meshes/**/*",
     "src/rai/**/*.g", "src/rai/**/*.urdf", "src/rai/**/collision/*.stl",
 )
 _RESERVED = {
@@ -367,11 +370,24 @@ def provenance():
       "source_files": source_files,
       "python": sys.version,
       "python_executable": sys.executable,
+      "package_versions": {
+          name: importlib.metadata.version(name)
+          for name in ("robotic", "numpy", "scipy", "trimesh", "python-fcl")
+          if _package_is_installed(name)
+      },
       "platform": platform.platform(),
       "machine": platform.machine(),
       "hostname": platform.node(),
       "cpu_count": os.cpu_count(),
   }
+
+
+def _package_is_installed(name):
+  try:
+    importlib.metadata.version(name)
+    return True
+  except importlib.metadata.PackageNotFoundError:
+    return False
 
 
 def parse_log(text: str):
@@ -754,6 +770,8 @@ def _prepare_grasp_database(entry, suite_dir, source_sha, env_extra):
     meta = _read_json(meta_path) if meta_path.exists() else {}
     entry["build_s"] = meta.get("build_s", 0.0)
     entry["generation_s"] = meta.get("generation_s", entry["build_s"])
+    entry["sampled_signature"] = meta.get("sampled_signature")
+    entry["coverage"] = meta.get("coverage", [])
     entry["status"] = "reused"
     return entry
   path.mkdir(parents=True, exist_ok=True)
@@ -788,8 +806,15 @@ def _prepare_grasp_database(entry, suite_dir, source_sha, env_extra):
           f"(sampled peak {sampled_peak_kb / 1024:.1f} MiB); process group terminated\n")
   log_text = log_path.read_text(encoding="utf-8", errors="replace")
   match = re.search(r"\[grasp-db\] build-only complete: .* in " + _NUM + r"s", log_text)
+  signature_match = re.search(r"^\[grasp-db\] sampled signature: (.+)$", log_text,
+                              flags=re.MULTILINE)
+  coverage = [line.split("] ", 1)[1] for line in log_text.splitlines()
+              if line.startswith("[grasp-db-coverage] ")]
   entry["build_s"] = elapsed
   entry["generation_s"] = float(match.group(1)) if match else elapsed
+  entry["sampled_signature"] = (signature_match.group(1).strip()
+                                  if signature_match else None)
+  entry["coverage"] = coverage
   entry["status"] = ("timeout" if timed_out else "oom" if rss_limit_hit else
                      "success" if returncode == 0 else "error")
   entry["rss_limit_hit"] = rss_limit_hit
@@ -804,6 +829,8 @@ def _prepare_grasp_database(entry, suite_dir, source_sha, env_extra):
   _write_json(meta_path, {
       "schema_version": 1, "cache_key": entry["cache_key"],
       "build_s": entry["build_s"], "generation_s": entry["generation_s"],
+      "sampled_signature": entry["sampled_signature"],
+      "coverage": entry["coverage"],
       "log": str(log_path.relative_to(suite_dir)),
   })
   size = sum(artifact.stat().st_size for artifact in artifacts)

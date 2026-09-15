@@ -1462,6 +1462,10 @@ class SimScene:
     self._cmd_qdot = None                                  # ... and its velocity feedforward
     self._phys = 0                                         # bumped by mj_step / mj_forward
     self._eq_cache = (None, None, None)                    # (realized layout key, rows, ids)
+    self._eq_rows_cache = (None, {})                       # layout key -> eq id -> six rows
+    self._mate_component_cache = (None, {})                # active weld bits -> rigid components
+    self._net_contact_force_cache = (None, {})             # physics/layout -> component force
+    self._contact_force_scratch = np.zeros(6)              # mj_contactForce output, reused
     # ``data.eq_active`` is a REQUEST for the next constraint rebuild.  Immediately after an
     # attach/release it can differ from the equality rows still stored in ``data.efc_*``.
     # Snapshot the active set only after MuJoCo has realized it (mj_forward/mj_step); the
@@ -1631,6 +1635,11 @@ class SimScene:
         raise RuntimeError("gripper animation requested, but no visual finger meshes were "
                            f"exported for {missing}; keep arm meshes enabled")
     self.active_grasps = {}                                # robot -> (eq_id, part, fcap, tcap)
+    # Presentation-only mode used by ``sim.py run --render-kinematic``.  It is deliberately
+    # opt-in: contacts and equality dynamics are disabled and the active grasp/mate graph is
+    # propagated exactly after every arm update.  This makes a deterministic scene-export
+    # trajectory, not a physics-validation result.
+    self.render_kinematic = False
     self._hold_info = {}                                   # robot -> grasp-frame info (directional caps)
     # FINITE MATE STRENGTH (--mate-force-cap/--mate-torque-cap): mate welds get the same
     # breakaway treatment as grasp welds. None = infinite strength = the historical model
@@ -1794,6 +1803,58 @@ class SimScene:
   def part_pose(self, p):
     b = self._body_id(p)
     return np.r_[self.data.xpos[b], self.data.xquat[b]]    # wxyz -- matches problem.py
+
+  def _set_free_part_pose(self, part, pose):
+    """Write one free part body pose (wxyz) for presentation-only kinematic replay."""
+    bid = self._body_id(part)
+    j0, nj = int(self.model.body_jntadr[bid]), int(self.model.body_jntnum[bid])
+    jid = next((j for j in range(j0, j0 + nj)
+                if self.model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE), None)
+    if jid is None:
+      return
+    qa = int(self.model.jnt_qposadr[jid])
+    va = int(self.model.jnt_dofadr[jid])
+    x = np.asarray(pose, dtype=float).copy()
+    qn = float(np.linalg.norm(x[3:]))
+    if qn > 0.0:
+      x[3:] /= qn
+    self.data.qpos[qa:qa + 7] = x
+    self.data.qvel[va:va + 6] = 0.0
+
+  def snap_render_attachments(self):
+    """Propagate the live attachment graph without invoking MuJoCo constraint dynamics.
+
+    Grasp and mate equality rows still serve as the authoritative relative-transform store;
+    only their *dynamics* are disabled.  Loose parts keep their current pose, a grasp anchors
+    a component root to the planned end effector, and active mates recursively place their
+    children at the declared assembly datum.
+    """
+    if not self.render_kinematic:
+      return
+    poses = {p: np.asarray(self.part_pose(p), dtype=float)
+             for p in self.assembly.objects}
+    # A symbolic co-grasp can temporarily expose multiple anchors for one rigid component.
+    # The saved path is certified at the event; choosing the lexicographically first live
+    # anchor gives one deterministic presentation transform between events.
+    for robot, (eq, part, *_caps) in sorted(self.active_grasps.items()):
+      anchor = self._body_id(self.grasp_anchor[robot])
+      ap = np.r_[self.data.xpos[anchor], self.data.xquat[anchor]]
+      rel = np.r_[np.asarray(self.model.eq_data[eq][3:6], dtype=float),
+                  np.asarray(self.model.eq_data[eq][6:10], dtype=float)]
+      poses[part] = _pose_compose(ap, rel)
+    # Assembly graphs are acyclic in the supported scenes.  Repeated relaxation avoids
+    # depending on object-name or dependency order and is bounded by the number of parts.
+    active_mates = [(child, parent, eq) for child, (eq, parent) in self._mate_eqs.items()
+                    if self.data.eq_active[eq]]
+    for _ in range(max(1, len(active_mates))):
+      for child, parent, eq in active_mates:
+        rel = np.r_[np.asarray(self.model.eq_data[eq][3:6], dtype=float),
+                    np.asarray(self.model.eq_data[eq][6:10], dtype=float)]
+        poses[child] = _pose_compose(poses[parent], rel)
+    for part, pose in poses.items():
+      self._set_free_part_pose(part, pose)
+    mujoco.mj_forward(self.model, self.data)
+    self._efc_active = self.data.eq_active.tobytes()
 
   # -- weld managers ---------------------------------------------------------------------
   def weld_violation(self, eq_id, body1, body2):
@@ -2217,20 +2278,34 @@ class SimScene:
     assembly DAG: later mates may not have fired yet and broken finite-strength mates must
     stop contributing immediately.
     """
-    component = {part}
-    changed = True
-    while changed:
-      changed = False
+    key = self.data.eq_active.tobytes()
+    cached_key, components = getattr(self, "_mate_component_cache", (None, {}))
+    if cached_key != key:
+      # The weld graph changes only at manipulation events (or physical breakaway), while this
+      # query runs on every servo tick. Build every connected component once per active set.
+      nodes = set(self._mate_eqs)
+      nodes.update(parent for _eq, parent in self._mate_eqs.values())
+      adjacency = {node: set() for node in nodes}
       for child, (eq, parent) in self._mate_eqs.items():
-        if not self.data.eq_active[eq]:
-          continue
-        if child in component and parent not in component:
-          component.add(parent)
-          changed = True
-        elif parent in component and child not in component:
-          component.add(child)
-          changed = True
-    return component
+        if self.data.eq_active[eq]:
+          adjacency[child].add(parent)
+          adjacency[parent].add(child)
+      components = {}
+      unseen = set(nodes)
+      while unseen:
+        root = unseen.pop()
+        component, frontier = {root}, [root]
+        while frontier:
+          node = frontier.pop()
+          new = adjacency[node] - component
+          component.update(new)
+          unseen.difference_update(new)
+          frontier.extend(new)
+        frozen = frozenset(component)
+        for node in frozen:
+          components[node] = frozen
+      self._mate_component_cache = (key, components)
+    return components.get(part, frozenset((part,)))
 
   def net_contact_force(self, part):
     """Net world-frame CONTACT force ON `part`'s live rigid component (N).
@@ -2249,6 +2324,16 @@ class SimScene:
     the table, eventually breaking the grasp weld despite the absence of root-body contact.
     """
     component = self._active_mate_component(part)
+    # Equality activation can change between physics steps at a manipulation event. Include it
+    # in the cache key so such a change cannot reuse the prior component's contact resultant.
+    state_key = (self._phys, self.data.eq_active.tobytes())
+    tick, cache = getattr(self, "_net_contact_force_cache", (None, {}))
+    if tick != state_key:
+      cache = {}
+      self._net_contact_force_cache = (state_key, cache)
+    cached = cache.get(component)
+    if cached is not None:
+      return cached.copy()
     F = np.zeros(3)
     for i in range(int(self.data.ncon)):
       c = self.data.contact[i]
@@ -2259,10 +2344,13 @@ class SimScene:
       in1, in2 = p1 in component, p2 in component
       if in1 == in2:                                      # internal contact or wholly foreign
         continue
-      f6 = np.zeros(6)
+      f6 = getattr(self, "_contact_force_scratch", None)
+      if f6 is None:                                      # compact unit-test fixtures
+        f6 = self._contact_force_scratch = np.zeros(6)
       mujoco.mj_contactForce(self.model, self.data, i, f6)
       fw = np.asarray(c.frame, dtype=float).reshape(3, 3).T @ f6[:3]
       F += fw if in2 else -fw
+    cache[component] = F.copy()
     return F
 
   def part_pair_contact_force(self, part_a, part_b):
@@ -2371,6 +2459,19 @@ class SimScene:
             f"cached rows {self._eq_cache[1]} vs live {_i}")
     return self._eq_cache[1], self._eq_cache[2]
 
+  def _eq_rows(self, eq_id):
+    """Cached equality-row lookup for a weld in the currently realized constraint layout."""
+    idx, ids = self._eq_index()
+    layout_key = self._eq_cache[0]
+    cached_key, rows_by_eq = getattr(self, "_eq_rows_cache", (None, {}))
+    if cached_key != layout_key:
+      rows_by_eq = {
+          int(eq): idx[ids == eq]
+          for eq in np.unique(ids)
+      }
+      self._eq_rows_cache = (layout_key, rows_by_eq)
+    return rows_by_eq.get(int(eq_id), idx[:0])
+
   def _grasp_violation(self, h):
     """Directional breakaway test in the GRASP's own frame -- the planner's box, not a scalar.
 
@@ -2383,7 +2484,7 @@ class SimScene:
     The grasp frame's columns are [t1, t2, n] with n pointing FROM the gripper INTO the part, so
     a POSITIVE axial component is the part pressed into the palm/cup (F_push) and a negative one
     is pull-off (F_pull). Returns (worst_ratio, label, |F|, |T|); ratio > 1 means broken."""
-    rows = self._eq_index()[0][self._eq_index()[1] == h["eq"]]
+    rows = self._eq_rows(h["eq"])
     if len(rows) < 6:
       return 0.0, "", 0.0, 0.0
     f = self.data.efc_force[rows]
@@ -2392,7 +2493,13 @@ class SimScene:
     Rp = self.data.xmat[bid].reshape(3, 3)
     F_p = Rp.T @ (-f[:3])                                  # world force -> part frame
     T_p = (-0.5 * ts) * f[3:6]                             # couple about the part ORIGIN
-    T_gp = T_p - np.cross(h["gp"], F_p)                    # ... moved to the GRASP POINT
+    gp = h["gp"]
+    # np.cross pays general N-D axis-normalization overhead for these tiny fixed vectors; this
+    # is the hottest Python arithmetic in the 2ms breakaway loop.
+    moment = np.array([gp[1] * F_p[2] - gp[2] * F_p[1],
+                       gp[2] * F_p[0] - gp[0] * F_p[2],
+                       gp[0] * F_p[1] - gp[1] * F_p[0]])
+    T_gp = T_p - moment                                    # ... moved to the GRASP POINT
     Fg, Tg = h["Rg"].T @ F_p, h["Rg"].T @ T_gp             # -> [t1, t2, n]
     c, name = h["caps"], h["model"]
     worst, lbl = 0.0, ""
@@ -2470,8 +2577,7 @@ class SimScene:
     """Constraint wrench currently exerted by an active weld: sum its efc rows.
     TODO(verify): efc bookkeeping -- rows with data.efc_type == mjCNSTR_EQUALITY and
     data.efc_id == eq_id; a weld contributes 6 rows (3 force + 3 torque)."""
-    idx, ids = self._eq_index()
-    rows = idx[ids == eq_id]
+    rows = self._eq_rows(eq_id)
     if len(rows) < 6:
       return 0.0, 0.0
     f = self.data.efc_force[rows]
@@ -2511,15 +2617,40 @@ class SimScene:
       target["peak_torque_nm"] = max(target["peak_torque_nm"], torque_nm)
       target["peak_utilization"] = max(target["peak_utilization"], utilization)
     key = (phase, robot, part)
-    hist, last = self._wrench_metric_history.get(
-        key, (deque(maxlen=self._wrench_metric_window), None))
+    history = self._wrench_metric_history.get(key)
+    if history is None:
+      hist, last, total = (deque(maxlen=self._wrench_metric_window), None,
+                           np.zeros(3, dtype=float))
+    elif len(history) == 2:                               # compact legacy unit-test fixture
+      hist, last = history
+      total = np.asarray(hist, dtype=float).sum(axis=0) if hist else np.zeros(3)
+    else:
+      hist, last, total = history
     if last is None or last != self.step_i - 1:
       hist.clear()
-    hist.append((utilization, force_n, torque_nm))
-    self._wrench_metric_history[key] = (hist, self.step_i)
+      total[:] = 0.0
+    sample = np.asarray((utilization, force_n, torque_nm), dtype=float)
+    if len(hist) == hist.maxlen:
+      leaving = hist[0]
+      rebuild_total = bool(np.any(~np.isfinite(total)) or np.any(~np.isfinite(leaving)))
+      if not rebuild_total:
+        total -= leaving
+    else:
+      rebuild_total = False
+    hist.append(sample)
+    if rebuild_total:
+      total = np.asarray(hist, dtype=float).sum(axis=0)
+    else:
+      total += sample
+    # Utilization may legitimately be +inf for a zero-cap component.  Once such a sample
+    # leaves the window, inf-inf would poison an incremental sum with NaN; rebuild only on
+    # that rare transition so the optimized path remains identical to np.mean semantics.
+    if np.any(np.isnan(total)):
+      total = np.asarray(hist, dtype=float).sum(axis=0)
+    self._wrench_metric_history[key] = (hist, self.step_i, total)
     if len(hist) != self._wrench_metric_window:
       return
-    avg = np.mean(np.asarray(hist, dtype=float), axis=0)
+    avg = total / float(self._wrench_metric_window)
     for target in (metric, kind_metric):
       for field, value in zip(
           ("peak_sustained_utilization", "peak_sustained_force_n",
@@ -2579,7 +2710,9 @@ class SimScene:
           component = frozenset(self._active_mate_component(part))
           for member in component:
             component_by_part[member] = component
-        f6 = np.zeros(6)
+        f6 = getattr(self, "_contact_force_scratch", None)
+        if f6 is None:                                    # compact unit-test fixtures
+          f6 = self._contact_force_scratch = np.zeros(6)
         mujoco.mj_contactForce(self.model, self.data, i, f6)
         normal, tangent = component_loads.get(component, (0.0, 0.0))
         normal += abs(float(f6[0]))
@@ -2605,14 +2738,33 @@ class SimScene:
     metric["peak_normal_force_n"] = max(metric["peak_normal_force_n"], normal)
     metric["peak_tangent_force_n"] = max(metric["peak_tangent_force_n"], tangent)
     metric["peak_utilization"] = max(metric["peak_utilization"], utilization)
-    hist, last = self._table_wrench_metric_history.get(
-        phase, (deque(maxlen=self._wrench_metric_window), None))
+    history = self._table_wrench_metric_history.get(phase)
+    if history is None:
+      hist, last, total = deque(maxlen=self._wrench_metric_window), None, 0.0
+    elif len(history) == 2:                               # compact legacy unit-test fixture
+      hist, last = history
+      total = float(sum(hist))
+    else:
+      hist, last, total = history
     if last is None or last != self.step_i - 1:
       hist.clear()
+      total = 0.0
+    rebuild_total = False
+    if len(hist) == hist.maxlen:
+      leaving = float(hist[0])
+      rebuild_total = not (np.isfinite(total) and np.isfinite(leaving))
+      if not rebuild_total:
+        total -= leaving
     hist.append(utilization)
-    self._table_wrench_metric_history[phase] = (hist, self.step_i)
+    if rebuild_total:
+      total = float(np.asarray(hist, dtype=float).sum())
+    else:
+      total += utilization
+    if np.isnan(total):
+      total = float(np.asarray(hist, dtype=float).sum())
+    self._table_wrench_metric_history[phase] = (hist, self.step_i, total)
     if len(hist) == self._wrench_metric_window:
-      avg = float(np.mean(np.asarray(hist, dtype=float)))
+      avg = total / float(self._wrench_metric_window)
       old = metric["peak_sustained_utilization"]
       metric["peak_sustained_utilization"] = avg if old is None else max(float(old), avg)
 
@@ -2681,6 +2833,7 @@ class SimScene:
         # the constrained dynamics. This is what makes the KINEMATIC arm behave; it goes away
         # when actuators make the chain track for real.
         self.set_arm_q(*self._cmd_q)
+      self.snap_render_attachments()
       self.step_i += 1
       if self._part_trace in self.assembly.objects:
         _p = np.asarray(self.part_pose(self._part_trace)[:3], dtype=float)
@@ -3797,6 +3950,7 @@ class _SkillServo:
 
 def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kinds=None,
                         record=None, verbose=True, gui=False, visual=True,
+                        record_on_failure=False,
                         record_metadata=None,
                         initial_state=None, object_perturbation=None,
                         object_perturb_observation="observed",
@@ -3828,6 +3982,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                         path_preflight_resolution=None,
                         apply_process_wrench=False, table_mu=None,
                         sim_gravity=True,
+                        render_kinematic=False,
                         insertion_only_grasp_check=False,
                         abort_on_action_failure=False,
                         process_noise_mode="nominal", process_noise_corner=0,
@@ -3946,6 +4101,15 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                    process_engagement_distance=process_engagement_distance,
                    process_wrench_ramp=process_wrench_ramp,
                    animate_grippers=animate_grippers, object_damping=object_damping)
+  if render_kinematic:
+    scene.render_kinematic = True
+    scene.model.opt.gravity[:] = 0.0
+    scene.model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONTACT)
+    scene.model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_EQUALITY)
+    mujoco.mj_forward(scene.model, scene.data)
+    print("[sim/render] --render-kinematic ACTIVE: contact, gravity, and equality dynamics "
+          "are disabled; active grasp/mate transforms are propagated exactly after each "
+          "planned arm update. This recording is for visualization, not physics validation.")
   if not sim_gravity:
     # Simulation-only counterfactual: retain the saved task plan, motion path, grasp caps,
     # controllers, contacts, and explicitly applied assembly-process wrench, but remove the
@@ -6010,7 +6174,14 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         # SAME path-resolution acceptance audit below. A counterexample triggers 4ms and finally
         # 2ms retries. Every planning grid is an integer multiple of the 2ms controller tick,
         # so fire points survive expansion exactly (5ms cannot be represented on that grid).
-        _plan_dts = list(dict.fromkeys([max(DT, 0.01), max(DT, 0.004), DT]))
+        # Each coarse tick must be an integer multiple of the controller/physics tick or an
+        # event cannot be mapped back exactly.  For the production 2ms step this remains
+        # byte-for-byte [10ms, 4ms, 2ms]; it also makes experimental 4ms execution use [8ms,
+        # 4ms] rather than the invalid 10ms -> 4ms conversion.
+        def _compatible_grid(target):
+          return max(DT, int(np.floor(float(target) / DT + 1e-12)) * DT)
+        _plan_dts = list(dict.fromkeys(
+            [_compatible_grid(0.01), _compatible_grid(0.004), DT]))
         _q_start = np.asarray(_phase_stretches[0][0][0], dtype=float)
         for _pdt in _plan_dts:
           _search_t0 = _time.perf_counter()
@@ -7261,8 +7432,10 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     _mm = ", ".join(f"{p}~{scene._mate_eqs[p][1]} {f:.1f}N/{t:.2f}Nm"
                     for p, (f, t) in sorted(scene._mate_max.items()))
     print(f"[sim/mate] per-mate max weld load over the run: {_mm}")
-  if rec is not None:
+  if rec is not None and (not record_on_failure or not report.success):
     _save_recording(record, scene, rec, report, metadata=record_metadata)
+  elif rec is not None:
+    print(f"[sim] successful run: skipped failure-only recording ({len(rec['qpos'])} frames)")
   return report
 
 
@@ -7592,6 +7765,10 @@ def replay_recording(path, speed=1.0, loop=True, frame=None, export_scene=None,
 # uses), so there is a single source of truth for the scene and zero solver duplication.
 # ---------------------------------------------------------------------------------------------
 _STANDARD_SIM_PROFILE = {
+    # Conservative MuJoCo/control sampling. 4ms is an explicit faster benchmark option; it
+    # passed the representative Cross/Cube/Chair executions but is not silently substituted
+    # for the paper reference until failure classifications have been checked across seeds.
+    "physics_step": 0.002,
     # Persisted real-arm path and the established collision-audited timing pipeline.
     "actuated": True,
     "skill_servo": True,
@@ -7722,7 +7899,17 @@ def _resolve_directional_caps(cfg, cli_value):
 
 
 def _cli_run(a):
-  global JOINT_RATE, ARM_ARM_CONTACTS
+  global DT, RECORD_EVERY, JOINT_RATE, ARM_ARM_CONTACTS
+  DT = float(a.physics_step)
+  # Keep replay output near the established 62.5fps even when physics/control uses 4ms.
+  RECORD_EVERY = max(1, int(round(0.016 / DT)))
+  if DT != 0.002:
+    print(f"[sim] --physics-step {DT * 1000:g}ms ACTIVE: physics and feedback run at "
+          f"{1.0 / DT:g}Hz; recordings remain near {1.0 / (DT * RECORD_EVERY):g}fps. "
+          "Continuous-time skill durations and 20ms wrench windows are preserved.")
+    if MATE_WELD_TIMECONST < 2.0 * DT:
+      print(f"[sim] note: MuJoCo refsafe effectively clamps the {MATE_WELD_TIMECONST*1000:g}ms "
+            f"mate-weld time constant to {2.0*DT*1000:g}ms at this physics step.")
   if getattr(a, "sim_profile", None):
     print("[profile] sim 'standard' resolved: saved real-arm path, actuated skill servo, "
           "collision-audited phase schedule + smoothing/batching, strict preflight, and "
@@ -8111,6 +8298,7 @@ def _cli_run(a):
       "record_every": RECORD_EVERY,
       "apply_process_wrench": bool(a.apply_process_wrench),
       "sim_gravity": bool(a.sim_gravity),
+      "render_kinematic": bool(a.render_kinematic),
       "insertion_only_grasp_check": bool(a.insertion_only_grasp_check),
       "abort_on_action_failure": bool(a.abort_on_action_failure),
       "animate_grippers": bool(a.animate_grippers),
@@ -8122,6 +8310,7 @@ def _cli_run(a):
   }
   rep = execute_motion_plan(C, asm, plan, states, prob, path, gripper_kinds=gripper_kinds,
                             record=a.record, gui=a.gui, visual=_want_meshes,
+                            record_on_failure=a.record_on_failure,
                             record_metadata=_run_metadata,
                             initial_state=initial_state,
                             object_perturbation=object_perturbation,
@@ -8189,6 +8378,7 @@ def _cli_run(a):
                             path_preflight_resolution=a.path_preflight_resolution,
                             apply_process_wrench=a.apply_process_wrench,
                             sim_gravity=a.sim_gravity,
+                            render_kinematic=a.render_kinematic,
                             insertion_only_grasp_check=a.insertion_only_grasp_check,
                             abort_on_action_failure=a.abort_on_action_failure,
                             table_mu=_saved(cfg, "table_mu", legacy=None),
@@ -8235,6 +8425,11 @@ def _build_cli():
                       "normalized wrench "
                       "guard, and strict path preflight. Explicit individual flags win. "
                       "--mp-path/--record and robot-specific calibrations remain per run.")
+  r.add_argument("--physics-step", type=float, choices=(0.002, 0.004), default=0.002,
+                 metavar="SEC",
+                 help="MuJoCo physics and feedback timestep: 0.002 (conservative standard) "
+                      "or 0.004 (faster experimental setting). Skill durations and sustained-"
+                      "wrench windows remain expressed in physical seconds.")
   r.add_argument("--require-mp-path", action=argparse.BooleanOptionalAction, default=False,
                  help="Fail unless --mp-path supplies a persisted path; prevents a reproduction "
                       "command from silently running a fresh stochastic BiRRT. Enabled by the "
@@ -8284,6 +8479,12 @@ def _build_cli():
                  help="Enable physical MuJoCo gravity (default). --no-sim-gravity is a "
                       "simulation-only counterfactual: it leaves the saved plan/path, grasp "
                       "limits, contacts, controllers, and --apply-process-wrench unchanged.")
+  r.add_argument("--render-kinematic", action="store_true",
+                 help="Presentation-only deterministic replay: disable contact, gravity, and "
+                      "equality dynamics and propagate the live grasp/mate transforms exactly "
+                      "along the saved robot path. Use for screenshots/model export, never as "
+                      "an execution-feasibility result. Combine with --no-actuated "
+                      "--articulated to retain real robot and animated-gripper joints.")
   r.add_argument("--insertion-only-grasp-check", action="store_true",
                  help="Ablation: keep physical gravity everywhere, but evaluate grasp "
                       "breakaway only while --apply-process-wrench is nonzero inside the "
@@ -8744,6 +8945,10 @@ def _build_cli():
                       "witness/pre-keyframe rebuild. Required to open an old --mp-path that "
                       "predates final-export persistence; normal replay never resolves IK.")
   r.add_argument("--record", metavar="FILE", default=None, help="save a replayable .npz")
+  r.add_argument("--record-on-failure", action="store_true",
+                 help="With --record, retain the full trace in memory but compress/write the "
+                      "NPZ only when execution fails. This preserves complete failure replays "
+                      "without successful-run compression and disk-I/O costs.")
   r.add_argument("--animate-grippers", action=argparse.BooleanOptionalAction, default=False,
                  help="Animate two-finger hands around pick/handover/release events using "
                       "simulation-only articulated hinge joints and position actuators. "

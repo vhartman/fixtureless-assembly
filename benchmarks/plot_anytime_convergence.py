@@ -149,22 +149,13 @@ def draw(ax, run: dict, color=None) -> None:
                color=line.get_color(), zorder=3)
 
 
-def main() -> None:
-  parser = argparse.ArgumentParser()
-  parser.add_argument("--log", action="append", type=Path, required=True)
-  parser.add_argument("--label", action="append", required=True)
-  parser.add_argument("--output-prefix", type=Path, required=True)
-  parser.add_argument("--title", default="Milestone-anytime convergence",
-                      help="title for the combined plot")
-  args = parser.parse_args()
-  if len(args.log) != len(args.label):
-    parser.error("each --log requires one corresponding --label")
+def write_outputs(runs, output_prefix: Path,
+                  title="Milestone-anytime convergence") -> None:
+  """Write combined and per-run convergence data and plots."""
+  output_prefix.parent.mkdir(parents=True, exist_ok=True)
 
-  runs = [parse_log(path, label) for path, label in zip(args.log, args.label)]
-  args.output_prefix.parent.mkdir(parents=True, exist_ok=True)
-
-  json_path = args.output_prefix.with_suffix(".json")
-  csv_path = args.output_prefix.with_suffix(".csv")
+  json_path = output_prefix.with_suffix(".json")
+  csv_path = output_prefix.with_suffix(".csv")
   json_path.write_text(json.dumps({"runs": runs}, indent=2) + "\n")
   with csv_path.open("w", newline="") as stream:
     writer = csv.DictWriter(stream, fieldnames=("scene", "time_s", "cost", "kind"))
@@ -182,9 +173,9 @@ def main() -> None:
   ax.yaxis.set_major_locator(MaxNLocator(integer=True))
   ax.grid(True, alpha=0.28)
   ax.legend(frameon=False)
-  ax.set_title(args.title)
-  fig.savefig(args.output_prefix.with_suffix(".png"), dpi=180)
-  fig.savefig(args.output_prefix.with_suffix(".pdf"))
+  ax.set_title(title)
+  fig.savefig(output_prefix.with_suffix(".png"), dpi=180)
+  fig.savefig(output_prefix.with_suffix(".pdf"))
   plt.close(fig)
 
   for run in runs:
@@ -199,9 +190,24 @@ def main() -> None:
     status = "optimal" if run["optimal_proved"] else "optimality not proved"
     ax.set_title(f"{run['label']}: {status}")
     ax.legend(frameon=False)
-    fig.savefig(args.output_prefix.parent / f"{slug}-convergence.png", dpi=180)
-    fig.savefig(args.output_prefix.parent / f"{slug}-convergence.pdf")
+    fig.savefig(output_prefix.parent / f"{slug}-convergence.png", dpi=180)
+    fig.savefig(output_prefix.parent / f"{slug}-convergence.pdf")
     plt.close(fig)
+
+
+def main() -> None:
+  parser = argparse.ArgumentParser()
+  parser.add_argument("--log", action="append", type=Path, required=True)
+  parser.add_argument("--label", action="append", required=True)
+  parser.add_argument("--output-prefix", type=Path, required=True)
+  parser.add_argument("--title", default="Milestone-anytime convergence",
+                      help="title for the combined plot")
+  args = parser.parse_args()
+  if len(args.log) != len(args.label):
+    parser.error("each --log requires one corresponding --label")
+
+  runs = [parse_log(path, label) for path, label in zip(args.log, args.label)]
+  write_outputs(runs, args.output_prefix, title=args.title)
 
 
 if __name__ == "__main__":
