@@ -31,9 +31,14 @@ a failure outside the selected breakage interval; it only prevents missed seats,
 or other already-failed actions from contaminating utilization with downstream motion in a
 corrupted scene. Use `--no-abort-on-action-failure` only for interactive cascade diagnostics.
 
-Runs are sequential fresh processes with thread, address-space, and wall-time guards. Task
-planning and motion planning are separate subprocesses and therefore have unambiguous timings
-and failure labels. Defaults are a 300 s task-planning wall limit, a 300 s RRT* optimization
+Runs use fresh processes with thread, address-space, and wall-time guards. Task planning and
+motion planning are separate subprocesses and therefore have unambiguous timings and failure
+labels. Runs are sequential by default; `--jobs N` executes up to N seeds concurrently while
+keeping the nine scene/model trials within each seed sequential and isolated below
+`.workers/seed-<seed>`. The top-level summary and `table.tex` are merged automatically. Since
+concurrent runs contend for CPU and memory, use `--jobs 1` when reporting stage runtimes; bounded
+parallelism is appropriate when the reported quantities are execution success and wrench
+utilization. Defaults are a 300 s task-planning wall limit, a 100 s RRT* optimization
 consultation inside a 450 s motion-stage wall limit, and a 600 s simulation wall limit; override
 them with `--task-timeout`, `--mp-runtime`, `--motion-timeout`, and `--sim-timeout`.
 
@@ -58,6 +63,14 @@ motion, and simulation wall times.
 The `planning_wall_s` field is the task-plus-motion sum. Useful
 development subsets are, for
 example, `--scenes cross --variants gravity full --seeds 11023` and `--dry-run`.
+With `--record failures`, the simulator retains the trace during execution but writes the NPZ
+only when the trial fails; successful trials therefore do not spend time or disk space on an
+artifact that the runner would immediately delete. Use `--record none` for the lowest runtime
+and memory when failure replays are not needed.
+The wrench-simulation runner defaults to `--physics-step 0.004` (250Hz). The ordinary
+`sim.py --sim-profile standard` replay remains at the conservative 0.002s/500Hz; pass
+`--physics-step 0.002` to the runner for that baseline. The runner persists this choice and
+refuses to mix timesteps when resuming a result directory.
 
 For execution robustness rather than search timing, `run_noisy_sim.py` expands seeded initial
 table-placement and process-wrench trials. It runs every sample sequentially in a fresh,
@@ -78,9 +91,11 @@ simulation section for the observed/unobserved controller semantics.
 ## Search timing
 
 `search_runner.py` executes search experiments from a JSON manifest. Every sample runs in a
-fresh Python process and all samples run sequentially. This is intentional: RAI, grasp, wrench,
-and IK caches must not leak across variants, and the main repository explicitly discourages two
-concurrent search or motion-planning jobs.
+fresh Python process. Runs are sequential by default; `--jobs N` may execute different assembly
+cases concurrently while retaining sequential solver/seed order within each case. This keeps
+RAI, grasp, wrench, and IK state isolated and preserves per-cell timeout suppression. Parallel
+execution improves throughput, although final wall-time measurements are cleanest with
+`--jobs 1`.
 
 The runner controls only experiment hygiene and search-only output:
 
@@ -157,9 +172,15 @@ only useful for measuring same-instance timing/numerical variation:
 ```bash
 python3 benchmarks/run_paper_search_comparison.py \
     --seeds 11023 11024 11025 11026 11027 \
+    --jobs 2 \
     --continue-after-timeout \
     --output benchmarks/results/paper-search-comparison-5seed
 ```
+
+Here `--jobs` parallelizes whole assembly cases rather than arbitrary solver cells. Since each
+child retains the manifest's 4 GiB process-tree RSS guard, two jobs are the recommended maximum
+with 16 GiB of available RAM. Checkpointing and `--resume` continue to use the one output
+directory; no manual shards or merge step are required.
 
 Without `--continue-after-timeout`, the wrapper retains its budget-protection policy: once one
 seed times out for a case/solver cell, later requested seeds for that cell are skipped.
@@ -497,6 +518,18 @@ python3 benchmarks/run_process_wrench_full_matrix.py \
 This is 357 sequential, fresh-process, single-seed searches in total: 231 cube and 126 Cross.
 Each child retains the 6 GiB and 900 s guards. Resume the same directory after interruption:
 
+For independent planner seeds and bounded case-level parallelism, use `--seeds` and `--jobs`.
+Runs for one part-count case remain sequential; only different part counts execute concurrently,
+so a slow cell cannot overlap another seed of the same cell:
+
+```bash
+python3 benchmarks/run_process_wrench_full_matrix.py \
+    --output benchmarks/results/process-wrench-full-matrix-3seed \
+    --seeds 11023 11024 11025 --jobs 3 --timeout 500
+```
+
+`--repeats 3` remains a same-seed timing repeat and is not a substitute for `--seeds`.
+
 Add `--optimistic-no-wrench` to run a second, matched topological control with the
 optimistic/Dogar-style solver. The plots then show both the standard milestone solver's dotted
 black no-wrench curve and the optimistic solver's dashed red no-wrench curve. This adds 51
@@ -521,6 +554,23 @@ Use `--assembly cube` or `--assembly cross` to run only one family. The wrapper 
 three-panel figure per family (2/3/4 robots), raw logs and plans for every successful cell, and
 CSV files that retain failures as censored observations. It performs search only: witness
 optimization and motion planning remain disabled by the benchmark runner.
+
+## Anytime convergence
+
+The dedicated convergence wrapper runs only the `ours` row from the paper manifest, enables
+the milestone-anytime/LNS phase, and generates `all-scenes.json`, CSV, PDF, and PNG outputs.
+Select assemblies explicitly with `--cases`; `--jobs` runs different assemblies concurrently
+while keeping seeds of one assembly sequential:
+
+```bash
+python3 benchmarks/run_paper_anytime_convergence.py \
+    --output benchmarks/results/paper-search-anytime-300 \
+    --cases cross stool chair --seeds 11023 \
+    --runtime 300 --jobs 3
+```
+
+Omit `--cases` for all ten paper assemblies. Interrupted runs can use `--resume` with the same
+output path and arguments.
 
 The matched two-finger Cross subset uses 2, 4, and 7 parts with the same lambda grid, gravity,
 robot count, seed, timeout, and resource guard:

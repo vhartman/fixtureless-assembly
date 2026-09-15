@@ -31,6 +31,7 @@ completed trials; ``summary.csv`` retains the full failure taxonomy and stage ti
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import fcntl
 import json
@@ -509,6 +510,10 @@ def _parse_args(argv=None):
                       default="lockstep",
                       help="simulation timing policy (default: lockstep)")
   parser.add_argument("--memory-gb", type=float, default=4.0, metavar="GB")
+  parser.add_argument(
+      "--jobs", type=int, default=1, metavar="N",
+      help=("run up to N seeds concurrently; each seed keeps its selected scene/model trials "
+            "sequential and writes to an isolated worker directory (default: 1)"))
   parser.add_argument("--resume", action="store_true")
   parser.add_argument(
       "--reuse-task-plans", type=Path, metavar="RESULT_DIR",
@@ -536,8 +541,12 @@ def _parse_args(argv=None):
   args = parser.parse_args(argv)
   if not args.seeds:
     parser.error("--seeds cannot be empty")
+  if args.jobs < 1:
+    parser.error("--jobs must be a positive integer")
   if args.reuse_task_plans and args.reuse_motion_plans:
     parser.error("--reuse-task-plans and --reuse-motion-plans are mutually exclusive")
+  if args.jobs > 1 and (args.reuse_task_plans or args.reuse_motion_plans):
+    parser.error("parallel runs cannot currently reuse task or motion plans")
   if args.dry_run and args.reuse_motion_plans:
     parser.error("--dry-run cannot be combined with --reuse-motion-plans")
   if any(x <= 0 for x in (args.mp_runtime, args.task_timeout, args.motion_timeout,
@@ -548,8 +557,7 @@ def _parse_args(argv=None):
   return args
 
 
-def main(argv=None):
-  args = _parse_args(argv)
+def _sequential_main(args):
   out = args.output.resolve()
   runs_dir = out / "runs"
   runs_dir.mkdir(parents=True, exist_ok=True)
@@ -914,6 +922,159 @@ def main(argv=None):
   if args.dry_run:
     return 0
   return 0 if all(r.get("success") for r in rows) else 1
+
+
+_ARTIFACT_FIELDS = (
+    "plan", "execution_plan", "motion_path", "sim_report", "recording", "planning_log",
+    "task_planning_log", "motion_planning_log", "sim_log",
+)
+
+
+def _worker_command(args, seed, output):
+  """Recreate one single-seed invocation without relying on shell quoting or ambient CLI."""
+  command = [
+      sys.executable, "-u", str(Path(__file__).resolve()),
+      "--output", str(output),
+      "--scenes", *args.scenes,
+      "--variants", *args.variants,
+      "--seeds", str(seed),
+      "--physical-force", str(args.physical_force),
+      "--mp-runtime", str(args.mp_runtime),
+      "--task-timeout", str(args.task_timeout),
+      "--motion-timeout", str(args.motion_timeout),
+      "--sim-timeout", str(args.sim_timeout),
+      "--physics-step", str(args.physics_step),
+      "--execution-timing", args.execution_timing,
+      "--memory-gb", str(args.memory_gb),
+      "--record", args.record,
+      "--jobs", "1",
+  ]
+  if args.resume:
+    command.append("--resume")
+  if args.insertion_only_grasp_check:
+    command.append("--insertion-only-grasp-check")
+  if not args.abort_on_action_failure:
+    command.append("--no-abort-on-action-failure")
+  if not args.animate_grippers:
+    command.append("--no-animate-grippers")
+  if args.dry_run:
+    command.append("--dry-run")
+  return command
+
+
+def _parallel_main(args):
+  """Run independent seeds concurrently and merge their checkpointed result trees.
+
+  Each worker uses the ordinary sequential runner and therefore retains the established
+  subprocess, timeout, and address-space guards.  Worker artifacts stay isolated below
+  ``.workers``; merged rows carry paths relative to the requested top-level result directory.
+  """
+  out = args.output.resolve()
+  out.mkdir(parents=True, exist_ok=True)
+  if (out / "summary.json").is_file() and not args.resume:
+    raise SystemExit(f"{out / 'summary.json'} already exists; use --resume or a fresh --output")
+  lock_stream = (out / ".runner.lock").open("w", encoding="utf-8")
+  try:
+    fcntl.flock(lock_stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+  except BlockingIOError as exc:
+    raise SystemExit(f"another ablation runner is already writing {out}") from exc
+
+  worker_root = out / ".workers"
+  worker_root.mkdir(parents=True, exist_ok=True)
+
+  def run_seed(seed):
+    destination = worker_root / f"seed-{seed}"
+    command = _worker_command(args, seed, destination)
+    log = destination / "runner.log"
+    destination.mkdir(parents=True, exist_ok=True)
+    with log.open("a" if args.resume else "w", encoding="utf-8") as stream:
+      stream.write("[parallel-command] " + shlex.join(command) + "\n")
+      stream.flush()
+      completed = subprocess.run(
+          command, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT, text=True)
+    summary = destination / "summary.json"
+    if not summary.is_file():
+      return seed, completed.returncode, [], f"worker produced no summary: {summary}"
+    try:
+      worker_manifest = json.loads(
+          (destination / "manifest.json").read_text(encoding="utf-8"))
+      payload = json.loads(summary.read_text(encoding="utf-8"))
+      worker_rows = payload["runs"]
+    except Exception as exc:
+      return seed, completed.returncode, [], f"invalid worker summary {summary}: {exc}"
+    expected_manifest = {
+        "scenes": args.scenes, "variants": args.variants, "seeds": [seed],
+        "physical_insert_force_n": args.physical_force,
+        "physics_step_s": args.physics_step, "execution_timing": args.execution_timing,
+        "record": args.record, "animate_grippers": args.animate_grippers,
+        "insertion_only_grasp_check": bool(args.insertion_only_grasp_check),
+        "abort_on_action_failure": bool(args.abort_on_action_failure),
+    }
+    mismatches = [key for key, value in expected_manifest.items()
+                  if worker_manifest.get(key) != value]
+    if mismatches:
+      return seed, completed.returncode, [], (
+          "worker result has incompatible manifest fields: " + ", ".join(mismatches))
+    expected = len(args.scenes) * len(args.variants)
+    error = None if len(worker_rows) == expected else (
+        f"worker returned {len(worker_rows)}/{expected} rows")
+    prefix = Path(".workers") / f"seed-{seed}"
+    for row in worker_rows:
+      for field in _ARTIFACT_FIELDS:
+        value = row.get(field)
+        if value:
+          row[field] = str(prefix / value)
+    return seed, completed.returncode, worker_rows, error
+
+  gathered = []
+  errors = []
+  workers = min(args.jobs, len(args.seeds))
+  print(f"[wrench-sim] parallel seed workers: {workers}; seeds={args.seeds}", flush=True)
+  with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+    futures = {pool.submit(run_seed, seed): seed for seed in args.seeds}
+    for future in concurrent.futures.as_completed(futures):
+      seed, returncode, worker_rows, error = future.result()
+      gathered.extend(worker_rows)
+      if error:
+        errors.append(f"seed {seed}: {error}")
+      print(f"[wrench-sim] seed {seed}: {len(worker_rows)} rows, runner rc={returncode}"
+            + (f", ERROR: {error}" if error else ""), flush=True)
+
+  # Keep paper output deterministic regardless of worker completion order.
+  scene_rank = {name: i for i, name in enumerate(args.scenes)}
+  variant_rank = {name: i for i, name in enumerate(args.variants)}
+  seed_rank = {seed: i for i, seed in enumerate(args.seeds)}
+  gathered.sort(key=lambda row: (
+      scene_rank[row["scene"]], variant_rank[row["variant"]], seed_rank[int(row["seed"])]))
+  if gathered:
+    first_manifest = json.loads(
+        (worker_root / f"seed-{args.seeds[0]}" / "manifest.json").read_text(
+            encoding="utf-8"))
+    first_manifest["seeds"] = list(args.seeds)
+    first_manifest["jobs"] = int(args.jobs)
+    first_manifest["parallel_layout"] = ".workers/seed-<seed>"
+    _write_json(out / "manifest.json", first_manifest)
+    aggregate = _aggregate(gathered, args.seeds, args.scenes, args.variants)
+    _write_json(out / "summary.json", {
+        "schema_version": SCHEMA_VERSION, "manifest": first_manifest,
+        "runs": gathered, "aggregate": aggregate,
+    })
+    _write_csv(out / "summary.csv", gathered)
+    _write_json(out / "aggregate.json", aggregate)
+    _write_tex(out / "table.tex", aggregate, len(args.seeds), args.scenes)
+  if errors:
+    print("[wrench-sim] incomplete workers:\n  " + "\n  ".join(errors), flush=True)
+  expected_total = len(args.scenes) * len(args.variants) * len(args.seeds)
+  lock_stream.close()
+  if args.dry_run:
+    return 0 if len(gathered) == expected_total and not errors else 1
+  return 0 if (len(gathered) == expected_total and not errors
+               and all(row.get("success") for row in gathered)) else 1
+
+
+def main(argv=None):
+  args = _parse_args(argv)
+  return _parallel_main(args) if args.jobs > 1 else _sequential_main(args)
 
 
 if __name__ == "__main__":
