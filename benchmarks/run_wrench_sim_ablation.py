@@ -579,8 +579,6 @@ def _parse_args(argv=None):
     parser.error("--jobs must be a positive integer")
   if args.reuse_task_plans and args.reuse_motion_plans:
     parser.error("--reuse-task-plans and --reuse-motion-plans are mutually exclusive")
-  if args.jobs > 1 and (args.reuse_task_plans or args.reuse_motion_plans):
-    parser.error("parallel runs cannot currently reuse task or motion plans")
   if args.dry_run and args.reuse_motion_plans:
     parser.error("--dry-run cannot be combined with --reuse-motion-plans")
   if any(x <= 0 for x in (args.mp_runtime, args.task_timeout, args.motion_timeout,
@@ -745,14 +743,14 @@ def _sequential_main(args):
         ]
         reused_row = reused_motion_rows.get(key)
         if args.reuse_motion_plans:
-          source_run = args.reuse_motion_plans.resolve() / "runs" / tag
-          source_plan = source_run / "plan.json"
-          source_motion = source_run / "mp.json"
+          if reused_row is None:
+            raise SystemExit(f"reusable summary has no row for {scene}/{variant}/seed-{seed}")
+          source_root = args.reuse_motion_plans.resolve()
+          source_plan = source_root / reused_row["plan"]
+          source_motion = source_root / reused_row["motion_path"]
           missing = [str(path) for path in (source_plan, source_motion) if not path.is_file()]
           if missing:
             raise SystemExit("reusable motion-plan artifact(s) not found: " + ", ".join(missing))
-          if reused_row is None:
-            raise SystemExit(f"reusable summary has no row for {scene}/{variant}/seed-{seed}")
           shutil.copy2(source_plan, plan)
           shutil.copy2(source_motion, motion)
           task_planning_log.write_text(
@@ -1000,6 +998,10 @@ def _worker_command(args, seed, output):
   ]
   if args.resume:
     command.append("--resume")
+  if args.reuse_task_plans:
+    command += ["--reuse-task-plans", str(args.reuse_task_plans.resolve())]
+  if args.reuse_motion_plans:
+    command += ["--reuse-motion-plans", str(args.reuse_motion_plans.resolve())]
   if args.insertion_only_grasp_check:
     command.append("--insertion-only-grasp-check")
   if not args.abort_on_action_failure:
@@ -1086,6 +1088,13 @@ def _parallel_main(args):
   errors = []
   workers = min(args.jobs, len(args.seeds))
   print(f"[wrench-sim] parallel seed workers: {workers}; seeds={args.seeds}", flush=True)
+  if workers > 2 and args.record != "none":
+    print(
+        "[wrench-sim/WARNING] recording is enabled with more than two concurrent workers. "
+        "Each recorded four-arm MuJoCo process can use about 2.3 GiB RSS because it compiles "
+        "the full visual model; native model compilation may fail under aggregate memory "
+        "pressure. Prefer --jobs 2, or --record none when NPZ failure replays are not needed.",
+        flush=True)
   with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
     futures = {pool.submit(run_seed, seed): seed for seed in args.seeds}
     for future in concurrent.futures.as_completed(futures):
