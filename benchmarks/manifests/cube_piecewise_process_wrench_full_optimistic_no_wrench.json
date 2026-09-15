@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "name": "cube-piecewise-process-wrench-full-optimistic-no-wrench",
+  "description": "Matched optimistic/Dogar-style topological control for the strict-sequence cube matrix.",
+  "timeout_s": 900,
+  "max_address_space_gb": 6,
+  "seeds": [11023],
+  "defaults": [
+    "--search-profile", "standard",
+    "--assembly", "cube-sequence-2x2x3",
+    "--robot", "ur10",
+    "--vacuum",
+    "--no-wrench",
+    "--optimistic", "--no-optimistic-fallback",
+    "--no-fill-local-h", "--no-fill-greedy", "--no-fill-exact",
+    "--no-placement-yaw-widening"
+  ],
+  "cases": [
+    {"name": "cube-02p", "args": ["--parts", "2"]},
+    {"name": "cube-03p", "args": ["--parts", "3"]},
+    {"name": "cube-04p", "args": ["--parts", "4"]},
+    {"name": "cube-05p", "args": ["--parts", "5"]},
+    {"name": "cube-06p", "args": ["--parts", "6"]},
+    {"name": "cube-07p", "args": ["--parts", "7"]},
+    {"name": "cube-08p", "args": ["--parts", "8"]},
+    {"name": "cube-09p", "args": ["--parts", "9"]},
+    {"name": "cube-10p", "args": ["--parts", "10"]},
+    {"name": "cube-11p", "args": ["--parts", "11"]},
+    {"name": "cube-12p", "args": ["--parts", "12"]}
+  ],
+  "variants": [
+    {"name": "2-robots", "args": ["--num-robots", "2"]},
+    {"name": "3-robots", "args": ["--num-robots", "3"]},
+    {"name": "4-robots", "args": ["--num-robots", "4"]}
+  ]
+}

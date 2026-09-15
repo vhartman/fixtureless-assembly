@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "name": "cross-process-wrench-full-no-wrench",
+  "description": "One matched topological control for every part and robot count in the full Cross process-load matrix.",
+  "timeout_s": 900,
+  "max_address_space_gb": 6,
+  "seeds": [11023],
+  "defaults": [
+    "--search-profile", "standard",
+    "--assembly", "cross",
+    "--robot", "ur10",
+    "--no-wrench"
+  ],
+  "cases": [
+    {"name": "cross-02p", "args": ["--parts", "2"]},
+    {"name": "cross-03p", "args": ["--parts", "3"]},
+    {"name": "cross-04p", "args": ["--parts", "4"]},
+    {"name": "cross-05p", "args": ["--parts", "5"]},
+    {"name": "cross-06p", "args": ["--parts", "6"]},
+    {"name": "cross-07p", "args": ["--parts", "7"]}
+  ],
+  "variants": [
+    {"name": "2-robots", "args": ["--num-robots", "2", "--grippers", "two_finger,two_finger"]},
+    {"name": "3-robots", "args": ["--num-robots", "3", "--grippers", "two_finger,two_finger,two_finger"]},
+    {"name": "4-robots", "args": ["--num-robots", "4", "--grippers", "two_finger,two_finger,two_finger,two_finger"]}
+  ]
+}

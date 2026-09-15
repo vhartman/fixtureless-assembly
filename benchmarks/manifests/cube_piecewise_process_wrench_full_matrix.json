@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "name": "cube-piecewise-process-wrench-full-matrix",
+  "description": "Full strict-sequence cube process-load matrix: 2--12 parts, 2--4 all-vacuum UR10 robots, gravity retained, and lambda in {0, 0.01, 0.1, 0.5, 1, 2} multiplying the nominal 10 N insertion force.",
+  "timeout_s": 900,
+  "max_address_space_gb": 6,
+  "seeds": [11023],
+  "defaults": [
+    "--search-profile", "standard",
+    "--assembly", "cube-sequence-2x2x3",
+    "--robot", "ur10",
+    "--vacuum"
+  ],
+  "cases": [
+    {"name": "cube-02p", "args": ["--parts", "2"]},
+    {"name": "cube-03p", "args": ["--parts", "3"]},
+    {"name": "cube-04p", "args": ["--parts", "4"]},
+    {"name": "cube-05p", "args": ["--parts", "5"]},
+    {"name": "cube-06p", "args": ["--parts", "6"]},
+    {"name": "cube-07p", "args": ["--parts", "7"]},
+    {"name": "cube-08p", "args": ["--parts", "8"]},
+    {"name": "cube-09p", "args": ["--parts", "9"]},
+    {"name": "cube-10p", "args": ["--parts", "10"]},
+    {"name": "cube-11p", "args": ["--parts", "11"]},
+    {"name": "cube-12p", "args": ["--parts", "12"]}
+  ],
+  "matrix": {
+    "rows": [
+      {"name": "2-robots", "args": ["--num-robots", "2"]},
+      {"name": "3-robots", "args": ["--num-robots", "3"]},
+      {"name": "4-robots", "args": ["--num-robots", "4"]}
+    ],
+    "columns": [
+      {"name": "lambda-0", "args": ["--insert-force", "0"]},
+      {"name": "lambda-0.01", "args": ["--insert-force", "0.1"]},
+      {"name": "lambda-0.1", "args": ["--insert-force", "1"]},
+      {"name": "lambda-0.5", "args": ["--insert-force", "5"]},
+      {"name": "lambda-1", "args": ["--insert-force", "10"]},
+      {"name": "lambda-2", "args": ["--insert-force", "20"]}
+    ]
+  }
+}

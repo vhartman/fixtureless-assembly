@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "name": "cross-process-wrench-full-matrix",
+  "description": "Full Cross process-load matrix: 2--7 parts, 2--4 two-finger UR10 robots, gravity retained, and lambda in {0, 0.01, 0.1, 0.5, 1, 2} multiplying the nominal 10 N insertion force.",
+  "timeout_s": 900,
+  "max_address_space_gb": 6,
+  "seeds": [11023],
+  "defaults": [
+    "--search-profile", "standard",
+    "--assembly", "cross",
+    "--robot", "ur10"
+  ],
+  "cases": [
+    {"name": "cross-02p", "args": ["--parts", "2"]},
+    {"name": "cross-03p", "args": ["--parts", "3"]},
+    {"name": "cross-04p", "args": ["--parts", "4"]},
+    {"name": "cross-05p", "args": ["--parts", "5"]},
+    {"name": "cross-06p", "args": ["--parts", "6"]},
+    {"name": "cross-07p", "args": ["--parts", "7"]}
+  ],
+  "matrix": {
+    "rows": [
+      {"name": "2-robots", "args": ["--num-robots", "2", "--grippers", "two_finger,two_finger"]},
+      {"name": "3-robots", "args": ["--num-robots", "3", "--grippers", "two_finger,two_finger,two_finger"]},
+      {"name": "4-robots", "args": ["--num-robots", "4", "--grippers", "two_finger,two_finger,two_finger,two_finger"]}
+    ],
+    "columns": [
+      {"name": "lambda-0", "args": ["--insert-force", "0"]},
+      {"name": "lambda-0.01", "args": ["--insert-force", "0.1"]},
+      {"name": "lambda-0.1", "args": ["--insert-force", "1"]},
+      {"name": "lambda-0.5", "args": ["--insert-force", "5"]},
+      {"name": "lambda-1", "args": ["--insert-force", "10"]},
+      {"name": "lambda-2", "args": ["--insert-force", "20"]}
+    ]
+  }
+}
