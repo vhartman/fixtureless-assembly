@@ -3,7 +3,7 @@
   "name": "cross-process-wrench-full-no-wrench",
   "description": "One matched topological control for every part and robot count in the full Cross process-load matrix.",
   "timeout_s": 900,
-  "max_address_space_gb": 6,
+  "max_rss_gb": 6,
   "seeds": [11023],
   "defaults": [
     "--search-profile", "standard",

@@ -3,7 +3,7 @@
   "name": "cross-process-wrench-full-matrix",
   "description": "Full Cross process-load matrix: 2--7 parts, 2--4 two-finger UR10 robots, gravity retained, and lambda in {0, 0.01, 0.1, 0.5, 1, 2} multiplying the nominal 10 N insertion force.",
   "timeout_s": 900,
-  "max_address_space_gb": 6,
+  "max_rss_gb": 6,
   "seeds": [11023],
   "defaults": [
     "--search-profile", "standard",
