@@ -43,6 +43,7 @@ planner's collision predicate before actuated execution.
 Recordings: sim_recordings/*.npz -- replay with `python3 sim.py replay <file> [speed]`.
 """
 import os
+import re
 import time as _time
 from collections import deque
 from pathlib import Path
@@ -655,16 +656,18 @@ def _compound_geoms_xml(spec, mu, mass, group, rgba, name_prefix=None):
 
 
 def _contact_friction(mu, *, table=False):
-  """MuJoCo sliding/torsional/rolling coefficients with the historical mu=0.5 values.
+  """MuJoCo sliding/torsional/rolling coefficients derived from sliding friction.
 
   The old generator changed only sliding friction: asking for ``mu=0`` silently retained
   0.005 torsional and 0.002 rolling friction. Scale all three together so low-friction and
-  frictionless experiments mean what their saved configuration says, while mu=0.5 remains
-  byte-for-byte the established model.
+  frictionless experiments mean what their saved configuration says.  The table needs more
+  rolling resistance than ordinary part contacts: otherwise MuJoCo's line contact for a
+  horizontal cylinder sustains a tiny numerical rolling velocity for minutes, moving a loose
+  Chair post out of its planned pick pose during a lockstep execution.
   """
   mu = max(0.0, float(mu))
   torsion = 0.01 * mu
-  rolling = (0.004 if table else 0.0002) * mu
+  rolling = (0.016 if table else 0.0002) * mu
   return f"{mu:g} {torsion:g} {rolling:g}"
 
 
@@ -1395,8 +1398,10 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
     <!-- condim=6 is required for MuJoCo to use the third (rolling) friction coefficient.
          Without it, horizontally scattered chair legs/posts are ideal cylinders with no
          rolling resistance: micron-scale contact noise makes them roll centimetres before
-         their pick. 2mm is modest relative to their 12.5mm radius and models a real bench's
-         finite rolling resistance without pinning or otherwise special-casing loose parts. -->
+         their pick. The 8mm coefficient at mu=0.5 models a real bench's finite rolling
+         resistance without pinning or otherwise special-casing loose parts, and keeps those
+         parts stationary over the multi-minute lockstep benchmark rather than merely during
+         the first approach. -->
     <geom name="table" type="box" size="{table_half_x} {table_half_y} {table_half_z}"
           pos="{table_x} {table_y} {table_z}" rgba="0.55 0.42 0.28 1"
           friction="{_contact_friction(mu_table, table=True)}" condim="6"
@@ -6258,7 +6263,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                 "[sim/mp] --phase-smooth REQUIRED but the phase scheduler fell back to a "
                 "synchronized trajectory with no independent phase trace. Aborting before "
                 "physics; rerun without --phase-smooth only if raw/synchronized execution "
-                "is explicitly desired.")
+                f"is explicitly desired. Phase-schedule failure: {_fallback_reason}")
           else:
             _raw_traj = traj
             _restore = set()
@@ -7611,6 +7616,41 @@ def _auto_scene_path(recording, frame):
   return source.with_name(f"{source.stem}-frame-{int(frame):06d}.glb")
 
 
+def _relocate_recording_mesh_assets(xml):
+  """Resolve content-keyed ``sim_meshes`` after a recording moves to another checkout.
+
+  Historical recordings embed absolute OBJ paths in their MJCF.  The OBJ basename includes
+  the geometry digest, so replacing a missing old ``.../sim_meshes/<name>`` path with the same
+  basename in this checkout is an identity-preserving relocation, not a model rebuild.
+  """
+  relocated = []
+  unresolved = []
+
+  def replace(match):
+    old = Path(match.group(2))
+    if old.is_file():
+      return match.group(0)
+    if old.parent.name != Path(_MESH_CACHE_DIR).name:
+      unresolved.append(str(old))
+      return match.group(0)
+    local = Path(_MESH_CACHE_DIR) / old.name
+    if not local.is_file():
+      unresolved.append(str(old))
+      return match.group(0)
+    relocated.append((str(old), str(local.resolve())))
+    return match.group(1) + str(local.resolve()) + match.group(3)
+
+  xml = re.sub(r'(\bfile=")([^"]+)(")', replace, str(xml))
+  if relocated:
+    old_roots = sorted({str(Path(old).parent) for old, _ in relocated})
+    print(f"[replay] relocated {len(relocated)} content-keyed mesh asset(s) from "
+          f"{', '.join(old_roots)} to {Path(_MESH_CACHE_DIR).resolve()}.")
+  if unresolved:
+    print(f"[replay] WARNING: {len(unresolved)} mesh asset path(s) remain unavailable; "
+          f"first missing asset: {unresolved[0]}")
+  return xml
+
+
 def replay_recording(path, speed=1.0, loop=True, frame=None, export_scene=None,
                      export_only=False):
   """Open the MuJoCo viewer on a recording made with execute(record=...): kinematic playback
@@ -7625,7 +7665,8 @@ def replay_recording(path, speed=1.0, loop=True, frame=None, export_scene=None,
   """
   import json, time
   z = np.load(path, allow_pickle=False)
-  model = mujoco.MjModel.from_xml_string(str(z["xml"]))
+  xml = _relocate_recording_mesh_assets(str(z["xml"]))
+  model = mujoco.MjModel.from_xml_string(xml)
   data = mujoco.MjData(model)
   marks = dict((int(f), a) for f, a in json.loads(str(z["marks"])))
   qpos = z["qpos"]
