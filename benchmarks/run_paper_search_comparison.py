@@ -65,9 +65,9 @@ METHOD_LABEL = {
 def _fmt(value, sd=None):
   if value is None or not math.isfinite(float(value)):
     return "--"
-  if sd is not None and math.isfinite(float(sd)) and float(sd) > 0.05:
-    return f"{float(value):.1f} $\\pm$ {float(sd):.1f}"
-  return f"{float(value):.1f}"
+  if sd is not None and math.isfinite(float(sd)):
+    return f"{float(value):.2f} $\\pm$ {float(sd):.2f}"
+  return f"{float(value):.2f}"
 
 
 def _geomean(values):
@@ -116,8 +116,8 @@ def _numeric_source(value, sd, metric):
     # converted the stored value to float.
     return f"{float(value):.0f}"
   elif sd is not None and math.isfinite(float(sd)):
-    return f"{float(value):.1f} +- {float(sd):.1f}"
-  return f"{float(value):.1f}"
+    return f"{float(value):.2f} +- {float(sd):.2f}"
+  return f"{float(value):.2f}"
 
 
 def _numeric_tex(value, sd, metric, best=False):
@@ -177,7 +177,7 @@ def _comparison_tex(groups):
       f"{'run' if run_count == 1 else 'runs'}.}}",
       "  \\label{tab:comparison}", "  \\resizebox{\\textwidth}{!}{%",
       "  \\begin{tabular}{ll|" + "*{" + str(len(CASES)) + "}{"
-      "S[table-format=3.1(1),separate-uncertainty=true,detect-weight=true,"
+      "S[table-format=3.2(2),separate-uncertainty=true,detect-weight=true,"
       "table-number-alignment=center,table-text-alignment=center]}" + "}",
       "\\toprule",
       f"Solver & Metric & {columns} \\\\", "\\midrule",
@@ -274,12 +274,12 @@ def _breakdown_tex(groups):
       "  \\caption{Breakdown of where time is spent in \\textsc{Wrap}.}",
       "  \\label{tab:search_time_spent}", "  \\resizebox{\\columnwidth}{!}{%",
       "  \\begin{tabular}{l|"
-      "S[table-format=3.1(1),separate-uncertainty=true,table-number-alignment=center]|"
-      "S[table-format=3.1(1),separate-uncertainty=true,table-number-alignment=center]"
-      "S[table-format=3.1(1),separate-uncertainty=true,table-number-alignment=center]|"
-      "S[table-format=3.1(1),separate-uncertainty=true,table-number-alignment=center]"
-      "S[table-format=3.1(1),separate-uncertainty=true,table-number-alignment=center]|"
-      "S[table-format=3.1(1),separate-uncertainty=true,table-number-alignment=center]}",
+      "S[table-format=3.2(2),separate-uncertainty=true,table-number-alignment=center]|"
+      "S[table-format=3.2(2),separate-uncertainty=true,table-number-alignment=center]"
+      "S[table-format=3.2(2),separate-uncertainty=true,table-number-alignment=center]|"
+      "S[table-format=3.2(2),separate-uncertainty=true,table-number-alignment=center]"
+      "S[table-format=3.2(2),separate-uncertainty=true,table-number-alignment=center]|"
+      "S[table-format=3.2(2),separate-uncertainty=true,table-number-alignment=center]}",
       "\\toprule",
       "& \\multicolumn{1}{c|}{} & \\multicolumn{2}{c|}{Backwards} & "
       "\\multicolumn{2}{c|}{Forward} & \\multicolumn{1}{c}{Motion} \\\\",

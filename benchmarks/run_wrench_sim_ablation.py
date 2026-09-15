@@ -49,7 +49,7 @@ import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 DEFAULT_SEEDS = (11023, 11024, 11025, 11026, 11027)
 RETRYABLE_INFRA_FAILURES = {
     "motion_planning", "motion_planning_timeout", "planning_timeout",
@@ -123,7 +123,7 @@ def _write_json(path, value):
 def _write_csv(path, rows):
   fields = [
       "scene", "variant", "seed", "status", "success", "failure_stage",
-      "returncode", "planning_wall_s", "task_planning_wall_s",
+      "failure_detail", "returncode", "planning_wall_s", "task_planning_wall_s",
       "motion_planning_wall_s", "sim_wall_s", "num_actions",
       "num_actions_ok_prefix", "num_objects_assembled", "num_objects_to_assemble",
       "first_failure_index", "first_failure_action", "path_length_rad",
@@ -171,19 +171,53 @@ def _run(command, *, log, timeout, memory_gb, env, dry_run=False):
         guarded, cwd=ROOT, env=env, text=True, stdout=stream, stderr=subprocess.STDOUT,
         start_new_session=True)
     outcome = "completed"
-    try:
-      returncode = proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-      outcome = "timeout"
-      os.killpg(proc.pid, signal.SIGTERM)
+    deadline = start + timeout
+    while True:
+      remaining = deadline - time.monotonic()
+      if remaining <= 0:
+        outcome = "timeout"
+        os.killpg(proc.pid, signal.SIGTERM)
+        try:
+          proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+          os.killpg(proc.pid, signal.SIGKILL)
+          proc.wait()
+        returncode = 124
+        stream.write(f"\n[runner] stage exceeded {timeout:g}s and its process group was killed\n")
+        stream.flush()
+        break
       try:
-        proc.wait(timeout=10)
+        returncode = proc.wait(timeout=min(30.0, remaining))
+        break
       except subprocess.TimeoutExpired:
-        os.killpg(proc.pid, signal.SIGKILL)
-        proc.wait()
-      returncode = 124
-      stream.write(f"\n[runner] stage exceeded {timeout:g}s and its process group was killed\n")
+        elapsed = time.monotonic() - start
+        log_label = "/".join(log.parts[-4:])
+        print(f"[wrench-sim/heartbeat] {log_label}: pid={proc.pid}, "
+              f"elapsed={elapsed:.0f}s/{timeout:g}s", flush=True)
     return returncode, time.monotonic() - start, outcome
+
+
+def _emit_failure_diagnostic(label, returncode, log, *, max_lines=20):
+  """Expose a subprocess failure without replacing its complete on-disk log."""
+  log = Path(log).resolve()
+  try:
+    lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+  except OSError as exc:
+    detail = f"return code {returncode}; log unavailable: {exc}"
+    print(f"[wrench-sim/error] {label}: {detail}; expected log: {log}", flush=True)
+    return detail
+  nonempty = [line for line in lines if line.strip()]
+  tail = nonempty[-max_lines:]
+  last = tail[-1].strip() if tail else "log is empty"
+  detail = f"return code {returncode}; {last}"
+  print(f"[wrench-sim/error] {label}: return code {returncode}; log: {log}", flush=True)
+  if tail:
+    print(f"[wrench-sim/error] last {len(tail)} non-empty log lines:", flush=True)
+    for line in tail:
+      print(f"[wrench-sim/error] | {line}", flush=True)
+  else:
+    print("[wrench-sim/error] | <empty log>", flush=True)
+  return detail
 
 
 def _motion_metrics(path):
@@ -748,7 +782,8 @@ def _sequential_main(args):
               memory_gb=args.memory_gb, env=env, dry_run=args.dry_run)
         row = {
             "scene": scene, "variant": variant, "seed": seed, "status": task_outcome,
-            "success": False, "failure_stage": None, "returncode": code,
+            "success": False, "failure_stage": None, "failure_detail": None,
+            "returncode": code,
             "planning_wall_s": round(task_wall, 6),
             "task_planning_wall_s": round(task_wall, 6),
             "motion_planning_wall_s": (
@@ -897,6 +932,20 @@ def _sequential_main(args):
                   else:
                     recording.unlink()
 
+        diagnostic_logs = {
+            "task_planning": task_planning_log,
+            "task_planning_timeout": task_planning_log,
+            "motion_planning": motion_planning_log,
+            "motion_planning_timeout": motion_planning_log,
+            "simulation_timeout": sim_log,
+            "simulator_preflight_or_crash": sim_log,
+        }
+        diagnostic_log = diagnostic_logs.get(row.get("failure_stage"))
+        if diagnostic_log is not None:
+          row["failure_detail"] = _emit_failure_diagnostic(
+              f"{scene}/{variant}/seed-{seed} ({row['failure_stage']})",
+              row.get("returncode"), diagnostic_log)
+
         rows.append(row)
         aggregate = _aggregate(rows, args.seeds, args.scenes, args.variants)
         _write_json(summary_path, {"schema_version": SCHEMA_VERSION,
@@ -990,18 +1039,25 @@ def _parallel_main(args):
     with log.open("a" if args.resume else "w", encoding="utf-8") as stream:
       stream.write("[parallel-command] " + shlex.join(command) + "\n")
       stream.flush()
-      completed = subprocess.run(
-          command, cwd=ROOT, stdout=stream, stderr=subprocess.STDOUT, text=True)
+      process = subprocess.Popen(
+          command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+          text=True, bufsize=1)
+      assert process.stdout is not None
+      for line in process.stdout:
+        stream.write(line)
+        stream.flush()
+        print(f"[wrench-sim/seed-{seed}] {line.rstrip()}", flush=True)
+      returncode = process.wait()
     summary = destination / "summary.json"
     if not summary.is_file():
-      return seed, completed.returncode, [], f"worker produced no summary: {summary}"
+      return seed, returncode, [], f"worker produced no summary: {summary}"
     try:
       worker_manifest = json.loads(
           (destination / "manifest.json").read_text(encoding="utf-8"))
       payload = json.loads(summary.read_text(encoding="utf-8"))
       worker_rows = payload["runs"]
     except Exception as exc:
-      return seed, completed.returncode, [], f"invalid worker summary {summary}: {exc}"
+      return seed, returncode, [], f"invalid worker summary {summary}: {exc}"
     expected_manifest = {
         "scenes": args.scenes, "variants": args.variants, "seeds": [seed],
         "physical_insert_force_n": args.physical_force,
@@ -1013,7 +1069,7 @@ def _parallel_main(args):
     mismatches = [key for key, value in expected_manifest.items()
                   if worker_manifest.get(key) != value]
     if mismatches:
-      return seed, completed.returncode, [], (
+      return seed, returncode, [], (
           "worker result has incompatible manifest fields: " + ", ".join(mismatches))
     expected = len(args.scenes) * len(args.variants)
     error = None if len(worker_rows) == expected else (
@@ -1024,7 +1080,7 @@ def _parallel_main(args):
         value = row.get(field)
         if value:
           row[field] = str(prefix / value)
-    return seed, completed.returncode, worker_rows, error
+    return seed, returncode, worker_rows, error
 
   gathered = []
   errors = []
