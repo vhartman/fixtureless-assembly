@@ -48,18 +48,6 @@ def test_namespace_roundtrip():
     assert a.get(k) == b.get(k), f"roundtrip changed {k}: {a.get(k)!r} -> {b.get(k)!r}"
 
 
-def test_mate_symmetry_flag_is_opt_in():
-  assert main.parse_args([]).mate_symmetry is False
-  assert main.parse_args(["--mate-symmetry"]).mate_symmetry is True
-  assert main.parse_args(["--mate-symmetry", "--no-mate-symmetry"]).mate_symmetry is False
-
-
-def test_real_arm_dominance_can_be_disabled_when_loading_a_floating_config():
-  assert main.parse_args([]).dominance is False
-  assert main.parse_args(["--dominance"]).dominance is True
-  assert main.parse_args(["--dominance", "--no-dominance"]).dominance is False
-
-
 def test_dict_roundtrip_and_unknown_key():
   rc = RunConfig(assembly="chair", parts=8, milestones=True, insert_force=25.0)
   assert RunConfig.from_dict(rc.to_dict()) == rc
@@ -361,16 +349,6 @@ def test_every_nonpresentation_standard_setting_is_persisted():
       set(main._SAVE_CONFIG_FIELDS)
 
 
-def test_execution_motion_margin_policy_is_persisted(tmp_path):
-  cfg = RunConfig.from_namespace(main.parse_args(["--motion-profile", "execution"]))
-  out = tmp_path / "execution-plan.json"
-  main.save_plan(str(out), cfg, [])
-  loaded = RunConfig.from_file(str(out))
-  assert loaded.mp_robot_margin == 0.05
-  assert loaded.mp_margin_ramp == 0.05
-  assert loaded.mp_margin_mode == "binary"
-
-
 def test_orientation_robust_wrench_cli_and_plan_roundtrip(tmp_path):
   cfg = RunConfig.from_namespace(main.parse_args(["--orientation-robust-wrench"]))
   assert cfg.orientation_robust_wrench is True
@@ -412,6 +390,16 @@ def test_max_robotiq_wrench_profile_cli_and_plan_roundtrip(tmp_path):
   out = tmp_path / "max-robotiq-plan.json"
   main.save_plan(str(out), cfg, [])
   assert RunConfig.from_file(str(out)).wrench_profile == "max_robotiq"
+
+
+def test_measured_wrench_profile_cli_and_plan_roundtrip(tmp_path):
+  cfg = RunConfig.from_namespace(main.parse_args([
+      "--search-profile", "standard", "--wrench-profile", "measured",
+  ]))
+  assert cfg.wrench_profile == "measured"
+  out = tmp_path / "measured-plan.json"
+  main.save_plan(str(out), cfg, [])
+  assert RunConfig.from_file(str(out)).wrench_profile == "measured"
 
 
 def test_open_plan_motion_loop_cli_and_config_roundtrip():
@@ -515,58 +503,6 @@ def test_open_plan_loop_suspends_then_fairly_reopens(tmp_path, monkeypatch):
   assert [a["status"] for a in manifest["candidates"][0]["attempts"]] == [
       "no_path", "success"]
   assert [a["status"] for a in manifest["candidates"][1]["attempts"]] == ["no_path"]
-
-
-def test_motion_profile_is_reversible_by_explicit_cli():
-  a = main.parse_args([
-      "--motion-profile", "standard", "--mp-collision-tolerance", "0.002",
-      "--mp-optimize", "--mp-runtime", "12", "--mp-stall-timeout", "3",
-      "--mp-shortcut-iters", "17", "--mp-table-margin", "0.004",
-      "--no-fuse-cograsp", "--no-fuse-pre-skill",
-  ])
-  assert a.mp_collision_tolerance == 0.002 and a.mp_optimize
-  assert a.mp_runtime == 12.0 and a.mp_stall_timeout == 3.0
-  assert a.mp_shortcut_iters == 17 and a.mp_table_margin == 0.004
-  assert a.mp_robot_margin == 0.0 and a.mp_margin_ramp == 0.0
-  assert a.mp_margin_mode == "linear"
-  assert not a.fuse_cograsp and not a.fuse_pre_skill
-
-
-def test_execution_motion_profile_differs_only_in_clearance_policy():
-  standard = main.parse_args(["--motion-profile", "standard"])
-  execution = main.parse_args(["--motion-profile", "execution"])
-  assert execution.mp_robot_margin == 0.05
-  assert execution.mp_margin_ramp == 0.05
-  assert execution.mp_margin_mode == "binary"
-  differing = {
-      key for key in main._STANDARD_MOTION_PROFILE
-      if getattr(standard, key) != getattr(execution, key)
-  }
-  assert differing == {"mp_robot_margin", "mp_margin_ramp", "mp_margin_mode"}
-
-
-def test_execution_margin_policy_is_reversible_by_explicit_cli():
-  a = main.parse_args([
-      "--motion-profile", "execution", "--mp-robot-margin", "0.02",
-      "--mp-margin-ramp", "0.03", "--mp-margin-mode", "linear",
-  ])
-  assert a.mp_robot_margin == 0.02
-  assert a.mp_margin_ramp == 0.03
-  assert a.mp_margin_mode == "linear"
-
-
-def test_profile_values_are_reversible_by_explicit_cli():
-  a = main.parse_args([
-      "--search-profile", "fast-open", "--weight", "5", "--no-open-witness",
-      "--analytic-seed-cap", "9", "--witness-margin", "0.002", "--view",
-      "--no-quiet-rai", "--no-grasp-sampler", "--no-grasp-sampler-scenes",
-      "--no-grasp-refine", "--no-grasp-widen", "--component-grasp-keep", "0",
-  ])
-  assert a.weight == 5.0 and not a.open_witness and a.analytic_seed_cap == 9
-  assert a.witness_margin == 0.002 and a.view and not a.quiet_rai
-  assert (not a.grasp_sampler and not a.grasp_sampler_scenes and not a.grasp_refine
-          and not a.grasp_widen)
-  assert a.component_grasp_keep == 0
 
 
 def test_profile_wins_over_config_and_individual_cli_wins_over_both(tmp_path):

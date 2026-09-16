@@ -226,15 +226,50 @@ WRENCH_PROFILES = {
         # is intentionally left to the later measured calibration.
         "isotropic": {"F_max": 50.0, "T_max": 3.0},  # conservative: one scalar torque cap
         "directional": {"F_axial": 50.0, "mu": 1.0,
-                        "T_axis": 3.0, "T_lat": 5.0},
+                        "F_t1": 50.0, "F_t2": 50.0,
+                        "T_axis": 3.0, "T_lat": 5.0,
+                        "T_t1": 5.0, "T_t2": 5.0},
         "asymmetric": {"F_push": 50.0, "F_pull": 50.0, "mu": 1.0,
-                       "T_axis": 3.0, "T_lat": 5.0, "T_close": 5.0},
+                       "F_t1": 50.0, "F_t2": 50.0,
+                       "T_axis": 3.0, "T_lat": 5.0, "T_close": 5.0,
+                       "T_t1": 5.0, "T_t2": 5.0},
+    },
+    "measured": {
+        # Axis-resolved working envelope used in the paper.  The grasp-frame columns are
+        # [t1, t2, n] == gripper-local [x, y, z].  For the Robotiq, each measured value is
+        # capped by the manufacturer's allowable limit: [50, 39.7, 50] N and
+        # [4.7, 4.5, 3] Nm.  The vacuum normal-force value is measured; its deliberately
+        # small lateral/moment caps are conservative modelling values, not measurements.
+        "isotropic": {
+            "two_finger": {"F_max": 39.7, "T_max": 3.0},
+            "vacuum": {"F_max": 5.0, "T_max": 0.1},
+        },
+        "directional": {
+            "two_finger": {"F_axial": 50.0, "mu": 39.7 / 50.0,
+                           "F_t1": 50.0, "F_t2": 39.7,
+                           "T_axis": 3.0, "T_lat": 4.5,
+                           "T_t1": 4.7, "T_t2": 4.5},
+            "vacuum": {"F_axial": 110.0, "mu": 5.0 / 110.0,
+                       "F_t1": 5.0, "F_t2": 5.0,
+                       "T_axis": 0.1, "T_lat": 0.1,
+                       "T_t1": 0.1, "T_t2": 0.1},
+        },
+        "asymmetric": {
+            "two_finger": {"F_push": 50.0, "F_pull": 50.0,
+                           "mu": 39.7 / 50.0, "F_t1": 50.0, "F_t2": 39.7,
+                           "T_axis": 3.0, "T_lat": 4.7, "T_close": 4.5,
+                           "T_t1": 4.7},
+            "vacuum": {"F_push": 110.0, "F_pull": 110.0,
+                       "mu": 5.0 / 110.0, "F_t1": 5.0, "F_t2": 5.0,
+                       "T_axis": 0.1, "T_lat": 0.1,
+                       "T_t1": 0.1, "T_t2": 0.1},
+        },
     },
 }
 
 
 def apply_wrench_profile(name):
-  """Install a named two-finger hardware envelope into every grasp-model family.
+  """Install a named gripper envelope into every grasp-model family.
 
   Scaling/axis-specific CLI overrides are intentionally applied by callers *after* this
   function, giving the usual explicit-flag > profile precedence.  ``None`` is a no-op so old
@@ -245,7 +280,13 @@ def apply_wrench_profile(name):
   if name not in WRENCH_PROFILES:
     raise ValueError(f"unknown wrench profile {name!r}; choose from {sorted(WRENCH_PROFILES)}")
   for model, caps in WRENCH_PROFILES[name].items():
-    PARAMS["grasp"][model]["two_finger"].update(caps)
+    # Legacy profiles contain a flat cap dictionary and affect the two-finger gripper only.
+    # New profiles may provide an envelope per gripper kind.
+    if "two_finger" not in caps and "vacuum" not in caps:
+      PARAMS["grasp"][model]["two_finger"].update(caps)
+      continue
+    for kind, kind_caps in caps.items():
+      PARAMS["grasp"][model][kind].update(kind_caps)
 
 
 def insert_force(part):
@@ -385,7 +426,8 @@ def cap_grasp_box(point, F_max, T_max):
   return np.array(G).T, np.array(ub, float)
 
 
-def cap_friction_grasp(point, n, t1, t2, F_axial, mu, T_axis, T_lat):
+def cap_friction_grasp(point, n, t1, t2, F_axial, mu, T_axis, T_lat,
+                       F_t1=None, F_t2=None, T_t1=None, T_t2=None):
   # DIRECTIONAL grasp: a wrench box in the GRASP's own frame (approach axis n, laterals t1,t2).
   #   FORCE : |axial| <= F_axial ; |lateral| <= mu*F_axial. The lateral bound is the friction
   #           at the grip/suction PRELOAD (holds even at zero external axial, unlike the
@@ -395,16 +437,21 @@ def cap_friction_grasp(point, n, t1, t2, F_axial, mu, T_axis, T_lat):
   #           torque (a two-finger grip lets the held part pivot in the jaws).
   n = np.asarray(n, float); t1 = np.asarray(t1, float); t2 = np.asarray(t2, float)
   G, ub = [], []
-  for vec, bound in ((n, F_axial), (t1, mu * F_axial), (t2, mu * F_axial)):
+  F_t1 = mu * F_axial if F_t1 is None else F_t1
+  F_t2 = mu * F_axial if F_t2 is None else F_t2
+  T_t1 = T_lat if T_t1 is None else T_t1
+  T_t2 = T_lat if T_t2 is None else T_t2
+  for vec, bound in ((n, F_axial), (t1, F_t1), (t2, F_t2)):
     for s in (+1.0, -1.0):
       G.append(_force_gen(s * vec, point)); ub.append(bound)
-  for axis, T in ((n, T_axis), (t1, T_lat), (t2, T_lat)):
+  for axis, T in ((n, T_axis), (t1, T_t1), (t2, T_t2)):
     for s in (+1.0, -1.0):
       G.append(_couple_gen(s * axis)); ub.append(T)
   return np.array(G).T, np.array(ub, float)
 
 
-def cap_asymmetric_grasp(point, n, t1, t2, F_push, F_pull, mu, T_axis, T_lat, T_close=None):
+def cap_asymmetric_grasp(point, n, t1, t2, F_push, F_pull, mu, T_axis, T_lat,
+                         T_close=None, F_t1=None, F_t2=None, T_t1=None, T_t2=None):
   # DIRECTIONAL + PUSH/PULL asymmetry. Grasp local z (`n`) points from the gripper INTO the
   # part, so a contact force ON the part
   #   along +n  = the palm / cup housing PUSHING the part -- a structural stop, not a
@@ -419,16 +466,20 @@ def cap_asymmetric_grasp(point, n, t1, t2, F_push, F_pull, mu, T_axis, T_lat, T_
   G, ub = [], []
   G.append(_force_gen(n, point)); ub.append(F_push)      # push (compression) -- strong
   G.append(_force_gen(-n, point)); ub.append(F_pull)     # pull-off -- weak
-  for vec in (t1, t2):
+  F_t1 = mu * F_pull if F_t1 is None else F_t1
+  F_t2 = mu * F_pull if F_t2 is None else F_t2
+  for vec, bound in ((t1, F_t1), (t2, F_t2)):
     for s in (+1.0, -1.0):
-      G.append(_force_gen(s * vec, point)); ub.append(mu * F_pull)
+      G.append(_force_gen(s * vec, point)); ub.append(bound)
   # torque caps per axis. t2 is the CLOSING axis (the line joining the two finger contacts):
   # the contacts are collinear on it, so they form NO couple to resist rotation ABOUT it --
   # only pad spin-friction does, so a two-finger's out-of-hand torque there is genuinely
   # weak. T_close (default = T_lat) makes that separately tunable; the vacuum is roll-
   # symmetric so it leaves T_close == T_lat.
   T_close = T_lat if T_close is None else T_close
-  for axis, T in ((n, T_axis), (t1, T_lat), (t2, T_close)):
+  T_t1 = T_lat if T_t1 is None else T_t1
+  T_t2 = T_close if T_t2 is None else T_t2
+  for axis, T in ((n, T_axis), (t1, T_t1), (t2, T_t2)):
     for s in (+1.0, -1.0):
       G.append(_couple_gen(s * axis)); ub.append(T)
   return np.array(G).T, np.array(ub, float)

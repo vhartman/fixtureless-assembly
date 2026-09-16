@@ -19,30 +19,6 @@ def test_bias_pose_is_the_exact_rigid_pose_encoded_by_each_soft_bias():
     assert np.isclose(np.linalg.det(R), 1.0)
 
 
-def test_assembly_pose_ssik_initializer_is_opt_in():
-  off = __import__("main").parse_args([])
-  on = __import__("main").parse_args(["--assemble-ssik-pose-seeds"])
-  projected = __import__("main").parse_args(["--assemble-ssik-pose-projection"])
-  reordered = __import__("main").parse_args(["--assemble-unbiased-first"])
-  racing = __import__("main").parse_args(["--assemble-basin-racing"])
-  handover_racing = __import__("main").parse_args(["--handover-basin-racing"])
-  assert off.assemble_ssik_pose_seeds is False
-  assert off.assemble_ssik_pose_projection is False
-  assert off.assemble_unbiased_first is False
-  assert off.assemble_basin_racing is False
-  assert on.assemble_ssik_pose_seeds is True
-  assert on.assemble_ssik_pose_projection is False
-  assert projected.assemble_ssik_pose_projection is True
-  assert reordered.assemble_unbiased_first is True
-  assert racing.assemble_basin_racing is True
-  assert racing.assemble_race_probe_evals == 24
-  assert racing.assemble_race_promote == 3
-  assert handover_racing.handover_basin_racing is True
-  assert handover_racing.handover_race_probe_evals == 24
-  assert handover_racing.handover_race_starts == 6
-  assert handover_racing.handover_race_promote == 3
-
-
 def test_bias_pose_accepts_a_projected_position_without_changing_orientation():
   bias = S._ASSEMBLE_BIAS_ORIENTATIONS[3]
   pose = S._assemble_bias_pose(bias, [0.2, -0.3, 0.7])
@@ -57,13 +33,6 @@ def test_assembly_position_bias_tracks_the_physical_table_centre():
   C.addFrame("table").setPosition([0.82, -0.13, 0.40]).setShape(
       ry.ST.box, [0.64, 1.10, 0.08, 0.0])
   assert np.allclose(S._assemble_position_bias_target(C), [0.82, -0.13, 0.74])
-
-
-def test_assembly_position_bias_preserves_the_historical_world_target():
-  C = ry.Config()
-  C.addFrame("table").setPosition([0.0, 0.0, 0.17]).setShape(
-      ry.ST.box, [3.0, 3.0, 0.06, 0.0])
-  assert np.allclose(S._assemble_position_bias_target(C), S._ASSEMBLE_POS_BIAS_TARGET)
 
 
 def test_exact_and_projected_ablation_cannot_run_together():

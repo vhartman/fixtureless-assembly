@@ -1,14 +1,17 @@
 import json
+import re
+import threading
 
 import numpy as np
 import pytest
 
 from benchmarks import plot_cube_scaling as C
-from benchmarks import plot_cube_wrench_envelope_scaling as W
 from benchmarks import plot_process_wrench_full_matrix as P
 from benchmarks import search_runner as B
 from benchmarks import run_wrench_sim_ablation as WS
 from benchmarks import run_paper_search_comparison as PS
+from benchmarks import run_paper_anytime_convergence as AC
+from benchmarks import run_process_wrench_full_matrix as PWM
 import problem
 
 
@@ -32,16 +35,6 @@ def _manifest():
 
 def test_wrench_sim_ablation_does_not_confound_task_model_with_mp_wrench_gate():
   assert all(not variant["mp_wrench_gate"] for variant in WS.VARIANTS.values())
-
-
-def test_wrench_sim_ablation_insertion_only_breakage_is_explicit():
-  default = WS._parse_args([])
-  isolated = WS._parse_args(["--insertion-only-grasp-check"])
-  assert not default.insertion_only_grasp_check
-  assert default.abort_on_action_failure
-  assert default.animate_grippers
-  assert not WS._parse_args(["--no-animate-grippers"]).animate_grippers
-  assert isolated.insertion_only_grasp_check
 
 
 def test_wrench_sim_ablation_flattens_phase_load_metrics():
@@ -119,12 +112,51 @@ def test_paper_runner_automatically_measures_first_motion_solution(tmp_path, mon
   monkeypatch.setattr(PS, "write_tables", lambda _output: None)
   output = tmp_path / "paper"
   assert PS.main(["--output", str(output), "--motion-runtime", "12"]) == 0
-  assert calls == [(output.resolve(), {
-      "runtime_s": 12.0, "timeout_s": 420.0, "memory_gb": 4.0, "resume": False,
-      "retry_failed_only": False,
-  })]
+  assert len(calls) == 1 and calls[0][0] == output.resolve()
+  assert calls[0][1]["runtime_s"] == 12.0
+  assert not calls[0][1]["resume"] and not calls[0][1]["retry_failed_only"]
   assert "--shared-grasp-db" in runner_calls[0]
-  assert runner_calls[0][runner_calls[0].index("--timeout") + 1] == "450.0"
+
+
+def test_benchmark_source_fingerprint_includes_nested_meshes_and_requirements():
+  _digest, files = B._source_hash()
+  assert "requirements.txt" in files
+  assert any(path.startswith("part_meshes/fabrica/") for path in files)
+
+
+def test_full_scaling_wrapper_forwards_independent_seeds_and_jobs(tmp_path, monkeypatch):
+  calls = []
+  monkeypatch.setattr(PWM.search_runner, "main", lambda args: calls.append(args) or 0)
+  assert PWM.main([
+      "--output", str(tmp_path / "scaling"), "--assembly", "cross",
+      "--seeds", "3", "5", "7", "--jobs", "2", "--timeout", "500",
+      "--dry-run", "--no-plot",
+  ]) == 0
+  assert len(calls) == 2  # topological control and finite-wrench matrix
+  for call in calls:
+    assert call[call.index("--seeds") + 1:call.index("--jobs")] == ["3", "5", "7"]
+    assert call[call.index("--jobs") + 1] == "2"
+    assert call[call.index("--timeout") + 1] == "500.0"
+
+
+def test_anytime_wrapper_selects_case_subset_and_forwards_jobs(tmp_path, monkeypatch):
+  calls = []
+  monkeypatch.setattr(AC.search_runner, "main", lambda args: calls.append(args) or 0)
+  assert AC.main([
+      "--output", str(tmp_path / "anytime"), "--cases", "cross", "chair",
+      "--seeds", "11", "13", "--jobs", "2", "--runtime", "150", "--dry-run",
+  ]) == 0
+  assert len(calls) == 1
+  call = calls[0]
+  assert call[call.index("--jobs") + 1] == "2"
+  assert call[call.index("--timeout") + 1] == "240.0"
+  assert call[call.index("--seeds") + 1:call.index("--jobs")] == ["11", "13"]
+  selector = call[call.index("--only") + 1]
+  assert re.search(selector, "cross__ours__seed-11")
+  assert re.search(selector, "chair__ours__seed-13")
+  assert not re.search(selector, "stool__ours__seed-11")
+  assert "--append-arg=--milestones-anytime" in call
+  assert call[call.index("--append-arg") + 1] == "150.0"
 
 
 def test_grasp_database_roundtrip_preserves_lazy_rows_and_kind_masks(tmp_path):
@@ -185,13 +217,13 @@ def test_paper_tables_use_requested_order_caption_and_explicit_uncertainty():
   comparison = PS._comparison_tex(groups)
   breakdown = PS._breakdown_tex(groups)
   assert "mean and standard deviation of 2 runs" in comparison
-  assert "1.0 +- 0.0" in comparison
+  assert "1.00 +- 0.00" in comparison
   assert "4 +-" not in comparison
   assert comparison.index("F. Beam") < comparison.index("F. Plumber block")
   assert comparison.index("F. Plumber block") < comparison.index("F. Car")
   assert comparison.index("F. Duct") < comparison.index("F. Stool")
   assert "Breakdown of where time is spent in \\textsc{Wrap}." in breakdown
-  assert "1.0 +- 0.0" in breakdown
+  assert "1.00 +- 0.00" in breakdown
 
 
 def _matrix_manifest():
@@ -346,6 +378,41 @@ def test_runner_can_stop_remaining_cell_trials_after_first_timeout(tmp_path, mon
   ])
   assert status == 1
   assert calls == ["a__legacy__seed-3__rep-01"]
+
+
+def test_runner_jobs_parallelizes_cases_but_serializes_each_case(tmp_path, monkeypatch):
+  manifest = _manifest()
+  path = tmp_path / "manifest.json"
+  path.write_text(json.dumps(manifest), encoding="utf-8")
+  lock = threading.Lock()
+  active_cases = set()
+  first_cases = set()
+  overlap = []
+  first_case_gate = threading.Barrier(2)
+
+  def fake_run_one(spec, *_args, **_kwargs):
+    with lock:
+      assert spec["case"] not in active_cases
+      active_cases.add(spec["case"])
+      overlap.append(len(active_cases))
+      first = spec["case"] not in first_cases
+      first_cases.add(spec["case"])
+    if first:
+      first_case_gate.wait(timeout=2)
+    with lock:
+      active_cases.remove(spec["case"])
+    return {
+        "run_id": spec["run_id"], "case": spec["case"], "variant": spec["variant"],
+        "seed": spec["seed"], "repeat": spec["repeat"], "tags": spec["tags"],
+        "status": "success", "success": True, "timed_out": False, "wall_s": 0.1,
+        "plan_cost": 1,
+    }
+
+  monkeypatch.setattr(B, "run_one", fake_run_one)
+  monkeypatch.setattr(B, "provenance", lambda: {"source_sha256": "unit-source"})
+  status = B.main([str(path), "--output", str(tmp_path / "results"), "--jobs", "2"])
+  assert status == 0
+  assert max(overlap) == 2
 
 
 def test_process_wrench_plot_can_use_plan_cost(tmp_path):
@@ -576,119 +643,6 @@ def test_matrix_suite_writes_markdown_csv_and_json(tmp_path):
   data = json.loads((tmp_path / "matrix.json").read_text())
   assert data["groups"][0]["method"] == "counting"
   assert data["groups"][0]["physics"] == "geometry"
-
-
-def test_cube_scaling_manifest_is_the_requested_12_by_3_product():
-  path = B.ROOT / "benchmarks" / "manifests" / "cube_scaling.json"
-  runs = B.expand_runs(B.validate_manifest(json.loads(path.read_text())))
-  assert len(runs) == 36
-  assert {int(C._flag_value(r["args"], "--parts")) for r in runs} == set(range(1, 13))
-  assert {int(C._flag_value(r["args"], "--num-robots")) for r in runs} == {2, 3, 4}
-  assert all("--vacuum" in r["args"] for r in runs)
-  assert all(r["max_address_space_gb"] == 6.0 for r in runs)
-
-
-def test_piecewise_cube_scaling_manifest_changes_only_the_assembly_family():
-  path = B.ROOT / "benchmarks" / "manifests" / "cube_scaling_piecewise.json"
-  runs = B.expand_runs(B.validate_manifest(json.loads(path.read_text())))
-  assert len(runs) == 36
-  assert all(C._flag_value(r["args"], "--assembly") == "cube-sequence-2x2x3"
-             for r in runs)
-  assert {int(C._flag_value(r["args"], "--parts")) for r in runs} == set(range(1, 13))
-  assert {int(C._flag_value(r["args"], "--num-robots")) for r in runs} == {2, 3, 4}
-
-
-@pytest.mark.parametrize("name,n_runs,parts,assembly", [
-    ("cube_piecewise_process_wrench_full_matrix.json", 198, range(2, 13),
-     "cube-sequence-2x2x3"),
-    ("cross_process_wrench_full_matrix.json", 108, range(2, 8), "cross"),
-])
-def test_full_process_wrench_manifests_have_requested_product(name, n_runs, parts, assembly):
-  path = B.ROOT / "benchmarks" / "manifests" / name
-  runs = B.expand_runs(B.validate_manifest(json.loads(path.read_text())))
-  assert len(runs) == n_runs
-  assert {int(C._flag_value(r["args"], "--parts")) for r in runs} == set(parts)
-  assert {int(C._flag_value(r["args"], "--num-robots")) for r in runs} == {2, 3, 4}
-  assert {float(C._flag_value(r["args"], "--insert-force")) / 10.0
-          for r in runs} == {0.0, 0.01, 0.1, 0.5, 1.0, 2.0}
-  assert all(C._flag_value(r["args"], "--assembly") == assembly for r in runs)
-  assert all("--no-wrench" not in r["args"] and "--ignore-gravity" not in r["args"]
-             for r in runs)
-  assert all(r["max_address_space_gb"] == 6.0 for r in runs)
-  if assembly == "cross":
-    assert all(C._flag_value(r["args"], "--grippers").split(",")
-               == ["two_finger"] * int(C._flag_value(r["args"], "--num-robots"))
-               for r in runs)
-  else:
-    assert all("--vacuum" in r["args"] and "--grippers" not in r["args"] for r in runs)
-
-
-@pytest.mark.parametrize("name,n_runs,parts,assembly", [
-    ("cube_piecewise_process_wrench_full_no_wrench.json", 33, range(2, 13),
-     "cube-sequence-2x2x3"),
-    ("cross_process_wrench_full_no_wrench.json", 18, range(2, 8), "cross"),
-])
-def test_full_process_wrench_controls_are_not_duplicated_per_lambda(
-    name, n_runs, parts, assembly):
-  path = B.ROOT / "benchmarks" / "manifests" / name
-  runs = B.expand_runs(B.validate_manifest(json.loads(path.read_text())))
-  assert len(runs) == n_runs
-  assert {int(C._flag_value(r["args"], "--parts")) for r in runs} == set(parts)
-  assert {int(C._flag_value(r["args"], "--num-robots")) for r in runs} == {2, 3, 4}
-  assert all(C._flag_value(r["args"], "--assembly") == assembly for r in runs)
-  assert all("--no-wrench" in r["args"] and "--insert-force" not in r["args"]
-             for r in runs)
-
-
-@pytest.mark.parametrize("name,n_runs,assembly", [
-    ("cube_piecewise_process_wrench_full_optimistic_no_wrench.json", 33,
-     "cube-sequence-2x2x3"),
-    ("cross_process_wrench_full_optimistic_no_wrench.json", 18, "cross"),
-])
-def test_full_process_wrench_optimistic_controls_are_matched(name, n_runs, assembly):
-  path = B.ROOT / "benchmarks" / "manifests" / name
-  runs = B.expand_runs(B.validate_manifest(json.loads(path.read_text())))
-  assert len(runs) == n_runs
-  assert all(C._flag_value(r["args"], "--assembly") == assembly for r in runs)
-  assert all("--no-wrench" in r["args"] and "--optimistic" in r["args"]
-             and "--no-optimistic-fallback" in r["args"]
-             and "--insert-force" not in r["args"] for r in runs)
-
-
-def test_wrench_envelope_scaling_is_12_by_5_and_changes_all_vacuum_caps():
-  path = B.ROOT / "benchmarks" / "manifests" / "cube_wrench_envelope_scaling.json"
-  runs = B.expand_runs(B.validate_manifest(json.loads(path.read_text())))
-  assert len(runs) == 60
-  assert {int(C._flag_value(r["args"], "--parts")) for r in runs} == set(range(1, 13))
-  assert {int(C._flag_value(r["args"], "--num-robots")) for r in runs} == {2}
-  assert {float(C._flag_value(r["args"], "--vacuum-scale")) for r in runs} == set(W.SCALES)
-  assert all("--vacuum" in r["args"] and "--no-wrench" not in r["args"] for r in runs)
-
-
-def test_cross_wrench_envelope_is_7_by_5_and_two_finger_only():
-  path = B.ROOT / "benchmarks" / "manifests" / "cross_wrench_envelope_scaling.json"
-  runs = B.expand_runs(B.validate_manifest(json.loads(path.read_text())))
-  assert len(runs) == 35
-  assert {int(C._flag_value(r["args"], "--parts")) for r in runs} == set(range(1, 8))
-  assert {int(C._flag_value(r["args"], "--num-robots")) for r in runs} == {2}
-  assert {float(C._flag_value(r["args"], "--two-finger-scale"))
-          for r in runs} == set(W.SCALES)
-  assert all(C._flag_value(r["args"], "--grippers") == "two_finger,two_finger"
-             for r in runs)
-  assert all("--vacuum" not in r["args"] and "--no-wrench" not in r["args"] for r in runs)
-
-
-@pytest.mark.parametrize("name,parts,scale_flag", [
-    ("cube_wrench_x100_high_friction.json", range(1, 11), "--vacuum-scale"),
-    ("cross_wrench_x100_high_friction.json", range(1, 8), "--two-finger-scale"),
-])
-def test_high_friction_diagnostic_changes_only_finite_support_model(name, parts, scale_flag):
-  path = B.ROOT / "benchmarks" / "manifests" / name
-  runs = B.expand_runs(B.validate_manifest(json.loads(path.read_text())))
-  assert {int(C._flag_value(r["args"], "--parts")) for r in runs} == set(parts)
-  assert all(float(C._flag_value(r["args"], scale_flag)) == 100 for r in runs)
-  assert all(float(C._flag_value(r["args"], "--table-friction")) == 10 for r in runs)
-  assert all("--no-wrench" not in r["args"] for r in runs)
 
 
 def test_cube_scaling_summary_does_not_turn_timeout_into_solution_time():

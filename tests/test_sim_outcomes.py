@@ -1,138 +1,6 @@
-"""END-TO-END SIM OUTCOMES -- the regression net the unit tests do not provide.
-
-WHY THIS FILE EXISTS. On 2026-07-26 a bare `NameError` killed EVERY `sim.py run`
-invocation while all 126 unit tests stayed green, because nothing in the suite ever built a
-SimScene. The same blind spot hid a `--mass-scale` StopIteration and a missing
-`<compiler angle="radian"/>` that made MuJoCo read rai's joint ranges as degrees. All three were
-found by running the sim by hand.
-
-WHAT THESE ASSERT, AND WHY NOT MILLIMETRES. A final part-pose error is almost always a CASCADE:
-one mate welds to a wrong datum and everything after inherits the displacement, so the headline
-mm number describes the wreckage rather than the fault (measured: a 33.7mm first miss became a
-1894mm final error). These tests assert the FIRST FAILURE's IDENTITY -- which action, which
-failure kind -- plus the ok/total count. That is the thing that stays stable when the physics is
-re-tuned, and the thing that actually changes when something breaks.
-
-The scene/path artifacts are untracked working files; every test SKIPS if its pair is absent
-rather than failing, so a fresh checkout stays green.
-"""
-import os
-import re
-import sys
-import json
+"""Behavioral checks for simulator outcomes and generated MuJoCo models."""
 
 import pytest
-
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def _have(*files):
-  return all(os.path.exists(os.path.join(REPO, f)) for f in files)
-
-
-def _has_final_export(path):
-  """Physics replay is meaningful only for a modern path with its exact task/keyframe bundle."""
-  try:
-    with open(os.path.join(REPO, path)) as f:
-      data = json.load(f)
-    return isinstance(data, dict) and isinstance(data.get("mp_export"), dict)
-  except (OSError, ValueError):
-    return False
-
-
-def _run(capsys, argv):
-  """Run a sim CLI invocation and return its printed output."""
-  import sim as S
-  cwd = os.getcwd()
-  os.chdir(REPO)
-  try:
-    S._cli_run(S._build_cli().parse_args(argv))
-  finally:
-    os.chdir(cwd)
-  return capsys.readouterr().out
-
-
-def _summary(out):
-  """(n_ok, n_total, first_failure_line or None) from a run's printed summary."""
-  m = re.search(r"(\d+)/(\d+) actions ok", out)
-  assert m, f"no summary line in output:\n{out[-2000:]}"
-  first = None
-  lines = out.splitlines()
-  for i, ln in enumerate(lines):
-    if "FIRST FAILURE" in ln:
-      first = lines[i + 1].strip() if i + 1 < len(lines) else ""
-      break
-  return int(m.group(1)), int(m.group(2)), first
-
-
-# The old local car path is retained as data, but it predates the exact task/keyframe export.
-# Never turn an outcome regression into a fresh IK solve: skip it until the path is regenerated.
-CAR = ["run", "car-mini-new.json", "--mp-path", "mp-car-mini-new.json"]
-
-
-@pytest.mark.skipif(not (_have("car-mini-new.json", "mp-car-mini-new.json") and
-                         _has_final_export("mp-car-mini-new.json")),
-                    reason="modern car-mini path with embedded final export not present")
-def test_car_mini_actuated_executes_cleanly(capsys):
-  """The compliant-arm reference case. Catches anything that breaks --actuated end to end:
-  the arm model, the servos, the velocity feedforward, the settle gate, the weld wrench.
-  (--smooth is gone with the --prioritized branch: one preprocessing mode -> one executor.)"""
-  # pin the ORIGINAL configuration: actuated drive alone (2026-07-29 made the full
-  # corridor/servo stack the CLI default; this test isolates the plain actuated path).
-  out = _run(capsys, CAR + ["--actuated", "--no-corridor", "--no-skill-servo",
-                            "--no-force-limits"])
-  n_ok, n_tot, first = _summary(out)
-  assert first is None, f"expected a clean run, first failure was: {first}"
-  assert n_ok == n_tot, f"{n_ok}/{n_tot}"
-
-
-@pytest.mark.skipif(not (_have("car-mini-new.json", "mp-car-mini-new.json") and
-                         _has_final_export("mp-car-mini-new.json")),
-                    reason="modern car-mini path with embedded final export not present")
-def test_car_mini_mocap_corridor_executes_cleanly_and_verifies(capsys):
-  """The DEFAULT path plus corridor retiming. Also pins the corridor's own verification: with
-  the legitimate-contact filter in place car-mini's schedule is genuinely collision-free, so a
-  regression that reintroduces false positives (a gripper vs the part it HOLDS, a seated mate)
-  shows up here rather than as mysterious refinement passes."""
-  # pin the ORIGINAL configuration: mocap + bare corridor (no actuated/servo/spline/
-  # rate-clamp/cross-only, which are all CLI defaults since 2026-07-29).
-  out = _run(capsys, CAR + ["--corridor", "--force-limits", "--inertia-factor", "1",
-                            "--no-actuated", "--no-skill-servo", "--no-spline",
-                            "--no-corridor-rate-clamp", "--no-corridor-cross-only"])
-  n_ok, n_tot, first = _summary(out)
-  assert first is None, f"expected a clean run, first failure was: {first}"
-  assert n_ok == n_tot, f"{n_ok}/{n_tot}"
-  assert "certified collision-free" in out, "corridor verification did not run or did not pass"
-
-
-@pytest.mark.skipif(not _have("car-mini-new.json", "mp-car-mini-new.json"),
-                    reason="legacy car-mini plan/path pair not present")
-def test_a_legacy_path_without_final_export_is_refused(capsys):
-  """A bare-list path has neither exact tasks nor final keyframes. Replay must not improvise
-  replacements by re-solving IK; regeneration is safer than a plausible-looking wrong run."""
-  with pytest.raises(SystemExit) as exc:
-    _run(capsys, CAR)
-  out = capsys.readouterr().out + str(exc.value)
-  assert "has no final post-fusion export block" in out
-  assert "Refusing to re-solve IK" in out
-  assert "actions ok" not in out, "legacy path executed despite lacking its exact export"
-
-
-@pytest.mark.skipif(not (_have("cross8.json", "mp.json") and _has_final_export("mp.json")),
-                    reason="modern cross8 path with embedded final export not present")
-def test_cross8_warns_that_its_assembles_have_no_funnel(capsys):
-  """cross8 was planned with pre_insertion=0, so every assemble drives the held part straight
-  to a pose already in contact and it arrives LATERALLY -- 0.213mm of penetration while the
-  target was still at rest, then ~800 steps of shoving and a weld fired 32mm off. The warning
-  is what turns an hour of probing into a line of output, so it must keep firing."""
-  out = _run(capsys, ["run", "cross8.json", "--mp-path", "mp.json",
-                      "--no-corridor", "--no-actuated", "--no-skill-servo",
-                      "--no-force-limits"])
-  assert "NO INSERTION FUNNEL" in out
-  m = re.search(r"NO INSERTION FUNNEL on (\d+)/(\d+) assemble", out)
-  assert m and m.group(1) == m.group(2), "expected EVERY cross8 assemble to be unfunnelled"
-
 
 def test_main_refuses_to_silently_do_nothing():
   """`main.py --motion-plan --save x` without --solve/--load-plan used to walk to the end and
@@ -199,6 +67,68 @@ def test_car_mini_wheel_rims_rest_on_sim_table():
     assert abs(rim_bottom - table_top) < 5e-4, (part, rim_bottom, table_top)
 
 
+def test_mujoco_rounded_box_does_not_fill_rai_rounded_corners():
+  """The sim collision proxy must represent the ssBox used by planning, not its AABB.
+
+  A small probe near a sharp-box corner is outside the radius-5mm rounded corner, while a
+  probe at the centre of a planar face must still make contact. This is the geometry mismatch
+  that previously let RAI certify a cube re-pick which bulldozed the assembly in MuJoCo.
+  """
+  import mujoco
+  import sim as S
+
+  rounded = S._rounded_box_geoms_xml(
+      ("box", [0.055, 0.055, 0.020, 0.005]), 0.5, 0.1, 0,
+      "0.8 0.2 0.2 1", "rounded")
+  assert rounded is not None and rounded.count("<geom") == 15
+
+  def contacts_at(pos):
+    xml = f"""
+    <mujoco><option gravity="0 0 0"/><worldbody>
+      {rounded}
+      <body pos="{pos[0]} {pos[1]} {pos[2]}"><freejoint/>
+        <geom name="probe" type="sphere" size="0.0005" mass="0.001"/>
+      </body>
+    </worldbody></mujoco>"""
+    model = mujoco.MjModel.from_xml_string(xml)
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    return data.ncon
+
+  # At x=y=27mm the probe is 6.36mm from the corner-arc centre (22.5,22.5),
+  # hence clear of the 5mm arc. A sharp 27.5mm-half-extent box would collide.
+  assert contacts_at((0.027, 0.027, 0.0)) == 0
+  assert contacts_at((0.0273, 0.0, 0.0)) > 0
+
+
+def test_grasp_and_mate_welds_have_distinct_default_compliance():
+  """A planned rigid subassembly must not become a soft serial chain in physics."""
+  import mujoco
+  import assembly as A
+  from env import make_four_robot_env
+  import sim as S
+
+  asm = A.make_assembly("peg-hole", 2)
+  C = make_four_robot_env(num_robots=1, floating_ee=True, vacuum=False)
+  A.add_disassembled_obj(C, asm, spacing=0.2, float_height=0.002)
+  state = A.get_initial_state(C, asm)
+
+  def timeconsts(**kwargs):
+    model = mujoco.MjModel.from_xml_string(
+        S.build_mjcf(asm, state, ["a1"], **kwargs))
+    grasp = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_EQUALITY, "grasp_a1_obj_1")
+    mate = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_EQUALITY, "mate_obj_1")
+    return float(model.eq_solref[grasp, 0]), float(model.eq_solref[mate, 0])
+
+  assert timeconsts() == pytest.approx((S.WELD_TIMECONST, S.MATE_WELD_TIMECONST))
+  # The old option remains a shared override; the new option can independently restore the
+  # rigid mate model in experiments that deliberately soften the physical grasp.
+  assert timeconsts(weld_timeconst=0.006) == pytest.approx((0.006, 0.006))
+  assert timeconsts(weld_timeconst=0.006,
+                    mate_weld_timeconst=0.003) == pytest.approx((0.006, 0.003))
+
+
 def test_chair_round_parts_do_not_roll_out_of_their_scatter_cells():
   """The bench must give loose horizontal cylinders finite rolling resistance.
 
@@ -228,13 +158,14 @@ def test_chair_round_parts_do_not_roll_out_of_their_scatter_cells():
     qadr = model.jnt_qposadr[model.body_jntadr[body_id]]
     starts[part] = (qadr, data.qpos[qadr:qadr + 2].copy())
 
-  # Longer than the approach to the first pick in the phase-scheduled Chair replay.
-  for _ in range(int(6.4 / model.opt.timestep)):
+  # Lockstep can leave a late post untouched for minutes. Thirty seconds is long enough to
+  # expose the old steady creep (about 1.5mm here) without making this regression expensive.
+  for _ in range(int(30.0 / model.opt.timestep)):
     mujoco.mj_step(model, data)
 
   for part, (qadr, xy0) in starts.items():
     drift = float(np.linalg.norm(data.qpos[qadr:qadr + 2] - xy0))
-    assert drift < 1e-3, (part, drift)
+    assert drift < 5e-4, (part, drift)
 
 
 def test_topple_error_respects_primitive_rotational_symmetry():

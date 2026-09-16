@@ -10,6 +10,32 @@ trimesh = pytest.importorskip("trimesh")
 import sim
 
 
+def test_recording_mesh_assets_relocate_by_content_keyed_basename(tmp_path, monkeypatch):
+  cache = tmp_path / "sim_meshes"
+  cache.mkdir()
+  local = cache / "arm__m0123456789.obj"
+  local.write_text("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n", encoding="utf-8")
+  monkeypatch.setattr(sim, "_MESH_CACHE_DIR", str(cache))
+  old = "/another/computer/project/sim_meshes/arm__m0123456789.obj"
+  xml = f'<mujoco><asset><mesh name="arm" file="{old}"/></asset></mujoco>'
+
+  relocated = sim._relocate_recording_mesh_assets(xml)
+
+  assert old not in relocated
+  assert f'file="{local.resolve()}"' in relocated
+
+
+def test_recording_mesh_assets_do_not_guess_for_non_cache_paths(tmp_path, monkeypatch):
+  cache = tmp_path / "sim_meshes"
+  cache.mkdir()
+  (cache / "visual.obj").write_text("not the source asset", encoding="utf-8")
+  monkeypatch.setattr(sim, "_MESH_CACHE_DIR", str(cache))
+  old = "/another/computer/project/source_meshes/visual.obj"
+  xml = f'<mujoco><asset><mesh name="visual" file="{old}"/></asset></mujoco>'
+
+  assert sim._relocate_recording_mesh_assets(xml) == xml
+
+
 def test_replay_exports_exact_frame_as_visual_only_self_contained_glb(tmp_path):
   xml = """
   <mujoco>
@@ -47,3 +73,41 @@ def test_scene_export_requires_glb_suffix(tmp_path):
   data = mujoco.MjData(model)
   with pytest.raises(ValueError, match="requires a .glb"):
     sim.export_visual_scene_glb(model, data, tmp_path / "scene.obj")
+
+
+def test_scene_export_does_not_apply_compiled_mesh_offset_twice(tmp_path):
+  # MuJoCo recentres an imported mesh and rotates it to principal axes.  The compensating
+  # transform is already folded into geom_pos/geom_quat; geom_xpos/xmat therefore maps the
+  # compiled mesh vertices directly to world.  This deliberately off-centre tetrahedron
+  # catches the tempting but wrong extra mesh_pos/mesh_quat multiplication.
+  obj = b"""\
+v 5 0 0
+v 7 0 0
+v 5 2 0
+v 5 0 2
+f 1 2 3
+f 1 4 2
+f 1 3 4
+f 2 4 3
+"""
+  xml = """
+  <mujoco>
+    <asset><mesh name="offcentre" file="offcentre.obj"/></asset>
+    <worldbody>
+      <body pos="1 2 3">
+        <geom type="mesh" mesh="offcentre" pos=".1 .2 .3"
+              rgba=".2 .4 .8 1" group="3"/>
+      </body>
+    </worldbody>
+  </mujoco>
+  """
+  model = mujoco.MjModel.from_xml_string(xml, assets={"offcentre.obj": obj})
+  data = mujoco.MjData(model)
+  output = tmp_path / "offcentre.glb"
+  sim.export_visual_scene_glb(model, data, output)
+
+  scene = trimesh.load(output, force="scene")
+  # Raw MuJoCo world bounds are x=[6.1,8.1], y=[2.2,4.2], z=[3.3,5.3].  The exporter maps
+  # (x,y,z) -> (x,z,-y) for glTF's Y-up convention.
+  np.testing.assert_allclose(
+      scene.bounds, [[6.1, 3.3, -4.2], [8.1, 5.3, -2.2]], atol=1e-5)

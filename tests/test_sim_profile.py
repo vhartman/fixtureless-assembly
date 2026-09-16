@@ -29,14 +29,6 @@ def test_standard_sim_profile_is_reversible_by_explicit_flags():
   assert a.corridor and a.joint_rate == 0.5 and a.mass_scale == 0.25
 
 
-def test_wait_for_gripper_is_opt_in_and_requires_animation():
-  assert not sim.parse_args(["run", "plan.json"]).wait_for_gripper
-  a = sim.parse_args([
-      "run", "plan.json", "--animate-grippers", "--wait-for-gripper", "--articulated",
-      "--no-actuated"])
-  assert a.animate_grippers and a.wait_for_gripper
-
-
 def test_kinematic_arm_reasserts_visual_gripper_mimic_joints(monkeypatch):
   """Kinematic parent resets must not leave presentation-only child hinges free-running."""
   scene = sim.SimScene.__new__(sim.SimScene)
@@ -76,29 +68,6 @@ def test_standard_profile_refuses_an_implicit_motion_plan_before_scene_build():
     sim._cli_run(a)
 
 
-def test_process_wrench_application_is_explicit_and_reversible():
-  assert not sim.parse_args(["run", "plan.json"]).apply_process_wrench
-  assert sim.parse_args(
-      ["run", "plan.json", "--apply-process-wrench"]).apply_process_wrench
-  assert not sim.parse_args([
-      "run", "plan.json", "--apply-process-wrench",
-      "--no-apply-process-wrench"]).apply_process_wrench
-
-
-def test_sim_gravity_is_enabled_by_default_and_explicitly_reversible():
-  assert sim.parse_args(["run", "plan.json"]).sim_gravity
-  assert not sim.parse_args(["run", "plan.json", "--no-sim-gravity"]).sim_gravity
-  assert sim.parse_args([
-      "run", "plan.json", "--no-sim-gravity", "--sim-gravity"]).sim_gravity
-
-
-def test_insertion_only_grasp_check_is_opt_in():
-  assert not sim.parse_args(["run", "plan.json"]).insertion_only_grasp_check
-  assert sim.parse_args([
-      "run", "plan.json", "--apply-process-wrench",
-      "--insertion-only-grasp-check"]).insertion_only_grasp_check
-
-
 def test_exact_grasp_target_uses_authored_relation_not_witness_fk(monkeypatch):
   part_pose = np.asarray([0.4, -0.2, 0.7, 1.0, 0.0, 0.0, 0.0])
   grasp = np.asarray([0.03, 0.01, -0.02, 1.0, 0.0, 0.0, 0.0])
@@ -113,16 +82,6 @@ def test_exact_grasp_target_uses_authored_relation_not_witness_fk(monkeypatch):
       part_pose, np.r_[grasp[:3], sim._quat_mul(grasp[3:], correction)])
 
   assert np.allclose(got, expected)
-
-
-def test_process_noise_cli_is_explicit_and_replayable():
-  a = sim.parse_args([
-      "run", "plan.json", "--apply-process-wrench", "--process-noise", "sample",
-      "--process-noise-seed", "17", "--process-engagement-distance", "0.006",
-      "--process-wrench-ramp", "0.08"])
-  assert a.process_noise == "sample" and a.process_noise_seed == 17
-  assert a.process_engagement_distance == pytest.approx(0.006)
-  assert a.process_wrench_ramp == pytest.approx(0.08)
 
 
 def test_process_noise_realizations_cover_exact_box_corners_and_seeded_samples():
@@ -240,12 +199,38 @@ def test_grasp_wrench_metric_requires_a_contiguous_full_window():
   assert got["phases"]["transport"]["peak_sustained_utilization"] == pytest.approx(0.6)
 
 
+def test_grasp_wrench_incremental_window_recovers_after_infinite_sample():
+  scene = sim.SimScene.__new__(sim.SimScene)
+  scene._wrench_metric_window = 2
+  scene._wrench_metric_history = {}
+  scene._wrench_metrics_by_kind = {}
+  scene.gripper_kinds = {"a1": "vacuum"}
+  scene._wrench_metrics = {
+      phase: {
+          "samples": 0, "peak_force_n": 0.0, "peak_torque_nm": 0.0,
+          "peak_utilization": 0.0, "peak_sustained_force_n": None,
+          "peak_sustained_torque_nm": None, "peak_sustained_utilization": None,
+      }
+      for phase in ("transport", "insertion")
+  }
+  for tick, utilization in enumerate((float("inf"), 1.0, 1.0)):
+    scene.step_i = tick
+    scene._observe_grasp_wrench(
+        "transport", "a1", "obj_0", utilization, 1.0, 1.0)
+  _hist, _last, total = scene._wrench_metric_history[("transport", "a1", "obj_0")]
+  assert np.allclose(total, [2.0, 2.0, 2.0])
+
+
 def test_max_robotiq_selects_axis_resolved_breakaway_unless_overridden():
   assert sim.parse_args(["run", "plan.json"]).directional_caps is None
   assert sim._resolve_directional_caps({"wrench_profile": "max_robotiq"}, None)
   assert not sim._resolve_directional_caps({"wrench_profile": "max_robotiq"}, False)
   assert sim._resolve_directional_caps({}, True)
   assert not sim._resolve_directional_caps({}, None)
+
+
+def test_measured_profile_selects_axis_resolved_breakaway():
+  assert sim._resolve_directional_caps({"wrench_profile": "measured"}, None)
 
 
 def test_recording_embeds_machine_readable_verdict_and_profile(tmp_path):

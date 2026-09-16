@@ -2517,17 +2517,20 @@ class SimScene:
     if name == "asymmetric":
       _hit(Fg[2], c["F_push"] if Fg[2] > 0 else c["F_pull"],
            "axial-push" if Fg[2] > 0 else "axial-PULL")
-      lat = c["mu"] * c["F_pull"]
-      _hit(Fg[0], lat, "lat1"); _hit(Fg[1], lat, "lat2")
+      lat1 = c.get("F_t1", c["mu"] * c["F_pull"])
+      lat2 = c.get("F_t2", c["mu"] * c["F_pull"])
+      _hit(Fg[0], lat1, "lat1"); _hit(Fg[1], lat2, "lat2")
       _hit(Tg[2], c.get("T_axis"), "T_axis")
-      _hit(Tg[0], c.get("T_lat"), "T_lat")
-      _hit(Tg[1], c.get("T_close", c.get("T_lat")), "T_close")
+      _hit(Tg[0], c.get("T_t1", c.get("T_lat")), "T_lat1")
+      _hit(Tg[1], c.get("T_t2", c.get("T_close", c.get("T_lat"))), "T_lat2")
     elif name == "directional":
       _hit(Fg[2], c["F_axial"], "axial")
-      lat = c["mu"] * c["F_axial"]
-      _hit(Fg[0], lat, "lat1"); _hit(Fg[1], lat, "lat2")
+      lat1 = c.get("F_t1", c["mu"] * c["F_axial"])
+      lat2 = c.get("F_t2", c["mu"] * c["F_axial"])
+      _hit(Fg[0], lat1, "lat1"); _hit(Fg[1], lat2, "lat2")
       _hit(Tg[2], c.get("T_axis"), "T_axis")
-      _hit(Tg[0], c.get("T_lat"), "T_lat"); _hit(Tg[1], c.get("T_lat"), "T_lat")
+      _hit(Tg[0], c.get("T_t1", c.get("T_lat")), "T_lat1")
+      _hit(Tg[1], c.get("T_t2", c.get("T_lat")), "T_lat2")
     else:                                                  # isotropic: magnitude bounds
       _hit(float(np.linalg.norm(F_p)), c.get("F_max"), "F")
       _hit(float(np.linalg.norm(T_gp)), c.get("T_max"), "T")
@@ -7936,7 +7939,7 @@ def _resolve_directional_caps(cfg, cli_value):
   """Explicit sim flag wins; otherwise an anisotropic named cap profile keeps its axes."""
   if cli_value is not None:
     return bool(cli_value)
-  return _saved(cfg, "wrench_profile") == "max_robotiq"
+  return _saved(cfg, "wrench_profile") in {"max_robotiq", "measured"}
 
 
 def _cli_run(a):

@@ -161,6 +161,19 @@ def test_cooling_manifold_hex_fasteners_have_sixfold_mate_symmetry():
                              np.sin(k * np.pi / 6.0)])
 
 
+def test_duct_fasteners_are_not_infinite_strength_handles():
+  asm = P.make_assembly("fabrica-duct", 8)
+  # obj_1 is the load-bearing cover.  The remaining six children are small
+  # fasteners whose authored finite mates must not carry the complete duct.
+  assert set(asm.mate_wrench_limits) == {
+      "obj_2", "obj_3", "obj_4", "obj_5", "obj_6", "obj_7"}
+  for limit in asm.mate_wrench_limits.values():
+    assert np.allclose(limit["force"], [0.25, 0.25, 0.25])
+    assert np.allclose(limit["torque"], [0.005, 0.005, 0.005])
+  assert sum(limit["force"][2] for limit in asm.mate_wrench_limits.values()) \
+      < 9.81 * sum(asm.masses.values())
+
+
 def test_fabrica_scattered_collision_and_mate_openings():
   for kind, n_parts in FABRICA_MODELS:
     asm = P.make_assembly(kind, n_parts)

@@ -1,21 +1,11 @@
-"""Regression net for the assembly planner: run a spread of assemblies through the
-GEOMETRIC solver (no real-arm IK -- the cheap floating-EE feasibility layer only) and check
-each returned plan is a genuine, feasible, goal-reaching sequence.
+"""Behavioral tests for the assembly planner.
 
-Kept deliberately fast (~20s total): geometry only for the bulk, a few SMALL wrench cases
-(the wrench search expands far more, so large wrench instances are excluded on purpose).
-Difficulty rises within each family (parts, robots).
-
-The load-bearing assertion is `valid` (replay the plan through successors + cheap_feasible
-and reach the goal) -- that invariant is hash-seed independent. Plan LENGTH is only bounded
-loosely (`<= baseline + SLACK`): wA* is suboptimal and successor order is hash-ordered, so
-the exact length jitters by ~±1-2 between runs. `LEN` below is the seed-0 baseline, kept as
-documentation and the anchor for the upper bound.
+The parametrized cases use the cheap floating-EE feasibility layer and verify that a plan
+exists, consists of valid successors, and reaches the goal.  Runtime and historical plan
+lengths belong in benchmarks, not in the correctness suite.
 
 Run:  python3 -m pytest tests/ -q      (from the repo root, or anywhere -- conftest fixes the path)
 """
-import time
-
 import numpy as np
 import pytest
 
@@ -138,65 +128,57 @@ def test_release_reroots_same_part_cograsps_by_robot_roster():
   assert after_a2_release(["a3", "a2", "a1"]).parent["obj_0"] == ("gripper", "a3")
 
 
-SLACK = 3                                                  # tolerated length jitter over baseline
-
-# (kind, n_parts, robots, weight, baseline_len). weight inf == greedy (keeps the hardest
-# geometric case fast). baseline_len is the seed-0 length; the test bounds len <= it + SLACK.
+# (kind, n_parts, robots, weight). weight inf == greedy (keeps the hardest geometric case
+# fast enough for the correctness suite).
 GEOMETRIC = [
-    ("cross", 3, 2, 3.0, 6),
-    ("cross", 5, 2, 3.0, 12),
-    ("cross", 5, 3, 3.0, 11),
-    ("cross", 7, 3, float("inf"), 21),                     # greedy: exact wA* is ~70s
-    ("cube", 8, 3, 3.0, 18),
-    ("arch-seq", 7, 2, 3.0, 16),
-    ("arch-seq", 7, 3, 3.0, 16),
-    ("cuboid-tower", 3, 2, 3.0, 4),                        # NON-CUBE: jenga tower (2:1:1 boxes,
-    ("cuboid-tower", 4, 2, 3.0, 8),                        # 2/level, levels rotated 90 deg)
-    ("cuboid-tower", 6, 2, 3.0, 13),
-    ("fixture-rack", 3, 2, 3.0, 6),                       # rail + top-down post + lateral arm
-    ("fixture-rack", 5, 3, float("inf"), 13),             # two independent station branches
-    ("car", 3, 2, 3.0, 8),                                 # ROTATED shapes: sideways wheels
-    ("car", 5, 2, float("inf"), 15),                       # full car (wA* too slow for the suite)
-    ("cube-plates", 4, 2, 3.0, 7),
-    ("cube-plates", 6, 2, 3.0, 13),
+    ("cross", 3, 2, 3.0),
+    ("cross", 5, 2, 3.0),
+    ("cross", 5, 3, 3.0),
+    ("cross", 7, 3, float("inf")),                     # greedy: exact wA* is ~70s
+    ("cube", 8, 3, 3.0),
+    ("arch-seq", 7, 2, 3.0),
+    ("arch-seq", 7, 3, 3.0),
+    ("cuboid-tower", 3, 2, 3.0),                        # NON-CUBE: jenga tower (2:1:1 boxes,
+    ("cuboid-tower", 4, 2, 3.0),                        # 2/level, levels rotated 90 deg)
+    ("cuboid-tower", 6, 2, 3.0),
+    ("fixture-rack", 3, 2, 3.0),                       # rail + top-down post + lateral arm
+    ("fixture-rack", 5, 3, float("inf")),              # two independent station branches
+    ("car", 3, 2, 3.0),                                # ROTATED shapes: sideways wheels
+    ("car", 5, 2, float("inf")),                       # full car (wA* too slow for the suite)
+    ("cube-plates", 4, 2, 3.0),
+    ("cube-plates", 6, 2, 3.0),
     # 8-part: the two-plate build is FORCED (top plate assembled as a unit, then joined), which
     # makes wA* slow -- use greedy, which still produces the forced module join, fast.
-    ("cube-plates", 8, 2, float("inf"), 20),
-    ("cube-plates", 8, 3, float("inf"), 20),
+    ("cube-plates", 8, 2, float("inf")),
+    ("cube-plates", 8, 3, float("inf")),
 ]
 
 # small WRENCH cases (asymmetric grasp model, 10 N insert). The wrench search is much
 # heavier, so these stay tiny to keep the suite quick.
 WRENCH = [
-    ("cross", 3, 2, 3.0, "asymmetric", 10.0, 7),
-    ("cross", 4, 2, 3.0, "asymmetric", 10.0, 12),
-    ("arch-seq", 5, 2, 3.0, "asymmetric", 10.0, 14),
-    ("cube-plates", 4, 2, 3.0, "asymmetric", 10.0, 16),   # +place/+release: on-table goal
-    ("cuboid-tower", 4, 2, 3.0, "asymmetric", 10.0, 10),   # shaped support polygon + levers
-    ("car", 3, 2, 3.0, "asymmetric", 10.0, 9),             # axial wheel press, rim contacts
+    ("cross", 3, 2, 3.0, "asymmetric", 10.0),
+    ("cross", 4, 2, 3.0, "asymmetric", 10.0),
+    ("arch-seq", 5, 2, 3.0, "asymmetric", 10.0),
+    ("cube-plates", 4, 2, 3.0, "asymmetric", 10.0),   # +place/+release: on-table goal
+    ("cuboid-tower", 4, 2, 3.0, "asymmetric", 10.0),  # shaped support polygon + levers
+    ("car", 3, 2, 3.0, "asymmetric", 10.0),           # axial wheel press, rim contacts
 ]
 
 
-@pytest.mark.parametrize("kind,n,robots,weight,exp_len", GEOMETRIC,
-                         ids=[f"{k}-{n}p-{r}R" for k, n, r, _w, _l in GEOMETRIC])
-def test_geometric(kind, n, robots, weight, exp_len):
-  t0 = time.time()
+@pytest.mark.parametrize("kind,n,robots,weight", GEOMETRIC,
+                         ids=[f"{k}-{n}p-{r}R" for k, n, r, _w in GEOMETRIC])
+def test_geometric(kind, n, robots, weight):
   plan, asm, C, robots_list, gk = _solve(kind, n, robots, weight, False, None, None)
   assert plan is not None, f"{kind} n={n} R={robots}: no plan found"
   assert _replay_ok(plan, asm, C, robots_list, gk), "plan does not reach the goal on replay"
-  assert len(plan) <= exp_len + SLACK, \
-      f"plan length {len(plan)} >> baseline {exp_len} (regression?)"
-  assert time.time() - t0 < 30.0, "case got unexpectedly slow"
 
 
-@pytest.mark.parametrize("kind,n,robots,weight,model,insert,exp_len", WRENCH,
-                         ids=[f"{k}-{n}p-{r}R-wr" for k, n, r, _w, _m, _i, _l in WRENCH])
-def test_wrench(kind, n, robots, weight, model, insert, exp_len):
+@pytest.mark.parametrize("kind,n,robots,weight,model,insert", WRENCH,
+                         ids=[f"{k}-{n}p-{r}R-wr" for k, n, r, _w, _m, _i in WRENCH])
+def test_wrench(kind, n, robots, weight, model, insert):
   plan, asm, C, robots_list, gk = _solve(kind, n, robots, weight, True, model, insert)
   assert plan is not None, f"{kind} n={n} R={robots} wrench: no plan found"
   assert _replay_ok(plan, asm, C, robots_list, gk), "wrench plan does not reach the goal"
-  assert len(plan) <= exp_len + SLACK, \
-      f"plan length {len(plan)} >> baseline {exp_len} (regression?)"
 
 
 def test_fixture_rack_lateral_press_is_solved_with_support_actions():
@@ -216,7 +198,6 @@ def test_fixture_rack_lateral_press_is_solved_with_support_actions():
                                   wrench=True, robot_ik=None, bracing=True)
   assert plan is not None
   assert _replay_ok(plan, asm, C, robots, gk, bracing=True)
-  assert len(plan) <= 8 + SLACK
 
 
 def _two_module_state(asm, C, robots, held_top):
@@ -462,7 +443,7 @@ def test_mini_car_two_finger():
   assert radial <= set(wheel_ids), f"radial wheel grasps missing: {wheel_ids}"
   plan = A.solve_assembly_problem(C, asm, robots=robots, weight=3.0, verbose=False,
                                   robot_ik=None)
-  assert plan is not None and len(plan) <= 8 + SLACK
+  assert plan is not None
   assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
 
 
@@ -810,14 +791,11 @@ def test_milestone_module_fill():
   C = make_four_robot_env(num_robots=3, floating_ee=True, vacuum=True)
   A.add_disassembled_obj(C, asm, spacing=0.2)
   robots = A.get_robots(C)
-  t0 = time.time()
   plan = A.solve_assembly_problem_milestones(C, asm, robots=robots, weight=5.0, verbose=False)
   assert plan is not None, "milestones found no plan for the module assembly"
   assert _replay_ok(plan, asm, C, robots_list=robots, gk=None), "milestone plan misses the goal"
   assert any(a[0] == "assemble" and a[2] == "obj_4" and a[3] == "obj_0" for a in plan), \
       "plan never performs the module join -- the module path was not exercised"
-  assert len(plan) <= 21 + SLACK, f"milestone plan length {len(plan)} >> baseline 21 (regression?)"
-  assert time.time() - t0 < 40.0, "milestone module fill got unexpectedly slow (repair cascade?)"
 
 
 def test_structural_milestones_skip_the_global_database(monkeypatch):

@@ -1053,11 +1053,13 @@ def build_parser():
            "--no-wrench = topological baseline.",
   )
   g_phys.add_argument(
-      "--wrench-profile", choices=["max_robotiq"], default=None, metavar="NAME",
+      "--wrench-profile", choices=["max_robotiq", "measured"], default=None, metavar="NAME",
       help="Named gripper-capability envelope. max_robotiq installs the Robotiq 2F-85 "
            "section 6.2.4 absolute limits (50N on each force axis, 5Nm about local x/y, "
            "3Nm about local z/approach). This is a hardware maximum, NOT a measured slip "
-           "calibration or safety-rated working envelope. It affects two-finger grasps only; "
+           "calibration or safety-rated working envelope and affects two-finger grasps only. "
+           "measured installs the paper's axis-resolved two-finger working envelope and its "
+           "conservative vacuum envelope. "
            "explicit --two-finger-scale/--tf-close-torque are applied afterwards.",
   )
   g_phys.add_argument(
@@ -3629,9 +3631,10 @@ def run(cfg, explicit=None):
   wrench.apply_wrench_profile(cfg.wrench_profile)
   if cfg.wrench_profile is not None:
     _tf = wrench.PARAMS["grasp"][cfg.grasp_model]["two_finger"]
-    print(f"[flag] --wrench-profile {cfg.wrench_profile} ACTIVE: two-finger absolute "
-          f"hardware envelope installed for {cfg.grasp_model}: {_tf}. This is a maximum, "
-          "not a slip calibration; explicit cap overrides are applied afterwards.")
+    _vac = wrench.PARAMS["grasp"][cfg.grasp_model]["vacuum"]
+    print(f"[flag] --wrench-profile {cfg.wrench_profile} ACTIVE: gripper envelope installed "
+          f"for {cfg.grasp_model}: two-finger={_tf}, vacuum={_vac}. Explicit cap overrides "
+          "are applied afterwards.")
   if cfg.table_mu is not None:
     wrench.PARAMS["table_model"] = "friction"
     wrench.PARAMS["table_mu"] = float(cfg.table_mu)
@@ -3672,9 +3675,12 @@ def run(cfg, explicit=None):
     print(f"[flag] --two-finger-scale ACTIVE: two-finger capability x{ts:g} "
           "(all forces + torques; vacuum and mu unchanged).")
   if cfg.tf_close_torque is not None:
-    wrench.PARAMS["grasp"]["asymmetric"]["two_finger"]["T_close"] = float(cfg.tf_close_torque)
+    _tf_asym = wrench.PARAMS["grasp"]["asymmetric"]["two_finger"]
+    _tf_asym["T_close"] = float(cfg.tf_close_torque)
+    if "T_t2" in _tf_asym:  # axis-resolved named profiles must not shadow the explicit flag
+      _tf_asym["T_t2"] = float(cfg.tf_close_torque)
     print(f"[flag] --tf-close-torque ACTIVE: two-finger closing-axis torque cap = "
-          f"{cfg.tf_close_torque:g} Nm (was 0.4). Models a pinch that rotates out of hand.")
+          f"{cfg.tf_close_torque:g} Nm. Models a pinch that rotates out of hand.")
   if cfg.grasp_compliance is not None:
     wrench.PARAMS["grasp_compliance"] = {"two_finger": 1.0, "vacuum": float(cfg.grasp_compliance)}
     print(f"[flag] --grasp-compliance ACTIVE: vacuum-held load paths inflate the insertion-"

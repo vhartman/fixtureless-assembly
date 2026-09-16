@@ -98,7 +98,10 @@ def apply_wrench_params(cfg):
             tf[_k] = tf[_k] * float(ts)
   tfc = cfg.get("tf_close_torque")                          # two-finger closing-axis torque cap
   if tfc is not None:
-    wrench.PARAMS["grasp"]["asymmetric"]["two_finger"]["T_close"] = float(tfc)
+    tf = wrench.PARAMS["grasp"]["asymmetric"]["two_finger"]
+    tf["T_close"] = float(tfc)
+    if "T_t2" in tf:
+      tf["T_t2"] = float(tfc)
 
 
 def build_scene(cfg):

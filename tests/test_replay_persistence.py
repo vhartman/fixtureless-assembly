@@ -76,14 +76,35 @@ def test_replay_restores_max_robotiq_profile_and_then_resets_it():
   R.apply_wrench_params({"wrench_profile": "max_robotiq", "grasp_model": "asymmetric"})
   assert wrench.PARAMS["grasp"]["asymmetric"]["two_finger"] == {
       "F_push": 50.0, "F_pull": 50.0, "mu": 1.0,
+      "F_t1": 50.0, "F_t2": 50.0,
       "T_axis": 3.0, "T_lat": 5.0, "T_close": 5.0,
+      "T_t1": 5.0, "T_t2": 5.0,
   }
   assert wrench.PARAMS["grasp"]["directional"]["two_finger"] == {
-      "F_axial": 50.0, "mu": 1.0, "T_axis": 3.0, "T_lat": 5.0,
+      "F_axial": 50.0, "mu": 1.0, "F_t1": 50.0, "F_t2": 50.0,
+      "T_axis": 3.0, "T_lat": 5.0, "T_t1": 5.0, "T_t2": 5.0,
   }
   R.apply_wrench_params({})
   assert wrench.PARAMS["grasp"]["asymmetric"]["two_finger"]["T_close"] == 0.4
   assert wrench.PARAMS["grasp"]["asymmetric"]["two_finger"]["F_pull"] == 25.0
+
+
+def test_replay_restores_measured_axis_resolved_profile_and_then_resets_it():
+  import wrench
+
+  R.apply_wrench_params({"wrench_profile": "measured", "grasp_model": "asymmetric"})
+  tf = wrench.PARAMS["grasp"]["asymmetric"]["two_finger"]
+  vac = wrench.PARAMS["grasp"]["asymmetric"]["vacuum"]
+  assert (tf["F_t1"], tf["F_t2"], tf["F_push"], tf["F_pull"]) == \
+      (50.0, 39.7, 50.0, 50.0)
+  assert (tf["T_t1"], tf["T_close"], tf["T_axis"]) == (4.7, 4.5, 3.0)
+  assert (vac["F_t1"], vac["F_t2"], vac["F_push"], vac["F_pull"]) == \
+      (5.0, 5.0, 110.0, 110.0)
+  assert (vac["T_t1"], vac["T_t2"], vac["T_axis"]) == (0.1, 0.1, 0.1)
+
+  R.apply_wrench_params({})
+  assert "F_t1" not in wrench.PARAMS["grasp"]["asymmetric"]["two_finger"]
+  assert wrench.PARAMS["grasp"]["asymmetric"]["vacuum"]["T_axis"] == 0.8
 
 
 def test_build_scene_roundtrips_centered_scatter_and_legacy_layout():

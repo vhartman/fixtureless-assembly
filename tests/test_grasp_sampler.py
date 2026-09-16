@@ -109,6 +109,39 @@ def test_sampled_deterministic_across_cache_reset():
     np.testing.assert_array_equal(a, b)
 
 
+def test_mesh_sampling_seed_does_not_depend_on_checkout_path(tmp_path):
+  """Two byte-identical assets must generate one raw-cloud identity wherever they live."""
+  a = tmp_path / "checkout-a" / "part.obj"
+  b = tmp_path / "checkout-b" / "part.obj"
+  a.parent.mkdir(); b.parent.mkdir()
+  contents = (b"v 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\n"
+              b"f 1 3 2\nf 1 2 4\nf 2 3 4\nf 3 1 4\n")
+  a.write_bytes(contents); b.write_bytes(contents)
+  ka = P._sampling_spec_key(("mesh", {"file": str(a), "scale": 0.25}))
+  kb = P._sampling_spec_key(("mesh", {"file": str(b), "scale": 0.25}))
+  assert ka == kb
+
+  # Check the public positional database too, with caches cleared between the two assets so
+  # equality cannot be an accidental memo hit on their common content key.
+  P.set_sampled_grasps(MODE)
+  posa = [np.array(p) for p in P.part_grasp_poses(("mesh", {"file": str(a)}))]
+  P.reset_grasp_pose_cache()
+  posb = P.part_grasp_poses(("mesh", {"file": str(b)}))
+  assert len(posa) == len(posb)
+  for left, right in zip(posa, posb):
+    np.testing.assert_array_equal(left, right)
+
+
+def test_surface_sampler_is_independent_of_numpy_global_rng():
+  mesh = P._spec_mesh(CUBE)
+  np.random.seed(1)
+  pa, fa = P._sample_surface_deterministic(mesh, 12, 123)
+  np.random.seed(999)
+  pb, fb = P._sample_surface_deterministic(mesh, 12, 123)
+  np.testing.assert_array_equal(pa, pb)
+  np.testing.assert_array_equal(fa, fb)
+
+
 def test_parallel_views_aligned_and_labels_sane():
   P.set_sampled_grasps(MODE)
   for spec in (CUBE, CYL):

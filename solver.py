@@ -13721,7 +13721,7 @@ def solve_assembly_problem_milestones(C, assembly, robots=None, verbose=True, ro
 
 
 def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_budget=300.0,
-                                              verbose=True, robot_ik=None, weight=5.0,
+                                              verbose=True, robot_ik=None, weight=1.0,
                                               wrench=False, wrench_aware_h=True, handovers=True,
                                               allow_place=True, bracing=False,
                                               geo_facts=False, sig_collapsed_h=False,
@@ -13770,41 +13770,29 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
   # the greedy net needs time to run (measured: giving milestones deadline=t_end left
   # -0.3s for the net => 'no plan' despite greedy solving the instance in 23s).
   t_mile = t_end - min(60.0, 0.25 * time_budget)
-  # The ordinary profile deliberately uses a measured finite IK effort (two epochs).  Carrying
-  # that cap into an explicitly time-bounded ANYTIME run is wrong: it can reject a milestone
-  # after two stochastic misses while most of the wall budget remains.  Dovetail open witness
-  # effort until this phase's finite deadline instead.  This changes only scheduling--cheap
-  # refutations remain permanent, successes persist, and no failed nonlinear solve becomes a
-  # no-good. Restore the caller's operational setting before the improvement/fallback phase.
-  old_open_epochs = None
-  if robot_ik is not None and getattr(robot_ik, "open_witness", False):
-    old_open_epochs = robot_ik.open_witness_epochs
-    robot_ik.open_witness_epochs = 0
-    if verbose:
-      print("[mile-anytime] open-witness effort is deadline-fair: stochastic IK failures "
-            "reopen until the milestone phase deadline (no finite epoch refutation)")
-  try:
-    inc = solve_assembly_problem_milestones(
-        C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik,
-        weight=max(weight, 5.0), wrench=wrench, wrench_aware_h=wrench_aware_h,
-        handovers=handovers,
-        allow_place=allow_place, bracing=bracing, geo_facts=geo_facts,
-        sig_collapsed_h=sig_collapsed_h, deadline=t_mile, fill_window=fill_window,
-        milestone_oracle=milestone_oracle, fill_local_h=fill_local_h,
-        fill_raw_grasp_h=fill_raw_grasp_h,
-        fill_target_support_quotient=fill_target_support_quotient,
-        fill_exact=fill_exact, fill_greedy=fill_greedy,
-        fill_incumbent_first=fill_incumbent_first,
-        fill_policy_first=fill_policy_first,
-        fill_policy_guide=fill_policy_guide,
-        fill_skeleton_first=fill_skeleton_first,
-        fill_action_widening=fill_action_widening,
-        fill_scope_widening=fill_scope_widening,
-        milestone_boundaries=milestone_boundaries,
-        placement_yaw_widening=placement_yaw_widening)
-  finally:
-    if old_open_epochs is not None:
-      robot_ik.open_witness_epochs = old_open_epochs
+  # The incumbent phase is deliberately the ordinary configured milestone search.  In
+  # particular, do not silently replace weight=1 by a historical w=5 policy or turn the
+  # finite open-witness schedule into unlimited effort.  Given the same grasp database and
+  # seed, ``--milestones-anytime`` must therefore expose exactly the same first solution as
+  # the non-anytime ``ours`` row; only the subsequent LNS consultations differ.
+  inc = solve_assembly_problem_milestones(
+      C, assembly, robots=robots, verbose=verbose, robot_ik=robot_ik,
+      weight=weight, wrench=wrench, wrench_aware_h=wrench_aware_h,
+      handovers=handovers,
+      allow_place=allow_place, bracing=bracing, geo_facts=geo_facts,
+      sig_collapsed_h=sig_collapsed_h, deadline=t_mile, fill_window=fill_window,
+      milestone_oracle=milestone_oracle, fill_local_h=fill_local_h,
+      fill_raw_grasp_h=fill_raw_grasp_h,
+      fill_target_support_quotient=fill_target_support_quotient,
+      fill_exact=fill_exact, fill_greedy=fill_greedy,
+      fill_incumbent_first=fill_incumbent_first,
+      fill_policy_first=fill_policy_first,
+      fill_policy_guide=fill_policy_guide,
+      fill_skeleton_first=fill_skeleton_first,
+      fill_action_widening=fill_action_widening,
+      fill_scope_widening=fill_scope_widening,
+      milestone_boundaries=milestone_boundaries,
+      placement_yaw_widening=placement_yaw_widening)
   remaining = t_end - time.perf_counter()
   if inc is None:
     if remaining > 5.0:
@@ -13859,7 +13847,7 @@ def solve_assembly_problem_milestones_anytime(C, assembly, robots=None, time_bud
       raise SystemExit("heuristic plan audit complete")
     best = _lns_improve(
         inc, C, assembly, robots, checker, grasp_table, robot_ik,
-        max(weight, 5.0), 20000, verbose, h_lab, gripper_kind=gk,
+        weight, 20000, verbose, h_lab, gripper_kind=gk,
         handovers=handovers, allow_place=allow_place, bracing=bracing,
         deadline=t_end, t0=t0, k_max=(None if lns_window is None
                                      else max(1, int(lns_window))), object_unit=True)
