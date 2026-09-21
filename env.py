@@ -216,8 +216,16 @@ def color_gripper(C, prefix, color):
     """Tint the gripper bodies of the robot with frame prefix `prefix` (e.g. 'a1_')."""
     for name in C.getFrameNames():
         if name.startswith(prefix) and any(k in name for k in _GRIPPER_BODY_KEYS):
+            frame = C.getFrame(name)
+            # RAI's ``setColor`` does not reject a shapeless kinematic helper.  It silently
+            # creates an ST.mesh shape with zero vertices instead.  Most collision queries
+            # happen to skip that decoration, but FCL's motion-planning path aborts when it
+            # encounters the resulting empty collision object.  Joint origins and mimic
+            # frames contain "finger" in their names, so the name test alone is insufficient.
+            if "shape" not in frame.info():
+                continue
             try:
-                C.getFrame(name).setColor(color)
+                frame.setColor(color)
             except Exception:
                 pass                      # shapeless frames (markers) may not take a color
 

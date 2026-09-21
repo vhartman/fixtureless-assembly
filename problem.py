@@ -1368,6 +1368,22 @@ class FabricaAssembly(Assembly):
           else self._collision_shape(source))
       self.visual_meshes[part] = f"part_meshes/fabrica/{self.model}/{source}.obj"
       self.grasp_shapes[part] = self._grasp_shape(source)
+      if self.model == "car" and source in ("0", "3", "4", "5"):
+        # The wheel's imported grasp mesh contains decorative spokes and a locating peg,
+        # while the reviewed physical grasp surface is the smooth cylindrical tread.  Mesh
+        # sampling those decorations gave nominally identical wheels different finite grasp
+        # alphabets and admitted poses whose open manufacturer finger meshes intersected the
+        # tire.  Reuse the tread primitive already recorded by the collision importer as the
+        # sampling surface.  The peg remains collidable and the exact CAD remains visual.
+        settings = self._manifest["parts"][source]["collision"]["settings"]
+        lo, hi = map(float, settings["tread_interval_m"])
+        radius = float(settings["tread_radius_m"])
+        # Shape cylinders use local +z; rotate that axis onto the wheel's local +y.
+        q_z_to_y = [np.sqrt(.5), -np.sqrt(.5), 0.0, 0.0]
+        self.grasp_shapes[part] = ("compound", [{
+            "shape": ("cylinder", [hi - lo, radius], q_z_to_y),
+            "pos": [0.0, 0.5 * (lo + hi), 0.0],
+        }])
       # Uniform light-plastic density: plausible demonstrators while preserving the source
       # volume ratios. Mesh volume is m^3 after import; density is 700 kg/m^3.
       volume = abs(float(_load_mesh({"file": self.visual_meshes[part]})["mesh"].volume))
@@ -2977,6 +2993,9 @@ _SAMPLED_GRASPS = None         # None = off; else current sampler configuration
 _SAMPLED_VIEWS_CACHE = {}
 _SAMPLED_META_CACHE = {}          # same key: per-candidate gate diagnostics (not the DB)
 _SAMPLED_SCENE_CTX = None         # --grasp-sampler-scenes: pick/assembly filter context
+_GRASP_PHYSICS_CHECK = False      # exact articulated-finger isolated certificate
+_GRASP_PHYSICS_CTX = None         # installed after the concrete robot scene exists
+_GRASP_PHYSICS_FORCE = 10.0       # N, in each of the six tool-frame directions
 _SAMPLED_CANONICAL_ONLY = False   # staged search refinement; IDs/DB itself never changes
 _COMPONENT_GRASP_KEEP = 0         # 0 = historical full constituent-grasp union
 _MAX_GRASP_WIDTH = 0.078       # two-finger max pinch width. The fixed-open robotiq pads
@@ -3008,6 +3027,47 @@ def set_sampled_grasps(mode):
   _SAMPLED_CANONICAL_ONLY = False
 
 
+def set_grasp_physics_check(on=False, force_n=10.0):
+  """Enable the isolated articulated-finger certificate for sampled two-finger grasps.
+
+  The concrete MuJoCo context is installed later, once the robot and assembly scene exist.
+  Toggling this invalidates the positional DB because failed two-finger candidates are no
+  longer admitted to two-finger grasp tables.
+  """
+  global _GRASP_PHYSICS_CHECK, _GRASP_PHYSICS_CTX, _GRASP_PHYSICS_FORCE
+  _GRASP_PHYSICS_CHECK = bool(on)
+  _GRASP_PHYSICS_FORCE = float(force_n)
+  if _GRASP_PHYSICS_FORCE < 0.0:
+    raise ValueError("grasp physics force must be non-negative")
+  _GRASP_PHYSICS_CTX = None
+  _SAMPLED_VIEWS_CACHE.clear()
+  _SAMPLED_META_CACHE.clear()
+
+
+def install_grasp_physics_ctx(C, assembly, robots=None):
+  """Install the lazy, scene-independent MuJoCo grasp certificate context."""
+  global _GRASP_PHYSICS_CTX
+  if not _GRASP_PHYSICS_CHECK:
+    _GRASP_PHYSICS_CTX = None
+    return
+  if robots is None:
+    robots = get_robots(C)
+  from solver import _search_context
+  checker, _table = _search_context(C, assembly, robots, build_table=False)
+  kind_robot = {}
+  for robot in robots:
+    kind_robot.setdefault(checker._robot_kind[robot], robot)
+  if "two_finger" not in kind_robot:
+    raise ValueError("--grasp-physics-check needs at least one two-finger robot")
+  from grasp_physics import GraspPhysicsContext
+  _GRASP_PHYSICS_CTX = GraspPhysicsContext(
+      C, assembly, get_initial_state(C, assembly), robots, kind_robot,
+      force_n=_GRASP_PHYSICS_FORCE,
+      gripper_paths=getattr(checker, "robot_gripper_paths", None))
+  _SAMPLED_VIEWS_CACHE.clear()
+  _SAMPLED_META_CACHE.clear()
+
+
 def set_sampled_canonical_only(on=False):
   """Restrict primitive grasp tables to their conventional prefix for a search epoch.
 
@@ -3033,10 +3093,13 @@ def set_component_grasp_keep(keep=0):
 
 
 def install_sampled_scene_ctx(C, assembly, robots=None):
-  """--grasp-sampler-scenes: give the sampled DB the two SCENE views it filters candidates
-  against -- the INITIAL scene (can this grasp pick the part where it lies?) and the FULLY
-  ASSEMBLED scene (can this grasp stand at the part's seated pose?) -- using the search's
-  OWN cheap floating-EE gate, so the filter and the search agree exactly. Rebuilds the
+  """Install the role scenes used to certify the immutable sampled grasp database.
+
+  ``pick`` is the initial table scene. ``assemble`` contains the incoming part and only the
+  predecessors required at its mate endpoint; unrelated future parts are parked. ``support``
+  is the fully assembled scene and is deliberately a ranking/reservation role rather than a
+  hard replacement for the actual mate context. All three use the search's OWN cheap
+  floating-EE gate, so sampling and search agree exactly. Rebuilds the
   sampled caches; call BEFORE any grasp-table consumer. Every grasp-table consumer must then
   thread the PART name: scene feasibility is per part INSTANCE (two identical legs sit in
   different sockets), and a part-less query raises instead of silently serving unfiltered ids."""
@@ -3053,14 +3116,26 @@ def install_sampled_scene_ctx(C, assembly, robots=None):
     kind_robot.setdefault(checker._robot_kind[r], r)
   s0 = get_initial_state(C, assembly)
   s_full = _full_assembly_state(assembly, s0)
+  role_states = {
+      p: {"pick": s0,
+          "assemble": _assembly_role_state(assembly, s0, p),
+          "support": s_full}
+      for p in assembly.objects}
   poses_pick = tuple(sorted((p, tuple(np.round(np.asarray(s0.poses[p], dtype=float), 4)))
                             for p in assembly.objects))
   poses_asm = tuple(sorted((p, tuple(np.round(np.asarray(
       _state_part_poses(s_full, assembly, lift=0.0)[p], dtype=float), 4)))
                             for p in assembly.objects))
-  sig = ("scenes", poses_pick, poses_asm)
+  role_sig = tuple(
+      (p, tuple((role, tuple(sorted(
+          (q, tuple(np.round(np.asarray(pose, dtype=float), 4)))
+          for q, pose in _state_part_poses(state, assembly, lift=0.0).items())))
+          for role, state in sorted(role_states[p].items())))
+      for p in assembly.objects)
+  sig = ("role-scenes-v1", poses_pick, poses_asm, role_sig)
   _SAMPLED_SCENE_CTX = {"checker": checker, "kind_robot": kind_robot,
                         "s0": s0, "s_full": s_full,
+                        "role_states": role_states,
                         "assembly": assembly, "sig": sig,
                         "robots": tuple(robots)}
   _SAMPLED_VIEWS_CACHE.clear()
@@ -3105,6 +3180,52 @@ def _full_assembly_state(assembly, s0):
                          **{p: frozenset({("mate", base)})
                             for p in assembly.objects if p != base}},
                poses={base: np.asarray(s0.poses[base], dtype=float).copy()})
+
+
+def _assembly_role_state(assembly, s0, incoming):
+  """Concrete endpoint context for one assemble-role grasp.
+
+  The state contains the incoming part, its mate parent, dependency closure, and both sides
+  required by a module-connect edge at their authored assembled poses. Every other part is
+  retained only because ``State``/the collision checker expect the complete object roster;
+  it is parked far away as an independent table body. This is a geometric role definition,
+  not search pruning, and therefore cannot remove a legal task sequence.
+  """
+  required = {incoming} | set(_mate_closure(assembly, incoming))
+  rel = assembly.relative_pose(incoming)
+  if rel is not None:
+    required.add(rel[0])
+    required.update(_mate_closure(assembly, rel[0]))
+  frontier = list(getattr(assembly, "connect_requires", {}).get(incoming, ()))
+  while frontier:
+    p = frontier.pop()
+    if p in required:
+      continue
+    required.add(p)
+    frontier.extend(_mate_closure(assembly, p))
+    rp = assembly.relative_pose(p)
+    if rp is not None:
+      frontier.append(rp[0])
+
+  full_poses = _state_part_poses(_full_assembly_state(assembly, s0), assembly, lift=0.0)
+  parent, supports, poses = {}, {}, {}
+  parked = 0
+  for p in assembly.objects:
+    rp = assembly.relative_pose(p)
+    if p in required and rp is not None and rp[0] in required:
+      parent[p] = ("part", rp[0])
+      supports[p] = frozenset({("mate", rp[0])})
+      continue
+    parent[p] = ("table",)
+    supports[p] = frozenset({("table",)})
+    if p in required:
+      poses[p] = np.asarray(full_poses[p], dtype=float).copy()
+    else:
+      pose = np.asarray(s0.poses[p], dtype=float).copy()
+      pose[:3] = [1000.0 + 10.0 * parked, 1000.0, 1000.0]
+      poses[p] = pose
+      parked += 1
+  return State(parent=parent, supports=supports, poses=poses)
 
 
 _FEATURE_EDGE_DEG = 30.0     # a CREASE, not a tessellation step -- see _mesh_feature_edges
@@ -3563,6 +3684,12 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
   asm = None if ctx is None else ctx["assembly"]
   seal = float(wrench.PARAMS.get("vacuum_seal_diameter", 0.0))
 
+  def role_states():
+    # Small unit-test/external sampler adapters created before role-scene-v1 may still pass
+    # only the original endpoints. Keep that API usable without weakening installed scenes.
+    by_part = None if ctx is None else ctx.get("role_states", {}).get(part)
+    return by_part or {"pick": ctx["s0"], "assemble": ctx["s_full"]}
+
   # Physical generation policy, not a collision relaxation. A candidate already places the
   # pads at a valid antipodal contact; translating the hand OUTWARD along its approach slides
   # those long pads over the same target. At most half a pad length is available for this
@@ -3628,16 +3755,28 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
   def enrich(row, origin, refinement=None):
     roles = {}
     closure_roles = {}
+    physics_by_kind = {}
+    # The physics query is isolated from the scene and therefore needs to run only once per
+    # (part, pose), not once for pick and assembly.  Vacuum remains outside this first-stage
+    # experiment; its global analytic wrench envelope is unchanged.
+    physics_pose = part_pose(row)
+    if _GRASP_PHYSICS_CHECK:
+      if _GRASP_PHYSICS_CTX is None:
+        raise RuntimeError("--grasp-physics-check enabled before its robot context was installed")
+      cert = _GRASP_PHYSICS_CTX.check(part, physics_pose, "two_finger")
+      physics_by_kind["two_finger"] = cert.metadata()
     for kind, robot in sorted(kind_robot.items()):
       # Pinch rows deliberately carry min_dim=0 and are not vacuum candidates. Canonical and
       # suction rows still need a flat patch large enough to seal.
       kind_ok = not (kind == "vacuum" and
                      (row[6] == "pinch" or row[1] == "curved" or row[2] < seal))
+      if kind == "two_finger" and _GRASP_PHYSICS_CHECK:
+        kind_ok = kind_ok and bool(physics_by_kind[kind]["feasible"])
       hits = []
       close_hits = []
       if kind_ok:
         pose = part_pose(row)
-        for role, state in (("pick", ctx["s0"]), ("assemble", ctx["s_full"])):
+        for role, state in role_states().items():
           if not checker.pose_collision_free(state, part, pose, asm, robot=robot):
             continue
           # With --grasp-closure-check, a scene label means OPEN geometry clears and the
@@ -3653,6 +3792,7 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
       closure_roles[kind] = tuple(close_hits)
     meta = {"origin": origin, "scene_by_kind": roles,
             "closure_by_kind": closure_roles,
+            "physics_by_kind": physics_by_kind,
             "sets": tuple(sorted({x for xs in roles.values() for x in xs}))}
     if refinement is not None:
       tag, delta, source = refinement
@@ -3670,7 +3810,7 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
                      (row[6] == "pinch" or row[1] == "curved" or row[2] < seal))
       if not kind_ok:
         continue
-      for role, state in (("pick", ctx["s0"]), ("assemble", ctx["s_full"])):
+      for role, state in role_states().items():
         repaired = repaired_table_pose(row, kind, robot, role, state)
         if repaired is None:
           continue
@@ -3725,7 +3865,17 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
   if raw_bad:
     probe_categories.append(_fps_row_order(raw_bad))
   probe, probe_seen, cursors = [], set(), [0] * len(probe_categories)
-  probe_cap = min(len(raw), 64 if spec[0] in ("mesh", "compound") else 32)
+  probe_cap = 64 if spec[0] in ("mesh", "compound") else 32
+  # The historical scene probe was deliberately fixed at 64/32 because ordinary open-hand
+  # and proxy-closure classification is expensive.  The opt-in articulated-finger physics
+  # gate is a materially stronger filter, however: on the Fabrica wheels it can retain only
+  # one pose from a 64-row mesh probe.  Silently keeping the old probe cap when the user asks
+  # for a larger immutable master means ``--grasp-sampler-keep`` cannot actually widen that
+  # certified set.  Honor the requested master size only in this explicit expensive mode;
+  # the standard sampler and every existing grasp id remain byte-identical.
+  if _GRASP_PHYSICS_CHECK:
+    probe_cap = max(probe_cap, int(_SAMPLED_GRASPS.get("master_keep", keep)))
+  probe_cap = min(len(raw), probe_cap)
   while len(probe) < probe_cap:
     progressed = False
     for j, block in enumerate(probe_categories):
@@ -3766,7 +3916,7 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
                   e[1]["scene_by_kind"].get(kind, ()))]
     if bridge:
       categories.append(ordered(bridge))
-    for role in ("pick", "assemble"):
+    for role in ("pick", "assemble", "support"):
       block = [e for e in usable if role in e[1]["scene_by_kind"].get(kind, ())]
       if block:
         categories.append(ordered(block))
@@ -3809,7 +3959,8 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
       tail.append(e); tail_seen.add(id(e[0]))
 
   # Reserve one deterministic bridge per kind when available, then one row for every still
-  # uncovered (gripper-kind, PICK/ASSEMBLE) fact.  A bridge can cover both facts and is emitted
+  # uncovered (gripper-kind, PICK/ASSEMBLE/SUPPORT) fact. A bridge can cover both transport
+  # endpoint facts and is emitted
   # once.  This makes a small K useful as a transport DB, not merely two unrelated endpoint
   # databases.
   # The complete order is built before slicing, so widening never rebinds an old grasp id.
@@ -3818,7 +3969,7 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
     return role in entry[1]["scene_by_kind"].get(kind, ())
 
   facts = [(kind, role) for kind in sorted(kind_robot)
-           for role in ("pick", "assemble")]
+           for role in ("pick", "assemble", "support")]
   primary = list(canonical) + list(good)
   reserve_blocks = []
   for kind in sorted(kind_robot):
@@ -3848,7 +3999,7 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
     seen.add(id(entry[0]))
     for covered_kind, roles in entry[1]["scene_by_kind"].items():
       for covered_role in roles:
-        if covered_role in ("pick", "assemble"):
+        if covered_role in ("pick", "assemble", "support"):
           covered.add((covered_kind, covered_role))
 
   for entry in tail:
@@ -3875,7 +4026,7 @@ def _sampled_keys(spec, offset, part=None):
           float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)),
           cfgv.get("wrap"))
   ctx = _SAMPLED_SCENE_CTX
-  cache = base + (bool(cfgv.get("strict", False)),
+  cache = base + (bool(cfgv.get("strict", False)), bool(_GRASP_PHYSICS_CHECK),
                   cfgv.get("master_keep", cfgv["keep"]),)
   return base, cache + (part, (ctx["sig"] if ctx is not None else None))
 
@@ -4066,7 +4217,9 @@ def sampled_grasp_db_signature(assembly):
     # selection; roles/origin document why each positional member was retained.
     identity = tuple((m.get("origin"), m.get("family"), m.get("sets"),
                       tuple(sorted((k, tuple(v)) for k, v in
-                                   (m.get("scene_by_kind") or {}).items()))) for m in meta)
+                                   (m.get("scene_by_kind") or {}).items())),
+                      tuple(sorted((k, bool(v.get("feasible", False))) for k, v in
+                                   (m.get("physics_by_kind") or {}).items()))) for m in meta)
     h.update(repr(identity).encode())
   return h.hexdigest()
 
@@ -4950,6 +5103,8 @@ class GraspTable(dict):
 
   kinds_of = None                                          # {(S_key, part, gid): frozenset}
   robot_kinds = None                                       # {robot: "vacuum"|"two_finger"}
+  handover_physics = None                                  # eager pair certificate lookup
+  handover_models = None                                   # {robot: physical hand model key}
 
   def usable(self, S_key, part, gid, robot):
     if self.kinds_of is None or self.robot_kinds is None:
@@ -4958,6 +5113,34 @@ class GraspTable(dict):
     if kind is None:
       return True
     return kind in self.kinds_of.get((S_key, part, gid), ())
+
+  def handover_usable(self, S_key, giver_robot, giver_part, giver_gid,
+                      receiver_robot, receiver_part, receiver_gid):
+    """Cached isolated two-hand certificate; no simulator work occurs in search."""
+    if self.handover_physics is None or self.handover_models is None:
+      return True
+    a = self.handover_models.get(giver_robot)
+    b = self.handover_models.get(receiver_robot)
+    if a is None or b is None:                             # vacuum/missing: outside this gate
+      return True
+    ga = (giver_part, int(giver_gid))
+    gb = (receiver_part, int(receiver_gid))
+    # Ordered even for identical hands: the receiver sweeps while the giver is already
+    # closed, so reversing the transfer reverses which swept volume must clear.
+    return bool(self.handover_physics.get((_subasm_key(S_key), a, ga, b, gb), False))
+
+
+def _handover_physics_usable(grasp_table, key, state, group, receiver, part, gid):
+  """Require one precomputed certificate against every current two-finger holder."""
+  if not isinstance(grasp_table, GraspTable) or grasp_table.handover_physics is None:
+    return True
+  holders = []
+  for p in group:
+    holders.extend((c[1], c[2], c[3]) for c in state.supports[p]
+                   if c[0] == "grasp" and c[1] != receiver)
+  return all(grasp_table.handover_usable(
+      key, r, gpart, grasp_id, receiver, part, gid)
+      for r, gpart, grasp_id in holders)
 
 
 class LazyGraspTable(GraspTable):
@@ -5250,7 +5433,13 @@ def compute_cube_grasps(assembly, subassembly, offset=0.01,
   # curved surfaces fine and keeps everything. --allow-curved-grasps overrides the drop (an
   # idealised suction on cylinders/spheres, e.g. to test whether curved-side grasps unblock
   # thin cylinder legs a real cup could not seal on).
-  vacuum = "vacuum" in os.path.basename(gripper_path) and not _ALLOW_CURVED_GRASPS
+  # Keep tool identity separate from the optional seal-on-curvature policy.  Conflating the
+  # two used to be harmless while this branch only filtered curved suction rows, but became
+  # a mixed-tool correctness bug once the articulated-finger certificate was added below:
+  # ``--allow-curved-grasps`` made a vacuum look like a two-finger hand and consequently
+  # removed every suction row which (correctly) lacked two-finger physics metadata.
+  is_vacuum = "vacuum" in os.path.basename(gripper_path)
+  filter_vacuum_curvature = is_vacuum and not _ALLOW_CURVED_GRASPS
 
   # A rigid component historically inherited the concatenation of every constituent
   # part's complete database. That makes its action alphabet grow linearly with component
@@ -5278,9 +5467,15 @@ def compute_cube_grasps(assembly, subassembly, offset=0.01,
           and grasp_spec[0] not in ("mesh", "compound")
           and sample_meta[grasp_id].get("origin") != "canonical"):
         continue                                          # staged search: samples reopen later
-      if vacuum and (surfaces[grasp_id] == "curved" or face_dims[grasp_id] < seal):
+      if (filter_vacuum_curvature and
+          (surfaces[grasp_id] == "curved" or face_dims[grasp_id] < seal)):
         continue                                          # no seal on curvature or on a face
                                                           # smaller than the cup (chair caps)
+      if (not is_vacuum and _GRASP_PHYSICS_CHECK and sample_meta
+          and not bool((sample_meta[grasp_id].get("physics_by_kind", {})
+                        .get("two_finger", {})).get("feasible", False))):
+        continue                                          # exact articulated fingers could
+                                                          # not acquire/retain this isolated grip
       grasp = np.concatenate([obj_in_ref + local[:3], local[3:]])
 
       conventional = bool(sample_meta and sample_meta[grasp_id].get("origin") == "canonical")
@@ -6000,6 +6195,9 @@ def fused_handovers(state, assembly, robots, grasp_table=None, gripper_kind=None
           continue
         if not _grasp_usable(grasp_table, key, gpart, grasp_id, rB):
           continue                                          # mixed EEs: not B's gripper
+        if not _handover_physics_usable(
+            grasp_table, key, state, group, rB, gpart, grasp_id):
+          continue                                          # lookup only; precomputed before search
         if not _vacuum_engagement_stable(
             state, assembly, group, rB, gpart, grasp_id, gripper_kind):
           continue                                          # giver must withstand B's seal push

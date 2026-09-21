@@ -5,9 +5,9 @@ config files, and a library caller all produce the same object. It is a CARRIER:
 nothing itself and leaves main()/the solver untouched -- `to_namespace()` yields the plain
 argparse.Namespace that main() already consumes, and `from_namespace()` goes the other way.
 
-Defaults deliberately live in TWO places (here and the argparse parser) to avoid a risky
-rewrite of the 115-flag parser; tests/test_config.py::test_defaults_match_parser asserts the
-two never drift, so this stays a safe mirror rather than a second source of truth that rots.
+Defaults deliberately live in TWO places (here and the argparse parser); the maintained public
+CLI is compact, while benchmark-only fields remain serializable. The drift test in
+tests/test_config.py asserts that both representations stay identical.
 
 Usage:
     from config import RunConfig
@@ -210,7 +210,12 @@ class RunConfig:
   placement_yaws: int = 1
   tight_fingers: bool = True
   openarm_real_finger_radius_scale: float = 1.0
-  grasp_closure_check: bool = False
+  grasp_closure_check: bool = True
+  # Persistence-only compatibility certificate populated after the concrete scene and grasp
+  # database exist. Hand-written fresh-run configs leave it unset.
+  artifact_contract: Optional[dict] = None
+  grasp_physics_check: bool = False
+  grasp_physics_force: float = 10.0
   quiet_rai: bool = False
 
   # -- witness optimization --
@@ -231,7 +236,6 @@ class RunConfig:
   fuse_cograsp: bool = True
 
   # -- skills / pre-insertion splits --
-  skill: float = 0.0
   screw_angle: Optional[float] = None
   screw_depth: Optional[float] = None
   screw_torque: Optional[float] = None
@@ -253,7 +257,7 @@ class RunConfig:
   mp_optimize: bool = True
   mp_runtime: float = 30.0
   mp_stall_timeout: Optional[float] = None
-  mp_no_shortcut: bool = False
+  mp_shortcut: bool = True
   mp_shortcut_iters: int = 1000
   mp_shortcut_res: Optional[float] = None
   mp_shortcut_strategy: str = "native"
@@ -338,6 +342,13 @@ class RunConfig:
     # Removed no-op option. It never changed a saved plan's scene, action space, or search;
     # discard the stale provenance key so existing artifacts remain usable as --config files.
     d.pop("mixed_wrench_h", None)
+    # Removed shorthand. All six funnels have explicit persisted values, so keeping the
+    # umbrella value as additional provenance only made config layering order-dependent.
+    d.pop("skill", None)
+    # Positive spelling replaced the double-negative CLI/config field. Preserve old saved
+    # plans exactly while exposing one conventional BooleanOptionalAction going forward.
+    if "mp_no_shortcut" in d and "mp_shortcut" not in d:
+      d["mp_shortcut"] = not bool(d.pop("mp_no_shortcut"))
     old_sampler_version = d.pop("grasp_sampler_version", None)
     if old_sampler_version not in (None, 4):
       raise ValueError(

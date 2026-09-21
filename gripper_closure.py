@@ -23,7 +23,7 @@ import robotic as ry
 
 # Bump whenever the calibrated proxy semantics change. It keys the cheap-check cache and the
 # sampled grasp database provenance, so a saved grasp id cannot silently acquire new meaning.
-VERSION = 2
+VERSION = 5
 
 # These are physical/proxy calibration constants, not search-tuning knobs.  Both current
 # models expose an approximately 80--115 mm open jaw gap and have about 40 mm inward travel
@@ -99,14 +99,29 @@ def _finger_groups(C: ry.Config, prefix: str):
         return "vacuum", (), None
 
     left, right = [], []
+    robotiq_left_pad, robotiq_right_pad = [], []
     for n in ours:
         s = str(n)
-        # Robotiq: ...finger1 / ...finger2.  OpenArm: ...finger1_coll[2],
-        # ...finger2_coll[12].  Do not include the visual/kinematic fingers.
-        if s.endswith("finger1") or "finger1_coll" in s:
+        # Robotiq: prefer the manufacturer's flat inner-pad boxes whenever they are present.
+        # The historical finger1/finger2 capsules use the opposite left/right naming from the
+        # imported linkage (finger1 is parented to right_inner_finger_joint).  Mixing capsules
+        # and pads in one side therefore averaged geometry from *opposite* jaws and could
+        # certify a grasp that the articulated viewer showed 1--3 cm off centre.  Pads are the
+        # actual pinch surfaces; capsules remain only the fallback for stripped models.
+        # OpenArm: ...finger1_coll[2], ...finger2_coll[12].  The pads are normally visual
+        # only; this disposable certificate enables them as collision geometry.  Including
+        # them is what makes simultaneous handover closure agree with MuJoCo instead of
+        # certifying two capsule proxies whose actual pad boxes overlap.
+        if "left_inner_finger_pad" in s:
+            robotiq_left_pad.append(s)
+        elif "right_inner_finger_pad" in s:
+            robotiq_right_pad.append(s)
+        elif s.endswith("finger1") or "finger1_coll" in s:
             left.append(s)
         elif s.endswith("finger2") or "finger2_coll" in s:
             right.append(s)
+    if robotiq_left_pad and robotiq_right_pad:
+        left, right = robotiq_left_pad, robotiq_right_pad
     if not left or not right:
         return None, (), None
     model = "openarm" if any("openarm" in n for n in ours) else "robotiq"
@@ -234,6 +249,9 @@ def _contact_aperture(C: ry.Config, prefix: str, target: str):
     # work scene can force it back on without changing the solve scene.
     for n in _target_collision_frames(work, target):
         work.getFrame(n).setContact(1)
+    for group in groups:
+        for n in group:
+            work.getFrame(n).setContact(1)
 
     def evaluate(shift):
         _move_to_shift(work, positions, axis, groups, signs, shift)
@@ -310,16 +328,16 @@ def contact_aperture(C: ry.Config, receiver_prefix: str, target: str) -> Closure
     return result
 
 
-def certify(C: ry.Config, receiver_prefix: str, target: str) -> ClosureResult:
+def certify(C: ry.Config, receiver_prefix: str, target: str,
+            existing_closures=()) -> ClosureResult:
     """Certify a virtual parallel-jaw closure in an already posed collision scene.
 
-    Existing holders remain their normal fixed-open collision geometry. This is conservative:
-    the receiver must clear their larger open envelope too.
-
-    TODO(gripper-closure): build a second floating-EE collision model with actual finger
-    joints and replay each existing holder at its object-dependent aperture. That resolves the
-    self-collision exclusion of a held object exactly, without touching the deliberately
-    joint-disabled search/IK/simulation models.
+    ``existing_closures`` contains ``(prefix, contacted_part)`` pairs for hands already
+    holding the component.  Their proxies are first moved to their own object-dependent
+    apertures.  This is essential for handovers: two individually valid pinches can have
+    intersecting closed fingers even though their larger *open* proxy envelopes happen not to
+    intersect.  The search model keeps finger joints disabled; this disposable scene remains
+    a deterministic geometric certificate rather than another configuration-space dimension.
     """
     res, meta = _contact_aperture(C, receiver_prefix, target)
     if not res.feasible:
@@ -328,18 +346,33 @@ def certify(C: ry.Config, receiver_prefix: str, target: str) -> ClosureResult:
         return res
     model, groups, axis, positions, signs = meta
 
-    # One private scene covers the complete receiver sweep. Existing holders intentionally
-    # retain their fixed-open collision proxies; see the articulated-shadow TODO above.
+    # One private scene covers the existing closed holders plus the complete receiver sweep.
     work = _copy(C)
     # Single-arm pick IK temporarily strips idle robots' collision geometry. Re-enable just
     # their finger proxies here: an incoming close must still be checked against every other
     # gripper, without changing the main IK scene or paying for full inactive-arm contacts.
     for n in work.getFrameNames():
         s = str(n)
-        if s.endswith("finger1") or s.endswith("finger2") or "finger1_coll" in s or "finger2_coll" in s:
+        if (s.endswith("finger1") or s.endswith("finger2")
+                or "finger1_coll" in s or "finger2_coll" in s
+                or "inner_finger_pad" in s):
             work.getFrame(n).setContact(1)
     for n in _target_collision_frames(work, target):
         work.getFrame(n).setContact(1)
+
+    # Pose every existing parallel-jaw holder at the same terminal aperture used to certify
+    # its own grasp. A malformed/stale holder is left at its conservative open geometry: the
+    # receiver still has to clear it, and no new action is rejected merely because a historic
+    # state predates this gate.
+    for holder_prefix, holder_target in existing_closures:
+        if holder_prefix == receiver_prefix:
+            continue
+        holder_res, holder_meta = _contact_aperture(work, holder_prefix, holder_target)
+        if not holder_res.feasible or holder_meta is None:
+            continue
+        _hm, holder_groups, holder_axis, holder_positions, holder_signs = holder_meta
+        _move_to_shift(work, holder_positions, holder_axis, holder_groups, holder_signs,
+                       float(holder_res.aperture or 0.0))
 
     # The contact aperture was solved without environmental blockers.  Now certify every point
     # of the actual receiver sweep against holders, the rest of the assembly, table and arms.
@@ -367,7 +400,8 @@ def closure_sweep_configs(C: ry.Config, receiver_prefix: str, target: str, steps
     for n in work.getFrameNames():
         s = str(n)
         if (s.endswith("finger1") or s.endswith("finger2")
-                or "finger1_coll" in s or "finger2_coll" in s):
+                or "finger1_coll" in s or "finger2_coll" in s
+                or "inner_finger_pad" in s):
             work.getFrame(s).setContact(1)
     for n in _target_collision_frames(work, target):
         work.getFrame(n).setContact(1)

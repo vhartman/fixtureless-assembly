@@ -104,7 +104,7 @@ def apply_wrench_params(cfg):
       tf["T_t2"] = float(tfc)
 
 
-def build_scene(cfg):
+def build_scene(cfg, *, require_artifact_contract=False):
   # reconstruct the exact environment the plan was solved in (same seed => same scatter/perturb)
   set_seed(cfg["seed"])
   # Closure-aware versioned sampling changes the ranked, bounded grasp database. Restore it BEFORE
@@ -112,6 +112,14 @@ def build_scene(cfg):
   # the database-hash check below compares like with like).
   from solver import set_grasp_closure_check
   set_grasp_closure_check(bool(_saved(cfg, "grasp_closure_check", legacy=False)))
+  # The physics certificate removes sampled rows and therefore changes every positional grasp
+  # id after the first rejection. Restore it before constructing/signing the database just as
+  # main.py does. Merely persisting the flag was insufficient: replay previously rebuilt the
+  # uncertified DB and (correctly) stopped at the signature guard even for a freshly saved plan.
+  from problem import set_grasp_physics_check
+  set_grasp_physics_check(
+      bool(_saved(cfg, "grasp_physics_check", legacy=False)),
+      float(_saved(cfg, "grasp_physics_force", legacy=10.0)))
   # mixed EEs: cfg["grippers"] = per-robot CSV (see main --grippers); rolls follow the
   # two-finger whenever any two-finger arm exists, exactly like the solve.
   ks = [k.strip() for k in (cfg.get("grippers") or "").split(",") if k.strip()]
@@ -243,6 +251,11 @@ def build_scene(cfg):
     # replay scene must install the same filter context or every saved grasp id misreads.
     from problem import install_sampled_scene_ctx, get_robots as _get_robots
     install_sampled_scene_ctx(C, assembly, robots=_get_robots(C))
+  if _saved(cfg, "grasp_physics_check", legacy=False):
+    # Requires the concrete robot model, so it follows scene construction but precedes the DB
+    # signature below. The isolated checks are deterministic and use the saved load magnitude.
+    from problem import install_grasp_physics_ctx, get_robots as _get_robots
+    install_grasp_physics_ctx(C, assembly, robots=_get_robots(C))
   _expected_db = cfg.get("grasp_sampler_db_hash")
   if _expected_db:
     from problem import sampled_grasp_db_signature
@@ -251,6 +264,13 @@ def build_scene(cfg):
       raise ValueError(
           "saved sampled-grasp database hash does not match this rebuild "
           f"({_expected_db} != {_actual_db}); refusing to reinterpret positional grasp ids")
+  from artifact_contract import build_artifact_contract, validate_artifact_contract
+  _actual_contract = build_artifact_contract(
+      C, grasp_db_hash=_expected_db,
+      closure_enabled=bool(_saved(cfg, "grasp_closure_check", legacy=False)))
+  if require_artifact_contract or cfg.get("artifact_contract") is not None:
+    validate_artifact_contract(
+        cfg.get("artifact_contract"), _actual_contract, who="replay scene rebuild")
   return C, assembly
 
 
@@ -260,7 +280,7 @@ def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=T
   """Rebuild the saved scene and replay the plan. Returns the ViserRecorder (or None) so a
   headless caller can inspect the recorded steps without serving."""
   cfg, plan = read_plan(path)
-  C, assembly = build_scene(cfg)
+  C, assembly = build_scene(cfg, require_artifact_contract=True)
   robots = get_robots(C)
   use_ik = bool(cfg.get("real_ik")) or real_ik
   print(f"[replay] {cfg['assembly']} ({cfg['parts']} parts), {cfg['num_robots']} robots, "

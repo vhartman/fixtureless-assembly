@@ -120,6 +120,9 @@ _STANDARD_SEARCH_PROFILE = {
     "grasp_sampler_keep": 20,
     "grasp_sampler_candidates": 96,
     "grasp_sampler_scenes": True,
+    # A fixed-open hand is not a grasp model. Every two-finger edge must carry a bilateral
+    # virtual-close certificate and an object-dependent aperture into the saved artifact.
+    "grasp_closure_check": True,
     # Multi-part components inherit candidate contacts from all constituent parts. Build
     # those tables only when first queried and expose a stable constituent-balanced prefix.
     # Exhaustion monotonically reopens the exact historical full union, so this is an anytime
@@ -156,17 +159,81 @@ _SEARCH_PROFILES = {
         "grasp_sampler_keep": 64,
         "grasp_widen": False,
     },
-    # Compatibility alias: open-witness scheduling is now part of standard. Keep historical
-    # commands reproducible at the profile-name level rather than deleting the public spelling.
-    "open": dict(_STANDARD_SEARCH_PROFILE),
-    # Aggressive performance overlay.  The exact-seed cap is a warm-start budget, not a sound
-    # unreachability test, so keep it visibly separate from the recommended open profile.
-    "fast-open": {
-        **_STANDARD_SEARCH_PROFILE,
-        "open_witness": True,
-        "analytic_seed_cap": 3,
-    },
 }
+
+
+# The planner still contains research ablations and diagnostics that are useful through a
+# RunConfig or an old reproducibility command, but they are not supported top-level workflow
+# choices.  Keeping all of them in ``--help`` had grown the public CLI to more than 2,200 lines
+# and made obsolete experiments look equivalent to the two maintained profiles.  They remain
+# parseable for artifact compatibility; new commands should use the compact public surface or a
+# checked-in config/benchmark manifest.  Delete the underlying branches only together with their
+# dedicated regression data, not opportunistically while cleaning the interface.
+_INTERNAL_MAIN_CLI = {
+    # One-off scene/model diagnostics.
+    "robot_types", "openarm_real_finger_radius_scale", "perturb_start_pose", "plain_box",
+    "check_init", "test_pick_ik", "test_assemble_ik", "test_assemble_held_ik",
+    "test_place_ik", "show_init", "disp_final", "mate_sequence_viz", "show_successors",
+    "view_cheap_checks", "diagnose_plan_rank", "log_ik_failures", "search_stats",
+    # Superseded global search engines and heuristic experiments.  The submitted comparison
+    # rows (optimistic, flat lazy, milestones/counting, exact fill, fine projection) stay public.
+    "canonical", "optimistic_fallback", "optimistic_chain_h", "full_backward",
+    "full_backward_max_states", "full_backward_max_edges", "bounded", "anytime", "ladder",
+    "ladder_lns", "dfbnb", "pea", "beam", "iter_bound", "labeled_h", "collapsed_h",
+    "grasp_collapsed_h", "corridor_h", "geo_facts", "por", "pathmax", "part_order_bias",
+    "dominance", "anon_robots", "lru_robots", "declutter", "lns_segments",
+    "lns_grasp_transition_h", "fill_incumbent_first", "fill_policy_first",
+    "fill_policy_guide", "fill_skeleton_first", "fill_action_widening",
+    # Standard-profile implementation details. They stay available to benchmark manifests,
+    # but a normal run selects the coherent bundle instead of reconstructing it flag by flag.
+    "placement_yaw_widening", "place_cells", "prefer_center", "wrench_aware_h",
+    "lazy_fills", "open_witness", "open_witness_epochs", "open_witness_batch",
+    "lazy_edge_selector", "fill_window", "lns_window", "milestone_oracle",
+    "fill_local_h", "fill_raw_grasp_h", "fill_target_support_quotient", "fill_exact",
+    "fill_greedy", "milestone_boundaries", "ik_accuracy", "tight_fingers",
+    "place_eq_weight", "quiet_rai", "mate_eq_weight", "mate_accuracy",
+    "mate_angular_accuracy", "grasp_eq_weight", "grasp_accuracy", "witness_branch_metric",
+    "useful_grasps", "fill_scope_widening", "fill_touch_all", "ban_actions",
+    "sig_collapsed_h", "sig_components",
+    # IK/grasp search experiments that are not selected by standard or fabrica.
+    "assemble_ssik_pose_seeds", "assemble_ssik_pose_projection", "assemble_unbiased_first",
+    "assemble_basin_racing", "assemble_race_probe_evals", "assemble_race_promote",
+    "handover_basin_racing", "handover_race_probe_evals", "handover_race_starts",
+    "handover_race_promote", "ik_restarts", "precheck_restarts", "fail_order",
+    "empty_seed_refutes", "ssik_seed_neighborhood", "ssik_neighborhood_cap", "full_ik",
+    "dense_grasps", "grasp_refine", "grasp_local_widen", "grasp_sampler_strict",
+    "grasp_sampler_seed", "ik_collision_gate", "grasp_translations",
+    "ik_positive_reuse", "analytic_seed_cap", "grasp_sampler", "grasp_sampler_keep",
+    "grasp_widen", "grasp_widen_batch", "grasp_widen_max", "component_grasp_keep",
+    "grasp_sampler_candidates", "grasp_sampler_pad_support", "grasp_sampler_wrap",
+    "grasp_sampler_scenes", "always_contact",
+    # Narrow physics/witness ablations and manual optimizer controls.
+    "orientation_robust_wrench", "curved_torque_scale", "insertion_offset", "robust_mode",
+    "inserter_check", "brace_resting", "brace_for_assembly_only", "vacuum_no_assemble",
+    "staged_mates", "strict_mate_collisions", "witness_draw", "witness_reconfig_thresh",
+    "inhand_reorient", "utilization", "witness_clearance", "witness_set_spread",
+    "witness_joint_margin", "witness_branch_budget", "witness_robot_collisions",
+    # Artifact forensics and viewers.  Normal motion export is --motion-plan/--mp-save;
+    # normal inspection is replay.py or --mp-viser.
+    "mp_clearance", "mp_cograsp", "mp_export_save", "mp_export_load", "mp_modes",
+    "mp_fake_clock", "viz_grasps", "viz_grasp_closure", "viz_rest_poses",
+    "viz_rest_poses_grid", "mp_stall_timeout", "mp_open_plans", "mp_plan_candidates",
+    "mp_plan_epochs", "mp_plan_initial_runtime", "mp_shortcut_iters",
+    "mp_shortcut_strategy", "mp_shortcut_pair_checks", "mp_shortcut_res",
+    "mp_collision_view", "mp_robot_margin", "mp_margin_ramp", "mp_margin_mode",
+    "mp_table_margin", "mp_wrench_gate",
+}
+
+
+def _hide_internal_cli(parser, dests):
+  """Remove internal/reproducibility switches from normal argparse help and usage."""
+  found = {action.dest for action in parser._actions}
+  missing = set(dests) - found
+  if missing:
+    raise AssertionError(f"unknown internal CLI destinations: {sorted(missing)}")
+  for action in parser._actions:
+    if action.dest in dests:
+      action.help = argparse.SUPPRESS
 
 _STANDARD_MOTION_PROFILE = {
     # Complete both sides of every contact skill and preserve the coupled endpoints. Tight
@@ -193,7 +260,7 @@ _STANDARD_MOTION_PROFILE = {
     "mp_plan_candidates": 4,
     "mp_plan_epochs": 6,
     "mp_plan_initial_runtime": 15.0,
-    "mp_no_shortcut": False,
+    "mp_shortcut": True,
     "mp_shortcut_iters": 100,
     "mp_shortcut_strategy": "native",
     # OpenArm's thin finger/object passages exposed a real swept collision inside a 0.01-rad
@@ -267,21 +334,25 @@ def _sampled_scene_coverage(assembly, checker, robots, prefix="[grasp-scenes]"):
               if "pick" in (row.get("scene_by_kind", {}).get(kind, ()) if row else ())}
       seat = {i for i, row in enumerate(meta)
               if "assemble" in (row.get("scene_by_kind", {}).get(kind, ()) if row else ())}
-      values = {"pick": len(pick), "assemble": len(seat), "both": len(pick & seat)}
+      support = {i for i, row in enumerate(meta)
+                 if "support" in (row.get("scene_by_kind", {}).get(kind, ()) if row else ())}
+      values = {"pick": len(pick), "assemble": len(seat), "support": len(support),
+                "both": len(pick & seat)}
       part_report[kind] = values
-      fields.append(f"{kind}: pick={values['pick']} asm={values['assemble']} "
+      fields.append(f"{kind}: pick={values['pick']} mate={values['assemble']} "
+                    f"support={values['support']} "
                     f"both={values['both']}")
     report[part] = part_report
     print(f"{prefix} {part}: " + ", ".join(fields))
     if part != assembly.base and all(values["both"] == 0
                                      for values in part_report.values()):
-      print(f"{prefix} WARNING {part}: no grasp is clear in both the isolated pick and "
-            "assembled scenes; any solution requires a regrasp or handover.")
+      print(f"{prefix} WARNING {part}: no grasp is clear in both the initial pick and "
+            "mandatory mate scenes; any solution requires a regrasp or handover.")
   return report
 
 def build_parser():
   parser = argparse.ArgumentParser(
-      description="Spawn a multi-robot UR10 environment."
+      description="Integrated multi-robot assembly task and motion planning."
   )
   parser.add_argument(
       "--config", metavar="FILE", default=None,
@@ -289,15 +360,14 @@ def build_parser():
            "flag overrides the file's value (CLI wins). Write one with config.RunConfig.save "
            "or by hand. Without --config nothing changes (byte-identical default path).",
   )
+  parser.add_argument("--artifact-contract", default=None, help=argparse.SUPPRESS)
   parser.add_argument(
       "--search-profile", choices=tuple(_SEARCH_PROFILES), default=None, metavar="NAME",
       help="Named fresh-search defaults: standard = robust 5mm witness contract + greedy "
            "structural milestone fills with a uniform local PDB + non-pruning useful-grasp "
            "guidance + bounded fair open witnesses; fabrica = standard with a fixed dense "
-           "64-grasp alphabet for imported CAD models; "
-           "open = compatibility alias for standard; fast-open = standard plus "
-           "--analytic-seed-cap 3 (aggressive/experimental). A profile "
-           "is opt-in. Precedence is explicit flag > profile > --config file > built-ins, and "
+           "64-grasp alphabet for imported CAD models. A profile is opt-in. Precedence is "
+           "explicit flag > profile > --config file > built-ins, and "
            "--parts/grippers/forces/layout/seed/save remain scene-specific.",
   )
   parser.add_argument(
@@ -640,7 +710,7 @@ def build_parser():
            "Default ON (2026-07-29 defaults change); --no-real-ik restores floating EEs.",
   )
   g_ik.add_argument(
-      "--no-ik-seeding", action="store_false", dest="ik_seeding",
+      "--ik-seeding", action=argparse.BooleanOptionalAction, default=True,
       help="With --real-ik: use analytic closed-form IK (ssik) on every fixed-target skill "
            "(pick/place/assemble-onto-table, incl. braced): exact per-arm reachability rejects "
            "(replacing the relaxed precheck), collision-probed branch combos, and warm starts "
@@ -1123,13 +1193,15 @@ def build_parser():
            "a small value (e.g. 0.05) models a grip that cannot resist out-of-hand twist.",
   )
   g_search.add_argument(
-      "--no-handovers", dest="handovers", action="store_false",
-      help="Disable the add_grasp/handover primitives (regrasp-in-air). On by default; "
-           "turning it off gives a leaner reference search (no second-grasp branching).",
+      "--handovers", action=argparse.BooleanOptionalAction, default=True,
+      help="Allow add_grasp/handover primitives (regrasp-in-air). On by default; disabling "
+           "them gives a leaner reference search with no second-grasp branching.",
   )
   g_search.add_argument(
-      "--no-place", dest="allow_place", action="store_false",
-      help="Forbid setting a held assembly back on the table: the search must hold it and "
+      "--allow-place", "--place", dest="allow_place",
+      action=argparse.BooleanOptionalAction, default=True,
+      help="Allow setting a held assembly back on the table. Disabling it makes the search "
+           "hold the assembly and "
            "regrasp in the air (handovers become mandatory -- the Dogar hold-and-work "
            "regime). Meaningful for the exact search; the optimistic search needs to set down.",
   )
@@ -1539,7 +1611,7 @@ def build_parser():
            "kills globally). Use only if the A* open list truly cannot fit memory.",
   )
   g_scene.add_argument(
-      "--no-goal-on-table", action="store_false", dest="goal_on_table",
+      "--goal-on-table", action=argparse.BooleanOptionalAction, default=True,
       help="GOAL: require the finished assembly to REST ON THE TABLE and be released "
            "(hands-off), not merely complete-in-air. Default goal is complete (held "
            "counts). Extensible to a specific target pose later (set_goal(pose=...)).",
@@ -1671,12 +1743,29 @@ def build_parser():
            "precompute alike (they must agree). Changes which grasps survive the DB filter.",
   )
   g_search.add_argument(
-      "--grasp-closure-check", action=argparse.BooleanOptionalAction, default=False,
-      help="Collision-only virtual close certificate for two-finger pick/handover/add_grasp. "
+      "--grasp-closure-check", action=argparse.BooleanOptionalAction, default=True,
+      help="Default ON. Collision-only virtual close certificate for two-finger "
+           "pick/handover/add_grasp "
+           "and for retained closed hands after assembly. "
            "Finger joints stay DISABLED: a temporary proxy sweeps from the fixed-open model "
            "to the object-dependent bilateral-contact aperture and rejects a sweep through "
            "another gripper, part, table, or arm. Vacuum is unchanged. Saved with plans; "
            "--no-grasp-closure-check reproduces legacy fixed-open semantics.",
+  )
+  g_search.add_argument(
+      "--grasp-physics-check", action=argparse.BooleanOptionalAction, default=False,
+      help="Experimental sampled two-finger grasp certificate: in an isolated MuJoCo world, "
+           "close the exported gripper's actual articulated finger joints on each candidate "
+           "and require bilateral contact plus retention under gravity and six axial test "
+           "loads. Scene collision/IK "
+           "remain separate, and accepted grasps all retain the same configured analytic "
+           "wrench envelope (no per-grasp force fitting). Requires --grasp-sampler and "
+           "--grasp-sampler-scenes. Saved with plans because it changes the grasp DB.",
+  )
+  g_search.add_argument(
+      "--grasp-physics-force", type=float, default=10.0, metavar="N",
+      help="Magnitude of each isolated grasp-qualification load in +/- tool x/y/z "
+           "(default: 10N). Gravity remains active during every rollout.",
   )
   g_search.add_argument(
       "--place-eq-weight", type=float, default=100.0, metavar="W",
@@ -1866,14 +1955,6 @@ def build_parser():
            "unchanged. May cost a few extra actions (forced alternation).",
   )
   g_skills.add_argument(
-      "--skill", type=float, nargs="?", const=0.05, default=0.0, metavar="DELTA",
-      help="Shorthand: set ALL approach/departure funnels (--pre-pick/--pre-place/"
-           "--pre-add-grasp/--pre-insertion/--post-pick/--post-release) to DELTA metres "
-           "(default 0.05). "
-           "An explicit per-skill flag overrides this for that skill. The individual funnels "
-           "already default to 0.05; this is mainly a convenient common retune.",
-  )
-  g_skills.add_argument(
       "--screw-angle", type=float, default=None, metavar="DEG",
       help="Override the signed rotation angle (degrees) of every screw mate authored by the "
            "assembly. The default comes from the assembly (peg-hole-screw: 180deg). This "
@@ -1953,7 +2034,7 @@ def build_parser():
            "unconstrained between endpoints. Default 0.05; 0 disables.",
   )
   g_skills.add_argument(
-      "--fuse-pre-skill", action="store_true", default=None,
+      "--fuse-pre-skill", action=argparse.BooleanOptionalAction, default=None,
       help="With --motion-plan and any --pre-* split: BEFORE the export, re-solve every pre-skill "
            "funnel keyframe with each arm that is NOT supposed to move PINNED (hard eq) to the "
            "skill witness, instead of letting the exporter solve it with only a weight-1.0 pull. "
@@ -1965,11 +2046,6 @@ def build_parser():
            "skill keyframe is never re-solved (so fused pairs survive). ALL-OR-NOTHING per "
            "split: any residual/penetration/no-improvement verdict keeps today's keyframe. The "
            "exported task structure is identical either way.",
-  )
-  g_skills.add_argument(
-      "--no-fuse-pre-skill", dest="fuse_pre_skill", action="store_false", default=None,
-      help="Force the pre-skill pin OFF (it defaults ON when a --pre-insertion/--pre-add-grasp "
-           "split is present).",
   )
   g_output.add_argument(
       "--hoist-releases", action=argparse.BooleanOptionalAction, default=True,
@@ -2165,8 +2241,8 @@ def build_parser():
            "Bounds ONLY the tree search, NOT shortcutting.",
   )
   g_mp.add_argument(
-      "--mp-no-shortcut", action="store_true",
-      help="With --motion-plan: skip the shortcutting post-process (fastest to a raw path).",
+      "--mp-shortcut", action=argparse.BooleanOptionalAction, default=True,
+      help="With --motion-plan: run the shortcutting post-process (default).",
   )
   g_mp.add_argument(
       "--mp-shortcut-iters", type=int, default=1000, metavar="N",
@@ -2351,6 +2427,7 @@ def build_parser():
            "wrench settings, ...) to PATH as JSON, so it can be replayed later without "
            "re-searching via the standalone `python replay.py PATH` script.",
   )
+  _hide_internal_cli(parser, _INTERNAL_MAIN_CLI)
   return parser
 
 
@@ -2448,6 +2525,7 @@ _SAVE_CONFIG_FIELDS = (
     "grasp_sampler", "grasp_sampler_keep",               # --grasp-sampler: sampled ids only
     "grasp_sampler_candidates", "grasp_sampler_seed",    # replay under identical settings
     "grasp_sampler_db_hash",                              # positional DB content identity
+    "artifact_contract",                                  # collision/grasp/closure identity
     "grasp_refine", "grasp_widen", "grasp_widen_batch", "grasp_widen_max",
     "grasp_local_widen", "grasp_local_caps", "component_grasp_keep",
     # search provenance; replay reconstructs the final widened prefix recorded in `keep`
@@ -2458,6 +2536,7 @@ _SAVE_CONFIG_FIELDS = (
     "tight_fingers",                                     # changes what the grasp DB filters out
     "openarm_real_finger_radius_scale",                  # diagnostic real-arm IK geometry
     "grasp_closure_check",                               # virtual close changes grasp-edge feasibility
+    "grasp_physics_check", "grasp_physics_force",      # exact finger physics changes grasp DB
     "ik_seeding",                                        # off => witness IK fails on re-picks/
     # reorienting places, and mp_export then exports the arm's PREVIOUS config as the goal
     "pre_pick", "post_pick", "pre_place", "pre_add_grasp", "post_release", # each SPLITS an action into tasks:
@@ -2481,7 +2560,7 @@ _SAVE_CONFIG_FIELDS = (
     "mp_sequence",                                       # depgraph vs sequence = a different
     # task GRAPH; the sim rebuilt SEQUENCE unconditionally while main defaults to depgraph
     "mp_optimize", "mp_runtime", "mp_stall_timeout",   # RRT* consultation contract
-    "mp_no_shortcut", "mp_shortcut_iters", "mp_shortcut_res",
+    "mp_shortcut", "mp_shortcut_iters", "mp_shortcut_res",
     "mp_shortcut_strategy", "mp_shortcut_pair_checks", # certified path post-processing
     "mp_collision_tolerance",                            # base predicate certificate
     "mp_robot_margin", "mp_margin_ramp", "mp_margin_mode", # clearance certificate
@@ -2558,7 +2637,7 @@ _WITNESS_FIELDS = (
     "witness_joint_margin", "object_over_table", "object_over_table_margin", "witness_draw",
     "witness_sets", "witness_set_spread", "pre_insertion", "skill_funnel_collision_res",
     "grasp_sampler", "grasp_sampler_keep", "grasp_sampler_candidates", "grasp_sampler_seed",
-    "grasp_sampler_db_hash",
+    "grasp_sampler_db_hash", "grasp_closure_check",
     "grasp_sampler_margin", "grasp_sampler_pad_support", "grasp_sampler_wrap",
     "grasp_sampler_strict", "grasp_sampler_scenes", "placement_yaws")
 
@@ -3059,8 +3138,8 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
       cmd.extend(["--motion-profile", cfg._motion_profile])
     if cfg.mp_stall_timeout is not None:
       cmd.extend(["--mp-stall-timeout", f"{min(runtime, cfg.mp_stall_timeout):g}"])
-    if cfg.mp_no_shortcut:
-      cmd.append("--mp-no-shortcut")
+    if not cfg.mp_shortcut:
+      cmd.append("--no-mp-shortcut")
     if cfg.mp_shortcut_res is not None:
       cmd.extend(["--mp-shortcut-res", f"{cfg.mp_shortcut_res:g}"])
     if cfg.mp_fake_clock:
@@ -3110,7 +3189,7 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
       selected_doc = json.load(f)
     selected_cfg = selected_doc.setdefault("config", {})
     for key in ("fuse_cograsp", "fuse_pre_skill", "mp_sequence", "mp_optimize",
-                "mp_runtime", "mp_stall_timeout", "mp_no_shortcut", "mp_shortcut_iters",
+                "mp_runtime", "mp_stall_timeout", "mp_shortcut", "mp_shortcut_iters",
                 "mp_shortcut_res", "mp_shortcut_strategy", "mp_shortcut_pair_checks",
                 "mp_collision_tolerance", "mp_robot_margin", "mp_margin_ramp",
                 "mp_margin_mode",
@@ -3412,9 +3491,15 @@ def run(cfg, explicit=None):
   set_rolls_per_face(2 if any_two_finger else 1)
   set_dense_grasps(cfg.dense_grasps and any_two_finger)
   from problem import (set_sampled_grasps, clear_sampled_scene_ctx,
+                       set_grasp_physics_check,
                        set_component_grasp_keep)
   if cfg.grasp_sampler_scenes and not cfg.grasp_sampler:
     raise SystemExit("--grasp-sampler-scenes requires --grasp-sampler")
+  if cfg.grasp_physics_check and not cfg.grasp_sampler:
+    raise SystemExit("--grasp-physics-check requires --grasp-sampler")
+  if cfg.grasp_physics_check and not cfg.grasp_sampler_scenes:
+    raise SystemExit("--grasp-physics-check currently requires --grasp-sampler-scenes so "
+                     "the finite DB can reserve physics-certified pick/assembly grasps")
   if cfg.grasp_local_widen and cfg.grasp_widen:
     # Named standard currently carries the older whole-search retry policy. An explicit
     # local schedule replaces it cleanly instead of forcing profile users to remember a
@@ -3454,6 +3539,9 @@ def run(cfg, explicit=None):
   # a previous in-process run's scene filter must not leak into THIS run's assembly
   # definition (define() queries the grasp DB, which raises under a stale part-less ctx).
   clear_sampled_scene_ctx()
+  if cfg.grasp_physics_force < 0.0:
+    raise SystemExit("--grasp-physics-force must be non-negative")
+  set_grasp_physics_check(cfg.grasp_physics_check, cfg.grasp_physics_force)
   if cfg.grasp_sampler:
     if cfg.dense_grasps or cfg.grasp_translations:
       # dense/translations are FACE-ENUMERATOR variant families and several id-arithmetic
@@ -3871,14 +3959,23 @@ def run(cfg, explicit=None):
     from problem import install_sampled_scene_ctx
     install_sampled_scene_ctx(C, assembly, robots=get_robots(C))
     print("[flag] --grasp-sampler-scenes ACTIVE: every candidate is tagged PER GRIPPER KIND "
-          "with floating-EE verdicts at its INITIAL pose (PICK) and fully ASSEMBLED pose; "
-          "the bounded DB reserves diverse proposals for those contexts. Exact intermediate-"
+          "for PICK, the mandatory MATE endpoint, and full-assembly SUPPORT contexts; "
+          "the bounded DB reserves diverse proposals for those roles. Exact intermediate-"
           "state cheap/IK gates remain authoritative. Grasp ids are per PART INSTANCE.")
     if _closure_active:
       print("[grasp-sampler-scenes] strict closure generation ACTIVE: a two-finger source "
             "whose fingers intersect the table may emit a distinct minimum approach-retracted "
             "candidate, retained only after open-hand + full closure re-certification. "
             "Clutter/other-hand collisions are never projected.")
+  if cfg.grasp_physics_check:
+    from problem import install_grasp_physics_ctx
+    install_grasp_physics_ctx(C, assembly, robots=get_robots(C))
+    print("[flag] --grasp-physics-check ACTIVE: every sampled two-finger candidate is "
+          "closed in an isolated MuJoCo model using the exported gripper's actual finger "
+          f"joints; bilateral acquisition plus gravity and six {cfg.grasp_physics_force:g}N "
+          "tool-frame load directions are required. Results are "
+          "cached per pose. The configured wrench profile remains one global envelope for "
+          "all accepted grasps; no empirical per-grasp limits are fitted.")
   if cfg.grasp_sampler:
     from problem import sampled_grasp_db_signature
     _db_hash = sampled_grasp_db_signature(assembly)
@@ -3903,6 +4000,27 @@ def run(cfg, explicit=None):
             "pass --refresh-witnesses to recertify its "
             "symbolic skeleton -- refusing to silently rebind grasp ids")
     cfg.grasp_sampler_db_hash = _db_hash
+
+  # Bind every newly saved task plan to the concrete contact model, grasp database and
+  # virtual-close semantics that gave its grasp ids meaning. A fresh --solve may use an old
+  # plan as a convenient config and deliberately upgrades the contract; --load-plan is a
+  # certificate consumer and must either match exactly or explicitly recertify.
+  from artifact_contract import build_artifact_contract, validate_artifact_contract
+  _saved_contract = cfg.artifact_contract
+  _actual_contract = build_artifact_contract(
+      C, grasp_db_hash=cfg.grasp_sampler_db_hash,
+      closure_enabled=bool(cfg.grasp_closure_check))
+  if cfg.load_plan:
+    if cfg.refresh_witnesses:
+      if _saved_contract != _actual_contract:
+        print("[artifact-contract] explicit --refresh-witnesses: recertifying the fixed "
+              "symbolic plan under the current collision/grasp/closure contract.")
+    else:
+      validate_artifact_contract(
+          _saved_contract, _actual_contract, who=f"--load-plan {cfg.load_plan}")
+  elif _saved_contract is not None and _saved_contract != _actual_contract:
+    print("[artifact-contract] fresh --solve replaces the config's stale model contract.")
+  cfg.artifact_contract = _actual_contract
 
   # Internal benchmark pre-pass: construct the finite, scene/gripper-filtered grasp database
   # once, before any solver is timed.  The public runner supplies both an explicit artifact
@@ -4317,14 +4435,6 @@ def run(cfg, explicit=None):
             "contact -- every witness must clear the strict-collisions gate with ALL contacts "
             "on (grasp and mate contact included); overlapping plans fail their IK and are "
             "re-searched. --no-always-contact restores the contact exclusions.")
-    if cfg.skill > 0.0:
-      # shorthand: set every funnel not explicitly overridden on this command. Checking the
-      # CLI presence rather than `<= 0` matters now that funnels default ON.
-      for _f in ("pre_insertion", "pre_pick", "post_pick", "pre_place", "pre_add_grasp", "post_release"):
-        if not explicit or _f not in explicit:
-          setattr(cfg, _f, cfg.skill)
-      print(f"[flag] --skill {cfg.skill:g} ACTIVE: enabling all approach/departure funnels "
-            "(pick, place, add_grasp, assemble).")
     if robot_ik is not None and cfg.pre_insertion > 0.0:
       robot_ik.pre_insertion_delta = cfg.pre_insertion
       print(f"[flag] --pre-insertion ACTIVE: MP export splits each assemble into a goto to the "
@@ -4673,12 +4783,13 @@ def run(cfg, explicit=None):
       # transaction *after* this source certificate exists: it can commit only if every changed
       # predecessor scene is re-certified, otherwise the original plan/witnesses are retained.
       # A loaded plan is read-only unless the user explicitly asks for --refresh-witnesses.
-      from plan_io import (read_pre_witnesses, read_skill_paths, read_witnesses,
+      from plan_io import (read_grasp_closures, read_pre_witnesses, read_skill_paths, read_witnesses,
                            read_witness_stage,
                            require_complete_witnesses, witness_block)
       joint_names = list(robot_ik.C.getJointNames()) if robot_ik is not None else []
       baseline_witnesses = None
       baseline_pre_witnesses = None
+      grasp_closures = {}
       skill_paths = None
       _saved_witness_stage = None
       _need_witnesses = bool(robot_ik is not None and not (
@@ -4774,6 +4885,18 @@ def run(cfg, explicit=None):
             # must run again rather than treating the old final stage as positionally reusable.
             _saved_witness_stage = None
 
+      if cfg.grasp_closure_check:
+        if cfg.load_plan and not cfg.refresh_witnesses and not _hoist_applied:
+          grasp_closures = read_grasp_closures(cfg.load_plan, plan, required=True)
+        else:
+          from solver import collect_plan_grasp_closures
+          grasp_closures = collect_plan_grasp_closures(
+              C, assembly, plan, robots,
+              gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
+              handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing)
+        print(f"[closure-persist] {len(grasp_closures)} two-finger grasp aperture "
+              "certificate(s) aligned to the final plan.")
+
       if baseline_witnesses is not None:
         require_complete_witnesses(plan, baseline_witnesses,
                                    who="search-witness persistence")
@@ -4802,7 +4925,8 @@ def run(cfg, explicit=None):
         save_plan(cfg.save, cfg, plan,
                   witnesses=(witness_block(
                       joint_names, baseline_witnesses, stage="search",
-                      pre_witnesses=baseline_pre_witnesses)
+                      pre_witnesses=baseline_pre_witnesses,
+                      grasp_closures=grasp_closures)
                              if baseline_witnesses is not None else None))
       opt_witnesses = baseline_witnesses
       opt_pre_witnesses = baseline_pre_witnesses
@@ -4958,7 +5082,8 @@ def run(cfg, explicit=None):
                                           stage=("optimized" if cfg.optimize_witnesses is not None
                                                  else "search"),
                                           skill_paths=skill_paths,
-                                          pre_witnesses=opt_pre_witnesses))
+                                          pre_witnesses=opt_pre_witnesses,
+                                          grasp_closures=grasp_closures))
       if plan is not None and cfg.utilization:
         from solver import utilization_report
         utilization_report(C, assembly, plan, robots, witnesses=opt_witnesses,
@@ -4996,6 +5121,11 @@ def run(cfg, explicit=None):
           _export_table_margin = cfg.mp_table_margin
           _export_table_float = cfg.part_float if cfg.mp_table_margin else 0.0
           _export_wrench_gate = cfg.mp_wrench_gate
+          # A physics-certified two-finger database is executed with the articulated Robotiq
+          # pads, not only the historical capsule proxies.  Keep those exact open-pad boxes
+          # in the motion collision model as well; this changes geometry, so persist it in the
+          # final export rather than re-inferring it during simulation.
+          _export_physical_fingers = bool(cfg.grasp_physics_check)
           mp_pre = dict(opt_pre_witnesses or {})
           _pre_pin_robots = {}
           _cograsp_pre = {}
@@ -5017,6 +5147,8 @@ def run(cfg, explicit=None):
             _export_table_margin = _clearance["table_margin"]
             _export_table_float = _clearance["table_float"]
             _export_wrench_gate = _clearance["wrench_gate"]
+            _export_physical_fingers = bool(
+                _es.get("physical_finger_collisions", _export_physical_fingers))
             robot_ik.pre_insertion_delta = float(
                 _es.get("pre_insertion", robot_ik.pre_insertion_delta))
             robot_ik.pre_pick_delta = float(_es.get("pre_pick", robot_ik.pre_pick_delta))
@@ -5210,7 +5342,8 @@ def run(cfg, explicit=None):
                                  saved_sequence_names=(None if _loaded_export is None else
                                                        _loaded_export["sequence_names"]),
                                  pre_pin_robots=_pre_pin_robots,
-                                 skill_paths=skill_paths)
+                                 skill_paths=skill_paths,
+                                 physical_finger_collisions=_export_physical_fingers)
           print(f"[motion-plan] {'DEPGRAPH' if _export_depgraph else 'SEQUENCE'} problem, "
                 f"{len(prob.tasks)} tasks")
           if _loaded_export is not None:
@@ -5243,6 +5376,7 @@ def run(cfg, explicit=None):
               "table_margin": float(_export_table_margin or 0.0),
               "table_float": float(_export_table_float or 0.0),
               "wrench_gate": bool(_export_wrench_gate),
+              "physical_finger_collisions": bool(_export_physical_fingers),
               "pre_insertion": float(robot_ik.pre_insertion_delta),
               "pre_pick": float(robot_ik.pre_pick_delta),
               "post_pick": float(robot_ik.post_pick_delta),
@@ -5315,7 +5449,7 @@ def run(cfg, explicit=None):
               print(f"[motion-plan] unified edge resolution: {_old_res:g} -> "
                     f"{prob.collision_resolution:g}rad (BiRRT, shortcut, sim preflight)")
           mp_path, _ = MP.run_birrt(
-              prob, runtime=cfg.mp_runtime, shortcut=not cfg.mp_no_shortcut,
+              prob, runtime=cfg.mp_runtime, shortcut=cfg.mp_shortcut,
               shortcut_iters=cfg.mp_shortcut_iters, shortcut_resolution=cfg.mp_shortcut_res,
               shortcut_strategy=cfg.mp_shortcut_strategy,
               shortcut_pair_checks=cfg.mp_shortcut_pair_checks,

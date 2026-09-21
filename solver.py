@@ -218,6 +218,7 @@ class CollisionChecker:
     self.robots_order = list(robots)
     paths = [robot_gripper_paths.get(r, self.gripper_path) for r in robots] \
         if robot_gripper_paths else [self.gripper_path] * len(robots)
+    self.robot_gripper_paths = dict(zip(robots, paths))
     self.mixed = len(set(paths)) > 1
     # robot -> gripper KIND (the geometry class): same-kind arms are interchangeable in a
     # floating-EE check, so verdict signatures and slot assignment key on the KIND, not the
@@ -483,37 +484,85 @@ class CollisionChecker:
     """
     if not self.closure_check:
       return True
-    kind, robot, part, gid = tuple(action[:4])
-    if kind not in _GRASP_ACTIONS:
+    if tuple(action)[0] not in _GRASP_ACTIONS:
       return True
-    key = ("closure", _CLOSURE_MODEL_VERSION, tuple(action), self._sig(s0, ()))
-    hit = self._closure_verdicts.get(key)
-    if hit is not None:
-      return hit
+    res = self.grasp_closure_result(s0, action, assembly)
+    ok = bool(res is not None and res.feasible)
+    reason = "receiver-slot-missing" if res is None else res.reason
+    if not ok:
+      self.closure_rejects[reason or "unknown"] = self.closure_rejects.get(
+          reason or "unknown", 0) + 1
+      if _CHEAP_DEBUG_VIEW:
+        detail = "" if res is None or res.detail is None else f" {res.detail!r}"
+        print(f"[closure] reject {tuple(action)!r}: {reason}{detail}", flush=True)
+    return ok
+
+  def grasp_closure_result(self, s0, action, assembly):
+    """Return the aperture-bearing closure certificate for one discrete grasp edge."""
+    if not self.closure_check or tuple(action)[0] not in _GRASP_ACTIONS:
+      return None
+    kind, robot, part, gid = tuple(action[:4])
+    key = ("closure-result", _CLOSURE_MODEL_VERSION, tuple(action), self._sig(s0, ()))
+    if key in self._closure_results:
+      return self._closure_results[key]
     C_col, owners = self._scene_for(
         s0, assembly, extra_grasps=[(robot, part, gid)], return_assignments=True)
     receiver = owners.get(robot)
     if receiver is None:
-      # A receiver without a slot is an internal bookkeeping error, not evidence that a
-      # physically impossible grasp is acceptable.  Fail closed and leave a useful reason.
       res = None
-      ok = False
-      reason = "receiver-slot-missing"
     else:
       prefix, _ = receiver
-      res = _certify_closure(C_col, prefix, part)
-      ok = bool(res.feasible)
-      reason = res.reason
+      existing = [(other_prefix, held_part)
+                  for held_robot, (other_prefix, held_part) in owners.items()
+                  if held_robot != robot]
+      res = _certify_closure(C_col, prefix, part, existing_closures=existing)
+    self._closure_results[key] = res
+    return res
+
+  def held_closures_free(self, state, assembly):
+    """Certify every closed parallel-jaw hand in a resulting held state.
+
+    A new-grasp certificate is not sufficient for an assembly edge: the hand may close
+    cleanly around the picked singleton and subsequently intersect a newly mated neighbour
+    while retaining exactly the same grasp.  The fixed-open floating proxy cannot detect
+    that case.  Rebuild the resulting state, pose all other holders at their terminal
+    apertures, and require each fingered holder's complete close sweep to remain clear.
+    Vacuum hands have no articulated close and therefore pass through ``certify`` directly.
+    """
+    if not self.closure_check:
+      return True
+    key = ("held-closures", _CLOSURE_MODEL_VERSION, self._sig(state, ()))
+    hit = self._closure_verdicts.get(key)
+    if hit is not None:
+      return hit
+    C_col, owners = self._scene_for(state, assembly, return_assignments=True)
+    holders = [(robot, prefix, part) for robot, (prefix, part) in owners.items()]
+    ok = True
+    reason = None
+    detail = None
+    failed = None
+    for robot, prefix, part in holders:
+      existing = [(other_prefix, other_part)
+                  for other_robot, other_prefix, other_part in holders
+                  if other_robot != robot]
+      res = _certify_closure(C_col, prefix, part, existing_closures=existing)
+      if not res.feasible:
+        ok = False
+        failed = (robot, part)
+        reason = res.reason or "unknown"
+        detail = res.detail
+        break
     kh = hash(key)
     if kh in self._closure_seen_hashes:
       self._closure_verdicts[key] = ok
     else:
       self._closure_seen_hashes.add(kh)
     if not ok:
-      self.closure_rejects[reason or "unknown"] = self.closure_rejects.get(reason or "unknown", 0) + 1
+      label = "held-" + str(reason)
+      self.closure_rejects[label] = self.closure_rejects.get(label, 0) + 1
       if _CHEAP_DEBUG_VIEW:
-        detail = "" if res is None or res.detail is None else f" {res.detail!r}"
-        print(f"[closure] reject {tuple(action)!r}: {reason}{detail}", flush=True)
+        print(f"[closure] reject resulting holder {failed!r}: {reason} {detail!r}",
+              flush=True)
     return ok
 
   def pose_collision_free(self, state, gpart, grasp_pose_7, assembly, note="", robot=None):
@@ -839,7 +888,7 @@ class RobotIK:
     # touched part's/group's contact in the skill IK -- the witness must clear the strict
     # gate with EVERY contact on (grasp/mate contact included); an overlapping plan then
     # fails its IK and the search re-runs. Default off (byte-identical).
-    self._mate_exempt = None                              # (moving parts, target parts) while solving a mate
+    self._mate_exempt = None                              # mate_penetration args while solving a mate
     self.harvest_branches = None                          # scratch list while harvesting
     self.harvest_all_branches = True                      # keep EVERY feasible analytic
       # branch as a ladder candidate, not just the first. `_solve_with_seeds` used to return on
@@ -2106,8 +2155,8 @@ class RobotIK:
     komo.addObjective([1, 1], ry.FS.qItself, sel, ry.OT.eq, [1e1],
                       [p[n] for n in sel])
 
-  def mate_penetration(self, C, moving, target):
-    """Total penetration of `moving` against everything EXCEPT its mate `target`.
+  def mate_penetration(self, C, moving, target, intended_moving=None):
+    """Total penetration except contacts across the authored mate interface.
 
     The mate scene has the moving group's contact DISABLED -- required for the solve, since the
     seating is flush and the intended contact would otherwise read as penetration -- but that
@@ -2116,6 +2165,7 @@ class RobotIK:
     per-frame, all-or-nothing), so the group's contact is re-enabled just long enough to sum the
     pairs by hand, and restored before returning.
     """
+    intended_moving = frozenset(moving if intended_moving is None else intended_moving)
     for mp in moving:
       set_part_contact(C, mp, 1)
     try:
@@ -2128,10 +2178,12 @@ class RobotIK:
         b_in = any(fb.startswith(m) for m in moving)
         if a_in and b_in:
           continue                                        # inside the moving group itself
-        if a_in != b_in:
+        a_intended = any(fa.startswith(m) for m in intended_moving)
+        b_intended = any(fb.startswith(m) for m in intended_moving)
+        if a_intended != b_intended:
           other = fb if a_in else fa
           if any(other.startswith(t) for t in target):
-            continue                                      # the INTENDED flush mate contact
+            continue                                      # the INTENDED authored interface
         # EVERYTHING ELSE COUNTS -- including pairs the moving group is not part of at all.
         # An earlier version skipped those ("if a_in == b_in: continue"), which silently
         # dropped the ACTOR'S ARM against a part of the TARGET assembly. Measured: the exported
@@ -2175,7 +2227,12 @@ class RobotIK:
     saved = C.getJointState()
     try:
       C.setJointState(np.asarray(q, dtype=float).ravel())
-      res = _certify_closure(C, action[1] + "_", action[2])
+      existing = [(c[1] + "_", c[2])
+                  for p in state.bodies()
+                  for c in state.supports.get(p, ())
+                  if c[0] == "grasp" and c[1] != action[1]]
+      res = _certify_closure(C, action[1] + "_", action[2],
+                             existing_closures=existing)
     finally:
       C.setJointState(saved)
     if res.feasible:
@@ -3985,8 +4042,13 @@ class RobotIK:
     # disagrees with us at the same tolerance (measured on cross-12: the inserted obj_3 through
     # the bracing arm's palm by 5.2mm, obj_5 by 4.3mm, both silently accepted).
     if self.mate_pair_gate:
-      target_grp = next((g for g in s0.subassemblies() if onto in g), (onto,))
-      self._mate_exempt = (frozenset(moving), frozenset(target_grp))
+      # The action authors one interface, ``part -> onto``.  The old implementation exempted
+      # moving x target_component, which also hid the incoming part striking an already-mated
+      # neighbour.  That admitted a full Cross funnel where obj_6 penetrated obj_1 by 5 mm and
+      # was twisted out of its physical pinch in MuJoCo.  A rigid moving module may contain
+      # several parts, but only the named interface is intended contact; all other pairs must
+      # remain collision-free.
+      self._mate_exempt = (frozenset(moving), frozenset((onto,)), frozenset((part,)))
 
     # FIXED-target fast rejects: when the TARGET group rests on the table (no robot holds any
     # of its parts) the mate pose is fixed in the world, and the moving group rides RIGIDLY on
@@ -4460,10 +4522,13 @@ class RobotIK:
     steps = max(1, int(np.ceil(float(np.max(np.abs(q1 - q0))) / resolution)))
     part, onto = action[2], action[3]
     moving = next((g for g in s0.subassemblies() if part in g), (part,))
-    target = next((g for g in s0.subassemblies() if onto in g), (onto,))
+    _strict_mate = bool(getattr(self, "mate_pair_gate", False))
+    target = ((onto,) if _strict_mate else
+              next((g for g in s0.subassemblies() if onto in g), (onto,)))
     old_action, old_exempt, old_funnel = self._cur_action, self._mate_exempt, self._funnel_solve
     self._cur_action = tuple(action)
-    self._mate_exempt = (frozenset(moving), frozenset(target))
+    self._mate_exempt = (frozenset(moving), frozenset((onto,)), frozenset((part,))) \
+        if _strict_mate else (frozenset(moving), frozenset(target))
     self._funnel_solve = True
     try:
       # Endpoints were already accepted by their own IK calls. Sampling them again is useful:
@@ -4830,6 +4895,11 @@ def cheap_feasible(action, s0, s1, assembly, checker):
     # This is deliberately a separate cheap layer: the fixed-open proxy can be clear while a
     # receiver's fingers would have to sweep through the current holder during a handover.
     # Reject before RobotIK/KOMO so another grasp/action can be considered normally.
+    return False
+  if action[0] == "assemble" and not checker.held_closures_free(s1, assembly):
+    # The holder was certified when it acquired the part, but assembly changes the rigid
+    # neighbourhood around that unchanged grasp.  Certify the actual closed fingers against
+    # the resulting component before paying for arm IK.
     return False
   if action[0] == "inhand_reorient":
     # v1 gate: the RESULT state (part held at its NEW grasp, everything else unchanged) must
@@ -5867,6 +5937,48 @@ def collect_plan_witnesses(C, assembly, plan, robots, robot_ik, *, gripper_kind=
   return out
 
 
+def collect_plan_grasp_closures(C, assembly, plan, robots, *, gripper_kind=None,
+                                handovers=True, allow_place=True, bracing=False,
+                                grasp_table=None, checker=None):
+  """Persist the exact aperture certificate for every two-finger grasp edge.
+
+  The certificate is indexed by the plan edge and binds the full action tuple. Consumers may
+  therefore command the planned aperture directly instead of re-inferring it from a rendered
+  mesh or a slightly drifted live pose.
+  """
+  if checker is None or grasp_table is None:
+    context_checker, context_table = _search_context(C, assembly, robots)
+    checker = checker or context_checker
+    grasp_table = grasp_table or context_table
+  states = _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
+                          bracing, grasp_table, "collect_plan_grasp_closures")
+  out = {}
+  for i, action0 in enumerate(plan):
+    action = tuple(action0)
+    if not action or action[0] not in _GRASP_ACTIONS:
+      continue
+    robot, part, gid = action[1], action[2], int(action[3])
+    if checker._robot_kind.get(robot) != "two_finger":
+      continue
+    res = checker.grasp_closure_result(states[i], action, assembly)
+    if res is None or not res.feasible or res.aperture is None:
+      reason = "missing" if res is None else (res.reason or "infeasible")
+      raise ValueError(
+          f"closure persistence: step {i} {action!r} has no valid aperture certificate "
+          f"({reason}); refusing to save a replay-ambiguous grasp")
+    out[i] = {
+        "contract": f"virtual-close-v{_CLOSURE_MODEL_VERSION}",
+        "action": list(action),
+        "robot": str(robot),
+        "part": str(part),
+        "grasp_id": gid,
+        "model": res.model,
+        "aperture": float(res.aperture),
+        "aperture_semantics": "per-finger-inward-travel-m",
+    }
+  return out
+
+
 def collect_plan_pre_witnesses(C, assembly, plan, witnesses, robots, robot_ik, *,
                                gripper_kind=None, handovers=True, allow_place=True,
                                bracing=False, grasp_table=None, resolve_missing=False):
@@ -6005,7 +6117,10 @@ def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
     if act[0] == "assemble":
       part, onto = act[2], act[3]
       moving = frozenset(next((g for g in states[i].subassemblies() if part in g), (part,)))
-      target = frozenset(next((g for g in states[i].subassemblies() if onto in g), (onto,)))
+      _strict_mate = bool(getattr(robot_ik, "mate_pair_gate", False))
+      target = (frozenset((onto,)) if _strict_mate else
+                frozenset(next((g for g in states[i].subassemblies()
+                                if onto in g), (onto,))))
       if not robot_ik.keep_contacts:
         for mp in moving:
           set_part_contact(Ci, mp, 0)                     # same exclusion the solve used
@@ -6015,7 +6130,8 @@ def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
     def pen_of(q):
       Ci.setJointState(np.asarray(q, dtype=float).ravel())
       if act[0] == "assemble":
-        return robot_ik.mate_penetration(Ci, moving, target)
+        return robot_ik.mate_penetration(
+            Ci, moving, target, frozenset((part,)) if _strict_mate else None)
       return float(Ci.getCollisionsTotalPenetration())
 
     def verdict(q):
@@ -6354,7 +6470,10 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
     # survives even with --strict-mate-collisions: the flag gates `_ik_assemble`, and THIS pass
     # produces the witnesses that actually reach mp_export. Under the flag, measure the mate
     # scene pair-wise instead, exempting only the intended moving<->target contact.
-    target_grp = frozenset(next((g for g in states[j].subassemblies() if onto in g), (onto,)))
+    _strict_mate = bool(getattr(robot_ik, "mate_pair_gate", False))
+    target_grp = (frozenset((onto,)) if _strict_mate else
+                  frozenset(next((g for g in states[j].subassemblies()
+                                  if onto in g), (onto,))))
     _mv = frozenset(moving)
 
     def residuals(q1, q2):
@@ -6382,7 +6501,8 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
           ang = max(ang, _quat_err_deg(v, tgt))
         else:
           pos = max(pos, float(np.linalg.norm(np.asarray(v) - np.asarray(tgt))))
-      p2 = (robot_ik.mate_penetration(Cb, _mv, target_grp) if robot_ik.mate_pair_gate
+      p2 = (robot_ik.mate_penetration(Cb, _mv, target_grp, frozenset((part,)))
+            if _strict_mate
             else float(Cb.getCollisionsTotalPenetration()))
       return (pos, ang, float(Ca.getCollisionsTotalPenetration()), p2)
 
@@ -9513,6 +9633,17 @@ def _search_context(C, assembly, robots, build_table=True):
       print(f"[grasp-db] wrote {stats['keys']} component rows / {stats['rows']} grasps "
             f"to {cache_path}")
     return table
+
+  def with_handover_physics(table):
+    if not _problem._GRASP_PHYSICS_CHECK:
+      return table
+    if _problem._GRASP_PHYSICS_CTX is None:
+      raise RuntimeError("grasp physics enabled before its concrete context was installed")
+    if not isinstance(table, GraspTable):
+      table = GraspTable(table)
+    if table.robot_kinds is None:
+      table.robot_kinds = {}
+    return _problem._GRASP_PHYSICS_CTX.precompute_handovers(table)
   if is_openarm:
     if distinct != ["two_finger"]:
       raise ValueError("OpenArm currently exports its native pinch hand only")
@@ -9549,8 +9680,9 @@ def _search_context(C, assembly, robots, build_table=True):
       return checker, None
     table = cached_table()
     if table is None:
-      table = persist_table(precompute_grasps(assembly, gripper_path=ee_path[k]))
-    return checker, table
+      table = precompute_grasps(assembly, gripper_path=ee_path[k])
+    table = with_handover_physics(table)
+    return checker, persist_table(table)
   # MIXED END EFFECTORS: per-robot cheap-EE slots; the grasp table is the UNION over kinds
   # with a per-grasp kind MASK (a grasp enters kind k's set iff k's EE stands there
   # collision-free vs the subassembly). Successor generators gate (robot, grasp) pairs on
@@ -9563,7 +9695,7 @@ def _search_context(C, assembly, robots, build_table=True):
     return checker, None
   table = cached_table()
   if table is not None:
-    return checker, table
+    return checker, with_handover_physics(table)
   per_kind = {k: precompute_grasps(assembly, gripper_path=ee_path[k]) for k in distinct}
   rolls = _problem._ROLLS_PER_FACE
   dense = _problem._DENSE_GRASPS
@@ -9607,6 +9739,7 @@ def _search_context(C, assembly, robots, build_table=True):
   if not isinstance(table, LazyGraspTable):
     for key in ordered_keys:
       table[key] = merge_key(key, table)
+  table = with_handover_physics(table)
   return checker, persist_table(table)
 
 
@@ -10889,6 +11022,8 @@ def _grasp_prefix_table(grasp_table, caps):
   if isinstance(out, GraspTable):
     out.kinds_of = grasp_table.kinds_of
     out.robot_kinds = grasp_table.robot_kinds
+    out.handover_physics = grasp_table.handover_physics
+    out.handover_models = grasp_table.handover_models
   return out
 
 

@@ -10,6 +10,7 @@ replaced by feasibility-safe optimized keyframes, so motion-plan and sim stages 
 functions of this file instead of re-solving the witness pass.
 Written by main.py --save, read by replay.py / main.py --load-plan / sim.py."""
 import json
+import math
 from pathlib import Path
 
 
@@ -56,7 +57,7 @@ def require_complete_witnesses(plan, witnesses, *, who="witness export"):
 
 def witness_block(joint_names, witnesses, alts=None, stage=None, skill_paths=None,
                   pre_witnesses=None, optimization_candidates=None,
-                  diagnostic_candidates=None):
+                  diagnostic_candidates=None, grasp_closures=None):
   """Pack per-action full-config witnesses for persistence. Entry i belongs to plan[i];
   None entries (actions without an IK keyframe) stay null. `joint_names` records the joint
   ORDER the vectors are expressed in -- readers must refuse the block if their scene's joint
@@ -107,6 +108,49 @@ def witness_block(joint_names, witnesses, alts=None, stage=None, skill_paths=Non
         str(i): [float(v) for v in q]
         for i, q in sorted(pre_witnesses.items()) if q is not None}
     out["pre_wit_contract"] = PRE_WITNESS_CONTRACT
+  if grasp_closures:
+    out["grasp_closures"] = {
+        str(i): dict(cert) for i, cert in sorted(grasp_closures.items())}
+  return out
+
+
+def read_grasp_closures(path, plan, *, required=False):
+  """Load and structurally validate saved two-finger closure/aperture certificates."""
+  with open(path) as f:
+    block = (json.load(f).get("witnesses") or {}).get("grasp_closures")
+  if not block:
+    if required:
+      raise ValueError(
+          "closure-certified plan has no persisted grasp apertures; regenerate the task "
+          "plan or explicitly refresh its witnesses")
+    return {}
+  out = {}
+  for raw_i, raw in block.items():
+    try:
+      i = int(raw_i)
+      action = tuple(raw["action"])
+      aperture = float(raw["aperture"])
+    except (KeyError, TypeError, ValueError) as exc:
+      raise ValueError(f"malformed grasp-closure certificate at {raw_i!r}") from exc
+    if not 0 <= i < len(plan) or action != tuple(plan[i]):
+      raise ValueError(
+          f"grasp-closure certificate {i} is not aligned to its saved plan action")
+    if action[0] not in {"pick", "add_grasp", "handover"}:
+      raise ValueError(f"grasp-closure certificate {i} belongs to non-grasp action {action}")
+    if not math.isfinite(aperture) or aperture < 0.0:
+      raise ValueError(f"invalid saved aperture at plan step {i}: {aperture!r}")
+    if raw.get("aperture_semantics") != "per-finger-inward-travel-m":
+      raise ValueError(
+          f"unsupported aperture semantics at step {i}: "
+          f"{raw.get('aperture_semantics')!r}")
+    from gripper_closure import VERSION as closure_version
+    if raw.get("contract") != f"virtual-close-v{closure_version}":
+      raise ValueError(
+          f"unsupported grasp-closure contract at step {i}: {raw.get('contract')!r}")
+    if (raw.get("robot") != action[1] or raw.get("part") != action[2]
+        or int(raw.get("grasp_id", -1)) != int(action[3])):
+      raise ValueError(f"grasp-closure fields disagree with action at plan step {i}")
+    out[i] = dict(raw, aperture=aperture)
   return out
 
 

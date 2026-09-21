@@ -23,6 +23,7 @@ ACTION -> TASK map (confirmed with the user 2026-07-20):
 import sys
 import json
 import os as _os
+import types as _types
 
 import numpy as np
 
@@ -35,10 +36,15 @@ _MRBENCH_SRC = _os.environ.get(
 def _ensure_mrbench():
   if _MRBENCH_SRC not in sys.path:
     sys.path.insert(0, _MRBENCH_SRC)
-  # A3 FIXED mr_bench-side: problems/__init__.py now guards the optional mr_vamp_env /
-  # pinocchio / mujoco imports with try/except ImportError (not find_spec), so the VAMP .so
-  # failing to load in this venv no longer breaks the package import. The sys.modules stub we
-  # used to pre-seed is gone.
+  # This exporter uses only mr_bench's RAI backend.  Some mr_bench revisions import every
+  # optional backend when its top-level package is discoverable, even when a required compiled
+  # extension is absent (e.g. VAMP's _mr_planner_core or MuJoCo's mjx).  Do not let unrelated
+  # partial installations break RAI planning.  Already-imported/explicitly-used backends are
+  # left untouched.
+  for _optional in ("mr_vamp_env", "pinocchio_env", "mujoco_env"):
+    _module = f"multi_robot_multi_goal_planning.problems.{_optional}"
+    if _module not in sys.modules:
+      sys.modules[_module] = _types.ModuleType(_module)
   try:
     import multi_robot_multi_goal_planning  # noqa: F401
   except ImportError as e:
@@ -1726,14 +1732,27 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
                  resolved_pre_witnesses=None,
                  resolve_missing_pre=True, task_records=None, saved_step_names=None,
                  saved_sequence_names=None, pre_pin_robots=None, skill_paths=None,
-                 wrench_gate_gripper_kind=None):
+                 wrench_gate_gripper_kind=None, physical_finger_collisions=False):
   """Build a live mr_bench problem from our solved plan. depgraph=False -> SequenceMixin (a
   fixed total order); depgraph=True -> DependencyGraphMixin (the partial order, so the planner
   may reorder independent actions). Same tasks/frames/witnesses either way."""
   _ensure_mrbench()
+  import multi_robot_multi_goal_planning.problems.rai_base_env as _rai_base_env
   from multi_robot_multi_goal_planning.problems.rai_base_env import rai_env
   from multi_robot_multi_goal_planning.problems.planning_env import (
       SequenceMixin, DependencyGraphMixin, BaseModeLogic)
+
+  # Keep the robot's kinematic tree intact.  Older/currently deployed mr_bench revisions call
+  # a helper named delete_visual_only_frames that deletes *every* mesh frame, including frames
+  # which carry a joint or collision-bearing descendants.  On UR5 this reparents the Robotiq
+  # finger collision capsules and creates impossible finger-vs-elbow penetrations at handover
+  # goals.  Visual shapes already have contact disabled, so retaining them cannot add collision
+  # constraints; it merely costs a little scene memory.  Patch the helper, not mr_bench on disk.
+  def _kinematic_copy(C):
+    out = ry.Config()
+    out.addConfigurationCopy(C)
+    return out
+  _rai_base_env.delete_visual_only_frames = _kinematic_copy
 
   states = _states_along_plan(C_start, assembly, plan, robots, gk, bracing)
   home = np.asarray(C_start.getJointState())               # physical initial/final HOME
@@ -1745,6 +1764,31 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
     def __init__(self):
       self.C = ry.Config()
       self.C.addConfigurationCopy(C_start)
+      if physical_finger_collisions:
+        # The Robotiq import already contains the manufacturer's inner-pad boxes at the
+        # fully-open mechanism pose, but historically labels them visual-only and plans with
+        # two simplified capsules.  Contact-grasp execution uses those moving pad boxes as
+        # the real collision geometry.  Include the exact open pads in the MP scene whenever
+        # the plan requested physics-certified grasps: otherwise a nominally collision-free
+        # release retreat can clip a pad against a resting assembly (the Cross moved 26 mm
+        # after a 0.01 mm physical-pad penetration while its proxy still reported 0.77 mm
+        # clearance).  Closing itself remains an atomic, separately certified event; during
+        # free transit the deterministic hand policy is fully open, which is precisely the
+        # static pose represented here.
+        _pads = 0
+        for _name in self.C.getFrameNames():
+          _s = str(_name)
+          if not (_s.endswith("left_inner_finger_pad_0") or
+                  _s.endswith("right_inner_finger_pad_0")):
+            continue
+          _frame = self.C.getFrame(_s)
+          if _frame is None or "shape" not in _frame.info():
+            continue
+          _frame.setContact(-2)
+          _pads += 1
+        if _pads:
+          print(f"[mp] physical finger collision model: enabled {_pads} exact Robotiq "
+                "open-pad boxes in addition to the conservative proxy capsules.")
       self.robots = list(robots)
       # Default rai_env.__init__ (delete_visual_only=True): mr_bench's delete_visual_only_frames
       # is now COLLISION-AWARE (A2 fix) -- it keeps every non-visual frame AND its ancestors, so
@@ -1828,6 +1872,15 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
       # attachment events are immutable, so derive them once per Mode instead of repeatedly
       # walking the full task sequence (millions of SequenceMixin list scans in a replay).
       self._canonical_relations_by_mode = {}
+      # mr_bench disables contact on the attached *root* after every mode switch.  Calling
+      # setContact on a shapeless RAI frame creates an empty ``shape:init`` collision object;
+      # a subsequent FCL query then aborts because that object has no vertices.  Remember the
+      # roots that were genuinely shapeless so set_to_mode can undo only that synthetic flag.
+      self._shapeless_attachment_frames = {
+          str(t.frames[1]) for t in self.tasks
+          if getattr(t, "frames", None) and len(t.frames) >= 2
+          and "shape" not in self.C.getFrame(str(t.frames[1])).info()
+      }
       BaseModeLogic.__init__(self)
       self.prev_mode = self.start_mode
 
@@ -1844,6 +1897,12 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
       target = config if config is not None else self.C
       if target is None:
         return
+      for name in self._shapeless_attachment_frames:
+        frame = target.getFrame(name)
+        if frame is not None:
+          # This removes the synthetic empty collision shape's contact flag while preserving
+          # the root and all of its real collision-bearing child frames.
+          frame.setContact(0)
       # Mode.id is the planner's monotonic semantic identity.  Do not use Python's id(m): the
       # planner creates short-lived Mode objects while rebuilding a chain, and CPython may
       # reuse an address for a different mode immediately after collection.
@@ -2053,7 +2112,7 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
     _reset_margin_audit()                                  # report THIS planner pull, not setup
   from multi_robot_multi_goal_planning.planners.planner_birrtstar import BidirectionalRRTstar
   from multi_robot_multi_goal_planning.planners.rrtstar_base import (
-      BaseRRTConfig, BidirectionalTree)
+      BaseRRTConfig, BidirectionalTree, Node)
   from multi_robot_multi_goal_planning.planners.shortcutting import robot_mode_shortcut
   from multi_robot_multi_goal_planning.planners.termination_conditions import (
       RuntimeTerminationCondition, PlannerTerminationCondition)
@@ -2093,6 +2152,19 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
   # a storage-policy shim: node order, samples, distances and collision predicates are
   # unchanged, and the upstream module remains unmodified.
   _tree_init = BidirectionalTree.__init__
+  _node_cost_property = Node.cost
+
+  def _set_scalar_node_cost(self, value):
+    # mr_bench's RRT-Connect extension currently adds the size-one result of
+    # batch_config_cost directly to a scalar parent cost.  Normalize that one-element batch
+    # at its typed storage boundary; larger arrays remain errors instead of being hidden.
+    a = np.asarray(value)
+    if a.size == 1:
+      value = float(a.reshape(-1)[0])
+    _node_cost_property.fset(self, value)
+
+  Node.cost = property(_node_cost_property.fget, _set_scalar_node_cost,
+                       _node_cost_property.fdel, _node_cost_property.__doc__)
   def _compact_tree_init(self, env):
     _init_compact_bidir_tree(self, env)
   BidirectionalTree.__init__ = _compact_tree_init
@@ -2100,6 +2172,7 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
     planner = BidirectionalRRTstar(problem, config=cfg)
   except Exception:
     BidirectionalTree.__init__ = _tree_init
+    Node.cost = _node_cost_property
     raise
   # Seed a pre-skill transition once from the funnel IK. Only task.robots are copied from the
   # full IK certificate; every idle robot remains at this mode's entry configuration. This is
@@ -2180,6 +2253,7 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
     _plan_wall_s = _time_mod.perf_counter() - _plan_wall_start
     _time_mod.time = _real_time
     BidirectionalTree.__init__ = _tree_init
+    Node.cost = _node_cost_property
   info = dict(info or {})
   # mr_bench records every incumbent's discovery time. Expose its first entry under a stable
   # name so benchmarks need not infer it from total process wall time (which also contains
@@ -2730,6 +2804,25 @@ def validate_nominal_keyframes(problem, tolerance=None, verbose=True):
     except Exception:
       pass
     return None
+
+  # Catch malformed collision meshes before FCL sees them.  Its assertion omits the frame
+  # name and may leave the Python process in a bad state, whereas RAI's mesh accessor lets us
+  # identify the construction bug deterministically.
+  _empty_meshes = []
+  for _name in env.C.getFrameNames():
+    _frame = env.C.getFrame(_name)
+    try:
+      if "mesh" not in str(_frame.info().get("shape", "")).lower():
+        continue
+      if np.asarray(_frame.getMeshPoints()).size == 0:
+        _empty_meshes.append(str(_name))
+    except Exception:
+      if "mesh" in str(_frame.info().get("shape", "")).lower():
+        _empty_meshes.append(str(_name))
+  if _empty_meshes:
+    raise RuntimeError(
+        "motion-planning scene contains empty mesh frame(s) before collision setup: "
+        + ", ".join(_empty_meshes[:20]))
 
   while not env.is_terminal_mode(m):
     combos = env.get_valid_next_task_combinations(m)

@@ -353,7 +353,7 @@ def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, inde
                    collide_fn=None, contype="2", conaffinity="1", link_mass=1e-3,
                    link_inertia=1e-6, armature=0.0, limits=True, static_mass=None,
                    meshes=False, assets=None, mesh_group=1, frame_colors=False,
-                   animate_grippers=False):
+                   animate_grippers=False, contact_grippers=False):
   """MJCF <body> tree for one articulated arm, read out of rai at q=0.
 
   Returns (xml, joint_names) with joint_names in MuJoCo's own qpos order for this arm -- the
@@ -370,6 +370,7 @@ def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, inde
   Z = _zeroed(C)
   root, kids = arm_frames(Z, prefix)
   gripper_joints = gripper_sim_joints(Z, prefix) if animate_grippers else {}
+  openarm_gripper = any("openarm_" in n for n in gripper_joints)
   jnames, out = [], []
 
   # The planner freezes the finger joints and certifies collision using their open-pose
@@ -386,7 +387,11 @@ def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, inde
       parent_of[child] = parent
   moving_collision = set()
   fixed_collision = {}
-  if gripper_joints and collide:
+  # ``contact_grippers`` is the experimental physical-pinch execution path.  There, the
+  # collision proxies must remain descendants of the real finger hinges so MuJoCo can carry
+  # the payload through frictional contact.  The default animation-only path retains the
+  # planner's rigid open-pose proxies exactly as before.
+  if gripper_joints and collide and not contact_grippers:
     for name in parent_of:
       info = Z.getFrame(name).info()
       kind = info.get("shape")
@@ -473,6 +478,17 @@ def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, inde
             and name not in moving_collision)
       g = _geom_xml(kind, info.get("size", []), geom_rgba, group,
                     contype if on else "0", conaffinity if on else "0")
+      if (g and contact_grippers and on
+          and ("finger_pad" in name.lower()
+               or (openarm_gripper and "finger" in name.lower() and "coll" in name.lower()))):
+        # A Robotiq rubber pad is the physical grasp interface, not a generic arm obstacle.
+        # MuJoCo's default 20ms contact lets a strongly pinched 100g payload penetrate about
+        # 3mm and creep off the pad.  Give the pad priority so its own stiff contact and
+        # rubber-like friction win over the payload geom's ordinary table-contact settings.
+        # This affects only --contact-grasps; planning and historical simulation are unchanged.
+        g = g.replace("/>",
+                      ' friction="0.8 0.01 0.001" condim="6" priority="2" '
+                      'solref="0.004 1" solimp="0.95 0.99 0.001"/>')
       if g:
         out.append(f'{pad}  {g}')
     elif kind == "mesh" and meshes:
@@ -524,18 +540,45 @@ def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, inde
   return "\n".join(out), jnames
 
 
-def gripper_actuator_mjcf(C, prefixes, kp=5.0, indent=4):
-  """Position actuators for :func:`gripper_sim_joints` (one per physical hinge)."""
+def gripper_actuator_mjcf(C, prefixes, kp=5.0, indent=4, coupled=False):
+  """Position actuators for :func:`gripper_sim_joints`.
+
+  The visualization model historically drives every mimic hinge independently.  For physical
+  contact that is not a valid Robotiq mechanism: contact lets the six servos disagree and the
+  pads cease to be parallel.  ``coupled=True`` drives only the first (master) joint; permanent
+  joint equalities emitted by :func:`gripper_equality_mjcf` transmit that motion to the rest.
+  """
   pad, out, names = " " * indent, [], []
   for prefix in prefixes:
     specs = gripper_sim_joints(C, prefix)
     effort = 7.0 if any("openarm_" in n for n in specs) else 50.0
-    for frame in specs:
+    frames = list(specs)
+    if coupled:
+      frames = frames[:1]
+    for frame in frames:
       name = "sim_grip__" + frame
       out.append(f'{pad}<position name="{name}" joint="{name}" kp="{kp:g}" '
                  f'dampratio="1" forcerange="{-effort:g} {effort:g}"/>')
       names.append(name)
   return "\n".join(out), names
+
+
+def gripper_equality_mjcf(C, prefixes, indent=4):
+  """Permanent linear mimic constraints for physical parallel-jaw execution."""
+  pad, out = " " * indent, []
+  for prefix in prefixes:
+    specs = gripper_sim_joints(C, prefix)
+    if len(specs) < 2:
+      continue
+    master = next(iter(specs))
+    master_gain = float(specs[master][1])
+    for frame, (_axis, gain, _angle, _side) in list(specs.items())[1:]:
+      ratio = float(gain) / master_gain
+      out.append(
+          f'{pad}<joint name="mimic__{frame}" joint1="sim_grip__{frame}" '
+          f'joint2="sim_grip__{master}" polycoef="0 {ratio:.9g} 0 0 0" '
+          f'solref="0.004 1"/>')
+  return "\n".join(out)
 
 
 def build_arms_mjcf(C, prefixes, contact_masks=None, **kw):

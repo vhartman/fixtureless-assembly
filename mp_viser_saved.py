@@ -31,7 +31,7 @@ def main():
 
     cfg, plan = read_plan(path)
     plan = [tuple(a) for a in plan]
-    C, asm = replay.build_scene(cfg)
+    C, asm = replay.build_scene(cfg, require_artifact_contract=True)
     robots = A.get_robots(C)
     gk = A.wrench_kind_arg(C, robots) if cfg.get("wrench") else None
 
