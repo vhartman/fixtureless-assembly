@@ -49,6 +49,13 @@ _BISECTION_STEPS = 4
 # witness gate; each caller still performs its own environment sweep.
 _APERTURE_CACHE: Dict[Tuple, ClosureResult] = {}
 
+# Disposable closure scenes are copied thousands of times while constructing a sampled grasp
+# database, but their frame *schema* is identical.  Discovering the two finger groups by
+# repeatedly scanning every frame was consequently a surprising preprocessing hotspot.  Key the
+# structural result by the complete ordered frame-name tuple: unlike a Config id this is safe
+# across short-lived copies and cannot alias configurations with different geometry names.
+_FINGER_GROUP_CACHE: Dict[Tuple[str, Tuple[str, ...]], Tuple] = {}
+
 
 @dataclass(frozen=True)
 class ClosureResult:
@@ -97,15 +104,22 @@ def _finger_groups(C: ry.Config, prefix: str):
     or inactive mechanism links.  This exactly follows the geometry the existing cheap gate
     and IK collision objective use.
     """
-    names = list(C.getFrameNames())
-    ours = [n for n in names if str(n).startswith(prefix)]
-    if any("vacuum" in str(n) for n in ours):
-        return "vacuum", (), None
+    names = tuple(str(n) for n in C.getFrameNames())
+    key = (str(prefix), names)
+    cached = _FINGER_GROUP_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    ours = [n for n in names if n.startswith(prefix)]
+    if any("vacuum" in n for n in ours):
+        result = ("vacuum", (), None)
+        _FINGER_GROUP_CACHE[key] = result
+        return result
 
     left, right = [], []
     robotiq_left_pad, robotiq_right_pad = [], []
     for n in ours:
-        s = str(n)
+        s = n
         # Robotiq: prefer the manufacturer's flat inner-pad boxes whenever they are present.
         # The historical finger1/finger2 capsules use the opposite left/right naming from the
         # imported linkage (finger1 is parented to right_inner_finger_joint).  Mixing capsules
@@ -127,12 +141,18 @@ def _finger_groups(C: ry.Config, prefix: str):
     if robotiq_left_pad and robotiq_right_pad:
         left, right = robotiq_left_pad, robotiq_right_pad
     if not left or not right:
-        return None, (), None
+        result = (None, (), None)
+        _FINGER_GROUP_CACHE[key] = result
+        return result
     model = "openarm" if any("openarm" in n for n in ours) else "robotiq"
-    centers = [n for n in ours if str(n).endswith("gripper_center")]
+    centers = [n for n in ours if n.endswith("gripper_center")]
     if not centers:
-        return None, (), None
-    return model, (tuple(left), tuple(right)), centers[0]
+        result = (None, (), None)
+        _FINGER_GROUP_CACHE[key] = result
+        return result
+    result = (model, (tuple(left), tuple(right)), centers[0])
+    _FINGER_GROUP_CACHE[key] = result
+    return result
 
 
 def _copy(C: ry.Config) -> ry.Config:

@@ -119,6 +119,7 @@ class RunConfig:
   open_witness: bool = False
   open_witness_epochs: int = 2
   open_witness_batch: int = 7
+  open_witness_positive_order: bool = False
   lazy_edge_selector: str = "forward"
   lns_segments: bool = False
   handovers: bool = True

@@ -189,6 +189,7 @@ _INTERNAL_MAIN_CLI = {
     # but a normal run selects the coherent bundle instead of reconstructing it flag by flag.
     "placement_yaw_widening", "place_cells", "prefer_center", "wrench_aware_h",
     "lazy_fills", "open_witness", "open_witness_epochs", "open_witness_batch",
+    "open_witness_positive_order",
     "lazy_edge_selector", "fill_window", "lns_window", "milestone_oracle",
     "fill_local_h", "fill_raw_grasp_h", "fill_target_support_quotient", "fill_exact",
     "fill_greedy", "milestone_boundaries", "ik_accuracy", "tight_fingers",
@@ -1447,6 +1448,14 @@ def build_parser():
            "immediately; later edges are not speculatively probed.",
   )
   g_search.add_argument(
+      "--open-witness-positive-order", action=argparse.BooleanOptionalAction, default=False,
+      help="With --open-witness: use SUCCESSFUL solve-scoped physical evidence only to order "
+           "equal-cost successors: exact certified edges first, then compatible co-grasp/"
+           "handover sets, then grasps previously reached by the same robot. Pure stable "
+           "ordering; unseen ties retain the original order and failures never prune or "
+           "penalize an action. Experimental and disabled by the named profiles.",
+  )
+  g_search.add_argument(
       "--lazy-edge-selector", choices=("forward", "terminal-first", "reverse", "fail-first",
                                         "defer-failed"),
       default="forward", metavar="POLICY",
@@ -2633,7 +2642,8 @@ _SAVE_CONFIG_FIELDS = (
     "fill_action_widening", "milestone_boundaries",
     "fill_scope_widening", "fill_touch_all", "placement_yaw_widening",
     "fill_window", "lns_window", "lns_grasp_transition_h", "lazy_fills", "open_witness", "open_witness_batch",
-    "open_witness_epochs", "lazy_edge_selector", "analytic_seed_cap", "ssik_seed_neighborhood",
+    "open_witness_epochs", "open_witness_positive_order", "lazy_edge_selector",
+    "analytic_seed_cap", "ssik_seed_neighborhood",
     "ssik_neighborhood_cap", "fail_order", "empty_seed_refutes",
     "ik_positive_reuse", "assemble_ssik_pose_seeds", "assemble_ssik_pose_projection",
     "assemble_unbiased_first", "assemble_basin_racing", "assemble_race_probe_evals",
@@ -4124,6 +4134,13 @@ def run(cfg, explicit=None):
     print(f"[grasp-db] sampled signature: {cfg.grasp_sampler_db_hash}")
     print(f"[grasp-db] build-only complete: {len(_table)} component rows / {_rows} grasps "
           f"in {_grasp_db_s:.6f}s")
+    if _os.environ.get("ASSEMBLY_GRASP_RAW_CACHE_DIR"):
+      from problem import sampled_grasp_raw_cache_stats
+      _raw = sampled_grasp_raw_cache_stats()
+      print("[grasp-raw-cache] "
+            f"memory_hits={_raw['memory_hits']} disk_hits={_raw['disk_hits']} "
+            f"misses={_raw['misses']} load={_raw['load_s']:.3f}s "
+            f"build={_raw['build_s']:.3f}s write={_raw['write_s']:.3f}s")
     return
 
   if cfg.check_init:
@@ -4378,6 +4395,7 @@ def run(cfg, explicit=None):
       robot_ik.open_witness = cfg.open_witness
       robot_ik.open_witness_epochs = cfg.open_witness_epochs
       robot_ik.open_witness_batch = cfg.open_witness_batch
+      robot_ik.open_witness_positive_order = bool(cfg.open_witness_positive_order)
       robot_ik.lazy_edge_selector = cfg.lazy_edge_selector
       if cfg.open_witness:
         if cfg.open_witness_batch < 1:
@@ -4390,6 +4408,11 @@ def run(cfg, explicit=None):
               f"is {cfg.lazy_edge_selector}; its first failed edge abandons the incumbent "
               "immediately. "
               "Legacy bind and fill paths remain unchanged when this flag is off.")
+        if cfg.open_witness_positive_order:
+          print("[flag] --open-witness-positive-order ACTIVE: exact certified edges, "
+                "compatible co-grasps, and robot-reachable grasps order equal-cost "
+                "successors. Failures do not score or prune; unseen ties retain the original "
+                "order.")
     if robot_ik is not None and cfg.full_ik:
       robot_ik.single_arm_ik = False
       robot_ik.strip_inactive_collision = False

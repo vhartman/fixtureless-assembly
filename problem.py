@@ -2992,6 +2992,10 @@ def set_dense_grasps(flag):
 _SAMPLED_GRASPS = None         # None = off; else current sampler configuration
 _SAMPLED_VIEWS_CACHE = {}
 _SAMPLED_META_CACHE = {}          # same key: per-candidate gate diagnostics (not the DB)
+_SAMPLED_RAW_CACHE = {}           # geometry-local proposals, independent of scene/part id
+_SAMPLED_RAW_CACHE_STATS = {"memory_hits": 0, "disk_hits": 0, "misses": 0,
+                            "load_s": 0.0, "build_s": 0.0, "write_s": 0.0}
+_SAMPLED_RAW_CODE_DIGEST = None
 _SAMPLED_SELECTION_DIAGNOSTICS = {} # part -> raw/probe/role coverage in current scene
 _SAMPLED_SCENE_CTX = None         # --grasp-sampler-scenes: pick/assembly filter context
 _GRASP_PHYSICS_CHECK = False      # exact articulated-finger isolated certificate
@@ -4509,6 +4513,201 @@ def _sampled_keys(spec, offset, part=None):
   return base, cache + (part, (ctx["sig"] if ctx is not None else None))
 
 
+def sampled_grasp_raw_cache_stats():
+  """Return process-local counters for the scene-invariant proposal cache."""
+  return dict(_SAMPLED_RAW_CACHE_STATS)
+
+
+def _sampled_raw_disk_path(raw_key):
+  """Content-addressed path for an optional cross-process proposal cache.
+
+  The cache is deliberately opt-in through ``ASSEMBLY_GRASP_RAW_CACHE_DIR``. Benchmark
+  runners install a suite-local directory, while ordinary library callers retain the old
+  no-filesystem-side-effect contract. The source digest is conservative: any edit to this
+  module invalidates the cache rather than risking that old contact scores acquire current
+  grasp IDs.
+  """
+  directory = os.environ.get("ASSEMBLY_GRASP_RAW_CACHE_DIR")
+  if not directory:
+    return None
+  global _SAMPLED_RAW_CODE_DIGEST
+  if _SAMPLED_RAW_CODE_DIGEST is None:
+    with open(__file__, "rb") as stream:
+      _SAMPLED_RAW_CODE_DIGEST = hashlib.sha256(stream.read()).hexdigest()
+  import trimesh
+  identity = ("sampled-raw-v1", _SAMPLED_RAW_CODE_DIGEST,
+              np.__version__, getattr(trimesh, "__version__", None), raw_key)
+  digest = hashlib.sha256(repr(identity).encode()).hexdigest()
+  return os.path.join(os.path.realpath(directory), digest + ".json.gz")
+
+
+def _sampled_raw_row_payload(row):
+  return [np.asarray(row[0], dtype=float).tolist(), str(row[1]), float(row[2]),
+          np.asarray(row[3], dtype=float).tolist(), float(row[4]), float(row[5]),
+          str(row[6]), bool(row[7])]
+
+
+def _sampled_raw_row_from_payload(row):
+  if not isinstance(row, list) or len(row) != 8:
+    raise ValueError("malformed sampled grasp raw-cache row")
+  pose = np.asarray(row[0], dtype=float)
+  feature = np.asarray(row[3], dtype=float)
+  # Suction diagnostics store (point, normal), pinch diagnostics additionally store the
+  # approach axis: six and nine values respectively.
+  if pose.shape != (7,) or feature.ndim != 1 or feature.size not in (6, 9):
+    raise ValueError("malformed sampled grasp raw-cache arrays")
+  pose.setflags(write=False)
+  feature.setflags(write=False)
+  return (pose, str(row[1]), float(row[2]), feature, float(row[4]), float(row[5]),
+          str(row[6]), bool(row[7]))
+
+
+def _sampled_raw_cache_load(raw_key):
+  hit = _SAMPLED_RAW_CACHE.get(raw_key)
+  if hit is not None:
+    _SAMPLED_RAW_CACHE_STATS["memory_hits"] += 1
+    return hit
+  path = _sampled_raw_disk_path(raw_key)
+  if path is None or not os.path.exists(path):
+    _SAMPLED_RAW_CACHE_STATS["misses"] += 1
+    return None
+  t0 = time.perf_counter()
+  try:
+    with gzip.open(path, "rt", encoding="utf-8") as stream:
+      payload = json.load(stream)
+    if payload.get("schema_version") != 1 or payload.get("raw_key") != repr(raw_key):
+      raise ValueError("sampled grasp raw-cache identity mismatch")
+    hit = (tuple(_sampled_raw_row_from_payload(r) for r in payload["suction"]),
+           tuple(_sampled_raw_row_from_payload(r) for r in payload["antipodal"]))
+  except (OSError, EOFError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+    # A killed concurrent writer cannot poison planning. Files are replaced atomically, but
+    # treating every malformed artifact as a miss also makes manual cache copying harmless.
+    _SAMPLED_RAW_CACHE_STATS["misses"] += 1
+    return None
+  _SAMPLED_RAW_CACHE[raw_key] = hit
+  _SAMPLED_RAW_CACHE_STATS["disk_hits"] += 1
+  _SAMPLED_RAW_CACHE_STATS["load_s"] += time.perf_counter() - t0
+  return hit
+
+
+def _sampled_raw_cache_store(raw_key, rows):
+  rows = (tuple(rows[0]), tuple(rows[1]))
+  _SAMPLED_RAW_CACHE[raw_key] = rows
+  path = _sampled_raw_disk_path(raw_key)
+  if path is None:
+    return rows
+  t0 = time.perf_counter()
+  os.makedirs(os.path.dirname(path), exist_ok=True)
+  payload = {"schema_version": 1, "raw_key": repr(raw_key),
+             "suction": [_sampled_raw_row_payload(r) for r in rows[0]],
+             "antipodal": [_sampled_raw_row_payload(r) for r in rows[1]]}
+  tmp = path + f".tmp-{os.getpid()}"
+  try:
+    with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=5) as stream:
+      json.dump(payload, stream, separators=(",", ":"), sort_keys=True)
+    os.replace(tmp, path)
+  finally:
+    if os.path.exists(tmp):
+      os.unlink(tmp)
+  _SAMPLED_RAW_CACHE_STATS["write_s"] += time.perf_counter() - t0
+  return rows
+
+
+def _sampled_raw_rows(spec, offset, base_key, cfgv):
+  """Return scene-independent, part-local surface proposals and contact scores.
+
+  Surface sampling, patch classification, antipodal ray casts, roll selection, edge
+  clearance, and finite-pad support depend only on the part geometry and sampler settings.
+  In particular they do *not* depend on scattered poses, neighboring parts, or robot base
+  placement. Keeping this immutable layer below scene-role classification removes the
+  dominant repeated CAD proximity work without caching a scene-dependent verdict.
+  """
+  import zlib
+  raw_key = (base_key, int(cfgv["candidates"]), bool(cfgv.get("roll_refine", False)),
+             float(wrench.PARAMS.get("vacuum_seal_diameter", 0.025)))
+  hit = _sampled_raw_cache_load(raw_key)
+  if hit is not None:
+    return hit
+
+  t0 = time.perf_counter()
+  mesh = _spec_mesh(spec)
+  rng_seed = zlib.crc32(repr(base_key).encode())
+  pts, fidx = _sample_surface_deterministic(mesh, cfgv["candidates"], int(rng_seed))
+  normals = mesh.face_normals[np.asarray(fidx, int)]
+  clr = _edge_clearance(mesh, np.asarray(pts, dtype=float))
+  min_support = float(cfgv.get("pad_support", 0.0))
+  wrap = cfgv.get("wrap")
+  cup = _pad_samples_disc(0.5 * float(wrench.PARAMS.get("vacuum_seal_diameter", 0.025)))
+  rect = _pad_samples_rect(_PAD_HALF_ACROSS, _PAD_HALF_ALONG)
+
+  suction, antip = [], []
+  for k in range(len(pts)):
+    p, n = np.asarray(pts[k], float), np.asarray(normals[k], float)
+    nn = np.linalg.norm(n)
+    if nn < 1e-9:
+      continue
+    n = n / nn
+    if spec[0] in ("mesh", "compound"):
+      surf, mind = _mesh_patch_class(mesh, int(fidx[k]))
+    else:
+      surf, mind = _surface_class_and_min_dim(spec, n)
+    q = _grasp_quat_for_normal(n)
+    pose = np.concatenate([p + offset * n, q])
+    u, v = _plane_axes(n)
+    if min_support > 0.0:
+      sup = (_pad_support_wrap(mesh, p, n, u, v, cup, wrap=wrap) if wrap is not None
+             else _pad_support(mesh, p, n, u, v, cup))
+    else:
+      sup = 1.0
+    suction.append((pose, surf, mind, np.concatenate([p, 0.02 * n]), float(clr[k]), sup,
+                    "suction", False))
+
+    p2, n2 = _ray_exit(spec, p - 1e-9 * n, -n)
+    width = float(np.linalg.norm(p2 - p))
+    if width <= 1e-4 or width > _MAX_GRASP_WIDTH or float(n2 @ (-n)) <= 0.95:
+      continue
+    y = (p2 - p) / width
+    u0, v0 = _plane_axes(y)
+    if min_support > 0.0:
+      _, z = _best_pad_axes(mesh, p, p2, y, u0, v0)
+    else:
+      ref = (np.array([0.0, 0.0, 1.0]) if abs(float(y[2])) < 0.9
+             else np.array([1.0, 0.0, 0.0]))
+      z = np.cross(y, ref); z /= np.linalg.norm(z)
+    x = np.cross(y, z)
+    mid = 0.5 * (p + p2)
+    z_rolls = [z, -z]
+    if wrap is not None:
+      z_rolls += [x, -x]
+      if bool(cfgv.get("roll_refine", False)):
+        z_rolls += [(z + x) / np.sqrt(2.0), (z - x) / np.sqrt(2.0),
+                    (-z + x) / np.sqrt(2.0), (-z - x) / np.sqrt(2.0)]
+    p2_clearance = float(_edge_clearance(mesh, p2)[0])
+    for zi, z_dir in enumerate(z_rolls):
+      x_dir = np.cross(y, z_dir)
+      if min_support > 0.0:
+        if wrap is not None:
+          sup = min(_pad_support_wrap(mesh, p, -y, x_dir, z_dir, rect, wrap=wrap),
+                    _pad_support_wrap(mesh, p2, y, x_dir, z_dir, rect, wrap=wrap))
+        else:
+          sup = min(_pad_support(mesh, p, -y, x_dir, z_dir, rect),
+                    _pad_support(mesh, p2, y, x_dir, z_dir, rect))
+      else:
+        sup = 1.0
+      p_exit, _n_exit = _ray_exit(spec, mid, -z_dir)
+      travel = float(np.linalg.norm(p_exit - mid))
+      pose = np.concatenate([
+          mid - z_dir * (travel + offset),
+          _mat_to_quat(np.column_stack([x_dir, y, z_dir])),
+      ])
+      antip.append((pose, surf, 0.0,
+                    np.concatenate([mid, 0.02 * y, 0.02 * z_dir]),
+                    min(float(clr[k]), p2_clearance), sup, "pinch", zi >= 2))
+
+  _SAMPLED_RAW_CACHE_STATS["build_s"] += time.perf_counter() - t0
+  return _sampled_raw_cache_store(raw_key, (suction, antip))
+
+
 def _sampled_grasp_views(spec, offset, part=None):
   """The joint (poses, surfaces, min_dims) triple for the sampled path -- ONE memoized
   computation so the three parallel per-gid views cannot drift apart. Poses follow the
@@ -4520,7 +4719,6 @@ def _sampled_grasp_views(spec, offset, part=None):
   and every candidate is additionally tagged pick-feasible (floating EE clear at the part's
   INITIAL pose) and assemble-feasible (floating EE clear at the part's ASSEMBLED pose); the
   keep budget then splits into per-set quotas so each purpose keeps a guaranteed share."""
-  import zlib
   cfgv = _SAMPLED_GRASPS
   ctx = _SAMPLED_SCENE_CTX
   if ctx is not None and part is None:
@@ -4528,120 +4726,14 @@ def _sampled_grasp_views(spec, offset, part=None):
                      f"({spec!r}) was queried without a part name. Every grasp-table "
                      "consumer must thread the part.")
   sq = _shape_quat(spec) if spec[0] != "compound" else None
-  wrap = cfgv.get("wrap")
   base_key, key = _sampled_keys(spec, offset, part)
   hit = _SAMPLED_VIEWS_CACHE.get(key)
   if hit is not None:
     return hit
-  mesh = _spec_mesh(spec)
-  # PRIVATE RNG, seeded from (sampler seed, canonical spec key): byte-identical across
-  # processes and entry points -- the global np.random stream is drained path-dependently
-  # by scatter layout and must never feed the id-bearing pipeline. Identical parts share the
-  # same RAW cloud (the base_key has no part); only the scene filter below differs per part.
-  rng_seed = zlib.crc32(repr(base_key).encode())
-  pts, fidx = _sample_surface_deterministic(mesh, cfgv["candidates"], int(rng_seed))
-  normals = mesh.face_normals[np.asarray(fidx, int)]
-
-  # EDGE CLEARANCE of every sampled point, up front (vectorised): the margin gate below
-  # keeps contacts INSIDE their face instead of hanging over a corner.
-  clr = _edge_clearance(mesh, np.asarray(pts, dtype=float))
-  margin = float(cfgv.get("margin", 0.0))
-  min_support = float(cfgv.get("pad_support", 0.0))
-  _cup = _pad_samples_disc(0.5 * float(wrench.PARAMS.get("vacuum_seal_diameter", 0.025)))
-  _rect = _pad_samples_rect(_PAD_HALF_ACROSS, _PAD_HALF_ALONG)
-
-  suction, antip = [], []              # (pose, surf, min_dim, feature, clr, support, family)
-  for k in range(len(pts)):
-    p, n = np.asarray(pts[k], float), np.asarray(normals[k], float)
-    nn = np.linalg.norm(n)
-    if nn < 1e-9:
-      continue
-    n = n / nn
-    if spec[0] in ("mesh", "compound"):
-      surf, mind = _mesh_patch_class(mesh, int(fidx[k]))
-    else:
-      surf, mind = _surface_class_and_min_dim(spec, n)
-    # ---- suction-style candidate: approach along -n, canonical roll ----
-    q = _grasp_quat_for_normal(n)
-    pose = np.concatenate([p + offset * n, q])
-    _u, _v = _plane_axes(n)                                # the cup sits in the contact plane
-    if min_support > 0.0:
-      _sup = (_pad_support_wrap(mesh, p, n, _u, _v, _cup, wrap=wrap) if wrap is not None
-              else _pad_support(mesh, p, n, _u, _v, _cup))
-    else:
-      _sup = 1.0
-    suction.append((pose, surf, mind, np.concatenate([p, 0.02 * n]), float(clr[k]), _sup,
-                    "suction", False))
-    # ---- antipodal candidate: the opposing surface point within the aperture ----
-    p2, n2 = _ray_exit(spec, p - 1e-9 * n, -n)
-    width = float(np.linalg.norm(p2 - p))
-    if width > 1e-4 and width <= _MAX_GRASP_WIDTH and float(n2 @ (-n)) > 0.95:
-      y = (p2 - p) / width                                 # closing axis: pad-to-pad
-      _u0, _v0 = _plane_axes(y)                            # the free roll lives in this plane
-      if min_support > 0.0:
-        _, z = _best_pad_axes(mesh, p, p2, y, _u0, _v0)    # lay the pads ALONG the part
-      else:
-        ref = (np.array([0.0, 0.0, 1.0]) if abs(float(y[2])) < 0.9
-               else np.array([1.0, 0.0, 0.0]))
-        z = np.cross(y, ref); z /= np.linalg.norm(z)       # legacy: an arbitrary roll
-      # x FROM y AND z, always: the frame must stay RIGHT-handed. Taking the roll search's
-      # own two axes as (x, z) makes the triple LEFT-handed -- _mat_to_quat then returns a
-      # reflected frame, so the recovered approach and closing axes are not the ones that
-      # were chosen. The existing convention tests caught exactly that.
-      x = np.cross(y, z)
-      mid = 0.5 * (p + p2)
-      # label = the contacted surface class; min_dim 0.0 keeps the vacuum seal gate shut
-      # for pinch candidates (the suction block is the vacuum's own candidate family).
-      # BOTH pads must clear the edges -- a pinch is only as good as its worse contact.
-      # each PAD lies in the plane the closing axis y is normal to, and it is long along
-      # the approach z -- so the rectangle's axes are (x across, z along).
-      # A pinch has TWO physically different approach directions for the same contact pair.
-      # Keeping only ``z`` is not merely a lost wrist-roll: for a peg, +axis puts the palm
-      # above the peg (through the socket plate at the seated pose), while -axis keeps the
-      # palm below the socket.  Emit both and let FPS retain directional diversity.  This is
-      # the sampled/mesh counterpart of the face enumerator's two in-plane rolls.
-      # --grasp-sampler-wrap adds the COMPLEMENTARY ROLL: the roll search above lays the pad
-      # LONG axis along the part (a barrel contact approaches along the peg axis; a long
-      # BOX's pads run along its long axis). A peg lying flat on a table is only pickable
-      # the other way -- pads across the short dimension, fingers across the thickness,
-      # approach from the side -- for a curved barrel that roll bends the pad to the
-      # surface (its support needs a wrap budget: sagitta over the pad length, ~12 mm on
-      # the 25 mm peg); for a flat box the same roll just crosses the narrow faces, but it
-      # is the ONLY grasp whose palm does not sit at the peg END (which collides with the
-      # seat during insertion). The wrap metric scores both exactly the same way.  Emit
-      # the complementary roll as an extra +- pair whenever the flag is set -- keeping the
-      # default DB byte-identical requires the default path to emit nothing extra.
-      z_rolls = [z, -z]
-      if wrap is not None:
-        z_rolls += [x, -x]
-        if bool(cfgv.get("roll_refine", False)):
-          # Nested midpoint refinement of the existing quarter-turn lattice.  Keep the first
-          # four rows byte-identical/order-identical, then add 45-degree approaches.  These
-          # sacrifice some pad-optimality but can make the difference between two colliding
-          # hands and a feasible transfer on a small part.
-          z_rolls += [(z + x) / np.sqrt(2.0), (z - x) / np.sqrt(2.0),
-                      (-z + x) / np.sqrt(2.0), (-z - x) / np.sqrt(2.0)]
-      for zi, z_dir in enumerate(z_rolls):
-        x_dir = np.cross(y, z_dir)                         # right-handed (x, y, z)
-        if min_support > 0.0:                              # support per roll: the wrap roll
-          if wrap is not None:                             # bends differently
-            _sup = min(_pad_support_wrap(mesh, p, -y, x_dir, z_dir, _rect, wrap=wrap),
-                       _pad_support_wrap(mesh, p2, y, x_dir, z_dir, _rect, wrap=wrap))
-          else:
-            _sup = min(_pad_support(mesh, p, -y, x_dir, z_dir, _rect),
-                       _pad_support(mesh, p2, y, x_dir, z_dir, _rect))
-        else:
-          _sup = 1.0
-        p_exit, _n_exit = _ray_exit(spec, mid, -z_dir)     # approach-side surface
-        t = float(np.linalg.norm(p_exit - mid))
-        pose = np.concatenate([
-            mid - z_dir * (t + offset),
-            _mat_to_quat(np.column_stack([x_dir, y, z_dir])),
-        ])
-        antip.append((pose, surf, 0.0,
-                      np.concatenate([mid, 0.02 * y, 0.02 * z_dir]),
-                      min(float(clr[k]), float(_edge_clearance(mesh, p2)[0])),
-                      _sup, "pinch", zi >= 2))             # zi >= 2: the wrap-roll pair
+  # This is the expensive, scene-invariant half of sampling. Identical part geometries share
+  # it inside one process; benchmark runs may additionally share it through the optional
+  # content-addressed disk cache. Scene-role collision and closure labels remain below.
+  suction, antip = _sampled_raw_rows(spec, offset, base_key, cfgv)
 
   # The positional list is the finite MASTER. Concrete local fills may expose a smaller
   # per-part prefix without regenerating this list, so ids and all cached IK witnesses stay
@@ -7845,6 +7937,9 @@ def reset_grasp_pose_cache():
   one process therefore share entries computed under different settings, and the grasp table
   silently stops matching the search that produced the plan."""
   _GRASP_POSE_CACHE.clear()
+  _SAMPLED_RAW_CACHE.clear()
+  for _name in _SAMPLED_RAW_CACHE_STATS:
+    _SAMPLED_RAW_CACHE_STATS[_name] = 0 if _name.endswith("hits") or _name == "misses" else 0.0
   _SAMPLED_VIEWS_CACHE.clear()                             # --grasp-sampler: same hazard class
   _SAMPLED_META_CACHE.clear()
   _SAMPLED_SELECTION_DIAGNOSTICS.clear()

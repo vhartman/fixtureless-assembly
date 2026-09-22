@@ -41,6 +41,9 @@ class OpenWitnessReport:
   prior_failure_first: int = 0
   physical_deferrals: int = 0
   deferred_physical_queries: int = 0
+  positive_order_calls: int = 0
+  positive_order_reorders: int = 0
+  positive_order_edges: int = 0
   search_profile: dict = field(default_factory=dict)
 
 
@@ -55,6 +58,12 @@ class OpenWitnessPool:
     # query -> the exact vector that certified this edge.  Keeping this (not a KOMO/scene)
     # makes search witness persistence independent of RobotIK's incidental memoization cache.
     self.success = {}
+    # Positive evidence is safe to transfer as an ORDERING hint even when the full obstacle
+    # scene differs.  It never certifies or removes an edge: the exact query still goes through
+    # ``known``/``probe`` below.  Keys are deliberately coarse, physical facts: a grasp that a
+    # particular robot has realized, and a pair/set of grasps that has closed simultaneously.
+    self.positive_evidence = set()
+    self.success_actions = set()
     # Solve-scoped diagnostics.  A run_open_lazy_fill invocation is one local fill/phase;
     # its tag is normally the incoming milestone part.  These counters distinguish merely
     # *recognising* aliases from actually reusing a success or advancing failed IK effort.
@@ -111,6 +120,75 @@ class OpenWitnessPool:
     key = self.key(state, action, successor, assembly)
     return self.visits.get(key, 0), self.attempts.get(key, 0)
 
+  @staticmethod
+  def _group(state, part):
+    groups = state.subassemblies() if hasattr(state, "subassemblies") else ()
+    return next((frozenset(g) for g in groups if part in g), frozenset((part,)))
+
+  @staticmethod
+  def _contacts(state, group):
+    supports = getattr(state, "supports", {})
+    return tuple(sorted((str(c[1]), str(c[2]), int(c[3]))
+                        for part in group
+                        for c in supports.get(part, ()) if c[0] == "grasp"))
+
+  def _positive_keys(self, state, action):
+    """Scene-independent successes usable only as stable successor tie-breaks."""
+    action = tuple(action)
+    kind = action[0]
+    out = []
+    if kind in ("pick", "add_grasp", "handover"):
+      receiver = (str(action[1]), str(action[2]), int(action[3]))
+      out.append(("robot-grasp",) + receiver)
+      if kind in ("add_grasp", "handover"):
+        group = self._group(state, action[2])
+        # Include component membership: the same two contacts on a larger rigid component can
+        # collide even when they closed on a singleton.  Existing holders plus receiver define
+        # the simultaneous hand geometry; symbolic ancestry and unrelated clutter do not.
+        out.append(("cograsp", tuple(sorted(group)), self._contacts(state, group), receiver))
+    elif kind in ("assemble", "place"):
+      group = self._group(state, action[2])
+      for robot, part, gid in self._contacts(state, group):
+        if robot == str(action[1]):
+          out.append(("robot-grasp", robot, part, gid))
+    return tuple(out)
+
+  def _record_positive(self, state, action):
+    self.positive_evidence.update(self._positive_keys(state, action))
+    self.success_actions.add(tuple(action))
+
+  def _positive_priority(self, state, action, successor, assembly):
+    """Exact certificate, compatible co-grasp, reachable grasp; all are hints only."""
+    action = tuple(action)
+    exact = 0
+    if action in self.success_actions:
+      # Use the pure physical key here: successor ordering must not inflate alias counters in
+      # RobotIK merely by inspecting generated graph edges.
+      exact = int(self.filter_key(state, action, successor, assembly) in self.success)
+    keys = self._positive_keys(state, action)
+    pair = int(any(k[0] == "cograsp" and k in self.positive_evidence for k in keys))
+    grasp = int(any(k[0] == "robot-grasp" and k in self.positive_evidence for k in keys))
+    return exact, pair, grasp
+
+  def order_successors(self, state, rows, assembly, report=None):
+    """Stable, non-pruning successor ordering from successful physical evidence."""
+    report = getattr(self, "active_report", None) if report is None else report
+    rows = list(rows)
+    if not rows or not self.positive_evidence:
+      return rows
+    scored = [(self._positive_priority(state, action, successor, assembly), i,
+               (action, successor))
+              for i, (action, successor) in enumerate(rows)]
+    if report is not None:
+      report.positive_order_calls += 1
+      report.positive_order_edges += sum(any(score) for score, _i, _row in scored)
+    # Python's sort is stable, so equal scores are byte-for-byte the old emission order.
+    ordered = sorted(scored, key=lambda item: item[0], reverse=True)
+    if report is not None and any(old_i != new_i
+                                  for new_i, (_score, old_i, _row) in enumerate(ordered)):
+      report.positive_order_reorders += 1
+    return [row for _score, _i, row in ordered]
+
   def _batch_for(self, action, key):
     """Skill-aware geometric effort ladder, capped by ``--open-witness-batch``.
 
@@ -130,6 +208,7 @@ class OpenWitnessPool:
     key = self.key(state, action, successor, assembly)
     if key in self.success:
       self.direct_success_hits += 1
+      self._record_positive(state, action)
       return True, self.success[key], False
     prior_visits = self.visits.get(key, 0)
     prior_slots = self.attempts.get(key, 0)
@@ -154,6 +233,7 @@ class OpenWitnessPool:
           action, state, successor, assembly, attempt=attempt, budget=batch)
       if ok:
         self.success[key] = witness
+        self._record_positive(state, action)
         self.success_visit_hist[self.visits[key]] += 1
       return ok, witness, batch
     # Tiny fake/backward-compatible adapter used by unit tests and external RobotIK-like
@@ -164,6 +244,7 @@ class OpenWitnessPool:
           action, state, successor, assembly, attempt=attempt + spent - 1)
       if ok:
         self.success[key] = witness
+        self._record_positive(state, action)
         self.success_visit_hist[self.visits[key]] += 1
         return True, witness, spent
     return False, witness, batch
@@ -187,6 +268,7 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
     pool.assembly = assembly
   pool.begin_session(tag)
   report = OpenWitnessReport()
+  pool.active_report = report
   selector = getattr(robot_ik, "lazy_edge_selector", "forward")
   if selector not in ("forward", "terminal-first", "reverse", "fail-first",
                       "defer-failed"):
@@ -296,12 +378,16 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
                  if selector == "defer-failed" else ""))
     succ = (f"{report.max_successor_states}/{report.max_successor_edges}"
             if report.max_successor_states else "regenerated")
+    positive = (f"; positive-order={report.positive_order_reorders}/"
+                f"{report.positive_order_calls} states, "
+                f"{report.positive_order_edges} preferred edges"
+                if getattr(robot_ik, "open_witness_positive_order", False) else "")
     return (f"; search peak pending/heap={report.max_frontier}/{report.max_heap_entries}, "
             f"alts={report.max_alternates}, unique={report.max_unique_states}, "
             f"succ={succ}, "
             f"tree={report.max_tree_edges}, expanded={report.max_expanded}, "
             f"h-states={report.max_heuristic_states}, node-cap={report.max_node_budget}" + select
-            + search_profile_tail())
+            + positive + search_profile_tail())
 
   epoch = 0
   while max_epochs == 0 or epoch < max_epochs:

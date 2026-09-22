@@ -2396,6 +2396,10 @@ def _task_record(task):
 
 
 def _task_from_record(rec):
+  # Saved export bundles are also consumed by lightweight replay/audit tools which need not
+  # have called make_problem (and therefore _ensure_mrbench) first.  Keep deserialization
+  # self-contained rather than relying on that order-dependent import side effect.
+  _ensure_mrbench()
   from multi_robot_multi_goal_planning.problems.planning_env import Task
   from multi_robot_multi_goal_planning.problems.core.goals import SingleGoal, GoalSet
   members = [np.asarray(g, dtype=float) for g in rec.get("goals") or []]
@@ -2816,7 +2820,10 @@ def validate_nominal_keyframes(problem, tolerance=None, verbose=True):
   # name and may leave the Python process in a bad state, whereas RAI's mesh accessor lets us
   # identify the construction bug deterministically.
   _empty_meshes = []
-  for _name in env.C.getFrameNames():
+  # Tiny unit-test and external planning adapters may expose only collision queries, not a
+  # complete RAI Config.  The guard is an early diagnostic for real RAI scenes; absence of
+  # frame introspection must not alter the planner-frontier validation contract.
+  for _name in (env.C.getFrameNames() if hasattr(env.C, "getFrameNames") else ()):
     _frame = env.C.getFrame(_name)
     try:
       if "mesh" not in str(_frame.info().get("shape", "")).lower():

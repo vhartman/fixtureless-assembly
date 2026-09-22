@@ -161,7 +161,9 @@ def build_scene(cfg, *, require_artifact_contract=False):
                       "wrap": _saved(cfg, "grasp_sampler_wrap"),
                       # Strict quality gating changes which sampled rows exist; restore it
                       # before recomputing the persisted positional-DB hash.
-                      "strict": bool(_saved(cfg, "grasp_sampler_strict", legacy=False))}
+                      "strict": bool(_saved(cfg, "grasp_sampler_strict", legacy=False)),
+                      "full_probe": bool(_saved(cfg, "grasp_sampler_full_probe", legacy=False)),
+                      "roll_refine": bool(_saved(cfg, "grasp_sampler_roll_refine", legacy=False))}
                      if _saved(cfg, "grasp_sampler") else None)  # sampled ids: same hazard class
   set_plain_box(bool(_saved(cfg, "plain_box")))                # cube collision geometry must match
   from problem import set_placement_yaw_prefix, set_placement_yaws, set_stable_rest_poses

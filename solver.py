@@ -995,6 +995,10 @@ class RobotIK:
     self.open_witness_epochs = 2
     self.open_witness_batch = 7
     self.lazy_edge_selector = "forward"                 # candidate-path IK check order only
+    # Successful exact physical queries, compatible co-grasps and robot/grasp pairs may order
+    # equal-cost successors in later open-witness fills.  This is positive-only evidence: the
+    # original deterministic order remains the fallback and no finite failure prunes an edge.
+    self.open_witness_positive_order = False
     self._open_probe_attempt = None
     self._open_probe_budget = 1
     self._open_probe_random_only = False
@@ -1602,8 +1606,11 @@ class RobotIK:
       # Visit zero deliberately shares the legacy/ordinary query stream. Every later OPEN
       # visit advances to a disjoint deterministic stream, so revisiting a stochastic miss
       # still invests genuinely new effort while query ordering can no longer perturb it.
-      effort_tier = (0 if self._open_probe_attempt is None
-                     else int(self._open_probe_attempt))
+      # A few diagnostic/library callers construct a deliberately minimal RobotIK via
+      # ``__new__``.  Visit zero is the semantic default, so do not make deterministic
+      # seeding depend on the constructor having populated this optional scheduler field.
+      open_probe_attempt = getattr(self, "_open_probe_attempt", None)
+      effort_tier = (0 if open_probe_attempt is None else int(open_probe_attempt))
       query_seed = _deterministic_ik_seed(getattr(self, "seed_root", 0), key, effort_tier)
       ry.params_add({"seed": query_seed})
       self.prof["query_seed_resets"] = self.prof.get("query_seed_resets", 0) + 1
@@ -2736,8 +2743,11 @@ class RobotIK:
     times = [phase, phase]
     fa, fb, _value, kind = violation
     if kind != "joint-limit":
-      M = float(self.clearance_reject or 0.0)
-      if M <= 0.0:
+      # A strict penetration certificate can fail even when the aggregate collision
+      # objective is numerically feasible. Feed that pair back at zero clearance, using
+      # the same small numerical interior as the margin cuts.
+      M = 0.0 if kind == "penetration" else float(self.clearance_reject or 0.0)
+      if M <= 0.0 and kind != "penetration":
         return None
       # RAI's FS.distance is negative in free space: distance <= -M means gap >= M.
       target = M + 1e-4                              # 0.1mm interior for NLP feasibility tol
@@ -2844,8 +2854,17 @@ class RobotIK:
         if clear_ok:
           return q, current
         if not pen_ok:
-          return None, current                            # margin cuts cannot repair penetration
-        violation = self.last_margin_reject
+          # With mate exemptions the diagnostic list may include intentional contacts;
+          # use only the ordinary unfiltered certificate here until those pairs are
+          # available separately. In particular this repairs shallow finger/table pick
+          # contacts instead of repeating hundreds of random starts of the same NLP.
+          strict = getattr(self, "last_strict_reject", None)
+          if getattr(self, "_mate_exempt", None) is not None or not strict or not strict[1]:
+            return None, current
+          a, b, d = strict[1][0]
+          violation = (a, b, d, "penetration")
+        else:
+          violation = self.last_margin_reject
         if violation is None:
           return None, current
         # The target receives a small numerical interior below. Once the same constraint is
@@ -12051,8 +12070,18 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
 
     def _make_open_engine(suspended):
       suspended.update(cheap_bl)                          # dead edges stay dead across epochs
+      pool = getattr(robot_ik, "_open_witness_pool", None)
+
+      def _ordered_successors(state):
+        rows = succ_fn(state)
+        if (not getattr(robot_ik, "open_witness_positive_order", False)
+            or pool is None):
+          return rows
+        return pool.order_successors(state, rows, assembly)
+
       return _IncrementalLazySearch(
-          start, goal_fn=goal_fn, succ_fn=succ_fn, cost_fn=action_cost, h_fn=h_fn,
+          start, goal_fn=goal_fn, succ_fn=_ordered_successors,
+          cost_fn=action_cost, h_fn=h_fn,
           weight=search_weight, blacklist=suspended,
           cheap_gate=_open_cheap_gate,
           cost_bound=cost_bound,
@@ -12783,8 +12812,7 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
                                            grasp_initial_keep=20,
                                            grasp_widen_batch=8,
                                            grasp_widen_max=96,
-                                           placement_yaw_widening=False,
-                                           _compact_fill_session=False):
+                                           placement_yaw_widening=False):
   """MILESTONE (Dogar-style, abstraction-guided) planner. Two levels:
 
     LEVEL 1: the assembly SEQUENCE. The labeled abstraction's backward Dijkstra (the same
@@ -13497,23 +13525,6 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
           print(f"[fill-policy-widen {q}] {msg}; continuing ordinary widening.", flush=True)
         return None, None, attempted
 
-    if _compact_fill_session:
-      # Global dovetailing over milestone boundaries.  First give every concrete settled
-      # predecessor the same compact local alphabet (current grasps, historical yaw, local
-      # manipulation scope, and only unbraced/PDB-certified-brace phases). A failure here is
-      # NOT a no-plan result: the public iterator below restarts once with the complete
-      # historical per-fill yaw/brace/scope schedule. This changes only search order, but
-      # prevents one geometrically bad checkpoint from consuming every relaxation before the
-      # already-supported K-boundary mechanism gets to try its siblings.
-      if verbose:
-        print(f"[fill-dovetail {q}] compact boundary probe: local scope, historical yaw, "
-              "and constrained brace family; full per-fill widening is deferred to the "
-              "completion session.", flush=True)
-      return attempt(
-          early_phases, scope_passes[:1],
-          dict(grasp_caps) if grasp_local_widen else None,
-          one_open_epoch=True)
-
     if not grasp_local_widen:
       if not placement_yaw_widening:
         return attempt(phases, scope_passes)
@@ -13869,7 +13880,7 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
         if verbose:
           print("[milestones] repair budget exhausted")
         return None
-    if fill_window >= 2 and not progressed and not _compact_fill_session:
+    if fill_window >= 2 and not progressed:
       # WIDTH-k WINDOWS (adaptive-width escalation): every single-part candidate failed at
       # this node -- before backjumping, try adding k parts in ONE joint fill (see
       # _add_parts), k escalating 2..fill_window only as each smaller width exhausts.
@@ -14024,27 +14035,6 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
       grasp_widen_batch=grasp_widen_batch, grasp_widen_max=grasp_widen_max,
       placement_yaw_widening=placement_yaw_widening)
   try:
-    # Search all milestone checkpoint alternatives under the same compact local action
-    # alphabet before spending the full yaw/brace/scope completion effort on any one of
-    # them. This is ordinary nested action-set dovetailing: the second session below is the
-    # unchanged complete per-fill schedule, and both sessions share deterministic IK
-    # witnesses/open effort through ``robot_ik``.
-    if placement_yaw_widening or fill_scope_widening or bracing:
-      if verbose:
-        print("[fill-dovetail] compact milestone-boundary session first; the complete "
-              "per-fill yaw/brace/scope schedule remains the next session.", flush=True)
-      yield from publish(_iter_assembly_problem_milestones_once(
-          C, assembly, grasp_local_widen=grasp_local_widen,
-          grasp_initial_keep=grasp_initial_keep,
-          _compact_fill_session=True, **common))
-      if deadline is not None and time.perf_counter() > deadline:
-        if verbose:
-          print("[fill-dovetail] compact session reached the deadline; full action-set "
-                "completion remains open.", flush=True)
-        return
-      if verbose:
-        print("[fill-dovetail] compact session exhausted -> complete per-fill "
-              "yaw/brace/scope session.", flush=True)
     yield from publish(_iter_assembly_problem_milestones_once(
         C, assembly, grasp_local_widen=grasp_local_widen,
         grasp_initial_keep=grasp_initial_keep, **common))
