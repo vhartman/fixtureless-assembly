@@ -23,7 +23,7 @@ import robotic as ry
 
 # Bump whenever the calibrated proxy semantics change. It keys the cheap-check cache and the
 # sampled grasp database provenance, so a saved grasp id cannot silently acquire new meaning.
-VERSION = 5
+VERSION = 6
 
 # These are physical/proxy calibration constants, not search-tuning knobs.  Both current
 # models expose an approximately 80--115 mm open jaw gap and have about 40 mm inward travel
@@ -57,6 +57,10 @@ class ClosureResult:
     reason: Optional[str] = None
     detail: Optional[Tuple[str, str, float]] = None
     model: Optional[str] = None
+    # Signed translation of the tool centre along its local +y/closing axis which equalises
+    # the two first-contact travels.  It is reported only for a miscentred bilateral grasp;
+    # callers may generate that corrected pose and must then certify it from scratch.
+    centering_offset: Optional[float] = None
 
 
 def _quat_to_R(q: Sequence[float]) -> np.ndarray:
@@ -305,7 +309,8 @@ def _contact_aperture(C: ry.Config, prefix: str, target: str):
         side = int(np.argmin(ds))
         res = ClosureResult(False, reason="miscentred-contact",
                             detail=(f"finger-side-{side}", target, float(ds[side])),
-                            model=model)
+                            model=model,
+                            centering_offset=0.5 * float(hits[0] - hits[1]))
         if key is not None:
             _APERTURE_CACHE[key] = res
         return res, None

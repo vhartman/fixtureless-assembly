@@ -2992,6 +2992,7 @@ def set_dense_grasps(flag):
 _SAMPLED_GRASPS = None         # None = off; else current sampler configuration
 _SAMPLED_VIEWS_CACHE = {}
 _SAMPLED_META_CACHE = {}          # same key: per-candidate gate diagnostics (not the DB)
+_SAMPLED_SELECTION_DIAGNOSTICS = {} # part -> raw/probe/role coverage in current scene
 _SAMPLED_SCENE_CTX = None         # --grasp-sampler-scenes: pick/assembly filter context
 _GRASP_PHYSICS_CHECK = False      # exact articulated-finger isolated certificate
 _GRASP_PHYSICS_CTX = None         # installed after the concrete robot scene exists
@@ -3014,6 +3015,8 @@ def set_sampled_grasps(mode):
   _SAMPLED_GRASPS = None if mode is None else {
       "seed": int(mode.get("seed", 0)),
       "candidates": max(8, int(mode.get("candidates", 200))),
+      "full_probe": bool(mode.get("full_probe", False)),
+      "roll_refine": bool(mode.get("roll_refine", False)),
       "keep": max(2, int(mode.get("keep", 12))),
       # A search may construct a larger immutable master while exposing only a prefix.
       "master_keep": max(2, int(mode.get("keep", 12)),
@@ -3024,6 +3027,7 @@ def set_sampled_grasps(mode):
       "wrap": (None if mode.get("wrap") is None else float(mode.get("wrap")))}
   _SAMPLED_VIEWS_CACHE.clear()
   _SAMPLED_META_CACHE.clear()
+  _SAMPLED_SELECTION_DIAGNOSTICS.clear()
   _SAMPLED_CANONICAL_ONLY = False
 
 
@@ -3042,6 +3046,7 @@ def set_grasp_physics_check(on=False, force_n=10.0):
   _GRASP_PHYSICS_CTX = None
   _SAMPLED_VIEWS_CACHE.clear()
   _SAMPLED_META_CACHE.clear()
+  _SAMPLED_SELECTION_DIAGNOSTICS.clear()
 
 
 def install_grasp_physics_ctx(C, assembly, robots=None):
@@ -3066,6 +3071,7 @@ def install_grasp_physics_ctx(C, assembly, robots=None):
       gripper_paths=getattr(checker, "robot_gripper_paths", None))
   _SAMPLED_VIEWS_CACHE.clear()
   _SAMPLED_META_CACHE.clear()
+  _SAMPLED_SELECTION_DIAGNOSTICS.clear()
 
 
 def set_sampled_canonical_only(on=False):
@@ -3097,9 +3103,10 @@ def install_sampled_scene_ctx(C, assembly, robots=None):
 
   ``pick`` is the initial table scene. ``assemble`` contains the incoming part and only the
   predecessors required at its mate endpoint; unrelated future parts are parked. ``support``
-  is the fully assembled scene and is deliberately a ranking/reservation role rather than a
-  hard replacement for the actual mate context. All three use the search's OWN cheap
-  floating-EE gate, so sampling and search agree exactly. Rebuilds the
+  is the fully assembled scene. ``component:<incoming>:<root>`` roles additionally certify
+  every constituent against the intermediate rigid component created at an authored assembly
+  boundary. Support/component labels are ranking reservations, never replacements for the
+  actual action context. All roles use the search's OWN cheap floating-EE gate. Rebuilds the
   sampled caches; call BEFORE any grasp-table consumer. Every grasp-table consumer must then
   thread the PART name: scene feasibility is per part INSTANCE (two identical legs sit in
   different sockets), and a part-less query raises instead of silently serving unfiltered ids."""
@@ -3121,6 +3128,71 @@ def install_sampled_scene_ctx(C, assembly, robots=None):
           "assemble": _assembly_role_state(assembly, s0, p),
           "support": s_full}
       for p in assembly.objects}
+  # A database selected only for the initial pick and the finished assembly can discard the
+  # interface needed to lift an intermediate rigid component. Certify every constituent at
+  # the dependency/mate component created by each authored assembly boundary. The component
+  # is free in space and all unrelated bodies are parked, so this is only an internal
+  # hand/component-clearance label; reachability and the actual table scene stay deferred.
+  for incoming in assembly.objects:
+    if incoming == assembly.base:
+      continue
+    endpoint = _assembly_role_state(assembly, s0, incoming)
+    for group in endpoint.subassemblies():
+      if len(group) < 2 or incoming not in group:
+        continue
+      free = State(endpoint.parent, endpoint.grasp, endpoint.place,
+                   endpoint.supports, endpoint.poses)
+      target_root = next(
+          p for p in group
+          if free.parent.get(p, (None, None))[0] != "part"
+          or free.parent[p][1] not in group)
+      parked = 0
+      for other in free.subassemblies():
+        root = next(
+            p for p in other
+            if free.parent.get(p, (None, None))[0] != "part"
+            or free.parent[p][1] not in other)
+        free.place.pop(root, None)
+        if other == group:
+          free.parent[root] = ("gripper", "__sampled_component__")
+          free.supports[root] = frozenset()
+        else:
+          free.parent[root] = ("table",)
+          free.supports[root] = frozenset({("table",)})
+          pose = np.asarray(free.poses.get(root, s0.poses[root]), dtype=float).copy()
+          pose[:3] = [1000.0 + 10.0 * parked, 1000.0, 1000.0]
+          free.poses[root] = pose
+          parked += 1
+      label = f"component:{incoming}:{target_root}"
+      for member in group:
+        role_states[member][label] = free
+  # A pick-clear and a mate-clear grasp are not useful as two unrelated marginals.  The
+  # cheapest principled connector is a table regrasp: carry with one grasp to a stable rest,
+  # release, and acquire the mate grasp there.  Build the exact singleton rest states once;
+  # the full-probe selector evaluates only endpoint-positive candidates in these states.
+  placement_states = {}
+  isolated_states = {}
+  for p in assembly.objects:
+    rows = {}
+    for face in rest_faces(assembly, frozenset({p})):
+      st = State(s0.parent, s0.grasp, s0.place, s0.supports, s0.poses)
+      st.place[p] = ("slot", _part_index(p), face)
+      rows[f"place:{repr(face)}"] = st
+    placement_states[p] = rows
+    # Object-local closure scene: the queried part floats well above the table while every
+    # other part is parked far away.  A failed bilateral aperture here (miscentred contact or
+    # insufficient stroke) is invariant to holders, placements and assembly order, unlike an
+    # environmental sweep collision.  Recording it once lets every component table omit an
+    # impossible grasp without turning a scene-dependent failure into a no-good.
+    iso = State(s0.parent, s0.grasp, s0.place, s0.supports, s0.poses)
+    for i, q in enumerate(assembly.objects):
+      iso.parent[q] = ("table",)
+      iso.supports[q] = frozenset({("table",)})
+      iso.place.pop(q, None)
+      iso.poses[q] = np.array([10.0 + 2.0 * i, 10.0, 1.0,
+                               1.0, 0.0, 0.0, 0.0])
+    iso.poses[p] = np.array([0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0])
+    isolated_states[p] = iso
   poses_pick = tuple(sorted((p, tuple(np.round(np.asarray(s0.poses[p], dtype=float), 4)))
                             for p in assembly.objects))
   poses_asm = tuple(sorted((p, tuple(np.round(np.asarray(
@@ -3132,14 +3204,18 @@ def install_sampled_scene_ctx(C, assembly, robots=None):
           for q, pose in _state_part_poses(state, assembly, lift=0.0).items())))
           for role, state in sorted(role_states[p].items())))
       for p in assembly.objects)
-  sig = ("role-scenes-v1", poses_pick, poses_asm, role_sig)
+  placement_sig = tuple((p, tuple(sorted(rows))) for p, rows in placement_states.items())
+  sig = ("role-scenes-v2", poses_pick, poses_asm, role_sig, placement_sig)
   _SAMPLED_SCENE_CTX = {"checker": checker, "kind_robot": kind_robot,
                         "s0": s0, "s_full": s_full,
                         "role_states": role_states,
+                        "placement_states": placement_states,
+                        "isolated_states": isolated_states,
                         "assembly": assembly, "sig": sig,
                         "robots": tuple(robots)}
   _SAMPLED_VIEWS_CACHE.clear()
   _SAMPLED_META_CACHE.clear()
+  _SAMPLED_SELECTION_DIAGNOSTICS.clear()
 
 
 def clear_sampled_scene_ctx():
@@ -3148,6 +3224,7 @@ def clear_sampled_scene_ctx():
   _SAMPLED_SCENE_CTX = None
   _SAMPLED_VIEWS_CACHE.clear()
   _SAMPLED_META_CACHE.clear()
+  _SAMPLED_SELECTION_DIAGNOSTICS.clear()
 
 
 def set_sampled_grasp_keep(keep):
@@ -3167,6 +3244,7 @@ def set_sampled_grasp_keep(keep):
   _SAMPLED_GRASPS["master_keep"] = _SAMPLED_GRASPS["keep"]
   _SAMPLED_VIEWS_CACHE.clear()
   _SAMPLED_META_CACHE.clear()
+  _SAMPLED_SELECTION_DIAGNOSTICS.clear()
 
 
 def _full_assembly_state(assembly, s0):
@@ -3667,8 +3745,9 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
   conditioning, transport-bridge and endpoint-role strata determine the useful prefix;
   without it the historical conventional-first order is retained. Under the explicit closure
   model, a source whose fingers graze the table may additionally emit a deterministic,
-  contact-preserving approach-retracted pose; the colliding source remains eligible as a
-  free-space fallback if the bounded set has room. Sampled rows are ordered by a round-robin over fleet/scene/family strata,
+  jaw-centred pose and a source whose fingers graze the table may additionally emit a
+  contact-preserving approach-retracted pose; the source remains eligible as a free-space
+  fallback if the bounded set has room. Sampled rows are ordered by a round-robin over fleet/scene/family strata,
   with farthest-first order inside every stratum. All rankings are independent of ``keep``;
   a larger budget therefore preserves every old id for a fixed scene/configuration.
   """
@@ -3689,6 +3768,10 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
     # only the original endpoints. Keep that API usable without weakening installed scenes.
     by_part = None if ctx is None else ctx.get("role_states", {}).get(part)
     return by_part or {"pick": ctx["s0"], "assemble": ctx["s_full"]}
+
+  def support_roles(entry, kind):
+    return tuple(role for role in entry[1]["scene_by_kind"].get(kind, ())
+                 if role == "support" or role.startswith("component:"))
 
   # Physical generation policy, not a collision relaxation. A candidate already places the
   # pads at a valid antipodal contact; translating the hand OUTWARD along its approach slides
@@ -3752,9 +3835,48 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
         return candidate, float(d), ("approach-retract", kind, role)
     return None
 
+  def recentered_closure_pose(row, kind, robot):
+    """Project a sampled pinch onto the coupled jaws' physical centreline.
+
+    Antipodal point contacts do not imply a centred *finite-pad* grasp on a CAD mesh: a pad
+    may meet a nearby flange before the sampled point.  The closure solver measures both
+    first-contact travels; half their difference is the exact lateral tool translation for
+    the current contact features.  Re-certification remains authoritative, so a feature
+    switch or environmental collision cannot be hidden by this projection.
+    """
+    if checker is None or not checker.closure_check or kind != "two_finger":
+      return None
+    isolated = ctx.get("isolated_states", {}).get(part)
+    if isolated is None:
+      return None
+    pose = part_pose(row).copy()
+    total = 0.0
+    for _ in range(3):
+      cert = checker.pose_grasp_closure_result(isolated, part, pose, asm, robot)
+      if cert is not None and cert.feasible:
+        return (pose, total, ("jaw-recenter", kind, "isolated")) if abs(total) > 1e-9 else None
+      if (cert is None or cert.reason != "miscentred-contact"
+          or cert.centering_offset is None):
+        return None
+      delta = float(cert.centering_offset)
+      if not np.isfinite(delta) or abs(delta) < 1e-6:
+        return None
+      # A valid correction cannot exceed one jaw's complete physical travel.  This is a
+      # mechanism-derived guard against jumping to an unrelated feature, not a search knob.
+      if abs(total + delta) > 0.045 + 1e-9:
+        return None
+      pose[:3] += _quat_to_R(pose[3:]) @ np.array([0.0, delta, 0.0])
+      total += delta
+    cert = checker.pose_grasp_closure_result(isolated, part, pose, asm, robot)
+    if cert is not None and cert.feasible:
+      return pose, total, ("jaw-recenter", kind, "isolated")
+    return None
+
   def enrich(row, origin, refinement=None):
     roles = {}
     closure_roles = {}
+    acquisition_by_kind = {}
+    acquisition_reject_by_kind = {}
     physics_by_kind = {}
     # The physics query is isolated from the scene and therefore needs to run only once per
     # (part, pose), not once for pick and assembly.  Vacuum remains outside this first-stage
@@ -3772,6 +3894,15 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
                      (row[6] == "pinch" or row[1] == "curved" or row[2] < seal))
       if kind == "two_finger" and _GRASP_PHYSICS_CHECK:
         kind_ok = kind_ok and bool(physics_by_kind[kind]["feasible"])
+      if kind_ok and checker.closure_check and kind == "two_finger":
+        isolated = ctx.get("isolated_states", {}).get(part)
+        cert = (None if isolated is None else checker.pose_grasp_closure_result(
+            isolated, part, physics_pose, asm, robot))
+        acquisition_by_kind[kind] = bool(cert is not None and cert.feasible)
+        if cert is None or not cert.feasible:
+          acquisition_reject_by_kind[kind] = (
+              "receiver-slot-missing" if cert is None else (cert.reason or "unknown"))
+        kind_ok = kind_ok and acquisition_by_kind[kind]
       hits = []
       close_hits = []
       if kind_ok:
@@ -3792,6 +3923,8 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
       closure_roles[kind] = tuple(close_hits)
     meta = {"origin": origin, "scene_by_kind": roles,
             "closure_by_kind": closure_roles,
+            "acquisition_by_kind": acquisition_by_kind,
+            "acquisition_reject_by_kind": acquisition_reject_by_kind,
             "physics_by_kind": physics_by_kind,
             "sets": tuple(sorted({x for xs in roles.values() for x in xs}))}
     if refinement is not None:
@@ -3805,22 +3938,36 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
     if checker is None or not checker.closure_check:
       return out
     poses = [part_pose(row)]
+    source_rows = [(row, origin)]
+    for kind, robot in sorted(kind_robot.items()):
+      repaired = recentered_closure_pose(row, kind, robot)
+      if repaired is None:
+        continue
+      pose, delta, tag = repaired
+      if any(_poses_near(pose, old, pos_tol=1e-4, angle_tol=1e-6) for old in poses):
+        continue
+      poses.append(pose)
+      centred_row = row_at_part_pose(row, pose)
+      source_rows.append((centred_row, origin + "-centered"))
+      out.append(enrich(centred_row, origin + "-centered",
+                        refinement=(tag, delta, origin)))
     for kind, robot in sorted(kind_robot.items()):
       kind_ok = not (kind == "vacuum" and
                      (row[6] == "pinch" or row[1] == "curved" or row[2] < seal))
       if not kind_ok:
         continue
-      for role, state in role_states().items():
-        repaired = repaired_table_pose(row, kind, robot, role, state)
-        if repaired is None:
-          continue
-        pose, delta, tag = repaired
-        if any(_poses_near(pose, old, pos_tol=1e-4, angle_tol=1e-6) for old in poses):
-          continue
-        poses.append(pose)
-        refined_row = row_at_part_pose(row, pose)
-        out.append(enrich(refined_row, origin + "-refined",
-                          refinement=(tag, delta, origin)))
+      for source_row, source_origin in source_rows:
+        for role, state in role_states().items():
+          repaired = repaired_table_pose(source_row, kind, robot, role, state)
+          if repaired is None:
+            continue
+          pose, delta, tag = repaired
+          if any(_poses_near(pose, old, pos_tol=1e-4, angle_tol=1e-6) for old in poses):
+            continue
+          poses.append(pose)
+          refined_row = row_at_part_pose(source_row, pose)
+          out.append(enrich(refined_row, source_origin + "-refined",
+                            refinement=(tag, delta, source_origin)))
     return out
 
   canonical = [entry for r in _canonical_sample_rows(spec, offset)
@@ -3876,20 +4023,151 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
   if _GRASP_PHYSICS_CHECK:
     probe_cap = max(probe_cap, int(_SAMPLED_GRASPS.get("master_keep", keep)))
   probe_cap = min(len(raw), probe_cap)
-  while len(probe) < probe_cap:
-    progressed = False
-    for j, block in enumerate(probe_categories):
-      while cursors[j] < len(block) and id(block[cursors[j]]) in probe_seen:
-        cursors[j] += 1
-      if cursors[j] >= len(block):
-        continue
-      row = block[cursors[j]]; cursors[j] += 1
-      probe.append(row); probe_seen.add(id(row)); progressed = True
-      if len(probe) >= probe_cap:
+  def extend_probe(target):
+    while len(probe) < target:
+      progressed = False
+      for j, block in enumerate(probe_categories):
+        while cursors[j] < len(block) and id(block[cursors[j]]) in probe_seen:
+          cursors[j] += 1
+        if cursors[j] >= len(block):
+          continue
+        row = block[cursors[j]]; cursors[j] += 1
+        probe.append(row); probe_seen.add(id(row)); progressed = True
+        if len(probe) >= target:
+          break
+      if not progressed:
         break
-    if not progressed:
-      break
+
+  extend_probe(probe_cap)
   sampled = [entry for r in probe for entry in enrich_variants(r, "sampled")]
+
+  # Adaptive semantic expansion. ``full_probe`` means that the complete raw master remains
+  # available, not that every row must be classified eagerly. Grow the deterministic FPS
+  # prefix in compact batches and stop as soon as the role needed by this part is represented:
+  # a direct/directional-handover transport route for an incoming part, or enough root
+  # PICK/SUPPORT rows to fill the bounded role-balanced selector. Exact search gates remain
+  # authoritative, and exhaustion still classifies the complete finite cloud.
+  expanded_full = False
+  if scene_select and bool(_SAMPLED_GRASPS.get("full_probe", False)):
+    robots_by_kind = {}
+    for robot in ctx.get("robots", ()):
+      robots_by_kind.setdefault(checker._robot_kind.get(robot, robot), []).append(robot)
+
+    # One endpoint bridge is only an existence certificate for the empty role scenes.  It is
+    # easily destroyed by a predecessor assembled before this part (the car-wheel scatter
+    # case is the minimal example).  Preserve two *distinct receiving grasps* when the finite
+    # cloud contains them.  This is graph redundancy rather than a scene-specific score: the
+    # selected manipulation graph has two endpoint vertices through which PICK can reach MATE.
+    route_redundancy = 2
+
+    def transport_represented(entries):
+      connected = set()
+      for kind in sorted(kind_robot):
+        for e in entries:
+          if {"pick", "assemble"}.issubset(
+              e[1]["scene_by_kind"].get(kind, ())):
+            connected.add((kind, id(e[0])))
+      if len(connected) >= route_redundancy:
+        return True
+      # A directional handover is already a complete bridge. Test only endpoint-positive
+      # rows; those sets are tiny compared with the raw cloud. The collision checker caches
+      # the pose-pair certificate across later selector passes.
+      for give_kind in sorted(kind_robot):
+        left = [e for e in entries
+                if "pick" in e[1]["scene_by_kind"].get(give_kind, ())]
+        if not left:
+          continue
+        for recv_kind in sorted(kind_robot):
+          right = [e for e in entries
+                   if "assemble" in e[1]["scene_by_kind"].get(recv_kind, ())]
+          robot_pairs = [(a, b) for a in robots_by_kind.get(give_kind, ())
+                         for b in robots_by_kind.get(recv_kind, ()) if a != b]
+          for b in right:
+            receiver = (recv_kind, id(b[0]))
+            if receiver in connected:
+              continue
+            if robot_pairs and any(
+                checker.pose_pair_grasp_free(
+                    ctx["s0"], part, part_pose(a[0]), part_pose(b[0]), asm, ra, rb)
+                for a in left for ra, rb in robot_pairs):
+              connected.add(receiver)
+              if len(connected) >= route_redundancy:
+                return True
+      return len(connected) >= route_redundancy
+
+    def root_roles_represented(entries):
+      # The root has no incoming transport problem. Two alternatives for each of its two
+      # physical roles are sufficient to make the selected graph non-articulated; asking the
+      # probe to fill an equal share of all K slots made rare SUPPORT labels force an eager
+      # scan of the entire cloud without adding a new connectivity fact.
+      pick_count = sum("pick" in e[1]["scene_by_kind"].get(kind, ())
+                       for e in entries for kind in kind_robot)
+      support_count = sum(bool(support_roles(e, kind))
+                          for e in entries for kind in kind_robot)
+      return min(pick_count, support_count) >= route_redundancy
+
+    def bounded_database_has_no_known_holes(entries):
+      """Whether K can be filled without a known endpoint-infeasible fallback.
+
+      The whole point of semantic probing is to downsample a collision/closure-feasible
+      database. Stopping after the first bridge while most of the K prefix is made from rows
+      with no certified role is inconsistent: an unclassified later row may dominate such a
+      fallback. Continue only for hard parts; easy parts stop as soon as K role-positive rows
+      have been seen. If fewer than K exist, exhaustion supplies the honest finite answer.
+      """
+      return sum(any(roles for roles in e[1]["scene_by_kind"].values())
+                 for e in entries) >= keep
+
+    while len(probe) < len(raw):
+      # Match the selector's actual primary pool exactly.  Counting role labels on sampled
+      # rows that fail the configured contact-margin/pad-support gate can terminate probing
+      # early even though those rows are relegated to the fallback tail moments later.  That
+      # produced a nominal K=20 wheel database with only three closure-feasible entries.
+      primary_now = list(canonical_seed) + [
+          e for e in sampled
+          if e[0][4] >= margin and e[0][5] >= support]
+      represented = ((root_roles_represented(primary_now)
+                      if part == getattr(asm, "base", None)
+                      else transport_represented(primary_now))
+                     and bounded_database_has_no_known_holes(primary_now))
+      if represented:
+        break
+      old_n = len(probe)
+      extend_probe(min(len(raw), old_n + probe_cap))
+      sampled.extend(entry for r in probe[old_n:]
+                     for entry in enrich_variants(r, "sampled"))
+      expanded_full = expanded_full or len(probe) > old_n
+      if len(probe) == old_n:
+        break
+
+  # In full-probe mode, certify the missing second-order fact needed for downsampling: can
+  # an endpoint grasp participate in a table regrasp route?  Evaluating every raw candidate
+  # in every rest state would recreate the preprocessing explosion this experiment is meant
+  # to avoid.  Only candidates already useful at PICK or ASSEMBLE are relevant endpoints, so
+  # classify that small union against the exact stable singleton placements.  These labels
+  # only order candidates; concrete search/IK still validates every action.
+  if scene_select and bool(_SAMPLED_GRASPS.get("full_probe", False)):
+    placement_states = ctx.get("placement_states", {}).get(part, {})
+    for entry in list(canonical) + list(sampled):
+      row, meta = entry
+      pose = part_pose(row)
+      for kind, robot in sorted(kind_robot.items()):
+        roles = list(meta["scene_by_kind"].get(kind, ()))
+        if not ({"pick", "assemble"} & set(roles)):
+          continue
+        close_roles = list(meta["closure_by_kind"].get(kind, ()))
+        for role, state in sorted(placement_states.items()):
+          if not checker.pose_collision_free(state, part, pose, asm, robot=robot):
+            continue
+          close_ok = checker.pose_grasp_closure_free(
+              state, part, pose, asm, robot) if checker.closure_check else True
+          if close_ok:
+            roles.append(role)
+            close_roles.append(role)
+        meta["scene_by_kind"][kind] = tuple(roles)
+        meta["closure_by_kind"][kind] = tuple(close_roles)
+      meta["sets"] = tuple(sorted({x for xs in meta["scene_by_kind"].values()
+                                   for x in xs}))
 
   good = [e for e in sampled if e[0][4] >= margin and e[0][5] >= support]
   good_ids = {id(e[0]) for e in good}
@@ -3916,7 +4194,10 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
                   e[1]["scene_by_kind"].get(kind, ()))]
     if bridge:
       categories.append(ordered(bridge))
-    for role in ("pick", "assemble", "support"):
+    support_names = sorted({role for e in usable
+                            for role in e[1]["scene_by_kind"].get(kind, ())
+                            if role == "support" or role.startswith("component:")})
+    for role in ("pick", "assemble", *support_names):
       block = [e for e in usable if role in e[1]["scene_by_kind"].get(kind, ())]
       if block:
         categories.append(ordered(block))
@@ -3968,9 +4249,13 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
     kind, role = fact
     return role in entry[1]["scene_by_kind"].get(kind, ())
 
-  facts = [(kind, role) for kind in sorted(kind_robot)
-           for role in ("pick", "assemble", "support")]
   primary = list(canonical) + list(good)
+  facts = []
+  for kind in sorted(kind_robot):
+    facts.extend((kind, role) for role in ("pick", "assemble"))
+    facts.extend((kind, role) for role in sorted({
+        r for e in primary for r in e[1]["scene_by_kind"].get(kind, ())
+        if r == "support" or r.startswith("component:")}))
   reserve_blocks = []
   for kind in sorted(kind_robot):
     block = [e for e in primary
@@ -3985,7 +4270,147 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
     if block:
       reserve_blocks.append((fact, ordered(block)))
 
+  # Before marginal role reservations, preserve a finite CONNECTIVITY COVER.  Marginal
+  # PICK/ASSEMBLE coverage is insufficient: a selected pickup and a selected seating grasp
+  # can belong to disconnected components of the manipulation graph.  A route is either a
+  # common stable table rest or a collision/closure-certified directional handover.  Cover
+  # assembly-side candidates in farthest-first order until the existing K budget is full;
+  # retain one slot per gripper kind for SUPPORT coverage.  No score or scene-specific magic
+  # constant is introduced: connectivity owns K-|kinds| columns, ordinary role/diversity
+  # reservation owns the remainder.
+  route_seed, route_kinds, table_routes = [], set(), []
+  route_seen = set()
+  # The assembly root has no incoming mate and therefore needs no transport route to an
+  # assembly endpoint.  Reserving handover pairs for it only displaced useful support/table
+  # grasps from the fixed K budget (and made the audit misleading).
+  connectivity_cover = (bool(_SAMPLED_GRASPS.get("full_probe", False))
+                        and part != getattr(asm, "base", None))
+  root_role_cover = (bool(_SAMPLED_GRASPS.get("full_probe", False))
+                     and part == getattr(asm, "base", None))
+  route_limit = (keep if root_role_cover else
+                 max(2, keep - len(kind_robot)) if connectivity_cover else
+                 max(1, len(kind_robot)))
+  connected_receivers = set()
+
+  def reserve_route(a, b):
+    new = [e for e in (a, b) if id(e[0]) not in route_seen]
+    if len(route_seen) + len(new) > route_limit:
+      return False
+    for e in new:
+      route_seed.append(e)
+      route_seen.add(id(e[0]))
+    return True
+
+  if root_role_cover:
+    # The root never needs an incoming transport route. Its useful finite alphabet consists
+    # of grasps that can first lift/re-place it and grasps that can support later mates. Build
+    # a deterministic farthest-first round robin over exactly those two physical roles. This
+    # prevents unrelated free-space quality strata from consuming K while preserving both
+    # roles and geometric diversity; concrete pair collisions remain search gates.
+    root_blocks = []
+    for kind in sorted(kind_robot):
+      root_support_roles = sorted({
+          r for e in primary for r in e[1]["scene_by_kind"].get(kind, ())
+          if r == "support" or r.startswith("component:")})
+      for role in ("pick", *root_support_roles):
+        block = [e for e in primary
+                 if role in e[1]["scene_by_kind"].get(kind, ())]
+        if block:
+          root_blocks.append(ordered(block))
+    root_cursors = [0] * len(root_blocks)
+    while len(route_seen) < route_limit:
+      progressed = False
+      for j, block in enumerate(root_blocks):
+        while (root_cursors[j] < len(block)
+               and id(block[root_cursors[j]][0]) in route_seen):
+          root_cursors[j] += 1
+        if root_cursors[j] >= len(block):
+          continue
+        reserve_route(block[root_cursors[j]], block[root_cursors[j]])
+        root_cursors[j] += 1
+        progressed = True
+        if len(route_seen) >= route_limit:
+          break
+      if not progressed:
+        break
+  else:
+    for kind in sorted(kind_robot):
+      direct = [e for e in primary if {"pick", "assemble"}.issubset(
+          e[1]["scene_by_kind"].get(kind, ()))]
+      direct_order = ordered(direct)
+      if not connectivity_cover:
+        direct_order = direct_order[:1]                  # historical one bridge per kind
+      for e in direct_order:
+        if reserve_route(e, e):
+          connected_receivers.add((kind, id(e[0])))
+      if direct:
+        continue
+      place_roles = sorted({role for e in primary
+                            for role in e[1]["scene_by_kind"].get(kind, ())
+                            if role.startswith("place:")})
+      for role in place_roles:
+        left = ordered([e for e in primary
+                        if {"pick", role}.issubset(
+                            e[1]["scene_by_kind"].get(kind, ()))])
+        right = ordered([e for e in primary
+                         if {"assemble", role}.issubset(
+                             e[1]["scene_by_kind"].get(kind, ()))])
+        if not left:
+          continue
+        for b in right:
+          if (kind, id(b[0])) in connected_receivers:
+            continue
+          if reserve_route(left[0], b):
+            route_kinds.add(kind)
+            connected_receivers.add((kind, id(b[0])))
+            table_routes.append((kind, role, left[0], b))
+
+  # Cover assembly-side candidates still disconnected after direct/table transport with a
+  # geometrically valid free-space handover.  This uses the same floating hand models and
+  # virtual closure as the forward cheap gate, but explicit poses because positional grasp
+  # ids do not exist yet. Endpoint sets are already role-positive and therefore small.
+  handover_kind_pairs, handover_routes = set(), []
+  if scene_select and connectivity_cover:
+    robots_by_kind = {}
+    for robot in ctx.get("robots", ()):
+      robots_by_kind.setdefault(checker._robot_kind.get(robot, robot), []).append(robot)
+    for give_kind in sorted(kind_robot):
+      left = ordered([e for e in primary
+                      if "pick" in e[1]["scene_by_kind"].get(give_kind, ())])
+      if not left:
+        continue
+      for recv_kind in sorted(kind_robot):
+        right = ordered([e for e in primary
+                         if "assemble" in e[1]["scene_by_kind"].get(recv_kind, ())])
+        if not right:
+          continue
+        robot_pairs = [(a, b) for a in robots_by_kind.get(give_kind, ())
+                       for b in robots_by_kind.get(recv_kind, ()) if a != b]
+        for b in right:
+          if (recv_kind, id(b[0])) in connected_receivers:
+            continue
+          found = None
+          for a in left:
+            if any(checker.pose_pair_grasp_free(
+                ctx["s0"], part, part_pose(a[0]), part_pose(b[0]), asm, ra, rb)
+                   for ra, rb in robot_pairs):
+              found = (a, b)
+              break
+          if found is not None and reserve_route(*found):
+            connected_receivers.add((recv_kind, id(b[0])))
+            handover_kind_pairs.add((give_kind, recv_kind))
+            handover_routes.append((give_kind, recv_kind, found[0], found[1]))
+
   out, seen, covered = [], set(), set()
+  for entry in route_seed:
+    if id(entry[0]) in seen:
+      continue
+    out.append(entry); seen.add(id(entry[0]))
+    for covered_kind, roles in entry[1]["scene_by_kind"].items():
+      for covered_role in roles:
+        if (covered_role in ("pick", "assemble", "support")
+            or covered_role.startswith("component:")):
+          covered.add((covered_kind, covered_role))
   for fact, block in reserve_blocks:
     kind, role = fact
     if ((role == "bridge" and
@@ -3999,13 +4424,59 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
     seen.add(id(entry[0]))
     for covered_kind, roles in entry[1]["scene_by_kind"].items():
       for covered_role in roles:
-        if covered_role in ("pick", "assemble", "support"):
+        if (covered_role in ("pick", "assemble", "support")
+            or covered_role.startswith("component:")):
           covered.add((covered_kind, covered_role))
 
   for entry in tail:
     if id(entry[0]) not in seen:
       out.append(entry); seen.add(id(entry[0]))
-  return out[:keep]
+  selected = out[:keep]
+  selected_ids = {id(entry[0]): gid for gid, entry in enumerate(selected)}
+
+  # Keep the loss audit next to the selector which owns the relevant populations.  This is
+  # intentionally metadata only: no search decision consumes it.  `evaluated` equals the
+  # complete raw cloud under --grasp-sampler-full-probe and otherwise exposes exactly how
+  # much information the historical geometry-only probe hid from role selection.
+  def coverage(entries):
+    ans = {}
+    for kind in sorted(kind_robot):
+      p = sum("pick" in e[1]["scene_by_kind"].get(kind, ()) for e in entries)
+      a = sum("assemble" in e[1]["scene_by_kind"].get(kind, ()) for e in entries)
+      s = sum(any(r == "support" or r.startswith("component:")
+                  for r in e[1]["scene_by_kind"].get(kind, ())) for e in entries)
+      b = sum({"pick", "assemble"}.issubset(
+          e[1]["scene_by_kind"].get(kind, ())) for e in entries)
+      ans[kind] = {"pick": int(p), "assemble": int(a), "support": int(s),
+                    "both": int(b)}
+    return ans
+
+  _SAMPLED_SELECTION_DIAGNOSTICS[part] = {
+      "raw": len(raw), "quality": len(raw_good), "probe": len(probe),
+      "evaluated": len(sampled) + len(canonical), "selected": len(selected),
+      "full_probe": bool(_SAMPLED_GRASPS.get("full_probe", False)),
+      "expanded_full": bool(expanded_full),
+      "evaluated_coverage": coverage(list(sampled) + list(canonical)),
+      "selected_coverage": coverage(selected),
+      "acquisition_rejects": {
+          kind: {
+              reason: sum(1 for e in list(sampled) + list(canonical)
+                          if e[1].get("acquisition_reject_by_kind", {}).get(kind) == reason)
+              for reason in sorted({
+                  e[1].get("acquisition_reject_by_kind", {}).get(kind)
+                  for e in list(sampled) + list(canonical)
+                  if e[1].get("acquisition_reject_by_kind", {}).get(kind)})}
+          for kind in sorted(kind_robot)},
+      "table_route_kinds": tuple(sorted(route_kinds)),
+      "handover_route_kinds": tuple(sorted(handover_kind_pairs)),
+      "table_routes": tuple(
+          (kind, role, selected_ids.get(id(a[0])), selected_ids.get(id(b[0])))
+          for kind, role, a, b in table_routes),
+      "handover_routes": tuple(
+          (ka, kb, selected_ids.get(id(a[0])), selected_ids.get(id(b[0])))
+          for ka, kb, a, b in handover_routes),
+  }
+  return selected
 
 
 def _sampled_keys(spec, offset, part=None):
@@ -4022,11 +4493,18 @@ def _sampled_keys(spec, offset, part=None):
   # worse, adding the option changed every historical non-strict grasp id even though its value
   # was False.  Keep strictness in the filtered-view cache key instead.  This also makes the
   # strict/non-strict comparison a matched filtering ablation over identical proposals.
-  base = (_sampling_spec_key(spec), float(offset), 2, cfgv["seed"], cfgv["candidates"],
+  # ``candidates`` is a prefix length of one deterministic proposal stream, not a proposal
+  # distribution parameter. Keeping it out of the RNG key makes N and larger N' genuinely
+  # nested; previously asking for more candidates silently resampled every old contact and
+  # turned candidate widening into an unrelated lottery. It remains in the view-cache key
+  # below because the materialized finite cloud is of course a different size.
+  base = (_sampling_spec_key(spec), float(offset), 2, cfgv["seed"],
           float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)),
           cfgv.get("wrap"))
   ctx = _SAMPLED_SCENE_CTX
-  cache = base + (bool(cfgv.get("strict", False)), bool(_GRASP_PHYSICS_CHECK),
+  cache = base + (int(cfgv["candidates"]), bool(cfgv.get("strict", False)),
+                  bool(cfgv.get("roll_refine", False)),
+                  bool(cfgv.get("full_probe", False)), bool(_GRASP_PHYSICS_CHECK),
                   cfgv.get("master_keep", cfgv["keep"]),)
   return base, cache + (part, (ctx["sig"] if ctx is not None else None))
 
@@ -4136,6 +4614,13 @@ def _sampled_grasp_views(spec, offset, part=None):
       z_rolls = [z, -z]
       if wrap is not None:
         z_rolls += [x, -x]
+        if bool(cfgv.get("roll_refine", False)):
+          # Nested midpoint refinement of the existing quarter-turn lattice.  Keep the first
+          # four rows byte-identical/order-identical, then add 45-degree approaches.  These
+          # sacrifice some pad-optimality but can make the difference between two colliding
+          # hands and a feasible transfer on a small part.
+          z_rolls += [(z + x) / np.sqrt(2.0), (z - x) / np.sqrt(2.0),
+                      (-z + x) / np.sqrt(2.0), (-z - x) / np.sqrt(2.0)]
       for zi, z_dir in enumerate(z_rolls):
         x_dir = np.cross(y, z_dir)                         # right-handed (x, y, z)
         if min_support > 0.0:                              # support per roll: the wrap roll
@@ -4190,6 +4675,14 @@ def sampled_grasp_meta(spec, offset=0.01, part=None):
     return ()
   _sampled_grasp_views(spec, offset, part)                  # fills both caches
   return _SAMPLED_META_CACHE.get(_sampled_keys(spec, offset, part)[1], ())
+
+
+def sampled_grasp_selection_diagnostics(part=None):
+  """Read-only sampler loss audit for the currently installed scene/database."""
+  if part is None:
+    return {p: dict(v) for p, v in _SAMPLED_SELECTION_DIAGNOSTICS.items()}
+  row = _SAMPLED_SELECTION_DIAGNOSTICS.get(part)
+  return None if row is None else dict(row)
 
 
 def sampled_grasp_db_signature(assembly):
@@ -5105,6 +5598,7 @@ class GraspTable(dict):
   robot_kinds = None                                       # {robot: "vacuum"|"two_finger"}
   handover_physics = None                                  # eager pair certificate lookup
   handover_models = None                                   # {robot: physical hand model key}
+  handover_signature = None                                # complete finite pair universe
 
   def usable(self, S_key, part, gid, robot):
     if self.kinds_of is None or self.robot_kinds is None:
@@ -5207,7 +5701,7 @@ class LazyGraspTable(GraspTable):
     return sum(len(rows) for rows in dict.values(self))
 
 
-_GRASP_TABLE_CACHE_SCHEMA = 1
+_GRASP_TABLE_CACHE_SCHEMA = 2
 _LOADED_GRASP_TABLE_CACHES = {}
 
 
@@ -5235,6 +5729,16 @@ def save_grasp_table_cache(path, table, cache_key):
                    for part, gid, pose in table[key]],
     })
   kinds = getattr(table, "kinds_of", None)
+  handover = getattr(table, "handover_physics", None)
+  handover_signature = getattr(table, "handover_signature", None)
+  accepted_handovers = None
+  if handover is not None and handover_signature:
+    # The signature says the full finite pair universe was enumerated, so rejected pairs need
+    # not be serialized. This keeps a 4k-pair physics table compact and portable.
+    accepted_handovers = [
+        [list(group), ma, ga[0], int(ga[1]), mb, gb[0], int(gb[1])]
+        for (group, ma, ga, mb, gb), feasible in sorted(
+            handover.items(), key=lambda item: repr(item[0])) if feasible]
   payload = {
       "schema_version": _GRASP_TABLE_CACHE_SCHEMA,
       "cache_key": str(cache_key),
@@ -5246,6 +5750,12 @@ def save_grasp_table_cache(path, table, cache_key):
               kinds.items(), key=lambda item: (item[0][0], item[0][1], item[0][2]))
       ],
       "robot_kinds": getattr(table, "robot_kinds", None),
+      "handover_physics": None if accepted_handovers is None else {
+          "contract": "handover-physics-v1",
+          "signature": handover_signature,
+          "models": getattr(table, "handover_models", None),
+          "accepted": accepted_handovers,
+      },
   }
   parent = os.path.dirname(os.path.abspath(path))
   os.makedirs(parent, exist_ok=True)
@@ -5270,7 +5780,7 @@ def load_grasp_table_cache(path, cache_key):
     return hit
   with gzip.open(path, "rt", encoding="utf-8") as f:
     payload = json.load(f)
-  if payload.get("schema_version") != _GRASP_TABLE_CACHE_SCHEMA:
+  if payload.get("schema_version") not in (1, _GRASP_TABLE_CACHE_SCHEMA):
     raise ValueError(
         f"grasp database schema mismatch in {path}: "
         f"{payload.get('schema_version')} != {_GRASP_TABLE_CACHE_SCHEMA}")
@@ -5298,6 +5808,20 @@ def load_grasp_table_cache(path, cache_key):
         for S_key, part, gid, mask in encoded
     }
     table.robot_kinds = payload.get("robot_kinds")
+    handover = payload.get("handover_physics")
+    if handover is not None:
+      if handover.get("contract") != "handover-physics-v1":
+        raise ValueError(f"unsupported handover certificate in grasp database {path}")
+      table.handover_models = {
+          str(r): str(model) for r, model in (handover.get("models") or {}).items()}
+      table.handover_signature = str(handover.get("signature") or "")
+      table.handover_physics = {}
+      for row in handover.get("accepted") or ():
+        if len(row) != 7:
+          raise ValueError(f"malformed handover certificate in grasp database {path}")
+        group, ma, pa, ga, mb, pb, gb = row
+        table.handover_physics[(tuple(group), str(ma), (str(pa), int(ga)),
+                                str(mb), (str(pb), int(gb)))] = True
   result = table, {"keys": len(keys), "rows": sum(len(v) for v in stored.values())}
   _LOADED_GRASP_TABLE_CACHES[memory_key] = result
   return result
@@ -5476,6 +6000,12 @@ def compute_cube_grasps(assembly, subassembly, offset=0.01,
                         .get("two_finger", {})).get("feasible", False))):
         continue                                          # exact articulated fingers could
                                                           # not acquire/retain this isolated grip
+      if (not is_vacuum and sample_meta
+          and "two_finger" in sample_meta[grasp_id].get("acquisition_by_kind", {})
+          and not sample_meta[grasp_id]["acquisition_by_kind"]["two_finger"]):
+        continue                                          # coupled jaws cannot reach one common
+                                                          # aperture even on the isolated part;
+                                                          # no scene or IK branch can repair it
       grasp = np.concatenate([obj_in_ref + local[:3], local[3:]])
 
       conventional = bool(sample_meta and sample_meta[grasp_id].get("origin") == "canonical")
@@ -7317,6 +7847,7 @@ def reset_grasp_pose_cache():
   _GRASP_POSE_CACHE.clear()
   _SAMPLED_VIEWS_CACHE.clear()                             # --grasp-sampler: same hazard class
   _SAMPLED_META_CACHE.clear()
+  _SAMPLED_SELECTION_DIAGNOSTICS.clear()
 
 
 def _grounding_caps(state, assembly, group, gripper_kind, table_override=None):

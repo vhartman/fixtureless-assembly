@@ -737,6 +737,32 @@ def test_open_scheduler_replans_immediately_after_first_failed_plan_edge():
   assert report.open_failures == 1
 
 
+def test_open_scheduler_does_not_repeat_an_exhausted_graph_without_ik_failures():
+  """A larger IK epoch cannot change a graph that exposed no candidate IK edge."""
+  builds = []
+
+  class RIK:
+    def _scene_sig(self, state):
+      return state
+
+  class Engine:
+    budget_hit = False
+
+    def __init__(self, suspended):
+      builds.append(frozenset(suspended))
+
+    def search(self, _max_nodes, deadline=None):
+      return None
+
+  plan, end, report = run_open_lazy_fill(
+      robot_ik=RIK(), assembly=object(), make_engine=Engine,
+      walk_plan=lambda _plan: (), is_ik=lambda _a: True,
+      max_nodes=10, max_epochs=3)
+  assert (plan, end) == (None, None)
+  assert builds == [frozenset()]
+  assert report.epochs == 1 and report.probes == 0 and report.exhausted
+
+
 def test_reverse_selector_checks_the_candidate_suffix_first():
   s0, s1, s2 = _State("s0"), _State("s1"), _State("s2")
   a = ("pick", "a1", "obj", 0)

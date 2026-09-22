@@ -310,6 +310,7 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
       return None, None, report
     epoch += 1
     report.epochs = epoch
+    epoch_open_failures = report.open_failures
     # A node-budget stop is search incompleteness, not new IK evidence.  The old scheduler
     # restarted every epoch with the identical cap, so a large equal-f shell could be replayed
     # forever while only the per-edge IK batch grew.  Geometric widening is the standard
@@ -363,10 +364,23 @@ def run_open_lazy_fill(*, robot_ik, assembly, make_engine, walk_plan, is_ik,
           report.budget_hits += 1
           if verbose:
             print(f"[open-witness {tag}] epoch {epoch} ended on the node budget "
-                  f"{epoch_nodes} (not exhaustion); reopening with IK + node effort"
+              f"{epoch_nodes} (not exhaustion); reopening with IK + node effort"
                   + (f" (next cap {epoch_nodes * 2})"
                      if max_epochs == 0 or epoch < max_epochs else ""))
-        break                                             # reopen all and increase effort
+        elif report.open_failures == epoch_open_failures:
+          # The finite symbolic/cheap graph is exhausted and this epoch suspended no failed
+          # IK edge. Rebuilding it with a larger stochastic IK batch is therefore exactly the
+          # same search: there is no open witness whose effort could increase. This occurred
+          # on bad milestone boundaries as two identical 70k-edge searches reporting
+          # "0 effort slots". Exhaust the current action alphabet immediately; an enclosing
+          # yaw/grasp/scope or milestone-boundary schedule may still widen it.
+          report.exhausted = True
+          if verbose:
+            print(f"[open-witness {tag}] symbolic/cheap graph exhausted in epoch {epoch} "
+                  "with no open IK failure; skipping identical higher-effort epochs"
+                  f"{storage_tail()}", flush=True)
+          return None, None, report
+        break                                             # reopen failed edges at more effort
       valid = True
       walked = list(walk_plan(subplan))
       end_state = walked[-1][2] if walked else None

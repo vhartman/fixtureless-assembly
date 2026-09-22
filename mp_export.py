@@ -2520,20 +2520,26 @@ def load_export_bundle(path_json, plan, joint_names, required=True):
           "task_signature": blob.get("task_signature"), "raw": blob}
 
 
-def save_path(path_json, path, problem=None, mp_export_bundle=None):
+def save_path(path_json, path, problem=None, mp_export_bundle=None, *, optimized=False):
   """Persist a solved BiRRT PATH (main --motion-plan --mp-save). Each mr_bench State ->
   {"q": joint vector, "mode": task_ids}. The discrete PLAN (main --save) must be saved from
   the SAME run: load_path replays against a problem REBUILT from that plan (make_problem is
   deterministic, so task ids / modes align).
 
-  FORMAT: a bare LIST historically; with `problem` it becomes a dict containing states and a
-  task signature. Current main.py also supplies ``mp_export_bundle``: the exact post-fusion
+  FORMAT: a bare LIST historically; current writers always emit a dict containing states and
+  an explicit optimized=true provenance marker (plus a task signature when ``problem`` is
+  supplied). Current main.py also supplies ``mp_export_bundle``: the exact post-fusion
   witnesses, pre-keyframes and task manifest are embedded beside the path, so viewers/sim need
   no IK or task inference. load_path still reads the historical forms, but execution requires
   an explicit legacy refresh when that final-export block is absent."""
+  if not optimized:
+    raise ValueError(
+        "refusing to persist a first-solution-only motion path; exported paths must finish "
+        "the configured RRT* optimization pass")
   states = [s.to_dict() for s in path] if path else []
-  blob = states if problem is None else {"states": states,
-                                        "task_signature": task_signature(problem)}
+  blob = {"states": states, "optimized": True}
+  if problem is not None:
+    blob["task_signature"] = task_signature(problem)
   if mp_export_bundle is not None:
     if not isinstance(blob, dict):
       blob = {"states": states}
@@ -2583,6 +2589,7 @@ def load_path(path_json):
   out = [_PathState(d["q"], _Mode(d["mode"])) for d in states]
   load_path.last_signature = sig                             # checked by the caller, if present
   load_path.last_export = _export_blob(data)
+  load_path.last_optimized = data.get("optimized") if isinstance(data, dict) else None
   return out
 
 

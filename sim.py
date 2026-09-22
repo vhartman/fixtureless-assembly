@@ -4422,6 +4422,15 @@ class _SkillServo:
       }
 
 
+def _action_acquires_grasp(plan, label):
+  """True only for an exported task that creates a new gripper grasp.
+
+  A release can re-root an assembly onto a continuing holder and therefore also have a
+  gripper-shaped attach parent.  That frame alone must not trigger a second close command.
+  """
+  return bool(label and tuple(plan[int(label[0])])[0] in ("pick", "handover"))
+
+
 def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kinds=None,
                         record=None, verbose=True, gui=False, visual=True,
                         record_on_failure=False,
@@ -5383,8 +5392,16 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       return
     parent, child = t.frames[0], t.frames[1]
     _before_grasps = {r: g[1] for r, g in scene.active_grasps.items()}
-    _incoming = (None if parent == "table" or parent in assembly.objects
-                 else parent.split("_", 1)[0])
+    # An exported release may re-root the assembly onto a CONTINUING holder, so its attach
+    # parent can be a gripper frame even though no new grasp is acquired.  Frame shape alone
+    # therefore cannot decide whether to close fingers (or which plan edge owns an aperture
+    # certificate).  Only pick/handover acquire a gripper here; add_grasp is handled by the
+    # frame-less branch above.  This also keeps a release from spuriously requesting a closure
+    # certificate indexed by the release action.
+    _incoming = (parent.split("_", 1)[0]
+                 if (_action_acquires_grasp(plan, _l)
+                     and parent != "table" and parent not in assembly.objects)
+                 else None)
     if task_id in _scheduled_preclose_tasks:
       _event = _scheduled_close_records.get(task_id)
       if _event is not None:
@@ -5928,7 +5945,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         task = problem.tasks[int(tid)]
         frames = getattr(task, "frames", None) or ()
         lbl = name_of.get(task.name)
-        if frames and frames[0] not in assembly.objects and frames[0] != "table":
+        if (_action_acquires_grasp(plan, lbl) and frames
+            and frames[0] not in assembly.objects and frames[0] != "table"):
           robot = next((r for r in robots if str(frames[0]).startswith(r)), None)
           if robot is not None and scene._gripper_qadr.get(robot):
             closes.append((int(tid), robot, str(frames[1])))

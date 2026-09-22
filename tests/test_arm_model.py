@@ -13,8 +13,9 @@ mujoco = pytest.importorskip("mujoco")
 
 import arm_model
 import fk_compare
-from env import (make_four_robot_env, make_fr3_duo_env, make_husky_duo_env,
+from env import (color_gripper, make_four_robot_env, make_fr3_duo_env, make_husky_duo_env,
                  make_openarm_duo_env)
+import robotic as ry
 import assembly as A
 
 
@@ -118,6 +119,22 @@ def test_articulated_gripper_hinges_are_sim_only_and_actuated(robot):
     assert abs(float(data.qpos[int(model.jnt_qposadr[jid])]) - 0.5 * gain * max_angle) < 0.02
 
 
+def test_physical_robotiq_uses_one_bounded_actuator_and_mimic_constraints():
+  """A contact pinch is one coupled mechanism, not six fighting position servos."""
+  C = _env("ur5")
+  prefix = A.get_robots(C)[0]
+  specs = arm_model.gripper_sim_joints(C, prefix)
+  assert len(specs) == 6
+
+  acts, names = arm_model.gripper_actuator_mjcf(C, [prefix], coupled=True)
+  equalities = arm_model.gripper_equality_mjcf(C, [prefix])
+
+  assert len(names) == 1
+  assert acts.count("<position ") == 1
+  assert equalities.count("<joint ") == len(specs) - 1
+  assert f'joint2="sim_grip__{next(iter(specs))}"' in equalities
+
+
 def test_tree_is_read_at_zero_not_at_home():
   """A rai joint frame's relative transform contains the CURRENT joint value, so the tree
   must be read at q=0. If it were read at home, moving the scene would change the model."""
@@ -219,3 +236,17 @@ def test_husky_duo_fk_and_static_carrier_export():
   assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "husky0_base_link") >= 0
   assert mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY,
                            "husky0_dual_arm_bulkhead_link") >= 0
+
+
+def test_gripper_coloring_does_not_create_empty_meshes_on_joint_helpers():
+  """Tinting names containing ``finger`` must leave shapeless joint origins shapeless.
+
+  RAI otherwise turns ``setColor`` on such a frame into a zero-vertex mesh, which later makes
+  FCL abort during motion planning instead of returning a collision result.
+  """
+  C = ry.Config()
+  C.addFile("src/rai/robotiq/robotiq.g", namePrefix="x_")
+  helper = C.getFrame("x_finger_joint_origin")
+  assert "shape" not in helper.info()
+  color_gripper(C, "x_", [0.9, 0.1, 0.1, 0.3])
+  assert "shape" not in helper.info()

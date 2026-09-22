@@ -26,7 +26,7 @@ def _patch_scene(monkeypatch, witnesses):
          "bracing": False, "pre_insertion": 0.0}
   plan = [("pick", "a1", "obj_0", 0)]
   monkeypatch.setattr(R, "read_plan", lambda _p: (cfg, plan))
-  monkeypatch.setattr(R, "build_scene", lambda _cfg: (_C(), object()))
+  monkeypatch.setattr(R, "build_scene", lambda _cfg, **_kw: (_C(), object()))
   monkeypatch.setattr(R, "get_robots", lambda _C: ["a1"])
   monkeypatch.setattr(R, "RobotIK", _IK)
   monkeypatch.setattr(R, "read_witnesses", lambda *_a: witnesses)

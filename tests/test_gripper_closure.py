@@ -47,6 +47,10 @@ def test_virtual_close_rejects_an_off_centre_bilateral_grasp():
   assert not out.feasible
   assert out.reason == "miscentred-contact"
   assert out.detail is not None and out.detail[2] < -.005
+  # The certificate exposes the kinematic projection used by the grasp sampler: moving the
+  # tool centre by the measured half-difference of first-contact travel recentres the jaws.
+  assert out.centering_offset is not None
+  assert abs(out.centering_offset - .005) < 2e-4
 
 
 def test_virtual_close_keeps_submillimetre_centring_noise_feasible():

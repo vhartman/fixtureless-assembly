@@ -55,7 +55,7 @@ def test_noisy_runner_builds_fail_closed_reproduction_command(tmp_path):
   plan.write_text("{}")
   mp.write_text("{}")
   args = SimpleNamespace(
-      plan=plan, mp_path=mp, sim_profile="standard", max_placement_tries=50,
+      plan=plan, mp_path=mp, max_placement_tries=50,
       grasp_capture=0.008, grasp_capture_angle=7.0, apply_process_wrench=True,
       process_noise="sample", process_noise_corner=0, extra=[], memory_gb=0.0)
   trial = {"xy_m": 0.005, "yaw_deg": 3.0, "seed": 11,
@@ -64,7 +64,7 @@ def test_noisy_runner_builds_fail_closed_reproduction_command(tmp_path):
   assert cmd[:3] == [__import__("sys").executable,
                      str(__import__("benchmarks.run_noisy_sim",
                                     fromlist=["ROOT"]).ROOT / "sim.py"), "run"]
-  assert "--sim-profile" in cmd and "standard" in cmd
+  assert "--sim-profile" not in cmd
   assert cmd[cmd.index("--object-perturb-seed") + 1] == "11"
   assert cmd[cmd.index("--process-noise") + 1] == "sample"
   assert "--report-json" in cmd and "--record" in cmd

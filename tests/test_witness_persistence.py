@@ -11,7 +11,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from plan_io import PRE_WITNESS_CONTRACT, missing_required_witnesses, read_plan, read_pre_witnesses, \
+from plan_io import PRE_WITNESS_CONTRACT, missing_required_witnesses, read_grasp_closures, read_grasp_physics, read_plan, read_pre_witnesses, \
     read_skill_paths, read_witnesses, read_witness_stage, require_complete_witnesses, \
     witness_block, write_plan
 import mp_export as MP
@@ -34,6 +34,32 @@ def test_write_plan_creates_requested_parent_directory(tmp_path):
   write_plan(str(p), {"assembly": "cross"}, PLAN)
   assert p.is_file()
   assert read_plan(str(p)) == ({"assembly": "cross"}, PLAN)
+
+
+def test_plan_roundtrip_carries_apriori_handover_physics(tmp_path):
+  p = tmp_path / "plan.json"
+  cert = {"contract": "handover-physics-v1", "force_n": 10.0,
+          "signature": "db", "models": {"a1": "hand"}, "accepted": []}
+  write_plan(str(p), {"assembly": "cross"}, PLAN, grasp_physics=cert)
+  assert read_grasp_physics(str(p)) == cert
+
+
+def test_grasp_closure_aperture_round_trip_is_action_aligned(tmp_path):
+  cert = {0: {"contract": "virtual-close-v5", "action": list(PLAN[0]),
+              "robot": "a1", "part": "obj_1", "grasp_id": 0,
+              "model": "robotiq", "aperture": 0.031,
+              "aperture_semantics": "per-finger-inward-travel-m"}}
+  path = _write(tmp_path, witness_block(JOINTS, [np.zeros(4), None, None],
+                                        grasp_closures=cert))
+  assert read_grasp_closures(path, PLAN, required=True)[0]["aperture"] == 0.031
+  with open(path) as f:
+    import json
+    data = json.load(f)
+  data["witnesses"]["grasp_closures"]["0"]["action"][2] = "obj_2"
+  with open(path, "w") as f:
+    json.dump(data, f)
+  with pytest.raises(ValueError, match="not aligned"):
+    read_grasp_closures(path, PLAN, required=True)
 
 
 def test_round_trip_exact(tmp_path):
@@ -305,7 +331,17 @@ def test_saved_motion_path_embeds_the_final_export(tmp_path):
       return {"q": [0.0] * 4, "mode": [0]}
 
   path = tmp_path / "mp.json"
-  MP.save_path(str(path), [_State()], problem=problem, mp_export_bundle=bundle)
+  MP.save_path(str(path), [_State()], problem=problem, mp_export_bundle=bundle,
+               optimized=True)
   out = MP.load_export_bundle(str(path), PLAN, JOINTS)
   assert out["task_signature"] == MP.task_signature(problem)
   assert out["sequence_names"] == ["terminal"]
+
+
+def test_motion_path_export_refuses_first_solution_only_artifact(tmp_path):
+  class _State:
+    def to_dict(self):
+      return {"q": [0.0], "mode": [0]}
+
+  with pytest.raises(ValueError, match="first-solution-only"):
+    MP.save_path(str(tmp_path / "raw.json"), [_State()])

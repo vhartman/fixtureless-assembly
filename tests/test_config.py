@@ -81,22 +81,22 @@ def test_current_sampler_marker_is_migrated_and_obsolete_markers_fail():
     RunConfig.from_dict({"grasp_sampler": True, "grasp_sampler_version": 3})
 
 
-def test_open_profile_is_a_compatibility_alias_and_profile_overlays_are_narrow():
-  alias = main.parse_args(["--search-profile", "open"])
+def test_removed_shorthands_and_negative_shortcut_field_migrate():
+  cfg = RunConfig.from_dict({"skill": 0.03, "mp_no_shortcut": True})
+  assert cfg.mp_shortcut is False
+  assert "skill" not in cfg.to_dict() and "mp_no_shortcut" not in cfg.to_dict()
+
+
+def test_supported_profile_overlays_are_narrow():
   standard = main.parse_args(["--search-profile", "standard"])
-  assert {k: getattr(alias, k) for k in main._STANDARD_SEARCH_PROFILE} == {
-      k: getattr(standard, k)
-      for k in main._STANDARD_SEARCH_PROFILE}
-  fast = main.parse_args(["--search-profile", "fast-open"])
-  differences = {k for k in main._STANDARD_SEARCH_PROFILE
-                 if getattr(fast, k) != getattr(standard, k)}
-  assert differences == {"analytic_seed_cap"}
-  assert standard.analytic_seed_cap is None and fast.analytic_seed_cap is not None
   fabrica = main.parse_args(["--search-profile", "fabrica"])
   differences = {k for k in main._STANDARD_SEARCH_PROFILE
                  if getattr(fabrica, k) != getattr(standard, k)}
   assert differences == {"grasp_sampler_keep", "grasp_widen"}
   assert fabrica.grasp_sampler_keep == 64 and fabrica.grasp_widen is False
+  assert set(main._SEARCH_PROFILES) == {"standard", "fabrica"}
+  with pytest.raises(SystemExit):
+    main.parse_args(["--search-profile", "open"])
 
 
 def test_optimistic_dispatch_uses_the_shared_local_fill_settings(monkeypatch):
@@ -509,9 +509,9 @@ def test_profile_wins_over_config_and_individual_cli_wins_over_both(tmp_path):
   RunConfig(weight=7.0, open_witness=False, witness_margin=0.003).to_file(
       str(tmp_path / "c.json"))
   a = main.parse_args([
-      "--search-profile", "fast-open", "--config", str(tmp_path / "c.json")])
+      "--search-profile", "standard", "--config", str(tmp_path / "c.json")])
   assert a.weight == 1.0 and a.open_witness and a.witness_margin == 0.005
-  assert a.analytic_seed_cap == 3
+  assert a.analytic_seed_cap is None
   b = main.parse_args([
       "--search-profile", "standard", "--config", str(tmp_path / "c.json"),
       "--weight", "9", "--open-witness"])

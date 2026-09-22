@@ -152,11 +152,11 @@ def test_anytime_wrapper_selects_case_subset_and_forwards_jobs(tmp_path, monkeyp
   assert call[call.index("--timeout") + 1] == "240.0"
   assert call[call.index("--seeds") + 1:call.index("--jobs")] == ["11", "13"]
   selector = call[call.index("--only") + 1]
-  assert re.search(selector, "cross__ours__seed-11")
-  assert re.search(selector, "chair__ours__seed-13")
-  assert not re.search(selector, "stool__ours__seed-11")
-  assert "--append-arg=--milestones-anytime" in call
-  assert call[call.index("--append-arg") + 1] == "150.0"
+  assert re.search(selector, "cross__ours-initial__seed-11")
+  assert re.search(selector, "chair__ours-anytime__seed-13")
+  assert not re.search(selector, "stool__ours-anytime__seed-11")
+  assert "--shared-grasp-db" in call
+  assert not any(arg.startswith("--append-arg") for arg in call)
 
 
 def test_grasp_database_roundtrip_preserves_lazy_rows_and_kind_masks(tmp_path):
@@ -170,6 +170,14 @@ def test_grasp_database_roundtrip_preserves_lazy_rows_and_kind_masks(tmp_path):
       (("obj_0", "obj_1"), "obj_1", 4): frozenset({"vacuum"}),
   }
   table.robot_kinds = {"a1": "two_finger", "a2": "vacuum"}
+  table.handover_models = {"a1": "hand:abc", "a3": "hand:abc"}
+  table.handover_signature = "complete-db-signature"
+  table.handover_physics = {
+      (("obj_0",), "hand:abc", ("obj_0", 3),
+       "hand:abc", ("obj_0", 7)): True,
+      (("obj_0",), "hand:abc", ("obj_0", 7),
+       "hand:abc", ("obj_0", 3)): False,
+  }
   path = tmp_path / "grasps.json.gz"
   assert problem.save_grasp_table_cache(path, table, "unit") == {"keys": 2, "rows": 2}
   loaded, stats = problem.load_grasp_table_cache(path, "unit")
@@ -178,6 +186,11 @@ def test_grasp_database_roundtrip_preserves_lazy_rows_and_kind_masks(tmp_path):
   assert np.array_equal(loaded[("obj_0",)][0][2], np.arange(7, dtype=float))
   assert loaded.usable(("obj_0",), "obj_0", 3, "a1")
   assert not loaded.usable(("obj_0",), "obj_0", 3, "a2")
+  assert loaded.handover_signature == "complete-db-signature"
+  assert loaded.handover_models == {"a1": "hand:abc", "a3": "hand:abc"}
+  assert loaded.handover_physics == {
+      (("obj_0",), "hand:abc", ("obj_0", 3),
+       "hand:abc", ("obj_0", 7)): True}
   with pytest.raises(ValueError, match="fingerprint mismatch"):
     problem.load_grasp_table_cache(path, "stale")
 
@@ -185,7 +198,7 @@ def test_grasp_database_roundtrip_preserves_lazy_rows_and_kind_masks(tmp_path):
 def test_paper_motion_command_is_first_solution_only(tmp_path):
   command = PS._motion_command(tmp_path / "plan.json", 30.0, 7)
   assert "--no-mp-optimize" in command
-  assert "--mp-no-shortcut" in command
+  assert "--no-mp-shortcut" in command
   assert command[command.index("--mp-runtime") + 1] == "30.0"
 
 

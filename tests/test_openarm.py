@@ -84,6 +84,20 @@ def test_openarm_model_contract_rejects_the_old_home_as_manipulation_exit(monkey
     S.RobotIK(C, A.get_robots(C))
 
 
+def test_openarm_exit_collision_filter_ignores_loose_part_pairs():
+  collisions = [
+      ("obj_0", "obj_1", -0.014),
+      ("table", "obj_2", -0.003),
+      ("a1_joint3_coll", "obj_0", -0.002),
+      ("a2_ee_coll", "a1_joint5_coll", -0.001),
+      ("a1_joint1_coll", "table", 0.004),
+  ]
+  assert S._penetrations_involving_robots(collisions, ["a1", "a2"]) == [
+      ("a1_joint3_coll", "obj_0", -0.002),
+      ("a2_ee_coll", "a1_joint5_coll", -0.001),
+  ]
+
+
 def test_openarm_hand_collision_frames_are_derived_from_the_ee_subtree():
   """Unconventional ee_coll names must still receive intended hand-contact semantics."""
   C = make_openarm_duo_env(2)

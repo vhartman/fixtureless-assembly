@@ -14,6 +14,7 @@ of the existing cheap floating-EE gates.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+import hashlib
 import math
 import os
 import time
@@ -404,6 +405,90 @@ class GraspPhysicsContext:
     self._handover_compat = {}
     self._handover_models = None
     self._handover_geometry = {}
+    # A handover certificate is an OFFLINE property of one finite grasp database and hand
+    # model roster.  Keep the completed table as a first-class artifact: repeated local fills,
+    # witness collection, and motion export must never rerun (or even re-enumerate) physics.
+    self._handover_signature = None
+
+  @staticmethod
+  def _model_key(path):
+    """Portable identity for a hand model (paths differ across machines)."""
+    path = os.path.realpath(path)
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+      for chunk in iter(lambda: f.read(1 << 20), b""):
+        h.update(chunk)
+    return f"{os.path.basename(path)}:{h.hexdigest()}"
+
+  def _handover_table_signature(self, table, models):
+    """Identity of every finite grasp row covered by an eager handover certificate."""
+    h = hashlib.sha256()
+    h.update(f"handover-physics-v1\0force={self.force_n:.17g}\0".encode())
+    for robot, model in sorted(models.items()):
+      h.update(f"robot={robot}\0model={model}\0".encode())
+    for key in sorted(table.keys(), key=repr):
+      key = tuple(key)
+      h.update(repr(key).encode() + b"\0")
+      for part, gid, pose in sorted(table[key], key=lambda row: (str(row[0]), int(row[1]))):
+        h.update(str(part).encode() + b"\0" + str(int(gid)).encode() + b"\0")
+        h.update(np.asarray(pose, dtype=np.float64).ravel().tobytes())
+        kinds = getattr(table, "kinds_of", None)
+        if kinds is not None:
+          h.update(repr(tuple(sorted(kinds.get((key, part, gid), ())))).encode())
+    return h.hexdigest()
+
+  def export_handovers(self):
+    """Compact, portable certificate payload for a saved task plan.
+
+    Only accepted pairs are stored.  Absence means rejection because ``signature`` certifies
+    that the complete finite pair universe was enumerated.
+    """
+    if self._handover_signature is None or self._handover_models is None:
+      return None
+    accepted = []
+    for (group, ma, ga, mb, gb), feasible in sorted(
+        self._handover_compat.items(), key=lambda item: repr(item[0])):
+      if feasible:
+        accepted.append([list(group), ma, ga[0], int(ga[1]),
+                         mb, gb[0], int(gb[1])])
+    return {
+        "contract": "handover-physics-v1",
+        "force_n": self.force_n,
+        "signature": self._handover_signature,
+        "models": dict(self._handover_models),
+        "accepted": accepted,
+    }
+
+  def import_handovers(self, payload):
+    """Install an a-priori certificate; its signature is checked against the DB on use."""
+    if not payload:
+      return False
+    if payload.get("contract") != "handover-physics-v1":
+      raise ValueError("unsupported saved handover-physics certificate contract")
+    if abs(float(payload.get("force_n", -1.0)) - self.force_n) > 1e-12:
+      raise ValueError("saved handover-physics force differs from this run")
+    models = {str(r): str(m) for r, m in (payload.get("models") or {}).items()}
+    # The robot names and model contents are part of the certificate.  Refuse a stale model
+    # before search rather than quietly recomputing physics inside a local fill.
+    current = {
+        r: self._model_key(path) for r, path in self.gripper_paths.items()
+        if path is not None and "vacuum" not in os.path.basename(path)
+    }
+    if models != current:
+      raise ValueError("saved handover-physics hand models differ from this scene")
+    compat = {}
+    for row in payload.get("accepted") or ():
+      if len(row) != 7:
+        raise ValueError("malformed saved handover-physics pair")
+      group, ma, pa, ga, mb, pb, gb = row
+      compat[(tuple(group), str(ma), (str(pa), int(ga)),
+              str(mb), (str(pb), int(gb)))] = True
+    self._handover_models = models
+    self._handover_compat = compat
+    self._handover_signature = str(payload.get("signature") or "")
+    if not self._handover_signature:
+      raise ValueError("saved handover-physics certificate has no database signature")
+    return True
 
   def check(self, part, pose, kind="two_finger"):
     if kind != "two_finger":
@@ -434,17 +519,43 @@ class GraspPhysicsContext:
     """
     import problem
 
-    if getattr(table, "handover_physics", None) is not None:
-      return table
     two_finger = [r for r in self.robots
                   if self.gripper_paths.get(r) is not None
                   and "vacuum" not in os.path.basename(self.gripper_paths[r])]
+    models = {r: self._model_key(self.gripper_paths[r]) for r in two_finger}
+    signature = self._handover_table_signature(table, models)
+
+    # A loaded shared grasp DB may already carry the complete table. Adopt it into this
+    # process-local context so every later independently rebuilt GraspTable is O(1).
+    table_signature = getattr(table, "handover_signature", None)
+    if (getattr(table, "handover_physics", None) is not None
+        and table_signature == signature
+        and getattr(table, "handover_models", None) == models):
+      self._handover_compat = table.handover_physics
+      self._handover_models = models
+      self._handover_signature = signature
+      print("[grasp-physics/handover] using a-priori certificate from grasp database")
+      return table
+
+    # This is the common in-process path: search, witness postprocessing, and MP export all
+    # rebuild their views of the same finite DB.  Do not rescan thousands of certified pairs.
+    if self._handover_signature == signature and self._handover_models == models:
+      table.handover_physics = self._handover_compat
+      table.handover_models = models
+      table.handover_signature = signature
+      print("[grasp-physics/handover] using a-priori in-memory certificate")
+      return table
+
+    # A genuinely different finite DB invalidates the complete-universe interpretation of
+    # absent pairs.  Start one new a-priori certification, before search begins.
+    self._handover_compat = {}
+    self._handover_models = models
+    self._handover_signature = None
     table.handover_physics = self._handover_compat
-    if self._handover_models is None:
-      self._handover_models = {
-          r: os.path.realpath(self.gripper_paths[r]) for r in two_finger}
     table.handover_models = self._handover_models
     if len(two_finger) < 2:
+      self._handover_signature = signature
+      table.handover_signature = signature
       print("[grasp-physics/handover] skipped: fewer than two articulated two-finger hands")
       return table
 
@@ -536,6 +647,8 @@ class GraspPhysicsContext:
     print(f"[grasp-physics/handover] eager table complete: {stats['pairs']} new / "
           f"{stats['cached']} cached pairs in {time.perf_counter() - start:.1f}s; search "
           f"performs cached lookups only{reasons}.")
+    self._handover_signature = signature
+    table.handover_signature = signature
     return table
 
 

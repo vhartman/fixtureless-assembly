@@ -192,6 +192,10 @@ class RunConfig:
   grasp_sampler: bool = False
   grasp_sampler_keep: int = 20
   grasp_sampler_candidates: int = 200
+  # Expensive diagnostic/selector mode: scene-classify every raw proposal instead of the
+  # historical geometry-only 32/64-row probe.
+  grasp_sampler_full_probe: bool = False
+  grasp_sampler_roll_refine: bool = False
   grasp_sampler_seed: int = 0
   grasp_sampler_db_hash: Optional[str] = None
   grasp_refine: bool = False

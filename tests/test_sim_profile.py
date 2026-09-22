@@ -1,4 +1,4 @@
-"""Named sim reproduction profiles are thin, reversible CLI defaults."""
+"""The simulation CLI has one maintained execution contract and one timing choice."""
 import json
 import copy
 from types import SimpleNamespace
@@ -10,23 +10,17 @@ import sim
 import wrench
 
 
-def test_standard_sim_profile_is_reversible_by_explicit_flags():
+def test_lockstep_is_one_coherent_timing_choice():
   a = sim.parse_args([
-      "run", "plan.json", "--sim-profile", "standard",
-      "--no-actuated", "--no-skill-servo", "--no-arm-arm-contacts",
-      "--no-spline", "--no-phase-schedule", "--no-phase-smooth", "--no-phase-batch",
-      "--no-servo-pick",
-      "--no-servo-place-seat",
-      "--no-servo-torque-guard", "--no-path-preflight", "--no-force-limits",
-      "--no-require-mp-path", "--no-require-success",
-      "--corridor", "--joint-rate", "0.5", "--mass-scale", "0.25",
+      "run", "plan.json", "--execution-timing", "lockstep",
+      "--joint-rate", "0.5", "--mass-scale", "0.25",
   ])
-  assert not a.actuated and not a.skill_servo and not a.arm_arm_contacts and not a.servo_pick
-  assert not a.servo_place_seat
-  assert not a.spline and not a.phase_schedule and not a.phase_smooth and not a.phase_batch
-  assert a.servo_torque_guard is None and not a.path_preflight and not a.force_limits
-  assert not a.require_mp_path and not a.require_success
-  assert a.corridor and a.joint_rate == 0.5 and a.mass_scale == 0.25
+  assert a.execution_timing == "lockstep"
+  assert not a.phase_schedule and not a.phase_smooth and not a.phase_batch
+  assert a.actuated and a.skill_servo and a.servo_pick and a.servo_place_seat
+  assert not a.spline and a.path_preflight and a.force_limits
+  assert a.require_mp_path and a.require_success
+  assert a.joint_rate == 0.5 and a.mass_scale == 0.25
 
 
 def test_kinematic_arm_reasserts_visual_gripper_mimic_joints(monkeypatch):
@@ -60,12 +54,29 @@ def test_kinematic_arm_reasserts_visual_gripper_mimic_joints(monkeypatch):
 
 
 def test_standard_profile_refuses_an_implicit_motion_plan_before_scene_build():
-  a = sim.parse_args(["run", "plan.json", "--sim-profile", "standard"])
+  a = sim.parse_args(["run", "plan.json"])
   assert a.servo_place_seat
   assert not a.spline
+  assert a.execution_timing == "phase"
   assert a.phase_schedule and a.phase_smooth and a.phase_batch
   with pytest.raises(SystemExit, match="require-mp-path"):
     sim._cli_run(a)
+
+
+def test_removed_sim_profile_selector_is_rejected():
+  with pytest.raises(SystemExit):
+    sim.parse_args(["run", "plan.json", "--sim-profile", "standard"])
+
+
+def test_release_reroot_to_continuing_holder_is_not_a_new_grasp():
+  """A gripper parent on release is kinematic re-rooting, not a finger-close event."""
+  plan = [("pick", "a1", "obj_0", 0),
+          ("handover", "a2", "obj_0", 1),
+          ("release", "a1", "obj_0")]
+  assert sim._action_acquires_grasp(plan, (0, True))
+  assert sim._action_acquires_grasp(plan, (1, True))
+  assert not sim._action_acquires_grasp(plan, (2, True))
+  assert not sim._action_acquires_grasp(plan, None)
 
 
 def test_exact_grasp_target_uses_authored_relation_not_witness_fk(monkeypatch):
@@ -106,8 +117,8 @@ def test_process_noise_realizations_cover_exact_box_corners_and_seeded_samples()
 
 
 def test_low_table_friction_scales_all_mujoco_contact_coefficients():
-  assert sim._contact_friction(0.5, table=True) == "0.5 0.005 0.002"
-  assert sim._contact_friction(0.02, table=True) == "0.02 0.0002 8e-05"
+  assert sim._contact_friction(0.5, table=True) == "0.5 0.005 0.008"
+  assert sim._contact_friction(0.02, table=True) == "0.02 0.0002 0.00032"
   assert sim._contact_friction(0.0, table=True) == "0 0 0"
 
 

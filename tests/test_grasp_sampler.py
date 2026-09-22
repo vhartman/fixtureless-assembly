@@ -26,6 +26,7 @@ MODE = {"seed": 3, "candidates": 64, "keep": 8}
 def _clean_sampler_state():
   yield
   S.set_grasp_closure_check(False)
+  P.set_grasp_physics_check(False)
   P.set_component_grasp_keep(0)
   P.clear_sampled_scene_ctx()
   P.set_sampled_grasps(None)
@@ -281,6 +282,54 @@ def test_sampler_flag_guards():
     main.run(RunConfig(grasp_sampler_scenes=True, solve=False, view=False))
   with pytest.raises(SystemExit):
     main.run(RunConfig(grasp_widen=True, solve=False, view=False))
+  with pytest.raises(SystemExit, match="grasp-sampler"):
+    main.run(RunConfig(grasp_physics_check=True, solve=False, view=False))
+  with pytest.raises(SystemExit, match="grasp-sampler-scenes"):
+    main.run(RunConfig(grasp_sampler=True, grasp_physics_check=True,
+                       solve=False, view=False))
+  with pytest.raises(SystemExit, match="non-negative"):
+    main.run(RunConfig(grasp_physics_force=-1.0, solve=False, view=False))
+
+
+def test_handover_physics_table_is_an_ordered_cached_gate_for_identical_hands():
+  table = P.GraspTable()
+  table.handover_models = {"a1": "robotiq", "a2": "robotiq"}
+  table.handover_physics = {
+      (("obj_0",), "robotiq", ("obj_0", 1),
+       "robotiq", ("obj_0", 4)): True,
+  }
+  assert table.handover_usable(
+      ("obj_0",), "a1", "obj_0", 1, "a2", "obj_0", 4)
+  assert not table.handover_usable(
+      ("obj_0",), "a2", "obj_0", 4, "a1", "obj_0", 1)
+  assert not table.handover_usable(
+      ("obj_0",), "a1", "obj_0", 1, "a2", "obj_0", 5)
+
+
+def test_apriori_handover_certificate_skips_all_physics_on_reuse(tmp_path):
+  from grasp_physics import GraspPhysicsContext
+
+  hand = tmp_path / "hand.g"
+  hand.write_text("# stable model identity\n")
+  paths = {"a1": str(hand), "a2": str(hand)}
+  table = P.GraspTable({
+      ("obj_0",): [("obj_0", 1, np.zeros(7)), ("obj_0", 2, np.ones(7))]})
+  ctx = GraspPhysicsContext(None, None, None, ("a1", "a2"),
+                            {"two_finger": "a1"}, gripper_paths=paths)
+  models = {r: ctx._model_key(path) for r, path in paths.items()}
+  signature = ctx._handover_table_signature(table, models)
+  ctx.import_handovers({
+      "contract": "handover-physics-v1", "force_n": 10.0,
+      "signature": signature, "models": models,
+      "accepted": [[list(("obj_0",)), models["a1"], "obj_0", 1,
+                    models["a2"], "obj_0", 2]],
+  })
+  ctx.check = lambda *_args, **_kw: (_ for _ in ()).throw(
+      AssertionError("a-priori reuse entered unary physics"))
+  out = ctx.precompute_handovers(table)
+  assert out.handover_signature == signature
+  assert out.handover_usable(("obj_0",), "a1", "obj_0", 1,
+                             "a2", "obj_0", 2)
 
 
 def test_sampler_contains_conventional_grasps_and_refines_by_prefix():
@@ -334,6 +383,28 @@ def test_strict_sampler_filters_the_same_raw_candidate_cloud():
 
   assert strict_base == loose_base
   assert strict_cache != loose_cache
+
+
+def test_candidate_count_extends_one_nested_raw_stream():
+  """Increasing proposal effort appends contacts instead of resampling old ones."""
+  mode = {"seed": 3, "keep": 20, "margin": 0.008,
+          "pad_support": 0.75, "wrap": 0.015}
+  mesh = P._spec_mesh(CUBE)
+  P.set_sampled_grasps({**mode, "candidates": 32})
+  base32, cache32 = P._sampled_keys(CUBE, 0.04)
+  import zlib
+  p32, f32 = P._sample_surface_deterministic(
+      mesh, 32, zlib.crc32(repr(base32).encode()))
+
+  P.set_sampled_grasps({**mode, "candidates": 96})
+  base96, cache96 = P._sampled_keys(CUBE, 0.04)
+  p96, f96 = P._sample_surface_deterministic(
+      mesh, 96, zlib.crc32(repr(base96).encode()))
+
+  assert base32 == base96
+  assert cache32 != cache96
+  np.testing.assert_array_equal(p32, p96[:32])
+  np.testing.assert_array_equal(f32, f96[:32])
 
 
 def test_closure_ranking_prioritizes_certified_canonical_rows_without_deleting_fallbacks():
@@ -407,7 +478,7 @@ def test_scene_masks_are_per_gripper_kind():
   for q, m in zip(poses, meta):
     for kind, roles in m["scene_by_kind"].items():
       for role in roles:
-        state = ctx["s0"] if role == "pick" else ctx["s_full"]
+        state = ctx["role_states"]["obj_1"][role]
         assert ctx["checker"].pose_collision_free(
             state, "obj_1", q, asm, robot=reps[kind])
 
@@ -514,12 +585,13 @@ def test_scene_aware_roles_are_certified_per_part_and_gripper():
   assert len(poses) == len(meta) == 12
   assert all("sets" in m and "scene_by_kind" in m for m in meta)
   roles = {role for m in meta for role in m["sets"]}
-  assert roles == {"pick", "assemble"}
+  assert {"pick", "assemble", "support"}.issubset(roles)
+  assert any(role.startswith("component:") for role in roles)
   ctx = P._SAMPLED_SCENE_CTX
   for pose, m in zip(poses, meta):
     for kind, kind_roles in m["scene_by_kind"].items():
       for role in kind_roles:
-        state = ctx["s0"] if role == "pick" else ctx["s_full"]
+        state = ctx["role_states"]["obj_1"][role]
         assert ctx["checker"].pose_collision_free(
             state, "obj_1", pose, asm, robot=ctx["kind_robot"][kind])
   # identical shape, different instance: its own DB (same raw cloud, own filter)
@@ -531,6 +603,20 @@ def test_scene_aware_roles_are_certified_per_part_and_gripper():
   # a part-less query under the scene ctx must fail loudly, never silently unfiltered
   with pytest.raises(ValueError):
     P.part_grasp_poses(spec)
+
+
+def test_assemble_role_scene_contains_only_mandatory_predecessors():
+  import env
+  from problem import add_disassembled_obj, get_initial_state, make_assembly
+  asm = make_assembly("cross", 3)
+  C = add_disassembled_obj(
+      env.make_four_robot_env(num_robots=1, floating_ee=True, vacuum=False),
+      asm, spacing=0.2)
+  state = P._assembly_role_state(asm, get_initial_state(C, asm), "obj_1")
+  poses = P._state_part_poses(state, asm, lift=0.0)
+  assert np.linalg.norm(poses["obj_0"][:2]) < 10.0
+  assert np.linalg.norm(poses["obj_1"][:2]) < 10.0
+  assert poses["obj_2"][0] > 900.0
 
 
 def test_scene_aware_off_is_byte_identical():
@@ -626,6 +712,78 @@ def test_scene_reservation_master_is_append_only(monkeypatch):
   assert len(k2) == 2 and len(k4) == 4
   for old, new in zip(k2, k4):
     np.testing.assert_array_equal(old[0][0], new[0][0])
+
+
+def test_full_probe_recovers_role_candidate_after_historical_probe_cap(monkeypatch):
+  """A semantic certificate must not be hidden forever by the pre-label FPS probe."""
+  spec, part, _suction, antip, ctx = _synthetic_scene_reservation_input(monkeypatch)
+
+  def row(i):
+    return (np.array([0.4 + 0.001 * i, 0.0, 0.08, 1.0, 0.0, 0.0, 0.0]),
+            "flat", 0.05, np.array([float(i), 0.0, 0.0, 0.0, 0.0, 0.0]),
+            0.02, 1.0, "suction", False)
+
+  raw = [row(i) for i in range(40)]
+  target_x = float(P._fps_row_order(raw)[-1][0][0])       # certainly outside prefix 32
+
+  def only_last(_state, _part, pose, _assembly, robot=None):
+    del robot
+    return abs(float(np.asarray(pose)[0]) - target_x) < 1e-9
+  monkeypatch.setattr(ctx["checker"], "pose_collision_free", only_last)
+
+  P.set_sampled_grasps({"seed": 0, "candidates": 40, "keep": 2,
+                        "full_probe": False})
+  capped = P._sampled_master_rows(spec, 0.01, part, raw, antip, 2, ctx, None)
+  assert all(not any(m[1]["scene_by_kind"].values()) for m in capped)
+
+  P.set_sampled_grasps({"seed": 0, "candidates": 40, "keep": 2,
+                        "full_probe": True})
+  full = P._sampled_master_rows(spec, 0.01, part, raw, antip, 2, ctx, None)
+  assert any({"pick", "assemble"}.issubset(
+      meta["scene_by_kind"]["two_finger"]) for _row, meta in full)
+  audit = P.sampled_grasp_selection_diagnostics(part)
+  assert audit["raw"] == audit["probe"] == 40
+  assert audit["evaluated_coverage"]["two_finger"]["both"] == 1
+
+
+def test_full_probe_reserves_a_complete_table_regrasp_route(monkeypatch):
+  spec, part, suction, antip, ctx = _synthetic_scene_reservation_input(monkeypatch)
+  rest = object()
+  ctx["placement_states"] = {part: {"place:5": rest}}
+  old = ctx["checker"].pose_collision_free
+
+  def endpoints_and_rest(state, target, pose, assembly, robot=None):
+    if state is rest and float(np.asarray(pose)[0]) in (1.0, 2.0):
+      return True
+    return old(state, target, pose, assembly, robot=robot)
+
+  monkeypatch.setattr(ctx["checker"], "pose_collision_free", endpoints_and_rest)
+  P.set_sampled_grasps({"seed": 0, "candidates": 8, "keep": 2,
+                        "full_probe": True})
+  rows = P._sampled_master_rows(spec, 0.01, part, suction, antip, 2, ctx, None)
+  xs = {float(row[0][0]) for row, _meta in rows}
+  assert xs == {1.0, 2.0}
+  assert P.sampled_grasp_selection_diagnostics(part)["table_route_kinds"] == (
+      "two_finger",)
+
+
+def test_full_probe_reserves_a_directional_handover_route(monkeypatch):
+  spec, part, suction, antip, ctx = _synthetic_scene_reservation_input(monkeypatch)
+  ctx["placement_states"] = {part: {}}
+  ctx["robots"] = ("a1", "a2")
+  ctx["checker"]._robot_kind = {"a1": "two_finger", "a2": "two_finger"}
+
+  def pair(_state, _part, give, receive, _assembly, giver, receiver):
+    return (giver != receiver and abs(float(np.asarray(give)[0]) - 1.0) < 1e-9
+            and abs(float(np.asarray(receive)[0]) - 2.0) < 1e-9)
+
+  ctx["checker"].pose_pair_grasp_free = pair
+  P.set_sampled_grasps({"seed": 0, "candidates": 8, "keep": 2,
+                        "full_probe": True})
+  rows = P._sampled_master_rows(spec, 0.01, part, suction, antip, 2, ctx, None)
+  assert {float(row[0][0]) for row, _meta in rows} == {1.0, 2.0}
+  assert P.sampled_grasp_selection_diagnostics(part)["handover_route_kinds"] == (
+      ("two_finger", "two_finger"),)
 
 
 def test_closure_invalid_canonical_rows_remain_last_resort(monkeypatch):

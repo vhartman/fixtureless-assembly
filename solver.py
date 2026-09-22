@@ -50,6 +50,19 @@ _ASSEMBLE_POS_BIAS_TARGET = (0.0, 0.0, 0.5)
 _ASSEMBLE_POS_BIAS_W = 1e0
 
 
+def _penetrations_involving_robots(collisions, robots):
+  """Return penetrating collision rows with at least one robot-owned frame.
+
+  The EXIT contract certifies the collective parked *robot* configuration.  The initial
+  loose-part layout has its own validation path and must not make that robot-model contract
+  report a fictitious EXIT failure (in particular while a random layout is being built).
+  """
+  prefixes = tuple(str(r) + "_" for r in robots)
+  return sorted((str(a), str(b), float(d)) for a, b, d in collisions
+                if float(d) < 0.0
+                and (str(a).startswith(prefixes) or str(b).startswith(prefixes)))
+
+
 def _canonical_seed_key(value):
   """Convert an IK query key to a hash/order-independent immutable representation.
 
@@ -280,6 +293,8 @@ class CollisionChecker:
     self._closure_seen_hashes = set()
     self._closure_results = {}                            # pose-valued sampler diagnostics
     self.closure_rejects = {}
+    self.action_rejects = {}                             # cheap-gate stage instrumentation
+    self.action_reject_examples = {}
     # PERSISTENT scene reuse (2026-07-17): rai's stale-broadphase problem is solved by a
     # global C.setJointState(C.getJointState()) round-trip before computeCollisions -- it
     # refreshes ALL frame writes (even plain setPosition on jointless frames; measured
@@ -350,7 +365,9 @@ class CollisionChecker:
 
     part_poses = _state_part_poses(state, assembly, lift=0.0)
     for k, group in enumerate(state.subassemblies()):
-      held = any(c[0] == "grasp" for p in group for c in state.supports.get(p, ()))
+      held = (any(state.parent.get(p, (None,))[0] == "gripper" for p in group)
+              or any(c[0] == "grasp" for p in group
+                     for c in state.supports.get(p, ())))
       on_table = any(("table",) in state.supports.get(p, ()) for p in group)
       if held and not on_table:                      # pose is free -> park it (own offset
         off = np.array([0.0, -1000.0 - 50.0 * k, 5.0])   # per group; clear of the EE park)
@@ -574,6 +591,43 @@ class CollisionChecker:
     extra = (("pose", gpart, grasp_pose_7) if robot is None
              else ("pose", robot, gpart, grasp_pose_7))
     return self._check(state, assembly, extra_grasps=[extra], note=note)
+
+  def pose_pair_grasp_free(self, state, gpart, first_pose_7, second_pose_7, assembly,
+                           first_robot, second_robot):
+    """Free-space coexistence + virtual-close certificate for two explicit sampler poses.
+
+    Candidate ids do not exist while the sampler is being built.  This pose-valued query is
+    the exact counterpart of the search's add-grasp/handover cheap gate: the held singleton is
+    pose-free and therefore parked away from the table/clutter, while both actual hand models
+    are placed relative to it.  It is used only to preserve a possible transition during
+    downsampling; later state, IK, and physics checks remain authoritative.
+    """
+    if first_robot == second_robot:
+      return False
+    free = State(state.parent, state.grasp, state.place, state.supports, state.poses)
+    free.parent[gpart] = ("gripper", first_robot)
+    free.place.pop(gpart, None)
+    free.supports[gpart] = frozenset()                    # no id-bearing grasp exists yet
+    extras = [("pose", first_robot, gpart, np.asarray(first_pose_7, dtype=float)),
+              ("pose", second_robot, gpart, np.asarray(second_pose_7, dtype=float))]
+    if not self._check(free, assembly, extra_grasps=extras,
+                       note="sampled free-space handover pair"):
+      return False
+    if not self.closure_check:
+      return True
+    C_col, owners = self._scene_for(
+        free, assembly, extra_grasps=extras, return_assignments=True)
+    first = owners.get(first_robot)
+    second = owners.get(second_robot)
+    if first is None or second is None:
+      return False
+    # Direction matters: the first/giver is already closed before the receiver approaches.
+    # Certify only the receiver's sweep with that existing closed hand, exactly like the
+    # forward add_grasp gate. Requiring the impossible reverse acquisition too would reject a
+    # perfectly usable directional handover.
+    receiver = _certify_closure(C_col, second[0], gpart,
+                                existing_closures=[(first[0], gpart)])
+    return bool(receiver.feasible)
 
   def pose_grasp_closure_free(self, state, gpart, grasp_pose_7, assembly, robot):
     """Virtual-close certificate for a sampler candidate before grasp ids exist.
@@ -1194,13 +1248,12 @@ class RobotIK:
     if openarms:
       self.C.setJointState(q)
       self.C.computeCollisions()
-      pen = float(self.C.getCollisionsTotalPenetration())
+      robot_pairs = _penetrations_involving_robots(self.C.getCollisions(), self.robots)
+      pen = float(sum(-d for _a, _b, d in robot_pairs))
       if pen > 1e-6:
-        pairs = sorted((str(a), str(b), float(d)) for a, b, d in self.C.getCollisions()
-                       if float(d) < 0.0)[:3]
         raise RuntimeError(
             f"robot model contract: OpenArm EXIT has {pen*1000:.3f}mm accumulated "
-            f"penetration ({pairs}); provide a collision-free collective exit pose")
+            f"penetration ({robot_pairs[:3]}); provide a collision-free collective exit pose")
 
   def holders(self, state):
     # {robot: (grasped_part, grasp_id)} -- who holds what, at which grasp, in this state.
@@ -4879,10 +4932,18 @@ def cheap_feasible(action, s0, s1, assembly, checker):
       g = _opening_grasp(action, s0)                       # EE at the about-to-open grasp,
       extra = (g,) if g is not None else ()                # part at its PLACED pose
     if not checker._check(s1, assembly, extra_grasps=extra, note=f"result of {action}"):
+      key = (action[0], "result-collision", action[2] if len(action) > 2 else None)
+      checker.action_rejects[key] = checker.action_rejects.get(key, 0) + 1
+      if (os.environ.get("FILL_SEARCH_PROFILE")
+          and key not in checker.action_reject_examples):
+        checker.action_reject_examples[key] = tuple(
+            checker.penetrating_pairs(s1, assembly, extra_grasps=extra)[:4])
       return False
   if action[0] in _GRASP_ACTIONS and not checker.pick_collision_free(
       s0, action[2], action[3], assembly, note=f"grasp candidate of {action}",
       robot=action[1]):
+    key = (action[0], "open-hand-collision", action[2] if len(action) > 2 else None)
+    checker.action_rejects[key] = checker.action_rejects.get(key, 0) + 1
     import os as _os
     if _os.environ.get("MILESTONE_DEBUG"):
       try:
@@ -4895,11 +4956,15 @@ def cheap_feasible(action, s0, s1, assembly, checker):
     # This is deliberately a separate cheap layer: the fixed-open proxy can be clear while a
     # receiver's fingers would have to sweep through the current holder during a handover.
     # Reject before RobotIK/KOMO so another grasp/action can be considered normally.
+    key = (action[0], "closure", action[2] if len(action) > 2 else None)
+    checker.action_rejects[key] = checker.action_rejects.get(key, 0) + 1
     return False
   if action[0] == "assemble" and not checker.held_closures_free(s1, assembly):
     # The holder was certified when it acquired the part, but assembly changes the rigid
     # neighbourhood around that unchanged grasp.  Certify the actual closed fingers against
     # the resulting component before paying for arm IK.
+    key = (action[0], "held-closure", action[2] if len(action) > 2 else None)
+    checker.action_rejects[key] = checker.action_rejects.get(key, 0) + 1
     return False
   if action[0] == "inhand_reorient":
     # v1 gate: the RESULT state (part held at its NEW grasp, everything else unchanged) must
@@ -9695,7 +9760,11 @@ def _search_context(C, assembly, robots, build_table=True):
     return checker, None
   table = cached_table()
   if table is not None:
-    return checker, with_handover_physics(table)
+    table = with_handover_physics(table)
+    # Schema-1 shared databases did not contain the eager handover certificate.  Upgrade the
+    # same immutable artifact after the one a-priori build so sibling benchmark/search
+    # processes never repeat physics.
+    return checker, persist_table(table)
   per_kind = {k: precompute_grasps(assembly, gripper_path=ee_path[k]) for k in distinct}
   rolls = _problem._ROLLS_PER_FACE
   dense = _problem._DENSE_GRASPS
@@ -11127,6 +11196,7 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
   # IK-infeasible for real arms on the chair's back+posts module: every module fill died.
   relevant = set(ideal) | {p}
   excluded_end_states = frozenset(excluded_end_states or ())
+  _cheap_stage0 = dict(getattr(checker, "action_rejects", {}))
 
   # A1 INSTRUMENTATION: per-fill bind deltas -- which fill burns the bind wall time, on what.
   _fp0 = None
@@ -11168,6 +11238,25 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
             f"{robot}={pick_kept_robot.get(robot, 0)}/{count}"
             for robot, count in sorted(pick_raw_robot.items()))
         print(f"[fill-succ-prof {tag}] pick successors kept/raw by robot: {detail}")
+    if _cheap_prof is not None:
+      accepted = ", ".join(f"{kind}={count}" for kind, count in
+                           _cheap_prof["accepted"].most_common()) or "none"
+      rejected = ", ".join(f"{kind}={count}" for kind, count in
+                           _cheap_prof["rejected"].most_common()) or "none"
+      print(f"[fill-cheap-prof {tag}] accepted: {accepted}; rejected: {rejected}")
+      stage_rejects = []
+      for key, count in sorted(getattr(checker, "action_rejects", {}).items()):
+        delta = int(count) - int(_cheap_stage0.get(key, 0))
+        if delta:
+          stage_rejects.append(f"{key[0]}/{key[1]}/{key[2]}={delta}")
+      print(f"[fill-cheap-prof {tag}] rejection stages: "
+            f"{', '.join(stage_rejects) or 'none'}")
+      examples = []
+      for key, rows in sorted(getattr(checker, "action_reject_examples", {}).items()):
+        if key[2] == p and rows:
+          examples.append(f"{key[0]}/{key[1]}={rows!r}")
+      if examples:
+        print(f"[fill-cheap-prof {tag}] representative pairs: {'; '.join(examples)}")
     if robot_ik is None or _fp0 is None:
       return
     pr, (f0, fba, fgates, fpairs, fpick) = robot_ik.prof, _fp0
@@ -11253,8 +11342,10 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
     from collections import Counter as _Counter
     _succ_prof = {"raw": _Counter(), "kept": _Counter(), "rejects": _Counter(),
                   "pick_raw_robot": _Counter(), "pick_kept_robot": _Counter()}
+    _cheap_prof = {"accepted": _Counter(), "rejected": _Counter()}
   else:
     _succ_prof = None
+    _cheap_prof = None
 
   def _comps(s):
     # (main, settle) components; identical when settle_ref is None/base (byte-identical
@@ -11270,6 +11361,44 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
                 for c in s.supports.get(q, ()) if c[0] == "grasp")
     holders = sum(1 for q in mod for c in s.supports.get(q, ()) if c[0] == "grasp")
     return loose, holders
+
+  def _table_interface_blocked(s):
+    """Whether p's target currently rests on a table face that occludes its mate.
+
+    This is an exact property already enforced by ``assembles``.  While true and p is not
+    mated, at least one additional action must lift or re-place the target component before
+    the ordinary pick/mate count can finish the fill.
+    """
+    rel = assembly.relative_pose(p)
+    if rel is None or _part_mated(s, p):
+      return False
+    onto = rel[0]
+    target = next((g for g in s.subassemblies() if onto in g), None)
+    if target is None or not _group_is_on_table(s, target):
+      return False
+    return not _on_table_mateable_cached(assembly, p, _placement_face(s, target))
+
+  def _remaining_interface_blocked_on_table(s):
+    """Whether this boundary's table rest occludes any later authored mate.
+
+    This is a lower bound on downstream manipulation, not a rejection: while the same rigid
+    component remains on that face, the exact successor gate cannot create the mate, so at
+    least one lift/re-place is unavoidable.  The greedy local fill may use that fact to prefer
+    an equally short held-through boundary.  Exact/complete passes retain the unmodified
+    action space and can still choose the table rest when it is globally useful.
+    """
+    main, _mod = _comps(s)
+    if not main or not _group_is_on_table(s, main):
+      return False
+    face = _placement_face(s, main)
+    for future in assembly.objects:
+      if future in main or _part_mated(s, future):
+        continue
+      rel = assembly.relative_pose(future)
+      if rel is not None and rel[0] in main \
+          and not _on_table_mateable_cached(assembly, future, face):
+        return True
+    return False
 
   def goal_fn(s):
     # p joined, nothing loose left in hand, and the settling component down to <=1 holder
@@ -11300,7 +11429,16 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
     else:
       left = 2
     loose, holders = _loose_and_holders(s, exclude=p)
-    hv = left + loose + max(0, holders - 1)
+    # If the target's current table face occludes the authored mate, a target lift/re-place
+    # is mandatory and cannot be the incoming part's pick or assemble action.  Counting that
+    # one independent action removes a large flat shell without choosing how it is achieved.
+    hv = left + loose + max(0, holders - 1) + int(_table_interface_blocked(s))
+    if fill_greedy:
+      # One admissible unit of downstream work breaks ties between locally settled
+      # boundaries.  Without it a PLACE that geometrically seals a later interface looks
+      # identical to keeping the assembly held, and milestone repair has to rediscover the
+      # avoidable lift only after the suffix fails.
+      hv += int(_remaining_interface_blocked_on_table(s))
     if fill_h is not None:
       # Goal-conditioned local PDB. A miss is UNKNOWN, never a pruning certificate: retain
       # the counting lower bound so an imperfect relaxation cannot remove a concrete route.
@@ -11419,6 +11557,96 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
         if a[0] == "pick":
           _succ_prof["pick_kept_robot"][a[1]] += 1
       yield a, ns
+
+  def _diagnose_reserved_routes():
+    """Check sampler-reserved 2-grasp routes in this fill's exact cheap domain.
+
+    This is deliberately opt-in instrumentation, not a search shortcut.  It bridges the
+    sampler audit (which reasons over endpoint scenes) and the concrete local-fill graph so
+    we can tell whether a retained route survives inherited holders and the exact assembled
+    component geometry.
+    """
+    if not _os.environ.get("MILESTONE_ROUTE_DEBUG"):
+      return
+    diag = _problem.sampled_grasp_selection_diagnostics(p) or {}
+    routes = [row for row in diag.get("handover_routes", ())
+              if row[2] is not None and row[3] is not None]
+    if not routes:
+      print(f"[fill-route {p}] no selected handover route", flush=True)
+      return
+
+    # Existing target holders are optional supports.  Enumerate the tiny release closure so
+    # the diagnostic does not falsely blame a route merely because the previous milestone
+    # retained one hand.  Every edge still comes from the current concrete successor set.
+    release_states, seen_release, release_i = [start], {start}, 0
+    while release_i < len(release_states):
+      s = release_states[release_i]
+      release_i += 1
+      for a, ns in succ_fn(s):
+        if a[0] != "release" or ns in seen_release:
+          continue
+        if cheap_feasible(a, s, ns, assembly, checker):
+          seen_release.add(ns)
+          release_states.append(ns)
+
+    for give_kind, recv_kind, give_gid, recv_gid in routes:
+      npick = nhandover = nassemble = 0
+      first_assemble_failure = None
+      first_missing_assemble = None
+      for s0 in release_states:
+        for ap, sp in succ_fn(s0):
+          if (ap[0] != "pick" or ap[2] != p or ap[3] != give_gid
+              or not cheap_feasible(ap, s0, sp, assembly, checker)):
+            continue
+          npick += 1
+          for ah, sh in succ_fn(sp):
+            if (ah[0] != "handover" or ah[2] != p or ah[3] != recv_gid
+                or not cheap_feasible(ah, sp, sh, assembly, checker)):
+              continue
+            nhandover += 1
+            next_rows = list(succ_fn(sh))
+            if (first_missing_assemble is None
+                and not any(aa[0] == "assemble" and aa[2] == p
+                            for aa, _sa in next_rows)):
+              group = next((g for g in sh.subassemblies() if p in g), frozenset())
+              onto = assembly.relative_pose(p)[0]
+              target = next((g for g in sh.subassemblies() if onto in g), frozenset())
+              face = _placement_face(sh, target) if target else None
+              first_missing_assemble = {
+                  "group": tuple(sorted(group)),
+                  "roots": tuple(q for q in group
+                                   if sh.parent.get(q, (None,))[0] == "gripper"),
+                  "external": tuple(q for q in group
+                                      if assembly.relative_pose(q) is not None
+                                      and assembly.relative_pose(q)[0] not in group),
+                  "target": tuple(sorted(target)),
+                  "target_supported": bool(target and sh.is_supported(
+                      target, assembly, gripper_kind)),
+                  "face": face,
+                  "on_table_mateable": (None if not target else bool(
+                      _on_table_mateable_cached(assembly, p, face))),
+              }
+            for aa, sa in next_rows:
+              if aa[0] != "assemble" or aa[2] != p:
+                continue
+              if cheap_feasible(aa, sh, sa, assembly, checker):
+                nassemble += 1
+              elif first_assemble_failure is None:
+                geom = checker._check(sa, assembly, note="reserved-route diagnostic")
+                first_assemble_failure = {
+                    "action": aa, "geometry": bool(geom),
+                    "pairs": tuple(checker.penetrating_pairs(sa, assembly)[:4]),
+                    "closures": bool(checker.held_closures_free(sa, assembly)),
+                }
+      print(f"[fill-route {p}] {give_kind}/g{give_gid} -> "
+            f"{recv_kind}/g{recv_gid}: releases={len(release_states)} "
+            f"pick={npick} handover={nhandover} assemble={nassemble}"
+            + (f" first-failure={first_assemble_failure!r}"
+               if first_assemble_failure is not None else "")
+            + (f" no-assemble={first_missing_assemble!r}"
+               if first_missing_assemble is not None else ""), flush=True)
+
+  _diagnose_reserved_routes()
 
   def _diagnose_reference_rank():
     """Run the real optimistic local queue against this fill's demonstrated segment.
@@ -11809,6 +12037,8 @@ def _add_one_part(start, p, ideal, assembly, robots, checker, grasp_table, robot
 
     def _open_cheap_gate(prev, act, ns):
       ok = cheap_feasible(act, prev, ns, assembly, checker)
+      if _cheap_prof is not None:
+        _cheap_prof["accepted" if ok else "rejected"][act[0]] += 1
       if not ok:
         cheap_bl.add((prev, act))                         # dead forever (cheap layer is sound)
       return ok
@@ -12553,7 +12783,8 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
                                            grasp_initial_keep=20,
                                            grasp_widen_batch=8,
                                            grasp_widen_max=96,
-                                           placement_yaw_widening=False):
+                                           placement_yaw_widening=False,
+                                           _compact_fill_session=False):
   """MILESTONE (Dogar-style, abstraction-guided) planner. Two levels:
 
     LEVEL 1: the assembly SEQUENCE. The labeled abstraction's backward Dijkstra (the same
@@ -13266,6 +13497,23 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
           print(f"[fill-policy-widen {q}] {msg}; continuing ordinary widening.", flush=True)
         return None, None, attempted
 
+    if _compact_fill_session:
+      # Global dovetailing over milestone boundaries.  First give every concrete settled
+      # predecessor the same compact local alphabet (current grasps, historical yaw, local
+      # manipulation scope, and only unbraced/PDB-certified-brace phases). A failure here is
+      # NOT a no-plan result: the public iterator below restarts once with the complete
+      # historical per-fill yaw/brace/scope schedule. This changes only search order, but
+      # prevents one geometrically bad checkpoint from consuming every relaxation before the
+      # already-supported K-boundary mechanism gets to try its siblings.
+      if verbose:
+        print(f"[fill-dovetail {q}] compact boundary probe: local scope, historical yaw, "
+              "and constrained brace family; full per-fill widening is deferred to the "
+              "completion session.", flush=True)
+      return attempt(
+          early_phases, scope_passes[:1],
+          dict(grasp_caps) if grasp_local_widen else None,
+          one_open_epoch=True)
+
     if not grasp_local_widen:
       if not placement_yaw_widening:
         return attempt(phases, scope_passes)
@@ -13608,6 +13856,8 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
           print(f"[milestones] added {what} in {len(sub)} actions "
                 f"({time.perf_counter() - tq:.1f}s, {len(plan)} total; boundary "
                 f"{len(excluded) + 1}/{milestone_boundaries})")
+          if _os.environ.get("MILESTONE_TRACE_ACTIONS"):
+            print(f"[mile-debug] committed {what}: {sub!r}", flush=True)
         break
       blacklist.add(decision)
       repairs += 1
@@ -13619,7 +13869,7 @@ def _iter_assembly_problem_milestones_once(C, assembly, robots=None, verbose=Tru
         if verbose:
           print("[milestones] repair budget exhausted")
         return None
-    if fill_window >= 2 and not progressed:
+    if fill_window >= 2 and not progressed and not _compact_fill_session:
       # WIDTH-k WINDOWS (adaptive-width escalation): every single-part candidate failed at
       # this node -- before backjumping, try adding k parts in ONE joint fill (see
       # _add_parts), k escalating 2..fill_window only as each smaller width exhausts.
@@ -13774,6 +14024,27 @@ def iter_assembly_problem_milestones(C, assembly, robots=None, verbose=True, rob
       grasp_widen_batch=grasp_widen_batch, grasp_widen_max=grasp_widen_max,
       placement_yaw_widening=placement_yaw_widening)
   try:
+    # Search all milestone checkpoint alternatives under the same compact local action
+    # alphabet before spending the full yaw/brace/scope completion effort on any one of
+    # them. This is ordinary nested action-set dovetailing: the second session below is the
+    # unchanged complete per-fill schedule, and both sessions share deterministic IK
+    # witnesses/open effort through ``robot_ik``.
+    if placement_yaw_widening or fill_scope_widening or bracing:
+      if verbose:
+        print("[fill-dovetail] compact milestone-boundary session first; the complete "
+              "per-fill yaw/brace/scope schedule remains the next session.", flush=True)
+      yield from publish(_iter_assembly_problem_milestones_once(
+          C, assembly, grasp_local_widen=grasp_local_widen,
+          grasp_initial_keep=grasp_initial_keep,
+          _compact_fill_session=True, **common))
+      if deadline is not None and time.perf_counter() > deadline:
+        if verbose:
+          print("[fill-dovetail] compact session reached the deadline; full action-set "
+                "completion remains open.", flush=True)
+        return
+      if verbose:
+        print("[fill-dovetail] compact session exhausted -> complete per-fill "
+              "yaw/brace/scope session.", flush=True)
     yield from publish(_iter_assembly_problem_milestones_once(
         C, assembly, grasp_local_widen=grasp_local_widen,
         grasp_initial_keep=grasp_initial_keep, **common))

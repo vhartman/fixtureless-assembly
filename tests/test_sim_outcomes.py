@@ -2,6 +2,30 @@
 
 import pytest
 
+
+def test_contact_handover_commits_only_after_receiver_acquisition():
+  """A failed receiver close must leave the physical giver as the payload support."""
+  import sim as S
+
+  scene = object.__new__(S.SimScene)
+  scene.contact_grasps = True
+  events = []
+
+  def attach(_receiver, _child, **kwargs):
+    events.append(("acquire", kwargs["preserve_existing_grasps"]))
+    return False
+
+  scene.attach = attach
+  scene.release = lambda robot: events.append(("release", robot))
+  assert not scene.contact_handover("a2_tool", "obj_0", ["a1"])
+  assert events == [("acquire", True)]
+
+  events.clear()
+  scene.attach = lambda _receiver, _child, **kwargs: (
+      events.append(("acquire", kwargs["preserve_existing_grasps"])) or True)
+  assert scene.contact_handover("a2_tool", "obj_0", ["a1"])
+  assert events == [("acquire", True), ("release", "a1")]
+
 def test_main_refuses_to_silently_do_nothing():
   """`main.py --motion-plan --save x` without --solve/--load-plan used to walk to the end and
   return None in 0.5s -- indistinguishable from a crash or a very fast solve."""
@@ -127,6 +151,27 @@ def test_grasp_and_mate_welds_have_distinct_default_compliance():
   assert timeconsts(weld_timeconst=0.006) == pytest.approx((0.006, 0.006))
   assert timeconsts(weld_timeconst=0.006,
                     mate_weld_timeconst=0.003) == pytest.approx((0.006, 0.003))
+
+
+def test_contact_grasps_preserve_vacuum_welds_in_mixed_workcell():
+  """Contact execution is per tool: suction welds remain, parallel-jaw welds disappear."""
+  import mujoco
+  import assembly as A
+  from env import make_four_robot_env
+  import sim as S
+
+  asm = A.make_assembly("peg-hole", 2)
+  C = make_four_robot_env(num_robots=1, floating_ee=True, vacuum=False)
+  A.add_disassembled_obj(C, asm, spacing=0.2, float_height=0.002)
+  state = A.get_initial_state(C, asm)
+  model = mujoco.MjModel.from_xml_string(S.build_mjcf(
+      asm, state, ["a1", "a2"], contact_grasps=True,
+      gripper_kinds={"a1": "vacuum", "a2": "two_finger"}))
+
+  assert mujoco.mj_name2id(
+      model, mujoco.mjtObj.mjOBJ_EQUALITY, "grasp_a1_obj_1") >= 0
+  assert mujoco.mj_name2id(
+      model, mujoco.mjtObj.mjOBJ_EQUALITY, "grasp_a2_obj_1") == -1
 
 
 def test_chair_round_parts_do_not_roll_out_of_their_scatter_cells():

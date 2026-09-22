@@ -110,9 +110,10 @@ _STANDARD_SEARCH_PROFILE = {
     "lazy_edge_selector": "forward",
     "analytic_seed_cap": None,
     # The scene-reserved hybrid sampler keeps a conventional/sample alphabet and reserves a
-    # scene-positive PICK/ASSEMBLE prefix before the ordinary hybrid order.  This prevents a
-    # compact K prefix from accidentally containing no initial acquisition for a part merely
-    # because conventional rows happened to occupy it. Exact state gates stay authoritative.
+    # scene-positive PICK/MATE/component-support prefix before the ordinary hybrid order.
+    # The intermediate-component roles matter: a grasp may clear the current rigid component
+    # but collide with a future part, so singleton/final-product labels alone can discard the
+    # only useful transport column. Exact state gates stay authoritative.
     "grasp_sampler": True,
     # Keep ordinary scenes cheap. A failed complete fill monotonically exposes more of the
     # immutable master database, so K=20 is an initial alphabet rather than a pruning decision.
@@ -205,7 +206,8 @@ _INTERNAL_MAIN_CLI = {
     "grasp_sampler_seed", "ik_collision_gate", "grasp_translations",
     "ik_positive_reuse", "analytic_seed_cap", "grasp_sampler", "grasp_sampler_keep",
     "grasp_widen", "grasp_widen_batch", "grasp_widen_max", "component_grasp_keep",
-    "grasp_sampler_candidates", "grasp_sampler_pad_support", "grasp_sampler_wrap",
+    "grasp_sampler_candidates", "grasp_sampler_full_probe", "grasp_sampler_roll_refine",
+    "grasp_sampler_pad_support", "grasp_sampler_wrap",
     "grasp_sampler_scenes", "always_contact",
     # Narrow physics/witness ablations and manual optimizer controls.
     "orientation_robust_wrench", "curved_torque_scale", "insertion_offset", "robust_mode",
@@ -322,7 +324,7 @@ def _sampled_scene_coverage(assembly, checker, robots, prefix="[grasp-scenes]"):
   spends its search budget on it. ``both=0`` is deliberately only a warning: a regrasp or
   handover may legitimately connect disjoint pick- and assembly-clear grasp sets.
   """
-  from problem import sampled_grasp_meta
+  from problem import sampled_grasp_meta, sampled_grasp_selection_diagnostics
   kinds = sorted(set(checker._robot_kind.get(r, r) for r in robots))
   report = {}
   for part in assembly.objects:
@@ -335,7 +337,8 @@ def _sampled_scene_coverage(assembly, checker, robots, prefix="[grasp-scenes]"):
       seat = {i for i, row in enumerate(meta)
               if "assemble" in (row.get("scene_by_kind", {}).get(kind, ()) if row else ())}
       support = {i for i, row in enumerate(meta)
-                 if "support" in (row.get("scene_by_kind", {}).get(kind, ()) if row else ())}
+                 if any(r == "support" or r.startswith("component:")
+                        for r in (row.get("scene_by_kind", {}).get(kind, ()) if row else ()))}
       values = {"pick": len(pick), "assemble": len(seat), "support": len(support),
                 "both": len(pick & seat)}
       part_report[kind] = values
@@ -344,6 +347,30 @@ def _sampled_scene_coverage(assembly, checker, robots, prefix="[grasp-scenes]"):
                     f"both={values['both']}")
     report[part] = part_report
     print(f"{prefix} {part}: " + ", ".join(fields))
+    audit = sampled_grasp_selection_diagnostics(part)
+    if audit is not None:
+      mode = ("adaptive-full" if audit.get("expanded_full") else
+              "compact" if audit["full_probe"] else "capped")
+      print(f"{prefix} {part}: selector raw={audit['raw']} quality={audit['quality']} "
+            f"probe={audit['probe']} evaluated={audit['evaluated']} "
+            f"selected={audit['selected']} ({mode} probe), table-route="
+            f"{','.join(f'{k}:g{a}->g{b}@{role}' for k, role, a, b in audit.get('table_routes', ())) or '-'}, "
+            f"handover-route={','.join(f'{ka}/{kb}:g{a}->g{b}' for ka, kb, a, b in audit.get('handover_routes', ())) or '-'}")
+      rejects = audit.get("acquisition_rejects", {})
+      if any(rejects.values()):
+        detail = ", ".join(
+            f"{kind}:" + "/".join(f"{reason}={count}" for reason, count in reasons.items())
+            for kind, reasons in rejects.items() if reasons)
+        print(f"{prefix} {part}: isolated closure rejects: {detail}")
+      lost = []
+      for kind, available in audit["evaluated_coverage"].items():
+        retained = audit["selected_coverage"].get(kind, {})
+        for role in ("pick", "assemble", "support", "both"):
+          if available.get(role, 0) and not retained.get(role, 0):
+            lost.append(f"{kind}:{role}")
+      if lost:
+        print(f"{prefix} WARNING {part}: selection removed all candidates for available "
+              f"certificate(s): {', '.join(lost)}")
     if part != assembly.base and all(values["both"] == 0
                                      for values in part_report.values()):
       print(f"{prefix} WARNING {part}: no grasp is clear in both the initial pick and "
@@ -868,9 +895,9 @@ def build_parser():
   g_ik.add_argument(
       "--grasp-sampler-keep", type=int, default=20, metavar="N",
       help="--grasp-sampler: initial TOTAL grasps kept per part (default 20). The current "
-           "scene-reserved hybrid reserves available per-kind pick/assemble representatives "
-           "before a stable conventional-plus-sampled tail. Mesh/compound parts use the "
-           "whole budget.",
+           "scene-reserved hybrid reserves available per-kind pick, mandatory-mate, and "
+           "intermediate/final rigid-component representatives before a stable conventional-"
+           "plus-sampled tail. Mesh/compound parts use the whole budget.",
   )
   g_ik.add_argument("--grasp-sampler-db-hash", default=None, help=argparse.SUPPRESS)
   g_ik.add_argument(
@@ -926,6 +953,20 @@ def build_parser():
       help="--grasp-sampler: raw surface samples per shape before downsampling (default 200).",
   )
   g_ik.add_argument(
+      "--grasp-sampler-full-probe", action=argparse.BooleanOptionalAction, default=False,
+      help="EXPERIMENTAL: first scene-classify the historical 32-row primitive / 64-row "
+           "mesh probe, then classify the complete raw cloud only for an incoming part whose "
+           "compact pool has no direct pick-to-mate bridge. This reveals candidates lost "
+           "before role-aware selection without charging every easy part for the dense pool.",
+  )
+  g_ik.add_argument(
+      "--grasp-sampler-roll-refine", action=argparse.BooleanOptionalAction, default=False,
+      help="EXPERIMENTAL: append the four 45-degree midpoint rolls between the sampled "
+           "pinch generator's existing nested 0/90/180/270-degree approach rolls. This "
+           "targets handover/co-grasp compatibility without changing surface contact pairs; "
+           "the existing four rows retain their order.",
+  )
+  g_ik.add_argument(
       "--grasp-sampler-pad-support", type=float, default=0.75, metavar="F",
       help="--grasp-sampler: least fraction of the CONTACT PATCH that must lie on the part. "
            "The patch mirrors the collision proxies: the two-finger pad (20x40mm, robotiq_"
@@ -957,13 +998,13 @@ def build_parser():
   g_ik.add_argument(
       "--grasp-sampler-scenes", action=argparse.BooleanOptionalAction, default=False,
       help="--grasp-sampler: SCENE-AWARE sampling (opt-in). Every raw candidate is tagged "
-           "with two floating-EE verdicts -- feasible at the part's INITIAL pose (the PICK "
-           "set) and feasible at the part's ASSEMBLED pose (the ASSEMBLE set) -- and the "
-           "keep budget splits into per-set quotas, so the DB provably contains a pick-able "
-           "grasp, an assemble-able grasp and free-space (handover) grasps for every part "
-           "instead of hoping the uniform cloud covers all three. The DB becomes per PART "
-           "INSTANCE (identical legs filter differently). Deterministic; saved with the "
-           "plan -- it rebinds grasp ids.",
+           "with floating-EE verdicts at the INITIAL pick, mandatory mate, and each authored "
+           "intermediate/final rigid-component context. The keep budget reserves available "
+           "representatives for those roles before the diversity tail, rather than hoping a "
+           "uniform cloud retains the grasps needed to carry a partial assembly. The DB "
+           "becomes per PART INSTANCE (identical legs filter differently). These are ranking "
+           "labels, not feasibility shortcuts; exact action gates remain authoritative. "
+           "Deterministic; saved with the plan -- it rebinds grasp ids.",
   )
   g_ik.add_argument(
       "--grasp-sampler-margin", type=float, default=0.008, metavar="M",
@@ -2184,8 +2225,9 @@ def build_parser():
   g_mp.add_argument(
       "--mp-optimize", action=argparse.BooleanOptionalAction, default=True,
       help="With --motion-plan: RRT* COST optimization until --mp-runtime. Default ON since "
-           "2026-07-29; --no-mp-optimize stops at the first solution. Improves path cost; "
-           "uses the tree-extension shim.",
+           "2026-07-29. --no-mp-optimize is a diagnostic first-solution timing mode and may "
+           "not be combined with --mp-save: exported production paths are always optimized. "
+           "Uses the tree-extension shim.",
   )
   g_search.add_argument(
       "--ban-actions", type=str, default=None, metavar="CSV",
@@ -2523,7 +2565,8 @@ _SAVE_CONFIG_FIELDS = (
     # mated onto it at 0.01-0.23mm -- perfectly seated on a body in the wrong place)
     "grasp_translations",                                # grasp ids index the DB
     "grasp_sampler", "grasp_sampler_keep",               # --grasp-sampler: sampled ids only
-    "grasp_sampler_candidates", "grasp_sampler_seed",    # replay under identical settings
+    "grasp_sampler_candidates", "grasp_sampler_full_probe", "grasp_sampler_roll_refine",
+    "grasp_sampler_seed",                                # replay under identical settings
     "grasp_sampler_db_hash",                              # positional DB content identity
     "artifact_contract",                                  # collision/grasp/closure identity
     "grasp_refine", "grasp_widen", "grasp_widen_batch", "grasp_widen_max",
@@ -2613,9 +2656,20 @@ def save_plan(path, cfg, plan, witnesses=None):
     _cert = (cfg.witness_margin if cfg.solve and cfg.real_ik
              and cfg.witness_margin is not None else 0.0)
   config["_search_witness_margin"] = float(_cert)
-  write_plan(path, config, plan, witnesses=witnesses)
+  grasp_physics = None
+  if cfg.grasp_physics_check:
+    from problem import _GRASP_PHYSICS_CTX
+    if _GRASP_PHYSICS_CTX is None:
+      raise RuntimeError("cannot save a physics-certified plan without its grasp context")
+    grasp_physics = _GRASP_PHYSICS_CTX.export_handovers()
+    if grasp_physics is None:
+      raise RuntimeError(
+          "cannot save a physics-certified plan before the a-priori handover table exists")
+  write_plan(path, config, plan, witnesses=witnesses, grasp_physics=grasp_physics)
   print(f"[save] wrote {len(plan)}-action plan + scene config"
-        + (" + witnesses" if witnesses is not None else "") + f" to {path}")
+        + (" + witnesses" if witnesses is not None else "")
+        + (" + handover certificates" if grasp_physics is not None else "")
+        + f" to {path}")
 
 
 # Witness REUSE guard: a persisted witness block is only valid if every setting that shaped
@@ -2636,7 +2690,8 @@ _WITNESS_FIELDS = (
     "tight_fingers", "openarm_real_finger_radius_scale", "part_float", "witness_margin",
     "witness_joint_margin", "object_over_table", "object_over_table_margin", "witness_draw",
     "witness_sets", "witness_set_spread", "pre_insertion", "skill_funnel_collision_res",
-    "grasp_sampler", "grasp_sampler_keep", "grasp_sampler_candidates", "grasp_sampler_seed",
+    "grasp_sampler", "grasp_sampler_keep", "grasp_sampler_candidates",
+    "grasp_sampler_full_probe", "grasp_sampler_roll_refine", "grasp_sampler_seed",
     "grasp_sampler_db_hash", "grasp_closure_check",
     "grasp_sampler_margin", "grasp_sampler_pad_support", "grasp_sampler_wrap",
     "grasp_sampler_strict", "grasp_sampler_scenes", "placement_yaws")
@@ -3495,6 +3550,10 @@ def run(cfg, explicit=None):
                        set_component_grasp_keep)
   if cfg.grasp_sampler_scenes and not cfg.grasp_sampler:
     raise SystemExit("--grasp-sampler-scenes requires --grasp-sampler")
+  if cfg.grasp_sampler_full_probe and not cfg.grasp_sampler:
+    raise SystemExit("--grasp-sampler-full-probe requires --grasp-sampler")
+  if cfg.grasp_sampler_roll_refine and not cfg.grasp_sampler:
+    raise SystemExit("--grasp-sampler-roll-refine requires --grasp-sampler")
   if cfg.grasp_physics_check and not cfg.grasp_sampler:
     raise SystemExit("--grasp-physics-check requires --grasp-sampler")
   if cfg.grasp_physics_check and not cfg.grasp_sampler_scenes:
@@ -3551,6 +3610,8 @@ def run(cfg, explicit=None):
                        "--grasp-translations (face-enumerator variant families).")
     set_sampled_grasps({"seed": cfg.grasp_sampler_seed,
                         "candidates": cfg.grasp_sampler_candidates,
+                        "full_probe": cfg.grasp_sampler_full_probe,
+                        "roll_refine": cfg.grasp_sampler_roll_refine,
                         "keep": cfg.grasp_sampler_keep,
                         "master_keep": (cfg.grasp_widen_max if cfg.grasp_local_widen
                                         else cfg.grasp_sampler_keep),
@@ -3567,6 +3628,13 @@ def run(cfg, explicit=None):
           + f"; suction + antipodal blocks; seed "
           f"{cfg.grasp_sampler_seed}; {'strict quality gates' if cfg.grasp_sampler_strict else 'fallback quality rows allowed'}). Grasp ids index the SAMPLED list -- plans/witnesses "
           f"only replay under the same sampler settings (saved with the plan).")
+    if cfg.grasp_sampler_full_probe:
+      print("[flag] --grasp-sampler-full-probe ACTIVE: adaptively classifying the complete "
+            "raw cloud when the compact role pool has no direct pick-to-mate bridge. This "
+            "changes the positional grasp database and may make preprocessing slower.")
+    if cfg.grasp_sampler_roll_refine:
+      print("[flag] --grasp-sampler-roll-refine ACTIVE: appending the nested 45-degree "
+            "pinch-roll lattice for transfer/co-grasp compatibility.")
     if cfg.grasp_widen:
       print(f"[flag] --grasp-widen ACTIVE: start with K={cfg.grasp_sampler_keep}; after a "
             f"no-plan return expose {cfg.grasp_widen_batch} stable IDs per epoch up to "
@@ -3959,13 +4027,14 @@ def run(cfg, explicit=None):
     from problem import install_sampled_scene_ctx
     install_sampled_scene_ctx(C, assembly, robots=get_robots(C))
     print("[flag] --grasp-sampler-scenes ACTIVE: every candidate is tagged PER GRIPPER KIND "
-          "for PICK, the mandatory MATE endpoint, and full-assembly SUPPORT contexts; "
-          "the bounded DB reserves diverse proposals for those roles. Exact intermediate-"
-          "state cheap/IK gates remain authoritative. Grasp ids are per PART INSTANCE.")
+          "for PICK, the mandatory MATE endpoint, and intermediate/final rigid-component "
+          "SUPPORT contexts; the bounded DB reserves diverse proposals for those roles. "
+          "Exact state cheap/IK gates remain authoritative. Grasp ids are per PART INSTANCE.")
     if _closure_active:
       print("[grasp-sampler-scenes] strict closure generation ACTIVE: a two-finger source "
-            "whose fingers intersect the table may emit a distinct minimum approach-retracted "
-            "candidate, retained only after open-hand + full closure re-certification. "
+            "with unequal jaw contact is recentered from measured first-contact travel; a "
+            "finger/table overlap may emit a minimum approach-retracted candidate. Every "
+            "generated pose is retained only after open-hand + full closure re-certification. "
             "Clutter/other-hand collisions are never projected.")
   if cfg.grasp_physics_check:
     from problem import install_grasp_physics_ctx
@@ -3976,6 +4045,20 @@ def run(cfg, explicit=None):
           "tool-frame load directions are required. Results are "
           "cached per pose. The configured wrench profile remains one global envelope for "
           "all accepted grasps; no empirical per-grasp limits are fitted.")
+    if cfg.load_plan and not cfg.refresh_witnesses:
+      from plan_io import read_grasp_physics
+      from problem import _GRASP_PHYSICS_CTX
+      _saved_handover_physics = read_grasp_physics(cfg.load_plan)
+      if _saved_handover_physics is not None:
+        _GRASP_PHYSICS_CTX.import_handovers(_saved_handover_physics)
+        print("[grasp-physics/handover] restored complete a-priori certificate from plan")
+      else:
+        print("[grasp-physics/handover] legacy plan has no persisted certificate; one "
+              "a-priori table will be built now and saved on the next plan export")
+        # Upgrade before witness replay/search/postprocessing begins.  In particular, do not
+        # let the first handover successor query trigger simulation as a hidden search cost.
+        from solver import _search_context
+        _search_context(C, assembly, get_robots(C))
   if cfg.grasp_sampler:
     from problem import sampled_grasp_db_signature
     _db_hash = sampled_grasp_db_signature(assembly)
@@ -5104,6 +5187,11 @@ def run(cfg, explicit=None):
         if robot_ik is None:
           print("[motion-plan] needs --real-ik (for the IK witnesses); skipping.")
         else:
+          if cfg.mp_save is not None and not cfg.mp_optimize:
+            raise SystemExit(
+                "refusing to export an unoptimized motion path: --no-mp-optimize is only "
+                "available for in-memory first-solution diagnostics. Remove it (the default "
+                "and every named motion profile enable RRT* optimization), or omit --mp-save.")
           if cfg.mp_wrench_gate and not cfg.wrench:
             raise ValueError(
                 "--mp-wrench-gate requires --wrench: a --no-wrench plan is the topological "
@@ -5470,8 +5558,10 @@ def run(cfg, explicit=None):
               print("[flag] --mp-cograsp ACTIVE: checking co-grasp rigidity along the path.")
               MP.report_cograsp_drift(C, prob, mp_path, robot_ik)
             if cfg.mp_save is not None:
+              if not cfg.mp_optimize:                       # defense below CLI validation
+                raise RuntimeError("internal error: attempted to save an unoptimized path")
               MP.save_path(cfg.mp_save, mp_path, problem=prob,
-                           mp_export_bundle=_mp_export_bundle)
+                           mp_export_bundle=_mp_export_bundle, optimized=True)
               print(f"[motion-plan] saved path -> {cfg.mp_save} (load in sim with "
                     f"`sim.py run <plan.json> --mp-path {cfg.mp_save}`)")
             if cfg.mp_viser:

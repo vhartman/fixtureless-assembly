@@ -6,8 +6,9 @@ The persisted JSON is `{"config": {...}, "plan": [[action...], ...]}` plus an op
 seed, scatter, wrench settings, ...) so replay.py can rebuild the identical scene; `plan` is
 the discrete action list produced by solve_assembly_problem (tuples <-> lists across JSON);
 `witnesses` (when present) persists the exact SEARCH per-action IK certificates, optionally
-replaced by feasibility-safe optimized keyframes, so motion-plan and sim stages are pure
-functions of this file instead of re-solving the witness pass.
+replaced by feasibility-safe optimized keyframes; `grasp_physics` carries the complete eager
+handover table certificate. Motion-plan and sim stages are therefore pure functions of this
+file instead of re-solving IK or rerunning grasp physics.
 Written by main.py --save, read by replay.py / main.py --load-plan / sim.py."""
 import json
 import math
@@ -161,10 +162,14 @@ def read_witness_stage(path):
   return blk.get("stage", "optimized") if blk else None
 
 
-def write_plan(path, config, plan, witnesses=None):
+def write_plan(path, config, plan, witnesses=None, grasp_physics=None):
   data = {"config": config, "plan": [list(step) for step in plan]}
   if witnesses is not None:
     data["witnesses"] = witnesses
+  if grasp_physics is not None:
+    # Complete a-priori handover certificate. Consumers restore this before constructing any
+    # search/replay context; physics is not an implicit side effect of loading a task plan.
+    data["grasp_physics"] = grasp_physics
   # `--save experiments/new-run/plan.json` is a normal CLI workflow.  Persisting a
   # successfully solved certificate must not fail merely because the run directory was
   # not pre-created by the caller.
@@ -178,6 +183,13 @@ def read_plan(path):
   with open(path) as f:
     data = json.load(f)
   return data["config"], [tuple(step) for step in data["plan"]]
+
+
+def read_grasp_physics(path):
+  """Return the optional a-priori handover certificate carried by a task plan."""
+  with open(path) as f:
+    payload = json.load(f).get("grasp_physics")
+  return payload
 
 
 def read_witnesses(path, joint_names, n_actions):
