@@ -1732,7 +1732,8 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
                  resolved_pre_witnesses=None,
                  resolve_missing_pre=True, task_records=None, saved_step_names=None,
                  saved_sequence_names=None, pre_pin_robots=None, skill_paths=None,
-                 wrench_gate_gripper_kind=None, physical_finger_collisions=False):
+                 wrench_gate_gripper_kind=None, physical_finger_collisions=False,
+                 motion_states=None):
   """Build a live mr_bench problem from our solved plan. depgraph=False -> SequenceMixin (a
   fixed total order); depgraph=True -> DependencyGraphMixin (the partial order, so the planner
   may reorder independent actions). Same tasks/frames/witnesses either way."""
@@ -1754,7 +1755,14 @@ def make_problem(C_start, assembly, plan, witnesses, robots, robot_ik, gk, braci
     return out
   _rai_base_env.delete_visual_only_frames = _kinematic_copy
 
-  states = _states_along_plan(C_start, assembly, plan, robots, gk, bracing)
+  if motion_states is None:
+    states = _states_along_plan(C_start, assembly, plan, robots, gk, bracing)
+  else:
+    # Restore the initial placement anchors without enumerating candidate grasps.
+    A.get_initial_state(C_start, assembly)
+    if len(motion_states) != len(plan) + 1:
+      raise ValueError("persisted motion state chain does not match plan length")
+    states = motion_states
   home = np.asarray(C_start.getJointState())               # physical initial/final HOME
   exit_state = np.asarray(getattr(robot_ik, "exit_configuration", home))
   _distinct_exit = not np.allclose(home, exit_state, atol=1e-12, rtol=0.0)

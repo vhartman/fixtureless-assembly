@@ -7,8 +7,9 @@ seed, scatter, wrench settings, ...) so replay.py can rebuild the identical scen
 the discrete action list produced by solve_assembly_problem (tuples <-> lists across JSON);
 `witnesses` (when present) persists the exact SEARCH per-action IK certificates, optionally
 replaced by feasibility-safe optimized keyframes; `grasp_physics` carries the complete eager
-handover table certificate. Motion-plan and sim stages are therefore pure functions of this
-file instead of re-solving IK or rerunning grasp physics.
+handover table certificate; `motion_data` freezes the selected grasps and symbolic state
+chain so downstream motion/sim stages do not regenerate the candidate grasp database.
+Motion-plan and sim stages are therefore pure functions of this file and the scene models.
 Written by main.py --save, read by replay.py / main.py --load-plan / sim.py."""
 import json
 import math
@@ -162,8 +163,10 @@ def read_witness_stage(path):
   return blk.get("stage", "optimized") if blk else None
 
 
-def write_plan(path, config, plan, witnesses=None, grasp_physics=None):
+def write_plan(path, config, plan, witnesses=None, grasp_physics=None, motion_data=None):
   data = {"config": config, "plan": [list(step) for step in plan]}
+  if motion_data is not None:
+    data["motion_data"] = motion_data
   if witnesses is not None:
     data["witnesses"] = witnesses
   if grasp_physics is not None:
@@ -183,6 +186,133 @@ def read_plan(path):
   with open(path) as f:
     data = json.load(f)
   return data["config"], [tuple(step) for step in data["plan"]]
+
+
+def _motion_plan_digest(plan):
+  import hashlib
+  raw = json.dumps([list(a) for a in plan], separators=(",", ":")).encode()
+  return hashlib.sha256(raw).hexdigest()
+
+
+def build_motion_data(C, assembly, plan, robots, gripper_kind, *,
+                      handovers=True, allow_place=True, bracing=False,
+                      grasp_db_hash=None):
+  """Freeze the symbolic state chain and ONLY the grasps used by a fixed plan.
+
+  This is computed once while the search grasp table is available. Motion planning can
+  subsequently build attachment modes without enumerating candidate grasps again.
+  """
+  import hashlib
+  import numpy as np
+  from problem import grasp_pose
+  from solver import _replay_states, _search_context
+
+  _checker, table = _search_context(C, assembly, robots)
+  states = _replay_states(C, assembly, plan, robots, gripper_kind,
+                          handovers, allow_place, bracing, table,
+                          "saved motion-data certificate")
+  selected = set()
+  for state in states:
+    selected.update((str(part), int(gid)) for part, gid in state.grasp.items())
+    for contacts in state.supports.values():
+      selected.update((str(c[2]), int(c[3])) for c in contacts
+                      if c[0] == "grasp")
+  for action in plan:
+    if action and action[0] in {"pick", "add_grasp", "handover",
+                                "inhand_reorient"}:
+      selected.add((str(action[2]), int(action[3])))
+
+  snapshots = []
+  for state in states:
+    snapshots.append({
+        "parent": {p: list(v) for p, v in state.parent.items()},
+        "grasp": {p: int(v) for p, v in state.grasp.items()},
+        "place": {p: list(v) for p, v in state.place.items()},
+        "supports": {p: [list(c) for c in sorted(cs)]
+                     for p, cs in state.supports.items()},
+        "poses": {p: np.asarray(v, dtype=float).tolist()
+                  for p, v in state.poses.items()},
+    })
+  body = {
+      "version": 1,
+      "plan_sha256": _motion_plan_digest(plan),
+      "grasp_db_sha256": grasp_db_hash,
+      "states": snapshots,
+      "selected_grasps": [
+          [part, gid, np.asarray(grasp_pose(assembly, part, gid), dtype=float).tolist()]
+          for part, gid in sorted(selected)],
+  }
+  raw = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+  body["sha256"] = hashlib.sha256(raw).hexdigest()
+  return body
+
+
+def read_motion_data(path, plan, *, grasp_db_hash=None):
+  """Load a fixed-plan certificate; None means an old plan requiring legacy reconstruction."""
+  import hashlib
+  import numpy as np
+  with open(path) as f:
+    body = json.load(f).get("motion_data")
+  if body is None:
+    return None
+  if body.get("version") != 1 or body.get("plan_sha256") != _motion_plan_digest(plan):
+    raise ValueError(f"{path}: motion-data certificate does not match the saved action list")
+  if body.get("grasp_db_sha256") != grasp_db_hash:
+    raise ValueError(f"{path}: motion-data grasp provenance differs from plan config")
+  payload = {k: v for k, v in body.items() if k != "sha256"}
+  raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+  if hashlib.sha256(raw).hexdigest() != body.get("sha256"):
+    raise ValueError(f"{path}: motion-data checksum mismatch")
+  if len(body.get("states", ())) != len(plan) + 1:
+    raise ValueError(f"{path}: motion-data state count does not match the plan")
+  seen = set()
+  for item in body.get("selected_grasps", ()):
+    if not isinstance(item, list) or len(item) != 3:
+      raise ValueError(f"{path}: malformed selected-grasp record")
+    part, gid, pose = item
+    key = (str(part), int(gid))
+    if key in seen or np.asarray(pose).shape != (7,) or not np.all(np.isfinite(pose)):
+      raise ValueError(f"{path}: invalid selected grasp {key}")
+    seen.add(key)
+  for state in body["states"]:
+    for part, gid in state.get("grasp", {}).items():
+      if (str(part), int(gid)) not in seen:
+        raise ValueError(f"{path}: state references an unpersisted grasp")
+    for contacts in state.get("supports", {}).values():
+      for c in contacts:
+        if c[0] == "grasp" and (str(c[2]), int(c[3])) not in seen:
+          raise ValueError(f"{path}: support references an unpersisted grasp")
+  return body
+
+
+def motion_data_states(body, assembly):
+  """Decode the exact state payload used to export attachment modes."""
+  import numpy as np
+  from problem import State
+  parts = set(assembly.objects)
+  out = []
+  for raw in body["states"]:
+    if set(raw["parent"]) != parts or set(raw["poses"]) != parts:
+      raise ValueError("motion-data state has a different part roster")
+    poses = {p: np.asarray(v, dtype=float) for p, v in raw["poses"].items()}
+    if any(v.shape != (7,) or not np.all(np.isfinite(v)) for v in poses.values()):
+      raise ValueError("motion-data state has an invalid part pose")
+    out.append(State(
+        parent={p: tuple(v) for p, v in raw["parent"].items()},
+        grasp={p: int(v) for p, v in raw["grasp"].items()},
+        place={p: _motion_tuple(v) for p, v in raw["place"].items()},
+        supports={p: frozenset(_motion_tuple(c) for c in cs)
+                  for p, cs in raw["supports"].items()},
+        poses=poses))
+  return out
+
+
+def _motion_tuple(value):
+  return tuple(_motion_tuple(v) if isinstance(v, list) else v for v in value)
+
+
+def motion_data_grasps(body):
+  return {(part, int(gid)): pose for part, gid, pose in body["selected_grasps"]}
 
 
 def read_grasp_physics(path):

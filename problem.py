@@ -5590,9 +5590,36 @@ def part_grasp_poses(spec, rolls=None, offset=0.01, part=None):
   return hit
 
 
+_FROZEN_PLAN_GRASPS = None
+
+
+def set_frozen_plan_grasps(grasps=None):
+  """Use only grasps selected by a persisted fixed task plan.
+
+  None restores candidate generation for a fresh search. A missing lookup in a frozen
+  plan is an artifact error, not a request to regenerate a reordered database.
+  """
+  global _FROZEN_PLAN_GRASPS
+  if grasps is None:
+    _FROZEN_PLAN_GRASPS = None
+    return
+  _FROZEN_PLAN_GRASPS = {
+      (str(part), int(gid)): np.asarray(pose, dtype=float).copy()
+      for (part, gid), pose in grasps.items()}
+
+
 def grasp_pose(assembly, part, grasp_id, offset=0.01):
   # grasp `grasp_id` of `part`, in the part's own frame (the shape-aware replacement for
   # raw cube_grasp_pose(gid, cube_size) -- identical values for cube parts).
+  if _FROZEN_PLAN_GRASPS is not None:
+    if float(offset) != 0.01:
+      raise ValueError("fixed-plan grasp certificate is defined at the 0.01m search offset")
+    try:
+      return _FROZEN_PLAN_GRASPS[(str(part), int(grasp_id))]
+    except KeyError as exc:
+      raise ValueError(
+          f"fixed-plan certificate lacks selected grasp ({part!r}, {grasp_id!r}); "
+          "refusing to regenerate or reinterpret its positional id") from exc
   return part_grasp_poses(assembly.grasp_shape(part), offset=offset, part=part)[grasp_id]
 
 

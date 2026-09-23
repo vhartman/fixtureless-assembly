@@ -104,7 +104,9 @@ def apply_wrench_params(cfg):
       tf["T_t2"] = float(tfc)
 
 
-def build_scene(cfg, *, require_artifact_contract=False):
+def build_scene(cfg, *, require_artifact_contract=False, motion_data=None):
+  from problem import set_frozen_plan_grasps
+  set_frozen_plan_grasps(None)
   # reconstruct the exact environment the plan was solved in (same seed => same scatter/perturb)
   set_seed(cfg["seed"])
   # Closure-aware versioned sampling changes the ranked, bounded grasp database. Restore it BEFORE
@@ -260,8 +262,11 @@ def build_scene(cfg, *, require_artifact_contract=False):
     install_grasp_physics_ctx(C, assembly, robots=_get_robots(C))
   _expected_db = cfg.get("grasp_sampler_db_hash")
   if _expected_db:
-    from problem import sampled_grasp_db_signature
-    _actual_db = sampled_grasp_db_signature(assembly)
+    if motion_data is None:
+      from problem import sampled_grasp_db_signature
+      _actual_db = sampled_grasp_db_signature(assembly)
+    else:
+      _actual_db = motion_data.get("grasp_db_sha256")
     if _actual_db != _expected_db:
       raise ValueError(
           "saved sampled-grasp database hash does not match this rebuild "
@@ -273,6 +278,9 @@ def build_scene(cfg, *, require_artifact_contract=False):
   if require_artifact_contract or cfg.get("artifact_contract") is not None:
     validate_artifact_contract(
         cfg.get("artifact_contract"), _actual_contract, who="replay scene rebuild")
+  if motion_data is not None:
+    from plan_io import motion_data_grasps
+    set_frozen_plan_grasps(motion_data_grasps(motion_data))
   return C, assembly
 
 

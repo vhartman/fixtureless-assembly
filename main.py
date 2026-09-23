@@ -2653,8 +2653,8 @@ _SAVE_CONFIG_FIELDS = (
 )
 
 
-def save_plan(path, cfg, plan, witnesses=None):
-  from plan_io import write_plan
+def save_plan(path, cfg, plan, witnesses=None, *, C=None, assembly=None, robots=None):
+  from plan_io import write_plan, _motion_plan_digest
   config = {k: getattr(cfg, k) for k in _SAVE_CONFIG_FIELDS}
   # A plan can only be replay-gated as strictly as the SEARCH that selected it.  This marker
   # separates new plans (where --witness-margin is installed before search) from old files
@@ -2675,7 +2675,29 @@ def save_plan(path, cfg, plan, witnesses=None):
     if grasp_physics is None:
       raise RuntimeError(
           "cannot save a physics-certified plan before the a-priori handover table exists")
-  write_plan(path, config, plan, witnesses=witnesses, grasp_physics=grasp_physics)
+  motion_data = getattr(cfg, "_loaded_motion_data", None)
+  digest = _motion_plan_digest(plan)
+  if (motion_data is not None and
+      (motion_data.get("plan_sha256") != digest or
+       motion_data.get("grasp_db_sha256") != cfg.grasp_sampler_db_hash)):
+    motion_data = None
+  if (motion_data is None and cfg.real_ik and plan and C is not None
+      and assembly is not None and robots is not None):
+    cache = getattr(cfg, "_motion_data_cache", None)
+    if cache is None:
+      cache = cfg._motion_data_cache = {}
+    cache_key = (digest, cfg.grasp_sampler_db_hash)
+    motion_data = cache.get(cache_key)
+    if motion_data is None:
+      from plan_io import build_motion_data
+      motion_data = build_motion_data(
+          C, assembly, plan, robots,
+          wrench_kind_arg(C, robots) if cfg.wrench else None,
+          handovers=cfg.handovers, allow_place=cfg.allow_place,
+          bracing=cfg.bracing, grasp_db_hash=cfg.grasp_sampler_db_hash)
+      cache[cache_key] = motion_data
+  write_plan(path, config, plan, witnesses=witnesses, grasp_physics=grasp_physics,
+             motion_data=motion_data)
   print(f"[save] wrote {len(plan)}-action plan + scene config"
         + (" + witnesses" if witnesses is not None else "")
         + (" + handover certificates" if grasp_physics is not None else "")
@@ -3168,7 +3190,8 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
                        + ", ".join(map(str, missing_pre)))
     save_plan(pfile, cfg, plan,
               witnesses=witness_block(list(robot_ik.C.getJointNames()), witnesses,
-                                      stage="search", pre_witnesses=pre_witnesses))
+                                      stage="search", pre_witnesses=pre_witnesses),
+              C=C, assembly=assembly, robots=robots)
     rec = {"index": index, "plan_id": pid, "actions": len(plan),
            "plan_path": pfile, "export_path": efile, "attempts": [],
            "status": "suspended"}
@@ -3452,6 +3475,10 @@ def _set_search_placement_yaw_prefix(cfg, active):
 
 
 def run(cfg, explicit=None):
+  from problem import set_frozen_plan_grasps
+  set_frozen_plan_grasps(None)  # a fresh search in this process must never inherit a loaded plan
+  cfg._loaded_motion_data = None
+  cfg._motion_data_cache = {}
   # cfg: RunConfig -- the single typed configuration object for the whole run. Every setting
   # below reads a cfg field; the thin main() wrapper builds cfg from the parsed CLI args.
   # explicit: set of dests the caller put on the command line (main()'s argv scan); None for
@@ -4069,9 +4096,23 @@ def run(cfg, explicit=None):
         # let the first handover successor query trigger simulation as a hidden search cost.
         from solver import _search_context
         _search_context(C, assembly, get_robots(C))
+  # A fixed saved plan carries its exact selected grasps and state chain. The contact-model
+  # contract below still checks the live scene, but there is no reason to regenerate all
+  # unused candidates merely to interpret positional grasp ids during motion export.
+  if cfg.load_plan and cfg.motion_plan and not cfg.refresh_witnesses:
+    from plan_io import read_motion_data, read_plan as _read_motion_plan
+    _md_cfg, _md_plan = _read_motion_plan(cfg.load_plan)
+    if (_witnesses_baseline_compatible(_md_cfg, cfg) and
+        (cfg.optimize_witnesses is None or _witnesses_reusable(_md_cfg, cfg))):
+      cfg._loaded_motion_data = read_motion_data(
+          cfg.load_plan, _md_plan, grasp_db_hash=cfg.grasp_sampler_db_hash)
   if cfg.grasp_sampler:
-    from problem import sampled_grasp_db_signature
-    _db_hash = sampled_grasp_db_signature(assembly)
+    if cfg._loaded_motion_data is not None:
+      _db_hash = cfg.grasp_sampler_db_hash
+      print("[grasp-db] fixed-plan selected grasps loaded; full candidate DB rebuild SKIPPED")
+    else:
+      from problem import sampled_grasp_db_signature
+      _db_hash = sampled_grasp_db_signature(assembly)
     if cfg.grasp_sampler_db_hash is not None and cfg.grasp_sampler_db_hash != _db_hash:
       if not cfg.load_plan:
         # A saved plan is also a convenient, complete scene/configuration file for
@@ -4114,6 +4155,9 @@ def run(cfg, explicit=None):
   elif _saved_contract is not None and _saved_contract != _actual_contract:
     print("[artifact-contract] fresh --solve replaces the config's stale model contract.")
   cfg.artifact_contract = _actual_contract
+  if cfg._loaded_motion_data is not None:
+    from plan_io import motion_data_grasps
+    set_frozen_plan_grasps(motion_data_grasps(cfg._loaded_motion_data))
 
   # Internal benchmark pre-pass: construct the finite, scene/gripper-filtered grasp database
   # once, before any solver is timed.  The public runner supplies both an explicit artifact
@@ -5033,7 +5077,8 @@ def run(cfg, explicit=None):
                       joint_names, baseline_witnesses, stage="search",
                       pre_witnesses=baseline_pre_witnesses,
                       grasp_closures=grasp_closures)
-                             if baseline_witnesses is not None else None))
+                             if baseline_witnesses is not None else None),
+                  C=C, assembly=assembly, robots=robots)
       opt_witnesses = baseline_witnesses
       opt_pre_witnesses = baseline_pre_witnesses
       witness_alts = None                                    # --witness-sets alternatives
@@ -5189,7 +5234,8 @@ def run(cfg, explicit=None):
                                                  else "search"),
                                           skill_paths=skill_paths,
                                           pre_witnesses=opt_pre_witnesses,
-                                          grasp_closures=grasp_closures))
+                                          grasp_closures=grasp_closures),
+                  C=C, assembly=assembly, robots=robots)
       if plan is not None and cfg.utilization:
         from solver import utilization_report
         utilization_report(C, assembly, plan, robots, witnesses=opt_witnesses,
@@ -5221,6 +5267,17 @@ def run(cfg, explicit=None):
                 "baseline and has no wrench-certified symbolic state. Omit the MP gate for "
                 "that baseline, or re-run task planning with --wrench.")
           import mp_export as MP
+          from plan_io import _motion_plan_digest, motion_data_states
+          _motion_data = (cfg._loaded_motion_data or
+                          getattr(cfg, "_motion_data_cache", {}).get(
+                              (_motion_plan_digest(plan), cfg.grasp_sampler_db_hash)))
+          _motion_states = None
+          if _motion_data is not None:
+            from problem import get_initial_state
+            get_initial_state(C, assembly)  # restore anchor metadata, without grasp generation
+            _motion_states = motion_data_states(_motion_data, assembly)
+            print(f"[motion-data] {len(_motion_states)} saved symbolic states and "
+                  f"{len(_motion_data['selected_grasps'])} selected grasps reused")
           gk = wrench_kind_arg(C, robots) if cfg.wrench else None
           _loaded_export = None
           _export_bracing = cfg.bracing
@@ -5306,7 +5363,8 @@ def run(cfg, explicit=None):
                     "planner remains free to detour between endpoints.")
               mp_wit, _frep = fuse_cograsp_witnesses(
                   C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
-                  handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing)
+                  handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
+                  states=_motion_states)
               _cograsp_pre = dict(_frep.get("pre_witnesses") or {})
               if _cograsp_pre:
                 mp_pre.update(_cograsp_pre)
@@ -5326,7 +5384,8 @@ def run(cfg, explicit=None):
             mp_wit, _bad = validate_export_witnesses(
                 C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
                 handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
-                baseline_witnesses=(baseline_witnesses if _loaded_export is None else mp_wit))
+                baseline_witnesses=(baseline_witnesses if _loaded_export is None else mp_wit),
+                states=_motion_states)
             # A collision-gate rollback changes the seated half of the certificate. Restore
             # the matching baseline mouth with it; never retain a mouth tied to the rejected
             # optimized/fused endpoint.
@@ -5404,7 +5463,7 @@ def run(cfg, explicit=None):
             mp_pre, _prep = fuse_pre_skill_witnesses(
                 C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
                 handovers=cfg.handovers, allow_place=cfg.allow_place, bracing=cfg.bracing,
-                certified_pre_witnesses=mp_pre)
+                certified_pre_witnesses=mp_pre, states=_motion_states)
             _pre_pin_robots = dict(_prep.get("pin_robots") or {})
             if _pre_pin_robots:
               print(f"[pre] {len(_pre_pin_robots)} accepted funnel solve(s) used idle-arm IK "
@@ -5454,7 +5513,8 @@ def run(cfg, explicit=None):
                                                        _loaded_export["sequence_names"]),
                                  pre_pin_robots=_pre_pin_robots,
                                  skill_paths=skill_paths,
-                                 physical_finger_collisions=_export_physical_fingers)
+                                 physical_finger_collisions=_export_physical_fingers,
+                                 motion_states=_motion_states)
           print(f"[motion-plan] {'DEPGRAPH' if _export_depgraph else 'SEQUENCE'} problem, "
                 f"{len(prob.tasks)} tasks")
           if _loaded_export is not None:

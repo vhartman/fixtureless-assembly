@@ -6173,7 +6173,7 @@ def certify_plan_skill_paths(C, assembly, plan, witnesses, robots, robot_ik, *,
 def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
                               gripper_kind=None, handovers=True, allow_place=True,
                               bracing=False, grasp_table=None, tol=None, verbose=True,
-                              baseline_witnesses=None):
+                              baseline_witnesses=None, states=None):
   """LAST GATE before mp_export: is every IK keyframe we are about to SHIP collision-free?
 
   Every earlier gate checks a witness at the moment it is SOLVED. Nothing checked the one that
@@ -6201,10 +6201,11 @@ def validate_export_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
     return witnesses, []
   if tol is None:
     tol = float("inf")                                  # workcell-only export validation
-  if grasp_table is None:
-    _checker, grasp_table = _search_context(C, assembly, robots)
-  states = _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
-                          bracing, grasp_table, "validate_export_witnesses")
+  if states is None:
+    if grasp_table is None:
+      _checker, grasp_table = _search_context(C, assembly, robots)
+    states = _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
+                            bracing, grasp_table, "validate_export_witnesses")
   out = list(witnesses)
   bad = []
   for i, a in enumerate(plan):
@@ -6359,7 +6360,7 @@ def cograsp_assembly_pairs(plan, states, robot_ik):
 def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
                            gripper_kind=None, handovers=True, allow_place=True,
                            bracing=False, grasp_table=None, weight=1e0,
-                           pos_tol=1e-3, ang_tol=1.0, verbose=True):
+                           pos_tol=1e-3, ang_tol=1.0, verbose=True, states=None):
   """CO-GRASP WITNESS FUSION -- a post-pass over a FIXED discrete plan, run AFTER
   optimize_witnesses and BEFORE mp_export.
 
@@ -6406,10 +6407,11 @@ def fuse_cograsp_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
             f"{time.perf_counter() - t0:.1f}s; the rest keep BOTH original witnesses.")
     return list(witnesses), {"pairs": 0, "fused": 0, "rows": [],
                              "pre_witnesses": {}}
-  if grasp_table is None:
-    _checker, grasp_table = _search_context(C, assembly, robots)
-  states = _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
-                          bracing, grasp_table, "fuse_cograsp_witnesses")
+  if states is None:
+    if grasp_table is None:
+      _checker, grasp_table = _search_context(C, assembly, robots)
+    states = _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
+                            bracing, grasp_table, "fuse_cograsp_witnesses")
 
   names = list(robot_ik.C.getJointNames())
   # penetration budget: the --strict-collisions gate when one is configured, else a 0.1mm
@@ -6709,7 +6711,7 @@ def fuse_pre_skill_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
                              gripper_kind=None, handovers=True, allow_place=True,
                              bracing=False, grasp_table=None, max_dq=0.35, hold_dq=0.02,
                              hold_mm=2.0, pos_tol=1e-3, ang_tol=1.0, verbose=True,
-                             certified_pre_witnesses=None):
+                             certified_pre_witnesses=None, states=None):
   """PRE-SKILL WITNESS CONSISTENCY -- a post-pass over a FIXED discrete plan, run AFTER
   optimize_witnesses / fuse_cograsp_witnesses and BEFORE mp_export.
 
@@ -6755,10 +6757,11 @@ def fuse_pre_skill_witnesses(C, assembly, plan, witnesses, robots, robot_ik,
       print("[pre] no --pre-* split is active (--skill / --pre-pick / --pre-place / "
             "--pre-add-grasp / --pre-insertion): nothing to make consistent.")
     return {}, {"splits": 0, "consistent": 0, "rows": []}
-  if grasp_table is None:
-    _checker, grasp_table = _search_context(C, assembly, robots)
-  states = _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
-                          bracing, grasp_table, "fuse_pre_skill_witnesses")
+  if states is None:
+    if grasp_table is None:
+      _checker, grasp_table = _search_context(C, assembly, robots)
+    states = _replay_states(C, assembly, plan, robots, gripper_kind, handovers, allow_place,
+                            bracing, grasp_table, "fuse_pre_skill_witnesses")
   names = list(robot_ik.C.getJointNames())
   jidx = {r: [k for k, n in enumerate(names) if n.startswith(r + "_")] for r in robots}
   # penetration budget: the --strict-collisions gate when one is configured, else a 0.1mm

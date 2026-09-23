@@ -8794,9 +8794,14 @@ def _cli_run(a):
     print(f"[sim] --joint-rate {JOINT_RATE:g} rad/s (default 1.0)")
   import assembly as A
   import replay as R
-  from plan_io import read_grasp_closures, read_plan
+  from plan_io import (read_grasp_closures, read_plan, read_motion_data,
+                       motion_data_states)
   cfg, plan = read_plan(a.path)
-  C, asm = R.build_scene(cfg, require_artifact_contract=True)  # exact reconstruction
+  motion_data = (None if getattr(a, "refresh_witnesses", False) else
+                 read_motion_data(a.path, plan,
+                                  grasp_db_hash=cfg.get("grasp_sampler_db_hash")))
+  C, asm = R.build_scene(cfg, require_artifact_contract=True,
+                         motion_data=motion_data)  # exact reconstruction
   grasp_closures = read_grasp_closures(
       a.path, plan, required=bool(_saved(cfg, "grasp_closure_check", legacy=False)))
   robots = A.get_robots(C)
@@ -8824,13 +8829,16 @@ def _cli_run(a):
   if not _want_meshes and a.arm_meshes:
     print("[sim] headless: skipping arm VISUAL meshes (capsules-only collision is unchanged). "
           "Pass --gui/--record to keep them.")
-  # MASSES MUST STILL BE THE PLANNING MASSES HERE. _states_from_plan re-simulates the saved
-  # actions through the wrench-gated successor generator, so scaling first makes it judge a
-  # DIFFERENT action set than the search did and the saved action stops being reachable
-  # (measured on cross-new at --mass-scale 0.25: step 6 assemble a3 obj_2 obj_0 had ZERO
-  # assemble successors -> StopIteration). Lighter parts are not automatically safer: a fixed
-  # --insert-force presses against less self-weight, so the LP calls the mate unstable.
-  states = _states_from_plan(cfg, C, asm, robots, plan)
+  # Restore the search's symbolic states before any execution-only mass scaling. Old plans
+  # must replay successors under the original wrench model; new plans carry those states
+  # directly. Scaling earlier can make an originally valid assemble action disappear.
+  if motion_data is None:
+    states = _states_from_plan(cfg, C, asm, robots, plan)
+  else:
+    A.get_initial_state(C, asm)  # placement anchors without successor enumeration
+    states = motion_data_states(motion_data, asm)
+    print(f"[sim] restored {len(states)} saved symbolic states and "
+          f"{len(motion_data['selected_grasps'])} selected grasps")
   try:
     initial_state, object_perturbation = _sample_initial_placement_perturbation(
         C, asm, states[0], xy=a.object_perturb_xy, yaw_deg=a.object_perturb_yaw,
@@ -9057,7 +9065,8 @@ def _cli_run(a):
       task_records=(None if _final_export is None else _final_export["tasks"]),
       saved_step_names=(None if _final_export is None else _final_export["step_names"]),
       saved_sequence_names=(None if _final_export is None else
-                            _final_export["sequence_names"]))
+                            _final_export["sequence_names"]),
+      motion_states=states)
   if a.mp_path:                                          # load a saved BiRRT path -> no re-plan
     path = _saved_mp_path
     print(f"[sim] loaded motion path ({len(path)} states) from {a.mp_path} -- skipping BiRRT")
