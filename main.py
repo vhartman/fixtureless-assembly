@@ -120,6 +120,9 @@ _STANDARD_SEARCH_PROFILE = {
     # Imported CAD scenes can opt into the dense fixed alphabet through `fabrica`.
     "grasp_sampler_keep": 20,
     "grasp_sampler_candidates": 96,
+    # The finite master includes the nested 45-degree pinch rolls; search still starts
+    # with the small active prefix and exposes further IDs only when needed.
+    "grasp_sampler_roll_refine": True,
     "grasp_sampler_scenes": True,
     # A fixed-open hand is not a grasp model. Every two-finger edge must carry a bilateral
     # virtual-close certificate and an object-dependent aperture into the saved artifact.
@@ -158,7 +161,9 @@ _SEARCH_PROFILES = {
     "fabrica": {
         **_STANDARD_SEARCH_PROFILE,
         "grasp_sampler_keep": 64,
-        "grasp_widen": False,
+        # Preserve its historical K=64 cost by default, but a single
+        # --grasp-widen-max N now opts into a larger fixed master.
+        "grasp_widen_max": 64,
     },
 }
 
@@ -328,6 +333,7 @@ def _sampled_scene_coverage(assembly, checker, robots, prefix="[grasp-scenes]"):
   from problem import sampled_grasp_meta, sampled_grasp_selection_diagnostics
   kinds = sorted(set(checker._robot_kind.get(r, r) for r in robots))
   report = {}
+  profile_totals = {"raw": 0.0, "master": 0.0, "materialize": 0.0}
   for part in assembly.objects:
     meta = sampled_grasp_meta(assembly.grasp_shape(part), part=part)
     part_report = {}
@@ -372,10 +378,27 @@ def _sampled_scene_coverage(assembly, checker, robots, prefix="[grasp-scenes]"):
       if lost:
         print(f"{prefix} WARNING {part}: selection removed all candidates for available "
               f"certificate(s): {', '.join(lost)}")
+      prof = audit.get("profile")
+      if prof:
+        profile_totals["raw"] += prof["raw_seconds"]
+        profile_totals["master"] += prof["master_seconds"]
+        profile_totals["materialize"] += prof["materialize_seconds"]
+        checks = ", ".join(
+            f"{name}={entry['seconds']:.2f}s/{entry['calls']}x"
+            for name, entry in sorted(prof["checks"].items(),
+                                      key=lambda item: -item[1]["seconds"])) or "none"
+        print(f"[grasp-prof] {part}: raw={prof['raw_seconds']:.2f}s "
+              f"({prof['raw_source']}), master={prof['master_seconds']:.2f}s "
+              f"[checks: {checks}; other={prof['master_other_seconds']:.2f}s], "
+              f"materialize={prof['materialize_seconds']:.2f}s")
     if part != assembly.base and all(values["both"] == 0
                                      for values in part_report.values()):
       print(f"{prefix} WARNING {part}: no grasp is clear in both the initial pick and "
             "mandatory mate scenes; any solution requires a regrasp or handover.")
+  if any(profile_totals.values()):
+    print(f"[grasp-prof] total: raw={profile_totals['raw']:.2f}s, "
+          f"master={profile_totals['master']:.2f}s, "
+          f"materialize={profile_totals['materialize']:.2f}s")
   return report
 
 def build_parser():
@@ -922,8 +945,9 @@ def build_parser():
   )
   g_ik.add_argument(
       "--grasp-widen-max", type=int, default=96, metavar="N",
-      help="Largest requested grasp prefix under --grasp-widen (default 96). Widening stops "
-           "earlier when the finite evaluated master pool is exhausted.",
+      help="Maximum finite grasp master per part under --grasp-widen (default 96). "
+           "The master is generated/classified once before search; widening reveals "
+           "stable prefixes of it. Raise N to probe and retain more raw candidates.",
   )
   g_ik.add_argument(
       "--grasp-local-widen", action=argparse.BooleanOptionalAction, default=False,
@@ -962,7 +986,7 @@ def build_parser():
   )
   g_ik.add_argument(
       "--grasp-sampler-roll-refine", action=argparse.BooleanOptionalAction, default=False,
-      help="EXPERIMENTAL: append the four 45-degree midpoint rolls between the sampled "
+      help="Append the four 45-degree midpoint rolls between the sampled "
            "pinch generator's existing nested 0/90/180/270-degree approach rolls. This "
            "targets handover/co-grasp compatibility without changing surface contact pairs; "
            "the existing four rows retain their order.",
@@ -3650,8 +3674,9 @@ def run(cfg, explicit=None):
                         "full_probe": cfg.grasp_sampler_full_probe,
                         "roll_refine": cfg.grasp_sampler_roll_refine,
                         "keep": cfg.grasp_sampler_keep,
-                        "master_keep": (cfg.grasp_widen_max if cfg.grasp_local_widen
+                        "master_keep": (cfg.grasp_widen_max if (cfg.grasp_widen or cfg.grasp_local_widen)
                                         else cfg.grasp_sampler_keep),
+                        "fixed_master": bool(cfg.grasp_widen and not cfg.grasp_local_widen),
                         "margin": cfg.grasp_sampler_margin,
                         "pad_support": cfg.grasp_sampler_pad_support,
                         "wrap": cfg.grasp_sampler_wrap,
@@ -3660,7 +3685,7 @@ def run(cfg, explicit=None):
           + f" grasp DB ({cfg.grasp_sampler_candidates} raw candidates -> "
           + (f"{cfg.grasp_sampler_keep} initially active, finite master requested up to "
              f"{cfg.grasp_widen_max} per part"
-             if cfg.grasp_local_widen else
+             if (cfg.grasp_widen or cfg.grasp_local_widen) else
              f"{cfg.grasp_sampler_keep} total kept per part")
           + f"; suction + antipodal blocks; seed "
           f"{cfg.grasp_sampler_seed}; {'strict quality gates' if cfg.grasp_sampler_strict else 'fallback quality rows allowed'}). Grasp ids index the SAMPLED list -- plans/witnesses "
@@ -3673,10 +3698,10 @@ def run(cfg, explicit=None):
       print("[flag] --grasp-sampler-roll-refine ACTIVE: appending the nested 45-degree "
             "pinch-roll lattice for transfer/co-grasp compatibility.")
     if cfg.grasp_widen:
-      print(f"[flag] --grasp-widen ACTIVE: start with K={cfg.grasp_sampler_keep}; after a "
-            f"no-plan return expose {cfg.grasp_widen_batch} stable IDs per epoch up to "
-            f"K={cfg.grasp_widen_max}, stopping earlier when the evaluated master hash is "
-            "unchanged. Finite misses remain open; the final effective K/hash are saved.")
+      print(f"[flag] --grasp-widen ACTIVE: generate one scene-ranked finite master up to "
+            f"K={cfg.grasp_widen_max}; start with K={cfg.grasp_sampler_keep}; after a "
+            f"no-plan return expose {cfg.grasp_widen_batch} stable IDs per epoch. "
+            "Finite misses remain open; the final effective K/hash are saved.")
     if cfg.grasp_local_widen:
       print(f"[flag] --grasp-local-widen ACTIVE: one stable finite master is built up to "
             f"K={cfg.grasp_widen_max}; concrete fills start with K={cfg.grasp_sampler_keep} "
@@ -4107,12 +4132,18 @@ def run(cfg, explicit=None):
       cfg._loaded_motion_data = read_motion_data(
           cfg.load_plan, _md_plan, grasp_db_hash=cfg.grasp_sampler_db_hash)
   if cfg.grasp_sampler:
+    _grasp_profile_on = _os.environ.get("ASSEMBLY_GRASP_PROFILE", "").lower() in (
+        "1", "true", "yes")
+    _grasp_signature_t0 = _time.perf_counter() if _grasp_profile_on else None
     if cfg._loaded_motion_data is not None:
       _db_hash = cfg.grasp_sampler_db_hash
       print("[grasp-db] fixed-plan selected grasps loaded; full candidate DB rebuild SKIPPED")
     else:
       from problem import sampled_grasp_db_signature
       _db_hash = sampled_grasp_db_signature(assembly)
+    if _grasp_profile_on:
+      print(f"[grasp-prof] signature/master access="
+            f"{_time.perf_counter() - _grasp_signature_t0:.2f}s")
     if cfg.grasp_sampler_db_hash is not None and cfg.grasp_sampler_db_hash != _db_hash:
       if not cfg.load_plan:
         # A saved plan is also a convenient, complete scene/configuration file for
@@ -4695,10 +4726,17 @@ def run(cfg, explicit=None):
       # prefix is only a request for the next prefix; the same sound abort runs again after the
       # finite master pool is exhausted.
       from solver import _search_context, isolated_graspability_report
+      _grasp_profile_on = _os.environ.get("ASSEMBLY_GRASP_PROFILE", "").lower() in (
+          "1", "true", "yes")
+      _pre_t0 = _time.perf_counter() if _grasp_profile_on else None
       _pre_checker, _pre_table = _search_context(C, assembly, robots)
+      _table_seconds = _time.perf_counter() - _pre_t0 if _grasp_profile_on else 0.0
       _pre = isolated_graspability_report(
           C, assembly, robots, _pre_checker, _pre_table,
           require_closure=bool(cfg.grasp_closure_check), robot_ik=robot_ik, verbose=True)
+      if _grasp_profile_on:
+        print(f"[grasp-prof] preflight: search-table={_table_seconds:.2f}s, "
+              f"isolated-pick/reach={_time.perf_counter() - _pre_t0 - _table_seconds:.2f}s")
       if cfg.grasp_sampler_scenes:
         # The two marginal counts printed by the sampler are not enough to diagnose a
         # transport funnel: a database can contain many pick-clear rows and many
@@ -4832,6 +4870,23 @@ def run(cfg, explicit=None):
             plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
             prev_keep, prev_hash = requested, new_hash
           if plan is None:
+            from problem import sampled_grasp_selection_diagnostics
+            _coverage = sampled_grasp_selection_diagnostics()
+            _unprobed = [p for p, row in _coverage.items()
+                         if row["probe"] < row["raw"]]
+            _unselected = [p for p, row in _coverage.items()
+                           if row["selected"] >= int(cfg.grasp_widen_max)
+                           and row["evaluated"] > row["selected"]]
+            _next = ("Increase --grasp-widen-max to expose more of the existing raw pool"
+                     if (_unprobed or _unselected) else
+                     "The generated pool is exhausted; increase --grasp-sampler-candidates "
+                     "to sample more contact points")
+            print(f"[grasp-widen] no plan within the finite sampled master "
+                  f"(active K={cfg.grasp_sampler_keep}, configured max "
+                  f"K={cfg.grasp_widen_max}; parts with more raw/selected grasps: "
+                  f"{sorted(set(_unprobed + _unselected)) or 'none'}). "
+                  "This is not a proof of geometric "
+                  f"infeasibility. {_next}.")
             _final_checker, _final_table = _search_context(C, assembly, robots)
             _final_pre = isolated_graspability_report(
                 C, assembly, robots, _final_checker, _final_table,

@@ -3022,9 +3022,12 @@ def set_sampled_grasps(mode):
       "full_probe": bool(mode.get("full_probe", False)),
       "roll_refine": bool(mode.get("roll_refine", False)),
       "keep": max(2, int(mode.get("keep", 12))),
+      "initial_keep": max(2, int(mode.get("keep", 12))),
       # A search may construct a larger immutable master while exposing only a prefix.
       "master_keep": max(2, int(mode.get("keep", 12)),
                          int(mode.get("master_keep", mode.get("keep", 12)))),
+      # Global widening builds one role-ranked master up front and exposes a prefix.
+      "fixed_master": bool(mode.get("fixed_master", False)),
       "margin": float(mode.get("margin", 0.008)),
       "pad_support": float(mode.get("pad_support", 0.75)),
       "strict": bool(mode.get("strict", False)),
@@ -3241,10 +3244,16 @@ def set_sampled_grasp_keep(keep):
   """
   if _SAMPLED_GRASPS is None:
     raise ValueError("sampled grasp database is disabled")
-  _SAMPLED_GRASPS["keep"] = max(2, int(keep))
-  # This API is the legacy/global widening operation: it physically grows the evaluated
-  # DB.  Fill-local widening never calls it; that path constructs master_keep once and
-  # gates stable ids inside the concrete fill.
+  new_keep = max(2, int(keep))
+  if _SAMPLED_GRASPS.get("fixed_master"):
+    if new_keep > _SAMPLED_GRASPS["master_keep"]:
+      raise ValueError("active grasp prefix exceeds the fixed master")
+    _SAMPLED_GRASPS["keep"] = new_keep
+    # The expensive full-master scene/closure certificates remain cached.
+    return
+  _SAMPLED_GRASPS["keep"] = new_keep
+  # Legacy callers physically grow the evaluated DB. Fixed-master callers only expose
+  # more cached IDs; fill-local widening gates the master inside the concrete fill.
   _SAMPLED_GRASPS["master_keep"] = _SAMPLED_GRASPS["keep"]
   _SAMPLED_VIEWS_CACHE.clear()
   _SAMPLED_META_CACHE.clear()
@@ -3441,6 +3450,38 @@ def _pad_support_wrap(mesh, p, n, u, v, offsets, lift=0.002, wrap=0.006):
   if not np.isfinite(dmin):
     return 0.0
   return float((np.isfinite(d) & (d - dmin <= float(wrap))).mean())
+
+
+def _pad_support_wrap_many(mesh, contacts, offsets, lift=0.002, wrap=0.006):
+  """Evaluate one pinch candidate's pad contacts in a single signed-distance query.
+
+  Each sampled point and its score are identical to :func:`_pad_support_wrap`; only
+  the proximity-query batch size changes. If the mesh backend cannot answer the batch,
+  defer to the original per-contact implementation and its ray fallback.
+  """
+  if not contacts:
+    return []
+  origins = [
+      (np.asarray(p, dtype=float)[None, :]
+       + offsets[:, 0:1] * np.asarray(u, dtype=float)[None, :]
+       + offsets[:, 1:2] * np.asarray(v, dtype=float)[None, :]
+       + float(lift) * np.asarray(n, dtype=float)[None, :])
+      for p, n, u, v in contacts]
+  try:
+    distance = -np.asarray(
+        mesh.nearest.signed_distance(np.concatenate(origins, axis=0)),
+        dtype=float).reshape(len(contacts), len(offsets))
+  except Exception:
+    return [_pad_support_wrap(mesh, p, n, u, v, offsets, lift=lift, wrap=wrap)
+            for p, n, u, v in contacts]
+  support = []
+  for d in distance:
+    d[~np.isfinite(d)] = np.inf
+    d[d < 0.0] = 0.0
+    dmin = float(d.min())
+    support.append(0.0 if not np.isfinite(dmin) else
+                   float((np.isfinite(d) & (d - dmin <= float(wrap))).mean()))
+  return support
 
 
 def _pad_end_drop(mesh, p, n, along, half_len, miss=1.0):
@@ -3755,6 +3796,21 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
   with farthest-first order inside every stratum. All rankings are independent of ``keep``;
   a larger budget therefore preserves every old id for a fixed scene/configuration.
   """
+  profile_on = os.environ.get("ASSEMBLY_GRASP_PROFILE", "").lower() in (
+      "1", "true", "yes")
+  timings = {}  # non-overlapping exact-check categories: name -> [calls, seconds]
+
+  def measured(name, fn, *args, **kwargs):
+    if not profile_on:
+      return fn(*args, **kwargs)
+    t0 = time.perf_counter()
+    try:
+      return fn(*args, **kwargs)
+    finally:
+      row = timings.setdefault(name, [0, 0.0])
+      row[0] += 1
+      row[1] += time.perf_counter() - t0
+
   def part_pose(row):
     pose = np.asarray(row[0], dtype=float)
     if shape_quat is None:
@@ -3785,6 +3841,54 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
   retract_max = 0.5 * _PAD_HALF_ALONG
   retract_clearance = 2.0e-4
 
+  # Retraction can only help when a finger's closing sweep reaches the table. A sphere
+  # enclosing every finger proxy throughout its full physical stroke supplies a sound
+  # broad-phase reject above the table. Unknown hand/table geometry falls through to the
+  # original exact certificate. The table's oriented-box upper z bound is deliberately
+  # conservative, including its optional rounded-edge radius.
+  table_upper_z = None
+  finger_sweep_bounds = {}
+  parked_role_states = {}
+  if checker is not None and checker.closure_check and hasattr(checker, "template"):
+    table = checker.template.getFrame("table")
+    if table is not None and "box" in str(table.getShapeType()).lower():
+      size = np.asarray(table.getSize(), dtype=float).ravel()
+      if size.size >= 3 and np.all(np.isfinite(size)) and np.all(size >= 0.0):
+        pose = np.asarray(table.getPose(), dtype=float)
+        table_upper_z = (float(pose[2])
+                         + float(np.abs(_quat_to_R(pose[3:])[2]) @ (size[:3] / 2.0))
+                         + float(np.sum(size[3:])))
+
+  def finger_sweep_above_table(row, robot, state):
+    if table_upper_z is None:
+      return False
+    if robot not in finger_sweep_bounds:
+      from gripper_closure import finger_sweep_radius_bound
+      slot = checker._slot_of[robot]
+      finger_sweep_bounds[robot] = finger_sweep_radius_bound(
+          checker.template, checker.slots[slot])
+    radius = finger_sweep_bounds[robot]
+    if radius is None:
+      return False
+    part_world = _state_part_poses(state, asm, lift=0.0)[part]
+    pose = part_pose(row)
+    tool_z = float(part_world[2] + _quat_to_R(part_world[3:])[2] @ pose[:3])
+    state_key = id(state)
+    if state_key not in parked_role_states:
+      group = next(group for group in state.subassemblies() if part in group)
+      held = (any(state.parent.get(p, (None,))[0] == "gripper" for p in group)
+              or any(c[0] == "grasp" for p in group
+                     for c in state.supports.get(p, ())))
+      on_table = any(("table",) in state.supports.get(p, ()) for p in group)
+      parked_role_states[state_key] = bool(held and not on_table)
+    if parked_role_states[state_key]:
+      # CollisionChecker._scene_for parks a free held component at +5m in z.
+      tool_z += 5.0
+    above = tool_z - radius > table_upper_z + 1e-3
+    if above and profile_on:
+      timings.setdefault("table_bound_skip", [0, 0.0])[0] += 1
+    return above
+
   def row_at_part_pose(row, pose):
     """Replace a row pose supplied in PART coordinates (rows precede shape rotation)."""
     pose = np.asarray(pose, dtype=float)
@@ -3804,6 +3908,8 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
     complete open hand and closure sweep, so this never converts collision into tolerance.
     """
     if checker is None or not checker.closure_check or kind != "two_finger":
+      return None
+    if finger_sweep_above_table(row, robot, state):
       return None
     pose = part_pose(row)
     res = checker.pose_grasp_closure_result(state, part, pose, asm, robot)
@@ -3889,7 +3995,8 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
     if _GRASP_PHYSICS_CHECK:
       if _GRASP_PHYSICS_CTX is None:
         raise RuntimeError("--grasp-physics-check enabled before its robot context was installed")
-      cert = _GRASP_PHYSICS_CTX.check(part, physics_pose, "two_finger")
+      cert = measured("physics", _GRASP_PHYSICS_CTX.check,
+                      part, physics_pose, "two_finger")
       physics_by_kind["two_finger"] = cert.metadata()
     for kind, robot in sorted(kind_robot.items()):
       # Pinch rows deliberately carry min_dim=0 and are not vacuum candidates. Canonical and
@@ -3900,7 +4007,8 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
         kind_ok = kind_ok and bool(physics_by_kind[kind]["feasible"])
       if kind_ok and checker.closure_check and kind == "two_finger":
         isolated = ctx.get("isolated_states", {}).get(part)
-        cert = (None if isolated is None else checker.pose_grasp_closure_result(
+        cert = (None if isolated is None else measured(
+            "acquisition_close", checker.pose_grasp_closure_result,
             isolated, part, physics_pose, asm, robot))
         acquisition_by_kind[kind] = bool(cert is not None and cert.feasible)
         if cert is None or not cert.feasible:
@@ -3912,13 +4020,14 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
       if kind_ok:
         pose = part_pose(row)
         for role, state in role_states().items():
-          if not checker.pose_collision_free(state, part, pose, asm, robot=robot):
+          if not measured("scene_open", checker.pose_collision_free,
+                          state, part, pose, asm, robot=robot):
             continue
           # With --grasp-closure-check, a scene label means OPEN geometry clears and the
           # receiver can actually close in that scene.  Failed closes are not thrown away:
           # they remain in the family/FPS fallback pools below, but no longer consume the
           # scarce pick/assemble-reserved slots ahead of closure-capable candidates.
-          close_ok = (checker.pose_grasp_closure_free(
+          close_ok = (measured("scene_close", checker.pose_grasp_closure_free,
               state, part, pose, asm, robot, **({"closing": False} if role == "assemble" else {}))
               if checker.closure_check else True)
           if close_ok:
@@ -3945,7 +4054,7 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
     poses = [part_pose(row)]
     source_rows = [(row, origin)]
     for kind, robot in sorted(kind_robot.items()):
-      repaired = recentered_closure_pose(row, kind, robot)
+      repaired = measured("recenter", recentered_closure_pose, row, kind, robot)
       if repaired is None:
         continue
       pose, delta, tag = repaired
@@ -3963,7 +4072,8 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
         continue
       for source_row, source_origin in source_rows:
         for role, state in role_states().items():
-          repaired = repaired_table_pose(source_row, kind, robot, role, state)
+          repaired = measured("table_retract", repaired_table_pose,
+                              source_row, kind, robot, role, state)
           if repaired is None:
             continue
           pose, delta, tag = repaired
@@ -4018,14 +4128,13 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
     probe_categories.append(_fps_row_order(raw_bad))
   probe, probe_seen, cursors = [], set(), [0] * len(probe_categories)
   probe_cap = 64 if spec[0] in ("mesh", "compound") else 32
-  # The historical scene probe was deliberately fixed at 64/32 because ordinary open-hand
-  # and proxy-closure classification is expensive.  The opt-in articulated-finger physics
-  # gate is a materially stronger filter, however: on the Fabrica wheels it can retain only
-  # one pose from a 64-row mesh probe.  Silently keeping the old probe cap when the user asks
-  # for a larger immutable master means ``--grasp-sampler-keep`` cannot actually widen that
-  # certified set.  Honor the requested master size only in this explicit expensive mode;
-  # the standard sampler and every existing grasp id remain byte-identical.
-  if _GRASP_PHYSICS_CHECK:
+  # The historical scene probe was fixed at 64/32 because classifying the raw cloud
+  # against scene geometry and virtual closure is expensive. A requested fixed master (or
+  # the articulated-finger physics gate) must probe at least its own maximum: otherwise
+  # widening K could never reveal a candidate concealed by this older source cap.
+  if (_GRASP_PHYSICS_CHECK or
+      (_SAMPLED_GRASPS.get("fixed_master") and
+       int(_SAMPLED_GRASPS["master_keep"]) > int(_SAMPLED_GRASPS["initial_keep"]))):
     probe_cap = max(probe_cap, int(_SAMPLED_GRASPS.get("master_keep", keep)))
   probe_cap = min(len(raw), probe_cap)
   def extend_probe(target):
@@ -4092,7 +4201,7 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
             if receiver in connected:
               continue
             if robot_pairs and any(
-                checker.pose_pair_grasp_free(
+                measured("pair", checker.pose_pair_grasp_free,
                     ctx["s0"], part, part_pose(a[0]), part_pose(b[0]), asm, ra, rb)
                 for a in left for ra, rb in robot_pairs):
               connected.add(receiver)
@@ -4162,9 +4271,10 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
           continue
         close_roles = list(meta["closure_by_kind"].get(kind, ()))
         for role, state in sorted(placement_states.items()):
-          if not checker.pose_collision_free(state, part, pose, asm, robot=robot):
+          if not measured("scene_open", checker.pose_collision_free,
+                          state, part, pose, asm, robot=robot):
             continue
-          close_ok = checker.pose_grasp_closure_free(
+          close_ok = measured("scene_close", checker.pose_grasp_closure_free,
               state, part, pose, asm, robot) if checker.closure_check else True
           if close_ok:
             roles.append(role)
@@ -4396,7 +4506,7 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
             continue
           found = None
           for a in left:
-            if any(checker.pose_pair_grasp_free(
+            if any(measured("pair", checker.pose_pair_grasp_free,
                 ctx["s0"], part, part_pose(a[0]), part_pose(b[0]), asm, ra, rb)
                    for ra, rb in robot_pairs):
               found = (a, b)
@@ -4480,6 +4590,9 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
       "handover_routes": tuple(
           (ka, kb, selected_ids.get(id(a[0])), selected_ids.get(id(b[0])))
           for ka, kb, a, b in handover_routes),
+      "profile_checks": ({name: {"calls": count, "seconds": seconds}
+                          for name, (count, seconds) in timings.items()}
+                         if profile_on else None),
   }
   return selected
 
@@ -4627,6 +4740,21 @@ def _sampled_raw_rows(spec, offset, base_key, cfgv):
   dominant repeated CAD proximity work without caching a scene-dependent verdict.
   """
   import zlib
+  profile_on = os.environ.get("ASSEMBLY_GRASP_PROFILE", "").lower() in (
+      "1", "true", "yes")
+  timings = {}
+
+  def measured(name, fn, *args, **kwargs):
+    if not profile_on:
+      return fn(*args, **kwargs)
+    start = time.perf_counter()
+    try:
+      return fn(*args, **kwargs)
+    finally:
+      row = timings.setdefault(name, [0, 0.0])
+      row[0] += 1
+      row[1] += time.perf_counter() - start
+
   raw_key = (base_key, int(cfgv["candidates"]), bool(cfgv.get("roll_refine", False)),
              float(wrench.PARAMS.get("vacuum_seal_diameter", 0.025)))
   hit = _sampled_raw_cache_load(raw_key)
@@ -4634,15 +4762,17 @@ def _sampled_raw_rows(spec, offset, base_key, cfgv):
     return hit
 
   t0 = time.perf_counter()
-  mesh = _spec_mesh(spec)
+  mesh = measured("mesh", _spec_mesh, spec)
   rng_seed = zlib.crc32(repr(base_key).encode())
-  pts, fidx = _sample_surface_deterministic(mesh, cfgv["candidates"], int(rng_seed))
+  pts, fidx = measured("surface", _sample_surface_deterministic,
+                       mesh, cfgv["candidates"], int(rng_seed))
   normals = mesh.face_normals[np.asarray(fidx, int)]
-  clr = _edge_clearance(mesh, np.asarray(pts, dtype=float))
+  clr = measured("edge", _edge_clearance, mesh, np.asarray(pts, dtype=float))
   min_support = float(cfgv.get("pad_support", 0.0))
   wrap = cfgv.get("wrap")
   cup = _pad_samples_disc(0.5 * float(wrench.PARAMS.get("vacuum_seal_diameter", 0.025)))
   rect = _pad_samples_rect(_PAD_HALF_ACROSS, _PAD_HALF_ALONG)
+  symmetric_rect = np.allclose(rect, -rect[::-1], rtol=0.0, atol=1e-16)
 
   suction, antip = [], []
   for k in range(len(pts)):
@@ -4652,28 +4782,29 @@ def _sampled_raw_rows(spec, offset, base_key, cfgv):
       continue
     n = n / nn
     if spec[0] in ("mesh", "compound"):
-      surf, mind = _mesh_patch_class(mesh, int(fidx[k]))
+      surf, mind = measured("patch", _mesh_patch_class, mesh, int(fidx[k]))
     else:
-      surf, mind = _surface_class_and_min_dim(spec, n)
+      surf, mind = measured("patch", _surface_class_and_min_dim, spec, n)
     q = _grasp_quat_for_normal(n)
     pose = np.concatenate([p + offset * n, q])
     u, v = _plane_axes(n)
     if min_support > 0.0:
-      sup = (_pad_support_wrap(mesh, p, n, u, v, cup, wrap=wrap) if wrap is not None
-             else _pad_support(mesh, p, n, u, v, cup))
+      sup = (measured("suction_support", _pad_support_wrap,
+                      mesh, p, n, u, v, cup, wrap=wrap) if wrap is not None
+             else measured("suction_support", _pad_support, mesh, p, n, u, v, cup))
     else:
       sup = 1.0
     suction.append((pose, surf, mind, np.concatenate([p, 0.02 * n]), float(clr[k]), sup,
                     "suction", False))
 
-    p2, n2 = _ray_exit(spec, p - 1e-9 * n, -n)
+    p2, n2 = measured("opposing_ray", _ray_exit, spec, p - 1e-9 * n, -n)
     width = float(np.linalg.norm(p2 - p))
     if width <= 1e-4 or width > _MAX_GRASP_WIDTH or float(n2 @ (-n)) <= 0.95:
       continue
     y = (p2 - p) / width
     u0, v0 = _plane_axes(y)
     if min_support > 0.0:
-      _, z = _best_pad_axes(mesh, p, p2, y, u0, v0)
+      _, z = measured("best_axes", _best_pad_axes, mesh, p, p2, y, u0, v0)
     else:
       ref = (np.array([0.0, 0.0, 1.0]) if abs(float(y[2])) < 0.9
              else np.array([1.0, 0.0, 0.0]))
@@ -4686,19 +4817,45 @@ def _sampled_raw_rows(spec, offset, base_key, cfgv):
       if bool(cfgv.get("roll_refine", False)):
         z_rolls += [(z + x) / np.sqrt(2.0), (z - x) / np.sqrt(2.0),
                     (-z + x) / np.sqrt(2.0), (-z - x) / np.sqrt(2.0)]
-    p2_clearance = float(_edge_clearance(mesh, p2)[0])
+    p2_clearance = float(measured("exit_edge", _edge_clearance, mesh, p2)[0])
+    # The same finite-pad point queries were formerly issued separately for every jaw
+    # and roll. One batch avoids repeatedly entering trimesh's nearest-surface backend.
+    if min_support > 0.0 and wrap is not None:
+      # A rectangular pad grid is centrally symmetric. Reversing both in-plane axes
+      # (an opposite pinch roll) visits exactly the same contact points, so its score
+      # is identical. Preserve the original roll/ID order while evaluating each pair once.
+      if symmetric_rect and len(z_rolls) in (4, 8):
+        roll_pairs = [(0, 1), (2, 3)]
+        if len(z_rolls) == 8:
+          roll_pairs += [(4, 7), (5, 6)]
+      else:
+        # A future roll lattice should stay correct even before it is paired.
+        roll_pairs = [(i, i) for i in range(len(z_rolls))]
+      pad_contacts = []
+      for first, _second in roll_pairs:
+        z_dir = z_rolls[first]
+        x_dir = np.cross(y, z_dir)
+        pad_contacts.extend(((p, -y, x_dir, z_dir), (p2, y, x_dir, z_dir)))
+      unique_scores = measured("pinch_support", _pad_support_wrap_many,
+                               mesh, pad_contacts, rect, wrap=wrap)
+      pad_scores = [0.0] * (2 * len(z_rolls))
+      for pair_index, (first, second) in enumerate(roll_pairs):
+        scores = unique_scores[2 * pair_index:2 * pair_index + 2]
+        pad_scores[2 * first:2 * first + 2] = scores
+        pad_scores[2 * second:2 * second + 2] = scores
     for zi, z_dir in enumerate(z_rolls):
       x_dir = np.cross(y, z_dir)
       if min_support > 0.0:
         if wrap is not None:
-          sup = min(_pad_support_wrap(mesh, p, -y, x_dir, z_dir, rect, wrap=wrap),
-                    _pad_support_wrap(mesh, p2, y, x_dir, z_dir, rect, wrap=wrap))
+          sup = min(pad_scores[2 * zi], pad_scores[2 * zi + 1])
         else:
-          sup = min(_pad_support(mesh, p, -y, x_dir, z_dir, rect),
-                    _pad_support(mesh, p2, y, x_dir, z_dir, rect))
+          sup = min(measured("pinch_support", _pad_support,
+                             mesh, p, -y, x_dir, z_dir, rect),
+                    measured("pinch_support", _pad_support,
+                             mesh, p2, y, x_dir, z_dir, rect))
       else:
         sup = 1.0
-      p_exit, _n_exit = _ray_exit(spec, mid, -z_dir)
+      p_exit, _n_exit = measured("approach_ray", _ray_exit, spec, mid, -z_dir)
       travel = float(np.linalg.norm(p_exit - mid))
       pose = np.concatenate([
           mid - z_dir * (travel + offset),
@@ -4709,6 +4866,12 @@ def _sampled_raw_rows(spec, offset, base_key, cfgv):
                     min(float(clr[k]), p2_clearance), sup, "pinch", zi >= 2))
 
   _SAMPLED_RAW_CACHE_STATS["build_s"] += time.perf_counter() - t0
+  if profile_on:
+    detail = ", ".join(
+        f"{name}={seconds:.2f}s/{count}x"
+        for name, (count, seconds) in sorted(timings.items(),
+                                              key=lambda item: -item[1][1]))
+    print(f"[grasp-prof] raw-detail: {detail}", flush=True)
   return _sampled_raw_cache_store(raw_key, (suction, antip))
 
 
@@ -4737,15 +4900,23 @@ def _sampled_grasp_views(spec, offset, part=None):
   # This is the expensive, scene-invariant half of sampling. Identical part geometries share
   # it inside one process; benchmark runs may additionally share it through the optional
   # content-addressed disk cache. Scene-role collision and closure labels remain below.
+  profile_on = os.environ.get("ASSEMBLY_GRASP_PROFILE", "").lower() in (
+      "1", "true", "yes")
+  raw_before = dict(_SAMPLED_RAW_CACHE_STATS) if profile_on else None
+  raw_t0 = time.perf_counter() if profile_on else None
   suction, antip = _sampled_raw_rows(spec, offset, base_key, cfgv)
+  raw_seconds = time.perf_counter() - raw_t0 if profile_on else 0.0
 
   # The positional list is the finite MASTER. Concrete local fills may expose a smaller
   # per-part prefix without regenerating this list, so ids and all cached IK witnesses stay
   # valid across widening epochs.
   keep = cfgv.get("master_keep", cfgv["keep"])
+  master_t0 = time.perf_counter() if profile_on else None
   selected = _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, sq)
+  master_seconds = time.perf_counter() - master_t0 if profile_on else 0.0
   if not selected:
     raise ValueError(f"--grasp-sampler: no feasible candidates for shape {spec!r}")
+  materialize_t0 = time.perf_counter() if profile_on else None
   poses, surfs, mins, meta = [], [], [], []
   for row, extra in selected:
     pose, surf, mind, _f, _clr, _sup, _fam = row[:7]
@@ -4756,6 +4927,20 @@ def _sampled_grasp_views(spec, offset, part=None):
     poses.append(pose); surfs.append(surf); mins.append(float(mind))
     meta.append({"edge_clearance": float(_clr), "pad_support": float(_sup),
                  "family": _fam, **extra})
+  if profile_on:
+    stats = _SAMPLED_RAW_CACHE_STATS
+    source = ("memory" if stats["memory_hits"] > raw_before["memory_hits"] else
+              "disk" if stats["disk_hits"] > raw_before["disk_hits"] else "built")
+    audit = _SAMPLED_SELECTION_DIAGNOSTICS[part]
+    checks = audit.pop("profile_checks") or {}
+    audit["profile"] = {
+        "raw_source": source, "raw_seconds": raw_seconds,
+        "master_seconds": master_seconds,
+        "materialize_seconds": time.perf_counter() - materialize_t0,
+        "checks": checks,
+        "master_other_seconds": max(0.0, master_seconds - sum(
+            item["seconds"] for item in checks.values())),
+    }
   _SAMPLED_META_CACHE[key] = tuple(meta)
   hit = _SAMPLED_VIEWS_CACHE[key] = (tuple(poses), tuple(surfs), tuple(mins))
   return hit
@@ -4770,7 +4955,8 @@ def sampled_grasp_meta(spec, offset=0.01, part=None):
   if _SAMPLED_GRASPS is None:
     return ()
   _sampled_grasp_views(spec, offset, part)                  # fills both caches
-  return _SAMPLED_META_CACHE.get(_sampled_keys(spec, offset, part)[1], ())
+  meta = _SAMPLED_META_CACHE.get(_sampled_keys(spec, offset, part)[1], ())
+  return meta[:_SAMPLED_GRASPS["keep"]] if _SAMPLED_GRASPS.get("fixed_master") else meta
 
 
 def sampled_grasp_selection_diagnostics(part=None):
@@ -4796,7 +4982,9 @@ def sampled_grasp_db_signature(assembly):
   h.update(b"assembly-grasp-db\0")
   for part in assembly.objects:
     spec = assembly.part_shape(part)
-    poses, surfaces, mins = _sampled_grasp_views(spec, 0.01, part)
+    poses = part_grasp_poses(spec, offset=0.01, part=part)
+    surfaces = part_grasp_surfaces(spec, part=part)
+    mins = part_grasp_face_min_dims(spec, part=part)
     meta = sampled_grasp_meta(spec, 0.01, part)
     h.update(part.encode() + b"\0")
     h.update(np.asarray(poses, dtype="<f8").tobytes())
@@ -5500,7 +5688,8 @@ def part_grasp_poses(spec, rolls=None, offset=0.01, part=None):
   -- per current model decision); spheres get the same six directions at radius standoff.
   Rotated/off-center grasp variants are a later, purely additive extension."""
   if _SAMPLED_GRASPS is not None:                          # --grasp-sampler second path
-    return _sampled_grasp_views(spec, offset, part)[0]
+    poses = _sampled_grasp_views(spec, offset, part)[0]
+    return poses[:_SAMPLED_GRASPS["keep"]] if _SAMPLED_GRASPS.get("fixed_master") else poses
   if spec[0] in ("mesh", "compound"):
     raise ValueError("mesh/compound parts need --grasp-sampler: the 6-face enumerator's "
                      "grasp ids are cube-face semantics and would silently mis-model them")
@@ -5629,7 +5818,8 @@ def part_grasp_surfaces(spec, rolls=None, part=None):
   # sphere is curved everywhere. Used to restrict the VACUUM to flat surfaces (a suction
   # cup cannot seal on strong curvature) -- the two-finger keeps curved grasps.
   if _SAMPLED_GRASPS is not None:                          # --grasp-sampler second path
-    return list(_sampled_grasp_views(spec, 0.01, part)[1])
+    rows = _sampled_grasp_views(spec, 0.01, part)[1]
+    return list(rows[:_SAMPLED_GRASPS["keep"]] if _SAMPLED_GRASPS.get("fixed_master") else rows)
   if spec[0] in ("mesh", "compound"):
     raise ValueError("mesh/compound parts need --grasp-sampler (see part_grasp_poses)")
   if rolls is None:
@@ -5657,7 +5847,8 @@ def part_grasp_face_min_dims(spec, rolls=None, part=None):
   # curved gate already handles them). Used for the VACUUM SEAL gate: a suction cup cannot
   # seal on a face smaller than its own diameter (wrench.PARAMS['vacuum_seal_diameter']).
   if _SAMPLED_GRASPS is not None:                          # --grasp-sampler second path
-    return list(_sampled_grasp_views(spec, 0.01, part)[2])
+    rows = _sampled_grasp_views(spec, 0.01, part)[2]
+    return list(rows[:_SAMPLED_GRASPS["keep"]] if _SAMPLED_GRASPS.get("fixed_master") else rows)
   if spec[0] in ("mesh", "compound"):
     raise ValueError("mesh/compound parts need --grasp-sampler (see part_grasp_poses)")
   if rolls is None:
@@ -6025,6 +6216,9 @@ def compute_cube_grasps(assembly, subassembly, offset=0.01,
   # collision-check scene: the subassembly parts, in the ref frame, PLUS one pre-loaded
   # gripper (added once, then just repositioned per candidate -- avoids re-parsing the
   # gripper .g for every face). A fresh copy per query, because rai caches the broadphase.
+  # This scene is copied once per candidate solely for FCL queries. The exact CAD visual
+  # children have contact=0; copying their meshes cannot affect a verdict, but is expensive
+  # for CAD assemblies. Viewers and other callers keep visuals by default.
   base_scene = make_subassembly_scene(assembly, subassembly)
   base_scene.addFile(gripper_path, namePrefix="ee_")
   from env import maybe_tighten_fingers          # the grasp DB must be filtered against the

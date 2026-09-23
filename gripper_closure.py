@@ -157,6 +157,37 @@ def _finger_groups(C: ry.Config, prefix: str):
     return result
 
 
+def finger_sweep_radius_bound(C: ry.Config, prefix: str) -> Optional[float]:
+    """Conservative tool-centred sphere containing every finger proxy during closure.
+
+    This is only a broad-phase *non-intersection* certificate. Unknown shape kinds return
+    None so the caller falls back to the exact closure test. Full rather than half primitive
+    dimensions cover RAI capsule and rounded-box size conventions.
+    """
+    model, groups, center_name = _finger_groups(C, prefix)
+    if model not in _MAX_INWARD or center_name is None:
+        return None
+    centre = np.asarray(C.getFrame(center_name).getPosition(), dtype=float)
+    bound = 0.0
+    for group in groups:
+        for name in group:
+            frame = C.getFrame(name)
+            shape = str(frame.getShapeType()).lower()
+            size = np.asarray(frame.getSize(), dtype=float).ravel()
+            if not np.all(np.isfinite(size)) or np.any(size < 0.0):
+                return None
+            if "capsule" in shape and size.size >= 2:
+                local_radius = float(np.sum(size))
+            elif "box" in shape and size.size >= 3:
+                local_radius = float(np.sum(size))
+            else:
+                return None
+            distance = float(np.linalg.norm(
+                np.asarray(frame.getPosition(), dtype=float) - centre))
+            bound = max(bound, distance + local_radius + _MAX_INWARD[model])
+    return bound + 1e-3  # geometric/numeric cushion; false negatives are not permitted
+
+
 def _copy(C: ry.Config) -> ry.Config:
     out = ry.Config()
     out.addConfigurationCopy(C)
