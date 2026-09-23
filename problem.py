@@ -3918,8 +3918,9 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
           # receiver can actually close in that scene.  Failed closes are not thrown away:
           # they remain in the family/FPS fallback pools below, but no longer consume the
           # scarce pick/assemble-reserved slots ahead of closure-capable candidates.
-          close_ok = checker.pose_grasp_closure_free(
-              state, part, pose, asm, robot) if checker.closure_check else True
+          close_ok = (checker.pose_grasp_closure_free(
+              state, part, pose, asm, robot, **({"closing": False} if role == "assemble" else {}))
+              if checker.closure_check else True)
           if close_ok:
             hits.append(role)
             close_hits.append(role)
@@ -4498,11 +4499,14 @@ def _sampled_keys(spec, offset, part=None):
   # was False.  Keep strictness in the filtered-view cache key instead.  This also makes the
   # strict/non-strict comparison a matched filtering ablation over identical proposals.
   # ``candidates`` is a prefix length of one deterministic proposal stream, not a proposal
-  # distribution parameter. Keeping it out of the RNG key makes N and larger N' genuinely
+  # distribution parameter. Keeping its variable value out of the RNG key makes N and larger N' genuinely
   # nested; previously asking for more candidates silently resampled every old contact and
   # turned candidate widening into an unrelated lottery. It remains in the view-cache key
   # below because the materialized finite cloud is of course a different size.
-  base = (_sampling_spec_key(spec), float(offset), 2, cfgv["seed"],
+  # Preserve the historical default (96-candidate) stream as the fixed salt. Simply deleting
+  # that tuple entry changed every default grasp when nesting was introduced, throwing away
+  # previously covered contacts even in runs that never widened their candidate budget.
+  base = (_sampling_spec_key(spec), float(offset), 2, cfgv["seed"], 96,
           float(cfgv.get("margin", 0.0)), float(cfgv.get("pad_support", 0.0)),
           cfgv.get("wrap"))
   ctx = _SAMPLED_SCENE_CTX

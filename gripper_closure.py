@@ -15,6 +15,7 @@ supplies a scene in which every relevant part/gripper has already been posed.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from typing import Dict, Optional, Sequence, Tuple
 
 import numpy as np
@@ -23,7 +24,7 @@ import robotic as ry
 
 # Bump whenever the calibrated proxy semantics change. It keys the cheap-check cache and the
 # sampled grasp database provenance, so a saved grasp id cannot silently acquire new meaning.
-VERSION = 6
+VERSION = 7
 
 # These are physical/proxy calibration constants, not search-tuning knobs.  Both current
 # models expose an approximately 80--115 mm open jaw gap and have about 40 mm inward travel
@@ -48,6 +49,7 @@ _BISECTION_STEPS = 4
 # scene. Keep its inexpensive geometric result across the cheap floating gate and the achieved
 # witness gate; each caller still performs its own environment sweep.
 _APERTURE_CACHE: Dict[Tuple, ClosureResult] = {}
+_APERTURE_CACHE_LIMIT = 4096
 
 # Disposable closure scenes are copied thousands of times while constructing a sampled grasp
 # database, but their frame *schema* is identical.  Discovering the two finger groups by
@@ -168,23 +170,26 @@ def _aperture_key(C: ry.Config, model: str, groups, target: str):
         return None
     Rt = _quat_to_R(tf.getQuaternion())
     pt = np.asarray(tf.getPosition(), dtype=float)
-    rel = []
-    for group in groups:
-        for name in group:
-            f = C.getFrame(name)
-            rel.extend(np.round(Rt.T @ (np.asarray(f.getPosition(), dtype=float) - pt), 4))
-            rel.extend(np.round((Rt.T @ _quat_to_R(f.getQuaternion())).ravel(), 4))
+    def geometry(name):
+        f = C.getFrame(name)
+        shape = str(f.getShapeType())
+        mesh = None
+        if "mesh" in shape.lower():
+            # Equal bounding sizes do not imply equal convex collision geometry.
+            mesh = hashlib.blake2b(np.asarray(f.getMeshPoints(), dtype=float).tobytes(),
+                                   digest_size=16).digest()
+        size = f.getSize()
+        return (shape, () if size is None else tuple(np.asarray(size, dtype=float).ravel()), mesh,
+                tuple(np.round(Rt.T @ (np.asarray(f.getPosition()) - pt), 12)),
+                tuple(np.round((Rt.T @ _quat_to_R(f.getQuaternion())).ravel(), 12)))
+
+    fingers = tuple(tuple(geometry(name) for name in group) for group in groups)
     shapes = []
     for name in C.getFrameNames():
         n = str(name)
         if n == target or n.startswith(target + "__shape"):
-            f = C.getFrame(n)
-            try:
-                shapes.append((n[len(target):], str(f.getShapeType()),
-                               tuple(np.round(f.getSize(), 5))))
-            except Exception:
-                shapes.append((n[len(target):], "mesh", ()))
-    return (model, tuple(shapes), tuple(np.asarray(rel, dtype=float)))
+            shapes.append((n[len(target):], geometry(n)))
+    return (model, tuple(shapes), fingers)
 
 
 def _finger_setup(C: ry.Config, prefix: str):
@@ -265,6 +270,10 @@ def _contact_aperture(C: ry.Config, prefix: str, target: str):
     cached = _APERTURE_CACHE.get(key) if key is not None else None
     if cached is not None:
         return cached, (model, groups, axis, positions, signs)
+    # Queries at distinct IK iterates need not live for the whole multi-milestone search.
+    # FIFO eviction changes only reuse, never a certificate or the optimization result.
+    if key is not None and len(_APERTURE_CACHE) >= _APERTURE_CACHE_LIMIT:
+        _APERTURE_CACHE.pop(next(iter(_APERTURE_CACHE)))
 
     max_inward = _MAX_INWARD[model]
     work = _copy(C)
@@ -354,7 +363,7 @@ def contact_aperture(C: ry.Config, receiver_prefix: str, target: str) -> Closure
 
 
 def certify(C: ry.Config, receiver_prefix: str, target: str,
-            existing_closures=()) -> ClosureResult:
+            existing_closures=(), *, closing=True) -> ClosureResult:
     """Certify a virtual parallel-jaw closure in an already posed collision scene.
 
     ``existing_closures`` contains ``(prefix, contacted_part)`` pairs for hands already
@@ -399,9 +408,10 @@ def certify(C: ry.Config, receiver_prefix: str, target: str,
         _move_to_shift(work, holder_positions, holder_axis, holder_groups, holder_signs,
                        float(holder_res.aperture or 0.0))
 
-    # The contact aperture was solved without environmental blockers.  Now certify every point
-    # of the actual receiver sweep against holders, the rest of the assembly, table and arms.
-    samples = np.linspace(0.0, float(res.aperture or 0.0), _SCAN_STEPS + 1)
+    # Acquisition checks the whole close. An already-held assembly endpoint does not reopen
+    # the fingers: only its closed geometry must clear the newly assembled neighbours.
+    samples = (np.linspace(0.0, float(res.aperture or 0.0), _SCAN_STEPS + 1)
+               if closing else [float(res.aperture or 0.0)])
     for shift in samples:
         _move_to_shift(work, positions, axis, groups, signs, float(shift))
         _ds, blocked = _contacts(work, groups, target)

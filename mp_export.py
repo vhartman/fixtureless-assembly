@@ -2117,9 +2117,12 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
   from multi_robot_multi_goal_planning.planners.termination_conditions import (
       RuntimeTerminationCondition, PlannerTerminationCondition)
   cfg = BaseRRTConfig()
-  # internal (tree_extension) shortcutting is only meaningful while optimizing; our EXPLICIT
-  # robot_mode_shortcut below is separate. optimize=True keeps improving cost until `runtime`.
-  cfg.shortcutting = optimize
+  # Run shortcutting once, in the explicit post-pass below. mr_bench otherwise performs an
+  # additional fixed 100-trial pass inside generate_path for every incumbent, without polling
+  # the planner deadline (Cooling: 105 s inside a nominal 60 s tree budget), then reinserts it
+  # into the trees. RRT* rewiring still runs with optimize=True; this disables only the duplicate
+  # embedded postprocessor and makes our shortcut_iters option own the shortcutting effort.
+  cfg.shortcutting = False
   # DISABLE mr_bench's pre-planning mode validation. It pre-checks each mode for a collision-
   # free goal and blacklists infeasible ones, propagating back -- on a SEQUENCE (linear) problem
   # a single collision-y keyframe (e.g. car-mini's active arm vs an idle arm parked at its entry
@@ -2294,6 +2297,7 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
     tag = "optimized" if optimize else "first solution"
     print(f"[mp/birrt] {tag}: {'%d states' % len(path) if path else 'NO path'}")
   if path and shortcut:
+    _shortcut_wall_start = _time_mod.perf_counter()
     from multi_robot_multi_goal_planning.problems.util import path_cost
     before = path_cost(path, problem.batch_config_cost)
     res = (shortcut_resolution if shortcut_resolution is not None
@@ -2335,6 +2339,9 @@ def run_birrt(problem, runtime=60.0, shortcut=True, shortcut_iters=1000,
     else:
       raise ValueError(f"unknown shortcut_strategy {shortcut_strategy!r}")
     info["shortcut_strategy"] = strategy
+    info["shortcut_wall_s"] = _time_mod.perf_counter() - _shortcut_wall_start
+    print(f"[mp-prof] shortcut_wall_s={info['shortcut_wall_s']:.6f} "
+          f"strategy={strategy} budget={shortcut_iters}")
     if verbose:
       after = path_cost(path, problem.batch_config_cost)
       print(f"[mp/birrt] shortcut: {len(path)} states, cost {before:.3f} -> {after:.3f}")

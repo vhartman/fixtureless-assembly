@@ -279,6 +279,7 @@ class CollisionChecker:
       template.getFrame(prefix + "ur_base").setPosition(_park_pos(i))
     self.template = template
     self._verdicts = {}                                    # repeated scene signature -> bool
+    self._sampled_pair_verdicts = {}
     # Scene signatures are large nested tuples. A wide search can issue hundreds of thousands
     # of one-off checks, and retaining every key made this exact cache consume >1 GiB between
     # LNS windows. Admit only on the second access (the standard 2Q/second-chance idea): the
@@ -543,7 +544,8 @@ class CollisionChecker:
     cleanly around the picked singleton and subsequently intersect a newly mated neighbour
     while retaining exactly the same grasp.  The fixed-open floating proxy cannot detect
     that case.  Rebuild the resulting state, pose all other holders at their terminal
-    apertures, and require each fingered holder's complete close sweep to remain clear.
+    apertures, and require each fingered holder's closed endpoint to remain clear. Assembly
+    does not reopen the fingers; repeating the acquisition sweep here rejects valid inserts.
     Vacuum hands have no articulated close and therefore pass through ``certify`` directly.
     """
     if not self.closure_check:
@@ -562,7 +564,7 @@ class CollisionChecker:
       existing = [(other_prefix, other_part)
                   for other_robot, other_prefix, other_part in holders
                   if other_robot != robot]
-      res = _certify_closure(C_col, prefix, part, existing_closures=existing)
+      res = _certify_closure(C_col, prefix, part, existing_closures=existing, closing=False)
       if not res.feasible:
         ok = False
         failed = (robot, part)
@@ -604,6 +606,18 @@ class CollisionChecker:
     """
     if first_robot == second_robot:
       return False
+    # Before IDs exist, identical tool models still define the same geometric query. The
+    # sampler tries all ordered robot pairs; four identical tools otherwise repeat each
+    # rejected closure twelve times. Keep direction, poses, scene and actual model paths.
+    pair_key = (self._sig(state, ()), gpart, bool(self.closure_check),
+                self.robot_gripper_paths[first_robot], self.robot_gripper_paths[second_robot],
+                tuple(np.asarray(first_pose_7, dtype=float)),
+                tuple(np.asarray(second_pose_7, dtype=float)))
+    if pair_key in self._sampled_pair_verdicts:
+      return self._sampled_pair_verdicts[pair_key]
+    def finish(value):
+      self._sampled_pair_verdicts[pair_key] = bool(value)
+      return bool(value)
     free = State(state.parent, state.grasp, state.place, state.supports, state.poses)
     free.parent[gpart] = ("gripper", first_robot)
     free.place.pop(gpart, None)
@@ -612,24 +626,24 @@ class CollisionChecker:
               ("pose", second_robot, gpart, np.asarray(second_pose_7, dtype=float))]
     if not self._check(free, assembly, extra_grasps=extras,
                        note="sampled free-space handover pair"):
-      return False
+      return finish(False)
     if not self.closure_check:
-      return True
+      return finish(True)
     C_col, owners = self._scene_for(
         free, assembly, extra_grasps=extras, return_assignments=True)
     first = owners.get(first_robot)
     second = owners.get(second_robot)
     if first is None or second is None:
-      return False
+      return finish(False)
     # Direction matters: the first/giver is already closed before the receiver approaches.
     # Certify only the receiver's sweep with that existing closed hand, exactly like the
     # forward add_grasp gate. Requiring the impossible reverse acquisition too would reject a
     # perfectly usable directional handover.
     receiver = _certify_closure(C_col, second[0], gpart,
                                 existing_closures=[(first[0], gpart)])
-    return bool(receiver.feasible)
+    return finish(receiver.feasible)
 
-  def pose_grasp_closure_free(self, state, gpart, grasp_pose_7, assembly, robot):
+  def pose_grasp_closure_free(self, state, gpart, grasp_pose_7, assembly, robot, *, closing=True):
     """Virtual-close certificate for a sampler candidate before grasp ids exist.
 
     This is the pose-valued counterpart of :meth:`grasp_closure_free`.  The hybrid sampler
@@ -640,7 +654,8 @@ class CollisionChecker:
     """
     if not self.closure_check:
       return True
-    res = self.pose_grasp_closure_result(state, gpart, grasp_pose_7, assembly, robot)
+    res = self.pose_grasp_closure_result(state, gpart, grasp_pose_7, assembly, robot,
+                                         closing=closing)
     ok = bool(res is not None and res.feasible)
     reason = "receiver-slot-missing" if res is None else res.reason
     if not ok:
@@ -648,7 +663,7 @@ class CollisionChecker:
           self.closure_rejects.get(reason or "unknown", 0) + 1
     return ok
 
-  def pose_grasp_closure_result(self, state, gpart, grasp_pose_7, assembly, robot):
+  def pose_grasp_closure_result(self, state, gpart, grasp_pose_7, assembly, robot, *, closing=True):
     """Return the strict closure certificate for an explicit sampler pose.
 
     The boolean wrapper above is sufficient for search ranking, but scene-aware grasp
@@ -660,9 +675,9 @@ class CollisionChecker:
     if not self.closure_check:
       return None
     extra = ("pose", robot, gpart, np.asarray(grasp_pose_7, dtype=float))
-    key = ("pose-closure-result", _CLOSURE_MODEL_VERSION,
+    key = ("pose-closure-result", _CLOSURE_MODEL_VERSION, bool(closing),
            self._robot_kind.get(robot, robot), gpart,
-           tuple(np.round(np.asarray(grasp_pose_7, dtype=float), 4)),
+           tuple(np.asarray(grasp_pose_7, dtype=float)),
            self._sig(state, ()))
     if key in self._closure_results:
       return self._closure_results[key]
@@ -673,7 +688,7 @@ class CollisionChecker:
       res = None
     else:
       prefix, _ = receiver
-      res = _certify_closure(C_col, prefix, gpart)
+      res = _certify_closure(C_col, prefix, gpart, closing=closing)
     self._closure_results[key] = res
     return res
 
