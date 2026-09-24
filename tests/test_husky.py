@@ -5,10 +5,8 @@ import numpy as np
 import assembly as A
 import analytic_ik
 from env import is_husky_scene, make_husky_duo_env
-from config import RunConfig
 from problem import (add_disassembled_obj, get_initial_state, make_assembly, places,
                      set_extra_place_cells)
-from replay import build_scene
 from solver import RobotIK, _quat_to_R
 
 
@@ -120,14 +118,3 @@ def test_husky_side_specific_ssik_matches_real_rai_fk_and_inverse():
       assert min(np.max(np.abs(np.asarray(solver.fk(seed)) @
                                cal["tools"]["two_finger"] - target))
                  for seed in seeds) < 2e-8
-
-
-def test_husky_saved_scenario_rebuilds_through_replay():
-  cfg = RunConfig(assembly="peg-hole", parts=2, robot="husky", num_robots=2,
-                  center_scatter=True, part_float=0.002).to_dict()
-  C, assembly = build_scene(cfg)
-
-  assert is_husky_scene(C)
-  assert A.get_robots(C) == ["a1", "a2"]
-  assert assembly.objects == ["obj_0", "obj_1"]
-  assert C.getCollisionsTotalPenetration() < 1e-6

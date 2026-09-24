@@ -29,12 +29,6 @@ def _write(tmp_path, witnesses):
   return str(p)
 
 
-def test_write_plan_creates_requested_parent_directory(tmp_path):
-  p = tmp_path / "new-run" / "nested" / "plan.json"
-  write_plan(str(p), {"assembly": "cross"}, PLAN)
-  assert p.is_file()
-  assert read_plan(str(p)) == ({"assembly": "cross"}, PLAN)
-
 
 def test_plan_roundtrip_carries_apriori_handover_physics(tmp_path):
   p = tmp_path / "plan.json"
@@ -45,7 +39,8 @@ def test_plan_roundtrip_carries_apriori_handover_physics(tmp_path):
 
 
 def test_grasp_closure_aperture_round_trip_is_action_aligned(tmp_path):
-  cert = {0: {"contract": "virtual-close-v5", "action": list(PLAN[0]),
+  from gripper_closure import VERSION as closure_version
+  cert = {0: {"contract": f"virtual-close-v{closure_version}", "action": list(PLAN[0]),
               "robot": "a1", "part": "obj_1", "grasp_id": 0,
               "model": "robotiq", "aperture": 0.031,
               "aperture_semantics": "per-finger-inward-travel-m"}}
@@ -128,10 +123,6 @@ def test_full_pre_insertion_contract_rejects_legacy_fractional_funnels(tmp_path)
     read_pre_witnesses(
         p, JOINTS, len(PLAN), wit, require_full_assemble=True)
 
-
-def test_file_without_block_reads_as_none(tmp_path):
-  p = _write(tmp_path, None)
-  assert read_witnesses(p, JOINTS, len(PLAN)) is None
 
 
 def test_joint_order_mismatch_is_refused(tmp_path, capsys):

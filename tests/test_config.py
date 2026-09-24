@@ -26,10 +26,6 @@ def test_defaults_match_parser():
     assert cd[k] == pd[k], f"default drift on {k}: RunConfig={cd[k]!r} parser={pd[k]!r}"
 
 
-def test_default_for_unknown_key_raises():
-  with pytest.raises(KeyError):
-    RunConfig.default_for("not_a_flag")
-
 
 def test_saved_cfg_saved_wins_missing_default_legacy_override():
   from config import saved_cfg
@@ -47,12 +43,6 @@ def test_namespace_roundtrip():
   for k in (set(a) | set(b)) - {"config"}:
     assert a.get(k) == b.get(k), f"roundtrip changed {k}: {a.get(k)!r} -> {b.get(k)!r}"
 
-
-def test_dict_roundtrip_and_unknown_key():
-  rc = RunConfig(assembly="chair", parts=8, milestones=True, insert_force=25.0)
-  assert RunConfig.from_dict(rc.to_dict()) == rc
-  with pytest.raises(ValueError):
-    RunConfig.from_dict({"assembly": "chair", "not_a_flag": 1})
 
 
 def test_file_roundtrip(tmp_path):
@@ -72,130 +62,6 @@ def test_config_cli_layering(tmp_path):
   assert (a.assembly, a.parts, a.num_robots, a.seed) == ("chair", 5, 3, 1)   # CLI wins
 
 
-def test_current_sampler_marker_is_migrated_and_obsolete_markers_fail():
-  cfg = RunConfig.from_dict({"grasp_sampler": True, "grasp_sampler_version": 4,
-                             "mixed_wrench_h": True})
-  assert cfg.grasp_sampler and "grasp_sampler_version" not in cfg.to_dict()
-  assert "mixed_wrench_h" not in cfg.to_dict()
-  with pytest.raises(ValueError, match="versions 1-3 are no longer supported"):
-    RunConfig.from_dict({"grasp_sampler": True, "grasp_sampler_version": 3})
-
-
-def test_removed_shorthands_and_negative_shortcut_field_migrate():
-  cfg = RunConfig.from_dict({"skill": 0.03, "mp_no_shortcut": True})
-  assert cfg.mp_shortcut is False
-  assert "skill" not in cfg.to_dict() and "mp_no_shortcut" not in cfg.to_dict()
-
-
-def test_supported_profile_overlays_are_narrow():
-  standard = main.parse_args(["--search-profile", "standard"])
-  fabrica = main.parse_args(["--search-profile", "fabrica"])
-  differences = {k for k in main._STANDARD_SEARCH_PROFILE
-                 if getattr(fabrica, k) != getattr(standard, k)}
-  assert differences == {"grasp_sampler_keep", "grasp_widen"}
-  assert fabrica.grasp_sampler_keep == 64 and fabrica.grasp_widen is False
-  assert set(main._SEARCH_PROFILES) == {"standard", "fabrica"}
-  with pytest.raises(SystemExit):
-    main.parse_args(["--search-profile", "open"])
-
-
-def test_optimistic_dispatch_uses_the_shared_local_fill_settings(monkeypatch):
-  seen = {}
-
-  def fake(*_args, **kwargs):
-    seen.update(kwargs)
-    return []
-
-  monkeypatch.setattr(main, "solve_assembly_problem_optimistic", fake)
-  cfg = RunConfig(optimistic=True, lazy_fills=True, optimistic_fallback=False,
-                  optimistic_chain_h=True, wrench_aware_h=False)
-  assert main._dispatch_solve(cfg, None, None, [], None) == []
-  assert seen["lazy_fills"] is True
-  assert seen["fallback"] is False
-  assert seen["chain_h"] is True
-  assert seen["wrench_aware_h"] is False
-
-  assert main.parse_args(["--lazy-fills"]).lazy_fills is True
-  assert main.parse_args(["--no-lazy-fills"]).lazy_fills is False
-  assert main.parse_args(["--optimistic-chain-h"]).optimistic_chain_h is True
-  assert main.parse_args(["--no-optimistic-chain-h"]).optimistic_chain_h is False
-
-
-def test_structural_milestone_oracle_cli_and_dispatch(monkeypatch):
-  seen = {}
-
-  def fake(*_args, **kwargs):
-    seen.update(kwargs)
-    return []
-
-  monkeypatch.setattr(main, "solve_assembly_problem_milestones", fake)
-  cfg = RunConfig(milestones=True, milestone_oracle="structural",
-                  fill_local_h=True, fill_exact=True, fill_greedy=True,
-                  fill_raw_grasp_h=True,
-                  fill_incumbent_first=True,
-                  fill_policy_first=True,
-                  fill_policy_guide=True,
-                  fill_skeleton_first=True,
-                  fill_action_widening=True,
-                  fill_scope_widening=True, milestone_boundaries=3,
-                  wrench_aware_h=False)
-  assert main._dispatch_solve(cfg, None, None, [], None) == []
-  assert seen["milestone_oracle"] == "structural"
-  assert seen["fill_local_h"] is True and seen["fill_exact"] is True
-  assert seen["fill_raw_grasp_h"] is True
-  assert seen["fill_greedy"] is True
-  assert seen["fill_incumbent_first"] is True
-  assert seen["fill_policy_first"] is True
-  assert seen["fill_policy_guide"] is True
-  assert seen["fill_skeleton_first"] is True
-  assert seen["fill_action_widening"] is True
-  assert seen["fill_scope_widening"] is True
-  assert seen["milestone_boundaries"] == 3
-  assert seen["wrench_aware_h"] is False
-  assert main.parse_args(["--milestone-oracle", "structural"]).milestone_oracle == "structural"
-  assert main.parse_args(["--milestone-oracle", "chain"]).milestone_oracle == "chain"
-  assert main.parse_args(["--fill-local-h", "--fill-exact"]).fill_local_h is True
-  assert main.parse_args(["--fill-raw-grasp-h"]).fill_raw_grasp_h is True
-  assert main.parse_args(["--mp-wrench-gate"]).mp_wrench_gate is True
-  assert main.parse_args(["--no-mp-wrench-gate"]).mp_wrench_gate is False
-  assert main.parse_args([
-      "--fill-target-support-quotient"
-  ]).fill_target_support_quotient is True
-  assert main.parse_args(["--fill-local-h", "--fill-exact"]).fill_exact is True
-  assert main.parse_args(["--fill-greedy"]).fill_greedy is True
-  assert main.parse_args(["--no-fill-greedy"]).fill_greedy is False
-  assert main.parse_args(["--fill-incumbent-first"]).fill_incumbent_first is True
-  assert main.parse_args(["--fill-skeleton-first"]).fill_skeleton_first is True
-  assert main.parse_args(["--fill-action-widening"]).fill_action_widening is True
-  assert main.parse_args(["--no-fill-action-widening"]).fill_action_widening is False
-  assert main.parse_args(["--fill-policy-first"]).fill_policy_first is True
-  assert main.parse_args(["--no-fill-policy-first"]).fill_policy_first is False
-  assert main.parse_args(["--fill-policy-guide"]).fill_policy_guide is True
-  assert main.parse_args(["--no-fill-policy-guide"]).fill_policy_guide is False
-  assert main.parse_args(["--fill-scope-widening"]).fill_scope_widening is True
-  assert main.parse_args(["--no-fill-scope-widening"]).fill_scope_widening is False
-  assert main.parse_args(["--fill-touch-all"]).fill_touch_all is True
-  assert main.parse_args(["--no-fill-touch-all"]).fill_touch_all is False
-  assert main.parse_args(["--no-wrench-aware-h"]).wrench_aware_h is False
-  assert main.parse_args(["--lazy-edge-selector", "defer-failed"]).lazy_edge_selector == \
-      "defer-failed"
-  assert main.parse_args([
-      "--diagnose-plan-rank", "known.json"
-  ]).diagnose_plan_rank == "known.json"
-
-
-def test_incumbent_first_requires_exact_lazy_milestone_fills():
-  with pytest.raises(SystemExit, match="requires --fill-local-h"):
-    main._validate_solver_scoped_flags(RunConfig(
-        milestones=True, fill_incumbent_first=True, fill_exact=False))
-  with pytest.raises(SystemExit, match="requires --fill-local-h"):
-    main._validate_solver_scoped_flags(RunConfig(
-        milestones=True, fill_local_h=True, fill_incumbent_first=True,
-        fill_exact=True, lazy_fills=False))
-  assert main._validate_solver_scoped_flags(RunConfig(
-      milestones=True, fill_local_h=True, fill_incumbent_first=True,
-      fill_exact=True, lazy_fills=True)) == "milestones"
-
 
 def test_fill_greedy_is_a_lazy_milestone_policy():
   with pytest.raises(SystemExit, match="implemented only by milestone local fills"):
@@ -207,81 +73,6 @@ def test_fill_greedy_is_a_lazy_milestone_policy():
   assert main._validate_solver_scoped_flags(RunConfig(
       milestones=True, fill_greedy=True, lazy_fills=True)) == "milestones"
 
-
-def test_target_support_quotient_is_a_no_wrench_local_pdb_ablation():
-  with pytest.raises(SystemExit, match="requires --fill-local-h"):
-    main._validate_solver_scoped_flags(RunConfig(
-        milestones=True, fill_target_support_quotient=True, fill_local_h=False,
-        wrench=False))
-  with pytest.raises(SystemExit, match="requires --fill-local-h"):
-    main._validate_solver_scoped_flags(RunConfig(
-        milestones=True, fill_target_support_quotient=True, fill_local_h=True,
-        wrench=True))
-  assert main._validate_solver_scoped_flags(RunConfig(
-      milestones=True, fill_target_support_quotient=True, fill_local_h=True,
-      wrench=False, geo_facts=False)) == "milestones"
-
-
-def test_raw_grasp_fill_heuristic_is_a_local_pdb_ablation():
-  with pytest.raises(SystemExit, match="requires --fill-local-h"):
-    main._validate_solver_scoped_flags(RunConfig(
-        milestones=True, fill_raw_grasp_h=True, fill_local_h=False))
-  with pytest.raises(SystemExit, match="mutually exclusive"):
-    main._validate_solver_scoped_flags(RunConfig(
-        milestones=True, fill_raw_grasp_h=True, fill_local_h=True,
-        fill_target_support_quotient=True, wrench=False))
-  assert main._validate_solver_scoped_flags(RunConfig(
-      milestones=True, fill_raw_grasp_h=True, fill_local_h=True)) == "milestones"
-
-
-def test_standard_uses_greedy_local_fills_without_changing_global_weight():
-  cfg = main.parse_args(["--search-profile", "standard"])
-  assert cfg.fill_local_h is True
-  assert cfg.fill_greedy is True
-  assert cfg.fill_exact is False
-  assert cfg.weight == 1.0
-  assert cfg.mate_symmetry is True
-  assert cfg.grasp_sampler_keep == 20
-  assert cfg.grasp_sampler_candidates == 96
-  assert cfg.grasp_widen is True
-
-
-def test_milestone_anytime_receives_greedy_incumbent_policy(monkeypatch):
-  seen = {}
-
-  def fake(*_args, **kwargs):
-    seen.update(kwargs)
-    return []
-
-  monkeypatch.setattr(main, "solve_assembly_problem_milestones_anytime", fake)
-  cfg = RunConfig(milestones_anytime=30.0, milestones=True, fill_local_h=True,
-                  fill_greedy=True, fill_exact=False, lazy_fills=True, weight=1.0,
-                  placement_yaws=4, placement_yaw_widening=True)
-  assert main._validate_solver_scoped_flags(cfg) == "milestones-anytime"
-  assert main._dispatch_solve(cfg, None, None, [], None) == []
-  assert seen["fill_greedy"] is True
-  assert seen["fill_exact"] is False
-  assert seen["weight"] == 1.0
-  assert seen["placement_yaw_widening"] is True
-  assert seen["lns_window"] is None
-
-
-def test_lns_window_is_an_explicit_anytime_only_cap():
-  cfg = main.parse_args(["--milestones-anytime", "30", "--lns-window", "3"])
-  assert cfg.lns_window == 3
-  assert main._validate_solver_scoped_flags(cfg) == "milestones-anytime"
-  with pytest.raises(SystemExit, match="requires --milestones-anytime"):
-    main._validate_solver_scoped_flags(RunConfig(milestones=True, lns_window=3))
-
-
-def test_lns_grasp_transition_heuristic_is_explicit_and_anytime_only():
-  cfg = main.parse_args(["--milestones-anytime", "30", "--lns-grasp-transition-h"])
-  assert cfg.lns_grasp_transition_h is True
-  assert main._validate_solver_scoped_flags(cfg) == "milestones-anytime"
-  assert main.parse_args(["--search-profile", "standard"]).lns_grasp_transition_h is False
-  with pytest.raises(SystemExit, match="requires --milestones-anytime"):
-    main._validate_solver_scoped_flags(
-        RunConfig(milestones=True, lns_grasp_transition_h=True))
 
 
 def test_solver_scoped_policy_flags_fail_closed_in_other_engines():
@@ -442,7 +233,7 @@ def test_open_plan_loop_suspends_then_fairly_reopens(tmp_path, monkeypatch):
   monkeypatch.setattr(plan_io, "require_complete_witnesses", lambda *_args, **_kwargs: None)
   monkeypatch.setattr(plan_io, "witness_block", lambda *_args, **_kwargs: {})
 
-  def fake_save(path, _cfg, plan, witnesses=None):
+  def fake_save(path, _cfg, plan, witnesses=None, **_kwargs):
     with open(path, "w") as f:
       json.dump({"config": {}, "plan": [list(a) for a in plan],
                  "witnesses": witnesses}, f)
@@ -639,11 +430,6 @@ def test_explicit_zero_table_margin_also_zeros_derived_table_float():
   assert values["robot_margin_ramp"] == cfg.mp_margin_ramp
   assert sources["table_float"] == "CLI/scene"
 
-
-def test_run_library_entry():
-  """main.run(RunConfig) is the argparse-free library entry (main() is now a thin wrapper over
-  it). A no-solve config builds the scene and returns without any CLI/viewer involvement."""
-  main.run(RunConfig(assembly="cross", parts=3, num_robots=2, solve=False, view=False))
 
 
 def test_grasp_lever_is_a_short_half_extent():

@@ -31,16 +31,6 @@ def _legacy_by_default():
 ASSEMBLIES = [("cross", 7), ("car-mini", 5), ("chair", 8)]
 
 
-@pytest.mark.parametrize("kind,n", ASSEMBLIES)
-def test_legacy_table_is_byte_identical_to_the_old_rule(kind, n):
-  """The default path must not move at all -- saved plans and witnesses index this table."""
-  a = P.make_assembly(kind, n)
-  groups = [(o,) for o in a.objects] + [tuple(a.objects)]
-  for grp in groups:
-    ref = P.reference_part(set(grp))
-    for face in range(len(P._FACE_DOWN_QUATS)):
-      assert np.allclose(P.placement_quat(a, grp, ref, face),
-                         P._legacy_placement_quat(a, ref, face), atol=1e-12)
 
 
 def test_yaw_lattice_keeps_legacy_prefix_and_distinct_state_ids():

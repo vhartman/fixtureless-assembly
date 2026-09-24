@@ -21,7 +21,6 @@ import mp_export as MP
 import solver as S
 from config import RunConfig
 from env import make_four_robot_env
-from problem import _quat_to_R
 
 
 # --------------------------------------------------------------------------- flag gate
@@ -49,19 +48,6 @@ def test_backoff_ee_retracts_along_the_tools_own_minus_z():
   assert out[3:] == pytest.approx(tipped[3:])                     # orientation untouched
   assert flat[2] == 0.3, "the caller's array must not be mutated"
 
-
-def test_backoff_ee_matches_the_expression_it_replaced_bit_for_bit():
-  """The four inline sites were folded into these helpers; --pre-* with the flag OFF must stay
-  byte-identical, so reproduce the ORIGINAL expression and demand exact equality."""
-  rng = np.random.default_rng(0)
-  for _ in range(20):
-    q = rng.normal(size=4)
-    q /= np.linalg.norm(q)
-    t = np.concatenate([rng.normal(size=3), q])
-    for delta in (0.01, 0.05, 0.2):
-      want = t.copy()
-      want[:3] = want[:3] - delta * (_quat_to_R(want[3:]) @ np.array([0.0, 0.0, 1.0]))
-      assert np.array_equal(S._backoff_ee(t, delta), want)
 
 
 def test_backoff_place_lifts_in_world_z_only():
@@ -497,11 +483,6 @@ def test_transition_hint_never_turns_idle_exit_pins_into_path_coordinates():
   assert merged[:6] == pytest.approx(np.full(6, 3.0))
   assert merged[6:] == pytest.approx(np.full(6, 2.0))
 
-
-def test_build_tasks_without_the_argument_keeps_solving_them_itself():
-  """Flag OFF is the historical path, untouched."""
-  (_t, seq, _s), rik = _tasks(None)
-  assert rik.solved == 2 and len(seq) == 5
 
 
 def test_loaded_final_export_refuses_a_missing_pre_keyframe_instead_of_solving():

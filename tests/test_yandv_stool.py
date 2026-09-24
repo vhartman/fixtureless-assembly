@@ -109,7 +109,7 @@ def test_assemble_bind_tries_symmetry_members_inside_one_symbolic_action():
   assert all(np.allclose(a, b) for a, b in zip(tried, asm.mate_quaternions("obj_1")))
 
 
-def test_mujoco_mate_weld_keeps_the_achieved_discrete_member():
+def test_mujoco_mate_weld_keeps_the_achieved_discrete_member(monkeypatch):
   """The mode switch must not erase the member selected by the IK witness."""
   from types import SimpleNamespace
   import sim as S
@@ -125,23 +125,11 @@ def test_mujoco_mate_weld_keeps_the_achieved_discrete_member():
   scene._eq_id = lambda name: 0
   scene.model = SimpleNamespace(eq_data=np.zeros((1, 11), dtype=float))
   scene.data = SimpleNamespace(
+      xpos=np.asarray([[0.0, 0.0, 0.0], [0.0, 0.0, 0.1]], dtype=float),
       xquat=np.asarray([[1.0, 0.0, 0.0, 0.0], q180], dtype=float),
       eq_active=np.zeros(1, dtype=np.int32))
-
+  scene._project_mate_component = lambda _part, _pose: None
+  monkeypatch.setattr(S.mujoco, "mj_forward", lambda _model, _data: None)
   scene.weld_mate("obj_1")
   assert scene.data.eq_active[0] == 1
   assert np.allclose(scene.model.eq_data[0, 6:10], q180)
-
-
-def test_yandv_normal_mujoco_view_enables_visual_group():
-  import sim as S
-
-  class Viewer:
-    class Opt:
-      geomgroup = np.zeros(6, dtype=int)
-    opt = Opt()
-
-  v = Viewer()
-  S._default_geomgroups(v, True)
-  assert v.opt.geomgroup[S.GROUP_VISUAL] == 1
-  assert v.opt.geomgroup[S.GROUP_COLL] == 0

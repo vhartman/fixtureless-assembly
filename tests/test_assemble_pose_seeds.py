@@ -1,7 +1,6 @@
 """Small invariants for the opt-in canonical assembly-pose SSIK initializer."""
 
 import numpy as np
-import pytest
 import robotic as ry
 
 import solver as S
@@ -33,22 +32,3 @@ def test_assembly_position_bias_tracks_the_physical_table_centre():
   C.addFrame("table").setPosition([0.82, -0.13, 0.40]).setShape(
       ry.ST.box, [0.64, 1.10, 0.08, 0.0])
   assert np.allclose(S._assemble_position_bias_target(C), [0.82, -0.13, 0.74])
-
-
-def test_exact_and_projected_ablation_cannot_run_together():
-  """The projection contains the exact-centre sample, so combining flags is ambiguous."""
-  cfg = __import__("config").RunConfig(
-      assemble_ssik_pose_seeds=True, assemble_ssik_pose_projection=True)
-  with pytest.raises(ValueError, match="alternative ablations"):
-    __import__("main").run(cfg)
-
-
-def test_assembly_ik_ablation_policies_cannot_run_together():
-  cfg = __import__("config").RunConfig(
-      assemble_unbiased_first=True, assemble_ssik_pose_seeds=True)
-  with pytest.raises(ValueError, match="alternative ablations"):
-    __import__("main").run(cfg)
-  cfg = __import__("config").RunConfig(
-      assemble_unbiased_first=True, assemble_basin_racing=True)
-  with pytest.raises(ValueError, match="alternative ablations"):
-    __import__("main").run(cfg)

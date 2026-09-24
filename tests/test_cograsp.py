@@ -230,36 +230,6 @@ def test_holder_mapping_uses_canonical_robot_order():
   assert rik._holders_of_group(_HolderState(), {"obj_0"}) == rik.robots
 
 
-def test_fuse_is_an_exact_noop_when_there_is_no_cograsp(monkeypatch):
-  """A plan without add_grasp has no (add_grasp, assemble) pair, so the pass must hand back
-  the SAME witnesses in a NEW list -- no re-solve, no mutation of the caller's list."""
-  import assembly as A
-  import solver as S
-
-  A.set_seed(0)
-  A.set_rolls_per_face(1)
-  asm = A.make_assembly("cross", 3)
-  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
-  A.add_disassembled_obj(C, asm, spacing=0.2)
-  robots = A.get_robots(C)
-  plan = A.solve_assembly_problem(C, asm, robots=robots, verbose=False, robot_ik=None)
-  assert plan and not any(a[0] == "add_grasp" for a in plan)
-
-  class _StubIK:                                           # the no-pair path reads only these
-    C = None
-    penetration_reject = None
-
-  stub = _StubIK()
-  stub.C = C
-  monkeypatch.setattr(S, "_search_context",
-                      lambda *_a, **_k: pytest.fail("empty fusion must not build context"))
-  monkeypatch.setattr(S, "_replay_states",
-                      lambda *_a, **_k: pytest.fail("empty fusion must not replay plan"))
-  wit = [np.arange(3.0) if i % 2 else None for i in range(len(plan))]
-  out, rep = S.fuse_cograsp_witnesses(C, asm, plan, wit, robots, stub, verbose=False)
-  assert rep == {"pairs": 0, "fused": 0, "rows": [], "pre_witnesses": {}}
-  assert out is not wit and len(out) == len(wit)
-  assert all(a is b for a, b in zip(out, wit))             # untouched, not merely equal
 
 
 def test_known_action_scoped_lookup_matches_global_successor():

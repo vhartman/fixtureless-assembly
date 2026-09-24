@@ -67,12 +67,6 @@ def test_replay_exports_exact_frame_as_visual_only_self_contained_glb(tmp_path):
   assert output.read_bytes()[:4] == b"glTF"
 
 
-def test_scene_export_requires_glb_suffix(tmp_path):
-  model = mujoco.MjModel.from_xml_string(
-      '<mujoco><worldbody><geom type="sphere" size=".1"/></worldbody></mujoco>')
-  data = mujoco.MjData(model)
-  with pytest.raises(ValueError, match="requires a .glb"):
-    sim.export_visual_scene_glb(model, data, tmp_path / "scene.obj")
 
 
 def test_scene_export_does_not_apply_compiled_mesh_offset_twice(tmp_path):

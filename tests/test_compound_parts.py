@@ -91,13 +91,17 @@ def test_no_nested_compounds():
 def test_sim_geoms_split_mass_by_volume():
   import sim as S
   xml = S._compound_geoms_xml(SPEC, 0.8, 1.0, 3, "1 0 0 1")
-  assert xml.count("<geom") == 2
+  # Rounded boxes are represented by several overlapping primitives.  Pin the physical
+  # invariant (one total part mass, distributed by child volume), not an obsolete exact geom
+  # count from before that collision-model improvement.
+  assert xml.count("<geom") >= 2
   import re
   masses = [float(m) for m in re.findall(r'mass="([0-9.e-]+)"', xml)]
   assert sum(masses) == pytest.approx(1.0)
   v_box = 0.05 * 0.05 * 0.03
   v_cyl = np.pi * 0.018 ** 2 * 0.03
-  assert masses[0] == pytest.approx(v_box / (v_box + v_cyl))
+  assert sum(masses[:-1]) == pytest.approx(v_box / (v_box + v_cyl))
+  assert masses[-1] == pytest.approx(v_cyl / (v_box + v_cyl))
 
 
 def test_peg_hole_compound_preserves_the_open_pocket():

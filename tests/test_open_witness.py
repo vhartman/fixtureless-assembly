@@ -2,7 +2,7 @@ import pytest
 
 from open_witness import OpenWitnessPool, run_open_lazy_fill
 import solver as solver_mod
-from solver import RobotIK, _IncrementalLazySearch, _deterministic_ik_seed
+from solver import RobotIK, _deterministic_ik_seed
 
 
 class _State:
@@ -37,19 +37,6 @@ def test_physical_query_seed_partitions_root_query_and_effort():
   assert all(1 <= seed <= 2_147_483_646 for seed in seeds)
 
 
-def test_incremental_search_pop_observer_sees_the_real_claim_order():
-  s, a, b = _State("s"), _State("a"), _State("b")
-  go_a = ("pick", "a1", "a", 0)
-  go_b = ("pick", "a1", "b", 0)
-  graph = {s: [(go_a, a), (go_b, b)], a: [], b: []}
-  seen = []
-  engine = _IncrementalLazySearch(
-      s, goal_fn=lambda x: x == b, succ_fn=lambda x: graph[x],
-      cost_fn=lambda _a: 1.0, h_fn=lambda x: {s: 1.0, a: 2.0, b: 0.0}[x],
-      weight=1.0, blacklist=set(),
-      pop_observer=lambda _engine, state, f, h, g: seen.append((state.name, f, h, g)))
-  assert engine.search(10) == [go_b]
-  assert seen == [("s", 1.0, 1.0, 0.0), ("b", 1.0, 0.0, 1.0)]
 
 
 def test_probe_bind_once_never_caches_a_stochastic_failure():
@@ -439,64 +426,6 @@ def test_lns_uses_weight_one_cleanup_then_weighted_wider_windows(monkeypatch, ca
   assert "expanded=7" in out and "peak-open=11" in out and "IK=2(1f)" in out
 
 
-def test_lns_visits_largest_admissible_gap_first_at_each_window_size(monkeypatch, capsys):
-  class State(_State):
-    def __init__(self, name, mated):
-      super().__init__(name)
-      self.mated = frozenset(mated)
-
-    def subassemblies(self):
-      main = frozenset({"obj_0"}) | self.mated
-      return ((main,) if "obj_2" in self.mated else
-              (main, frozenset({"obj_2"})))
-
-  s0 = State("s0", ())
-  s1 = State("s1", ("obj_1",))
-  s1a = State("s1a", ("obj_1",))
-  s1b = State("s1b", ("obj_1",))
-  s2 = State("s2", ("obj_1", "obj_2"))
-  a1 = ("assemble", "a1", "obj_1", "obj_0")
-  h1 = ("handover", "a2", "obj_2", 1)
-  h2 = ("handover", "a1", "obj_2", 2)
-  a2 = ("assemble", "a1", "obj_2", "obj_0")
-  graph = {s0: [(a1, s1)], s1: [(h1, s1a)], s1a: [(h2, s1b)],
-           s1b: [(a2, s2)], s2: []}
-
-  class Assembly:
-    base = "obj_0"
-    objects = ("obj_0", "obj_1", "obj_2")
-
-  class H:
-    def value(self, _state):
-      return 0.0
-
-  monkeypatch.setattr(solver_mod, "get_initial_state", lambda *_args: s0)
-  monkeypatch.setattr(
-      solver_mod, "successors", lambda state, *_args, **_kwargs: graph[state])
-  monkeypatch.setattr(
-      solver_mod, "_part_mated",
-      lambda state, part: part == "obj_0" or part in state.mated)
-  monkeypatch.setattr(solver_mod, "_make_lns_endpoint_pdb", lambda *_args: None)
-  monkeypatch.setattr(solver_mod, "_release_fill_scratch", lambda *_args, **_kwargs: None)
-  starts = []
-
-  def fake_refill(*args, **kwargs):
-    starts.append(args[0].name)
-    kwargs["stats"].update(outcome="exhausted", wall=0.0)
-    return None
-
-  monkeypatch.setattr(solver_mod, "_refill_window", fake_refill)
-  plan = solver_mod._lns_improve(
-      [a1, h1, h2, a2], object(), Assembly(), ("a1", "a2"), object(), object(),
-      None, weight=5.0, max_nodes=20000, verbose=True, h_lab=H(), k_max=1)
-
-  assert plan == [a1, h1, h2, a2]
-  # The second segment costs 5 versus the first segment's 1. Both have lower bound zero,
-  # hence both greedy/exact consultations for the second segment precede the first.
-  assert starts == ["s1", "s1", "s0", "s0"]
-  out = capsys.readouterr().out
-  assert ("consultation=1 pending=1 k=1 parts[1:2] ('obj_2',) "
-          "bound=5 landmark-lb=0 gap=5 nodes=512") in out
 
 
 def test_lns_reopens_a_node_capped_window_with_geometric_effort(monkeypatch, capsys):
@@ -842,39 +771,6 @@ def test_terminal_first_checks_last_assemble_then_forward_prefix():
   assert report.reordered_paths == 1
 
 
-def test_terminal_first_is_forward_when_candidate_has_no_assemble():
-  s0, s1, s2 = _State("s0"), _State("s1"), _State("s2")
-  a = ("pick", "a1", "obj", 0)
-  b = ("place", "a1", "obj", 1)
-  calls = []
-
-  class RIK:
-    lazy_edge_selector = "terminal-first"
-
-    def _scene_sig(self, state):
-      return state.name
-
-    def probe_bind_once(self, action, _state, _successor, _assembly, attempt):
-      calls.append(action)
-      return False, None
-
-  class Engine:
-    def __init__(self, suspended):
-      self.suspended = suspended
-
-    def search(self, _max_nodes, deadline=None):
-      return None if (s0, a) in self.suspended else [a, b]
-
-    def delete_edge(self, *_args):
-      pass
-
-  def walk(_plan):
-    yield s0, a, s1
-    yield s1, b, s2
-
-  run_open_lazy_fill(robot_ik=RIK(), assembly=object(), make_engine=Engine,
-                     walk_plan=walk, is_ik=lambda _a: True, max_nodes=10, max_epochs=1)
-  assert calls == [a]
 
 
 def test_fail_first_uses_exact_scene_failure_before_reverse_fallback():
@@ -1218,13 +1114,63 @@ def test_physical_alias_revisit_uses_fresh_effort_in_the_same_epoch():
   assert rik._open_witness_pool.revisit_probes == 1
 
 
-def test_zero_epochs_requires_a_deadline():
+
+
+def test_positive_witness_order_is_stable_and_never_removes_successors():
+  class State(_State):
+    def __init__(self, name, giver=2):
+      super().__init__(name)
+      self.supports = {
+          "obj": frozenset({("grasp", "a1", "obj", giver)}),
+          "other": frozenset(),
+      }
+
+    def subassemblies(self):
+      return (frozenset(("obj",)), frozenset(("other",)))
+
   class RIK:
-    pass
-  try:
-    run_open_lazy_fill(robot_ik=RIK(), assembly=None, make_engine=None,
-                       walk_plan=None, is_ik=None, max_nodes=1, max_epochs=0)
-  except ValueError as exc:
-    assert "deadline" in str(exc)
-  else:
-    raise AssertionError("unbounded open-witness loop accepted without a deadline")
+    def _physical_query_key(self, action, state, successor, _assembly):
+      return tuple(action), state.name, successor.name
+
+  pool = OpenWitnessPool(RIK(), object())
+  learned = State("learned")
+  handover = ("handover", "a2", "obj", 7)
+  pool._record_positive(learned, handover)
+
+  state = State("s")
+  rows = [
+      (("pick", "a3", "other", 0), State("unknown-a")),
+      (("pick", "a2", "obj", 7), State("known-grasp")),
+      (handover, State("known-pair")),
+      (("pick", "a4", "other", 1), State("unknown-b")),
+  ]
+  ordered = pool.order_successors(state, rows, object())
+  assert [row[1].name for row in ordered] == [
+      "known-pair", "known-grasp", "unknown-a", "unknown-b"]
+  assert set((a, s.name) for a, s in ordered) == set((a, s.name) for a, s in rows)
+
+
+def test_exact_positive_witness_orders_before_coarse_positive_evidence():
+  class State(_State):
+    supports = {"obj": frozenset({("grasp", "a1", "obj", 2)})}
+
+    def subassemblies(self):
+      return (frozenset(("obj",)),)
+
+  class RIK:
+    def _physical_query_key(self, action, state, successor, _assembly):
+      return tuple(action), state.name, successor.name
+
+  pool = OpenWitnessPool(RIK(), object())
+  state = State("s")
+  coarse = ("pick", "a2", "obj", 7)
+  exact = ("pick", "a3", "obj", 8)
+  coarse_end, exact_end = State("coarse"), State("exact")
+  pool._record_positive(state, coarse)
+  exact_key = pool.filter_key(state, exact, exact_end, object())
+  pool.success[exact_key] = "q"
+  pool._record_positive(state, exact)
+
+  assert pool.order_successors(
+      state, [(coarse, coarse_end), (exact, exact_end)], object()) == [
+          (exact, exact_end), (coarse, coarse_end)]

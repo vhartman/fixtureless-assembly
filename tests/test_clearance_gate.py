@@ -2,6 +2,7 @@
 import os
 import sys
 import numpy as np
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -323,7 +324,8 @@ def test_ik_skips_a_seed_when_komo_exposes_a_wider_internal_q():
   assert rik.seed_init_skips == 1
 
 
-def test_ik_feeds_a_failed_margin_certificate_back_into_komo():
+@pytest.mark.parametrize("penetration", [False, True])
+def test_ik_feeds_a_failed_margin_certificate_back_into_komo(penetration):
   """A nominally feasible optimum is refined, not merely rejected and randomized."""
   rik = object.__new__(S.RobotIK)
   rik._cur_action = ("pick", "a1", "obj_0", 0)
@@ -344,12 +346,20 @@ def test_ik_feeds_a_failed_margin_certificate_back_into_komo():
       "restart_solves": 0, "restart_time": 0.0,
       "getpath_calls": 0, "post_calls": 0, "post_time": 0.0,
   }
-  rik._pen_ok = lambda _C, _q: True
+  rik._mate_exempt = None
+  pen_calls = []
+  def pen(_C, _q):
+    pen_calls.append(1)
+    if penetration and len(pen_calls) == 1:
+      rik.last_strict_reject = (4e-5, [("a1_link", "table", -4e-5)])
+      return False
+    return True
+  rik._pen_ok = pen
   clearance_calls = []
 
   def clearance(_C, _q):
     clearance_calls.append(1)
-    if len(clearance_calls) == 1:
+    if not penetration and len(clearance_calls) == 1:
       rik.last_margin_reject = ("a1_link", "obj_9", 0.001, "arm-part")
       return False
     return True
@@ -383,7 +393,8 @@ def test_ik_feeds_a_failed_margin_certificate_back_into_komo():
   ok, q = rik._solve_ik(komo, restarts=0, C=object())
   assert ok
   assert q.shape == (2,)
-  assert len(clearance_calls) == 2
+  assert len(clearance_calls) == (1 if penetration else 2)
+  assert len(pen_calls) == 2
   assert len(komo.objectives) == 1
   assert len(komo.warm_starts) == 1
   assert rik.prof["margin_refine_solves"] == 1

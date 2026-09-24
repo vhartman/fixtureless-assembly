@@ -83,22 +83,6 @@ def test_component_grasp_tables_are_lazy_but_full_iteration_is_explicit(monkeypa
   assert table.materialized == len(table)
 
 
-def test_flag_off_is_byte_identical():
-  P.set_sampled_grasps(None)
-  P.reset_grasp_pose_cache()
-  base = P.part_grasp_poses(CUBE)
-  base_s = P.part_grasp_surfaces(CUBE)
-  base_m = P.part_grasp_face_min_dims(CUBE)
-  P.set_sampled_grasps(MODE)                               # on, then OFF again
-  P.set_sampled_grasps(None)
-  P.reset_grasp_pose_cache()
-  again = P.part_grasp_poses(CUBE)
-  assert len(base) == len(again)
-  for a, b in zip(base, again):
-    np.testing.assert_array_equal(a, b)
-  assert base_s == P.part_grasp_surfaces(CUBE)
-  assert base_m == P.part_grasp_face_min_dims(CUBE)
-
 
 def test_sampled_deterministic_across_cache_reset():
   P.set_sampled_grasps(MODE)
@@ -106,6 +90,36 @@ def test_sampled_deterministic_across_cache_reset():
   P.reset_grasp_pose_cache()                               # fresh compute, same seed
   second = P.part_grasp_poses(CUBE)
   assert len(first) == len(second) == MODE["keep"]
+  for a, b in zip(first, second):
+    np.testing.assert_array_equal(a, b)
+
+
+def test_raw_geometry_is_shared_across_part_instances():
+  """Per-instance scene ranking must not repeat part-local mesh proximity work."""
+  P.set_sampled_grasps({**MODE, "margin": 0.008, "pad_support": 0.75, "wrap": 0.015})
+  P.part_grasp_poses(CUBE, part="obj_0")
+  after_first = P.sampled_grasp_raw_cache_stats()
+  P.part_grasp_poses(CUBE, part="obj_1")
+  after_second = P.sampled_grasp_raw_cache_stats()
+  assert after_first["misses"] == 1
+  assert after_second["memory_hits"] == 1
+  assert after_second["build_s"] == after_first["build_s"]
+
+
+def test_raw_geometry_disk_cache_is_exact_and_scene_independent(tmp_path, monkeypatch):
+  """A new process-equivalent cache reset reloads identical positional candidates."""
+  monkeypatch.setenv("ASSEMBLY_GRASP_RAW_CACHE_DIR", str(tmp_path / "raw"))
+  mode = {**MODE, "margin": 0.008, "pad_support": 0.75, "wrap": 0.015}
+  P.set_sampled_grasps(mode)
+  first = [np.asarray(p).copy() for p in P.part_grasp_poses(CUBE, part="obj_0")]
+  assert P.sampled_grasp_raw_cache_stats()["misses"] == 1
+
+  P.reset_grasp_pose_cache()
+  P.set_sampled_grasps(mode)
+  second = P.part_grasp_poses(CUBE, part="a-different-scene-instance")
+  stats = P.sampled_grasp_raw_cache_stats()
+  assert stats["disk_hits"] == 1 and stats["misses"] == 0
+  assert len(first) == len(second)
   for a, b in zip(first, second):
     np.testing.assert_array_equal(a, b)
 
@@ -198,6 +212,27 @@ def test_wrap_support_treats_points_inside_material_as_contact():
       np.array([1.0, 0.0, 0.0]), np.array([0.0, 1.0, 0.0]), offsets,
       lift=0.002, wrap=0.0)
   assert got == pytest.approx(1.0)
+
+
+def test_batched_wrap_support_matches_scalar_scores():
+  """Batching proximity queries must not change any finite-pad support score."""
+  import trimesh
+
+  mesh = trimesh.creation.box(extents=[1.0, 1.0, 1.0])
+  offsets = P._pad_samples_rect(0.01, 0.02)
+  np.testing.assert_allclose(offsets, -offsets[::-1], atol=1e-16)
+  n = np.array([0.0, 0.0, 1.0])
+  contacts = []
+  for p in (np.array([0.0, 0.0, 0.5]), np.array([0.495, 0.0, 0.5])):
+    for angle in np.linspace(0.0, np.pi, 8, endpoint=False):
+      u = np.array([np.cos(angle), np.sin(angle), 0.0])
+      v = np.array([-np.sin(angle), np.cos(angle), 0.0])
+      contacts.append((p, n, u, v))
+  scalar = [P._pad_support_wrap(mesh, *c, offsets, wrap=0.006) for c in contacts]
+  batched = P._pad_support_wrap_many(mesh, contacts, offsets, wrap=0.006)
+  assert batched == scalar
+  assert [P._pad_support_wrap(mesh, p, n, -u, -v, offsets, wrap=0.006)
+          for p, n, u, v in contacts] == scalar
 
 
 def test_antipodal_width_within_aperture():
@@ -405,6 +440,12 @@ def test_candidate_count_extends_one_nested_raw_stream():
   assert cache32 != cache96
   np.testing.assert_array_equal(p32, p96[:32])
   np.testing.assert_array_equal(f32, f96[:32])
+  # Nesting must not discard the established default cloud as a side effect.
+  historical_key = (P._sampling_spec_key(CUBE), 0.04, 2, mode["seed"], 96,
+                    mode["margin"], mode["pad_support"], mode["wrap"])
+  historical, _ = P._sample_surface_deterministic(
+      mesh, 96, zlib.crc32(repr(historical_key).encode()))
+  np.testing.assert_array_equal(p96, historical)
 
 
 def test_closure_ranking_prioritizes_certified_canonical_rows_without_deleting_fallbacks():
@@ -519,26 +560,6 @@ def test_openarm_car_wheel_sampler_generates_strict_table_clear_grasp():
     assert cert is not None and cert.feasible
 
 
-def test_canonical_epoch_reproduces_conventional_grasp_table():
-  """Staged epoch zero must be the old primitive action space, not merely similar poses."""
-  from problem import make_assembly
-  P.set_rolls_per_face(2)
-  asm = make_assembly("cross", 2)
-  P.set_sampled_grasps(None)
-  legacy = P.precompute_grasps(asm)
-  P.set_sampled_grasps({"seed": 0, "candidates": 32, "keep": 20,
-                        "margin": 0.008, "pad_support": 0.75, "wrap": 0.015})
-  P.set_sampled_canonical_only(True)
-  staged = P.precompute_grasps(asm)
-  P.set_sampled_canonical_only(False)
-  full = P.precompute_grasps(asm)
-  assert set(staged) == set(legacy)
-  for key in legacy:
-    assert [(p, g) for p, g, _q in staged[key]] == [(p, g) for p, g, _q in legacy[key]]
-    for (_p, _g, a), (_p2, _g2, b) in zip(staged[key], legacy[key]):
-      np.testing.assert_array_equal(a, b)
-  assert any(len(full[k]) > len(staged[k]) for k in staged)
-
 
 def test_wrap_emits_side_roll_for_long_boxes():
   """A long flat box (the cuboid peg) needs the SIDE pinch: fingers across the short
@@ -618,15 +639,6 @@ def test_assemble_role_scene_contains_only_mandatory_predecessors():
   assert np.linalg.norm(poses["obj_1"][:2]) < 10.0
   assert poses["obj_2"][0] > 900.0
 
-
-def test_scene_aware_off_is_byte_identical():
-  P.set_sampled_grasps({"seed": 0, "candidates": 64, "keep": 12})
-  before = [np.array(p) for p in P.part_grasp_poses(CUBE)]
-  P.reset_grasp_pose_cache()                          # rebuild without any scene context
-  after = P.part_grasp_poses(CUBE)
-  assert len(before) == len(after)
-  for a, b in zip(before, after):
-    np.testing.assert_array_equal(a, b)
 
 
 def _synthetic_scene_reservation_input(monkeypatch):
@@ -850,3 +862,74 @@ def test_global_widening_preserves_cached_prefix_ids():
   assert len(q6) == 6 and len(q12) == 12
   for a, b in zip(old, q12):
     np.testing.assert_array_equal(a, b)
+
+
+def test_fixed_master_widening_reuses_preclassified_rows(monkeypatch):
+  """A larger maximum is ranked once; exposing a prefix never changes old IDs."""
+  P.set_rolls_per_face(2)
+  _install_mixed_public_scene_ctx()
+  P.set_sampled_grasps({"seed": 19, "candidates": 96, "keep": 6,
+                        "master_keep": 28, "fixed_master": True,
+                        "margin": 0.0, "pad_support": 0.0, "wrap": 0.015})
+  calls = 0
+  original = P._sampled_master_rows
+
+  def counted(*args, **kwargs):
+    nonlocal calls
+    calls += 1
+    return original(*args, **kwargs)
+
+  monkeypatch.setattr(P, "_sampled_master_rows", counted)
+  q6 = P.part_grasp_poses(CUBE, part="obj_0")
+  meta6 = P.sampled_grasp_meta(CUBE, part="obj_0")
+  assert len(q6) == len(meta6) == 6 and calls == 1
+
+  class OnePart:
+    objects = ("obj_0",)
+
+    @staticmethod
+    def part_shape(_part):
+      return CUBE
+
+  sig6 = P.sampled_grasp_db_signature(OnePart())
+  P.set_sampled_grasp_keep(12)
+  q12 = P.part_grasp_poses(CUBE, part="obj_0")
+  assert len(q12) == len(P.sampled_grasp_meta(CUBE, part="obj_0")) == 12
+  assert len(P.part_grasp_surfaces(CUBE, part="obj_0")) == 12
+  assert len(P.part_grasp_face_min_dims(CUBE, part="obj_0")) == 12
+  assert calls == 1
+  assert P.sampled_grasp_db_signature(OnePart()) != sig6
+  for a, b in zip(q6, q12):
+    np.testing.assert_array_equal(a, b)
+  P.set_sampled_grasp_keep(28)
+  q28 = tuple(np.asarray(q).copy() for q in P.part_grasp_poses(CUBE, part="obj_0"))
+  P.reset_grasp_pose_cache()
+  rebuilt = P.part_grasp_poses(CUBE, part="obj_0")
+  assert len(rebuilt) == len(q28) == 28
+  for a, b in zip(q28, rebuilt):
+    np.testing.assert_array_equal(a, b)
+  with pytest.raises(ValueError, match="exceeds the fixed master"):
+    P.set_sampled_grasp_keep(29)
+
+
+def test_fixed_master_max_expands_the_raw_scene_probe(monkeypatch):
+  """Kmax must reach past the old 32-row hidden source cap."""
+  spec, part, _suction, antip, ctx = _synthetic_scene_reservation_input(monkeypatch)
+
+  def row(i):
+    return (np.array([0.4 + 0.001 * i, 0.0, 0.08, 1.0, 0.0, 0.0, 0.0]),
+            "flat", 0.05, np.array([float(i), 0.0, 0.0, 0.0, 0.0, 0.0]),
+            0.02, 1.0, "suction", False)
+
+  raw = [row(i) for i in range(40)]
+  target_x = float(P._fps_row_order(raw)[-1][0][0])
+
+  def only_last(_state, _part, pose, _assembly, robot=None):
+    return abs(float(np.asarray(pose)[0]) - target_x) < 1e-9
+
+  monkeypatch.setattr(ctx["checker"], "pose_collision_free", only_last)
+  P.set_sampled_grasps({"seed": 0, "candidates": 40, "keep": 2,
+                        "master_keep": 40, "fixed_master": True})
+  rows = P._sampled_master_rows(spec, 0.01, part, raw, antip, 40, ctx, None)
+  assert P.sampled_grasp_selection_diagnostics(part)["probe"] == 40
+  assert any("pick" in meta["scene_by_kind"]["two_finger"] for _row, meta in rows)

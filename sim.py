@@ -4238,7 +4238,11 @@ class _SkillServo:
     # millimetres away after actuated tracking and contact. Re-commanding that endpoint before
     # applying a differential correction creates exactly the plunge the servo is meant to avoid.
     jn = self.scene._rai_joints
-    for robot in controlled:
+    # A physical pinch is not a weld. Every other arm must hold its achieved
+    # posture while this skill runs, including the arm supporting the parent;
+    # otherwise a nominal-reference snap moves the target beneath the inserter.
+    held_posture_robots = self.scene.robots if self.scene.contact_grasps else controlled
+    for robot in held_posture_robots:
       for j in self.qidx[robot]:
         q_ref[j] = float(self.scene.data.qpos[self.scene._qadr[jn[j]]])
 
@@ -4429,6 +4433,22 @@ def _action_acquires_grasp(plan, label):
   gripper-shaped attach parent.  That frame alone must not trigger a second close command.
   """
   return bool(label and tuple(plan[int(label[0])])[0] in ("pick", "handover"))
+
+
+def _symbolic_grasps(state):
+  """Hands holding parts, independent of temporary MuJoCo weld ownership.
+
+  An assembly mate replaces the inserter's grasp weld with a part-part weld, but the
+  symbolic grasp remains until a later release. Finger commands follow that lifetime.
+  """
+  return {(contact[1], part)
+          for part, contacts in state.supports.items()
+          for contact in contacts if contact[0] == "grasp"}
+
+
+def _symbolic_grasp_opens(states, action_index):
+  """(robot, part) pairs released by one task-planning action."""
+  return _symbolic_grasps(states[action_index]) - _symbolic_grasps(states[action_index + 1])
 
 
 def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kinds=None,
@@ -5526,13 +5546,17 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         # execution failure (the report metadata retains render_kinematic=true).
         seat_miss = seat_angle = None
     # Transfers close the receiver before the weld changes hands, then open every giver.
-    # Releases and mates simply open the former holder(s). This is a LOGICAL hardware event
-    # even when finger animation is disabled; older code accidentally omitted every open event
-    # from ordinary standard-profile recordings because it logged them inside the visual flag.
-    _open = {r: _open_aperture(r) for r, p in _before_grasps.items()
-             if p == child and r not in scene.active_grasps}
-    for _r in sorted(_open):
-      _record_gripper_event("open_start", _r, child)
+    # Open only when the task state actually ends a grasp. This logical hardware event is
+    # recorded even when finger animation is disabled, so open-loop export remains accurate.
+    # A mate removes the inserter's *physical* grasp weld so the datum can carry the
+    # part, but the task state still holds that grasp until an explicit release. Opening
+    # from active_grasps here used to make every inserter open immediately at assembly.
+    _released = (_symbolic_grasp_opens(states, _l[0]) if _l is not None else set())
+    _open = {r: _open_aperture(r) for r, _part in _released
+             if scene._gripper_qadr.get(r)}
+    for _r, _part in sorted(_released):
+      if _r in _open:
+        _record_gripper_event("open_start", _r, _part)
     if animate_grippers:
       _opened = _command_gripper_targets(_open)
       # Ownership has already transferred (or the part has been released), so a handover
@@ -5927,12 +5951,6 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
       return arms_set
     acting = [acting_for(done) for _, done in stretches]
 
-    def _state_grasps(state):
-      """Physical (robot, directly-grasped-part) pairs in one symbolic state."""
-      return {(c[1], p) for p in assembly.objects
-              for c in state.supports.get(p, ())
-              if c[0] == "grasp" and c[1] in robot_index}
-
     def _gripper_changes(done_ids):
       """Two-finger close/open transitions completed by this task barrier.
 
@@ -5955,9 +5973,8 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         # invents an open command one task too early (real-bench pre-place task 17).
         if lbl is None or not frames:
           continue
-        before = _state_grasps(states[lbl[0]])
-        after = _state_grasps(states[min(lbl[0] + 1, len(states) - 1)])
-        opens.update(r for r, _part in before - after if scene._gripper_qadr.get(r))
+        opens.update(r for r, _part in _symbolic_grasp_opens(states, lbl[0])
+                     if scene._gripper_qadr.get(r))
       # A split action can list several task markers at one barrier. Preserve the first task
       # occurrence while removing duplicate physical commands.
       closes = list({(r, p): (tid, r, p) for tid, r, p in closes}.values())

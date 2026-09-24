@@ -137,3 +137,26 @@ def test_build_scene_restores_discrete_mate_symmetry_and_legacy_off():
   legacy.pop("mate_symmetry")
   _C_old, assembly_old = R.build_scene(legacy)
   assert len(assembly_old.mate_quaternions("obj_1")) == 1
+
+
+def test_build_scene_restores_sampling_expansion_and_resets_legacy(monkeypatch):
+  import problem as P
+  seen = []
+  original = P.set_sampled_grasps
+  def capture(mode):
+    seen.append(mode)
+    original(mode)
+  monkeypatch.setattr(P, "set_sampled_grasps", capture)
+  cfg = RunConfig(assembly="cross", parts=1, num_robots=1, floating_ee=True,
+                  grasp_sampler=True, grasp_sampler_full_probe=True,
+                  grasp_sampler_roll_refine=True, grasp_sampler_keep=8,
+                  grasp_widen=True, grasp_widen_max=24).to_dict()
+  R.build_scene(cfg)
+  assert seen[-1]["full_probe"] and seen[-1]["roll_refine"]
+  assert seen[-1]["master_keep"] == 24 and seen[-1]["fixed_master"]
+  cfg.pop("grasp_sampler_full_probe")
+  cfg.pop("grasp_sampler_roll_refine")
+  cfg.pop("grasp_widen")
+  R.build_scene(cfg)
+  assert not seen[-1]["full_probe"] and not seen[-1]["roll_refine"]
+  assert seen[-1]["master_keep"] == 8 and not seen[-1]["fixed_master"]

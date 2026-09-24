@@ -148,9 +148,14 @@ def build_scene(cfg, *, require_artifact_contract=False, motion_data=None):
   set_sampled_grasps({"seed": int(_saved(cfg, "grasp_sampler_seed")),
                       "candidates": int(_saved(cfg, "grasp_sampler_candidates")),
                       "keep": int(_saved(cfg, "grasp_sampler_keep")),
+                      # Standard global widening ranks one immutable finite master up front.
+                      # Rebuilding only the active K rows silently changes positional grasp IDs.
                       "master_keep": (int(_saved(cfg, "grasp_widen_max"))
-                                      if _saved(cfg, "grasp_local_widen", legacy=False)
+                                      if (_saved(cfg, "grasp_widen", legacy=False)
+                                          or _saved(cfg, "grasp_local_widen", legacy=False))
                                       else int(_saved(cfg, "grasp_sampler_keep"))),
+                      "fixed_master": bool(_saved(cfg, "grasp_widen", legacy=False)
+                                           and not _saved(cfg, "grasp_local_widen", legacy=False)),
                       # LEGACY-FAITHFUL: a plan saved BEFORE the edge margin existed carries
                       # no key and was built with NO margin -- reconstructing it at today's
                       # DEFAULT would rebind every saved grasp id. Missing => 0.0, not 0.008.

@@ -5,7 +5,7 @@ import robotic as ry
 
 from assembly import get_robots
 from env import make_openarm_duo_env
-from gripper_closure import VERSION, certify, closure_sweep_configs
+from gripper_closure import VERSION, certify, closure_sweep_configs, finger_sweep_radius_bound
 from problem import add_disassembled_obj, get_initial_state, grasp_pose, make_assembly
 from solver import _search_context, isolated_pick_state
 
@@ -31,6 +31,99 @@ def test_robotiq_virtual_close_finds_object_dependent_aperture():
   assert out.feasible and out.model == "robotiq"
   assert 0.0 < out.aperture < 0.042
   assert VERSION >= 2
+
+
+def test_finger_sweep_bound_contains_both_gripper_models():
+  """A table broad-phase reject must cover every finger pose in the exact sweep."""
+  import gripper_closure as G
+  scenes = [(_robotiq_scene(), "x_")]
+  openarm = ry.Config()
+  openarm.addFile("src/rai/openarm/openarm_pinch_floating.g", namePrefix="x_")
+  centre = np.asarray(openarm.getFrame("x_gripper_center").getPosition(), dtype=float)
+  openarm.addFrame("obj_0").setShape(ry.ST.box, [.03, .04, .03, .0]).setPosition(
+      centre).setContact(1)
+  scenes.append((openarm, "x_"))
+  for C, prefix in scenes:
+    radius = finger_sweep_radius_bound(C, prefix)
+    assert radius is not None and radius > 0.0
+    _result, frames = closure_sweep_configs(C, prefix, "obj_0", steps=5)
+    for sweep, _label in frames:
+      _model, groups, center_name = G._finger_groups(sweep, prefix)
+      center = np.asarray(sweep.getFrame(center_name).getPosition(), dtype=float)
+      for group in groups:
+        for name in group:
+          frame = sweep.getFrame(name)
+          distance = np.linalg.norm(np.asarray(frame.getPosition(), dtype=float) - center)
+          assert distance + np.sum(np.asarray(frame.getSize(), dtype=float)) <= radius
+
+
+def test_aperture_cache_distinguishes_compound_offsets_and_finger_sizes():
+  import gripper_closure as G
+  C = _robotiq_scene()
+  C.addFrame("obj_0__shape0", "obj_0").setShape(ry.ST.box, [.01, .01, .01])
+  model, groups, _center = G._finger_groups(C, "x_")
+  before = G._aperture_key(C, model, groups, "obj_0")
+  C.getFrame("obj_0__shape0").setRelativePosition([0, .01, 0])
+  shifted = G._aperture_key(C, model, groups, "obj_0")
+  assert shifted != before
+  finger = C.getFrame(groups[0][0])
+  finger.setShape(ry.ST.box, [.01, .02, .03])
+  assert G._aperture_key(C, model, groups, "obj_0") != shifted
+
+
+def test_aperture_cache_distinguishes_meshes_with_same_extents():
+  import gripper_closure as G
+  C = _robotiq_scene()
+  points = np.array([[0, 0, 0], [.02, 0, 0], [0, .02, 0], [0, 0, .02]])
+  child = C.addFrame("obj_0__shape0", "obj_0").setConvexMesh(points)
+  model, groups, _center = G._finger_groups(C, "x_")
+  before = G._aperture_key(C, model, groups, "obj_0")
+  child.setConvexMesh(np.vstack([points, [.02, .02, .02]]))
+  assert G._aperture_key(C, model, groups, "obj_0") != before
+
+
+def test_held_endpoint_does_not_repeat_acquisition_sweep():
+  C = _robotiq_scene(with_blocker=True)
+  assert not certify(C, "x_", "obj_0").feasible
+  assert certify(C, "x_", "obj_0", closing=False).feasible
+  center = np.asarray(C.getFrame("x_ur_gripper_center").getPosition())
+  C.getFrame("other_gripper").setPosition(center + [0, .013, 0])
+  assert not certify(C, "x_", "obj_0", closing=False).feasible
+
+
+def test_sampler_pair_cache_shares_identical_tools_but_retains_direction():
+  from solver import CollisionChecker
+  from problem import State
+  checker = object.__new__(CollisionChecker)
+  checker._sampled_pair_verdicts = {}
+  checker.closure_check = False
+  checker.robot_gripper_paths = dict(a1='tool.g', a2='tool.g', a3='tool.g')
+  checker._sig = lambda *args: ('scene',)
+  calls = []
+  checker._check = lambda *args, **kw: calls.append(1) or False
+  state = State({}, {}, {}, {}, {})
+  a = np.array([0, 0, .01, 1, 0, 0, 0.])
+  b = np.array([0, 0, .02, 1, 0, 0, 0.])
+  assert not checker.pose_pair_grasp_free(state, 'obj_0', a, b, None, 'a1', 'a2')
+  assert not checker.pose_pair_grasp_free(state, 'obj_0', a, b, None, 'a2', 'a3')
+  assert len(calls) == 1
+  assert not checker.pose_pair_grasp_free(state, 'obj_0', b, a, None, 'a2', 'a1')
+  assert len(calls) == 2
+
+
+def test_aperture_cache_eviction_preserves_the_certificate(monkeypatch):
+  import gripper_closure as G
+  monkeypatch.setattr(G, '_APERTURE_CACHE', {})
+  monkeypatch.setattr(G, '_APERTURE_CACHE_LIMIT', 1)
+  C = _robotiq_scene()
+  first = G.certify(C, 'x_', 'obj_0')
+  C.getFrame('obj_0').setShape(ry.ST.box, [.02, .03, .02, .0])
+  wider = G.certify(C, 'x_', 'obj_0')
+  assert first.feasible and wider.feasible
+  assert wider.aperture < first.aperture
+  assert len(G._APERTURE_CACHE) == 1
+  C.getFrame('obj_0').setShape(ry.ST.box, [.02, .02, .02, .0])
+  assert G.certify(C, 'x_', 'obj_0') == first
 
 
 def test_virtual_close_rejects_an_off_centre_bilateral_grasp():

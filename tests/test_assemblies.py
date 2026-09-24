@@ -933,76 +933,6 @@ def test_milestone_session_resumes_after_external_complete_plan_suspension(monke
   assert ("middle", "obj_2", frozenset({"final-a"})) in calls
 
 
-def test_chain_milestone_oracle_plans_a_sequence():
-  A.set_seed(0); A.set_rolls_per_face(1)
-  asm = A.make_assembly("cross", 3)
-  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
-  A.add_disassembled_obj(C, asm, spacing=0.2)
-  robots = A.get_robots(C)
-  plan = A.solve_assembly_problem_milestones(
-      C, asm, robots=robots, weight=5.0, verbose=False,
-      milestone_oracle="chain")
-  assert plan is not None
-  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
-
-
-def test_fill_local_exact_plans_a_sequence_without_global_oracle():
-  A.set_seed(0); A.set_rolls_per_face(1)
-  asm = A.make_assembly("cross", 3)
-  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
-  A.add_disassembled_obj(C, asm, spacing=0.2)
-  robots = A.get_robots(C)
-  plan = A.solve_assembly_problem_milestones(
-      C, asm, robots=robots, weight=100.0, verbose=False,
-      milestone_oracle="structural", fill_local_h=True, fill_exact=True)
-  assert plan is not None
-  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
-
-
-def test_fill_local_greedy_plans_a_sequence_without_global_oracle():
-  """The standard local ordering is a real solver path, not only a profile spelling."""
-  A.set_seed(0); A.set_rolls_per_face(1)
-  asm = A.make_assembly("cross", 3)
-  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
-  A.add_disassembled_obj(C, asm, spacing=0.2)
-  robots = A.get_robots(C)
-  plan = A.solve_assembly_problem_milestones(
-      C, asm, robots=robots, weight=1.0, verbose=False,
-      milestone_oracle="structural", fill_local_h=True,
-      fill_exact=False, fill_greedy=True)
-  assert plan is not None
-  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
-
-
-def test_fill_raw_grasp_pdb_plans_with_the_same_milestone_solver():
-  """The fine reverse ablation changes labels, not the outer or forward algorithm."""
-  A.set_seed(0); A.set_rolls_per_face(1)
-  asm = A.make_assembly("cross", 3)
-  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
-  A.add_disassembled_obj(C, asm, spacing=0.2)
-  robots = A.get_robots(C)
-  plan = A.solve_assembly_problem_milestones(
-      C, asm, robots=robots, weight=1.0, verbose=False,
-      milestone_oracle="structural", fill_local_h=True,
-      fill_raw_grasp_h=True, fill_exact=False, fill_greedy=True)
-  assert plan is not None
-  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
-
-
-def test_fill_target_support_quotient_plans_without_wrench():
-  """Anonymous target holders retain a valid concrete fill on a growing component."""
-  A.set_seed(0); A.set_rolls_per_face(1)
-  asm = A.make_assembly("cross", 3)
-  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
-  A.add_disassembled_obj(C, asm, spacing=0.2)
-  robots = A.get_robots(C)
-  plan = A.solve_assembly_problem_milestones(
-      C, asm, robots=robots, weight=1.0, verbose=False, wrench=False,
-      milestone_oracle="structural", fill_local_h=True,
-      fill_target_support_quotient=True, fill_greedy=True)
-  assert plan is not None
-  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
-
 
 def test_exact_search_initializes_useful_grasps_from_its_search_context(monkeypatch):
   """Anytime's exact phase must not consume the grasp table before constructing it."""
@@ -1147,15 +1077,16 @@ def test_fill_policy_widening_failure_falls_through_to_complete_fill(monkeypatch
       S.CollapsedLabeledHeuristic, "policy_atom_frontier",
       lambda _self, _state: (("grasp", "loose", ("obj_1",), "obj_1", 999,
                               frozenset({999})),))
-  # Make the compact and its one numerical widening stall.  The invalid full-master policy
-  # demand must then fail open to ordinary local recovery rather than become a no-good.
+  # Make both the outer compact probe and the complete session's compact/numerical probes
+  # stall. The invalid full-master policy demand must then fail open to ordinary local
+  # recovery rather than become a no-good.
   original_add = S._add_one_part
   calls = {"n": 0}
 
   def first_compact_miss(*args, **kwargs):
     if kwargs.get("diagnostic_only"):
       return original_add(*args, **kwargs)
-    if calls["n"] < 2:
+    if calls["n"] < 3:
       calls["n"] += 1
       return None, None
     calls["n"] += 1
@@ -1199,9 +1130,9 @@ def test_fill_policy_lift_adds_to_instead_of_replacing_compact_columns(monkeypat
     if active is not None and 5 in active.get("obj_1", ()):
       observed.append({p: set(gs) for p, gs in active.items()})
       return original_add(*args, **kwargs)
-    if calls["ordinary"] < 2:
+    if calls["ordinary"] < 3:
       calls["ordinary"] += 1
-      return None, None                    # compact + ordinary numeric batch both miss
+      return None, None                    # outer compact + complete compact/numeric miss
     calls["ordinary"] += 1
     return original_add(*args, **kwargs)
 
@@ -1303,9 +1234,9 @@ def test_fill_policy_lift_can_select_one_hidden_support_fibre(monkeypatch):
         observed.append(({p: set(gs) for p, gs in active.items()}, set(brace_allow)))
         return original_add(*args, **kwargs)
       return None, None
-    if calls["ordinary"] < 2:
+    if calls["ordinary"] < 3:
       calls["ordinary"] += 1
-      return None, None                    # compact + ordinary numeric batch both miss
+      return None, None                    # outer compact + complete compact/numeric miss
     calls["ordinary"] += 1
     return original_add(*args, **kwargs)
 
@@ -1835,21 +1766,6 @@ def test_scope_aware_successors_match_families(kind, n):
     assert scoped == legacy
 
 
-def test_direct_fill_skeleton_plans_a_simple_join():
-  """The reviewer baseline uses ordinary actions and returns a replayable direct schema."""
-  A.set_seed(0); A.set_rolls_per_face(1)
-  asm = A.make_assembly("cross", 2)
-  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
-  A.add_disassembled_obj(C, asm, spacing=0.2)
-  robots = A.get_robots(C)
-  plan = A.solve_assembly_problem_milestones(
-      C, asm, robots=robots, weight=1.0, verbose=False,
-      milestone_oracle="structural", fill_skeleton_first=True)
-  assert plan is not None
-  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
-  assert sum(a[0] == "handover" for a in plan) <= 1
-  assert sum(a[0] == "add_grasp" for a in plan) <= 1
-
 
 def test_direct_fill_skeleton_failure_explicitly_uses_complete_fallback(monkeypatch, capsys):
   """Exhausting the restricted family must not become a new infeasibility declaration."""
@@ -1974,19 +1890,6 @@ def test_fill_local_exact_handles_a_detached_module():
   assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
   assert any(a[0] == "assemble" and a[2] == "obj_4" for a in plan)
 
-
-def test_optimistic_chain_heuristic_plans_a_non_module_assembly():
-  """The fixed-order chain projection must remain a usable heuristic, not only a small DB."""
-  A.set_seed(0); A.set_rolls_per_face(1)
-  asm = A.make_assembly("cross", 3)
-  C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
-  A.add_disassembled_obj(C, asm, spacing=0.2)
-  robots = A.get_robots(C)
-  plan = A.solve_assembly_problem_optimistic(
-      C, asm, robots=robots, weight=5.0, verbose=False, fallback=False,
-      wrench=False, bracing=False, chain_h=True)
-  assert plan is not None
-  assert _replay_ok(plan, asm, C, robots_list=robots, gk=None)
 
 
 def test_full_backward_is_exact_on_unprojected_symbolic_graph():

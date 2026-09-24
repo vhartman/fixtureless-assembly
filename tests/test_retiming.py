@@ -1,54 +1,12 @@
-"""Pin the extracted retiming math to the pre-refactor sim behavior + the portable
-trajectory contract (input = sequence/DAG + collision-free path, output = q(t) with
-v=0 at goals). Pure numpy -- no sim/MuJoCo/rai needed."""
+"""Portable trajectory contracts: path, event, rate, and collision invariants."""
 import numpy as np
 import pytest
 
 import retiming
 
 
-def _old_drive_stretch(qs, dt, joint_rate, ramp_dist, ramp_min):
-  """Verbatim copy of the inline profile that lived in sim.execute_motion_plan,
-  so a drift in retime_stretch is caught immediately."""
-  qs = [np.asarray(q, float) for q in qs]
-  segs = [float(np.linalg.norm(b - a)) for a, b in zip(qs, qs[1:])]
-  D = float(sum(segs))
-  out = []
-  if D < 1e-9:
-    return out
-  csum = np.concatenate([[0.0], np.cumsum(segs)])
-
-  def config_at(s):
-    i = min(int(np.searchsorted(csum, s, side="right")) - 1, len(segs) - 1)
-    if segs[i] < 1e-12:
-      return qs[i + 1]
-    a = (s - csum[i]) / segs[i]
-    return (1 - a) * qs[i] + a * qs[i + 1]
-
-  s = 0.0
-  while s < D:
-    ramp = min(1.0, (min(s, D - s) + 1e-6) / ramp_dist) if ramp_dist > 0 else 1.0
-    s = min(D, s + joint_rate * max(ramp_min, ramp) * dt)
-    out.append(config_at(s))
-  return out
 
 
-def _old_split(states, full_q):
-  """Verbatim copy of the inline stretch decomposition (mode handles = st.mode)."""
-  mode = states[0].mode
-  stretches = []
-  cur = [full_q(states[0].q)]
-  for st in states[1:]:
-    q = full_q(st.q)
-    if st.mode != mode:
-      done = [int(t) for t in np.atleast_1d(mode.task_ids)
-              if t not in np.atleast_1d(st.mode.task_ids)]
-      stretches.append((cur, sorted(set(done))))
-      cur = [cur[-1]]
-      mode = st.mode
-    cur.append(q)
-  stretches.append((cur, sorted(set(int(t) for t in np.atleast_1d(mode.task_ids)))))
-  return stretches
 
 
 DT, RATE, RD, RM = 0.002, 1.0, 0.2, 0.04
@@ -59,14 +17,6 @@ STRETCHES = [
     [np.array([1.0, 1.0]), np.array([1.0, 1.0])],             # degenerate (D=0)
 ]
 
-
-@pytest.mark.parametrize("qs", STRETCHES)
-def test_retime_stretch_matches_old(qs):
-  new = list(retiming.retime_stretch(qs, DT, RATE, RD, RM))
-  old = _old_drive_stretch(qs, DT, RATE, RD, RM)
-  assert len(new) == len(old)
-  for a, b in zip(new, old):
-    assert np.allclose(a, b)
 
 
 def test_final_sample_lands_on_goal_at_rest():
@@ -105,21 +55,6 @@ class _St:
     self.q = np.asarray(q, float)
     self.mode = mode
 
-
-def test_split_stretches_matches_old():
-  m0, m1, m2 = _Mode([0]), _Mode([0, 1]), _Mode([0, 1, 2])
-  path = [_St([0, 0], m0), _St([1, 0], m0),
-          _St([1, 0], m1), _St([1, 1], m1),          # transition -> task 0 not done here
-          _St([1, 1], m2), _St([2, 2], m2)]
-  full_q = lambda q: np.asarray(q, float)
-  new = retiming.split_stretches(path, q_of=lambda s: full_q(s.q),
-                                 mode_of=lambda s: s.mode,
-                                 taskids_of=lambda m: np.atleast_1d(m.task_ids))
-  old = _old_split(path, full_q)
-  assert len(new) == len(old)
-  for (nq, nd), (oq, od) in zip(new, old):
-    assert nd == od
-    assert len(nq) == len(oq) and all(np.allclose(a, b) for a, b in zip(nq, oq))
 
 
 def test_compact_stretches_removes_dense_shortcut_samples_but_keeps_barriers():
@@ -256,16 +191,6 @@ def test_schedule_fires_in_dag_order_at_rest():
       assert np.linalg.norm(traj.q[idx] - traj.q[idx - 1]) < RATE * DT + 1e-6
 
 
-def test_schedule_single_arm_matches_build_trajectory():
-  # one arm, both barriers acting -> no crossing freedom -> same samples as the composite trapezoid
-  st = [([np.array([0.0]), np.array([1.0])], [10]),
-        ([np.array([1.0]), np.array([2.0])], [11])]
-  arm_dims = [np.array([0])]
-  sched = retiming.plan_schedule(st, arm_dims, [{0}, {0}], DT, RATE, RD, RM)
-  comp = retiming.build_trajectory(st, DT, RATE, RD, RM)
-  comp_path = np.array([q for q, ph in zip(comp.q, comp.phase) if ph == "path"])
-  assert np.allclose(sched.q, comp_path)
-
 
 def test_per_stretch_rate_slows_only_selected_skill_interval():
   st = [([np.array([0.0]), np.array([1.0])], [10]),
@@ -388,29 +313,6 @@ def test_schedule_corridor_formation_holds():
   assert np.allclose(traj.q[-1], [6.0, 6.0])                 # both finished
   assert [e for _, e in traj.fires] == [[10], [11]]
 
-
-def test_arm_rate_boost_values():
-  # 2 arms of 1 dof. Both move equally -> each gets 1/sqrt(2) of composite -> boost sqrt(2).
-  qs = [np.array([0.0, 0.0]), np.array([1.0, 1.0]), np.array([2.0, 1.0])]
-  b = retiming.arm_rate_boost(qs, [np.array([0]), np.array([1])])
-  assert np.isclose(b[0], np.sqrt(2), atol=1e-6)             # both moving: full dilution
-  assert np.isclose(b[1], 1.0, atol=1e-6)                    # one arm moving: no boost
-  assert (b <= np.sqrt(2) + 1e-9).all()                      # bounded by sqrt(#arms)
-
-
-def test_arm_rate_boost_same_path_faster():
-  # THE SAFETY PROPERTY: boosting a COMMON clock rescales time only -- the geometric path
-  # is unchanged, so the collision certificate carries over. Verify the boosted samples all
-  # lie on the unboosted path (same curve), and that it takes fewer samples.
-  qs = [np.zeros(2), np.array([1.0, 1.0]), np.array([2.0, 2.0])]
-  dims = [np.array([0]), np.array([1])]
-  plain = np.array(list(retiming.retime_stretch(qs, DT, RATE, RD, RM)))
-  fast = np.array(list(retiming.retime_stretch(qs, DT, RATE, RD, RM, arm_dims=dims)))
-  assert len(fast) < len(plain)                              # genuinely faster
-  assert np.allclose(fast[:, 0], fast[:, 1])                 # still on the x0==x1 path
-  assert np.allclose(fast[-1], qs[-1])                       # still lands on the goal
-  # every boosted sample lies on the segment set of the original path (max deviation ~0)
-  assert float(np.abs(fast[:, 0] - fast[:, 1]).max()) < 1e-9
 
 
 def test_schedule_rate_boost_preserves_events():

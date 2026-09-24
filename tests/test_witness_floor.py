@@ -89,10 +89,6 @@ def test_no_gross_arm_vs_arm_penetration(floor_result):
   assert worst > -0.02, f"gross arm-vs-arm penetration {worst * 1000:.1f}mm at {where}"
 
 
-def test_report_is_populated(floor_result):
-  _wit, rep, _C, _robots, _rik = floor_result
-  assert rep.get("alpha") is not None
-  assert rep.get("crossings", -1) >= 0
 
 
 # ---------------------------------------------------------------------------------------

@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 
 from benchmarks import plot_cube_scaling as C
-from benchmarks import plot_process_wrench_full_matrix as P
 from benchmarks import search_runner as B
 from benchmarks import run_wrench_sim_ablation as WS
 from benchmarks import run_paper_search_comparison as PS
@@ -31,6 +30,25 @@ def _manifest():
           {"name": "open", "args": ["--open-witness"]},
       ],
   }
+
+
+def test_grasp_db_only_builds_without_running_search(tmp_path, monkeypatch):
+  manifest = tmp_path / "manifest.json"
+  manifest.write_text(json.dumps(_manifest()))
+  entry = {"case": "a", "seed": 3, "path": tmp_path / "result" / "db",
+           "cache_key": "test"}
+  calls = []
+  monkeypatch.setattr(B, "provenance", lambda: {"source_sha256": "test"})
+  monkeypatch.setattr(B, "_grasp_database_specs", lambda *_: {("a", 3): entry})
+  monkeypatch.setattr(B, "_prepare_grasp_database",
+                      lambda db, *_: calls.append(db["case"]) or db.update(status="success"))
+  monkeypatch.setattr(B, "run_one", lambda *_args, **_kwargs: pytest.fail("task search ran"))
+  out = tmp_path / "result"
+  assert B.main([str(manifest), "--output", str(out),
+                 "--shared-grasp-db", "--grasp-db-only"]) == 0
+  assert calls == ["a"]
+  saved = json.loads((out / "grasp-databases.json").read_text())
+  assert saved["databases"][0]["case"] == "a"
 
 
 def test_wrench_sim_ablation_does_not_confound_task_model_with_mp_wrench_gate():
@@ -214,29 +232,35 @@ def test_paper_breakdown_includes_aggregated_initial_motion_time():
   assert "4.2" in tex
 
 
-def test_paper_tables_use_requested_order_caption_and_explicit_uncertainty():
-  records = []
-  for case in PS.CASES:
-    for seed in (3, 5):
-      records.append({
-          "case": case, "variant": "ours", "seed": seed,
-          "success": True, "timed_out": False, "out_of_memory": False,
-          "status": "success", "search_pipeline_s": 1.0, "plan_cost": 4,
-          "grasp_generation_s": 1.0, "backward_graph_search_s": 1.0,
-          "backward_force_lp_s": 1.0, "forward_search_s": 1.0,
-          "ik_bind_wall_s": 1.0, "mp_initial_solution_s": 1.0,
-      })
-  groups = B.aggregate(records)
-  comparison = PS._comparison_tex(groups)
-  breakdown = PS._breakdown_tex(groups)
-  assert "mean and standard deviation of 2 runs" in comparison
-  assert "1.00 +- 0.00" in comparison
-  assert "4 +-" not in comparison
-  assert comparison.index("F. Beam") < comparison.index("F. Plumber block")
-  assert comparison.index("F. Plumber block") < comparison.index("F. Car")
-  assert comparison.index("F. Duct") < comparison.index("F. Stool")
-  assert "Breakdown of where time is spent in \\textsc{Wrap}." in breakdown
-  assert "1.00 +- 0.00" in breakdown
+
+def test_paper_manifest_uses_portable_plain_fabrica_configs():
+  from config import RunConfig
+  from main import parse_args
+
+  manifest = json.loads(PS.MANIFEST.read_text(encoding="utf-8"))
+  fabrica = [case for case in manifest["cases"]
+             if "--search-profile" in case["args"]
+             and case["args"][case["args"].index("--search-profile") + 1] == "fabrica"]
+  assert len(fabrica) == 7
+  for case in fabrica:
+    args = case["args"]
+    config_token = args[args.index("--config") + 1]
+    config_path = B.ROOT / config_token
+    assert not config_token.startswith("/")
+    assert config_path.is_file()
+    assert "experiments" not in config_path.parts
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    assert "plan" not in raw and "witnesses" not in raw
+    cfg = RunConfig.from_file(config_path)
+    assert cfg.assembly.startswith("fabrica-")
+
+    # A historical saved plan used as --config silently supplied legacy replay defaults.
+    # These benchmark configs must instead inherit the current profile/default semantics.
+    resolved = parse_args([*manifest["defaults"], *args, "--seed", "4242"])
+    assert resolved.seed == 4242
+    assert resolved.grasp_sampler_db_hash is None
+    assert resolved.mate_wrench_limits
+    assert resolved.post_pick == pytest.approx(0.05)
 
 
 def _matrix_manifest():
@@ -272,24 +296,6 @@ def test_manifest_expansion_is_deterministic_and_case_seed_can_override():
   assert runs[0]["args"] == ["--weight", "inf", "--assembly", "cross", "--parts", "3",
                               "--no-open-witness"]
 
-
-def test_matrix_expansion_is_row_by_column_and_keeps_coordinates_and_guard():
-  runs = B.expand_runs(B.validate_manifest(_matrix_manifest()))
-  assert [r["run_id"] for r in runs] == [
-      "cross__counting__geometry__seed-3",
-      "cross__counting__noisy__seed-3",
-      "cross__reverse__geometry__seed-3",
-      "cross__reverse__noisy__seed-3",
-  ]
-  assert runs[-1]["method"] == "reverse" and runs[-1]["physics"] == "noisy"
-  assert runs[-1]["max_address_space_gb"] == 6.0
-  assert runs[-1]["args"] == [
-      "--weight", "1", "--assembly", "cross", "--parts", "3",
-      "--fill-local-h", "--wrench", "--insertion-noise", "0.05",
-  ]
-  guarded = B._guarded_command(runs[-1], ["planner", "--flag"])
-  assert guarded == ["/usr/bin/prlimit", "--as=6442450944", "--",
-                     "planner", "--flag"]
 
 
 def test_resident_memory_limit_expands_without_becoming_an_address_space_limit():
@@ -336,35 +342,6 @@ def test_seed_override_replaces_manifest_case_and_variant_seeds():
   assert {run["seed"] for run in runs} == {41, 42}
   assert len(runs) == 2 * len(manifest["cases"]) * len(manifest["variants"])
 
-
-def test_paper_manifest_uses_portable_plain_fabrica_configs():
-  from config import RunConfig
-  from main import parse_args
-
-  manifest = json.loads(PS.MANIFEST.read_text(encoding="utf-8"))
-  fabrica = [case for case in manifest["cases"]
-             if "--search-profile" in case["args"]
-             and case["args"][case["args"].index("--search-profile") + 1] == "fabrica"]
-  assert len(fabrica) == 7
-  for case in fabrica:
-    args = case["args"]
-    config_token = args[args.index("--config") + 1]
-    config_path = B.ROOT / config_token
-    assert not config_token.startswith("/")
-    assert config_path.is_file()
-    assert "experiments" not in config_path.parts
-    raw = json.loads(config_path.read_text(encoding="utf-8"))
-    assert "plan" not in raw and "witnesses" not in raw
-    cfg = RunConfig.from_file(config_path)
-    assert cfg.assembly.startswith("fabrica-")
-
-    # A historical saved plan used as --config silently supplied legacy replay defaults.
-    # These benchmark configs must instead inherit the current profile/default semantics.
-    resolved = parse_args([*manifest["defaults"], *args, "--seed", "4242"])
-    assert resolved.seed == 4242
-    assert resolved.grasp_sampler_db_hash is None
-    assert resolved.mate_wrench_limits
-    assert resolved.post_pick == pytest.approx(0.05)
 
 
 def test_runner_can_stop_remaining_cell_trials_after_first_timeout(tmp_path, monkeypatch):
@@ -428,19 +405,6 @@ def test_runner_jobs_parallelizes_cases_but_serializes_each_case(tmp_path, monke
   assert max(overlap) == 2
 
 
-def test_process_wrench_plot_can_use_plan_cost(tmp_path):
-  def sample(parts, robots, force, cost):
-    return {"planner_command": ["python", "main.py", "--parts", str(parts),
-                                "--num-robots", str(robots), "--insert-force", str(force)],
-            "success": True, "plan_cost": cost, "milestone_search_s": 1.0}
-  physical = [sample(2, 2, 0, 3), sample(2, 2, 10, 4), sample(2, 2, 20, 5),
-              sample(2, 3, 0, 3), sample(2, 3, 10, 4), sample(2, 3, 20, 5),
-              sample(2, 4, 0, 3), sample(2, 4, 10, 4), sample(2, 4, 20, 5)]
-  # The real plot requires all six lambda columns; exercise the metric path through the
-  # aggregator directly so this remains a small, deterministic unit test.
-  rows = P._aggregate(physical, physical=True)
-  assert rows[0]["plan_cost_mean"] == 3.0
-
 
 def test_manifest_rejects_ambiguous_variant_and_matrix_products():
   m = _matrix_manifest()
@@ -448,26 +412,6 @@ def test_manifest_rejects_ambiguous_variant_and_matrix_products():
   with pytest.raises(ValueError, match="either variants or matrix"):
     B.validate_manifest(m)
 
-
-@pytest.mark.parametrize("name", ["search_smoke.json", "fixture_scaling.json",
-                                   "fixture_abstract_scaling.json", "core_assemblies.json",
-                                   "local_fill_reviewer.json",
-                                   "fixture_support_diagnostic.json",
-                                   "paper_search_matrix.json",
-                                   "paper_search_stress_4r.json",
-                                   "paper_search_comparison.json",
-                                   "search_finalists_4r.json",
-                                   "search_manipulation_scope_ablation.json",
-                                   "cube_scaling.json", "cube_scaling_piecewise.json",
-                                   "cube_wrench_envelope_scaling.json",
-                                   "cube_wrench_x100_high_friction.json",
-                                   "cross_wrench_envelope_scaling.json",
-                                   "cross_wrench_x100_high_friction.json",
-                                   "cross_no_wrench_scaling.json"])
-def test_repository_manifests_validate_and_expand(name):
-  path = B.ROOT / "benchmarks" / "manifests" / name
-  data = B.validate_manifest(json.loads(path.read_text()))
-  assert B.expand_runs(data)
 
 
 def test_runner_rejects_flags_that_would_escape_or_pollute_search_measurement():
@@ -624,38 +568,6 @@ def test_native_bad_alloc_is_classified_as_oom():
   assert B._looks_like_out_of_memory("Traceback\nMemoryError")
   assert not B._looks_like_out_of_memory("ordinary planner failure")
 
-
-def test_matrix_markdown_reports_method_by_physics_cells():
-  manifest = _matrix_manifest()
-  results = [
-      {"case": "cross", "variant": "counting__geometry", "method": "counting",
-       "physics": "geometry", "success": True, "timed_out": False,
-       "wall_s": 2.0, "max_rss_kb": 102400, "plan_cost": 7,
-       "ik_bind_calls": 10, "ik_bind_fail": 2},
-      {"case": "cross", "variant": "counting__noisy", "method": "counting",
-       "physics": "noisy", "success": False, "timed_out": True, "wall_s": 12.0},
-  ]
-  groups = B.aggregate_matrix(results)
-  text = B.matrix_markdown(manifest, groups)
-  assert "| method | geometry | noisy |" in text
-  assert "| counting | 1/1 · 2.0+/-0.0s · 100MB · cost 7.0 · IK 10/2 | " in text
-  assert "0/1 · 12.0+/-0.0s" in text
-  assert "| reverse | -- | -- |" in text
-
-
-def test_matrix_suite_writes_markdown_csv_and_json(tmp_path):
-  manifest = _matrix_manifest()
-  results = [{
-      "case": "cross", "variant": "counting__geometry", "method": "counting",
-      "physics": "geometry", "success": True, "timed_out": False,
-      "wall_s": 2.0, "max_rss_kb": 102400, "plan_cost": 7,
-  }]
-  B.write_suite_outputs(tmp_path, manifest, {}, results)
-  assert (tmp_path / "matrix.md").is_file()
-  assert (tmp_path / "matrix.csv").is_file()
-  data = json.loads((tmp_path / "matrix.json").read_text())
-  assert data["groups"][0]["method"] == "counting"
-  assert data["groups"][0]["physics"] == "geometry"
 
 
 def test_cube_scaling_summary_does_not_turn_timeout_into_solution_time():

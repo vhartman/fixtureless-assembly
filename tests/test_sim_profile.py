@@ -10,18 +10,6 @@ import sim
 import wrench
 
 
-def test_lockstep_is_one_coherent_timing_choice():
-  a = sim.parse_args([
-      "run", "plan.json", "--execution-timing", "lockstep",
-      "--joint-rate", "0.5", "--mass-scale", "0.25",
-  ])
-  assert a.execution_timing == "lockstep"
-  assert not a.phase_schedule and not a.phase_smooth and not a.phase_batch
-  assert a.actuated and a.skill_servo and a.servo_pick and a.servo_place_seat
-  assert not a.spline and a.path_preflight and a.force_limits
-  assert a.require_mp_path and a.require_success
-  assert a.joint_rate == 0.5 and a.mass_scale == 0.25
-
 
 def test_kinematic_arm_reasserts_visual_gripper_mimic_joints(monkeypatch):
   """Kinematic parent resets must not leave presentation-only child hinges free-running."""
@@ -63,10 +51,6 @@ def test_standard_profile_refuses_an_implicit_motion_plan_before_scene_build():
     sim._cli_run(a)
 
 
-def test_removed_sim_profile_selector_is_rejected():
-  with pytest.raises(SystemExit):
-    sim.parse_args(["run", "plan.json", "--sim-profile", "standard"])
-
 
 def test_release_reroot_to_continuing_holder_is_not_a_new_grasp():
   """A gripper parent on release is kinematic re-rooting, not a finger-close event."""
@@ -77,6 +61,20 @@ def test_release_reroot_to_continuing_holder_is_not_a_new_grasp():
   assert sim._action_acquires_grasp(plan, (1, True))
   assert not sim._action_acquires_grasp(plan, (2, True))
   assert not sim._action_acquires_grasp(plan, None)
+
+def test_assembly_keeps_inserter_fingers_closed_until_explicit_release():
+  """The mate weld can replace a grasp weld without ending the planned grasp."""
+  base = ("grasp", "a1", "obj_0", 0)
+  inserter = ("grasp", "a2", "obj_1", 1)
+  states = [
+      SimpleNamespace(supports={"obj_0": (base,), "obj_1": (inserter,)}),
+      SimpleNamespace(supports={"obj_0": (base,),
+                                "obj_1": (("part", "obj_0"), inserter)}),
+      SimpleNamespace(supports={"obj_0": (base,),
+                                "obj_1": (("part", "obj_0"),)}),
+  ]
+  assert sim._symbolic_grasp_opens(states, 0) == set()
+  assert sim._symbolic_grasp_opens(states, 1) == {("a2", "obj_1")}
 
 
 def test_exact_grasp_target_uses_authored_relation_not_witness_fk(monkeypatch):

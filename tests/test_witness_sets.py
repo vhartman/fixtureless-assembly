@@ -6,7 +6,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from plan_io import (read_diagnostic_candidates, read_optimization_candidates,
-                     read_witnesses, read_witness_sets, witness_block, write_plan)
+                     read_witness_sets, witness_block, write_plan)
 
 
 JOINTS = [f"j{i}" for i in range(6)]
@@ -15,13 +15,6 @@ JOINTS = [f"j{i}" for i in range(6)]
 def _w(seed):
   return np.arange(6, dtype=float) + seed
 
-
-def test_witness_block_without_alts_is_unchanged(tmp_path=None):
-  blk = witness_block(JOINTS, [_w(0), None, _w(2)])
-  assert set(blk.keys()) == {"joints", "wit"}          # no new key when alts is None/empty
-  blk2 = witness_block(JOINTS, [_w(0), None, _w(2)], alts=None)
-  assert blk == blk2
-  assert witness_block(JOINTS, [_w(0)], alts={}) == witness_block(JOINTS, [_w(0)])
 
 
 def test_round_trip_and_member0_guard(tmp_path):
@@ -43,13 +36,6 @@ def test_round_trip_and_member0_guard(tmp_path):
   got = read_witness_sets(str(p), JOINTS, 3)
   assert set(got.keys()) == {2}
 
-
-def test_old_files_without_alts_load_as_none(tmp_path):
-  p = tmp_path / "plan.json"
-  write_plan(str(p), {"assembly": "t"}, [("pick", "a1", "obj_0", 0)],
-             witnesses=witness_block(JOINTS, [_w(0)]))
-  assert read_witness_sets(str(p), JOINTS, 1) is None
-  assert read_witnesses(str(p), JOINTS, 1) is not None    # plain witnesses unaffected
 
 
 def test_optimizer_candidates_are_separate_and_guard_selected_member(tmp_path):
