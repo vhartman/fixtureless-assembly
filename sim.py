@@ -106,6 +106,9 @@ BREAK_SUSTAIN = 0.02            # s : a grasp breaks only if overloaded CONTINUO
                                 # survivable by a real seal/pinch; loss of grip is a leak/slip
                                 # process, not a single-sample event. Static overloads (what
                                 # the LP prices) persist and still break.
+CONTACT_LOSS_SUSTAIN = 0.10     # s: unilateral pad-force gaps are not instantaneous slip.
+CONTACT_SLIP_SHIFT = 0.010      # m: execution loss, distinct from the 3mm grasp-certificate quality bound.
+CONTACT_SLIP_ANGLE = np.deg2rad(10.0)
 WELD_TIMECONST = 0.012          # s   : solref timeconstant of physical grasp interfaces. 4ms amplified
                                 # sub-millimetre capture/tracking residuals into sustained
                                 # 8--12N numerical reactions; 12ms removes that ringing while
@@ -143,8 +146,8 @@ INSERT_ALIGN_ANG_TOL = np.deg2rad(0.5)
 GRASP_ALIGN_TOL = 0.0005       # m
 GRASP_ALIGN_ANG_TOL = np.deg2rad(0.5)
 INSERT_CONTACT_SPEED = 0.020   # m/s : axial rate after intended guide/socket contact
-INSERT_STALL_TIME = 0.12       # s   : commanded insertion without 0.2mm progress => jam
-INSERT_PROGRESS = 0.0002       # m   : progress quantum resetting the stall timer
+INSERT_STALL_TIME = 0.12       # s: legacy progress-based retry threshold
+INSERT_PROGRESS = 0.0002       # m: legacy progress quantum
 INSERT_SKILL_BUDGET = 2.5      # s   : lower bound; funnel reach derives the real budget
 RAMP_DIST = 0.2                 # rad : trapezoid -- ramp to/from ~rest over this much joint
                                 # arc at each per-mode stretch boundary (task goals), so every
@@ -859,6 +862,10 @@ ACTUATED_LINK_MASS = 4.0         # kg per link for --actuated. A first-order sta
                                  # which the 50kg kinematic links would blow past. Per-link
                                  # inertias are the obvious next refinement.
 ACTUATED_KP = 3000.0             # position-servo gain; kv defaults to 2*sqrt(kp) in arm_model
+CONTACT_GRIPPER_KP = 100.0       # Nm/rad: drives a near-closed thin part into bilateral contact
+CONTACT_GRIPPER_EFFORT = 10.0    # Nm, one master motor: bounds pinch on wide parts; both the
+                                 # offline physics certificate and execution use this model.
+                                 # Provisional contact calibration, not a measured motor spec.
 ARTICULATED_ARMATURE = 0.0       # MEASURED DEAD END: 1e6 was meant to make the chain
                                  # unaccelerable, but it ill-conditions the mass matrix and made
                                  # the first missed seat 66mm -> 20001mm. The arm is pinned by
@@ -1334,11 +1341,12 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
     _actuators.append(a)
   if articulated_C is not None and animate_grippers:
     # Presentation-only animation needs little authority.  A physical pinch instead drives
-    # against contact, so use a stiffer bounded position servo; its forcerange remains the
-    # manufacturer's per-joint limit emitted by arm_model.
+    # against contact with one coupled motor.  Both the higher stiffness and lower effort
+    # cap are shared with the offline physical-grasp certificate.
     a, _ = arm_model.gripper_actuator_mjcf(
-        articulated_C, robots, kp=(25.0 if contact_grasps else 5.0),
-        coupled=bool(contact_grasps))
+        articulated_C, robots, kp=(CONTACT_GRIPPER_KP if contact_grasps else 5.0),
+        coupled=bool(contact_grasps),
+        max_effort=(CONTACT_GRIPPER_EFFORT if contact_grasps else None))
     if a:
       _actuators.append(a)
     if contact_grasps:
@@ -1702,6 +1710,8 @@ class SimScene:
               f"for both fingers of {missing_contact}")
     self.active_grasps = {}                                # robot -> (eq_id, part, fcap, tcap)
     self._contact_grasp_misses = {}                        # physical pinch: lost-contact ticks
+    self._contact_grasp_slips = {}                         # physical pinch: relative-pose drift ticks
+    self._contact_grasp_ref = {}                           # achieved tool-to-part pose at capture
     # Presentation-only mode used by ``sim.py run --render-kinematic``.  It is deliberately
     # opt-in: contacts and equality dynamics are disabled and the active grasp/mate graph is
     # propagated exactly after every arm update.  This makes a deterministic scene-export
@@ -2036,6 +2046,9 @@ class SimScene:
     if not hasattr(self, "_contact_grasp_misses"):
       self._contact_grasp_misses = {}
     self._contact_grasp_misses[robot] = 0
+    self._contact_grasp_slips[robot] = 0
+    if physical:
+      self._contact_grasp_ref[robot] = self._contact_relative_pose(robot, part)
     # DIRECTIONAL CAPS need the grasp FRAME, which is a property of the grasp id. Stored in a
     # parallel dict so active_grasps keeps its 4-tuple shape for every existing consumer. With
     # no gid we cannot build the frame and fall back to the conservative scalar.
@@ -2063,10 +2076,30 @@ class SimScene:
                               "gid": gid, "model": _model,
                               "caps": _caps, "gp": _gp,
                               "Rg": _R.reshape(3, 3)}
-    for gid in self._holdex.get(robot, ()):                # wrist cluster exempt while holding
-      self.model.geom_contype[gid] = 0
-      self.model.geom_conaffinity[gid] = 0
+    if not physical:
+      # Ideal welds need the planner's wrist-cluster exemption. A physical
+      # pinch instead depends on contact at the moving pads; some exports put
+      # those pads in _holdex, so disabling the cluster here destroys the
+      # contact immediately after acquisition.
+      for gid in self._holdex.get(robot, ()):
+        self.model.geom_contype[gid] = 0
+        self.model.geom_conaffinity[gid] = 0
     return True
+
+  def _contact_relative_pose(self, robot, part):
+    """Achieved tool-to-part transform, independent of intermittent contact impulses."""
+    body = self._body_id(self.grasp_anchor[robot])
+    tool = np.r_[self.data.xpos[body], self.data.xquat[body]]
+    return _pose_compose(_pose_invert(tool), self.part_pose(part))
+
+  def _contact_grasp_drift(self, robot, part):
+    ref = self._contact_grasp_ref.get(robot)
+    if ref is None:
+      return 0.0, 0.0
+    now = self._contact_relative_pose(robot, part)
+    shift = float(np.linalg.norm(now[:3] - ref[:3]))
+    dot = min(1.0, abs(float(np.dot(now[3:], ref[3:]))))
+    return shift, float(2.0 * np.arccos(dot))
 
   def contact_grasp_status(self, robot, part):
     """Return ``(bilateral, [left_N, right_N])`` for a physical parallel-jaw grasp.
@@ -2479,13 +2512,15 @@ class SimScene:
     if g is not None and g[0] >= 0:
       self.data.eq_active[g[0]] = 0
     self._contact_grasp_misses.pop(robot, None)
+    self._contact_grasp_slips.pop(robot, None)
+    self._contact_grasp_ref.pop(robot, None)
     self._physical_contact_target.pop(robot, None)
     self._hold_info.pop(robot, None)
     for gid in self._holdex.get(robot, ()):                # restore wrist collision
       self.model.geom_contype[gid] = 2
       self.model.geom_conaffinity[gid] = 1
 
-  def weld_mate(self, part):
+  def weld_mate(self, part, *, project=True):
     """Activate the mate weld at the MANUAL's exact relative pose (not the achieved one):
     the seat CHECK verified we are inside the funnel tolerance; the weld then models the
     mate as a self-aligning datum (snap-fit semantics -- matches the planner's exact rigid
@@ -2498,7 +2533,10 @@ class SimScene:
     structure, not the arm, so keeping the grasp weld makes the wandering goto segment a
     tug-of-war: 191N stiff / 72N with a compliance window, both measured. Any KEEP-HOLDING
     the plan needs is expressed by the path's pinned joint goals, exactly as in the export
-    -- the known mr_bench B2c gap, same modeling on both sides)."""
+    -- the known mr_bench B2c gap, same modeling on both sides).
+
+    ``project=False`` is reserved for measured physical-contact execution: the
+    hand remains active, so moving only the part would fabricate a grasp slip."""
     for r, g in list(self.active_grasps.items()):
       if g[1] == part:
         if g[0] >= 0:
@@ -2509,6 +2547,8 @@ class SimScene:
             self.model.geom_conaffinity[gid] = 1
         del self.active_grasps[r]
         self._contact_grasp_misses.pop(r, None)
+        self._contact_grasp_slips.pop(r, None)
+        self._contact_grasp_ref.pop(r, None)
         self._physical_contact_target.pop(r, None)
         self._hold_info.pop(r, None)
     rel = self.assembly.relative_pose(part)
@@ -2529,11 +2569,12 @@ class SimScene:
     target_pose = _pose_compose(
         parent_pose,
         np.r_[np.asarray(rel[1], dtype=float), np.asarray(chosen, dtype=float)])
-    self._project_mate_component(part, target_pose)
+    if project:
+      self._project_mate_component(part, target_pose)
     self.data.eq_active[eq] = 1
-    # Build the equality rows from an exactly satisfied initial condition.  Without this
-    # forward pass, the next simulation step may still use stale body transforms and create
-    # the very constraint impulse avoided by the explicit projection above.
+    # Rebuild equality rows from the current measured body poses. In ideal-weld mode
+    # the optional projection already put the datum exactly on target; contact mode
+    # enters from its measured seat tolerance without a part-only teleport.
     mujoco.mj_forward(self.model, self.data)
 
   # -- frame-based attach (mirrors mr_bench set_to_mode) ---------------------------------
@@ -2649,6 +2690,33 @@ class SimScene:
       self._mate_component_cache = (key, components)
     return components.get(part, frozenset((part,)))
 
+  def _physical_hand_bodies(self, robot):
+    """Bodies of an articulated hand, excluding the arm upstream of its tool."""
+    cache = getattr(self, "_physical_hand_body_cache", None)
+    if cache is None:
+      cache = self._physical_hand_body_cache = {}
+    if robot in cache:
+      return cache[robot]
+    model = self.model
+    root = self._body_id(self.grasp_anchor[robot])
+    tokens = ("gripper", "robotiq", "finger", "palm", "vacuum", "ee_coll")
+    while True:
+      parent = int(model.body_parentid[root])
+      name = (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, parent) or "").lower()
+      if parent <= 0 or not any(token in name for token in tokens):
+        break
+      root = parent
+    bodies = set()
+    for body in range(int(model.nbody)):
+      ancestor = body
+      while ancestor > 0:
+        if ancestor == root:
+          bodies.add(body)
+          break
+        ancestor = int(model.body_parentid[ancestor])
+    cache[robot] = frozenset(bodies)
+    return cache[robot]
+
   def net_contact_force(self, part):
     """Net world-frame CONTACT force ON `part`'s live rigid component (N).
 
@@ -2668,7 +2736,9 @@ class SimScene:
     component = self._active_mate_component(part)
     # Equality activation can change between physics steps at a manipulation event. Include it
     # in the cache key so such a change cannot reuse the prior component's contact resultant.
-    state_key = (self._phys, self.data.eq_active.tobytes())
+    physical_holders = (tuple(sorted((r, g[1]) for r, g in self.active_grasps.items()
+                                     if g[0] < 0)) if self.contact_grasps else ())
+    state_key = (self._phys, self.data.eq_active.tobytes(), physical_holders)
     tick, cache = getattr(self, "_net_contact_force_cache", (None, {}))
     if tick != state_key:
       cache = {}
@@ -2677,6 +2747,11 @@ class SimScene:
     if cached is not None:
       return cached.copy()
     F = np.zeros(3)
+    own_hand_bodies = set()
+    if self.contact_grasps:
+      for robot, held in physical_holders:
+        if held in component:
+          own_hand_bodies.update(self._physical_hand_bodies(robot))
     for i in range(int(self.data.ncon)):
       c = self.data.contact[i]
       b1 = int(self.model.geom_bodyid[c.geom1])
@@ -2685,6 +2760,11 @@ class SimScene:
       p2 = self._part_owner_by_body[b2]
       in1, in2 = p1 in component, p2 in component
       if in1 == in2:                                      # internal contact or wholly foreign
+        continue
+      if (in1 and b2 in own_hand_bodies) or (in2 and b1 in own_hand_bodies):
+        # The active fingers' normal forces hold the cargo; they are INTERNAL to
+        # this hand-payload system, not a disturbance for the admittance loop.
+        # A released hand is no longer in own_hand_bodies and remains observable.
         continue
       f6 = getattr(self, "_contact_force_scratch", None)
       if f6 is None:                                      # compact unit-test fixtures
@@ -3132,6 +3212,7 @@ class SimScene:
     """Advance; after each step check every active grasp weld against its breakaway caps --
     an overloaded grasp DROPS (deactivates) and is recorded as the LP-predicted failure."""
     sustain = max(1, int(BREAK_SUSTAIN / DT))
+    contact_sustain = max(1, int(CONTACT_LOSS_SUSTAIN / DT))
     for _ in range(n):
       self._advance_grippers()
       self._apply_process_wrenches()
@@ -3225,24 +3306,34 @@ class SimScene:
         if eq < 0:
           contacted = (self._hold_info.get(r) or {}).get("grasp_part", part)
           _ok, _finger_forces = self.contact_grasp_status(r, contacted)
-          if _ok:
-            self._contact_grasp_misses[r] = 0
-          else:
-            self._contact_grasp_misses[r] = self._contact_grasp_misses.get(r, 0) + 1
-            if self._contact_grasp_misses[r] >= sustain:
-              del self.active_grasps[r]
-              self._hold_info.pop(r, None)
-              for _gid in self._holdex.get(r, ()):
-                self.model.geom_contype[_gid] = 2
-                self.model.geom_conaffinity[_gid] = 1
-              if report is not None:
-                report.results.append(ActionResult(
-                    action or ("step",), False, "grasp_broke",
-                    f"{r}/{part} lost bilateral physical finger contact for "
-                    f"{BREAK_SUSTAIN*1000:.0f}ms (left/right "
-                    f"{_finger_forces[0]:.2f}/{_finger_forces[1]:.2f}N)"
-                    + (f" at trajectory sample {int(self.trace_ctx)}"
-                       if self.trace_ctx is not None else "")))
+          self._contact_grasp_misses[r] = (0 if _ok else
+              self._contact_grasp_misses.get(r, 0) + 1)
+          shift, angle = self._contact_grasp_drift(r, part)
+          slipping = shift > CONTACT_SLIP_SHIFT or angle > CONTACT_SLIP_ANGLE
+          self._contact_grasp_slips[r] = (self._contact_grasp_slips.get(r, 0) + 1
+                                          if slipping else 0)
+          if self._contact_grasp_misses[r] == contact_sustain:
+            print(f"[sim/contact-grasp] {r}/{part}: unilateral pad contact for "
+                  f"{CONTACT_LOSS_SUSTAIN*1000:.0f}ms; monitoring physical slip; "
+                  f"{self.contact_grasp_diagnostic(r, contacted)}")
+          if self._contact_grasp_slips[r] >= sustain:
+            reason = f"relative slip {shift*1000:.2f}mm/{np.rad2deg(angle):.2f}deg"
+            del self.active_grasps[r]
+            self._hold_info.pop(r, None)
+            self._contact_grasp_ref.pop(r, None)
+            self._contact_grasp_slips.pop(r, None)
+            self._contact_grasp_misses.pop(r, None)
+            for _gid in self._holdex.get(r, ()):
+              self.model.geom_contype[_gid] = 2
+              self.model.geom_conaffinity[_gid] = 1
+            if report is not None:
+              report.results.append(ActionResult(
+                  action or ("step",), False, "grasp_broke",
+                  f"{r}/{part} physical grasp lost: {reason} (left/right "
+                  f"{_finger_forces[0]:.2f}/{_finger_forces[1]:.2f}N; "
+                  f"{self.contact_grasp_diagnostic(r, contacted)})"
+                  + (f" at trajectory sample {int(self.trace_ctx)}"
+                     if self.trace_ctx is not None else "")))
           continue
         # Measure every active grasp even when the optional insertion-only BREAKAGE switch
         # suppresses transport rejection. Phase membership follows the explicitly declared
@@ -4198,15 +4289,18 @@ class _SkillServo:
 
   def seat(self, q_ref, parent, child, name, drive, tick, budget,
            relative_target, insertion_axis, intrinsic_axis=None, min_steps=0,
-           posture_target=None):
+           posture_target=None, progress_backoff=True, clearance_filter=None,
+           angular_rate_limit=None, command_governor=None, tool_pose_target=False,
+           contact_tolerance=SEAT_POS_TOL):
     """Guarded, parent-relative insertion of ``child`` into ``parent``.
 
     This is a small hybrid skill rather than a world-position correction. It first removes
     lateral and angular error while holding insertion depth, then advances along the authored
-    mate axis. A premature intended-pair contact gets one bounded axial backoff/re-alignment
-    attempt; repeated early contact is a jam, never a successful seat. The desired world pose
-    is recomputed from the measured parent pose every tick, so a supported or actively-held
-    target may move without invalidating the controller reference.
+    mate axis. A measured overload gets one bounded axial backoff/re-alignment
+    attempt; a second overload fails. Legacy execution can also request the
+    progress-timer retry. The desired world pose is recomputed from the measured
+    parent pose every tick, so a supported or actively-held target may move
+    without invalidating the controller reference.
     """
     holder = next((r for r, g in self.scene.active_grasps.items() if g[1] == child), None)
     if holder is None:
@@ -4223,14 +4317,13 @@ class _SkillServo:
     controlled = [holder] + servo_target_holders
     relative_target = np.asarray(relative_target, dtype=float)
     insertion_axis = np.asarray(insertion_axis, dtype=float)
-    # A frictional pinch has no equality tying the free body to the arm.  Freeze the
-    # *achieved* anchor-to-child relation at skill entry, then command the anchor pose that
-    # realizes each desired child pose.  This is the physical analogue of the rigid-grasp
-    # Jacobian used below: it preserves the grasp instead of repeatedly pretending that the
-    # part body itself is a kinematic descendant of the arm.
+    # Freeze the achieved anchor-to-child relation at skill entry, then command the
+    # tool pose that realizes each desired child pose. In contact mode this preserves
+    # the physical grasp; in ideal-grasp execution it avoids chasing part-body
+    # contact oscillations through a rigid-body Jacobian.
     physical_anchor_rel = None
     anchor_name = self.scene.grasp_anchor[holder]
-    if self.scene.contact_grasps:
+    if self.scene.contact_grasps or tool_pose_target:
       physical_anchor_rel = _pose_compose(
           _pose_invert(self.scene.part_pose(anchor_name)), self.scene.part_pose(child))
     q_ref = np.asarray(q_ref, dtype=float).copy()
@@ -4254,12 +4347,12 @@ class _SkillServo:
     progress_best = None
     stalled = 0
     phases = []
-    # Contact pinches cannot absorb the impulsive correction that an ideal grasp weld masks.
-    # Keep the same feedback law and target, but execute the short terminal correction at a
-    # quasi-static Cartesian rate.  This is a physical controller parameter, not a relaxed
-    # success gate: the same 2mm/angle terminal test and bilateral-contact monitor remain.
-    servo_vmax = min(self.vmax, 0.01) if self.scene.contact_grasps else self.vmax
-    servo_wmax = 0.15 if self.scene.contact_grasps else 0.75
+    first_ready = None
+    # Physical pinches advance more cautiously than ideal attachment welds.
+    # Both use the same pose tolerance and the same grasp-break monitor.
+    servo_vmax = min(self.vmax, 0.03) if self.scene.contact_grasps else self.vmax
+    servo_wmax = (float(angular_rate_limit) if angular_rate_limit is not None
+                 else (0.15 if self.scene.contact_grasps else 0.75))
     for _ in range(int(budget / self.dt)):
       pp = self.scene.part_pose(parent)
       cp = self.scene.part_pose(child)
@@ -4269,22 +4362,30 @@ class _SkillServo:
         err0 = err
       ang = metrics["angle"]
       pair_force = self.scene.part_pair_contact_force(parent, child)
+      if first_ready is None and err < self.tol and ang < SEAT_ANG_TOL:
+        first_ready = _ * self.dt
+      if err < self.tol and ang < SEAT_ANG_TOL and _ < min_steps:
+        # The mate is ready, but unrelated robots still have saved motion
+        # concurrent with this event. Hold the achieved tool command; resume
+        # correction only if the measured mate drifts out of tolerance.
+        phases.append("hold")
+        drive(q_ref)
+        tick()
+        continue
       if err < self.tol and ang < SEAT_ANG_TOL and _ >= min_steps:
         status = "converged"
         break
       # Contact is a valid terminal only inside the real seat tolerance. CAPTURE_RANGE is a
       # numerical anti-explosion range for the later weld, not an insertion acceptance region.
-      if (pair_force >= 0.5 and err <= SEAT_POS_TOL and ang <= SEAT_ANG_TOL
+      if (pair_force >= 0.5 and err <= min(self.tol, contact_tolerance) and ang <= SEAT_ANG_TOL
           and _ >= min_steps):
         self.seat_touch.add(name)
         status = "seated_contact"
         break
 
-      # Guide/socket contact before full depth is normal. Slow the axial motion and call it a
-      # jam only if commanded insertion makes no measurable axial progress, or if the measured
-      # grasp wrench reaches the configured safety guard. This distinguishes useful wall
-      # contact from a blocked insertion without recognizing scene-specific collision pairs.
-      if phase == "insert" and pair_force >= 0.5:
+      # simv2 uses measured overload and a finite budget: a brief pause under
+      # guide contact is not a jam. Legacy replay retains its historical retry.
+      if progress_backoff and phase == "insert" and pair_force >= 0.5:
         remaining = abs(metrics["axial"])
         if progress_best is None or progress_best - remaining >= INSERT_PROGRESS:
           progress_best, stalled = remaining, 0
@@ -4292,7 +4393,7 @@ class _SkillServo:
           stalled += 1
       else:
         progress_best, stalled = None, 0
-      jammed = stalled * self.dt >= INSERT_STALL_TIME
+      jammed = progress_backoff and stalled * self.dt >= INSERT_STALL_TIME
 
       F = self.scene.net_contact_force(child)
       # Net part force is a useful bulldoze guard before intended contact. During an actual
@@ -4347,12 +4448,12 @@ class _SkillServo:
         # and angular feedback continuously active.
         vp_parent = self.kp * (metrics["lateral_vec"] if phase == "align"
                                else metrics["parent"])
+        wp = self.kp * metrics["rotation_vec"]
         if phase == "insert" and pair_force >= 0.5:
           axial_speed = float(vp_parent @ metrics["axis"])
           contact_speed = INSERT_CONTACT_SPEED * (0.5 if retried else 1.0)
           if axial_speed > contact_speed:
             vp_parent += (contact_speed - axial_speed) * metrics["axis"]
-        wp = self.kp * metrics["rotation_vec"]
       phases.append(phase)
 
       vp = _quat_to_R(pp[3:]) @ vp_parent
@@ -4372,8 +4473,8 @@ class _SkillServo:
         else:
           dq = np.r_[np.cos(0.5 * ra), np.sin(0.5 * ra) * rv / ra]
           child_target[3:] = _quat_mul(dq, cp[3:])
-        anchor_target = _pose_compose(child_target, _pose_invert(physical_anchor_rel))
         anchor_pose = self.scene.part_pose(anchor_name)
+        anchor_target = _pose_compose(child_target, _pose_invert(physical_anchor_rel))
         vp = self.kp * (anchor_target[:3] - anchor_pose[:3])
         qe = _quat_mul(anchor_target[3:], _quat_conj(anchor_pose[3:]))
         if qe[0] < 0.0:
@@ -4410,7 +4511,18 @@ class _SkillServo:
             qerr[k] = (qerr[k] + np.pi) % (2.0 * np.pi) - np.pi
         null = np.eye(len(q_control)) - Jpinv @ J
         dq += null @ (1.0 * qerr * self.dt)
-      q_ref[q_control] += np.clip(dq, -0.02, 0.02)
+      if command_governor is not None:
+        measured = np.asarray([self.scene.data.qpos[self.scene._qadr[jn[j]]]
+                               for j in q_control], dtype=float)
+        constraint = (None if clearance_filter is None else
+                      clearance_filter.constraint(q_control, controlled))
+        dq = command_governor.step(dq, q_ref[q_control], measured,
+                                   constraint=constraint)
+      else:
+        dq = np.clip(dq, -0.02, 0.02)
+        if clearance_filter is not None:
+          dq = clearance_filter(q_control, dq, controlled)
+      q_ref[q_control] += dq
       drive(q_ref)
       tick()
     if err0 is not None:
@@ -4419,10 +4531,17 @@ class _SkillServo:
                                  relative_target, insertion_axis, intrinsic_axis)
       self.seat_log.append((name, err0, metrics["position"]))
       self.seat_outcome[name] = {
-          "status": status, "position": metrics["position"],
+          "status": status, "elapsed_s": (_ + 1) * self.dt,
+          "start_position": err0,
+          "first_ready_s": first_ready,
+          "minimum_overlap_s": min_steps * self.dt,
+          "position": metrics["position"],
           "lateral": metrics["lateral"], "axial": metrics["axial"],
           "angle": metrics["angle"], "retried": retried,
+          "backoff_delta": (None if backoff_axial is None else
+                            metrics["axial"] - backoff_axial),
           "phases": tuple(dict.fromkeys(phases)),
+          "phase_durations_s": {p: phases.count(p) * self.dt for p in set(phases)},
       }
 
 

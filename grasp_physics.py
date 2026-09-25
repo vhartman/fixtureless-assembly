@@ -17,11 +17,16 @@ from dataclasses import asdict, dataclass
 import hashlib
 import math
 import os
+import re
 import time
 from typing import Dict
 
 import numpy as np
 
+
+# A physical mate needs room for the closed hand at the exact datum.
+MATE_CLEARANCE_MIN = 0.001
+HANDOVER_CERTIFICATE_CONTRACT = "handover-physics-v2"
 
 @dataclass(frozen=True)
 class GraspPhysicsResult:
@@ -124,6 +129,8 @@ class GraspPhysicsChecker:
     self._all_contype = np.asarray(self.scene.model.geom_contype, dtype=int).copy()
     self._all_conaffinity = np.asarray(self.scene.model.geom_conaffinity, dtype=int).copy()
     self._cache: Dict[tuple, GraspPhysicsResult] = {}
+    self._acquired = {}  # physically closed hand states for geometric mate queries
+    self._mate_clearance = {}
 
     # q_correction is part of the exact RobotIK/tool convention.  Omitting it would test a
     # visually plausible but different grasp on robots whose imported EE axes differ.
@@ -250,6 +257,7 @@ class GraspPhysicsChecker:
     # grasp against six tool-frame force directions under ordinary gravity.  The force is a
     # fixed global test load--we do not infer a per-grasp wrench envelope from the outcome.
     acquired = self._snapshot()
+    self._acquired[key] = acquired
     sustain = max(1, round(self.sim.BREAK_SUSTAIN / model.opt.timestep))
     peak_forces = np.asarray(forces, float)
     worst_shift = worst_angle = 0.0
@@ -305,6 +313,73 @@ class GraspPhysicsChecker:
     self._cache[key] = result
     return result
 
+  def mate_clearance(self, child, part_T_tool, receiver_parts, mate_quat=None):
+    """Exact closed-hand gap at one mate, or best over all authored alternatives.
+
+    The hand is at its simulated bilateral acquisition aperture, not an open or translated
+    proxy. Only tool-versus-receiver geometry is queried; the intended child/tool contact
+    and child/receiver mating contact are excluded. A nonnegative result certifies that
+    some discrete mate orientation has room for this grasp.
+    """
+    from execution.grasp_preflight import (_active_collision_geom, _descends_from,
+                                            _pair_enabled, _tool_root)
+    receiver_parts = tuple(sorted(set(receiver_parts)))
+    rel = self.assembly.relative_pose(child)
+    if rel is None or rel[0] not in receiver_parts:
+      raise ValueError(f'{child}: mate receiver must contain its authored parent')
+    pose = np.asarray(part_T_tool, dtype=float)
+    key = ('component', (child,), child, tuple(np.round(pose, 7)))
+    chosen = (None if mate_quat is None else
+              tuple(np.round(np.asarray(mate_quat, dtype=float), 7)))
+    cache_key = (key, receiver_parts, chosen)
+    if cache_key in self._mate_clearance:
+      return self._mate_clearance[cache_key]
+    if not self.check(child, pose).feasible:
+      self._mate_clearance[cache_key] = -float('inf')
+      return -float('inf')
+
+    scene, model, data = self.scene, self.scene.model, self.scene.data
+    self._restore(self._acquired[key])
+    model.geom_contype[:] = self._all_contype
+    model.geom_conaffinity[:] = self._all_conaffinity
+    root = _tool_root(model, scene._body_id(self.anchor))
+    hands = [g for g in range(model.ngeom) if _active_collision_geom(model, g)
+             and _descends_from(model, model.geom_bodyid[g], root)]
+    receivers = [g for g in range(model.ngeom) if _active_collision_geom(model, g)
+                 and scene._part_owner_by_body[int(model.geom_bodyid[g])] in receiver_parts]
+    if not hands or not receivers:
+      raise ValueError(f'{child}: articulated mate check lacks collision geometry')
+    child_pose = self._pose(child)
+    parent, offset = rel
+    best = -float('inf')
+    witness = np.empty(6)
+    quats = (self.assembly.mate_quaternions(child) if mate_quat is None
+             else (np.asarray(mate_quat, dtype=float),))
+    for quat in quats:
+      parent_T_child = np.r_[np.asarray(offset, float), np.asarray(quat, float)]
+      parent_pose = self.problem._pose_compose(
+          child_pose, self.problem._pose_invert(parent_T_child))
+      for part in receiver_parts:
+        delta = self.assembly.position_in_base(part) - self.assembly.position_in_base(parent)
+        world_pose = self.problem._pose_compose(
+            parent_pose, np.r_[delta, 1.0, 0.0, 0.0, 0.0])
+        scene._set_free_part_pose(part, world_pose)
+      self.mujoco.mj_forward(model, data)
+      nearest = 0.1
+      for hand in hands:
+        for receiver in receivers:
+          if not _pair_enabled(model, hand, receiver):
+            continue
+          gap = float(self.mujoco.mj_geomDistance(
+              model, data, hand, receiver, 0.1, witness))
+          # Unsupported convex-mesh pairs can return zero with separated witness points.
+          if abs(np.linalg.norm(witness[:3] - witness[3:]) - abs(gap)) > 1e-4:
+            continue
+          nearest = min(nearest, gap)
+      best = max(best, nearest)
+    self._mate_clearance[cache_key] = best
+    return best
+
   def check_component_fixed_acquisition(self, group, contacted_part, ref_T_tool):
     """Whether this hand closes bilaterally while the component is held fixed.
 
@@ -318,6 +393,7 @@ class GraspPhysicsChecker:
     group = tuple(group)
     ref = group[0]
     pose_key = tuple(np.round(np.asarray(ref_T_tool, dtype=float), 7))
+
     key = ("fixed-acquisition", group, contacted_part, pose_key)
     hit = self._cache.get(key)
     if hit is not None:
@@ -412,18 +488,36 @@ class GraspPhysicsContext:
 
   @staticmethod
   def _model_key(path):
-    """Portable identity for a hand model (paths differ across machines)."""
+    """Portable identity for the hand and its transitive RAI model includes."""
+    import env
     path = os.path.realpath(path)
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-      for chunk in iter(lambda: f.read(1 << 20), b""):
-        h.update(chunk)
+    seen = set()
+
+    def add_file(filename):
+      filename = os.path.realpath(filename)
+      if filename in seen:
+        return
+      seen.add(filename)
+      with open(filename, "rb") as f:
+        body = f.read()
+      h.update(body)
+      for child in re.findall(rb"(?m)^\s*Include:\s*<([^>]+)>", body):
+        add_file(os.path.join(os.path.dirname(filename), os.fsdecode(child)))
+
+    add_file(path)
+    # These process-wide calibration switches change collision geometry after the .g
+    # files are parsed. They must therefore be part of a persisted pair certificate too.
+    h.update((f"tight={int(env._TIGHT_FINGERS)}\0"
+              f"openarm-finger-scale={env._OPENARM_REAL_FINGER_RADIUS_SCALE:.17g}\0").encode())
     return f"{os.path.basename(path)}:{h.hexdigest()}"
 
   def _handover_table_signature(self, table, models):
     """Identity of every finite grasp row covered by an eager handover certificate."""
+    import gripper_closure
     h = hashlib.sha256()
-    h.update(f"handover-physics-v1\0force={self.force_n:.17g}\0".encode())
+    h.update((f"{HANDOVER_CERTIFICATE_CONTRACT}\0"
+              f"closure={gripper_closure.VERSION}\0force={self.force_n:.17g}\0").encode())
     for robot, model in sorted(models.items()):
       h.update(f"robot={robot}\0model={model}\0".encode())
     for key in sorted(table.keys(), key=repr):
@@ -452,7 +546,7 @@ class GraspPhysicsContext:
         accepted.append([list(group), ma, ga[0], int(ga[1]),
                          mb, gb[0], int(gb[1])])
     return {
-        "contract": "handover-physics-v1",
+        "contract": HANDOVER_CERTIFICATE_CONTRACT,
         "force_n": self.force_n,
         "signature": self._handover_signature,
         "models": dict(self._handover_models),
@@ -463,8 +557,9 @@ class GraspPhysicsContext:
     """Install an a-priori certificate; its signature is checked against the DB on use."""
     if not payload:
       return False
-    if payload.get("contract") != "handover-physics-v1":
-      raise ValueError("unsupported saved handover-physics certificate contract")
+    if payload.get("contract") != HANDOVER_CERTIFICATE_CONTRACT:
+      raise ValueError("saved handover-physics certificate uses an obsolete collision "
+                       "contract; rerun search to recompute handover pairs")
     if abs(float(payload.get("force_n", -1.0)) - self.force_n) > 1e-12:
       raise ValueError("saved handover-physics force differs from this run")
     models = {str(r): str(m) for r, m in (payload.get("models") or {}).items()}
@@ -502,6 +597,29 @@ class GraspPhysicsContext:
           self.C, self.assembly, self.state, robot, force_n=self.force_n)
     return checker.check(part, pose)
 
+  def supports_component(self, group, robot, contacted_part, grasp_id):
+    """Qualify a lone physical hand carrying this complete rigid component."""
+    import problem
+    group = tuple(sorted(group))
+    ref = group[0]
+    pose = problem.grasp_pose(self.assembly, contacted_part, grasp_id)
+    delta = (self.assembly.position_in_base(contacted_part)
+             - self.assembly.position_in_base(ref))
+    ref_T_tool = problem._pose_compose(
+        np.r_[delta, 1.0, 0.0, 0.0, 0.0], pose)
+    return self._checker_for_robot(robot).check_component(
+        group, contacted_part, ref_T_tool)
+
+  def mate_clearance(self, child, pose, receiver_parts, kind='two_finger',
+                     mate_quat=None):
+    if kind != 'two_finger':
+      return 0.1
+    robot = self.kind_robot.get(kind)
+    if robot is None:
+      raise ValueError('no articulated two-finger model for mate clearance')
+    return self._checker_for_robot(robot).mate_clearance(
+        child, pose, receiver_parts, mate_quat)
+
   def _checker_for_robot(self, robot):
     checker = self._checkers.get(robot)
     if checker is None:
@@ -512,10 +630,10 @@ class GraspPhysicsContext:
   def precompute_handovers(self, table):
     """Eagerly certify every two-finger co-grasp represented by ``table``.
 
-    A cheap deterministic RAI simultaneous-hand closing-sweep certificate runs first. Only
-    survivors enter MuJoCo, where each articulated hand must close on and retain the assembled
-    component under the same six loads as a unary grasp. Search later sees only the resulting
-    Boolean dictionary.
+    A deterministic RAI simultaneous-hand closing-sweep certificate runs first. Only
+    survivors enter MuJoCo for two separate unary retention checks and a receiver-on-fixed-
+    component acquisition check. MuJoCo does not simulate both hands together here; the RAI
+    pair sweep owns the inter-hand collision guarantee. Search sees only the resulting table.
     """
     import problem
 
@@ -653,7 +771,7 @@ class GraspPhysicsContext:
 
 
 class HandoverGeometryChecker:
-  """Preloaded exact virtual-jaw overlap filter for one component and hand-model pair."""
+  """Preloaded articulated-finger RAI filter for one component and hand-model pair."""
 
   def __init__(self, assembly, group, path_a, path_b):
     import problem
@@ -683,7 +801,6 @@ class HandoverGeometryChecker:
       root.setPosition(root_pose[:3])
       root.setQuaternion(root_pose[3:])
     C.setJointState(C.getJointState())                     # refresh FCL broad phase
-    result = gripper_closure.certify(
-        C, self.prefix_b, receiver[0],
-        existing_closures=((self.prefix_a, giver[0]),))
+    result = gripper_closure.certify_handover(
+        C, self.prefix_a, giver[0], self.prefix_b, receiver[0])
     return bool(result.feasible)

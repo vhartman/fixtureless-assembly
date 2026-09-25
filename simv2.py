@@ -32,6 +32,10 @@ def _parser():
             q.add_argument('--report-json')
             q.add_argument('--physics-step', type=float, default=0.002)
             q.add_argument('--joint-rate', type=float, default=0.5)
+            q.add_argument('--joint-accel', type=float, default=2.0,
+                           help='maximum scalar progress acceleration along each saved path '
+                                '(rad/s^2 equivalent); sharp geometric corners can still '
+                                'change joint velocity abruptly')
             q.add_argument('--actuated', action='store_true',
                            help='bounded PD arm drive (reference baseline is kinematic arms)')
             q.add_argument('--contact-grasps', action='store_true',
@@ -41,6 +45,10 @@ def _parser():
             q.add_argument('--no-visual', action='store_true')
             q.add_argument('--settle-tolerance', type=float, default=0.01)
             q.add_argument('--settle-timeout', type=float, default=1.5)
+            q.add_argument('--mate-grasp-clearance', type=float, default=None,
+                           help='minimum measured-grasp gripper/receiver gap at the seated '
+                                'mate target (m); physical-contact mode defaults to +1 mm '
+                                'to reject a hand blocked at the exact seated pose')
             q.add_argument('--skill-timeout', type=float, default=2.0)
     return p
 
@@ -70,20 +78,28 @@ def main(argv=None):
     if args.contact_grasps and abs(args.physics_step - 0.002) > 1e-12:
         raise SystemExit('[simv2] physical finger contacts require a 2 ms physics step')
     from execution.runtime import ReferenceExecutor
+    mate_grasp_clearance = args.mate_grasp_clearance
+    if args.contact_grasps and mate_grasp_clearance is None:
+        mate_grasp_clearance = 0.001
     executor = ReferenceExecutor(
         program, dt=args.physics_step, joint_rate=args.joint_rate,
+        joint_accel=args.joint_accel,
         actuated=args.actuated, contact_grasps=args.contact_grasps,
         process_wrench=not args.no_process_wrench,
         record=bool(args.record), gui=args.gui, visual=not args.no_visual,
         settle_tolerance=args.settle_tolerance,
-        settle_timeout=args.settle_timeout, skill_timeout=args.skill_timeout)
+        settle_timeout=args.settle_timeout, skill_timeout=args.skill_timeout,
+        mate_grasp_clearance=mate_grasp_clearance)
     report = executor.run()
     metadata = {'executor': 'simv2-event-lockstep',
                 'plan_path': program.plan_path,
                 'motion_path': program.motion_path, 'actuated': args.actuated,
                 'contact_grasps': args.contact_grasps,
+                'mate_grasp_clearance': mate_grasp_clearance,
                 'process_wrench': not args.no_process_wrench,
-                'physics_step': args.physics_step, 'joint_rate': args.joint_rate}
+                'physics_step': args.physics_step, 'joint_rate': args.joint_rate,
+                'seat_tolerance': executor.seat_tolerance,
+                'joint_accel': args.joint_accel}
     if args.record:
         executor.backend.save(args.record, report, metadata)
     if args.report_json:
@@ -92,6 +108,8 @@ def main(argv=None):
             'results': [repr(r) for r in report.results],
             'final_pose_err': report.final_pose_err,
             'grasp_wrench_metrics': report.grasp_wrench_metrics,
+            'mate_preflight': executor.mate_preflight,
+            'seat_clearance': executor.seat_clearance,
             'table_wrench_metrics': report.table_wrench_metrics,
             'metadata': metadata}, indent=2) + '\n')
     print(report.summary())

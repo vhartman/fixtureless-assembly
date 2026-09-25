@@ -221,6 +221,9 @@ class RunConfig:
   artifact_contract: Optional[dict] = None
   grasp_physics_check: bool = False
   grasp_physics_force: float = 10.0
+  # Search-only acceleration: reuse the fully signed handover table from another
+  # plan with the exact same finite grasp database and physical hand models.
+  grasp_physics_cache_plan: Optional[str] = None
   quiet_rai: bool = False
 
   # -- witness optimization --

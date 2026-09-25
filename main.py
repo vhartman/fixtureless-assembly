@@ -369,6 +369,15 @@ def _sampled_scene_coverage(assembly, checker, robots, prefix="[grasp-scenes]"):
             f"{kind}:" + "/".join(f"{reason}={count}" for reason, count in reasons.items())
             for kind, reasons in rejects.items() if reasons)
         print(f"{prefix} {part}: isolated closure rejects: {detail}")
+      physics_rejects = audit.get("physics_rejects", {})
+      if any(physics_rejects.values()):
+        detail = ", ".join(
+            f"{kind}:" + "/".join(f"{reason}={count}" for reason, count in reasons.items())
+            for kind, reasons in physics_rejects.items() if reasons)
+        print(f"{prefix} {part}: isolated physics rejects: {detail}")
+      for kind, gap_mm in audit.get("mate_gap_best_mm", {}).items():
+        if gap_mm is not None:
+          print(f"{prefix} {part}: best physical mate gap ({kind})={gap_mm:.2f}mm")
       lost = []
       for kind, available in audit["evaluated_coverage"].items():
         retained = audit["selected_coverage"].get(kind, {})
@@ -2491,6 +2500,12 @@ def build_parser():
            "fixed. Pair it with --config <the same file> so the scene matches.",
   )
   g_output.add_argument(
+      "--grasp-physics-cache-plan", metavar="FILE", default=None,
+      help="With --solve --grasp-physics-check, reuse FILE's complete a-priori handover "
+           "certificate only when its force, physical hand models, and exact finite grasp "
+           "database signature match. This does not load FILE's task plan or witnesses.",
+  )
+  g_output.add_argument(
       "--refresh-witnesses", action="store_true",
       help="With --load-plan: IGNORE the witnesses persisted in the plan file and re-run the "
            "witness pass. Default: reuse them whenever every witness-shaping setting matches "
@@ -3617,6 +3632,8 @@ def run(cfg, explicit=None):
     raise SystemExit("--grasp-sampler-roll-refine requires --grasp-sampler")
   if cfg.grasp_physics_check and not cfg.grasp_sampler:
     raise SystemExit("--grasp-physics-check requires --grasp-sampler")
+  if cfg.grasp_physics_cache_plan and not cfg.grasp_physics_check:
+    raise SystemExit("--grasp-physics-cache-plan requires --grasp-physics-check")
   if cfg.grasp_physics_check and not cfg.grasp_sampler_scenes:
     raise SystemExit("--grasp-physics-check currently requires --grasp-sampler-scenes so "
                      "the finite DB can reserve physics-certified pick/assembly grasps")
@@ -3747,9 +3764,9 @@ def run(cfg, explicit=None):
     rai_quiet.install()                                  # no-op if RAI_QUIET already installed it
     print("[flag] --quiet-rai ACTIVE: rai's libccd/pairCollision spam is dropped at fd 1/2 "
           "(matched on the C++ source file, never on 'WARNING', so real diagnostics survive).")
+  from env import set_tight_fingers
+  set_tight_fingers(bool(cfg.tight_fingers))
   if cfg.tight_fingers:
-    from env import set_tight_fingers
-    set_tight_fingers(True)
     if cfg.robot == "openarm":
       print("[flag] --tight-fingers requested: OpenArm keeps its native calibrated pinch "
             "capsules (the Robotiq-only tightening transform does not apply).")
@@ -3771,9 +3788,9 @@ def run(cfg, explicit=None):
   _closure_active = bool(cfg.grasp_closure_check or cfg.viz_initial_grasps is not None)
   set_grasp_closure_check(_closure_active)
   if cfg.grasp_closure_check:
-    print("[flag] --grasp-closure-check ACTIVE: two-finger pick/handover/add_grasp use a "
-          "collision-only virtual jaw sweep to their object-dependent common aperture; "
-          "finger joints remain disabled.")
+    print("[flag] --grasp-closure-check ACTIVE: two-finger pick/add_grasp use a "
+          "collision-only virtual jaw sweep; Robotiq handovers rotate the articulated "
+          "finger linkage in a disposable RAI scene. Planning joints remain disabled.")
   elif cfg.viz_initial_grasps is not None:
     print("[initial-grasp-viz] closure enabled during scene-aware DB construction so the "
           "catalog uses the same candidate IDs/ranking as a closure-enabled search.")
@@ -4107,13 +4124,19 @@ def run(cfg, explicit=None):
           "tool-frame load directions are required. Results are "
           "cached per pose. The configured wrench profile remains one global envelope for "
           "all accepted grasps; no empirical per-grasp limits are fitted.")
-    if cfg.load_plan and not cfg.refresh_witnesses:
+    _physics_source = (cfg.grasp_physics_cache_plan or
+                       (cfg.load_plan if not cfg.refresh_witnesses else None))
+    if _physics_source:
       from plan_io import read_grasp_physics
       from problem import _GRASP_PHYSICS_CTX
-      _saved_handover_physics = read_grasp_physics(cfg.load_plan)
+      _saved_handover_physics = read_grasp_physics(_physics_source)
       if _saved_handover_physics is not None:
         _GRASP_PHYSICS_CTX.import_handovers(_saved_handover_physics)
-        print("[grasp-physics/handover] restored complete a-priori certificate from plan")
+        print(f"[grasp-physics/handover] restored a-priori certificate from "
+              f"{_physics_source}; finite database signature checked on use")
+      elif cfg.grasp_physics_cache_plan:
+        raise ValueError(
+            f"--grasp-physics-cache-plan {_physics_source} has no saved certificate")
       else:
         print("[grasp-physics/handover] legacy plan has no persisted certificate; one "
               "a-priori table will be built now and saved on the next plan export")

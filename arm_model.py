@@ -540,18 +540,23 @@ def build_arm_mjcf(C, prefix, collide=True, rgba="0.6 0.6 0.65 1", group=2, inde
   return "\n".join(out), jnames
 
 
-def gripper_actuator_mjcf(C, prefixes, kp=5.0, indent=4, coupled=False):
+def gripper_actuator_mjcf(C, prefixes, kp=5.0, indent=4, coupled=False,
+                          max_effort=None):
   """Position actuators for :func:`gripper_sim_joints`.
 
   The visualization model historically drives every mimic hinge independently.  For physical
   contact that is not a valid Robotiq mechanism: contact lets the six servos disagree and the
   pads cease to be parallel.  ``coupled=True`` drives only the first (master) joint; permanent
   joint equalities emitted by :func:`gripper_equality_mjcf` transmit that motion to the rest.
+  ``max_effort`` may further cap that motor below the model's per-joint upper bound; contact
+  certification and execution must pass the same value.
   """
   pad, out, names = " " * indent, [], []
   for prefix in prefixes:
     specs = gripper_sim_joints(C, prefix)
     effort = 7.0 if any("openarm_" in n for n in specs) else 50.0
+    if max_effort is not None:
+      effort = min(effort, float(max_effort))
     frames = list(specs)
     if coupled:
       frames = frames[:1]

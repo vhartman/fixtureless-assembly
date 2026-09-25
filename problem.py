@@ -7,6 +7,7 @@ import json
 import os
 import random
 import time
+from collections import Counter
 from dataclasses import dataclass
 
 import robotic as ry
@@ -1482,6 +1483,13 @@ class FabricaAssembly(Assembly):
         self.mate_interfaces[p] = np.array([0.0, side * .0025, 0.0])
         self.scatter_orientations[p] = q_flat
         self.no_hold.add(p)
+        # Each wheel and its coaxial peg have the same mate after a half-turn about
+        # the local axle. The authored CAD vertices are invariant under this turn;
+        # a quarter-turn is not exact (the decorative spokes move by ~0.95 mm).
+        # Keep the alternative on the existing opt-in mate-symmetry edge.
+        self.mate_symmetry_quats[p] = (
+            np.array([1.0, 0.0, 0.0, 0.0]),
+            np.array([0.0, 0.0, 1.0, 0.0]))
     elif self.model == "duct":
       for source, p in source_to_part.items():
         if source != "0":
@@ -3211,8 +3219,14 @@ def install_sampled_scene_ctx(C, assembly, robots=None):
           for q, pose in _state_part_poses(state, assembly, lift=0.0).items())))
           for role, state in sorted(role_states[p].items())))
       for p in assembly.objects)
+  mate_sig = tuple(
+      (p, tuple(tuple(np.round(np.asarray(q, dtype=float), 7))
+                for q in assembly.mate_quaternions(p)))
+      for p in assembly.objects)
   placement_sig = tuple((p, tuple(sorted(rows))) for p, rows in placement_states.items())
-  sig = ("role-scenes-v2", poses_pick, poses_asm, role_sig, placement_sig)
+  # The sampled mate labels depend on the discrete orientations, even though the
+  # canonical role-state poses do not. Keep them in the cache identity.
+  sig = ("role-scenes-v3", poses_pick, poses_asm, role_sig, mate_sig, placement_sig)
   _SAMPLED_SCENE_CTX = {"checker": checker, "kind_robot": kind_robot,
                         "s0": s0, "s_full": s_full,
                         "role_states": role_states,
@@ -3988,6 +4002,7 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
     acquisition_by_kind = {}
     acquisition_reject_by_kind = {}
     physics_by_kind = {}
+    mate_gap_by_kind = {}
     # The physics query is isolated from the scene and therefore needs to run only once per
     # (part, pose), not once for pick and assembly.  Vacuum remains outside this first-stage
     # experiment; its global analytic wrench envelope is unchanged.
@@ -4020,19 +4035,43 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
       if kind_ok:
         pose = part_pose(row)
         for role, state in role_states().items():
-          if not measured("scene_open", checker.pose_collision_free,
-                          state, part, pose, asm, robot=robot):
-            continue
-          # With --grasp-closure-check, a scene label means OPEN geometry clears and the
-          # receiver can actually close in that scene.  Failed closes are not thrown away:
-          # they remain in the family/FPS fallback pools below, but no longer consume the
-          # scarce pick/assemble-reserved slots ahead of closure-capable candidates.
-          close_ok = (measured("scene_close", checker.pose_grasp_closure_free,
-              state, part, pose, asm, robot, **({"closing": False} if role == "assemble" else {}))
-              if checker.closure_check else True)
-          if close_ok:
-            hits.append(role)
-            close_hits.append(role)
+          # The role state uses the authored mate pose. For an exact discrete symmetry,
+          # rotating the part and attached hand at the mate is equivalent to leaving the
+          # (symmetric) part fixed and rotating the queried hand about its part origin.
+          # Test the SAME alternative in the open-hand, closure and physical mate gates;
+          # otherwise a valid symmetric mate is discarded before IK ever sees it.
+          mate_quats = (asm.mate_quaternions(part)
+                        if role == "assemble" and hasattr(asm, "mate_quaternions")
+                        and asm.relative_pose(part) is not None else (None,))
+          for mate_quat in mate_quats:
+            role_pose = (pose if mate_quat is None else _pose_compose(
+                np.r_[np.zeros(3), np.asarray(mate_quat, float)], pose))
+            if not measured("scene_open", checker.pose_collision_free,
+                            state, part, role_pose, asm, robot=robot):
+              continue
+            # With --grasp-closure-check, a scene label means OPEN geometry clears and the
+            # receiver can actually close in that scene. Failed closes remain available
+            # to the family/FPS fallback pool, but do not consume mate-reserved slots.
+            close_ok = (measured("scene_close", checker.pose_grasp_closure_free,
+                state, part, role_pose, asm, robot,
+                **({"closing": False} if role == "assemble" else {}))
+                if checker.closure_check else True)
+            if (close_ok and role == 'assemble' and kind == 'two_finger'
+                    and _GRASP_PHYSICS_CHECK):
+              component = next(g for g in state.subassemblies() if part in g)
+              receiver = tuple(sorted(set(component) - {part}))
+              from grasp_physics import MATE_CLEARANCE_MIN
+              gap = (measured('scene_mate_physical',
+                  _GRASP_PHYSICS_CTX.mate_clearance, part, pose, receiver, kind,
+                  mate_quat)
+                  if receiver else -float('inf'))
+              mate_gap_by_kind[kind] = max(
+                  float(gap), mate_gap_by_kind.get(kind, -float('inf')))
+              close_ok = gap >= MATE_CLEARANCE_MIN
+            if close_ok:
+              hits.append(role)
+              close_hits.append(role)
+              break
       roles[kind] = tuple(hits)
       closure_roles[kind] = tuple(close_hits)
     meta = {"origin": origin, "scene_by_kind": roles,
@@ -4040,6 +4079,7 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
             "acquisition_by_kind": acquisition_by_kind,
             "acquisition_reject_by_kind": acquisition_reject_by_kind,
             "physics_by_kind": physics_by_kind,
+            "mate_gap_by_kind": mate_gap_by_kind,
             "sets": tuple(sorted({x for xs in roles.values() for x in xs}))}
     if refinement is not None:
       tag, delta, source = refinement
@@ -4566,13 +4606,29 @@ def _sampled_master_rows(spec, offset, part, suction, antip, keep, ctx, shape_qu
                     "both": int(b)}
     return ans
 
+  evaluated = list(sampled) + list(canonical)
+  physics_rejects = {
+      kind: dict(sorted(Counter(
+          e[1]["physics_by_kind"][kind]["reason"] for e in evaluated
+          if kind in e[1].get("physics_by_kind", {})
+          and not e[1]["physics_by_kind"][kind]["feasible"]).items()))
+      for kind in sorted(kind_robot)}
+  mate_gap_best_mm = {
+      kind: (max(gaps) * 1000.0 if gaps else None)
+      for kind in sorted(kind_robot)
+      for gaps in [[e[1].get("mate_gap_by_kind", {}).get(kind)
+                    for e in evaluated
+                    if e[1].get("mate_gap_by_kind", {}).get(kind) is not None]]}
+
   _SAMPLED_SELECTION_DIAGNOSTICS[part] = {
       "raw": len(raw), "quality": len(raw_good), "probe": len(probe),
       "evaluated": len(sampled) + len(canonical), "selected": len(selected),
       "full_probe": bool(_SAMPLED_GRASPS.get("full_probe", False)),
       "expanded_full": bool(expanded_full),
-      "evaluated_coverage": coverage(list(sampled) + list(canonical)),
+      "evaluated_coverage": coverage(evaluated),
       "selected_coverage": coverage(selected),
+      "physics_rejects": physics_rejects,
+      "mate_gap_best_mm": mate_gap_best_mm,
       "acquisition_rejects": {
           kind: {
               reason: sum(1 for e in list(sampled) + list(canonical)
@@ -6065,7 +6121,7 @@ def save_grasp_table_cache(path, table, cache_key):
       ],
       "robot_kinds": getattr(table, "robot_kinds", None),
       "handover_physics": None if accepted_handovers is None else {
-          "contract": "handover-physics-v1",
+          "contract": "handover-physics-v2",
           "signature": handover_signature,
           "models": getattr(table, "handover_models", None),
           "accepted": accepted_handovers,
@@ -6124,18 +6180,22 @@ def load_grasp_table_cache(path, cache_key):
     table.robot_kinds = payload.get("robot_kinds")
     handover = payload.get("handover_physics")
     if handover is not None:
-      if handover.get("contract") != "handover-physics-v1":
-        raise ValueError(f"unsupported handover certificate in grasp database {path}")
-      table.handover_models = {
-          str(r): str(model) for r, model in (handover.get("models") or {}).items()}
-      table.handover_signature = str(handover.get("signature") or "")
-      table.handover_physics = {}
-      for row in handover.get("accepted") or ():
-        if len(row) != 7:
-          raise ValueError(f"malformed handover certificate in grasp database {path}")
-        group, ma, pa, ga, mb, pb, gb = row
-        table.handover_physics[(tuple(group), str(ma), (str(pa), int(ga)),
-                                str(mb), (str(pb), int(gb)))] = True
+      if handover.get("contract") != "handover-physics-v2":
+        # Keep the expensive grasp rows, but never adopt a pair table made with obsolete
+        # collision semantics. The search context recomputes it before successor generation.
+        print(f"[grasp-db] obsolete handover certificate ignored in {path}; "
+              "recomputing pair feasibility")
+      else:
+        table.handover_models = {
+            str(r): str(model) for r, model in (handover.get("models") or {}).items()}
+        table.handover_signature = str(handover.get("signature") or "")
+        table.handover_physics = {}
+        for row in handover.get("accepted") or ():
+          if len(row) != 7:
+            raise ValueError(f"malformed handover certificate in grasp database {path}")
+          group, ma, pa, ga, mb, pb, gb = row
+          table.handover_physics[(tuple(group), str(ma), (str(pa), int(ga)),
+                                  str(mb), (str(pb), int(gb)))] = True
   result = table, {"keys": len(keys), "rows": sum(len(v) for v in stored.values())}
   _LOADED_GRASP_TABLE_CACHES[memory_key] = result
   return result

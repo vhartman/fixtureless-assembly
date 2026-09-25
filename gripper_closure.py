@@ -1,15 +1,12 @@
 """Collision-only certificate for a parallel-jaw gripper closing on a grasp.
 
-The assembly configuration deliberately keeps finger joints inactive.  This module does
-*not* change that contract: it creates short-lived copies of an already posed collision
-scene, translates only the receiver's finger collision proxies through a calibrated virtual
-stroke, and asks RAI for contacts.  It is therefore a feasibility certificate, not another
-configuration-space dimension, controller, or dynamics simulation.
-
-The current collision proxies are intentionally simple capsules.  The certificate mirrors
-that fidelity: it verifies that both proxy fingers can reach the target at one common
-aperture and that their sweep does not intersect any non-target geometry.  The caller
-supplies a scene in which every relevant part/gripper has already been posed.
+The assembly configuration deliberately keeps finger joints inactive. This module does
+not change that contract: it creates disposable posed scenes and asks RAI for contacts.
+Ordinary pick checks translate pad proxies through a calibrated virtual stroke. Robotiq
+handover checks instead rotate the full finger linkage through the same mimic map as
+execution, so the two hands are checked in their actual closed geometry. The current
+OpenArm floating proxy has no hinges and retains the translated-pad certificate. Neither
+changes the planner's configuration space or simulates dynamics.
 """
 
 from __future__ import annotations
@@ -24,7 +21,7 @@ import robotic as ry
 
 # Bump whenever the calibrated proxy semantics change. It keys the cheap-check cache and the
 # sampled grasp database provenance, so a saved grasp id cannot silently acquire new meaning.
-VERSION = 7
+VERSION = 9
 
 # These are physical/proxy calibration constants, not search-tuning knobs.  Both current
 # models expose an approximately 80--115 mm open jaw gap and have about 40 mm inward travel
@@ -262,11 +259,14 @@ def _move_to_shift(C: ry.Config, positions: Dict[str, np.ndarray], axis: np.ndar
     C.setJointState(C.getJointState())
 
 
-def _contacts(C: ry.Config, groups: Tuple[Tuple[str, ...], Tuple[str, ...]], target: str):
+def _contacts(C: ry.Config, groups: Tuple[Tuple[str, ...], Tuple[str, ...]], target: str,
+              *, capture_pairs=None):
     """(per-side target distance, first non-target penetration)."""
     # A positive query margin gives us a smooth-ish signed-distance trace before first touch;
     # RAI returns all pairs inside the margin, including non-penetrating near contacts.
     pairs = list(C.getCollisions(0.01))
+    if capture_pairs is not None:
+        capture_pairs.extend(pairs)
     group_of = {n: i for i, g in enumerate(groups) for n in g}
     d_target = [float("inf"), float("inf")]
     blocked = None
@@ -449,6 +449,138 @@ def certify(C: ry.Config, receiver_prefix: str, target: str,
         if blocked is not None:
             return ClosureResult(False, reason="sweep-collision", detail=blocked, model=model)
     return res
+
+
+def certify_handover(C: ry.Config, giver_prefix: str, giver_target: str,
+                     receiver_prefix: str, receiver_target: str) -> ClosureResult:
+    """Certify a handover with the same articulated finger linkage used in MuJoCo.
+
+    Search keeps finger joints disabled, so this disposable RAI scene rotates their frames
+    through the manufacturer's mimic map. A translated pad/capsule approximation misses the
+    giver-finger blockage that a rotating receiving pad encounters during a real close.
+    """
+    from arm_model import gripper_sim_joints
+    from problem import _quat_mul
+
+    work = _copy(C)
+    hands = []
+    for prefix, target in ((giver_prefix, giver_target),
+                           (receiver_prefix, receiver_target)):
+        setup = _finger_setup(work, prefix)
+        model, pads = setup[:2]
+        joints = gripper_sim_joints(work, prefix)
+        if model is None or model == "vacuum":
+            return ClosureResult(False, reason="unsupported-articulated-gripper", model=model)
+        def pad_moves_with_joint(name):
+            parent = work.getFrame(name).getParent()
+            while parent is not None:
+                if parent.name in joints:
+                    return True
+                parent = parent.getParent()
+            return False
+
+        if not joints or not all(any(pad_moves_with_joint(n) for n in group)
+                                 for group in pads):
+            # OpenArm's floating EE declares finger hinges for its visual meshes, but its
+            # collision capsules are still rigid siblings of those hinges. Rotating them
+            # would not check physical closure. Preserve the existing proxy certificate
+            # until the duplicate RAI model attaches collision fingers to its hinges.
+            return certify(C, receiver_prefix, receiver_target,
+                           existing_closures=((giver_prefix, giver_target),))
+        bases = {name: np.asarray(work.getFrame(name).getRelativeQuaternion(), dtype=float)
+                 for name in joints}
+        names = set()
+        for name in work.getFrameNames():
+            name = str(name)
+            if not name.startswith(prefix):
+                continue
+            info = work.getFrame(name).info()
+            if (name in pads[0] or name in pads[1] or
+                    (info.get("contact", 0) and not info.get("visual", False))):
+                names.add(name)
+                work.getFrame(name).setContact(1)
+        for name in _target_collision_frames(work, target):
+            work.getFrame(name).setContact(1)
+        hands.append((prefix, target, model, pads, joints, bases, names))
+
+    def pose(hand, angle):
+        for name, (axis, gain, _max_angle, _side) in hand[4].items():
+            half = float(gain) * float(angle) / 2.0
+            delta = np.r_[np.cos(half), np.asarray(axis, dtype=float) * np.sin(half)]
+            work.getFrame(name).setRelativeQuaternion(_quat_mul(hand[5][name], delta))
+        work.setJointState(work.getJointState())
+
+    def contact_angle(hand):
+        key_body = _aperture_key(work, hand[2] + "/articulated", hand[3], hand[1])
+        key = None if key_body is None else ("joint", key_body)
+        cached = _APERTURE_CACHE.get(key) if key is not None else None
+        if cached is not None:
+            return cached
+        limit = min(float(spec[2]) for spec in hand[4].values())
+        samples = np.linspace(0.0, limit, _SCAN_STEPS + 1)
+        trace = []
+        for q in samples:
+            pose(hand, q)
+            trace.append(_contacts(work, hand[3], hand[1])[0])
+        hits = []
+        for side in range(2):
+            hit = next((i for i, ds in enumerate(trace) if ds[side] <= _CONTACT_EPS), None)
+            if hit is None:
+                result = ClosureResult(False, reason="aperture-out-of-range", model=hand[2])
+                break
+            lo = hi = 0.0 if hit == 0 else float(samples[hit])
+            if hit:
+                lo = float(samples[hit - 1])
+                for _ in range(_BISECTION_STEPS):
+                    mid = (lo + hi) / 2.0
+                    pose(hand, mid)
+                    ds, _blocked = _contacts(work, hand[3], hand[1])
+                    if ds[side] <= _CONTACT_EPS:
+                        hi = mid
+                    else:
+                        lo = mid
+            hits.append(hi)
+        else:
+            angle = max(hits)
+            pose(hand, angle)
+            ds, _blocked = _contacts(work, hand[3], hand[1])
+            if any(d > _CONTACT_EPS for d in ds):
+                result = ClosureResult(False, reason="no-bilateral-contact", model=hand[2])
+            elif any(d < -_MISALIGN_PENETRATION for d in ds):
+                result = ClosureResult(False, reason="miscentred-contact", model=hand[2],
+                                       detail=("finger-side", hand[1], float(min(ds))))
+            else:
+                result = ClosureResult(True, aperture=angle, model=hand[2])
+        pose(hand, 0.0)
+        if key is not None:
+            if len(_APERTURE_CACHE) >= _APERTURE_CACHE_LIMIT:
+                _APERTURE_CACHE.pop(next(iter(_APERTURE_CACHE)))
+            _APERTURE_CACHE[key] = result
+        return result
+
+    giver, receiver = hands
+    giver_result = contact_angle(giver)
+    if not giver_result.feasible:
+        return giver_result
+    receiver_result = contact_angle(receiver)
+    if not receiver_result.feasible:
+        return receiver_result
+    pose(giver, giver_result.aperture)
+    steps = max(_SCAN_STEPS, int(np.ceil(receiver_result.aperture / 0.05)))
+    for angle in np.linspace(0.0, receiver_result.aperture, steps + 1):
+        pose(receiver, angle)
+        pairs = []
+        _ds, blocked = _contacts(work, receiver[3], receiver[1], capture_pairs=pairs)
+        if blocked is not None:
+            return ClosureResult(False, reason="sweep-collision", detail=blocked,
+                                 model=receiver[2])
+        for a, b, depth in pairs:
+            a, b = str(a), str(b)
+            if ((a in giver[6] and b in receiver[6]) or
+                    (b in giver[6] and a in receiver[6])) and depth < -_HARD_PENETRATION:
+                return ClosureResult(False, reason="handover-hand-collision",
+                                     detail=(a, b, float(depth)), model=receiver[2])
+    return receiver_result
 
 
 def closure_sweep_configs(C: ry.Config, receiver_prefix: str, target: str, steps: int = 21):

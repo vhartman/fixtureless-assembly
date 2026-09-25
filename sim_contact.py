@@ -13,7 +13,8 @@ nominal process wrench. This is not full contact-only peg dynamics or an MPCC.
     python3 sim_contact.py run PLAN.json --mp-path MP.json --record REPLAY.npz
 
 sim.py has no scene-factory hook, so this entry point replaces its scene class only
-for one in-process run, restoring it in finally. sim.py itself is untouched.
+for one in-process run, restoring it in finally. The shared mate helper accepts
+an explicit no-projection option for physical contact.
 """
 
 from __future__ import annotations
@@ -58,25 +59,29 @@ class ContactScene(sim.SimScene):
     Legacy weld_mate removes every grasp of part. A physical pinch has no grasp
     equality to remove: its pads already exert genuine MuJoCo forces. Save only
     those contact registrations across the existing mate operation. The usual
-    sustained bilateral-contact monitor then detects a real loss of hold.
+    sustained relative-slip monitor then detects a real loss of hold.
     """
     preserved = {}
     for robot, grasp in self.active_grasps.items():
       if grasp[1] == part and grasp[0] < 0:
         preserved[robot] = (
             grasp, self._physical_contact_target.get(robot),
-            self._hold_info.get(robot), self._contact_grasp_misses.get(robot, 0))
-    super().weld_mate(part)
-    for robot, (grasp, target, info, misses) in preserved.items():
+            self._hold_info.get(robot), self._contact_grasp_misses.get(robot, 0),
+            self._contact_grasp_slips.get(robot, 0),
+            self._contact_grasp_ref.get(robot))
+    # A continuing physical hand cannot follow a part-only datum projection.
+    # The measured seat must satisfy the mate before its weld is enabled.
+    super().weld_mate(part, project=False)
+    for robot, (grasp, target, info, misses, slips, reference) in preserved.items():
       self.active_grasps[robot] = grasp
       if target is not None:
         self._physical_contact_target[robot] = target
       if info is not None:
         self._hold_info[robot] = info
       self._contact_grasp_misses[robot] = misses
-      for geom_id in self._holdex.get(robot, ()):
-        self.model.geom_contype[geom_id] = 0
-        self.model.geom_conaffinity[geom_id] = 0
+      self._contact_grasp_slips[robot] = slips
+      if reference is not None:
+        self._contact_grasp_ref[robot] = reference
     if preserved:
       mujoco.mj_forward(self.model, self.data)
       print(f"[sim_contact/contact] mate {part}: retained physical hand(s) "

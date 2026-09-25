@@ -5000,6 +5000,47 @@ def cheap_feasible(action, s0, s1, assembly, checker):
     key = (action[0], "held-closure", action[2] if len(action) > 2 else None)
     checker.action_rejects[key] = checker.action_rejects.get(key, 0) + 1
     return False
+  if action[0] == 'assemble' and _problem._GRASP_PHYSICS_CHECK:
+    # The translated floating-jaw proxy can clear a seated mate even when the articulated
+    # finger linkage blocks it. The isolated acquired-hand model answers that exact nominal
+    # geometry question once per grasp/component. Only reject direct singleton movers here;
+    # compound or indirectly held movers retain the existing geometric/IK checks.
+    child = action[2]
+    moving = next(g for g in s0.subassemblies() if child in g)
+    if set(moving) == {child}:
+      assembled = next(g for g in s1.subassemblies() if child in g)
+      receiver = tuple(sorted(set(assembled) - {child}))
+      ctx = _problem._GRASP_PHYSICS_CTX
+      if ctx is None:
+        raise RuntimeError('grasp physics enabled without its concrete scene')
+      for support in s1.supports.get(child, ()):
+        if (support[0] == 'grasp' and support[2] == child
+                and checker._robot_kind.get(support[1]) == 'two_finger'):
+          gap = ctx.mate_clearance(
+              child, grasp_pose(assembly, child, support[3]), receiver)
+          from grasp_physics import MATE_CLEARANCE_MIN
+          if gap < MATE_CLEARANCE_MIN:
+            key = ('assemble', 'physical-mate-finger', child)
+            checker.action_rejects[key] = checker.action_rejects.get(key, 0) + 1
+            return False
+  if _problem._GRASP_PHYSICS_CHECK:
+    ctx = _problem._GRASP_PHYSICS_CTX
+    if ctx is None:
+      raise RuntimeError('grasp physics enabled without its concrete scene')
+    for group in s1.subassemblies():
+      if any(('table',) in s1.supports.get(p, ()) for p in group):
+        continue
+      hands = [c for p in group for c in s1.supports.get(p, ()) if c[0] == 'grasp']
+      if len(hands) != 1:
+        continue  # co-grasps share load; their joint support needs a different certificate
+      hand = hands[0]
+      if checker._robot_kind.get(hand[1]) != 'two_finger':
+        continue
+      result = ctx.supports_component(group, hand[1], hand[2], hand[3])
+      if not result.feasible:
+        key = (action[0], 'physical-component-support', hand[2])
+        checker.action_rejects[key] = checker.action_rejects.get(key, 0) + 1
+        return False
   if action[0] == "inhand_reorient":
     # v1 gate: the RESULT state (part held at its NEW grasp, everything else unchanged) must
     # be collision-free. Deliberately NOT the _GRASP_ACTIONS candidate check -- that would
