@@ -24,8 +24,6 @@ the detailed research record and operational guidance.
 - [FRAGILITY.md](FRAGILITY.md) - cross-stage contracts and known failure modes.
 - [mr_bench_integration_notes.md](mr_bench_integration_notes.md) - motion-planner integration
   issues.
-- [SIMV2.md](SIMV2.md) - execution-program simulator notes.
-- [SIM_CONTACT.md](SIM_CONTACT.md) - opt-in physical-contact experiment.
 
 Maintained benchmark commands stay in [benchmarks/README.md](../benchmarks/README.md). Detailed
 historical results and superseded experiments are retained in

@@ -7,9 +7,7 @@ quick-start guide. For maintained commands and the repository map, see the
 
 This repository searches for multi-robot assembly plans, exports real-arm motion paths with
 `mr_bench`, and validates the paths in MuJoCo. See [PIPELINE.md](PIPELINE.md) for the general
-workflow and the other solver modes. The opt-in physical-contact execution
-experiment and its current limitations are described in [SIM_CONTACT.md](SIM_CONTACT.md).
-The new execution-program prototype is described in [SIMV2.md](SIMV2.md).
+workflow and the other solver modes.
 
 ## Setup
 

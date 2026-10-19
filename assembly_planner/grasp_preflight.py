@@ -1,4 +1,4 @@
-"""One-shot geometric certificate for an achieved grasp at a mate target.
+"""Geometry helpers and a one-shot achieved-grasp certificate at a mate target.
 
 This projects the *current* tool geometry with the measured tool-to-part
 transform. It deliberately does not mutate the live MuJoCo state or assert

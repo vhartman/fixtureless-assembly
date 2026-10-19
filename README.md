@@ -96,7 +96,7 @@ The full solve, export, simulation, and replay commands are in the
 | --- | --- |
 | `main.py` | Main command-line entry point and run configuration |
 | `assembly_planner/` | Assembly models, search, witnesses, statics, and motion-planning export |
-| `sim.py`, `execution/` | MuJoCo validation and execution programs |
+| `sim.py` | MuJoCo validation and replay |
 | `benchmarks/` | Reproducible runners, manifests, plots, and benchmark notes |
 | `tests/` | Maintained regression tests |
 | `experiments/` | Saved run artifacts and focused experiment records |

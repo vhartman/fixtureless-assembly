@@ -4383,8 +4383,8 @@ class _SkillServo:
         status = "seated_contact"
         break
 
-      # simv2 uses measured overload and a finite budget: a brief pause under
-      # guide contact is not a jam. Legacy replay retains its historical retry.
+      # A brief pause under guide contact is not necessarily a jam; this replay retains its
+      # historical progress retry so older artifacts preserve their execution semantics.
       if progress_backoff and phase == "insert" and pair_force >= 0.5:
         remaining = abs(metrics["axial"])
         if progress_best is None or progress_best - remaining >= INSERT_PROGRESS:

@@ -321,8 +321,8 @@ class GraspPhysicsChecker:
     and child/receiver mating contact are excluded. A nonnegative result certifies that
     some discrete mate orientation has room for this grasp.
     """
-    from execution.grasp_preflight import (_active_collision_geom, _descends_from,
-                                            _pair_enabled, _tool_root)
+    from assembly_planner.grasp_preflight import (_active_collision_geom, _descends_from,
+                                                   _pair_enabled, _tool_root)
     receiver_parts = tuple(sorted(set(receiver_parts)))
     rel = self.assembly.relative_pose(child)
     if rel is None or rel[0] not in receiver_parts:

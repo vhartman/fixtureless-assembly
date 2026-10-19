@@ -2,7 +2,7 @@
 import mujoco
 import numpy as np
 
-from execution.grasp_preflight import mate_gripper_clearance
+from assembly_planner.grasp_preflight import mate_gripper_clearance
 
 
 class _Scene:
