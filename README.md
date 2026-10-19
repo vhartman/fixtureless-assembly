@@ -55,6 +55,38 @@ when you keep it elsewhere:
 export MRBENCH_SRC=/absolute/path/to/mr_bench/src
 ```
 
+### Verified Car Mini pipeline
+
+The following four-arm example exercises task search, motion planning, strict path preflight,
+and actuated MuJoCo execution. It was verified end to end with the current standard profiles:
+
+```bash
+mkdir -p /tmp/assembly-car-mini
+
+PYTHONHASHSEED=0 python3 main.py --solve --search-profile standard \
+  --assembly car-mini --parts 5 --num-robots 4 --robot ur5_limited \
+  --seed 11023 --insert-force 10 --insertion-noise 0 \
+  --wrench-profile measured --quiet-rai --no-view \
+  --save /tmp/assembly-car-mini/plan.json
+
+PYTHONHASHSEED=0 python3 main.py \
+  --config /tmp/assembly-car-mini/plan.json \
+  --load-plan /tmp/assembly-car-mini/plan.json \
+  --motion-plan --motion-profile standard --mp-runtime 30 --mp-seed 11023 \
+  --quiet-rai --no-view \
+  --mp-export-save /tmp/assembly-car-mini/export.json \
+  --mp-save /tmp/assembly-car-mini/mp.json
+
+PYTHONHASHSEED=0 python3 sim.py run /tmp/assembly-car-mini/plan.json \
+  --mp-path /tmp/assembly-car-mini/mp.json \
+  --record /tmp/assembly-car-mini/replay.npz \
+  --report-json /tmp/assembly-car-mini/report.json
+```
+
+Success ends with `16/16 actions ok; plan SUCCEEDED`. Motion planning uses a wall-clock budget,
+so preserve the successful `mp.json` artifact rather than expecting a regenerated path to be
+byte-identical.
+
 The full solve, export, simulation, and replay commands are in the
 [pipeline guide](docs/PIPELINE.md). Use `python3 main.py --help` for the complete option list.
 
@@ -71,7 +103,7 @@ The full solve, export, simulation, and replay commands are in the
 | `part_meshes/`, `sim_meshes/`, `src/rai/` | Assembly and robot geometry |
 | `project_page/` | Paper project-page draft and replay viewer |
 | `docs/` | Method, evaluation, reproduction, and implementation writeups |
-| `tools/` | Calibration, diagnostics, export, and visualization commands |
+| `tools/` | Calibration, validation, export, and visualization commands |
 
 Generated plans, recordings, and result tables belong in `experiments/`, `sim_recordings/`,
 or `benchmarks/results/`, not in the repository root.
@@ -83,8 +115,8 @@ or `benchmarks/results/`, not in the repository root.
 - [Search method](docs/SEARCH_METHOD.md) - full search description and scope.
 - [Short paper method](docs/PAPER_METHOD_SHORT.md) - condensed methods text.
 - [Evaluation status](docs/EVALUATION.md) - available evidence and open validation work.
-- [Full reproduction record](docs/REPRODUCTION.md) - detailed commands, ablations, and
-  historical experiment notes formerly kept in this README.
+- [Historical reproduction record](docs/REPRODUCTION.md) - detailed ablations and experiment
+  notes formerly kept in this README.
 - [Known pipeline failure modes](docs/FRAGILITY.md) - reproducibility and stage-contract risks.
 
 For comparable runs, set `PYTHONHASHSEED=0`, do not run two heavy solves at the same time, and

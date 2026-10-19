@@ -58,8 +58,8 @@ python3 part_meshes/fabrica/import_assets.py \
 
 # Check complete moving-part geometry against the assembled prefix in both engines.
 # Default: 50 mm insertion, samples every 0.5 mm, penetration tolerance 1 micrometre.
-python3 tools/diagnostics/audit_fabrica.py duct --containment
-python3 tools/diagnostics/audit_fabrica.py car --containment
+python3 tools/validation/audit_fabrica.py duct --containment
+python3 tools/validation/audit_fabrica.py car --containment
 
 python3 tools/visualization/view_fabrica.py duct --pose assembled
 python3 tools/visualization/view_fabrica.py car --pose assembled
@@ -69,7 +69,7 @@ The Duct cover and all six fasteners enter along the common flange normal
 `(-0.5, 0, -sqrt(0.75))`. The former radial XY insertion guesses were invalid even for
 the authored meshes. An audit is sampled, not continuous; a finer `--step` tightens it.
 Use `--output /tmp/fabrica-candidate` when experimenting, then
-`tools/diagnostics/audit_fabrica.py duct --asset-root /tmp/fabrica-candidate` before replacing
+`tools/validation/audit_fabrica.py duct --asset-root /tmp/fabrica-candidate` before replacing
 assets.
 Sub-micrometre duplicate seam vertices are welded at 0.1 micrometre (needed by Circular
 Stool). Sources that remain non-watertight require repair; the importer fails explicitly.
@@ -109,7 +109,7 @@ two inserted uprights retain their three-child semantic proxies. This reduces th
 five-part collider from 395 children to 33 without changing the exact visual/grasp meshes.
 The boxes stop on either side of every authored through-hole and are strictly contained in
 the rounded CAD skin.
-`tools/diagnostics/audit_fabrica.py beam --containment --robustness 0.001` is the required
+`tools/validation/audit_fabrica.py beam --containment --robustness 0.001` is the required
 regression: it checks every full insertion sweep and the seated pose under +/-1 mm translations
 in both RAI and MuJoCo. Re-running the generic importer does not overwrite this reviewed runtime
 proxy, which is defined in `FabricaAssembly._beam_primitive_collision_shape`.
@@ -130,7 +130,7 @@ Circular Stool keeps the exact render meshes and mate transforms.  Its four fitt
 proxies are retreated 2.5 mm axially/radially inside the exact CAD.  This is recorded as
 `axial_fit_trim` in the manifest and is deliberately local to collision geometry: it gives
 the insertion channel a finite numerical clearance without moving or shrinking the visible
-part. Re-run `tools/diagnostics/audit_fabrica.py circular-stool --containment` after changing it.
+part. Re-run `tools/validation/audit_fabrica.py circular-stool --containment` after changing it.
 
 For end-to-end CAD planning, use hard witness residual contracts in addition to collision
 checks.  `benchmarks/run_fabrica_smoke.py` applies 40 micrometre grasp/mate translation

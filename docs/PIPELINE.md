@@ -1,7 +1,12 @@
-# Pipeline instructions — solve → validate → motion-plan → simulate → look at it
+# Pipeline instructions — solve → motion-plan → simulate → replay
 
-Everything below is deterministic under `PYTHONHASHSEED=0` (use it for anything you intend
-to compare). Never run two heavy solves concurrently. Always `--no-view` in scripted runs.
+Use `PYTHONHASHSEED=0` for comparable task searches. Motion planning is wall-clock bounded and
+is not fully deterministic, so retain every successful path used for a reported result. Never
+run two heavy solves concurrently. Always use `--no-view` in scripted runs.
+
+For the shortest maintained end-to-end example, use the verified four-arm Car Mini commands in
+the [root README](../README.md#verified-car-mini-pipeline). The sections below are a reference
+for individual stages and less common options.
 
 ## 1. Solve a plan (CLI)
 

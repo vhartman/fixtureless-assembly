@@ -4,7 +4,7 @@ This is the guarantee the whole articulated-sim plan rests on: the planner expre
 witness, strict-collision gate and seat tolerance in rai's joint space, so if MuJoCo's
 kinematics drift even slightly, the same q means a different end-effector pose in the two and
 witnesses land somewhere else -- silently. Cheap to check, catastrophic to get wrong, so it is
-pinned here rather than left to `tools/diagnostics/fk_compare.py` being run by hand.
+pinned here rather than left to `tools/validation/fk_compare.py` being run by hand.
 """
 import numpy as np
 import pytest
@@ -12,7 +12,7 @@ import pytest
 mujoco = pytest.importorskip("mujoco")
 
 import assembly_planner.arm_model as arm_model
-from tools.diagnostics import fk_compare
+from tools.validation import fk_compare
 from assembly_planner.env import (color_gripper, make_four_robot_env, make_fr3_duo_env, make_husky_duo_env,
                  make_openarm_duo_env)
 import robotic as ry

@@ -14,7 +14,7 @@ all. This emits the real chain: one body per rai frame, a `<joint>` wherever rai
 the model can be driven by SETTING qpos (kinematic, still perfectly stiff -- the intermediate
 step) and later by actuators without changing the model.
 
-rai -> MJCF conventions relied on here, all verified in tools/diagnostics/fk_compare.py rather
+rai -> MJCF conventions relied on here, all verified in tools/validation/fk_compare.py rather
 than assumed:
   * both use quaternions as [w, x, y, z], so relative quats copy across verbatim;
   * a rai `hingeX/Y/Z` frame rotates about that local axis, which is exactly a MuJoCo

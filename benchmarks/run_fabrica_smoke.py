@@ -108,7 +108,7 @@ def main():
     for name in args.models:
         plan, mp = out / f"{name}-plan.json", out / f"{name}-mp.json"
         commands = {
-            "audit": ["tools/diagnostics/audit_fabrica.py", name, "--containment",
+            "audit": ["tools/validation/audit_fabrica.py", name, "--containment",
                       "--tolerance", "0.0001",
                       "--robustness", str(args.mate_robustness)],
             # The historical JSON supplies only scene identity/robot layout. Reapply the

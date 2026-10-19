@@ -4807,7 +4807,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                   if actuated else "SETTING qpos (kinematic diagnostic)")
     print(f"[sim/mp] --articulated ACTIVE: real kinematic chains generated from rai "
           f"(arm_model), driven by {_arm_drive} -- not {len(arms)} teleported mocap bodies. "
-          "Run tools/diagnostics/fk_compare.py to re-check the model.")
+          "Run tools/validation/fk_compare.py to re-check the model.")
 
   _hook_log = {"settle": [], "seat": []}                    # fire-window durations (sim s)
 
@@ -9740,7 +9740,7 @@ def _build_cli():
                       "by SETTING qpos: still perfectly stiff, so the grasp weld remains an "
                       "exact measure of the payload's m(a-g) and every wrench/corner calibration "
                       "stays interpretable. The step before actuators. Verify the model with "
-                      "`python tools/diagnostics/fk_compare.py --robot <type>` "
+                      "`python tools/validation/fk_compare.py --robot <type>` "
                       "(agreement is machine-precision).")
   r.add_argument("--spline", action=argparse.BooleanOptionalAction, default=True,
                  help="With --corridor: replace the C0 path by a C1 Catmull-Rom curve through "

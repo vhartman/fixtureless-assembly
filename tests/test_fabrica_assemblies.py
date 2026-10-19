@@ -378,7 +378,7 @@ def test_fabrica_exact_visuals_are_noncolliding_in_mujoco():
 
 def test_fabrica_insertion_sweeps():
   """A clear bore centre is insufficient: the entire mover must fit along the path."""
-  from tools.diagnostics.audit_fabrica import audit
+  from tools.validation.audit_fabrica import audit
   for name in ("car", "beam", "duct", "cooling-manifold", "gamepad", "plumbers-block",
                "circular-stool"):
     for row in audit(name, step=.0025):
@@ -388,7 +388,7 @@ def test_fabrica_insertion_sweeps():
 
 def test_car_mates_cover_the_witness_residual_envelope():
   """The 1mm IK mate gate must not create a collision after its exemption is removed."""
-  from tools.diagnostics.audit_fabrica import audit
+  from tools.validation.audit_fabrica import audit
   for row in audit("car", step=.005, tolerance=1e-4, robustness=.001):
     assert row["robust_bad"] == 0, row
 

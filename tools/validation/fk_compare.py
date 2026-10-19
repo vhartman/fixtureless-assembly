@@ -5,9 +5,9 @@ in a new robot repeatable: point it at a different robot type and it tells you, 
 degrees, whether MuJoCo agrees with rai over the whole joint range -- rather than leaving that
 as a spot-check you find out about later via a mysteriously missed seat.
 
-    python3 tools/diagnostics/fk_compare.py
-    python3 tools/diagnostics/fk_compare.py --robot ur5e
-    python3 tools/diagnostics/fk_compare.py --num-robots 3 -n 500 --verbose
+    python3 tools/validation/fk_compare.py
+    python3 tools/validation/fk_compare.py --robot ur5e
+    python3 tools/validation/fk_compare.py --num-robots 3 -n 500 --verbose
 
 Every arm frame is compared, not just the tool, because a mid-chain offset error can cancel at
 one pose and reappear at another. Configs are drawn inside rai's own joint limits, plus the

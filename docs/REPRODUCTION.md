@@ -1,7 +1,9 @@
-# Full reproduction and experiment record
+# Historical reproduction and experiment record
 
 This document contains the detailed working notes that previously lived in the root README.
-For the project overview and repository map, see the [root README](../README.md).
+It preserves old measurements, ablations, and commands for auditability; it is not the current
+quick-start guide. For maintained commands and the repository map, see the
+[root README](../README.md) and [pipeline guide](PIPELINE.md).
 
 This repository searches for multi-robot assembly plans, exports real-arm motion paths with
 `mr_bench`, and validates the paths in MuJoCo. See [PIPELINE.md](PIPELINE.md) for the general
@@ -2309,8 +2311,8 @@ python3 tools/visualization/view_fabrica.py duct --pose assembled
 python3 tools/visualization/view_fabrica.py car --pose assembled
 
 # Check complete insertion sweeps in RAI and MuJoCo and containment in the original CAD.
-python3 tools/diagnostics/audit_fabrica.py duct --containment
-python3 tools/diagnostics/audit_fabrica.py car --containment
+python3 tools/validation/audit_fabrica.py duct --containment
+python3 tools/validation/audit_fabrica.py car --containment
 ```
 
 The importer is generic, but assembly membership and mate directions/dependencies remain

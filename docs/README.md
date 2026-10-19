@@ -7,8 +7,8 @@ the detailed research record and operational guidance.
 
 - [PIPELINE.md](PIPELINE.md) - commands for task search, motion export, simulation, and replay.
 - [EVALUATION.md](EVALUATION.md) - current evidence, limitations, and open paper work.
-- [REPRODUCTION.md](REPRODUCTION.md) - full experiment and reproduction record. This is the
-  former long root README, kept intact so that detailed commands and results stay available.
+- [REPRODUCTION.md](REPRODUCTION.md) - historical experiment and reproduction record. Use it
+  to audit older results; use the root README and pipeline guide for maintained commands.
 
 ## Method and paper
 
@@ -27,5 +27,7 @@ the detailed research record and operational guidance.
 - [SIMV2.md](SIMV2.md) - execution-program simulator notes.
 - [SIM_CONTACT.md](SIM_CONTACT.md) - opt-in physical-contact experiment.
 
-Benchmark-specific instructions stay in [benchmarks/README.md](../benchmarks/README.md).
+Maintained benchmark commands stay in [benchmarks/README.md](../benchmarks/README.md). Detailed
+historical results and superseded experiments are retained in
+[BENCHMARK_HISTORY.md](BENCHMARK_HISTORY.md); they are not the current usage guide.
 Experiment-local notes stay with their artifacts under `experiments/`.

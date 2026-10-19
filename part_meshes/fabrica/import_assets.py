@@ -142,7 +142,7 @@ _SEMANTIC_INSERT_PRIMITIVES = {
 # ``axial`` retreats only the leading end of an inserted shaft.  The larger beam value is
 # required by its authored tapered/dovetail mortise: the nominal rectangular tenon proxy
 # otherwise overlaps the exact female surface by roughly 2 mm.  All values are recorded in
-# the generated manifest and verified by tools/diagnostics/audit_fabrica.py against both
+# the generated manifest and verified by tools/validation/audit_fabrica.py against both
 # collision backends.
 _SEMANTIC_INSERT_CLEARANCE = {
     "duct": {source: {"radial": .0010, "axial": .0005, "leading": "upper"}
