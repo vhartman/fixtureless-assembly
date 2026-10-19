@@ -4,7 +4,7 @@ from types import MethodType
 
 import numpy as np
 
-from solver import RobotIK
+from assembly_planner.solver import RobotIK
 
 
 class _State:

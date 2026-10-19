@@ -543,7 +543,13 @@ def _parse_args(argv=None):
   parser.add_argument("--execution-timing", choices=("lockstep", "phase"),
                       default="lockstep",
                       help="simulation timing policy (default: lockstep)")
-  parser.add_argument("--memory-gb", type=float, default=4.0, metavar="GB")
+  parser.add_argument(
+      "--memory-gb", type=float, default=4.0, metavar="GB",
+      help="virtual-address-space guard for task and motion planning (default: 4)")
+  parser.add_argument(
+      "--sim-memory-gb", type=float, default=20.0, metavar="GB",
+      help=("virtual-address-space guard for MuJoCo (default: 20); recorded visual models "
+            "can reserve more than 6 GiB even when resident memory is much lower"))
   parser.add_argument(
       "--jobs", type=int, default=1, metavar="N",
       help=("run up to N seeds concurrently; each seed keeps its selected scene/model trials "
@@ -582,7 +588,7 @@ def _parse_args(argv=None):
   if args.dry_run and args.reuse_motion_plans:
     parser.error("--dry-run cannot be combined with --reuse-motion-plans")
   if any(x <= 0 for x in (args.mp_runtime, args.task_timeout, args.motion_timeout,
-                          args.sim_timeout, args.memory_gb)):
+                          args.sim_timeout, args.memory_gb, args.sim_memory_gb)):
     parser.error("runtime, timeout, and memory limits must be positive")
   if args.physical_force < 0:
     parser.error("--physical-force must be non-negative")
@@ -610,7 +616,7 @@ def _sequential_main(args):
       "scenes": args.scenes, "variants": args.variants, "seeds": args.seeds,
       "physical_insert_force_n": args.physical_force,
       "simulation_process_noise": "nominal", "search_profile": "standard",
-      "motion_profile": "standard", "sim_profile": "standard",
+      "motion_profile": "standard", "simulation_contract": "standard",
       "physics_step_s": args.physics_step,
       "simulation_gravity": True,
       "motion_gravity_gate": {
@@ -619,6 +625,7 @@ def _sequential_main(args):
       "mp_runtime_s": args.mp_runtime, "task_timeout_s": args.task_timeout,
       "motion_timeout_s": args.motion_timeout,
       "sim_timeout_s": args.sim_timeout, "memory_gb": args.memory_gb,
+      "sim_memory_gb": args.sim_memory_gb,
       "record": args.record, "animate_grippers": args.animate_grippers,
       "reused_task_plans_from": (str(args.reuse_task_plans.resolve())
                                   if args.reuse_task_plans else None),
@@ -632,9 +639,11 @@ def _sequential_main(args):
   summary_path = out / "summary.json"
   if args.resume and manifest_path.is_file():
     previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if previous.get("sim_profile") == "standard" and "simulation_contract" not in previous:
+      previous["simulation_contract"] = "standard"
     semantic_keys = (
         "scenes", "variants", "seeds", "physical_insert_force_n",
-        "simulation_process_noise", "search_profile", "motion_profile", "sim_profile",
+        "simulation_process_noise", "search_profile", "motion_profile", "simulation_contract",
         "physics_step_s",
         "simulation_gravity", "motion_gravity_gate", "execution_timing", "animate_grippers",
         "reused_task_plans_from", "reused_motion_plans_from",
@@ -877,14 +886,12 @@ def _sequential_main(args):
               else:
                 sim_cmd = [
                     sys.executable, "-u", str(ROOT / "sim.py"), "run", str(execution_plan),
-                    "--sim-profile", "standard", "--mp-path", str(motion),
+                    "--mp-path", str(motion),
+                    "--execution-timing", args.execution_timing,
                     "--physics-step", str(args.physics_step),
                     "--apply-process-wrench", "--process-noise", "nominal",
                     "--process-noise-seed", str(seed), "--report-json", str(sim_report),
                 ]
-                if args.execution_timing == "lockstep":
-                  sim_cmd += ["--no-phase-schedule", "--no-phase-smooth",
-                              "--no-phase-batch", "--no-spline"]
                 if args.insertion_only_grasp_check:
                   sim_cmd += ["--insertion-only-grasp-check"]
                 if args.abort_on_action_failure:
@@ -899,7 +906,7 @@ def _sequential_main(args):
                       flush=True)
                 scode, sim_wall, sim_outcome = _run(
                     sim_cmd, log=sim_log, timeout=args.sim_timeout,
-                    memory_gb=args.memory_gb, env=env, dry_run=False)
+                    memory_gb=args.sim_memory_gb, env=env, dry_run=False)
                 row["sim_wall_s"] = round(sim_wall, 6)
                 row["returncode"] = scode
                 report = {}
@@ -993,6 +1000,7 @@ def _worker_command(args, seed, output):
       "--physics-step", str(args.physics_step),
       "--execution-timing", args.execution_timing,
       "--memory-gb", str(args.memory_gb),
+      "--sim-memory-gb", str(args.sim_memory_gb),
       "--record", args.record,
       "--jobs", "1",
   ]
@@ -1064,6 +1072,7 @@ def _parallel_main(args):
         "scenes": args.scenes, "variants": args.variants, "seeds": [seed],
         "physical_insert_force_n": args.physical_force,
         "physics_step_s": args.physics_step, "execution_timing": args.execution_timing,
+        "sim_memory_gb": args.sim_memory_gb,
         "record": args.record, "animate_grippers": args.animate_grippers,
         "insertion_only_grasp_check": bool(args.insertion_only_grasp_check),
         "abort_on_action_failure": bool(args.abort_on_action_failure),

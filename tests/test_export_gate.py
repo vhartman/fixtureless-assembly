@@ -1,8 +1,8 @@
 """The final motion-export gate covers every IK skill, not only assembly seats."""
 import numpy as np
 
-import mp_export
-import solver
+import assembly_planner.mp_export as mp_export
+import assembly_planner.solver as solver
 
 
 class _Scene:

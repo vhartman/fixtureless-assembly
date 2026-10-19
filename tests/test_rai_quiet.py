@@ -8,7 +8,7 @@ def test_native_gil_held_write_does_not_deadlock_and_preserves_diagnostics():
     code = r'''
 import ctypes
 import os
-import rai_quiet
+import assembly_planner.rai_quiet as rai_quiet
 
 rai_quiet.install()
 # PyDLL deliberately retains the GIL, as the RAI binding does during a native solve.

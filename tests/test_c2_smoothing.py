@@ -1,6 +1,6 @@
 import numpy as np
 
-import c2_smoothing as c2
+import assembly_planner.c2_smoothing as c2
 
 
 def _corner():

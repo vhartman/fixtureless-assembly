@@ -176,13 +176,16 @@ Edit left_ur_arm_wrist_3_joint: { q: 0 }
 
 # One Robotiq 2F-85 per arm.  The calibrated URDF's tool0 is already located at
 # the physical flange (unlike ur5.g's wrist joint, it needs no 90 mm offset).
-# Zero tool roll keeps this dual-arm home configuration collision-free.
+# The physical tool roll is applied explicitly below, after the gripper subtree is included.
 Prefix: "right_ur_arm_"
 Include: <../../robotiq/robotiq.g>
 Prefix: false
-Edit right_ur_arm_robotiq_base (right_ur_arm_tool0): {}
+# The physical two-finger tool is rolled 90 degrees about the tool/flange axis
+# relative to the calibrated UR tool0 convention.  Keep this in the source model
+# so RAI, MuJoCo exports, closure checks, and replay all see the same orientation.
+Edit right_ur_arm_robotiq_base (right_ur_arm_tool0): { Q: "d(90 0 0 1)" }
 
 Prefix: "left_ur_arm_"
 Include: <../../robotiq/robotiq.g>
 Prefix: false
-Edit left_ur_arm_robotiq_base (left_ur_arm_tool0): {}
+Edit left_ur_arm_robotiq_base (left_ur_arm_tool0): { Q: "d(90 0 0 1)" }

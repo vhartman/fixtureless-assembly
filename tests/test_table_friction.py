@@ -1,8 +1,8 @@
 """--table-friction: the friction-cone table model vs the frictionless default."""
 import numpy as np
 
-import problem as P
-import wrench
+import assembly_planner.problem as P
+import assembly_planner.wrench as wrench
 
 
 def _table_rest_state():

@@ -176,7 +176,8 @@ def _plot_pair(physical_suite: Path, no_wrench_suite: Path, output_dir: Path, *,
                output_stem: str, title: str, x_label: str,
                metric: str = "milestone_search_s_mean",
                y_label: str = "Time to initial witnessed plan (s)",
-               paper: bool = False, optimistic_no_wrench_suite: Path | None = None):
+               paper: bool = False, linear_y: bool = False,
+               optimistic_no_wrench_suite: Path | None = None):
   physical = _aggregate(_read_results(physical_suite), physical=True)
   topological = _aggregate(_read_results(no_wrench_suite), physical=False)
   optimistic_topological = (
@@ -239,7 +240,7 @@ def _plot_pair(physical_suite: Path, no_wrench_suite: Path, output_dir: Path, *,
     ax.set_xlabel(r"\#parts" if paper else x_label)
     if paper:
       ax.tick_params(axis="x", labelsize=24)
-    ax.set_yscale("linear" if metric == "plan_cost_mean" else "log")
+    ax.set_yscale("linear" if linear_y or metric == "plan_cost_mean" else "log")
     ax.grid(True, which="both", alpha=0.25)
     ax.set_xticks(sorted({int(row["parts"]) for row in physical}))
   paper_y_label = ("Plan cost" if metric == "plan_cost_mean" else "Planning time (s)")
@@ -276,7 +277,8 @@ def plot_pair(physical_suite: Path, no_wrench_suite: Path, output_dir: Path, *,
               output_stem: str, title: str, x_label: str,
               metric: str = "milestone_search_s_mean",
               y_label: str = "Time to initial witnessed plan (s)",
-              paper: bool = False, optimistic_no_wrench_suite: Path | None = None):
+              paper: bool = False, linear_y: bool = False,
+              optimistic_no_wrench_suite: Path | None = None):
   """Plot one matrix pair, optionally under the repository's paper style.
 
   The style context is deliberately local: importing this module or producing a paper plot does
@@ -286,6 +288,7 @@ def plot_pair(physical_suite: Path, no_wrench_suite: Path, output_dir: Path, *,
     return _plot_pair(
         physical_suite, no_wrench_suite, output_dir, output_stem=output_stem,
         title=title, x_label=x_label, metric=metric, y_label=y_label, paper=False,
+        linear_y=linear_y,
         optimistic_no_wrench_suite=optimistic_no_wrench_suite)
   if not PAPER_STYLE.is_file():
     raise ValueError(f"paper style does not exist: {PAPER_STYLE}")
@@ -293,6 +296,7 @@ def plot_pair(physical_suite: Path, no_wrench_suite: Path, output_dir: Path, *,
     return _plot_pair(
         physical_suite, no_wrench_suite, output_dir, output_stem=output_stem,
         title=title, x_label=x_label, metric=metric, y_label=y_label, paper=True,
+        linear_y=linear_y,
         optimistic_no_wrench_suite=optimistic_no_wrench_suite)
 
 
@@ -309,6 +313,9 @@ def main(argv=None):
   parser.add_argument(
       "--paper", action="store_true",
       help="load paper_2.mplstyle and omit all titles and legends")
+  parser.add_argument(
+      "--linear-y", action="store_true",
+      help="use a linear y axis for planning time (cost is always linear)")
   args = parser.parse_args(argv)
   metric = ("milestone_search_s_mean", "Time to initial witnessed plan (s)")
   if args.metric == "cost":
@@ -316,6 +323,7 @@ def main(argv=None):
   plot_pair(args.physical_suite, args.no_wrench_suite, args.output,
             output_stem=args.output_stem, title=args.title, x_label=args.x_label,
             metric=metric[0], y_label=metric[1], paper=args.paper,
+            linear_y=args.linear_y,
             optimistic_no_wrench_suite=args.optimistic_no_wrench_suite)
   write_tikz_legend(
       args.output / f"{args.output_stem}-legend.tex",

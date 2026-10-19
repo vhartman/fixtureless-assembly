@@ -5,7 +5,7 @@ import sys, os
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from plan_io import (read_diagnostic_candidates, read_optimization_candidates,
+from assembly_planner.plan_io import (read_diagnostic_candidates, read_optimization_candidates,
                      read_witness_sets, witness_block, write_plan)
 
 
@@ -102,7 +102,7 @@ def test_greedy_maxmin_wrist_selection():
 # representative), shoulder-lift only [-3.2832, 0.2832] (range < 2*pi -> targets either fit
 # or the transform is dropped).
 def _solver_mod():
-  import solver
+  import assembly_planner.solver as solver
   return solver
 
 

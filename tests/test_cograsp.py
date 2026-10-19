@@ -13,8 +13,8 @@ No MuJoCo and no mr_bench: the mode chain / task list the reporter walks are stu
 import numpy as np
 import pytest
 
-import mp_export as MP
-from env import make_four_robot_env
+import assembly_planner.mp_export as MP
+from assembly_planner.env import make_four_robot_env
 
 
 # --------------------------------------------------------------------------- stubs
@@ -81,8 +81,8 @@ def scene():
   tool-centre frames, so the arms must be real (a floating-EE scene has no joint chain).
   The tool-centre names come from a real RobotIK -- its __init__ is a config copy plus frame
   lookups, and hardcoding 'a1_ur_gripper_center' would silently rot when the EE changes."""
-  import assembly as A
-  import solver as S
+  import assembly_planner.assembly as A
+  import assembly_planner.solver as S
   C = make_four_robot_env(num_robots=2, floating_ee=False)
   robots = A.get_robots(C)
   rik = S.RobotIK(C, robots)
@@ -211,7 +211,7 @@ def test_translation_is_read_in_the_anchor_frame_but_the_angle_is_not():
 # --------------------------------------------------------------------------- fusion gate
 def test_holder_mapping_uses_canonical_robot_order():
   """A state's grasp contacts are frozensets; their hash order must not leak into MP goals."""
-  import solver as S
+  import assembly_planner.solver as S
 
   class _HolderState:
     supports = {"obj_0": frozenset({
@@ -234,8 +234,8 @@ def test_holder_mapping_uses_canonical_robot_order():
 
 def test_known_action_scoped_lookup_matches_global_successor():
   """Fixed-plan replay may skip unrelated loops, but must return the same states."""
-  import assembly as A
-  import solver as S
+  import assembly_planner.assembly as A
+  import assembly_planner.solver as S
 
   A.set_seed(0)
   A.set_rolls_per_face(1)

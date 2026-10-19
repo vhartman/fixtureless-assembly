@@ -17,10 +17,10 @@ import pytest
 import robotic as ry
 
 import main
-import mp_export as MP
-import solver as S
-from config import RunConfig
-from env import make_four_robot_env
+import assembly_planner.mp_export as MP
+import assembly_planner.solver as S
+from assembly_planner.config import RunConfig
+from assembly_planner.env import make_four_robot_env
 
 
 # --------------------------------------------------------------------------- flag gate
@@ -175,7 +175,7 @@ def test_gate_falls_back_to_absolute_tolerances_when_todays_solve_failed():
 @pytest.fixture(scope="module")
 def arms():
   C = make_four_robot_env(num_robots=3, floating_ee=False)
-  import assembly as A
+  import assembly_planner.assembly as A
   return C, A.get_robots(C)
 
 

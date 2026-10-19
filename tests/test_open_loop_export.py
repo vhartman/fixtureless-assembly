@@ -3,7 +3,7 @@ import json
 import numpy as np
 import pytest
 
-import export_open_loop as E
+from tools.exporters import export_open_loop as E
 import sim
 
 

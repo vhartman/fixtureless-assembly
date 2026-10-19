@@ -5,9 +5,9 @@ import os
 import mujoco
 import numpy as np
 
-import problem as P
+import assembly_planner.problem as P
 import sim as S
-from env import make_world
+from assembly_planner.env import make_world
 
 
 FABRICA_MODELS = (
@@ -62,6 +62,12 @@ def test_fabrica_source_mapping_and_dependencies():
   assert np.allclose(car.position_in_base("obj_1"), [-.05606, .0225, -.02157], atol=2e-5)
   assert np.allclose(car.mate_axis("obj_1"), [0, -1, 0])
   assert np.allclose(car.mate_axis("obj_3"), [0, 1, 0])
+  assert set(car.mate_symmetry_quats) == set(car.objects[1:])
+  assert all(len(car.mate_quaternions(p)) == 1 for p in car.objects[1:])
+  car.configure_mate_symmetry(True)
+  assert all(len(car.mate_quaternions(p)) == 2 for p in car.objects[1:])
+  assert all(np.allclose(car.mate_quaternions(p)[1], [0, 0, 1, 0])
+             for p in car.objects[1:])
   # A wheel is one rounded tread plus one coaxial locating peg.  Hundreds of tetrahedral
   # cells for this surface of revolution make every MP predicate needlessly expensive.
   for source in ("0", "3", "4", "5"):
@@ -372,7 +378,7 @@ def test_fabrica_exact_visuals_are_noncolliding_in_mujoco():
 
 def test_fabrica_insertion_sweeps():
   """A clear bore centre is insufficient: the entire mover must fit along the path."""
-  from audit_fabrica import audit
+  from tools.diagnostics.audit_fabrica import audit
   for name in ("car", "beam", "duct", "cooling-manifold", "gamepad", "plumbers-block",
                "circular-stool"):
     for row in audit(name, step=.0025):
@@ -382,7 +388,7 @@ def test_fabrica_insertion_sweeps():
 
 def test_car_mates_cover_the_witness_residual_envelope():
   """The 1mm IK mate gate must not create a collision after its exemption is removed."""
-  from audit_fabrica import audit
+  from tools.diagnostics.audit_fabrica import audit
   for row in audit("car", step=.005, tolerance=1e-4, robustness=.001):
     assert row["robust_bad"] == 0, row
 

@@ -14,7 +14,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import problem as P
+import assembly_planner.problem as P
 
 SPEC = ("compound", [
     {"shape": ("box", [0.05, 0.05, 0.03, 0.005]), "pos": [0.0, 0.0, -0.015]},

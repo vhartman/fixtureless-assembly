@@ -8,11 +8,11 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import mp_export as MP
-import problem as P
+import assembly_planner.mp_export as MP
+import assembly_planner.problem as P
 import sim
-import solver as S
-import wrench as W
+import assembly_planner.solver as S
+import assembly_planner.wrench as W
 
 
 def test_peg_hole_screw_is_one_atomic_mate_with_typed_skill():

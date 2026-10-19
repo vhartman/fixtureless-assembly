@@ -18,11 +18,11 @@ import pytest
 import robotic as ry
 from pathlib import Path
 
-import assembly as A
+import assembly_planner.assembly as A
 import replay as R
-from plan_io import read_plan
-from solver import RobotIK, _replay_states, _search_context, involved_robots
-from witness_floor import optimize_witnesses_floor
+from assembly_planner.plan_io import read_plan
+from assembly_planner.solver import RobotIK, _replay_states, _search_context, involved_robots
+from assembly_planner.witness_floor import optimize_witnesses_floor
 
 SCENE = Path(os.environ.get(
     "ASSEMBLY_WITNESS_FLOOR_FIXTURE",
@@ -99,8 +99,8 @@ def test_no_gross_arm_vs_arm_penetration(floor_result):
 # solver.involved_robots; these tests are what stops them drifting apart again.
 
 def test_active_robots_and_involved_agree_on_every_witnessed_action():
-  from visualization import _active_robots
-  from witness_floor import _involved
+  from assembly_planner.visualization import _active_robots
+  from assembly_planner.witness_floor import _involved
   cfg, plan, C, asm, robots, gk, rik = _setup()
   _ck, gt = _search_context(C, asm, robots)
   states = _replay_states(C, asm, plan, robots, gk, True, True,
@@ -121,8 +121,8 @@ def test_active_robots_and_involved_agree_on_every_witnessed_action():
 def test_release_involves_nobody():
   """A release has no witness (bind returns None), so there is nothing to pose or choose. This
   was the ONLY disagreement between the two old copies -- 28 releases across four plans."""
-  from witness_floor import _involved
-  from visualization import _active_robots
+  from assembly_planner.witness_floor import _involved
+  from assembly_planner.visualization import _active_robots
   cfg, plan, C, asm, robots, gk, rik = _setup()
   _ck, gt = _search_context(C, asm, robots)
   states = _replay_states(C, asm, plan, robots, gk, True, True,

@@ -3,11 +3,11 @@
 import numpy as np
 import robotic as ry
 
-from assembly import get_robots
-from env import make_openarm_duo_env
-from gripper_closure import VERSION, certify, closure_sweep_configs, finger_sweep_radius_bound
-from problem import add_disassembled_obj, get_initial_state, grasp_pose, make_assembly
-from solver import _search_context, isolated_pick_state
+from assembly_planner.assembly import get_robots
+from assembly_planner.env import make_openarm_duo_env
+from assembly_planner.gripper_closure import VERSION, certify, closure_sweep_configs, finger_sweep_radius_bound
+from assembly_planner.problem import add_disassembled_obj, get_initial_state, grasp_pose, make_assembly
+from assembly_planner.solver import _search_context, isolated_pick_state
 
 
 def _robotiq_scene(with_blocker=False):
@@ -35,7 +35,7 @@ def test_robotiq_virtual_close_finds_object_dependent_aperture():
 
 def test_finger_sweep_bound_contains_both_gripper_models():
   """A table broad-phase reject must cover every finger pose in the exact sweep."""
-  import gripper_closure as G
+  import assembly_planner.gripper_closure as G
   scenes = [(_robotiq_scene(), "x_")]
   openarm = ry.Config()
   openarm.addFile("src/rai/openarm/openarm_pinch_floating.g", namePrefix="x_")
@@ -58,7 +58,7 @@ def test_finger_sweep_bound_contains_both_gripper_models():
 
 
 def test_aperture_cache_distinguishes_compound_offsets_and_finger_sizes():
-  import gripper_closure as G
+  import assembly_planner.gripper_closure as G
   C = _robotiq_scene()
   C.addFrame("obj_0__shape0", "obj_0").setShape(ry.ST.box, [.01, .01, .01])
   model, groups, _center = G._finger_groups(C, "x_")
@@ -72,7 +72,7 @@ def test_aperture_cache_distinguishes_compound_offsets_and_finger_sizes():
 
 
 def test_aperture_cache_distinguishes_meshes_with_same_extents():
-  import gripper_closure as G
+  import assembly_planner.gripper_closure as G
   C = _robotiq_scene()
   points = np.array([[0, 0, 0], [.02, 0, 0], [0, .02, 0], [0, 0, .02]])
   child = C.addFrame("obj_0__shape0", "obj_0").setConvexMesh(points)
@@ -92,8 +92,8 @@ def test_held_endpoint_does_not_repeat_acquisition_sweep():
 
 
 def test_sampler_pair_cache_shares_identical_tools_but_retains_direction():
-  from solver import CollisionChecker
-  from problem import State
+  from assembly_planner.solver import CollisionChecker
+  from assembly_planner.problem import State
   checker = object.__new__(CollisionChecker)
   checker._sampled_pair_verdicts = {}
   checker.closure_check = False
@@ -112,7 +112,7 @@ def test_sampler_pair_cache_shares_identical_tools_but_retains_direction():
 
 
 def test_aperture_cache_eviction_preserves_the_certificate(monkeypatch):
-  import gripper_closure as G
+  import assembly_planner.gripper_closure as G
   monkeypatch.setattr(G, '_APERTURE_CACHE', {})
   monkeypatch.setattr(G, '_APERTURE_CACHE_LIMIT', 1)
   C = _robotiq_scene()
@@ -161,6 +161,91 @@ def test_virtual_close_rejects_collision_only_in_sweep():
   assert not out.feasible
   assert out.reason == "sweep-collision"
   assert out.detail is not None and "other_gripper" in out.detail[:2]
+
+
+def test_handover_checks_articulated_fingers_not_only_translated_pads(monkeypatch):
+  """A real Cross handover blocks the receiver although a translated-pad sweep passes."""
+  import assembly_planner.gripper_closure as G
+  import assembly_planner.problem as P
+  import assembly_planner.env as env
+  from assembly_planner.grasp_physics import HandoverGeometryChecker
+
+  monkeypatch.setattr(env, "_TIGHT_FINGERS", True)
+  assembly = make_assembly("cross", 4)
+  path = "src/rai/ur5/ur5_two_finger_floating_wrist.g"
+  checker = HandoverGeometryChecker(assembly, ("obj_3",), path, path)
+  poses = {
+      0: np.array([0, .016641914583884122, .035, 0, 2**-.5, 2**-.5, 0]),
+      2: np.array([0, .035, 0, .5, .5, -.5, .5]),
+      3: np.array([.03207106781186547, -.020969562185302586, 0,
+                   .6532814824381883, -.6532814824381882,
+                   -.2705980500730985, .2705980500730985]),
+  }
+
+  def posed_pair(giver, receiver):
+    C = ry.Config()
+    C.addConfigurationCopy(checker.template)
+    for prefix, pose, (base, correction) in (
+        (checker.prefix_a, poses[giver], checker.tool_a),
+        (checker.prefix_b, poses[receiver], checker.tool_b)):
+      root_pose = P._ee_root_pose(pose, base, correction)
+      root = C.getFrame(prefix + "ur_base")
+      root.setPosition(root_pose[:3])
+      root.setQuaternion(root_pose[3:])
+    C.setJointState(C.getJointState())
+    return C
+
+  clear = posed_pair(3, 2)
+  assert G.certify_handover(clear, checker.prefix_a, "obj_3",
+                            checker.prefix_b, "obj_3").feasible
+  blocked = posed_pair(0, 2)
+  assert G.certify(blocked, checker.prefix_b, "obj_3",
+                   existing_closures=((checker.prefix_a, "obj_3"),)).feasible
+  result = G.certify_handover(blocked, checker.prefix_a, "obj_3",
+                              checker.prefix_b, "obj_3")
+  assert not result.feasible
+  assert result.reason in ("sweep-collision", "handover-hand-collision")
+  assert "finger" in result.detail[0] or "finger" in result.detail[1]
+
+
+def test_openarm_floating_handover_keeps_proxy_certificate_without_moving_collision_pads():
+  import assembly_planner.gripper_closure as G
+  from assembly_planner.arm_model import gripper_sim_joints
+
+  C = ry.Config()
+  path = "src/rai/openarm/openarm_pinch_floating.g"
+  C.addFile(path, namePrefix="giver_")
+  C.addFile(path, namePrefix="receiver_")
+  centre = np.asarray(C.getFrame("giver_gripper_center").getPosition(), dtype=float)
+  C.addFrame("obj_0").setShape(ry.ST.box, [.03, .04, .03, 0]).setPosition(centre).setContact(1)
+  assert gripper_sim_joints(C, "giver_")  # visual hinges exist; collision pads bypass them
+  expected = G.certify(C, "receiver_", "obj_0",
+                       existing_closures=(("giver_", "obj_0"),))
+  assert G.certify_handover(C, "giver_", "obj_0", "receiver_", "obj_0") == expected
+
+
+def test_handover_certificate_rejects_old_contract_and_tracks_includes(tmp_path, monkeypatch):
+  import assembly_planner.env as env
+  from assembly_planner.grasp_physics import GraspPhysicsContext
+
+  context = object.__new__(GraspPhysicsContext)
+  try:
+    context.import_handovers({"contract": "handover-physics-v1"})
+  except ValueError as exc:
+    assert "obsolete collision contract" in str(exc)
+  else:
+    raise AssertionError("an old accepted-pair table must never be trusted")
+
+  child = tmp_path / "finger.g"
+  parent = tmp_path / "hand.g"
+  child.write_text("finger: {shape: capsule, size: [.04, .02]}\n")
+  parent.write_text("Include: <finger.g>\n")
+  before = GraspPhysicsContext._model_key(parent)
+  child.write_text("finger: {shape: capsule, size: [.05, .02]}\n")
+  assert GraspPhysicsContext._model_key(parent) != before
+  before = GraspPhysicsContext._model_key(parent)
+  monkeypatch.setattr(env, "_TIGHT_FINGERS", not env._TIGHT_FINGERS)
+  assert GraspPhysicsContext._model_key(parent) != before
 
 
 def test_closure_visualization_samples_the_same_certificate_without_mutation():

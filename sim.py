@@ -49,11 +49,11 @@ from collections import deque
 from pathlib import Path
 import numpy as np
 from math import sqrt as _sqrt
-import arm_model
+import assembly_planner.arm_model as arm_model
 
-from config import saved_cfg as _saved
+from assembly_planner.config import saved_cfg as _saved
 
-import retiming                                              # portable path->trajectory retiming
+import assembly_planner.retiming as retiming                                              # portable path->trajectory assembly_planner.retiming as retiming
 
 try:
   import mujoco
@@ -78,7 +78,7 @@ def _assembly_contact_filter(model, data, geom1, geom2):
     return 0
   return scene._filter_active_mate_contact(data, int(geom1), int(geom2))
 
-from problem import (grasp_pose, _pose_compose, _pose_invert, _quat_to_R, _quat_mul,
+from assembly_planner.problem import (grasp_pose, _pose_compose, _pose_invert, _quat_to_R, _quat_mul,
                      _shape_half_z, _shape_quat, _state_part_poses)
 
 
@@ -167,7 +167,7 @@ def _grasp_caps(kind):
   reason the sim used to reject loads the planner considers nearly free -- with the asymmetric
   model this collapses F_push=100 and F_pull=25 to 25N in EVERY direction, so a compressive
   insertion reaction reads as a 3x overload. See _grasp_polytope for the real test."""
-  import wrench as W
+  import assembly_planner.wrench as W
   model = W.PARAMS["grasp"].get(W.PARAMS.get("grasp_model", "isotropic"),
                                 W.PARAMS["grasp"]["isotropic"])
   g = model.get(kind, {})
@@ -194,7 +194,7 @@ def _grasp_polytope(kind):
   weaker F_pull when it is pulled off), a per-axis lateral bound mu*F_axial from friction at the
   preload, and separate couple bounds about n / the two lateral axes. Reproducing that box here
   is what makes the sim's verdict the same statement as the planner's."""
-  import wrench as W
+  import assembly_planner.wrench as W
   name = W.PARAMS.get("grasp_model", "isotropic")
   fam = W.PARAMS["grasp"].get(name)
   if fam is None or kind not in fam:
@@ -236,7 +236,7 @@ def _process_wrench_pair(assembly, part, parent, part_pose, parent_pose, realiza
   current pose defines the mate frame; this preserves Newton's third law even after a failed
   execution lets the two bodies drift apart.
   """
-  import wrench as W
+  import assembly_planner.wrench as W
   pp = np.asarray(part_pose, dtype=float)
   pt = np.asarray(parent_pose, dtype=float)
   Rp, Rt = _quat_to_R(pp[3:]), _quat_to_R(pt[3:])
@@ -288,7 +288,7 @@ def _process_realizations(plan, mode="nominal", corner=0, seed=0):
   two contact-point axes. ``corner`` chooses one of its 4/16 vertices. ``sample`` draws once
   per assemble action from the box and never redraws during execution.
   """
-  import wrench as W
+  import assembly_planner.wrench as W
   unc = W.PARAMS.get("insertion_uncertainty") or {}
   lat = float(unc.get("lateral", 0.0) or 0.0)
   off = float(unc.get("offset", 0.0) or 0.0)
@@ -393,7 +393,7 @@ class SimReport:
 
 def _clone_state_with_poses(state, poses):
   """Copy a symbolic state while replacing only its non-identity pose payload."""
-  from problem import State
+  from assembly_planner.problem import State
   return State(state.parent, state.grasp, state.place, state.supports,
                {p: np.asarray(x, dtype=float).copy() for p, x in poses.items()})
 
@@ -480,7 +480,7 @@ def _part_mesh_asset(prm):
   path-only cache silently paired a new manifest offset with an old cached hull, visibly
   scattering Car and Duct collision pieces centimetres away from their renderer meshes.
   """
-  import problem as P
+  import assembly_planner.problem as P
   import hashlib
   hm = P._load_mesh(prm)["hull_mesh"]
   digest = hashlib.sha256(
@@ -505,7 +505,7 @@ def _part_mesh_asset(prm):
 
 def _part_visual_mesh_asset(spec):
   """MuJoCo asset for an exact renderer-only part mesh (no hull or decomposition)."""
-  import problem as P
+  import assembly_planner.problem as P
   prm = {"file": spec} if isinstance(spec, str) else dict(spec)
   source = prm["file"]
   source = source if os.path.isabs(source) else os.path.join(P.HERE, source)
@@ -531,7 +531,7 @@ def _spec_volume(spec):
   if kind == "sphere":
     return float(4.0 / 3.0 * np.pi * p[0] ** 3)
   if kind == "mesh":
-    import problem as P
+    import assembly_planner.problem as P
     return float(P._load_mesh(p)["hull_mesh"].volume)
   raise ValueError(f"unknown shape kind {kind!r}")
 
@@ -630,7 +630,7 @@ def _compound_geoms_xml(spec, mu, mass, group, rgba, name_prefix=None):
   """FINISHED <geom> strings for a compound part: one geom per sub-shape, each at its own
   pos/quat inside the body, mass split by sub-shape volume (no mass_placeholder -- the
   caller's single-geom replace would stamp the FULL mass onto every child)."""
-  import problem as P
+  import assembly_planner.problem as P
   chs = P._compound_children(spec)
   vols = np.array([_spec_volume(s) for s, _ in chs], dtype=float)
   vols = vols / max(float(vols.sum()), 1e-12)
@@ -1140,7 +1140,7 @@ def build_mjcf(assembly, state, robots, mu_table=0.5, arms=None, arm_poses=None,
   # <mesh> assets for MESH-shaped parts and mesh CHILDREN of compound parts (deduped by
   # asset name; _geom_xml references them)
   def _mesh_specs():
-    import problem as _P
+    import assembly_planner.problem as _P
     for p in assembly.objects:
       spec = assembly.part_shape(p)
       if spec[0] == "mesh":
@@ -2058,7 +2058,7 @@ class SimScene:
     _model, _caps = _grasp_polytope(kind)
     if _model is None:
       return True
-    import problem as _P
+    import assembly_planner.problem as _P
     # mr_bench welds a gripper to the fixed ROOT of an already-mated group, while the actual
     # contact may be on a descendant.  A handover of a stool held by one leg is exactly this:
     # frames=[gripper, obj_0] but State records grasp(robot, obj_3, gid).  Reusing ``gid`` as
@@ -4807,7 +4807,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
                   if actuated else "SETTING qpos (kinematic diagnostic)")
     print(f"[sim/mp] --articulated ACTIVE: real kinematic chains generated from rai "
           f"(arm_model), driven by {_arm_drive} -- not {len(arms)} teleported mocap bodies. "
-          "Run fk_compare.py to re-check the model.")
+          "Run tools/diagnostics/fk_compare.py to re-check the model.")
 
   _hook_log = {"settle": [], "seat": []}                    # fire-window durations (sim s)
 
@@ -5345,7 +5345,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         _visual_pose = _pose_compose(_mj_anchor, _pose_invert(_object_T_anchor))
       intended_pose = _visual_pose
       Cc.getFrame(target).setPosition(_pose[:3]).setQuaternion(_pose[3:])
-      from gripper_closure import contact_aperture
+      from assembly_planner.gripper_closure import contact_aperture
       result = contact_aperture(Cc, robot + "_", target)
       if result.feasible and result.aperture is not None:
         if os.environ.get("SIM_GRIPPER_TRACE"):
@@ -5447,7 +5447,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
   except ValueError as e:
     raise SystemExit(f"[sim/process-wrench] {e}")
   if record_metadata is not None and apply_process_wrench:
-    import wrench as _Wproc
+    import assembly_planner.wrench as _Wproc
     _unc = _Wproc.PARAMS.get("insertion_uncertainty") or {}
     record_metadata["process_wrench"] = {
         "noise_mode": process_noise_mode,
@@ -5773,7 +5773,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
     scene.set_process_wrenches(pairs)
     _active_process_pairs[0] = pairs
     if pairs:
-      import wrench as W
+      import assembly_planner.wrench as W
       desc = []
       for part, parent, realization in pairs:
         skill = assembly.screw_skill(part)
@@ -5893,7 +5893,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
   stretch_mode = None
   _conf = None
   if corridor:
-    import mp_export as _MP
+    import assembly_planner.mp_export as _MP
     chain = _MP.mode_sequence(problem)
     _ids = lambda m: frozenset(int(t) for t in np.atleast_1d(m.task_ids))
     chain_by_ids = {_ids(m): m for m in chain}
@@ -6252,7 +6252,7 @@ def execute_motion_plan(C, assembly, plan, states, problem, mp_path, gripper_kin
         # EXPERIMENTAL GEOMETRY STAGE.  This is intentionally a sibling of --spline, not a
         # modification of the now-stable phase scheduler: it consumes mode-local polylines,
         # emits a certified replacement, and the existing pipeline sees ordinary waypoints.
-        import c2_smoothing as _c2
+        import assembly_planner.c2_smoothing as _c2
         _limits = getattr(problem, "limits", None)
         if _limits is None:
           _limits = C_fk.getJointLimits()
@@ -8756,7 +8756,7 @@ def _states_from_plan(cfg, C, asm, robots, plan):
   """Re-derive the discrete state trajectory the same way tests/_replay_ok does -- the saved
   JSON carries only actions, and the successor flags (gripper kind, bracing) must match the
   search that produced it (both are in the saved config)."""
-  import assembly as A
+  import assembly_planner.assembly as A
   # MIXED-EE aware: gripper_kind(C) says "vacuum" whenever ANY vacuum frame exists, which
   # prices every arm's grasps with vacuum caps on a mixed scene -- the successor set then
   # cannot reproduce two-finger actions (user-hit on the chair: "cannot reproduce action 2").
@@ -8790,7 +8790,7 @@ def _restore_saved_wrench_config(cfg):
   MuJoCo still broke it at the 0.4 Nm default).  Scene construction and simulation now share
   replay's one idempotent reset-and-apply path; search-only printing remains in main.py.
   """
-  import wrench as W
+  import assembly_planner.wrench as W
   # replay.build_scene has already applied this configuration once. Reuse its idempotent
   # reset-and-apply implementation rather than multiplying saved cap scales a second time
   # (e.g. --two-finger-scale 4 used to become x16 in simulation).
@@ -8928,9 +8928,9 @@ def _cli_run(a):
   if getattr(a, "joint_rate", None):
     JOINT_RATE = float(a.joint_rate)                          # per-arm cruise speed override
     print(f"[sim] --joint-rate {JOINT_RATE:g} rad/s (default 1.0)")
-  import assembly as A
+  import assembly_planner.assembly as A
   import replay as R
-  from plan_io import (read_grasp_closures, read_plan, read_motion_data,
+  from assembly_planner.plan_io import (read_grasp_closures, read_plan, read_motion_data,
                        motion_data_states)
   cfg, plan = read_plan(a.path)
   motion_data = (None if getattr(a, "refresh_witnesses", False) else
@@ -9003,8 +9003,8 @@ def _cli_run(a):
     raise SystemExit(
       "[sim] execution needs a REAL-ARM plan: save from a run WITHOUT --floating-ee (and "
         "with --real-ik). This plan is floating-EE.")
-  from solver import RobotIK, optimize_witnesses
-  import mp_export as MP
+  from assembly_planner.solver import RobotIK, optimize_witnesses
+  import assembly_planner.mp_export as MP
   gk = A.wrench_kind_arg(C, robots) if cfg.get("wrench") else None   # mixed-EE aware
   rik = RobotIK(C, robots)                                # geometric export only -- the
   # Preserve the search's closure contract during simulation rebuilds too.  Replay already
@@ -9121,7 +9121,7 @@ def _cli_run(a):
   # and the last source of witness drift between the export and the sim.
   wit = _final_export["witnesses"] if _final_export is not None else None
   if wit is None and not getattr(a, "refresh_witnesses", False):
-    from plan_io import read_witnesses
+    from assembly_planner.plan_io import read_witnesses
     wit = read_witnesses(a.path, list(rik.C.getJointNames()), len(plan))
     if wit is not None:
       print(f"[sim/mp] {sum(w is not None for w in wit)} persisted witnesses loaded from "
@@ -9132,7 +9132,7 @@ def _cli_run(a):
           "[sim/mp] plan has no compatible persisted search-witness certificate. "
           "Refusing to resolve IK implicitly; regenerate the plan with current main.py, "
           "or pass --refresh-witnesses for the explicit legacy repair path.")
-    from plan_io import require_complete_witnesses
+    from assembly_planner.plan_io import require_complete_witnesses
     try:
       require_complete_witnesses(plan, wit, who="sim replay")
     except ValueError as e:
@@ -9146,7 +9146,7 @@ def _cli_run(a):
   if wit is not None:
     pass
   elif _witopt == "floor":
-    from witness_floor import optimize_witnesses_floor
+    from assembly_planner.witness_floor import optimize_witnesses_floor
     wit, _ = optimize_witnesses_floor(
         C, asm, plan, robots, rik, gripper_kind=gk, handovers=_hand, allow_place=_aplace,
         bracing=brace, branch_budget=_saved(cfg, "witness_branch_budget"),
@@ -9740,7 +9740,8 @@ def _build_cli():
                       "by SETTING qpos: still perfectly stiff, so the grasp weld remains an "
                       "exact measure of the payload's m(a-g) and every wrench/corner calibration "
                       "stays interpretable. The step before actuators. Verify the model with "
-                      "`python fk_compare.py --robot <type>` (agreement is machine-precision).")
+                      "`python tools/diagnostics/fk_compare.py --robot <type>` "
+                      "(agreement is machine-precision).")
   r.add_argument("--spline", action=argparse.BooleanOptionalAction, default=True,
                  help="With --corridor: replace the C0 path by a C1 Catmull-Rom curve through "
                       "the SAME waypoints, so there are no velocity discontinuities to crawl "

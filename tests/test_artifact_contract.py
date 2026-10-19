@@ -3,7 +3,7 @@ import copy
 import numpy as np
 import pytest
 
-from artifact_contract import build_artifact_contract, validate_artifact_contract
+from assembly_planner.artifact_contract import build_artifact_contract, validate_artifact_contract
 
 
 class _Frame:

@@ -2,7 +2,7 @@
 import pytest
 
 import main
-from config import RunConfig
+from assembly_planner.config import RunConfig
 
 
 def _parser_defaults():
@@ -28,7 +28,7 @@ def test_defaults_match_parser():
 
 
 def test_saved_cfg_saved_wins_missing_default_legacy_override():
-  from config import saved_cfg
+  from assembly_planner.config import saved_cfg
   assert saved_cfg({"seed": 7}, "seed") == 7
   assert saved_cfg({}, "parts") == RunConfig.default_for("parts")
   assert saved_cfg({}, "part_float", legacy=0.015) == 0.015
@@ -209,8 +209,8 @@ def test_open_plan_loop_suspends_then_fairly_reopens(tmp_path, monkeypatch):
   """Two failed small pulls must precede either plan's second, larger pull."""
   import json
   import subprocess
-  import plan_io
-  import solver
+  import assembly_planner.plan_io as plan_io
+  import assembly_planner.solver as solver
 
   plan_a = [("pick", "a1", "obj_1", 0)]
   plan_b = [("pick", "a2", "obj_1", 1)]
@@ -223,7 +223,7 @@ def test_open_plan_loop_suspends_then_fairly_reopens(tmp_path, monkeypatch):
     return iter(()) if len(session_caps) == 1 else iter((plan_a, plan_b))
 
   monkeypatch.setattr(main, "_milestone_candidate_session", candidate_session)
-  import problem
+  import assembly_planner.problem as problem
   installed_component_caps = []
   monkeypatch.setattr(problem, "set_component_grasp_keep",
                       installed_component_caps.append)
@@ -322,7 +322,7 @@ def test_loaded_plan_is_not_hoisted_twice_without_explicit_request():
 
 def test_compact_placement_yaw_prefix_is_fresh_search_only(monkeypatch):
   """A saved non-prefix placement ID must remain visible to every plan consumer."""
-  import problem
+  import assembly_planner.problem as problem
 
   seen = []
   monkeypatch.setattr(problem, "set_placement_yaw_prefix", seen.append)
@@ -436,7 +436,7 @@ def test_grasp_lever_is_a_short_half_extent():
   """The wrench model takes moments about the part CENTROID, so the lever is a surface
   half-extent -- always short. Regression guard: a gripper-to-COM distance (~326mm) once
   slipped in here and its weight moment alone exceeded the grasp torque cap."""
-  import problem as P
+  import assembly_planner.problem as P
   a = P.make_assembly("cross", 5)
   for part in a.objects:
     lev = a.grasp_lever(part)
@@ -448,7 +448,7 @@ def test_grasp_lever_is_a_short_half_extent():
 
 def test_group_lever_adds_only_the_centroid_offset():
   import numpy as np
-  import problem as P
+  import assembly_planner.problem as P
   a = P.make_assembly("cross", 5)
   parts = sorted(a.objects)[:2]
   root = parts[0]

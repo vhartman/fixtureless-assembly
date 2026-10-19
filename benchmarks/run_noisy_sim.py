@@ -53,7 +53,7 @@ def _write_csv(path, rows):
 
 def build_command(args, trial, report, recording):
   cmd = [sys.executable, str(ROOT / "sim.py"), "run", str(args.plan.resolve()),
-         "--sim-profile", args.sim_profile, "--mp-path", str(args.mp_path.resolve()),
+         "--mp-path", str(args.mp_path.resolve()),
          "--object-perturb-xy", str(trial["xy_m"]),
          "--object-perturb-yaw", str(trial["yaw_deg"]),
          "--object-perturb-seed", str(trial["seed"]),
@@ -109,7 +109,6 @@ def _parse_args(argv=None):
   p.add_argument("--process-noise", choices=("nominal", "sample", "corner"),
                  default="sample")
   p.add_argument("--process-noise-corner", type=int, default=0, metavar="N")
-  p.add_argument("--sim-profile", default="standard")
   p.add_argument("--timeout", type=float, default=900.0, metavar="SEC")
   p.add_argument("--memory-gb", type=float, default=4.0, metavar="GB")
   p.add_argument("--max-placement-tries", type=int, default=200)
@@ -129,7 +128,7 @@ def _parse_args(argv=None):
     p.error("timeout and memory-gb must be positive")
   if not a.plan.is_file() or not a.mp_path.is_file():
     p.error("--plan and --mp-path must exist")
-  controlled = {"--sim-profile", "--mp-path", "--record", "--report-json",
+  controlled = {"--mp-path", "--record", "--report-json",
                 "--object-perturb-xy", "--object-perturb-yaw",
                 "--object-perturb-seed", "--object-perturb-observation",
                 "--object-perturb-max-tries", "--object-grasp-capture",
@@ -152,7 +151,7 @@ def main(argv=None):
   rows, kept_success = [], set()
   manifest = {
       "schema_version": SCHEMA_VERSION, "plan": str(args.plan.resolve()),
-      "motion_path": str(args.mp_path.resolve()), "sim_profile": args.sim_profile,
+      "motion_path": str(args.mp_path.resolve()), "simulation_contract": "standard",
       "timeout_s": args.timeout, "memory_gb": args.memory_gb,
       "apply_process_wrench": args.apply_process_wrench,
       "process_noise": args.process_noise, "process_noise_corner": args.process_noise_corner,

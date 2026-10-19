@@ -12,7 +12,8 @@ convex hull fills wheel/peg holes, mortises and ducts. Both RAI and MuJoCo consu
 generated hull list; the exact source mesh remains the renderer geometry.
 
 Mate parents and insertion axes are intentionally *not* inferred here.  Those are task
-semantics, not file-format facts, and remain reviewed in ``FabricaAssembly`` in problem.py.
+semantics, not file-format facts, and remain reviewed in ``FabricaAssembly`` in
+``assembly_planner/problem.py``.
 
 Usage (from the assembly repository):
   python3 part_meshes/fabrica/import_assets.py \
@@ -141,7 +142,8 @@ _SEMANTIC_INSERT_PRIMITIVES = {
 # ``axial`` retreats only the leading end of an inserted shaft.  The larger beam value is
 # required by its authored tapered/dovetail mortise: the nominal rectangular tenon proxy
 # otherwise overlaps the exact female surface by roughly 2 mm.  All values are recorded in
-# the generated manifest and verified by audit_fabrica.py against both collision backends.
+# the generated manifest and verified by tools/diagnostics/audit_fabrica.py against both
+# collision backends.
 _SEMANTIC_INSERT_CLEARANCE = {
     "duct": {source: {"radial": .0010, "axial": .0005, "leading": "upper"}
              for source in ("2", "3", "4", "5", "6", "7")},

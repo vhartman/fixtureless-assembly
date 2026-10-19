@@ -15,11 +15,11 @@ silently resolves missing IK; ``--resolve-ik`` is the explicit one-time diagnost
 import argparse
 import numpy as np
 
-from assembly import *
-from env import make_four_robot_env
-from plan_io import (read_diagnostic_candidates, read_optimization_candidates,
+from assembly_planner.assembly import *
+from assembly_planner.env import make_four_robot_env
+from assembly_planner.plan_io import (read_diagnostic_candidates, read_optimization_candidates,
                      read_plan, read_witnesses)
-from config import saved_cfg as _saved
+from assembly_planner.config import saved_cfg as _saved
 
 
 _WRENCH_PARAMS0 = None
@@ -40,7 +40,7 @@ def _restore_in_place(dst, src):
 
 def apply_wrench_params(cfg):
   import copy
-  import wrench
+  import assembly_planner.wrench as wrench
   # RESET TO THE PRISTINE DEFAULTS FIRST. This function mutates wrench.PARAMS IN PLACE and
   # CUMULATIVELY, so back-to-back scenes in one process contaminated each other two ways:
   # `tf_close_torque` is applied only when non-None, so a previous scene's value survived into
@@ -105,20 +105,20 @@ def apply_wrench_params(cfg):
 
 
 def build_scene(cfg, *, require_artifact_contract=False, motion_data=None):
-  from problem import set_frozen_plan_grasps
+  from assembly_planner.problem import set_frozen_plan_grasps
   set_frozen_plan_grasps(None)
   # reconstruct the exact environment the plan was solved in (same seed => same scatter/perturb)
   set_seed(cfg["seed"])
   # Closure-aware versioned sampling changes the ranked, bounded grasp database. Restore it BEFORE
   # make_assembly/install_sampled_scene_ctx so a saved grasp id cannot silently rebind (and so
   # the database-hash check below compares like with like).
-  from solver import set_grasp_closure_check
+  from assembly_planner.solver import set_grasp_closure_check
   set_grasp_closure_check(bool(_saved(cfg, "grasp_closure_check", legacy=False)))
   # The physics certificate removes sampled rows and therefore changes every positional grasp
   # id after the first rejection. Restore it before constructing/signing the database just as
   # main.py does. Merely persisting the flag was insufficient: replay previously rebuilt the
   # uncertified DB and (correctly) stopped at the signature guard even for a freshly saved plan.
-  from problem import set_grasp_physics_check
+  from assembly_planner.problem import set_grasp_physics_check
   set_grasp_physics_check(
       bool(_saved(cfg, "grasp_physics_check", legacy=False)),
       float(_saved(cfg, "grasp_physics_force", legacy=10.0)))
@@ -134,17 +134,17 @@ def build_scene(cfg, *, require_artifact_contract=False, motion_data=None):
   set_rolls_per_face(2 if any_tf else 1)
   set_dense_grasps(bool(_saved(cfg, "dense_grasps")) and any_tf)
   set_inhand_reorient(bool(_saved(cfg, "inhand_reorient")))    # plan may contain reorient edges
-  from problem import set_staged_mates, set_allow_curved_grasps, set_plain_box
+  from assembly_planner.problem import set_staged_mates, set_allow_curved_grasps, set_plain_box
   set_staged_mates(bool(_saved(cfg, "staged_mates")))          # staged-mate invariant, as searched
   set_allow_curved_grasps(bool(_saved(cfg, "allow_curved_grasps")))  # grasp table must match the search
-  from problem import set_grasp_translations
+  from assembly_planner.problem import set_grasp_translations
   set_grasp_translations(int(_saved(cfg, "grasp_translations")))  # grasp IDS index this DB:
   # a replay with a different count would read every saved grasp id against a different table.
-  from problem import set_banned_actions
+  from assembly_planner.problem import set_banned_actions
   set_banned_actions(())                                   # search-only; never active in replays
-  from problem import set_kind_forbid
+  from assembly_planner.problem import set_kind_forbid
   set_kind_forbid(())                                      # search-only; never active in replays
-  from problem import set_sampled_grasps
+  from assembly_planner.problem import set_sampled_grasps
   set_sampled_grasps({"seed": int(_saved(cfg, "grasp_sampler_seed")),
                       "candidates": int(_saved(cfg, "grasp_sampler_candidates")),
                       "keep": int(_saved(cfg, "grasp_sampler_keep")),
@@ -173,22 +173,22 @@ def build_scene(cfg, *, require_artifact_contract=False, motion_data=None):
                       "roll_refine": bool(_saved(cfg, "grasp_sampler_roll_refine", legacy=False))}
                      if _saved(cfg, "grasp_sampler") else None)  # sampled ids: same hazard class
   set_plain_box(bool(_saved(cfg, "plain_box")))                # cube collision geometry must match
-  from problem import set_placement_yaw_prefix, set_placement_yaws, set_stable_rest_poses
+  from assembly_planner.problem import set_placement_yaw_prefix, set_placement_yaws, set_stable_rest_poses
   # PLACEMENT ids index the per-group table, so a replay must fill it the same way the
   # search did. Missing key => False, which is what every plan saved before the flag used.
   set_stable_rest_poses(bool(_saved(cfg, "stable_rest_poses")))
   set_placement_yaws(int(_saved(cfg, "placement_yaws")))
   set_placement_yaw_prefix(None)                            # scheduling never restricts replay
-  from env import set_tight_fingers
+  from assembly_planner.env import set_tight_fingers
   # LEGACY-FAITHFUL: tight fingers became the DEFAULT on 2026-07-29, so a plan saved before
   # the flag was persisted was certified with the FAT proxy. Missing => False, not True.
   set_tight_fingers(bool(_saved(cfg, "tight_fingers", legacy=False)))
   # -- set unconditionally (not under an `if`): a stale global from a previous scene in the same
   # process would rebuild this one with the wrong finger proxy (FRAGILITY 1.10).
-  from problem import set_dominance, set_useful_grasps_enabled
+  from assembly_planner.problem import set_dominance, set_useful_grasps_enabled
   set_dominance(bool(cfg.get("dominance")))                # successor set must match the search
   set_useful_grasps_enabled(bool(cfg.get("useful_grasps")))  # ordering must match the search
-  from problem import set_brace_resting
+  from assembly_planner.problem import set_brace_resting
   set_brace_resting(bool(cfg.get("brace_resting")))         # action space must match the search
   # RESET THE REST OF THE SUCCESSOR-AFFECTING GLOBALS TOO, unconditionally. These are module
   # state in problem.py, so whatever ran in this process BEFORE us leaves them set -- a single
@@ -196,7 +196,7 @@ def build_scene(cfg, *, require_artifact_contract=False, motion_data=None):
   # the plan's own actions unreproducible ("cannot reproduce action ... from the successor
   # set"). Absent keys fall back to the parser defaults, which is what a plan saved before
   # these were persisted was solved with.
-  from problem import (set_brace_for_assembly_only, set_extra_place_cells, set_prefer_center,
+  from assembly_planner.problem import (set_brace_for_assembly_only, set_extra_place_cells, set_prefer_center,
                        set_anonymous_robots, set_lru_robots)
   set_brace_for_assembly_only(bool(_saved(cfg, "brace_for_assembly_only")))
   set_extra_place_cells(int(_saved(cfg, "place_cells")))
@@ -205,23 +205,23 @@ def build_scene(cfg, *, require_artifact_contract=False, motion_data=None):
   set_lru_robots(bool(_saved(cfg, "lru_robots")))
   # and drop the cross-scene CACHES: they outlive a scene and are not keyed on every global
   # that feeds them, so a previous scene's entries would be served to this one.
-  from problem import reset_wrench_cache, reset_grasp_pose_cache
+  from assembly_planner.problem import reset_wrench_cache, reset_grasp_pose_cache
   reset_wrench_cache()
   reset_grasp_pose_cache()
-  from problem import clear_sampled_scene_ctx
+  from assembly_planner.problem import clear_sampled_scene_ctx
   clear_sampled_scene_ctx()                 # a previous scene's filter must not leak into
   # make_assembly below (define() queries the grasp DB, which raises under a stale ctx).
   apply_wrench_params(cfg)
   if (_saved(cfg, "robot_types") or _saved(cfg, "robot")) == "fr3":
-    from env import make_fr3_duo_env
+    from assembly_planner.env import make_fr3_duo_env
     C = make_fr3_duo_env(num_duos=max(1, cfg["num_robots"] // 2))
   elif (_saved(cfg, "robot_types") or _saved(cfg, "robot")) == "openarm":
-    from env import make_openarm_duo_env, make_openarm_floating_env
+    from assembly_planner.env import make_openarm_duo_env, make_openarm_floating_env
     C = (make_openarm_floating_env(num_robots=cfg["num_robots"])
          if _saved(cfg, "floating_ee") else
          make_openarm_duo_env(num_duos=max(1, cfg["num_robots"] // 2)))
   elif (_saved(cfg, "robot_types") or _saved(cfg, "robot")) == "husky":
-    from env import make_husky_duo_env
+    from assembly_planner.env import make_husky_duo_env
     if int(cfg["num_robots"]) != 2:
       raise ValueError("saved Husky scene must contain exactly two robots")
     if _saved(cfg, "floating_ee"):
@@ -258,17 +258,17 @@ def build_scene(cfg, *, require_artifact_contract=False, motion_data=None):
   if _saved(cfg, "grasp_sampler_scenes", legacy=False):
     # the scene-filtered DB is per PART INSTANCE and its ids are what the plan indexes: the
     # replay scene must install the same filter context or every saved grasp id misreads.
-    from problem import install_sampled_scene_ctx, get_robots as _get_robots
+    from assembly_planner.problem import install_sampled_scene_ctx, get_robots as _get_robots
     install_sampled_scene_ctx(C, assembly, robots=_get_robots(C))
   if _saved(cfg, "grasp_physics_check", legacy=False):
     # Requires the concrete robot model, so it follows scene construction but precedes the DB
     # signature below. The isolated checks are deterministic and use the saved load magnitude.
-    from problem import install_grasp_physics_ctx, get_robots as _get_robots
+    from assembly_planner.problem import install_grasp_physics_ctx, get_robots as _get_robots
     install_grasp_physics_ctx(C, assembly, robots=_get_robots(C))
   _expected_db = cfg.get("grasp_sampler_db_hash")
   if _expected_db:
     if motion_data is None:
-      from problem import sampled_grasp_db_signature
+      from assembly_planner.problem import sampled_grasp_db_signature
       _actual_db = sampled_grasp_db_signature(assembly)
     else:
       _actual_db = motion_data.get("grasp_db_sha256")
@@ -276,7 +276,7 @@ def build_scene(cfg, *, require_artifact_contract=False, motion_data=None):
       raise ValueError(
           "saved sampled-grasp database hash does not match this rebuild "
           f"({_expected_db} != {_actual_db}); refusing to reinterpret positional grasp ids")
-  from artifact_contract import build_artifact_contract, validate_artifact_contract
+  from assembly_planner.artifact_contract import build_artifact_contract, validate_artifact_contract
   _actual_contract = build_artifact_contract(
       C, grasp_db_hash=_expected_db,
       closure_enabled=bool(_saved(cfg, "grasp_closure_check", legacy=False)))
@@ -284,7 +284,7 @@ def build_scene(cfg, *, require_artifact_contract=False, motion_data=None):
     validate_artifact_contract(
         cfg.get("artifact_contract"), _actual_contract, who="replay scene rebuild")
   if motion_data is not None:
-    from plan_io import motion_data_grasps
+    from assembly_planner.plan_io import motion_data_grasps
     set_frozen_plan_grasps(motion_data_grasps(motion_data))
   return C, assembly
 
@@ -305,7 +305,7 @@ def replay(path, viser=False, view=True, real_ik=False, viser_port=8080, serve=T
   # throwaway recorder so the replay runs without opening any window.
   recorder = None
   if viser or not view:
-    from viser_view import ViserRecorder
+    from tools.visualization.viser_view import ViserRecorder
     # Optimizer alternatives are a visual comparison, not collision debugging. Suppress the
     # translucent robot/gripper proxy capsules here while leaving ordinary replay unchanged.
     recorder = ViserRecorder(

@@ -6,7 +6,7 @@ import numpy as np
 import pytest
 import trimesh
 
-from export_assembly_parts import export_assembly
+from tools.exporters.export_assembly_parts import export_assembly
 
 
 @pytest.mark.parametrize("kind,count", [("cross", 7), ("cube", 8), ("chair", 8)])

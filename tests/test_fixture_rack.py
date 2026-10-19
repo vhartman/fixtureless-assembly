@@ -2,7 +2,7 @@
 
 import numpy as np
 
-import problem as P
+import assembly_planner.problem as P
 
 
 def test_fixture_rack_scales_and_truncates_by_station():

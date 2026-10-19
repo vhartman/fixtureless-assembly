@@ -15,7 +15,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import problem as P
+import assembly_planner.problem as P
 
 
 @pytest.fixture(autouse=True)

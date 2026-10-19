@@ -2,12 +2,12 @@
 
 import numpy as np
 
-import assembly as A
-import analytic_ik
-from env import is_husky_scene, make_husky_duo_env
-from problem import (add_disassembled_obj, get_initial_state, make_assembly, places,
+import assembly_planner.assembly as A
+import assembly_planner.analytic_ik as analytic_ik
+from assembly_planner.env import is_husky_scene, make_husky_duo_env
+from assembly_planner.problem import (add_disassembled_obj, get_initial_state, make_assembly, places,
                      set_extra_place_cells)
-from solver import RobotIK, _quat_to_R
+from assembly_planner.solver import RobotIK, _quat_to_R
 
 
 def _matrix(frame):

@@ -63,8 +63,8 @@ def test_car_mini_wheel_rims_rest_on_sim_table():
   import numpy as np
   import mujoco
 
-  import assembly as A
-  from env import make_four_robot_env
+  import assembly_planner.assembly as A
+  from assembly_planner.env import make_four_robot_env
   import sim as S
 
   asm = A.make_assembly("car-mini", 5)
@@ -128,8 +128,8 @@ def test_mujoco_rounded_box_does_not_fill_rai_rounded_corners():
 def test_grasp_and_mate_welds_have_distinct_default_compliance():
   """A planned rigid subassembly must not become a soft serial chain in physics."""
   import mujoco
-  import assembly as A
-  from env import make_four_robot_env
+  import assembly_planner.assembly as A
+  from assembly_planner.env import make_four_robot_env
   import sim as S
 
   asm = A.make_assembly("peg-hole", 2)
@@ -156,8 +156,8 @@ def test_grasp_and_mate_welds_have_distinct_default_compliance():
 def test_contact_grasps_preserve_vacuum_welds_in_mixed_workcell():
   """Contact execution is per tool: suction welds remain, parallel-jaw welds disappear."""
   import mujoco
-  import assembly as A
-  from env import make_four_robot_env
+  import assembly_planner.assembly as A
+  from assembly_planner.env import make_four_robot_env
   import sim as S
 
   asm = A.make_assembly("peg-hole", 2)
@@ -184,8 +184,8 @@ def test_chair_round_parts_do_not_roll_out_of_their_scatter_cells():
   import numpy as np
   import mujoco
 
-  import assembly as A
-  from env import make_four_robot_env
+  import assembly_planner.assembly as A
+  from assembly_planner.env import make_four_robot_env
   import sim as S
 
   asm = A.make_assembly("chair", 8)
@@ -217,7 +217,7 @@ def test_topple_error_respects_primitive_rotational_symmetry():
   """Rolling a round peg is not toppling it; tilting its axis still is."""
   import numpy as np
 
-  import assembly as A
+  import assembly_planner.assembly as A
   import sim as S
 
   asm = A.make_assembly("peg-stool", 4)
@@ -237,7 +237,7 @@ def test_topple_error_respects_enabled_discrete_mate_symmetry():
   """A concrete symmetry member retained by the mate weld is not a toppled part."""
   import numpy as np
 
-  import assembly as A
+  import assembly_planner.assembly as A
   import sim as S
 
   asm = A.make_assembly("real-stool", 5)

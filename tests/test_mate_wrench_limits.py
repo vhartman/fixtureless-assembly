@@ -1,7 +1,7 @@
 import numpy as np
 
-import problem as P
-import wrench as W
+import assembly_planner.problem as P
+import assembly_planner.wrench as W
 
 
 class _VerticalChain(P.Assembly):

@@ -7,11 +7,11 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import problem as P
+import assembly_planner.problem as P
 
 
 def test_yandv_rai_visuals_and_lying_legs():
-  from env import make_world
+  from assembly_planner.env import make_world
 
   asm = P.make_assembly("real-stool", 5)
   C = P.add_disassembled_obj(make_world(), asm, spacing=0.3, float_height=0.002)
@@ -37,7 +37,7 @@ def test_yandv_authored_lightweight_masses():
 def test_yandv_mujoco_uses_exact_visual_meshes_but_box_contacts():
   import mujoco
   import sim as S
-  from env import make_world
+  from assembly_planner.env import make_world
 
   asm = P.make_assembly("real-stool", 5)
   C = P.add_disassembled_obj(make_world(), asm, spacing=0.3, float_height=0.002)
@@ -89,7 +89,7 @@ def test_real_stool_discrete_mate_symmetry_is_explicit_and_opt_in():
 
 
 def test_assemble_bind_tries_symmetry_members_inside_one_symbolic_action():
-  import solver as S
+  import assembly_planner.solver as S
 
   asm = P.make_assembly("real-stool", 2)
   asm.configure_mate_symmetry(True)

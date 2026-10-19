@@ -24,7 +24,7 @@ import sys
 import mujoco
 
 import sim
-from plan_io import read_plan
+from assembly_planner.plan_io import read_plan
 
 
 def _desired_grasps(state):

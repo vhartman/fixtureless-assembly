@@ -3,7 +3,7 @@
 import numpy as np
 import robotic as ry
 
-import solver as S
+import assembly_planner.solver as S
 
 
 def test_bias_pose_is_the_exact_rigid_pose_encoded_by_each_soft_bias():

@@ -9,11 +9,11 @@ import numpy as np
 import pytest
 import robotic as ry
 
-import assembly as A
-import analytic_ik
-import solver as S
-import visualization as V
-from env import (OPENARM_FLOATING_EE_PATH, is_openarm_scene, make_openarm_duo_env,
+import assembly_planner.assembly as A
+import assembly_planner.analytic_ik as analytic_ik
+import assembly_planner.solver as S
+import assembly_planner.visualization as V
+from assembly_planner.env import (OPENARM_FLOATING_EE_PATH, is_openarm_scene, make_openarm_duo_env,
                  make_openarm_floating_env, robot_exit_configuration,
                  set_openarm_real_finger_radius_scale)
 

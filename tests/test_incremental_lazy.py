@@ -1,6 +1,6 @@
 """Memory/correctness regressions for incremental lazy-search repair bookkeeping."""
 
-from solver import _IncrementalLazySearch
+from assembly_planner.solver import _IncrementalLazySearch
 
 
 def test_duplicate_repair_routes_are_stored_once():

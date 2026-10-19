@@ -4,8 +4,8 @@ import copy
 
 import numpy as np
 
-import problem as P
-import wrench as W
+import assembly_planner.problem as P
+import assembly_planner.wrench as W
 
 
 def test_gravity_wrench_map_matches_direct_rigid_body_wrench():

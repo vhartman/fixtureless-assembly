@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 import sim
-import wrench
+import assembly_planner.wrench as wrench
 
 
 

@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-import retiming
+import assembly_planner.retiming as retiming
 
 
 

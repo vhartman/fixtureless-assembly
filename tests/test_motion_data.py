@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-import plan_io
-import problem
+import assembly_planner.plan_io as plan_io
+import assembly_planner.problem as problem
 
 
 def _certificate(plan):

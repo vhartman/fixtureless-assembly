@@ -676,6 +676,7 @@ def run_one(spec, suite_dir: Path, suite_provenance, env_extra, timeout_override
   env = os.environ.copy()
   env.update({"PYTHONHASHSEED": "0", "PYTHONUNBUFFERED": "1",
               "ASSEMBLY_BENCH_PROFILE": "1",
+              "ASSEMBLY_GRASP_RAW_CACHE_DIR": str(suite_dir / "grasp-raw-cache"),
               "NUMBA_CACHE_DIR": "/tmp/assembly-numba-cache",
               "MPLCONFIGDIR": "/tmp/assembly-mpl-cache"})
   env.update(env_extra)
@@ -771,6 +772,7 @@ def _prepare_grasp_database(entry, suite_dir, source_sha, env_extra):
     entry["build_s"] = meta.get("build_s", 0.0)
     entry["generation_s"] = meta.get("generation_s", entry["build_s"])
     entry["sampled_signature"] = meta.get("sampled_signature")
+    entry["raw_cache"] = meta.get("raw_cache")
     entry["coverage"] = meta.get("coverage", [])
     entry["status"] = "reused"
     return entry
@@ -785,6 +787,7 @@ def _prepare_grasp_database(entry, suite_dir, source_sha, env_extra):
               "ASSEMBLY_GRASP_DB_BUILD_ONLY": "1",
               "ASSEMBLY_GRASP_DB_PATH": str(path),
               "ASSEMBLY_GRASP_DB_KEY": entry["cache_key"],
+              "ASSEMBLY_GRASP_RAW_CACHE_DIR": str(suite_dir / "grasp-raw-cache"),
               "NUMBA_CACHE_DIR": "/tmp/assembly-numba-cache",
               "MPLCONFIGDIR": "/tmp/assembly-mpl-cache"})
   env.update(env_extra)
@@ -808,12 +811,21 @@ def _prepare_grasp_database(entry, suite_dir, source_sha, env_extra):
   match = re.search(r"\[grasp-db\] build-only complete: .* in " + _NUM + r"s", log_text)
   signature_match = re.search(r"^\[grasp-db\] sampled signature: (.+)$", log_text,
                               flags=re.MULTILINE)
+  raw_match = re.search(
+      r"^\[grasp-raw-cache\] memory_hits=(\d+) disk_hits=(\d+) misses=(\d+) "
+      r"load=" + _NUM + r"s build=" + _NUM + r"s write=" + _NUM + r"s$",
+      log_text, flags=re.MULTILINE)
   coverage = [line.split("] ", 1)[1] for line in log_text.splitlines()
               if line.startswith("[grasp-db-coverage] ")]
   entry["build_s"] = elapsed
   entry["generation_s"] = float(match.group(1)) if match else elapsed
   entry["sampled_signature"] = (signature_match.group(1).strip()
                                   if signature_match else None)
+  entry["raw_cache"] = (None if raw_match is None else {
+      "memory_hits": int(raw_match.group(1)), "disk_hits": int(raw_match.group(2)),
+      "misses": int(raw_match.group(3)), "load_s": float(raw_match.group(4)),
+      "build_s": float(raw_match.group(5)), "write_s": float(raw_match.group(6)),
+  })
   entry["coverage"] = coverage
   entry["status"] = ("timeout" if timed_out else "oom" if rss_limit_hit else
                      "success" if returncode == 0 else "error")
@@ -830,6 +842,7 @@ def _prepare_grasp_database(entry, suite_dir, source_sha, env_extra):
       "schema_version": 1, "cache_key": entry["cache_key"],
       "build_s": entry["build_s"], "generation_s": entry["generation_s"],
       "sampled_signature": entry["sampled_signature"],
+      "raw_cache": entry["raw_cache"],
       "coverage": entry["coverage"],
       "log": str(log_path.relative_to(suite_dir)),
   })
@@ -1021,6 +1034,8 @@ def build_parser():
       "--shared-grasp-db", action="store_true",
       help=("precompute one fingerprinted collision-filtered grasp database per case/seed "
             "outside timed search, then load that identical artifact in every variant"))
+  p.add_argument("--grasp-db-only", action="store_true",
+      help="build and profile shared grasp databases without running task search")
   p.add_argument("--append-arg", action="append", default=[], metavar="TOKEN",
                  help="append one planner argument token to every expanded run; repeat for "
                       "flags with values (use --append-arg=--flag for option-like tokens)")
@@ -1038,6 +1053,8 @@ def main(argv=None):
     raise SystemExit("--repeats must be a positive integer")
   if args.jobs < 1:
     raise SystemExit("--jobs must be a positive integer")
+  if args.grasp_db_only and not args.shared_grasp_db:
+    raise SystemExit("--grasp-db-only requires --shared-grasp-db")
   runs = expand_runs(manifest, repeats=args.repeats, seeds=args.seeds)
   if args.append_arg:
     _check_args(args.append_arg, "--append-arg")
@@ -1060,6 +1077,7 @@ def main(argv=None):
   prov["appended_args"] = list(args.append_arg)
   prov["seed_override"] = list(args.seeds) if args.seeds is not None else None
   prov["shared_grasp_database"] = bool(args.shared_grasp_db)
+  prov["grasp_db_only"] = bool(args.grasp_db_only)
   prov["jobs"] = int(args.jobs)
   prov["manifest_path"] = str(manifest_path)
   prov["manifest_sha256"] = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
@@ -1074,6 +1092,19 @@ def main(argv=None):
   results_by_id = {}
   grasp_databases = (_grasp_database_specs(runs, prov["source_sha256"], suite_dir)
                      if args.shared_grasp_db else {})
+  if args.grasp_db_only:
+    records = []
+    for entry in grasp_databases.values():
+      if args.dry_run:
+        print("[grasp-db] would build {} seed {}".format(entry["case"], entry["seed"]))
+        continue
+      _prepare_grasp_database(entry, suite_dir, prov["source_sha256"],
+                              manifest.get("env", {}))
+      records.append({k: (str(v.relative_to(suite_dir)) if isinstance(v, Path) else v)
+                      for k, v in entry.items() if k != "representative"})
+      _write_json(suite_dir / "grasp-databases.json", {
+          "schema_version": 1, "databases": records})
+    return 0
   run_order = {spec["run_id"]: i for i, spec in enumerate(runs)}
   output_lock = threading.Lock()
 

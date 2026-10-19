@@ -34,8 +34,8 @@ def _assembled_scene(mate_caps):
   datum-welds only within the seat tolerance."""
   import mujoco
   import replay as R
-  from plan_io import read_plan
-  import assembly as A
+  from assembly_planner.plan_io import read_plan
+  import assembly_planner.assembly as A
   cfg, plan = read_plan("car-mini-new.json")
   C, asm = R.build_scene(cfg)
   robots = A.get_robots(C)

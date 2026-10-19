@@ -6,10 +6,10 @@ when it reaches the selected tool centre, not merely the arm flange or another g
 import numpy as np
 import pytest
 
-import analytic_ik
-from env import make_four_robot_env
-from problem import _pose_compose, _pose_invert
-from solver import _quat_to_R
+import assembly_planner.analytic_ik as analytic_ik
+from assembly_planner.env import make_four_robot_env
+from assembly_planner.problem import _pose_compose, _pose_invert
+from assembly_planner.solver import _quat_to_R
 
 
 def _target_in_base(C, frame):

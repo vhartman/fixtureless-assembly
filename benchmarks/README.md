@@ -38,9 +38,20 @@ keeping the nine scene/model trials within each seed sequential and isolated bel
 `.workers/seed-<seed>`. The top-level summary and `table.tex` are merged automatically. Since
 concurrent runs contend for CPU and memory, use `--jobs 1` when reporting stage runtimes; bounded
 parallelism is appropriate when the reported quantities are execution success and wrench
-utilization. Defaults are a 300 s task-planning wall limit, a 100 s RRT* optimization
+utilization. Parallel workers relay their stage transitions to the terminal, with a heartbeat
+every 30 seconds during long task-planning, motion-planning, and simulation subprocesses; full
+subprocess output remains in each trial's log. A subprocess crash prints its return code, exact
+log path, and the last 20 non-empty log lines; the final line is also saved as `failure_detail`
+in `summary.json` and `summary.csv`. Recording retains the full visual MuJoCo model and can use
+roughly 2.3 GiB per concurrent four-arm simulation; the runner warns above two simultaneous
+recording workers. `--memory-gb` guards task and motion planning at 4 GiB by default;
+`--sim-memory-gb` separately gives MuJoCo 20 GiB of virtual address space because its native
+model compiler can reserve more than 6 GiB despite substantially lower resident usage. Defaults
+are a 300 s task-planning wall limit, a 100 s RRT* optimization
 consultation inside a 450 s motion-stage wall limit, and a 600 s simulation wall limit; override
 them with `--task-timeout`, `--mp-runtime`, `--motion-timeout`, and `--sim-timeout`.
+`--reuse-motion-plans RESULT_DIR` also supports parallel result layouts and may be combined with
+`--jobs`; it copies the saved task and motion plans and reruns only simulation.
 
 Simulation explicitly disables the standard profile's spline and phase scheduler and executes
 the certified synchronized/lockstep reference. Actuated arms, skill servos, arm--arm contacts,
@@ -68,7 +79,7 @@ only when the trial fails; successful trials therefore do not spend time or disk
 artifact that the runner would immediately delete. Use `--record none` for the lowest runtime
 and memory when failure replays are not needed.
 The wrench-simulation runner defaults to `--physics-step 0.004` (250Hz). The ordinary
-`sim.py --sim-profile standard` replay remains at the conservative 0.002s/500Hz; pass
+`sim.py` replay remains at the conservative 0.002s/500Hz; pass
 `--physics-step 0.002` to the runner for that baseline. The runner persists this choice and
 refuses to mix timesteps when resuming a result directory.
 
@@ -85,8 +96,9 @@ python3 benchmarks/run_noisy_sim.py \
 ```
 
 The simulator, not the runner, samples the collision-free scene and judges physical capture;
-there is no nominal fallback when a perturbation cannot be sampled. See the main README's
-simulation section for the observed/unobserved controller semantics.
+there is no nominal fallback when a perturbation cannot be sampled. See the
+[full reproduction record](../docs/REPRODUCTION.md) for the observed/unobserved controller
+semantics.
 
 ## Search timing
 
@@ -226,7 +238,7 @@ the persistent HiGHS backend and SciPy fallback. OOM,
 timeout, and no-plan outcomes remain explicit rather than being replaced by their resource cap.
 
 After the search matrix, the runner automatically takes every successful **Ours** plan through
-the standard motion export and BiRRT with `--no-mp-optimize --mp-no-shortcut`. The resulting
+the standard motion export and BiRRT with `--no-mp-optimize --no-mp-shortcut`. The resulting
 $t_{\mathrm{MP\,init}}$ is the planner's internally recorded time to its first complete path,
 so scene reconstruction and post-solution optimization are excluded. Motion planning uses a
 300 s planner budget, 420 s whole-process guard, and 4 GiB address-space guard by default;
@@ -247,9 +259,11 @@ python3 benchmarks/plot_paper_convergence.py \\
 
 This writes one title-free PDF/PNG per assembly and a common `convergence-legend.tex`. All
 solver points use the same circular marker; color alone identifies the solver. The black Ours
-curve is the validated incumbent trajectory, whereas the comparison algorithms contribute only
-their final returned solution. Time is logarithmic by default so both early solutions and the
-full anytime horizon remain legible; pass `--linear-time` for a linear axis.
+curve is the across-seed mean validated incumbent cost with a one-standard-deviation band. It
+starts once every seed has found its first solution; comparison algorithms contribute only their
+final returned solution and a horizontal one-standard-deviation time bar. Time is logarithmic by
+default so both early solutions and the full anytime horizon remain legible; pass `--linear-time`
+for a linear axis.
 
 The no-wrench target-support quotient ablation compares the ordinary labeled local PDB with a
 version that represents holders on the already-built component only by count and tool-kind mask;
@@ -1191,3 +1205,62 @@ the domain, is physically interpretable, and tests whether backward facts unders
 partially seated bracket must remain supported until its fastener arrives. The shaft family is
 more scientifically interesting but should wait until loop-closing/capture semantics are explicit;
 encoding it as a convenient tree would repeat the known problem with the old arch benchmark.
+
+## Scattered grasp-database robustness
+
+`manifests/fabrica_stool_gamepad_scatter_grasp_robustness.json` checks the maintained Fabrica
+Stool and Gamepad grasp pipeline on five deterministic, collision-free random XY/yaw layouts.
+It uses a 0.25 m centre separation: plain nonpenetration is insufficient for this experiment,
+because neighboring parts can otherwise occlude every open-hand approach before planning starts.
+Run it with:
+
+```bash
+python3 benchmarks/search_runner.py \
+  benchmarks/manifests/fabrica_stool_gamepad_scatter_grasp_robustness.json \
+  --output benchmarks/results/fabrica-stool-gamepad-scatter-grasp-robustness \
+  --shared-grasp-db
+```
+
+Floating and articulated cases have separate case IDs so `--shared-grasp-db` precomputes the
+correct collision-filtered table for each embodiment. They still use the same deterministic raw
+candidate stream and scattered part pose for a seed. Floating success therefore establishes
+candidate/action-space coverage; a paired articulated timeout localizes the remaining difficulty
+to wrist clearance, fixed-base reachability, or IK search rather than silently blaming sampling.
+The 2026-09-22 five-seed run solved both assemblies 5/5 with floating end effectors and 2/5 with
+the articulated UR5s under a 450 s guard. Every articulated preflight retained collision-clear
+pick grasps for every part; the remaining variance was in multi-arm witness selection.
+
+The benchmark runner now also keeps a suite-local `grasp-raw-cache/`. It caches only
+content-addressed, scene-independent surface proposals and finite-pad scores; scattered poses,
+robot geometry, collision labels, and closure verdicts are recomputed. On plugged-in matched
+Gamepad builds, a cold cache required 106.95 s of grasp-database construction and a warm cache
+36.96 s (142.53 versus 67.47 s total process wall time), with the identical sampled-database
+signature `119d744db439ac88f3e12cb46532663c7d5c046a08b80ca563357984ad77f0b6`.
+
+## Fabrica feasibility matrix
+
+`manifests/fabrica_feasibility_matrix.json` is the nominal-scene regression matrix for all
+seven maintained Fabrica imports.  It crosses floating versus articulated UR5 end effectors
+with topological versus wrench-aware search while holding the four two-finger tools, dense
+Fabrica grasp alphabet, scene/closure checks, seed, and resource guards fixed.  Floating
+failure therefore identifies a manipulation-alphabet/geometric issue; floating success with
+articulated failure instead localizes the remaining problem to reachability, joint limits, or
+arm collisions.  The topological/wrench pair separates those causes from support feasibility.
+
+```bash
+python3 benchmarks/search_runner.py \
+  benchmarks/manifests/fabrica_feasibility_matrix.json \
+  --output benchmarks/results/fabrica-feasibility-matrix \
+  --jobs 1
+```
+
+The generated `matrix.md`, `matrix.csv`, and `matrix.json` are the feasibility report.  Do not
+use `--shared-grasp-db` for this particular matrix: floating and articulated rows have different
+collision scenes, while the runner's shared-DB grouping is intentionally case/seed based.  The
+safe scene-independent proposal cache is still used automatically inside the suite directory.
+
+The follow-up [regression audit](../experiments/fabrica-regression-audit/README.md) records
+the Car/Cooling investigation, concrete closure/cache/replay fixes, and fresh optimized-MP
+checks. Its successful expanded-sampler recipes are explicit diagnostics, **not** evidence
+that all 28 original standard-profile cells are now green. Timeouts remain budget outcomes,
+not infeasibility proofs.

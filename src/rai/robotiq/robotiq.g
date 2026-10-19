@@ -26,7 +26,7 @@ finger2 (left_inner_finger_joint): {
  shape: capsule, size: [.04, .02], color: [1., 1., 1., .2], contact: -2 }
 
 Edit right_inner_finger_joint: { joint_scale: -1 }
-Edit left_inner_finger_joint: { joint_scale: -1 }
+Edit left_inner_finger_joint: { joint_scale: -1}
  
 Edit finger_joint: { q: .2 }
 Edit finger_joint: { joint_active: false }

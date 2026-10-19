@@ -63,7 +63,7 @@ def test_phs_handles_coincident_empty_and_degenerate_cases():
 
 def test_sum_completion_pins_task_robot_and_allocates_one_joint_budget():
   M = _module()
-  from mp_export import _ensure_mrbench
+  from assembly_planner.mp_export import _ensure_mrbench
   _ensure_mrbench()
   from multi_robot_multi_goal_planning.problems.core.configuration import NpConfiguration
 
@@ -172,7 +172,7 @@ def _tiny_sampler(metric="euclidean"):
 
 
 def test_transition_control_uses_uniform_and_direct_avoids_it():
-  from mp_export import _ensure_mrbench
+  from assembly_planner.mp_export import _ensure_mrbench
   _ensure_mrbench()
   M = _module()
 
@@ -192,7 +192,7 @@ def test_transition_control_uses_uniform_and_direct_avoids_it():
 
 
 def test_non_euclidean_direct_request_falls_back_to_uniform():
-  from mp_export import _ensure_mrbench
+  from assembly_planner.mp_export import _ensure_mrbench
   _ensure_mrbench()
   M = _module()
   sampler, path = _tiny_sampler(metric="manhattan")
@@ -203,7 +203,7 @@ def test_non_euclidean_direct_request_falls_back_to_uniform():
 
 
 def test_preincumbent_hold_and_linear_use_mode_entry_and_each_robots_goal():
-  from mp_export import _ensure_mrbench
+  from assembly_planner.mp_export import _ensure_mrbench
   _ensure_mrbench()
   from multi_robot_multi_goal_planning.problems.core.configuration import NpConfiguration
   M = _module()
@@ -266,7 +266,7 @@ def test_lazy_source_uses_logical_forward_subtree_across_birrt_swaps():
 
 
 def test_persistent_factored_sampler_keeps_untouched_baseline_branch():
-  from mp_export import _ensure_mrbench
+  from assembly_planner.mp_export import _ensure_mrbench
   _ensure_mrbench()
   from multi_robot_multi_goal_planning.problems.core.configuration import NpConfiguration
   M = _factored_module()
@@ -291,7 +291,7 @@ def test_persistent_factored_sampler_keeps_untouched_baseline_branch():
 
 
 def test_persistent_factored_sampler_repairs_only_a_colliding_robot():
-  from mp_export import _ensure_mrbench
+  from assembly_planner.mp_export import _ensure_mrbench
   _ensure_mrbench()
   from multi_robot_multi_goal_planning.problems.core.configuration import NpConfiguration
   from unittest.mock import patch

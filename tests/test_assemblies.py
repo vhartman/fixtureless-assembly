@@ -9,10 +9,10 @@ Run:  python3 -m pytest tests/ -q      (from the repo root, or anywhere -- conft
 import numpy as np
 import pytest
 
-import assembly as A
-import solver as S
-import wrench as W
-from env import make_four_robot_env
+import assembly_planner.assembly as A
+import assembly_planner.solver as S
+import assembly_planner.wrench as W
+from assembly_planner.env import make_four_robot_env
 
 
 def _solve(kind, n, robots, weight, wrench, model, insert):
@@ -393,7 +393,7 @@ def test_cograsp_bracing():
   the yaw couple and the frictionless table gives no lateral help. So WITHOUT bracing the instance
   is infeasible (labeled-h h(s0)=inf); WITH bracing (+ the abstraction's inverse-add_grasp edge)
   it's feasible and a real plan uses add_grasp. `bracing` must also toggle the primitive."""
-  import solver as S
+  import assembly_planner.solver as S
   A.set_seed(0); A.set_rolls_per_face(2)                    # two-finger
   saved = (W.PARAMS.get("grasp_model"), W.PARAMS.get("insertion_uncertainty"),
            W.PARAMS["insert_force"].get("_default"))
@@ -717,7 +717,7 @@ def test_milestone_fill_releases_inherited_grasp():
   the fill succeeds and its subplan releases obj_2; WITHOUT it the fill returns None (loose
   never clears) and this test fails -- the direct guard for the one-line fix. (Fast: one
   crafted state, one mini-fill.)"""
-  import solver as S
+  import assembly_planner.solver as S
   A.set_seed(0); A.set_rolls_per_face(1)
   asm = A.make_assembly("cross", 3)
   C = make_four_robot_env(num_robots=2, floating_ee=True, vacuum=True)
@@ -830,7 +830,7 @@ def test_milestones_lazily_retry_a_distinct_boundary_after_suffix_failure(monkey
   K=1 therefore reproduces the historical claim-once failure and K=2 must recover without
   changing the dependency-valid part order.
   """
-  import solver as S
+  import assembly_planner.solver as S
 
   class DummyState:
     def __init__(self, label, goal=False):
@@ -883,7 +883,7 @@ def test_milestones_lazily_retry_a_distinct_boundary_after_suffix_failure(monkey
 
 def test_milestone_session_resumes_after_external_complete_plan_suspension(monkeypatch):
   """A consumer can request the next exact boundary without restarting symbolic/IK search."""
-  import solver as S
+  import assembly_planner.solver as S
 
   class DummyState:
     def __init__(self, label, goal=False):
@@ -936,7 +936,7 @@ def test_milestone_session_resumes_after_external_complete_plan_suspension(monke
 
 def test_exact_search_initializes_useful_grasps_from_its_search_context(monkeypatch):
   """Anytime's exact phase must not consume the grasp table before constructing it."""
-  import problem
+  import assembly_planner.problem as problem
 
   A.set_seed(0); A.set_rolls_per_face(1)
   asm = A.make_assembly("cross", 2)
@@ -951,7 +951,7 @@ def test_exact_search_initializes_useful_grasps_from_its_search_context(monkeypa
 
 
 def test_fill_policy_edge_uses_bellman_equality_and_rejects_hidden_stutters():
-  import solver as S
+  import assembly_planner.solver as S
 
   class PDB:
     def abstract(self, state):
@@ -969,7 +969,7 @@ def test_fill_policy_edge_uses_bellman_equality_and_rejects_hidden_stutters():
 
 def test_policy_atoms_follow_one_bellman_route_as_atomic_fibres():
   """The guide sees ordered raw signature fibres, never a union/product of policy paths."""
-  import solver as S
+  import assembly_planner.solver as S
 
   pdb = object.__new__(S.CollapsedLabeledHeuristic)
   held = object()
@@ -997,7 +997,7 @@ def test_policy_atoms_follow_one_bellman_route_as_atomic_fibres():
 
 def test_policy_atom_frontier_covers_all_bellman_branches_breadth_first():
   """Widening sees an alternative optimal branch hidden by deterministic path selection."""
-  import solver as S
+  import assembly_planner.solver as S
 
   pdb = object.__new__(S.CollapsedLabeledHeuristic)
   held = object()
@@ -1054,7 +1054,7 @@ def test_fill_policy_guide_requires_a_widened_fibre():
 
 def test_fill_policy_guide_rejects_backends_that_cannot_schedule_a_fibre():
   """Library callers get the same fail-closed contract as the CLI."""
-  import solver as S
+  import assembly_planner.solver as S
 
   with pytest.raises(ValueError, match="ordinary milestone"):
     S.solve_assembly_problem_optimistic(
@@ -1066,7 +1066,7 @@ def test_fill_policy_guide_rejects_backends_that_cannot_schedule_a_fibre():
 
 def test_fill_policy_widening_failure_falls_through_to_complete_fill(monkeypatch, capsys):
   """A spurious post-failure policy lift changes effort order, never feasibility."""
-  import solver as S
+  import assembly_planner.solver as S
 
   A.set_seed(0); A.set_rolls_per_face(1)
   asm = A.make_assembly("cross", 2)
@@ -1108,7 +1108,7 @@ def test_fill_policy_widening_failure_falls_through_to_complete_fill(monkeypatch
 
 def test_fill_policy_lift_adds_to_instead_of_replacing_compact_columns(monkeypatch):
   """The policy batch retains every ordinary prefix column for every manipulated part."""
-  import solver as S
+  import assembly_planner.solver as S
 
   A.set_seed(0); A.set_rolls_per_face(1)
   asm = A.make_assembly("cross", 2)
@@ -1152,7 +1152,7 @@ def test_fill_policy_lift_adds_to_instead_of_replacing_compact_columns(monkeypat
 
 def test_fill_policy_lift_advances_across_branches_and_retains_prior_columns(monkeypatch):
   """A failed first Bellman demand does not hide an equally short alternative branch."""
-  import solver as S
+  import assembly_planner.solver as S
 
   A.set_seed(0); A.set_rolls_per_face(1)
   asm = A.make_assembly("cross", 2)
@@ -1204,7 +1204,7 @@ def test_fill_policy_lift_can_select_one_hidden_support_fibre(monkeypatch):
   the unchanged prefix while a later hidden mover id stays closed.  This is the important
   non-Cartesian generalization that can reach a hidden support as well as the mover.
   """
-  import solver as S
+  import assembly_planner.solver as S
 
   A.set_seed(0); A.set_rolls_per_face(1)
   asm = A.make_assembly("cross", 2)
@@ -1263,8 +1263,8 @@ def test_fill_policy_lift_can_select_one_hidden_support_fibre(monkeypatch):
 def test_policy_yaw_orbit_is_additive_to_the_existing_prefix():
   """One selected yaw orbit must not remove ordinary prefix PLACE actions."""
   import numpy as np
-  import problem as P
-  import solver as S
+  import assembly_planner.problem as P
+  import assembly_planner.solver as S
 
   old_yaws, old_prefix = P._PLACEMENT_YAWS, P._PLACEMENT_YAW_PREFIX
   P.set_placement_yaws(2)
@@ -1310,8 +1310,8 @@ def test_fill_policy_raw_stage_defers_yaw_to_one_yaw_probe(monkeypatch):
   expensive.  Force the unique policy yaw attempt to fail, then let the ordinary yaw lattice
   solve the same small fill; exactly one restricted-rest attempt must have occurred.
   """
-  import problem as P
-  import solver as S
+  import assembly_planner.problem as P
+  import assembly_planner.solver as S
 
   old_yaws, old_prefix = P._PLACEMENT_YAWS, P._PLACEMENT_YAW_PREFIX
   P.set_placement_yaws(2)
@@ -1357,8 +1357,8 @@ def test_fill_policy_raw_stage_defers_yaw_to_one_yaw_probe(monkeypatch):
 
 def test_fill_policy_yaw_probe_retains_failed_raw_branch_columns(monkeypatch):
   """Independent policy dimensions accumulate when a relaxed route needs both of them."""
-  import problem as P
-  import solver as S
+  import assembly_planner.problem as P
+  import assembly_planner.solver as S
 
   old_yaws, old_prefix = P._PLACEMENT_YAWS, P._PLACEMENT_YAW_PREFIX
   P.set_placement_yaws(2)
@@ -1416,8 +1416,8 @@ def test_public_milestone_iterator_publishes_policy_yaw_for_replay(monkeypatch):
   full finite yaw lattice.  The fake inner iterator stands in for a successful policy-yaw fill.
   """
   import numpy as np
-  import problem as P
-  import solver as S
+  import assembly_planner.problem as P
+  import assembly_planner.solver as S
 
   old_yaws, old_prefix = P._PLACEMENT_YAWS, P._PLACEMENT_YAW_PREFIX
   P.set_placement_yaws(2)
@@ -1455,8 +1455,8 @@ def test_public_milestone_iterator_publishes_policy_yaw_for_replay(monkeypatch):
 
 def test_terminal_settle_searches_full_yaw_lattice_and_restores_schedule(monkeypatch):
   """The final held assembly is settled with all configured yaws, then search state restores."""
-  import problem as P
-  import solver as S
+  import assembly_planner.problem as P
+  import assembly_planner.solver as S
 
   old_yaws, old_prefix = P._PLACEMENT_YAWS, P._PLACEMENT_YAW_PREFIX
   P.set_placement_yaws(2)
@@ -1494,7 +1494,7 @@ def test_terminal_settle_searches_full_yaw_lattice_and_restores_schedule(monkeyp
 def test_optional_policy_pdb_state_guard_falls_through_but_baseline_does_not(
     monkeypatch, capsys):
   """Only the optional full-master guide may fail open on its PDB resource guard."""
-  import solver as S
+  import assembly_planner.solver as S
 
   A.set_seed(0); A.set_rolls_per_face(1)
   asm = A.make_assembly("cross", 2)
@@ -1546,7 +1546,7 @@ def test_local_widen_reaches_all_part_master_before_returning_no_plan(monkeypatc
   Force every compact-session fill to miss.  The direct solver (not main's old whole-search
   wrapper) must then start its one eager finite-master completion session before returning.
   """
-  import solver as S
+  import assembly_planner.solver as S
 
   A.set_seed(0); A.set_rolls_per_face(1)
   asm = A.make_assembly("cross", 2)
@@ -1588,7 +1588,7 @@ def test_local_widen_reaches_all_part_master_before_returning_no_plan(monkeypatc
 
 def test_local_widen_iterator_runs_one_eager_master_completion(monkeypatch):
   """The resumable/MP-facing iterator gets the same completion epoch as direct solve."""
-  import solver as S
+  import assembly_planner.solver as S
   from types import SimpleNamespace
 
   asm = SimpleNamespace(objects=("obj_0", "obj_1"))
@@ -1615,7 +1615,7 @@ def test_local_widen_iterator_runs_one_eager_master_completion(monkeypatch):
 
 
 def test_fill_policy_failure_falls_through_to_unrestricted_fill(monkeypatch, capsys):
-  import solver as S
+  import assembly_planner.solver as S
 
   A.set_seed(0); A.set_rolls_per_face(1)
   asm = A.make_assembly("cross", 2)
@@ -1634,7 +1634,7 @@ def test_fill_policy_failure_falls_through_to_unrestricted_fill(monkeypatch, cap
 
 def test_fill_touch_all_expands_manipulation_scope_but_not_milestone_assembly_scope():
   """The locality ablation may move blockers without silently growing the outer ideal."""
-  import solver as S
+  import assembly_planner.solver as S
 
   relevant = {"obj_0", "obj_1"}
   S.set_fill_touch_all(False)
@@ -1656,7 +1656,7 @@ def test_fill_touch_all_expands_manipulation_scope_but_not_milestone_assembly_sc
 
 
 def test_fill_scope_widening_is_local_first_and_force_all_skips_the_fast_pass():
-  import solver as S
+  import assembly_planner.solver as S
 
   assert S._fill_scope_passes(False, False) == (False,)
   assert S._fill_scope_passes(False, True) == (False, True)
@@ -1672,7 +1672,7 @@ def test_scope_aware_successors_equal_ordered_legacy_postfilter():
   successor's value key, not only its action label, so moving the filter before State copying
   cannot silently change either transition semantics or ordering.
   """
-  import solver as S
+  import assembly_planner.solver as S
 
   A.set_seed(0); A.set_rolls_per_face(1)
   asm = A.make_assembly("cross", 4)
@@ -1733,7 +1733,7 @@ def test_scope_aware_successors_equal_ordered_legacy_postfilter():
 ])
 def test_scope_aware_successors_match_families(kind, n):
   """The same ordered-subsequence invariant covers chains, a DAG and modules."""
-  import solver as S
+  import assembly_planner.solver as S
 
   A.set_seed(0); A.set_rolls_per_face(1)
   asm = A.make_assembly(kind, n)

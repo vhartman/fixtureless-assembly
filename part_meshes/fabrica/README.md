@@ -41,7 +41,7 @@ The geometric conversion covers `car`, `beam`, `cooling_manifold`, `duct`, `game
 proxies remain small per-model annotations because they are not encoded in Fabrica's asset
 files; Fabrica itself computes precedence using a separate disassembly planner. For the five
 models beyond Car/Beam, the current first-pass dependency tree is inferred from final-pose
-proximity and kept explicit in `problem.py` so it can be reviewed rather than changing with
+proximity and kept explicit in `assembly_planner/problem.py` so it can be reviewed rather than changing with
 sampling noise.
 
 Every authored stem, peg, pin and screw remains collision geometry; it is no longer trimmed
@@ -58,18 +58,19 @@ python3 part_meshes/fabrica/import_assets.py \
 
 # Check complete moving-part geometry against the assembled prefix in both engines.
 # Default: 50 mm insertion, samples every 0.5 mm, penetration tolerance 1 micrometre.
-python3 audit_fabrica.py duct --containment
-python3 audit_fabrica.py car --containment
+python3 tools/diagnostics/audit_fabrica.py duct --containment
+python3 tools/diagnostics/audit_fabrica.py car --containment
 
-python3 view_fabrica.py duct --pose assembled
-python3 view_fabrica.py car --pose assembled
+python3 tools/visualization/view_fabrica.py duct --pose assembled
+python3 tools/visualization/view_fabrica.py car --pose assembled
 ```
 
 The Duct cover and all six fasteners enter along the common flange normal
 `(-0.5, 0, -sqrt(0.75))`. The former radial XY insertion guesses were invalid even for
 the authored meshes. An audit is sampled, not continuous; a finer `--step` tightens it.
 Use `--output /tmp/fabrica-candidate` when experimenting, then
-`audit_fabrica.py duct --asset-root /tmp/fabrica-candidate` before replacing assets.
+`tools/diagnostics/audit_fabrica.py duct --asset-root /tmp/fabrica-candidate` before replacing
+assets.
 Sub-micrometre duplicate seam vertices are welded at 0.1 micrometre (needed by Circular
 Stool). Sources that remain non-watertight require repair; the importer fails explicitly.
 
@@ -102,6 +103,17 @@ The Car source's `2.obj` is a fixture, not an assembly part. The importer retain
 hash-complete source conversion, but `fabrica-car` excludes it from the initial scene and
 the final assembly. None of the other currently available Fabrica models has such a fixture.
 
+Beam uses reviewed axis-aligned box unions at runtime for its three mortised wooden members:
+seven boxes for the four-hole base rail and ten boxes for each tapered one-hole crossbar. The
+two inserted uprights retain their three-child semantic proxies. This reduces the complete
+five-part collider from 395 children to 33 without changing the exact visual/grasp meshes.
+The boxes stop on either side of every authored through-hole and are strictly contained in
+the rounded CAD skin.
+`tools/diagnostics/audit_fabrica.py beam --containment --robustness 0.001` is the required
+regression: it checks every full insertion sweep and the seated pose under +/-1 mm translations
+in both RAI and MuJoCo. Re-running the generic importer does not overwrite this reviewed runtime
+proxy, which is defined in `FabricaAssembly._beam_primitive_collision_shape`.
+
 Cooling Manifold deliberately approximates the fin stack with solid rectangular collision
 envelopes. The connector-bore columns are excluded from these boxes; their detailed
 collision cells remain. The visual mesh still shows individual fins. This explicit
@@ -118,7 +130,7 @@ Circular Stool keeps the exact render meshes and mate transforms.  Its four fitt
 proxies are retreated 2.5 mm axially/radially inside the exact CAD.  This is recorded as
 `axial_fit_trim` in the manifest and is deliberately local to collision geometry: it gives
 the insertion channel a finite numerical clearance without moving or shrinking the visible
-part.  Re-run `audit_fabrica.py circular-stool --containment` after changing it.
+part. Re-run `tools/diagnostics/audit_fabrica.py circular-stool --containment` after changing it.
 
 For end-to-end CAD planning, use hard witness residual contracts in addition to collision
 checks.  `benchmarks/run_fabrica_smoke.py` applies 40 micrometre grasp/mate translation

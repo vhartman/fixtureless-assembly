@@ -4,19 +4,19 @@ This is the guarantee the whole articulated-sim plan rests on: the planner expre
 witness, strict-collision gate and seat tolerance in rai's joint space, so if MuJoCo's
 kinematics drift even slightly, the same q means a different end-effector pose in the two and
 witnesses land somewhere else -- silently. Cheap to check, catastrophic to get wrong, so it is
-pinned here rather than left to fk_compare.py being run by hand.
+pinned here rather than left to `tools/diagnostics/fk_compare.py` being run by hand.
 """
 import numpy as np
 import pytest
 
 mujoco = pytest.importorskip("mujoco")
 
-import arm_model
-import fk_compare
-from env import (color_gripper, make_four_robot_env, make_fr3_duo_env, make_husky_duo_env,
+import assembly_planner.arm_model as arm_model
+from tools.diagnostics import fk_compare
+from assembly_planner.env import (color_gripper, make_four_robot_env, make_fr3_duo_env, make_husky_duo_env,
                  make_openarm_duo_env)
 import robotic as ry
-import assembly as A
+import assembly_planner.assembly as A
 
 
 def _env(robot, n=1):
@@ -133,6 +133,11 @@ def test_physical_robotiq_uses_one_bounded_actuator_and_mimic_constraints():
   assert acts.count("<position ") == 1
   assert equalities.count("<joint ") == len(specs) - 1
   assert f'joint2="sim_grip__{next(iter(specs))}"' in equalities
+
+  capped, _ = arm_model.gripper_actuator_mjcf(
+      C, [prefix], kp=100.0, coupled=True, max_effort=10.0)
+  assert 'forcerange="-10 10"' in capped
+  assert 'kp="100"' in capped
 
 
 def test_tree_is_read_at_zero_not_at_home():

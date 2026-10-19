@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 
 import replay as R
-from config import RunConfig
+from assembly_planner.config import RunConfig
 
 
 class _C:
@@ -53,7 +53,7 @@ def test_replay_refuses_missing_witness_without_explicit_resolve(monkeypatch):
 
 
 def test_replay_restores_vacuum_engagement_successor_gate():
-  import wrench
+  import assembly_planner.wrench as wrench
 
   R.apply_wrench_params({"vacuum_engage_force": 7.5})
   assert wrench.PARAMS["vacuum_engage_force"] == 7.5
@@ -62,7 +62,7 @@ def test_replay_restores_vacuum_engagement_successor_gate():
 
 
 def test_replay_restores_orientation_robust_wrench_gate():
-  import wrench
+  import assembly_planner.wrench as wrench
 
   R.apply_wrench_params({"orientation_robust_wrench": True})
   assert wrench.PARAMS["orientation_robust_gravity"] is True
@@ -71,7 +71,7 @@ def test_replay_restores_orientation_robust_wrench_gate():
 
 
 def test_replay_restores_max_robotiq_profile_and_then_resets_it():
-  import wrench
+  import assembly_planner.wrench as wrench
 
   R.apply_wrench_params({"wrench_profile": "max_robotiq", "grasp_model": "asymmetric"})
   assert wrench.PARAMS["grasp"]["asymmetric"]["two_finger"] == {
@@ -90,7 +90,7 @@ def test_replay_restores_max_robotiq_profile_and_then_resets_it():
 
 
 def test_replay_restores_measured_axis_resolved_profile_and_then_resets_it():
-  import wrench
+  import assembly_planner.wrench as wrench
 
   R.apply_wrench_params({"wrench_profile": "measured", "grasp_model": "asymmetric"})
   tf = wrench.PARAMS["grasp"]["asymmetric"]["two_finger"]
@@ -140,7 +140,7 @@ def test_build_scene_restores_discrete_mate_symmetry_and_legacy_off():
 
 
 def test_build_scene_restores_sampling_expansion_and_resets_legacy(monkeypatch):
-  import problem as P
+  import assembly_planner.problem as P
   seen = []
   original = P.set_sampled_grasps
   def capture(mode):

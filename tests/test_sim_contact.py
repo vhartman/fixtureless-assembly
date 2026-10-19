@@ -1,4 +1,5 @@
 """Behavioral guards for the separate physical-contact executor."""
+
 from types import SimpleNamespace
 
 import numpy as np
@@ -17,6 +18,10 @@ def _scene(monkeypatch):
   scene._hold_info = {"a1": {"grasp_part": "obj_1"},
                       "a2": {"grasp_part": "obj_0"}}
   scene._contact_grasp_misses = {"a1": 2, "a2": 1}
+  scene._contact_grasp_slips = {"a1": 0, "a2": 0}
+  scene._contact_grasp_ref = {"a1": np.array([0, 0, 0, 1, 0, 0, 0]),
+                              "a2": np.array([0, 0, 0, 1, 0, 0, 0])}
+  scene._contact_relative_pose = lambda *_: np.array([0, 0, 0, 1, 0, 0, 0])
   scene._holdex = {}
   scene.model = SimpleNamespace(geom_contype=np.zeros(0, dtype=int),
                                 geom_conaffinity=np.zeros(0, dtype=int))
@@ -27,7 +32,13 @@ def _scene(monkeypatch):
 
 def test_mate_preserves_live_contact_holder(monkeypatch):
   scene = _scene(monkeypatch)
-  def old_weld(self, part):
+  # OpenArm includes moving pads in the historical wrist-exemption set.
+  # Mating must not disable those load-bearing physical contacts.
+  scene._holdex = {"a1": [0, 1]}
+  scene.model.geom_contype = np.array([2, 2])
+  scene.model.geom_conaffinity = np.array([1, 1])
+  def old_weld(self, part, *, project=True):
+    assert not project, 'physical mate must not project the part out of its hand'
     for robot, (_, held) in list(self.active_grasps.items()):
       if held == part:
         self.release(robot)
@@ -36,6 +47,10 @@ def test_mate_preserves_live_contact_holder(monkeypatch):
   assert scene.active_grasps == {"a1": (-1, "obj_1"), "a2": (-1, "obj_0")}
   assert scene._physical_contact_target["a1"] == "obj_1"
   assert scene._contact_grasp_misses["a1"] == 2
+  assert scene._contact_grasp_slips["a1"] == 0
+  assert np.array_equal(scene._contact_grasp_ref["a1"], [0, 0, 0, 1, 0, 0, 0])
+  assert np.array_equal(scene.model.geom_contype, [2, 2])
+  assert np.array_equal(scene.model.geom_conaffinity, [1, 1])
 
 def test_release_reroot_does_not_regrasp_continuing_holder(monkeypatch):
   scene = _scene(monkeypatch)
@@ -98,3 +113,47 @@ def test_handover_acquires_receiver_before_releasing_giver(monkeypatch):
   assert scene.contact_handover("a2_gripper", "obj_1", ["a1"])
   assert events == ["receiver-contact", "release-a1"]
   assert set(scene.active_grasps) == {"a2"}
+
+
+def test_contact_drift_uses_measured_relative_pose_and_quaternion_sign():
+  scene = sim.SimScene.__new__(sim.SimScene)
+  scene._contact_grasp_ref = {"a1": np.array([0., 0., 0., 1., 0., 0., 0.])}
+  scene._contact_relative_pose = lambda *_: np.array([0.002, 0., 0., -1., 0., 0., 0.])
+  shift, angle = scene._contact_grasp_drift("a1", "obj_0")
+  assert shift == pytest.approx(0.002)
+  assert angle == pytest.approx(0.0)
+  scene._contact_relative_pose = lambda *_: np.array([0.012, 0., 0., 1., 0., 0., 0.])
+  shift, _angle = scene._contact_grasp_drift("a1", "obj_0")
+  assert shift > sim.CONTACT_SLIP_SHIFT
+
+
+def test_admittance_excludes_own_physical_fingers_but_sees_released_hand(monkeypatch):
+  scene = sim.SimScene.__new__(sim.SimScene)
+  scene.contact_grasps = True
+  scene.active_grasps = {"a1": (-1, "obj_1", 0.0, 0.0)}
+  scene.grasp_anchor = {"a1": "a1_gripper_center"}
+  scene._body_id = lambda _name: 2
+  scene._active_mate_component = lambda part: frozenset((part,))
+  scene._part_owner_by_body = [None, "obj_1", None, None, None]
+  scene._phys = 0
+  scene.model = SimpleNamespace(
+      nbody=5, body_parentid=np.array([0, 0, 0, 2, 0]),
+      geom_bodyid=np.array([3, 4, 1]))
+  contact = lambda geom: SimpleNamespace(
+      geom1=geom, geom2=2, frame=np.eye(3))
+  scene.data = SimpleNamespace(
+      eq_active=np.zeros(0, dtype=int), ncon=2,
+      contact=[contact(0), contact(1)])
+  names = {0: "world", 1: "obj_1", 2: "a1_gripper_center",
+           3: "a1_finger", 4: "a2_finger"}
+  monkeypatch.setattr(sim.mujoco, "mj_id2name",
+                      lambda _model, _kind, body: names[int(body)])
+  def contact_force(_model, _data, index, out):
+    out[:] = 0.0
+    out[0] = 10.0 if index == 0 else 4.0
+  monkeypatch.setattr(sim.mujoco, "mj_contactForce", contact_force)
+
+  assert scene.net_contact_force("obj_1")[0] == pytest.approx(4.0)
+  scene.active_grasps.clear()
+  # The same contact from a released hand is now an external collision.
+  assert scene.net_contact_force("obj_1")[0] == pytest.approx(14.0)

@@ -21,7 +21,7 @@ def test_sim_report_has_structured_first_failure():
 
 def test_zero_placement_perturbation_is_exact_copy():
   import sim as S
-  from problem import State
+  from assembly_planner.problem import State
   state = State({"obj_0": ("table",)}, poses={
       "obj_0": np.array([1., 2., 3., 1., 0., 0., 0.])})
   got, meta = S._sample_initial_placement_perturbation(
@@ -33,8 +33,8 @@ def test_zero_placement_perturbation_is_exact_copy():
 
 
 def test_planar_placement_draw_is_collision_free_and_reproducible():
-  import assembly as A
-  from env import make_four_robot_env
+  import assembly_planner.assembly as A
+  from assembly_planner.env import make_four_robot_env
   import sim as S
   asm = A.make_assembly("car-mini", 5)
   C = make_four_robot_env(num_robots=1, floating_ee=True, vacuum=False)

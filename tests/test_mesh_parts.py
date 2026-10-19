@@ -13,7 +13,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import problem as P
+import assembly_planner.problem as P
 
 MESH = ("mesh", {"file": "part_meshes/chamfered_box.stl"})
 _have_mesh = os.path.exists(os.path.join(os.path.dirname(os.path.dirname(
@@ -78,7 +78,7 @@ def test_sampler_filter_rejects_buried_fingers():
   base = P.make_subassembly_scene(asm, ("obj_1",))
   base.addFile(os.path.join(os.path.dirname(os.path.abspath(P.__file__)),
                             "src/rai/ur10/ur10_two_finger_floating.g"), namePrefix="ee_")
-  from env import maybe_tighten_fingers
+  from assembly_planner.env import maybe_tighten_fingers
   maybe_tighten_fingers(base, "ee_")
   _, brt, qc = P._gripper_rest_transforms(base, "ee_")
   for _obj, _gid, grasp in labeled:

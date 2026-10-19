@@ -386,7 +386,7 @@ def _motion_command(plan: Path, runtime_s: float, seed: int):
   return [
       sys.executable, str(ROOT / "main.py"), "--config", str(plan),
       "--load-plan", str(plan), "--motion-plan", "--motion-profile", "standard",
-      "--no-mp-optimize", "--mp-no-shortcut", "--mp-runtime", str(runtime_s),
+      "--no-mp-optimize", "--no-mp-shortcut", "--mp-runtime", str(runtime_s),
       "--mp-seed", str(seed), "--quiet-rai", "--no-view",
   ]
 

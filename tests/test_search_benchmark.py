@@ -11,7 +11,7 @@ from benchmarks import run_wrench_sim_ablation as WS
 from benchmarks import run_paper_search_comparison as PS
 from benchmarks import run_paper_anytime_convergence as AC
 from benchmarks import run_process_wrench_full_matrix as PWM
-import problem
+import assembly_planner.problem as problem
 
 
 def _manifest():
@@ -234,7 +234,7 @@ def test_paper_breakdown_includes_aggregated_initial_motion_time():
 
 
 def test_paper_manifest_uses_portable_plain_fabrica_configs():
-  from config import RunConfig
+  from assembly_planner.config import RunConfig
   from main import parse_args
 
   manifest = json.loads(PS.MANIFEST.read_text(encoding="utf-8"))

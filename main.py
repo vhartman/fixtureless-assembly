@@ -6,14 +6,14 @@ import time as _time
 # BEFORE rai loads: RAI_QUIET=1 drops rai's libccd/pairCollision spam at the fd (see rai_quiet).
 # Env var as well as a flag so it can be exported once instead of typed on every run.
 if _os.environ.get("RAI_QUIET", "").strip() not in ("", "0", "false", "no"):
-  import rai_quiet as _rq
+  import assembly_planner.rai_quiet as _rq
   _rq.install()
 
 import numpy as np
 
-from env import *
-from assembly import *
-from config import RunConfig
+from assembly_planner.env import *
+from assembly_planner.assembly import *
+from assembly_planner.config import RunConfig
 
 # Named CLI profiles are deliberately a thin layer over the ordinary flags.  RunConfig stays
 # the fully-resolved configuration (there is no profile magic in the solver/library API), and
@@ -330,7 +330,7 @@ def _sampled_scene_coverage(assembly, checker, robots, prefix="[grasp-scenes]"):
   spends its search budget on it. ``both=0`` is deliberately only a warning: a regrasp or
   handover may legitimately connect disjoint pick- and assembly-clear grasp sets.
   """
-  from problem import sampled_grasp_meta, sampled_grasp_selection_diagnostics
+  from assembly_planner.problem import sampled_grasp_meta, sampled_grasp_selection_diagnostics
   kinds = sorted(set(checker._robot_kind.get(r, r) for r in robots))
   report = {}
   profile_totals = {"raw": 0.0, "master": 0.0, "materialize": 0.0}
@@ -2567,7 +2567,7 @@ def parse_args(argv=None):
   _warn_duplicate_flags(parser, argv)
   args = parser.parse_args(argv)
   if getattr(args, "config", None):
-    from config import RunConfig
+    from assembly_planner.config import RunConfig
     parser.set_defaults(**RunConfig.from_file(args.config).to_dict())
   if getattr(args, "search_profile", None):
     parser.set_defaults(**_SEARCH_PROFILES[args.search_profile])
@@ -2693,7 +2693,7 @@ _SAVE_CONFIG_FIELDS = (
 
 
 def save_plan(path, cfg, plan, witnesses=None, *, C=None, assembly=None, robots=None):
-  from plan_io import write_plan, _motion_plan_digest
+  from assembly_planner.plan_io import write_plan, _motion_plan_digest
   config = {k: getattr(cfg, k) for k in _SAVE_CONFIG_FIELDS}
   # A plan can only be replay-gated as strictly as the SEARCH that selected it.  This marker
   # separates new plans (where --witness-margin is installed before search) from old files
@@ -2707,7 +2707,7 @@ def save_plan(path, cfg, plan, witnesses=None, *, C=None, assembly=None, robots=
   config["_search_witness_margin"] = float(_cert)
   grasp_physics = None
   if cfg.grasp_physics_check:
-    from problem import _GRASP_PHYSICS_CTX
+    from assembly_planner.problem import _GRASP_PHYSICS_CTX
     if _GRASP_PHYSICS_CTX is None:
       raise RuntimeError("cannot save a physics-certified plan without its grasp context")
     grasp_physics = _GRASP_PHYSICS_CTX.export_handovers()
@@ -2728,7 +2728,7 @@ def save_plan(path, cfg, plan, witnesses=None, *, C=None, assembly=None, robots=
     cache_key = (digest, cfg.grasp_sampler_db_hash)
     motion_data = cache.get(cache_key)
     if motion_data is None:
-      from plan_io import build_motion_data
+      from assembly_planner.plan_io import build_motion_data
       motion_data = build_motion_data(
           C, assembly, plan, robots,
           wrench_kind_arg(C, robots) if cfg.wrench else None,
@@ -2774,7 +2774,7 @@ def _witnesses_reusable(saved_cfg, cfg):
   # (the single source of defaults) instead of declaring a mismatch (a bare `k not in
   # saved_cfg` silently re-solved the witnesses of EVERY older plan file each time a new
   # witness-affecting flag landed).
-  from config import RunConfig
+  from assembly_planner.config import RunConfig
   # These two defaults became non-zero after saved witness blocks already existed.  Missing
   # keys therefore mean the historical OFF values, not today's fresh-run defaults.
   legacy = {"witness_margin": None, "witness_sets": 0,
@@ -2799,7 +2799,7 @@ _WITNESS_OPTIMIZER_FIELDS = {
 
 def _witnesses_baseline_compatible(saved_cfg, cfg):
   """Whether saved feasible keyframes are safe inputs under the current scene/IK gates."""
-  from config import RunConfig
+  from assembly_planner.config import RunConfig
   legacy = {"witness_margin": None, "witness_sets": 0,
             "grasp_sampler_db_hash": None}
   fields = [k for k in _WITNESS_FIELDS if k not in _WITNESS_OPTIMIZER_FIELDS]
@@ -3076,7 +3076,7 @@ def _dispatch_solve(cfg, C, assembly, robots, robot_ik):
 
 def _milestone_candidate_session(cfg, C, assembly, robots, robot_ik):
   """The standard milestone search as a resumable stream of complete plans."""
-  from solver import iter_assembly_problem_milestones
+  from assembly_planner.solver import iter_assembly_problem_milestones
   return iter_assembly_problem_milestones(
       C, assembly, robots=robots, robot_ik=robot_ik, weight=cfg.weight,
       wrench=cfg.wrench, wrench_aware_h=cfg.wrench_aware_h,
@@ -3114,8 +3114,8 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
   import shutil
   import subprocess
   import time
-  from solver import collect_plan_witnesses, hoist_releases_certified
-  from plan_io import require_complete_witnesses, witness_block
+  from assembly_planner.solver import collect_plan_witnesses, hoist_releases_certified
+  from assembly_planner.plan_io import require_complete_witnesses, witness_block
 
   if not cfg.motion_plan or not cfg.solve or cfg.load_plan:
     raise SystemExit("--mp-open-plans requires a fresh --solve --motion-plan run")
@@ -3214,7 +3214,7 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
     prefix = _os.path.join(work, f"candidate-{index:03d}-{pid}")
     pfile, efile = prefix + "-plan.json", prefix + "-export.json"
     require_complete_witnesses(plan, witnesses, who="open-plan search certificate")
-    from solver import collect_plan_pre_witnesses
+    from assembly_planner.solver import collect_plan_pre_witnesses
     pre_witnesses = collect_plan_pre_witnesses(
         C, assembly, plan, witnesses, robots, robot_ik,
         gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
@@ -3358,7 +3358,7 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
       raw = next(session)
     except StopIteration:
       if staged_grasps and not widened_grasps:
-        from problem import set_sampled_canonical_only
+        from assembly_planner.problem import set_sampled_canonical_only
         widened_grasps = True
         set_sampled_canonical_only(False)
         manifest["grasp_refinement_widened"] = True
@@ -3368,7 +3368,7 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
         session = _milestone_candidate_session(cfg, C, assembly, robots, robot_ik)
         continue
       if cfg.component_grasp_keep and not widened_component_grasps:
-        from problem import set_component_grasp_keep
+        from assembly_planner.problem import set_component_grasp_keep
         previous_keep = int(cfg.component_grasp_keep)
         widened_component_grasps = True
         set_component_grasp_keep(0)
@@ -3389,7 +3389,7 @@ def _run_open_plan_loop(cfg, C, assembly, robots, robot_ik, explicit=None):
           and widen_keep < int(cfg.grasp_widen_max)):
         if cfg.grasp_widen_batch < 1:
           raise ValueError("--grasp-widen-batch must be >= 1")
-        from problem import set_sampled_grasp_keep, sampled_grasp_db_signature
+        from assembly_planner.problem import set_sampled_grasp_keep, sampled_grasp_db_signature
         requested = min(int(cfg.grasp_widen_max), widen_keep + int(cfg.grasp_widen_batch))
         set_sampled_grasp_keep(requested)
         cfg.grasp_sampler_keep = requested
@@ -3508,13 +3508,13 @@ def _set_search_placement_yaw_prefix(cfg, active):
   """
   prefix = (1 if active and cfg.solve and not cfg.load_plan
             and cfg.placement_yaw_widening else None)
-  from problem import set_placement_yaw_prefix
+  from assembly_planner.problem import set_placement_yaw_prefix
   set_placement_yaw_prefix(prefix)
   return prefix
 
 
 def run(cfg, explicit=None):
-  from problem import set_frozen_plan_grasps
+  from assembly_planner.problem import set_frozen_plan_grasps
   set_frozen_plan_grasps(None)  # a fresh search in this process must never inherit a loaded plan
   cfg._loaded_motion_data = None
   cfg._motion_data_cache = {}
@@ -3621,7 +3621,7 @@ def run(cfg, explicit=None):
   any_two_finger = (gripper_list is not None and not all(gripper_list)) or not cfg.vacuum
   set_rolls_per_face(2 if any_two_finger else 1)
   set_dense_grasps(cfg.dense_grasps and any_two_finger)
-  from problem import (set_sampled_grasps, clear_sampled_scene_ctx,
+  from assembly_planner.problem import (set_sampled_grasps, clear_sampled_scene_ctx,
                        set_grasp_physics_check,
                        set_component_grasp_keep)
   if cfg.grasp_sampler_scenes and not cfg.grasp_sampler:
@@ -3727,7 +3727,7 @@ def run(cfg, explicit=None):
             "finite-master session follows. IK misses remain open and grasp IDs never change.")
   else:
     set_sampled_grasps(None)
-  from problem import set_placement_yaws, set_stable_rest_poses
+  from assembly_planner.problem import set_placement_yaws, set_stable_rest_poses
   set_stable_rest_poses(bool(getattr(cfg, "stable_rest_poses", False)))
   set_placement_yaws(cfg.placement_yaws)
   # The compact prefix is a search schedule, never part of the scene/plan identity.  Keep the
@@ -3750,21 +3750,21 @@ def run(cfg, explicit=None):
           "then admits all-part manipulation. The complete configured lattice remains the "
           "final action-space net.")
   if cfg.plain_box:
-    from problem import set_plain_box
+    from assembly_planner.problem import set_plain_box
     set_plain_box(True)
     print("[flag] --plain-box ACTIVE: cube parts use sharp ST.box (no ssBox corner-radius "
           "inflation), for solve + export + replay.")
   if cfg.grasp_translations:
-    from problem import set_grasp_translations
+    from assembly_planner.problem import set_grasp_translations
     set_grasp_translations(cfg.grasp_translations)
     print(f"[flag] --grasp-translations {cfg.grasp_translations}: each base grasp also offered "
           f"SLID along the gripper's open directions (bounded so the pads stay on the part).")
   if cfg.quiet_rai:
-    import rai_quiet
+    import assembly_planner.rai_quiet as rai_quiet
     rai_quiet.install()                                  # no-op if RAI_QUIET already installed it
     print("[flag] --quiet-rai ACTIVE: rai's libccd/pairCollision spam is dropped at fd 1/2 "
           "(matched on the C++ source file, never on 'WARNING', so real diagnostics survive).")
-  from env import set_tight_fingers
+  from assembly_planner.env import set_tight_fingers
   set_tight_fingers(bool(cfg.tight_fingers))
   if cfg.tight_fingers:
     if cfg.robot == "openarm":
@@ -3775,7 +3775,7 @@ def run(cfg, explicit=None):
             "robotiq_tight.g's radius (20mm -> 10mm, shifted 8mm so the grip surface holds). "
             "The fat proxy reaches 32.9mm past the tool centre -- it is what pokes out the far "
             "side of small parts and what forces --part-float.")
-  from env import set_openarm_real_finger_radius_scale
+  from assembly_planner.env import set_openarm_real_finger_radius_scale
   set_openarm_real_finger_radius_scale(cfg.openarm_real_finger_radius_scale)
   if cfg.openarm_real_finger_radius_scale != 1.0:
     if cfg.robot != "openarm":
@@ -3784,7 +3784,7 @@ def run(cfg, explicit=None):
           f"{cfg.openarm_real_finger_radius_scale:g}: REAL OpenArm finger capsule radius "
           f"15mm -> {15.0 * cfg.openarm_real_finger_radius_scale:g}mm; sampled grasps and "
           "the floating closure proxy remain nominal for a controlled A/B test.")
-  from solver import set_grasp_closure_check
+  from assembly_planner.solver import set_grasp_closure_check
   _closure_active = bool(cfg.grasp_closure_check or cfg.viz_initial_grasps is not None)
   set_grasp_closure_check(_closure_active)
   if cfg.grasp_closure_check:
@@ -3806,25 +3806,25 @@ def run(cfg, explicit=None):
           "may only assemble/release. Prunes brace branching; can miss plans that carry a "
           "brace across unrelated work (experimental).")
   if cfg.lru_robots:
-    from problem import set_lru_robots
+    from assembly_planner.problem import set_lru_robots
     set_lru_robots(True)
     print("[flag] --lru-robots ACTIVE: successor robots ordered least-recently-used first "
           "(deterministic tie-break; spreads actions across arms).")
   if cfg.brace_resting:
-    from problem import set_brace_resting
+    from assembly_planner.problem import set_brace_resting
     set_brace_resting(True)
     print("[flag] --brace-resting ACTIVE: resting assemblies may be braced (add_grasp), "
           "matching the abstraction's resting+braced states.")
   # Reset both switches on every in-process run. A standard-profile run must not leak this
   # ordering into a later --no-useful-grasps ablation in the same benchmark worker.
-  from problem import set_useful_grasps_enabled, set_useful_grasps
+  from assembly_planner.problem import set_useful_grasps_enabled, set_useful_grasps
   set_useful_grasps_enabled(cfg.useful_grasps)
   if not cfg.useful_grasps:
     set_useful_grasps(None)
   if cfg.useful_grasps:
     print("[flag] --useful-grasps ACTIVE: mate-viable grasp sets ordered first + fill-h "
           "regrasp pricing (spec 6.2).")
-  from solver import set_fill_touch_all
+  from assembly_planner.solver import set_fill_touch_all
   set_fill_touch_all(cfg.fill_touch_all)                 # reset for repeated in-process runs
   if cfg.fill_scope_widening:
     print("[flag] --fill-scope-widening ACTIVE: a failed local-scope fill is retried with "
@@ -3840,28 +3840,28 @@ def run(cfg, explicit=None):
   if cfg.lazy_edge_selector == "terminal-first" and not cfg.open_witness:
     raise SystemExit("--lazy-edge-selector terminal-first requires --open-witness")
   if cfg.dominance:
-    from problem import set_dominance
+    from assembly_planner.problem import set_dominance
     set_dominance(True)
     warn = "" if cfg.floating_ee else " WARNING: real fixed-base arms are not exact twins -- may prune plans."
     print(f"[flag] --dominance ACTIVE: one free arm per gripper kind acts (idle-twin symmetry).{warn}")
   if cfg.allow_curved_grasps:
-    from problem import set_allow_curved_grasps
+    from assembly_planner.problem import set_allow_curved_grasps
     set_allow_curved_grasps(True)
     print("[flag] --allow-curved-grasps ACTIVE: vacuum keeps curved-surface grasps (idealised "
           "suction on cylinders/spheres).")
   if cfg.staged_mates:
-    from problem import set_staged_mates
+    from assembly_planner.problem import set_staged_mates
     set_staged_mates(True)
     print("[flag] --staged-mates ACTIVE: staged mates are SLOTS until their fastener lands "
           "(unheld unfastened part falls out unless the slot faces up); successor filter + "
           "labeled-h gate, admissible. Assemblies without staged_mates are unaffected.")
   if cfg.inhand_reorient:
-    from problem import set_inhand_reorient
+    from assembly_planner.problem import set_inhand_reorient
     set_inhand_reorient(True)
     print("[flag] --inhand-reorient ACTIVE: held lone parts may rotate to any other grasp "
           "in hand (v1: full connectivity, unchanged grip capability, solo-held lone parts). "
           "Labeled/collapsed h model the inverse-reorient edge (cost 1) -> h stays admissible.")
-  import wrench
+  import assembly_planner.wrench as wrench
   wrench.PARAMS["grasp_model"] = cfg.grasp_model  # capability model (used when --wrench)
   wrench.apply_wrench_profile(cfg.wrench_profile)
   if cfg.wrench_profile is not None:
@@ -3935,14 +3935,14 @@ def run(cfg, explicit=None):
           "balance gravity for the complete continuous orientation sphere; exact cached "
           "contact-zonotope containment, no orientation samples or IK. Table-resting "
           "components keep their discrete rest orientation.")
-  from problem import set_banned_actions
+  from assembly_planner.problem import set_banned_actions
   set_banned_actions([x.strip() for x in cfg.ban_actions.split(",") if x.strip()]
                      if cfg.ban_actions else ())
   if cfg.ban_actions:
     print(f"[flag] --ban-actions ACTIVE: {cfg.ban_actions} (successor generator filters "
           f"matching actions; search only)")
   if cfg.vacuum_no_assemble:
-    from problem import set_kind_forbid
+    from assembly_planner.problem import set_kind_forbid
     set_kind_forbid(("vacuum:assemble",))
     print("[flag] --vacuum-no-assemble ACTIVE: no assemble may involve a vacuum arm "
           "(actor, inserted-part/target holder, or brace) -- the vacuum may pick and hand "
@@ -3989,7 +3989,7 @@ def run(cfg, explicit=None):
         robot_types=cfg.robot_types or cfg.robot,   # --robot for all; --robot-types overrides
     )
 
-  from problem import assembly_max_parts
+  from assembly_planner.problem import assembly_max_parts
   _maxp = assembly_max_parts(cfg.assembly)
   if cfg.parts > _maxp:
     if explicit and "parts" in explicit:
@@ -3999,7 +3999,7 @@ def run(cfg, explicit=None):
       print(f"[flag] NOTE: --assembly {cfg.assembly} has at most {_maxp} parts; the default "
             f"--parts {cfg.parts} is clamped to {_maxp}.")
   assembly = make_assembly(cfg.assembly, cfg.parts)
-  from problem import set_mate_wrench_limits
+  from assembly_planner.problem import set_mate_wrench_limits
   set_mate_wrench_limits(cfg.mate_wrench_limits)
   if assembly.mate_wrench_limits:
     if cfg.mate_wrench_limits:
@@ -4098,12 +4098,12 @@ def run(cfg, explicit=None):
     # Role restrictions describe the physical tool roster, not whether the wrench LP is on.
     # Install that roster only after the actual scene exists; successor calls deliberately
     # keep gripper_kind=None in a --no-wrench ablation so all statics/capacity checks stay off.
-    from problem import set_kind_forbid
+    from assembly_planner.problem import set_kind_forbid
     _role_robots = get_robots(C)
     set_kind_forbid(("vacuum:assemble",), robot_gripper_kinds(C, _role_robots))
 
   if cfg.grasp_sampler_scenes:
-    from problem import install_sampled_scene_ctx
+    from assembly_planner.problem import install_sampled_scene_ctx
     install_sampled_scene_ctx(C, assembly, robots=get_robots(C))
     print("[flag] --grasp-sampler-scenes ACTIVE: every candidate is tagged PER GRIPPER KIND "
           "for PICK, the mandatory MATE endpoint, and intermediate/final rigid-component "
@@ -4116,7 +4116,7 @@ def run(cfg, explicit=None):
             "generated pose is retained only after open-hand + full closure re-certification. "
             "Clutter/other-hand collisions are never projected.")
   if cfg.grasp_physics_check:
-    from problem import install_grasp_physics_ctx
+    from assembly_planner.problem import install_grasp_physics_ctx
     install_grasp_physics_ctx(C, assembly, robots=get_robots(C))
     print("[flag] --grasp-physics-check ACTIVE: every sampled two-finger candidate is "
           "closed in an isolated MuJoCo model using the exported gripper's actual finger "
@@ -4127,8 +4127,8 @@ def run(cfg, explicit=None):
     _physics_source = (cfg.grasp_physics_cache_plan or
                        (cfg.load_plan if not cfg.refresh_witnesses else None))
     if _physics_source:
-      from plan_io import read_grasp_physics
-      from problem import _GRASP_PHYSICS_CTX
+      from assembly_planner.plan_io import read_grasp_physics
+      from assembly_planner.problem import _GRASP_PHYSICS_CTX
       _saved_handover_physics = read_grasp_physics(_physics_source)
       if _saved_handover_physics is not None:
         _GRASP_PHYSICS_CTX.import_handovers(_saved_handover_physics)
@@ -4142,13 +4142,13 @@ def run(cfg, explicit=None):
               "a-priori table will be built now and saved on the next plan export")
         # Upgrade before witness replay/search/postprocessing begins.  In particular, do not
         # let the first handover successor query trigger simulation as a hidden search cost.
-        from solver import _search_context
+        from assembly_planner.solver import _search_context
         _search_context(C, assembly, get_robots(C))
   # A fixed saved plan carries its exact selected grasps and state chain. The contact-model
   # contract below still checks the live scene, but there is no reason to regenerate all
   # unused candidates merely to interpret positional grasp ids during motion export.
   if cfg.load_plan and cfg.motion_plan and not cfg.refresh_witnesses:
-    from plan_io import read_motion_data, read_plan as _read_motion_plan
+    from assembly_planner.plan_io import read_motion_data, read_plan as _read_motion_plan
     _md_cfg, _md_plan = _read_motion_plan(cfg.load_plan)
     if (_witnesses_baseline_compatible(_md_cfg, cfg) and
         (cfg.optimize_witnesses is None or _witnesses_reusable(_md_cfg, cfg))):
@@ -4162,7 +4162,7 @@ def run(cfg, explicit=None):
       _db_hash = cfg.grasp_sampler_db_hash
       print("[grasp-db] fixed-plan selected grasps loaded; full candidate DB rebuild SKIPPED")
     else:
-      from problem import sampled_grasp_db_signature
+      from assembly_planner.problem import sampled_grasp_db_signature
       _db_hash = sampled_grasp_db_signature(assembly)
     if _grasp_profile_on:
       print(f"[grasp-prof] signature/master access="
@@ -4193,7 +4193,7 @@ def run(cfg, explicit=None):
   # virtual-close semantics that gave its grasp ids meaning. A fresh --solve may use an old
   # plan as a convenient config and deliberately upgrades the contract; --load-plan is a
   # certificate consumer and must either match exactly or explicitly recertify.
-  from artifact_contract import build_artifact_contract, validate_artifact_contract
+  from assembly_planner.artifact_contract import build_artifact_contract, validate_artifact_contract
   _saved_contract = cfg.artifact_contract
   _actual_contract = build_artifact_contract(
       C, grasp_db_hash=cfg.grasp_sampler_db_hash,
@@ -4210,7 +4210,7 @@ def run(cfg, explicit=None):
     print("[artifact-contract] fresh --solve replaces the config's stale model contract.")
   cfg.artifact_contract = _actual_contract
   if cfg._loaded_motion_data is not None:
-    from plan_io import motion_data_grasps
+    from assembly_planner.plan_io import motion_data_grasps
     set_frozen_plan_grasps(motion_data_grasps(cfg._loaded_motion_data))
 
   # Internal benchmark pre-pass: construct the finite, scene/gripper-filtered grasp database
@@ -4221,7 +4221,7 @@ def run(cfg, explicit=None):
       "1", "true", "yes"):
     if not _os.environ.get("ASSEMBLY_GRASP_DB_PATH"):
       raise SystemExit("ASSEMBLY_GRASP_DB_BUILD_ONLY requires ASSEMBLY_GRASP_DB_PATH")
-    from solver import _search_context
+    from assembly_planner.solver import _search_context
     _grasp_db_t0 = _time.perf_counter()
     _checker, _table = _search_context(C, assembly, get_robots(C))
     _grasp_db_s = _time.perf_counter() - _grasp_db_t0
@@ -4233,7 +4233,7 @@ def run(cfg, explicit=None):
     print(f"[grasp-db] build-only complete: {len(_table)} component rows / {_rows} grasps "
           f"in {_grasp_db_s:.6f}s")
     if _os.environ.get("ASSEMBLY_GRASP_RAW_CACHE_DIR"):
-      from problem import sampled_grasp_raw_cache_stats
+      from assembly_planner.problem import sampled_grasp_raw_cache_stats
       _raw = sampled_grasp_raw_cache_stats()
       print("[grasp-raw-cache] "
             f"memory_hits={_raw['memory_hits']} disk_hits={_raw['disk_hits']} "
@@ -4288,11 +4288,11 @@ def run(cfg, explicit=None):
     if chosen is not None and chosen not in assembly.objects:
       raise SystemExit(f"--viz-initial-grasps: unknown part {chosen!r}; choose from "
                        f"{list(assembly.objects)}")
-    from solver import _search_context
+    from assembly_planner.solver import _search_context
     checker, grasp_table = _search_context(C, assembly, get_robots(C))
     rec = None
     if cfg.viser:
-      from viser_view import ViserRecorder
+      from tools.visualization.viser_view import ViserRecorder
       rec = ViserRecorder()
     visualize_initial_grasps_viser(
         C, assembly, checker, grasp_table, get_robots(C), recorder=rec,
@@ -4317,9 +4317,9 @@ def run(cfg, explicit=None):
                        f"{list(assembly.objects)}")
     # Build exactly the floating-EE scene used by the cheap action gate. The pose-valued
     # sampler and id-valued search paths both reduce to this same receiver/part geometry.
-    from solver import _search_context
-    from problem import get_initial_state
-    from gripper_closure import closure_sweep_configs
+    from assembly_planner.solver import _search_context
+    from assembly_planner.problem import get_initial_state
+    from assembly_planner.gripper_closure import closure_sweep_configs
     checker, _table = _search_context(C, assembly, robots)
     s0 = get_initial_state(C, assembly)
     try:
@@ -4335,7 +4335,7 @@ def run(cfg, explicit=None):
           f"model={result.model} aperture={result.aperture} reason={result.reason} "
           f"detail={result.detail}")
     if cfg.viser:
-      from viser_view import ViserRecorder
+      from tools.visualization.viser_view import ViserRecorder
       rec = ViserRecorder()
       for Ci, label in frames:
         rec.record(Ci, label)
@@ -4352,12 +4352,12 @@ def run(cfg, explicit=None):
   if cfg.viz_grasps or cfg.viz_rest_poses or cfg.viz_rest_poses_grid:
     rec = None
     if cfg.viser:
-      from viser_view import ViserRecorder
+      from tools.visualization.viser_view import ViserRecorder
       rec = ViserRecorder()
     if cfg.viz_grasps:
       U = None
       if cfg.wrench:
-        from solver import _search_context     # local import ONLY of names not module-global
+        from assembly_planner.solver import _search_context     # local import ONLY of names not module-global
         _chk, _gt = _search_context(C, assembly, get_robots(C))  # -- shadowing wrench_kind_arg
         U = compute_useful_grasps(assembly, _gt, wrench_kind_arg(C, get_robots(C)))  # here made
         #                                                        # it function-local everywhere
@@ -4374,7 +4374,7 @@ def run(cfg, explicit=None):
     # schematic DAG mate-sequence: interface points + per-mate insertion wrench, NO search.
     rec = None
     if cfg.viser:
-      from viser_view import ViserRecorder
+      from tools.visualization.viser_view import ViserRecorder
       rec = ViserRecorder()
     visualize_mate_sequence(C, assembly, recorder=rec, view=cfg.view)
     if rec is not None:
@@ -4416,13 +4416,13 @@ def run(cfg, explicit=None):
       print("[robot] distinct HOME/EXIT poses ACTIVE: the physical trajectory starts/ends "
             "at HOME; inactive arms park at EXIT during manipulation, and motion planning "
             "connects HOME directly to each arm's first useful task.")
-    from solver import set_fill_reference_diagnostic
+    from assembly_planner.solver import set_fill_reference_diagnostic
     set_fill_reference_diagnostic()                    # reset across repeated library runs
     if cfg.diagnose_plan_rank is not None:
       if not cfg.solve or cfg.load_plan or not cfg.milestones:
         raise SystemExit("--diagnose-plan-rank requires --solve with the milestone solver "
                          "(and cannot be combined with --load-plan)")
-      from plan_io import read_plan as _read_rank_plan
+      from assembly_planner.plan_io import read_plan as _read_rank_plan
       _rank_cfg, _rank_actions = _read_rank_plan(cfg.diagnose_plan_rank)
       set_fill_reference_diagnostic(_rank_actions, cfg.diagnose_plan_rank)
       print(f"[fill-rank] ACTIVE: {len(_rank_actions)} demonstrated actions loaded "
@@ -4692,7 +4692,7 @@ def run(cfg, explicit=None):
       set_cheap_check_debug(True)
     fail_rec = None
     if cfg.log_ik_failures is not None and robot_ik is not None:
-      from viser_view import ViserRecorder
+      from tools.visualization.viser_view import ViserRecorder
       fail_rec = ViserRecorder()
       robot_ik.fail_recorder = fail_rec
       robot_ik.fail_log_seconds = cfg.log_ik_failures
@@ -4701,8 +4701,8 @@ def run(cfg, explicit=None):
                       not in ("", "0", "false", "no"))
     _bench_search_t0 = None
     if _bench_profile and not cfg.load_plan:
-      import problem as _bench_problem
-      import wrench as _bench_wrench
+      import assembly_planner.problem as _bench_problem
+      import assembly_planner.wrench as _bench_wrench
       _bench_problem.reset_grasp_timing()
       _bench_wrench.reset_wrench_timing()
       _bench_search_t0 = _time.perf_counter()
@@ -4714,7 +4714,7 @@ def run(cfg, explicit=None):
       # search may return a different discrete plan. Loading keeps the certified action list
       # fixed and re-runs only what was requested. The scene still comes from --config/CLI, so
       # it must MATCH the saved plan.
-      from plan_io import read_plan as _read_saved_plan
+      from assembly_planner.plan_io import read_plan as _read_saved_plan
       _saved_cfg, plan = _read_saved_plan(cfg.load_plan)
       # Keep the original search certificate if this plan is written out again.
       cfg._search_witness_margin = float(_saved_cfg.get("_search_witness_margin", 0.0))
@@ -4748,7 +4748,7 @@ def run(cfg, explicit=None):
       # is the complete configured DB and can abort immediately. Under --grasp-widen an empty
       # prefix is only a request for the next prefix; the same sound abort runs again after the
       # finite master pool is exhausted.
-      from solver import _search_context, isolated_graspability_report
+      from assembly_planner.solver import _search_context, isolated_graspability_report
       _grasp_profile_on = _os.environ.get("ASSEMBLY_GRASP_PROFILE", "").lower() in (
           "1", "true", "yes")
       _pre_t0 = _time.perf_counter() if _grasp_profile_on else None
@@ -4805,7 +4805,7 @@ def run(cfg, explicit=None):
         _original_bracing = bool(cfg.bracing)
         _original_scope_widening = bool(cfg.fill_scope_widening)
         if _staged_dispatch:
-          from problem import set_sampled_canonical_only
+          from assembly_planner.problem import set_sampled_canonical_only
           set_sampled_canonical_only(True)
           # Monotone action-space widening. The former nesting did the most expensive thing
           # first: exhaust compact grasps through unrestricted bracing/all-part recovery, and
@@ -4842,7 +4842,7 @@ def run(cfg, explicit=None):
                 "grasps + configured bracing + all-part scope widening.")
           plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
         if plan is None and cfg.component_grasp_keep:
-          from problem import set_component_grasp_keep
+          from assembly_planner.problem import set_component_grasp_keep
           _component_keep = int(cfg.component_grasp_keep)
           set_component_grasp_keep(0)
           # Save/replay must rebuild the alphabet which actually produced the plan. The
@@ -4854,7 +4854,7 @@ def run(cfg, explicit=None):
                 "witness cache entries remain valid because grasp ids never changed.")
           plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
         if plan is None and cfg.grasp_widen:
-          from problem import (set_sampled_canonical_only, set_sampled_grasp_keep,
+          from assembly_planner.problem import (set_sampled_canonical_only, set_sampled_grasp_keep,
                                sampled_grasp_db_signature)
           if not cfg.grasp_sampler:
             raise ValueError("--grasp-widen requires --grasp-sampler")
@@ -4893,7 +4893,7 @@ def run(cfg, explicit=None):
             plan = _dispatch_solve(cfg, C, assembly, robots, robot_ik)
             prev_keep, prev_hash = requested, new_hash
           if plan is None:
-            from problem import sampled_grasp_selection_diagnostics
+            from assembly_planner.problem import sampled_grasp_selection_diagnostics
             _coverage = sampled_grasp_selection_diagnostics()
             _unprobed = [p for p, row in _coverage.items()
                          if row["probe"] < row["raw"]]
@@ -4955,7 +4955,7 @@ def run(cfg, explicit=None):
           cfg.bracing = _original_bracing
           cfg.fill_scope_widening = _original_scope_widening
         if cfg.grasp_sampler:
-          from problem import set_sampled_canonical_only
+          from assembly_planner.problem import set_sampled_canonical_only
           set_sampled_canonical_only(False)               # post-passes/replay see full DB
         _set_search_placement_yaw_prefix(cfg, active=False)  # saved plan/post-passes see all ids
     if cfg.grasp_local_widen and hasattr(assembly, "_grasp_local_caps"):
@@ -4988,8 +4988,8 @@ def run(cfg, explicit=None):
       robot_ik.prof_report()
       print(f"[rss] peak RSS after solve attempt: {_rss_mb():.0f} MB")
     if _bench_search_t0 is not None:
-      import problem as _bench_problem
-      import wrench as _bench_wrench
+      import assembly_planner.problem as _bench_problem
+      import assembly_planner.wrench as _bench_wrench
       _gp = _bench_problem.grasp_timing_snapshot()
       _wp = _bench_wrench.wrench_timing_snapshot()
       print(f"[search-phase-prof] pipeline={_time.perf_counter() - _bench_search_t0:.6f}s "
@@ -5011,7 +5011,7 @@ def run(cfg, explicit=None):
       # transaction *after* this source certificate exists: it can commit only if every changed
       # predecessor scene is re-certified, otherwise the original plan/witnesses are retained.
       # A loaded plan is read-only unless the user explicitly asks for --refresh-witnesses.
-      from plan_io import (read_grasp_closures, read_pre_witnesses, read_skill_paths, read_witnesses,
+      from assembly_planner.plan_io import (read_grasp_closures, read_pre_witnesses, read_skill_paths, read_witnesses,
                            read_witness_stage,
                            require_complete_witnesses, witness_block)
       joint_names = list(robot_ik.C.getJointNames()) if robot_ik is not None else []
@@ -5046,7 +5046,7 @@ def run(cfg, explicit=None):
                         a and a[0] == "assemble" and assembly.screw_skill(a[2]) is None
                         for a in plan)))
         if baseline_witnesses is None and cfg.refresh_witnesses:
-          from solver import collect_plan_witnesses
+          from assembly_planner.solver import collect_plan_witnesses
           baseline_witnesses = collect_plan_witnesses(
               C, assembly, plan, robots, robot_ik,
               gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
@@ -5060,7 +5060,7 @@ def run(cfg, explicit=None):
               "original solve once with this version, or explicitly pass --refresh-witnesses "
               "to certify this legacy plan.")
       elif _need_witnesses and not cfg.load_plan:
-        from solver import collect_plan_witnesses
+        from assembly_planner.solver import collect_plan_witnesses
         baseline_witnesses = collect_plan_witnesses(
             C, assembly, plan, robots, robot_ik,
             gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
@@ -5091,7 +5091,7 @@ def run(cfg, explicit=None):
         if robot_ik is None:
           # There is no keyframe certificate in a floating-EE / symbolic-only solve. Retain the
           # original cheap-geometric hoist behaviour in that mode.
-          from solver import hoist_releases
+          from assembly_planner.solver import hoist_releases
           plan = hoist_releases(C, assembly, plan, robots, gripper_kind=gk,
                                 handovers=cfg.handovers, allow_place=cfg.allow_place,
                                 bracing=cfg.bracing)
@@ -5102,7 +5102,7 @@ def run(cfg, explicit=None):
           print("[hoist] skipped: no source witness block is available to recertify the "
                 "rewritten plan; retaining the original plan.")
         else:
-          from solver import hoist_releases_certified
+          from assembly_planner.solver import hoist_releases_certified
           plan, baseline_witnesses, _hoist_applied = hoist_releases_certified(
               C, assembly, plan, baseline_witnesses, robots, robot_ik,
               gripper_kind=gk, handovers=cfg.handovers, allow_place=cfg.allow_place,
@@ -5117,7 +5117,7 @@ def run(cfg, explicit=None):
         if cfg.load_plan and not cfg.refresh_witnesses and not _hoist_applied:
           grasp_closures = read_grasp_closures(cfg.load_plan, plan, required=True)
         else:
-          from solver import collect_plan_grasp_closures
+          from assembly_planner.solver import collect_plan_grasp_closures
           grasp_closures = collect_plan_grasp_closures(
               C, assembly, plan, robots,
               gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
@@ -5132,7 +5132,7 @@ def run(cfg, explicit=None):
                          if a and a[0] == "assemble" and cfg.pre_insertion > 0.0
                          and assembly.screw_skill(a[2]) is None]
         if not cfg.load_plan or cfg.refresh_witnesses or _hoist_applied:
-          from solver import collect_plan_pre_witnesses
+          from assembly_planner.solver import collect_plan_pre_witnesses
           baseline_pre_witnesses = collect_plan_pre_witnesses(
               C, assembly, plan, baseline_witnesses, robots, robot_ik,
               gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
@@ -5177,7 +5177,7 @@ def run(cfg, explicit=None):
                               and baseline_witnesses is not None
                               and _saved_witness_stage == "optimized")
           if _reuse_final:
-            from plan_io import (read_diagnostic_candidates,
+            from assembly_planner.plan_io import (read_diagnostic_candidates,
                                  read_optimization_candidates, read_witness_sets)
             if opt_witnesses is not None:
               print(f"[witness-reuse] {sum(w is not None for w in opt_witnesses)} persisted "
@@ -5200,7 +5200,7 @@ def run(cfg, explicit=None):
                 print(f"[witdiag-candidates] {len(diagnostic_candidates)} persisted broad "
                       f"diagnostic candidate pool(s) loaded from {cfg.load_plan}.")
           if not _reuse_final and cfg.optimize_witnesses == "floor":
-            from witness_floor import optimize_witnesses_floor
+            from assembly_planner.witness_floor import optimize_witnesses_floor
             # floor mode CONSTRAINS clearance (a per-step normalised floor) rather than
             # weighting it, so there is nothing for --witness-clearance to scale. Say so
             # instead of accepting the flag and ignoring it.
@@ -5257,7 +5257,7 @@ def run(cfg, explicit=None):
                 f"{cfg.load_plan} has endpoint witnesses for an atomic screw skill but no "
                 "matching path certificate. Refusing to redo skill IK implicitly; re-run "
                 "the original solve once with this version.")
-          from solver import certify_plan_skill_paths
+          from assembly_planner.solver import certify_plan_skill_paths
           opt_witnesses, skill_paths = certify_plan_skill_paths(
               C, assembly, plan, opt_witnesses, robots, robot_ik,
               gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
@@ -5283,7 +5283,7 @@ def run(cfg, explicit=None):
       _endpoints_postprocessed = bool(cfg.optimize_witnesses is not None or _has_path_skill)
       if (opt_witnesses is not None and _required_pre and not _reuse_final
           and _endpoints_postprocessed):
-        from solver import collect_plan_pre_witnesses
+        from assembly_planner.solver import collect_plan_pre_witnesses
         opt_pre_witnesses = collect_plan_pre_witnesses(
             C, assembly, plan, opt_witnesses, robots, robot_ik,
             gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
@@ -5315,7 +5315,7 @@ def run(cfg, explicit=None):
                                           grasp_closures=grasp_closures),
                   C=C, assembly=assembly, robots=robots)
       if plan is not None and cfg.utilization:
-        from solver import utilization_report
+        from assembly_planner.solver import utilization_report
         utilization_report(C, assembly, plan, robots, witnesses=opt_witnesses,
                            gripper_kind=wrench_kind_arg(C, robots) if cfg.wrench else None,
                            handovers=cfg.handovers, allow_place=cfg.allow_place,
@@ -5344,14 +5344,14 @@ def run(cfg, explicit=None):
                 "--mp-wrench-gate requires --wrench: a --no-wrench plan is the topological "
                 "baseline and has no wrench-certified symbolic state. Omit the MP gate for "
                 "that baseline, or re-run task planning with --wrench.")
-          import mp_export as MP
-          from plan_io import _motion_plan_digest, motion_data_states
+          import assembly_planner.mp_export as MP
+          from assembly_planner.plan_io import _motion_plan_digest, motion_data_states
           _motion_data = (cfg._loaded_motion_data or
                           getattr(cfg, "_motion_data_cache", {}).get(
                               (_motion_plan_digest(plan), cfg.grasp_sampler_db_hash)))
           _motion_states = None
           if _motion_data is not None:
-            from problem import get_initial_state
+            from assembly_planner.problem import get_initial_state
             get_initial_state(C, assembly)  # restore anchor metadata, without grasp generation
             _motion_states = motion_data_states(_motion_data, assembly)
             print(f"[motion-data] {len(_motion_states)} saved symbolic states and "
@@ -5434,7 +5434,7 @@ def run(cfg, explicit=None):
                   robot_collisions=cfg.witness_robot_collisions,
                   baseline_witnesses=baseline_witnesses)
             if cfg.fuse_cograsp:
-              from solver import fuse_cograsp_witnesses
+              from assembly_planner.solver import fuse_cograsp_witnesses
               print("[flag] --fuse-cograsp ACTIVE: re-solving each (add_grasp, assemble) "
                     "witness pair as ONE 2-phase KOMO. add_grasp shares the assembly's "
                     "funnel-mouth rendezvous at the keyframe level; the ordinary motion "
@@ -5457,7 +5457,7 @@ def run(cfg, explicit=None):
           # subassembly through the table and fail later as an unexplained "no path".
           if (robot_ik.penetration_reject is not None
               or getattr(robot_ik, "object_over_table", False)):
-            from solver import validate_export_witnesses
+            from assembly_planner.solver import validate_export_witnesses
             _pre_gate_input_wit = list(mp_wit)
             mp_wit, _bad = validate_export_witnesses(
                 C, assembly, plan, mp_wit, robots, robot_ik, gripper_kind=gk,
@@ -5530,7 +5530,7 @@ def run(cfg, explicit=None):
                     "split is present, which is where the pin bites). Disable with "
                     "--no-fuse-pre-skill.")
           if _loaded_export is None and cfg.fuse_pre_skill:
-            from solver import fuse_pre_skill_witnesses
+            from assembly_planner.solver import fuse_pre_skill_witnesses
             print("[flag] --fuse-pre-skill ACTIVE: each pre-* GOTO keyframe is re-solved with "
                   "every arm that does NOT move with the skill PINNED (hard eq) to the skill "
                   "witness, then gated on actor dq <= 0.35 rad, idle-arm dq <= 0.02 rad, "
@@ -5641,7 +5641,7 @@ def run(cfg, explicit=None):
             print(f"[mp-export] saved final zero-IK replay artifact -> {cfg.mp_export_save}")
           if cfg.mp_clearance:
             # pass OUR per-step scene so the report can name parts that sit elsewhere here
-            from solver import _replay_states as _rs, _search_context as _sc
+            from assembly_planner.solver import _replay_states as _rs, _search_context as _sc
             try:
               _ck2, _gt2 = _sc(C, assembly, robots)
               _st = _rs(C, assembly, plan, robots, gk, cfg.handovers, cfg.allow_place,
@@ -5740,7 +5740,7 @@ def run(cfg, explicit=None):
       if (cfg.view or cfg.viser) and not cfg.motion_plan:
         recorder = None
         if cfg.viser:
-          from viser_view import ViserRecorder
+          from tools.visualization.viser_view import ViserRecorder
           recorder = ViserRecorder()
         # wrench arrows are computed whenever the capability model is on; a viser GUI
         # checkbox ("Show wrenches") toggles their display per step.
@@ -5757,7 +5757,7 @@ def run(cfg, explicit=None):
     return
 
   if cfg.viser:
-    from viser_view import ViserRecorder
+    from tools.visualization.viser_view import ViserRecorder
     recorder = ViserRecorder()
     recorder.record(C, "scene")
     recorder.serve(port=cfg.viser_port)

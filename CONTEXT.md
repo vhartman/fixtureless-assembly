@@ -13,7 +13,7 @@ intermediate state is the planning constraint.
   motion — is quasistatically supported and kinematically feasible.
 - Core idea: regrasps are NOT free, and mates are supports with possibly unilateral wrench
   capability. Hold / brace / handover decisions are reasoned about, not scripted.
-- Design document: `assembly_planner_spec.md` (scene-graph state + witness, actions under the
+- Design document: `docs/assembly_planner_spec.md` (scene-graph state + witness, actions under the
   fuse-vs-reify principle, wrench LP at search time).
 
 ## Ubiquitous language
@@ -28,39 +28,40 @@ intermediate state is the planning constraint.
 - **witness** — one consistent kinematic realization per search node (excluded from identity).
 - **fuse-vs-reify** — fused `pick`/`place` actions for the common cases; unfused variants
   expose intermediate states for handovers and bracing.
-- **milestones / ladder / LNS** — the search-solver menu in `assembly.py` / `main.py`.
-- **wrench LP** — conservative wrench sufficiency (`wrench.py`); `wrench=True` vs `False` is
+- **milestones / ladder / LNS** — the search-solver menu in `assembly_planner/assembly.py` / `main.py`.
+- **wrench LP** — conservative wrench sufficiency (`assembly_planner/wrench.py`); `wrench=True` vs `False` is
   the paper discriminator pair.
 - **zero-tolerance recipe** — `--strict-collisions` + `--witness-robot-collisions` +
-  `--pre-insertion 0.05` + `--mp-collision-tolerance 1e-6` (`PIPELINE.md` §4).
+  `--pre-insertion 0.05` + `--mp-collision-tolerance 1e-6` (`docs/PIPELINE.md` §4).
 - **discriminator** — a scene where the topological plan is physically infeasible and the
-  wrench-aware plan succeeds. The single most important missing result (`EVALUATION.md`).
-- **floating vs real arms** — floating-gripper keyframes (v1 sim, validates the statics) vs
-  FK-synced arms following the BiRRT path (v2 sim).
+  wrench-aware plan succeeds. The single most important missing result (`docs/EVALUATION.md`).
+- **real-arm simulation** — actuated MuJoCo arms follow the persisted BiRRT path, with
+  collision preflight, phase scheduling, skill servos, and physical force guards.
 
 ## Pipeline
 
-solve (`main.py`, `assembly.py`, `solver.py`) → motion-plan (mr_bench as an unmodified module
-via `mp_export.py`, BiRRT) → validate (MuJoCo, `sim.py`). Commands: `PIPELINE.md`.
+solve (`main.py`, `assembly_planner/assembly.py`, `assembly_planner/solver.py`) → motion-plan
+(mr_bench as an unmodified module via `assembly_planner/mp_export.py`, BiRRT) → validate
+(MuJoCo, `sim.py`). Commands: `docs/PIPELINE.md`.
 
 ## Conventions
 
 - `PYTHONHASHSEED=0` for anything you compare. Never run two heavy solves concurrently.
   Always `--no-view` in scripted runs.
-- mr_bench is used unmodified; its issues live in `mr_bench_integration_notes.md`.
+- mr_bench is used unmodified; its issues live in `docs/mr_bench_integration_notes.md`.
 - A BiRRT export is irreproducible by design (wall-clock termination, `set()` iteration,
   numba RNG). Treat a working `mp` path as a preserved artifact; never regenerate
-  (`FRAGILITY.md` §1.2).
+  (`docs/FRAGILITY.md` §1.2).
 - New experiment files only; keep experiment records under `experiments/`.
 - Use ASD-STE100 Simplified Technical English.
 
 ## Doc map
 
-- `PIPELINE.md` — how to run each stage.
-- `EVALUATION.md` — status, baselines, open work. Read before claiming any result.
-- `FRAGILITY.md` — cross-stage contract failures and known traps.
-- `assembly_planner_spec.md` — the design document (paper skeleton).
-- `mr_bench_integration_notes.md` — mr_bench-side bugs and fixes.
+- `docs/PIPELINE.md` — how to run each stage.
+- `docs/EVALUATION.md` — status, baselines, open work. Read before claiming any result.
+- `docs/FRAGILITY.md` — cross-stage contract failures and known traps.
+- `docs/assembly_planner_spec.md` — the design document (paper skeleton).
+- `docs/mr_bench_integration_notes.md` — mr_bench-side bugs and fixes.
 - `experiments/shortcut-sampling/README-v5.md` — the shortcutting experiment round record.
 
 ## Current state

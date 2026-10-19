@@ -11,11 +11,11 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from plan_io import PRE_WITNESS_CONTRACT, missing_required_witnesses, read_grasp_closures, read_grasp_physics, read_plan, read_pre_witnesses, \
+from assembly_planner.plan_io import PRE_WITNESS_CONTRACT, missing_required_witnesses, read_grasp_closures, read_grasp_physics, read_plan, read_pre_witnesses, \
     read_skill_paths, read_witnesses, read_witness_stage, require_complete_witnesses, \
     witness_block, write_plan
-import mp_export as MP
-import solver
+import assembly_planner.mp_export as MP
+import assembly_planner.solver as solver
 
 
 JOINTS = ["a1_j0", "a1_j1", "a2_j0", "a2_j1"]
@@ -39,7 +39,7 @@ def test_plan_roundtrip_carries_apriori_handover_physics(tmp_path):
 
 
 def test_grasp_closure_aperture_round_trip_is_action_aligned(tmp_path):
-  from gripper_closure import VERSION as closure_version
+  from assembly_planner.gripper_closure import VERSION as closure_version
   cert = {0: {"contract": f"virtual-close-v{closure_version}", "action": list(PLAN[0]),
               "robot": "a1", "part": "obj_1", "grasp_id": 0,
               "model": "robotiq", "aperture": 0.031,

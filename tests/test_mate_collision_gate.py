@@ -1,6 +1,6 @@
 import pytest
 
-import solver as S
+import assembly_planner.solver as S
 
 
 class _CollisionScene:

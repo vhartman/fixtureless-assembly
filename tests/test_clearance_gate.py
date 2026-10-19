@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import solver as S
+import assembly_planner.solver as S
 import robotic as ry
 
 

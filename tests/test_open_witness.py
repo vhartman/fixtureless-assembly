@@ -1,8 +1,8 @@
 import pytest
 
-from open_witness import OpenWitnessPool, run_open_lazy_fill
-import solver as solver_mod
-from solver import RobotIK, _deterministic_ik_seed
+from assembly_planner.open_witness import OpenWitnessPool, run_open_lazy_fill
+import assembly_planner.solver as solver_mod
+from assembly_planner.solver import RobotIK, _deterministic_ik_seed
 
 
 class _State:

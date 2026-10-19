@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from viser_view import ViserRecorder, _mesh_vertex_rgba
+from tools.visualization.viser_view import ViserRecorder, _mesh_vertex_rgba
 
 
 def _pose(x):

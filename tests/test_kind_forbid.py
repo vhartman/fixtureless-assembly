@@ -1,5 +1,5 @@
 """--vacuum-no-assemble: the successor-level kind-role forbid."""
-import problem as P
+import assembly_planner.problem as P
 
 
 class _FakeState:

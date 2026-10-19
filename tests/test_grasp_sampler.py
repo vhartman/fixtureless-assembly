@@ -11,9 +11,9 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import problem as P
-import solver as S
-from config import RunConfig
+import assembly_planner.problem as P
+import assembly_planner.solver as S
+from assembly_planner.config import RunConfig
 import main
 
 
@@ -35,7 +35,7 @@ def _clean_sampler_state():
 
 def test_component_grasp_pool_is_bounded_stable_subset_of_full_union():
   """Component columns are an ordering over, not a replacement for, raw part grasps."""
-  from problem import make_assembly
+  from assembly_planner.problem import make_assembly
 
   asm = make_assembly("cross", 3)
   group = ("obj_0", "obj_1", "obj_2")
@@ -61,7 +61,7 @@ def test_component_grasp_pool_is_bounded_stable_subset_of_full_union():
 
 
 def test_component_grasp_tables_are_lazy_but_full_iteration_is_explicit(monkeypatch):
-  from problem import make_assembly
+  from assembly_planner.problem import make_assembly
 
   asm = make_assembly("cross", 3)
   calls = []
@@ -342,7 +342,7 @@ def test_handover_physics_table_is_an_ordered_cached_gate_for_identical_hands():
 
 
 def test_apriori_handover_certificate_skips_all_physics_on_reuse(tmp_path):
-  from grasp_physics import GraspPhysicsContext
+  from assembly_planner.grasp_physics import GraspPhysicsContext
 
   hand = tmp_path / "hand.g"
   hand.write_text("# stable model identity\n")
@@ -354,7 +354,7 @@ def test_apriori_handover_certificate_skips_all_physics_on_reuse(tmp_path):
   models = {r: ctx._model_key(path) for r, path in paths.items()}
   signature = ctx._handover_table_signature(table, models)
   ctx.import_handovers({
-      "contract": "handover-physics-v1", "force_n": 10.0,
+      "contract": "handover-physics-v2", "force_n": 10.0,
       "signature": signature, "models": models,
       "accepted": [[list(("obj_0",)), models["a1"], "obj_0", 1,
                     models["a2"], "obj_0", 2]],
@@ -500,8 +500,8 @@ def test_per_part_grasp_caps_gate_only_new_grasp_choices():
 
 def test_scene_masks_are_per_gripper_kind():
   """Mixed fleets must not classify every explicit pose through whichever EE slot is first."""
-  import env
-  from problem import add_disassembled_obj, get_robots, make_assembly
+  import assembly_planner.env as env
+  from assembly_planner.problem import add_disassembled_obj, get_robots, make_assembly
   P.set_rolls_per_face(2)
   P.set_sampled_grasps({"seed": 0, "candidates": 64, "keep": 20,
                         "margin": 0.008, "pad_support": 0.75, "wrap": 0.015})
@@ -531,8 +531,8 @@ def test_openarm_car_wheel_sampler_generates_strict_table_clear_grasp():
   must be a distinct generated pose that passes the strict full closure certificate—not the
   historical 5mm open-hand tolerance.
   """
-  import env
-  from problem import add_disassembled_obj, get_robots, make_assembly
+  import assembly_planner.env as env
+  from assembly_planner.problem import add_disassembled_obj, get_robots, make_assembly
 
   P.set_rolls_per_face(2)
   P.set_sampled_grasps({"seed": 0, "candidates": 96, "keep": 16,
@@ -592,8 +592,8 @@ def test_wrap_emits_side_roll_for_long_boxes():
 
 def test_scene_aware_roles_are_certified_per_part_and_gripper():
   """Every advertised scene role re-passes its check, and equal shapes get per-part DBs."""
-  import env
-  from problem import add_disassembled_obj, get_robots, make_assembly
+  import assembly_planner.env as env
+  from assembly_planner.problem import add_disassembled_obj, get_robots, make_assembly
   P.set_sampled_grasps({"seed": 0, "candidates": 64, "keep": 12,
                         "margin": 0.008, "pad_support": 0.75})
   C = env.make_four_robot_env(num_robots=1, floating_ee=False, vacuum=False)
@@ -627,8 +627,8 @@ def test_scene_aware_roles_are_certified_per_part_and_gripper():
 
 
 def test_assemble_role_scene_contains_only_mandatory_predecessors():
-  import env
-  from problem import add_disassembled_obj, get_initial_state, make_assembly
+  import assembly_planner.env as env
+  from assembly_planner.problem import add_disassembled_obj, get_initial_state, make_assembly
   asm = make_assembly("cross", 3)
   C = add_disassembled_obj(
       env.make_four_robot_env(num_robots=1, floating_ee=True, vacuum=False),
@@ -691,6 +691,35 @@ def test_scene_reservation_preempts_a_full_canonical_prefix(monkeypatch):
   facts = {(kind, role) for _row, meta in rows
            for kind, roles in meta["scene_by_kind"].items() for role in roles}
   assert facts == {("two_finger", "pick"), ("two_finger", "assemble")}
+
+
+def test_scene_reservation_checks_discrete_mate_symmetry(monkeypatch):
+  """A valid symmetric mate must not be lost at the sampler's authored-pose gate."""
+  spec, _part, suction, _antip, ctx = _synthetic_scene_reservation_input(monkeypatch)
+  part = "obj_1"
+  pick_state, asm_state = ctx["s0"], ctx["s_full"]
+
+  class SymmetricAssembly:
+    def relative_pose(self, queried):
+      return ("obj_0", np.zeros(3)) if queried == part else None
+
+    def mate_quaternions(self, queried):
+      assert queried == part
+      return (np.array([1., 0., 0., 0.]), np.array([0., 0., 0., 1.]))
+
+  def clearance(state, _part, pose, _assembly, robot=None):
+    del robot
+    x = float(np.asarray(pose)[0])
+    return ((state is pick_state and abs(x - 1.) < 1e-9)
+            or (state is asm_state and abs(x + 1.) < 1e-9))
+
+  ctx["assembly"] = SymmetricAssembly()
+  monkeypatch.setattr(ctx["checker"], "pose_collision_free", clearance)
+  P.set_sampled_grasps({"seed": 0, "candidates": 8, "keep": 2,
+                        "full_probe": True})
+  rows = P._sampled_master_rows(spec, 0.01, part, [suction[0]], [], 2, ctx, None)
+  assert any({"pick", "assemble"}.issubset(meta["scene_by_kind"]["two_finger"])
+             for _row, meta in rows)
 
 
 def test_scene_reservation_puts_transport_bridge_before_endpoint_only_rows(monkeypatch):

@@ -1,0 +1,30 @@
+.venv*/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+*.orig
+depgraph_*.png
+*.svg
+sim_meshes/
+sim_recordings/
+debugging/
+
+# Generated run products. Scope these to the two artifact locations: blanket ``*.json`` used
+# to hide benchmark manifests and hand-authored configuration files everywhere in the repo.
+/*.json
+/*.npz
+/*.log
+/*.png
+/*.out
+/MUJOCO_LOG.TXT
+/z.log.global
+/benchmarks/results/
+/shortcut_exp/
+/experiments/**/*.json
+/experiments/**/*.npz
+/experiments/**/*.log
+/experiments/**/*.glb
+/exports/
+/tetgen-tmpfile_skipped.*
+/chair.g
+/.vscode/
